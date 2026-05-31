@@ -1,0 +1,10 @@
+[package]
+name = "isyncyou-statusbar"
+description = "Native mini status-bar app (own renderer: tiny-skia + cosmic-text). Stub in Phase 0."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

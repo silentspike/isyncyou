@@ -1,0 +1,10 @@
+[package]
+name = "isyncyou-ipc-types"
+description = "Shared API/IPC types (serde) between engine, GUI and CLI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

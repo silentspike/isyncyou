@@ -1,0 +1,40 @@
+name: Promote
+
+# Automation: after a merge into dev/staging, open (or keep) the next-stage
+# promotion PR so the dev -> staging -> main path is one click.
+on:
+  push:
+    branches: [dev, staging]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: promote-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  open-promotion-pr:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const next = { dev: 'staging', staging: 'main' };
+            const head = context.ref.replace('refs/heads/', '');
+            const base = next[head];
+            if (!base) { core.info(`no promotion target for ${head}`); return; }
+            const { owner, repo } = context.repo;
+            const open = await github.rest.pulls.list({ owner, repo, base, head: `${owner}:${head}`, state: 'open' });
+            if (open.data.length) { core.info(`promotion PR already open: #${open.data[0].number}`); return; }
+            try {
+              const pr = await github.rest.pulls.create({
+                owner, repo, head, base,
+                title: `chore: promote ${head} to ${base}`,
+                body: `Automated promotion of \`${head}\` into \`${base}\`.`,
+              });
+              core.info(`opened promotion PR #${pr.data.number}`);
+            } catch (e) {
+              core.warning(`could not open promotion PR (${head} -> ${base}): ${e.message}`);
+            }

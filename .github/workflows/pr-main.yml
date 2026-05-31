@@ -1,0 +1,96 @@
+name: PR (main)
+
+# Release-grade gate for PRs into `main`: everything from staging plus a
+# release build. main is the release branch; RC artifacts are produced by
+# release.yml on merge.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-main-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: build & test
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny (prebuilt)
+        run: |
+          if ! cargo deny --version >/dev/null 2>&1; then
+            ver=0.19.8
+            tmp=$(mktemp -d)
+            curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C "$tmp"
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
+            install -m0755 "$tmp"/*/cargo-deny "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-deny"
+          fi
+      - run: cargo deny check
+
+  docs:
+    name: docs
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --workspace
+
+  release-build:
+    name: release build
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+
+  main-pass:
+    name: main-pass
+    if: always()
+    needs: [fmt, clippy, test, deny, docs, release-build]
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Fail if any required job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "main (release-grade) checks passed"
