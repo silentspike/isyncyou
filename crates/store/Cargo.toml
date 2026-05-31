@@ -1,0 +1,10 @@
+[package]
+name = "isyncyou-store"
+description = "SQLite (id-based) + FTS5 store, migrations, snapshot/quiesce."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
