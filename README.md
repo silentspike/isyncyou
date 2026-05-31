@@ -1,20 +1,20 @@
 # iSyncYou
 
-> *I sync you.* — Persönlicher Cloud-Sync-Client + Microsoft-365-Backup/Archiv (Personal/Family) für Linux, in Rust.
+> *I sync you.* — Personal cloud sync client + Microsoft 365 backup & archive (personal/family) for Linux, written in Rust.
 
-**Status:** Pre-Implementation (SDD steht). **Privat bis RC.**
+**Status:** Pre-implementation (SDD complete). **Private until RC.**
 
-## Was
+## What it is
 
-- **Sync-Client (bidirektional):** OneDrive 1:1, Linux-Desktop (KDE-first), Tray + Mini-Statusbar.
-- **Backup/Archiv:** Mail, Kalender, Kontakte, ToDo, OneNote — durchsuchbar, mit High-Fidelity-Restore.
-- **Vollsteuerung im Browser** (lokale Web-UI vom Daemon); native Statusbar via eigenem Renderer.
+- **Sync client (bidirectional):** OneDrive 1:1, Linux desktop (KDE-first), tray + mini status bar.
+- **Backup / archive:** Mail, Calendar, Contacts, ToDo, OneNote — searchable, with high-fidelity restore.
+- **Full control in the browser** (local web UI served by the daemon); native status bar via our own renderer.
 
-## Architektur (Kurz)
+## Architecture (short)
 
-- `m365d`-Daemon (graph/sync/store) · `m365ctl` (CLI) · Mini-Statusbar (eigener Renderer) · Web-UI (Browser).
-- Personal/Family-Konten via Microsoft Graph. Stateful, id-basiert. SQLite + FTS5.
+- `daemon` (graph / sync / store) · `cli` · mini status bar (own renderer) · web UI (browser).
+- Personal/family accounts via Microsoft Graph. Stateful, id-based. SQLite + FTS5.
 
-## Lizenz
+## License
 
 Apache-2.0.
