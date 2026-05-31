@@ -42,7 +42,7 @@ jobs:
 
       - name: Publish RC prerelease (on push to main)
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v0.1.0-rc.${{ github.run_number }}
           name: iSyncYou v0.1.0-rc.${{ github.run_number }}
@@ -53,7 +53,7 @@ jobs:
 
       - name: Publish release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
