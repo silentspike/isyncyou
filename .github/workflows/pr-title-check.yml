@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   conventional:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/github-script@v7
         with:
