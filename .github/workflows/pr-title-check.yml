@@ -1,0 +1,24 @@
+name: PR Title Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            const re = /^(feat|fix|docs|refactor|perf|test|build|ci|chore|deps|spike)(\([^)]+\))?!?:\s.+/;
+            if (!re.test(title)) {
+              core.setFailed(
+                'PR title must follow Conventional Commits, e.g. "feat(graph): add delta cursor".\n' +
+                'Allowed types: feat, fix, docs, refactor, perf, test, build, ci, chore, deps, spike'
+              );
+            }

@@ -1,0 +1,30 @@
+name: Dependabot auto-merge
+
+# Automation: enable auto-merge for Dependabot PRs so they merge once the
+# branch's required checks pass (keeps deps current without manual work).
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const q = `mutation($id: ID!) {
+              enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: SQUASH }) {
+                pullRequest { number }
+              }
+            }`;
+            try {
+              await github.graphql(q, { id: pr.node_id });
+              core.info(`auto-merge enabled for #${pr.number}`);
+            } catch (e) {
+              core.warning(`could not enable auto-merge: ${e.message}`);
+            }
