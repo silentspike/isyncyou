@@ -53,8 +53,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-deny (cached in runner home)
-        run: command -v cargo-deny >/dev/null || cargo install cargo-deny --locked
+      - name: Install cargo-deny (prebuilt)
+        run: |
+          if ! cargo deny --version >/dev/null 2>&1; then
+            ver=0.19.8
+            tmp=$(mktemp -d)
+            curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C "$tmp"
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
+            install -m0755 "$tmp"/*/cargo-deny "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-deny"
+          fi
       - run: cargo deny check
 
   docs:
