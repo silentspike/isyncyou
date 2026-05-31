@@ -58,10 +58,8 @@ jobs:
     needs: [fmt, clippy, test, deny]
     runs-on: ubuntu-latest
     steps:
-      - name: Verify all jobs passed
-        run: |
-          if echo '${{ join(needs.*.result, ",") }}' | grep -qE 'failure|cancelled'; then
-            echo "One or more required jobs failed."
-            exit 1
-          fi
-          echo "All required jobs passed."
+      - name: Fail if any required job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: All required jobs passed
+        run: echo "All required jobs passed."
