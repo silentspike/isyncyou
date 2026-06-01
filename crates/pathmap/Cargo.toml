@@ -8,3 +8,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = { workspace = true }
