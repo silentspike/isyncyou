@@ -2,8 +2,13 @@
 //! guards, recovery, scheduling). Pure, deterministic building blocks layered on
 //! top of `store`, `pathmap` and `graph`.
 //!
-//! This module currently provides the per-item [`sync_state`] automaton.
+//! Currently: the per-item [`sync_state`] automaton and the [`conflict`] engine.
 
+pub mod conflict;
 pub mod sync_state;
 
+pub use conflict::{
+    classify, compare_versions, conflict_copy_name, resolve, Change, ConflictKind, ConflictPolicy,
+    Resolution, Versus,
+};
 pub use sync_state::{SyncEvent, SyncState};
