@@ -1,11 +1,40 @@
-//! `isyncyou-graph` — Microsoft Graph: OAuth (PKCE/device-code), delta, throttle/429, upload sessions, immutable-id policy.
+//! `isyncyou-graph` — Microsoft Graph transport core.
 //!
-//! Phase 0 skeleton: structure only, no implementation yet.
+//! This module holds the **pure, network-independent** building blocks of the
+//! Graph client so they can be unit-tested deterministically:
+//!
+//! - [`error`] — classify an HTTP status into a [`GraphAction`] (retry / refresh
+//!   auth / resync / precondition-failed / …).
+//! - [`throttle`] — an adaptive [`Pacer`] implementing the project rule: no
+//!   artificial limit (full speed) until a `429`, then honor `Retry-After`,
+//!   back off, probe, and decay back to full speed.
+//! - [`upload`] — [`UploadSession`] chunk planning for large OneDrive uploads
+//!   (320 KiB-aligned chunks, `< 60 MiB`, `nextExpectedRanges` resume).
+//!
+//! OAuth (Auth-Code+PKCE / device-code) and the live HTTP client are layered on
+//! top of these and exercised against the test account separately.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        assert_eq!(2 + 2, 4);
+pub mod error;
+pub mod throttle;
+pub mod upload;
+
+pub use error::{classify, GraphAction};
+pub use throttle::{Outcome, Pacer};
+pub use upload::{ChunkPlan, UploadSession};
+
+/// An opaque Microsoft Graph delta token. Never construct or parse the inner
+/// value — it is only ever round-tripped through the store and back to Graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaCursor(String);
+
+impl DeltaCursor {
+    pub fn new(token: impl Into<String>) -> Self {
+        DeltaCursor(token.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
