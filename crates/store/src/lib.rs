@@ -1,11 +1,493 @@
-//! `isyncyou-store` — SQLite (id-based) + FTS5 store, migrations, snapshot/quiesce.
+//! `isyncyou-store` — id-based SQLite store with FTS5, migrations and a
+//! single-instance lock.
 //!
-//! Phase 0 skeleton: structure only, no implementation yet.
+//! Everything is tracked by stable id (`(account_id, service, remote_id)`), never
+//! by path, so moves/renames don't lose identity. Delta cursors are persisted per
+//! `(account, service, scope)` so incremental sync survives restarts. File names
+//! are full-text indexed via an external-content FTS5 table kept in sync by
+//! triggers.
+//!
+//! WAL journaling + a `<db>.lock` advisory lock (single writer per store) protect
+//! against corruption from concurrent daemons.
+
+use fs2::FileExt;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::fs::{File, OpenOptions};
+use std::path::Path;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("another instance already holds the store lock at {0}")]
+    AlreadyRunning(String),
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Current schema version. Bump + add a migration step when the schema changes.
+pub const SCHEMA_VERSION: i64 = 1;
+
+const MIGRATION_V1: &str = r#"
+CREATE TABLE items (
+    id                INTEGER PRIMARY KEY,
+    account_id        TEXT NOT NULL,
+    service           TEXT NOT NULL,
+    remote_id         TEXT NOT NULL,
+    parent_remote_id  TEXT,
+    name              TEXT NOT NULL,
+    local_path        TEXT,
+    item_type         TEXT NOT NULL,            -- 'file' | 'folder'
+    etag              TEXT,
+    ctag              TEXT,
+    quickxorhash      TEXT,
+    size              INTEGER,
+    remote_mtime      TEXT,
+    sync_state        TEXT NOT NULL DEFAULT 'clean',
+    deleted_at        TEXT,
+    UNIQUE(account_id, service, remote_id)
+);
+CREATE INDEX idx_items_parent ON items(account_id, service, parent_remote_id);
+
+CREATE TABLE delta_state (
+    account_id  TEXT NOT NULL,
+    service     TEXT NOT NULL,
+    scope       TEXT NOT NULL DEFAULT '',       -- folder/calendar id; '' = whole service
+    cursor      TEXT NOT NULL,
+    generation  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (account_id, service, scope)
+);
+
+-- External-content FTS5 over file names, kept in sync by triggers.
+CREATE VIRTUAL TABLE items_fts USING fts5(
+    name,
+    content='items',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts(rowid, name) VALUES (new.id, new.name);
+END;
+CREATE TRIGGER items_ad AFTER DELETE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, name) VALUES ('delete', old.id, old.name);
+END;
+CREATE TRIGGER items_au AFTER UPDATE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, name) VALUES ('delete', old.id, old.name);
+    INSERT INTO items_fts(rowid, name) VALUES (new.id, new.name);
+END;
+"#;
+
+/// A tracked item, keyed by `(account_id, service, remote_id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    pub account_id: String,
+    pub service: String,
+    pub remote_id: String,
+    pub parent_remote_id: Option<String>,
+    pub name: String,
+    pub local_path: Option<String>,
+    pub item_type: String,
+    pub etag: Option<String>,
+    pub ctag: Option<String>,
+    pub quickxorhash: Option<String>,
+    pub size: Option<i64>,
+    pub remote_mtime: Option<String>,
+    pub sync_state: String,
+    pub deleted_at: Option<String>,
+}
+
+impl Item {
+    /// Minimal constructor with sensible defaults (`sync_state = "clean"`).
+    pub fn new(
+        account_id: impl Into<String>,
+        service: impl Into<String>,
+        remote_id: impl Into<String>,
+        name: impl Into<String>,
+        item_type: impl Into<String>,
+    ) -> Self {
+        Item {
+            account_id: account_id.into(),
+            service: service.into(),
+            remote_id: remote_id.into(),
+            parent_remote_id: None,
+            name: name.into(),
+            local_path: None,
+            item_type: item_type.into(),
+            etag: None,
+            ctag: None,
+            quickxorhash: None,
+            size: None,
+            remote_mtime: None,
+            sync_state: "clean".into(),
+            deleted_at: None,
+        }
+    }
+}
+
+/// The store. Holds the DB connection and (for on-disk stores) the instance lock.
+pub struct Store {
+    conn: Connection,
+    _lock: Option<File>,
+}
+
+impl Store {
+    /// Open (or create) an on-disk store. Acquires an exclusive `<path>.lock`;
+    /// returns [`StoreError::AlreadyRunning`] if another instance holds it.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let lock = Self::acquire_lock(path)?;
+        let conn = Connection::open(path)?;
+        Self::init(&conn)?;
+        Ok(Store {
+            conn,
+            _lock: Some(lock),
+        })
+    }
+
+    /// In-memory store for tests (no lock, no WAL).
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(&conn)?;
+        Ok(Store { conn, _lock: None })
+    }
+
+    fn acquire_lock(path: &Path) -> Result<File> {
+        let lock_path = format!("{}.lock", path.display());
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        f.try_lock_exclusive()
+            .map_err(|_| StoreError::AlreadyRunning(lock_path.clone()))?;
+        Ok(f)
+    }
+
+    fn init(conn: &Connection) -> Result<()> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        migrate(conn)?;
+        Ok(())
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+
+    /// Insert or update an item (by `(account, service, remote_id)`). FTS stays in
+    /// sync via triggers.
+    pub fn upsert_item(&self, it: &Item) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO items
+                 (account_id, service, remote_id, parent_remote_id, name, local_path,
+                  item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+               ON CONFLICT(account_id, service, remote_id) DO UPDATE SET
+                 parent_remote_id = excluded.parent_remote_id,
+                 name             = excluded.name,
+                 local_path       = excluded.local_path,
+                 item_type        = excluded.item_type,
+                 etag             = excluded.etag,
+                 ctag             = excluded.ctag,
+                 quickxorhash     = excluded.quickxorhash,
+                 size             = excluded.size,
+                 remote_mtime     = excluded.remote_mtime,
+                 sync_state       = excluded.sync_state,
+                 deleted_at       = excluded.deleted_at"#,
+            params![
+                it.account_id,
+                it.service,
+                it.remote_id,
+                it.parent_remote_id,
+                it.name,
+                it.local_path,
+                it.item_type,
+                it.etag,
+                it.ctag,
+                it.quickxorhash,
+                it.size,
+                it.remote_mtime,
+                it.sync_state,
+                it.deleted_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_item(&self, account: &str, service: &str, remote_id: &str) -> Result<Option<Item>> {
+        let it = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {COLS} FROM items WHERE account_id=?1 AND service=?2 AND remote_id=?3"
+                ),
+                params![account, service, remote_id],
+                row_to_item,
+            )
+            .optional()?;
+        Ok(it)
+    }
+
+    /// Direct children of a parent (`None` parent = service root). Excludes tombstones.
+    pub fn children(
+        &self,
+        account: &str,
+        service: &str,
+        parent: Option<&str>,
+    ) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL
+               AND parent_remote_id IS ?3
+             ORDER BY name"
+        ))?;
+        let rows = stmt.query_map(params![account, service, parent], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark an item as a tombstone (sets `deleted_at`, `sync_state='deleted'`).
+    pub fn mark_deleted(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        when: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE items SET deleted_at=?4, sync_state='deleted'
+             WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, when],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Persist a delta cursor, bumping its generation. Tokens are stored opaque.
+    pub fn set_delta_cursor(
+        &self,
+        account: &str,
+        service: &str,
+        scope: &str,
+        cursor: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO delta_state (account_id, service, scope, cursor, generation)
+             VALUES (?1,?2,?3,?4,1)
+             ON CONFLICT(account_id, service, scope) DO UPDATE SET
+               cursor = excluded.cursor,
+               generation = delta_state.generation + 1",
+            params![account, service, scope, cursor],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_delta_cursor(
+        &self,
+        account: &str,
+        service: &str,
+        scope: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT cursor FROM delta_state WHERE account_id=?1 AND service=?2 AND scope=?3",
+                params![account, service, scope],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn delta_generation(
+        &self,
+        account: &str,
+        service: &str,
+        scope: &str,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT generation FROM delta_state WHERE account_id=?1 AND service=?2 AND scope=?3",
+                params![account, service, scope],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Full-text search over file names within an account (FTS5 MATCH).
+    pub fn search_names(&self, account: &str, query: &str) -> Result<Vec<Item>> {
+        let cols_q = COLS
+            .split(", ")
+            .map(|c| format!("items.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {cols_q} FROM items
+             JOIN items_fts ON items_fts.rowid = items.id
+             WHERE items.account_id=?1 AND items.deleted_at IS NULL AND items_fts MATCH ?2
+             ORDER BY rank"
+        ))?;
+        let rows = stmt.query_map(params![account, query], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
+                    item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at";
+
+fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
+    Ok(Item {
+        account_id: r.get(0)?,
+        service: r.get(1)?,
+        remote_id: r.get(2)?,
+        parent_remote_id: r.get(3)?,
+        name: r.get(4)?,
+        local_path: r.get(5)?,
+        item_type: r.get(6)?,
+        etag: r.get(7)?,
+        ctag: r.get(8)?,
+        quickxorhash: r.get(9)?,
+        size: r.get(10)?,
+        remote_mtime: r.get(11)?,
+        sync_state: r.get(12)?,
+        deleted_at: r.get(13)?,
+    })
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
+    let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if v < 1 {
+        conn.execute_batch(MIGRATION_V1)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn item(acc: &str, id: &str, name: &str) -> Item {
+        Item::new(acc, "onedrive", id, name, "file")
+    }
+
     #[test]
-    fn smoke() {
-        assert_eq!(2 + 2, 4);
+    fn migrates_to_current_version() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upsert_then_get_roundtrips() {
+        let s = Store::open_in_memory().unwrap();
+        let mut it = item("a", "r1", "Photo.jpg");
+        it.quickxorhash = Some("abc=".into());
+        it.size = Some(1234);
+        s.upsert_item(&it).unwrap();
+        assert_eq!(s.get_item("a", "onedrive", "r1").unwrap(), Some(it));
+        assert_eq!(s.get_item("a", "onedrive", "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn upsert_updates_in_place() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_item(&item("a", "r1", "old.txt")).unwrap();
+        let mut changed = item("a", "r1", "new.txt");
+        changed.etag = Some("e2".into());
+        s.upsert_item(&changed).unwrap();
+        let got = s.get_item("a", "onedrive", "r1").unwrap().unwrap();
+        assert_eq!(got.name, "new.txt");
+        assert_eq!(got.etag.as_deref(), Some("e2"));
+        // still a single row
+        assert_eq!(s.search_names("a", "new").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn children_by_parent_excludes_tombstones() {
+        let s = Store::open_in_memory().unwrap();
+        let mut c1 = item("a", "c1", "b.txt");
+        c1.parent_remote_id = Some("root".into());
+        let mut c2 = item("a", "c2", "a.txt");
+        c2.parent_remote_id = Some("root".into());
+        s.upsert_item(&c1).unwrap();
+        s.upsert_item(&c2).unwrap();
+        let kids = s.children("a", "onedrive", Some("root")).unwrap();
+        assert_eq!(
+            kids.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["a.txt", "b.txt"]
+        );
+        s.mark_deleted("a", "onedrive", "c1", "2026-06-02T00:00:00Z")
+            .unwrap();
+        assert_eq!(s.children("a", "onedrive", Some("root")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delta_cursor_persists_and_bumps_generation() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.get_delta_cursor("a", "onedrive", "").unwrap(), None);
+        s.set_delta_cursor("a", "onedrive", "", "TOKEN1").unwrap();
+        assert_eq!(
+            s.get_delta_cursor("a", "onedrive", "").unwrap().as_deref(),
+            Some("TOKEN1")
+        );
+        assert_eq!(s.delta_generation("a", "onedrive", "").unwrap(), Some(1));
+        s.set_delta_cursor("a", "onedrive", "", "TOKEN2").unwrap();
+        assert_eq!(
+            s.get_delta_cursor("a", "onedrive", "").unwrap().as_deref(),
+            Some("TOKEN2")
+        );
+        assert_eq!(s.delta_generation("a", "onedrive", "").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn fts_search_matches_names_and_respects_account() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_item(&item("a", "r1", "vacation report.txt"))
+            .unwrap();
+        s.upsert_item(&item("a", "r2", "invoice.pdf")).unwrap();
+        s.upsert_item(&item("b", "r3", "report card.txt")).unwrap();
+        let hits = s.search_names("a", "report").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].remote_id, "r1");
+        // diacritics-insensitive tokenizer
+        s.upsert_item(&item("a", "r4", "Lebenslauf.pdf")).unwrap();
+        assert_eq!(s.search_names("a", "lebenslauf").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.upsert_item(&item("a", "r1", "keep.txt")).unwrap();
+            s.set_delta_cursor("a", "onedrive", "", "CUR").unwrap();
+        } // drop -> releases lock
+        let s2 = Store::open(&path).unwrap();
+        assert_eq!(
+            s2.get_item("a", "onedrive", "r1").unwrap().unwrap().name,
+            "keep.txt"
+        );
+        assert_eq!(
+            s2.get_delta_cursor("a", "onedrive", "").unwrap().as_deref(),
+            Some("CUR")
+        );
+    }
+
+    #[test]
+    fn single_instance_lock_blocks_second_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let _s = Store::open(&path).unwrap();
+        match Store::open(&path) {
+            Err(StoreError::AlreadyRunning(_)) => {}
+            Err(e) => panic!("expected AlreadyRunning, got {e:?}"),
+            Ok(_) => panic!("expected AlreadyRunning, got a second store"),
+        }
     }
 }
