@@ -1,11 +1,9 @@
-//! `isyncyou-core` — Job model, scheduler, sync-state machine, conflict engine, config, self-check.
+//! `isyncyou-core` — engine core logic (sync-state machine, conflict engine,
+//! guards, recovery, scheduling). Pure, deterministic building blocks layered on
+//! top of `store`, `pathmap` and `graph`.
 //!
-//! Phase 0 skeleton: structure only, no implementation yet.
+//! This module currently provides the per-item [`sync_state`] automaton.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod sync_state;
+
+pub use sync_state::{SyncEvent, SyncState};
