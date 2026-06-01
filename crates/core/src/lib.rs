@@ -5,10 +5,12 @@
 //! Currently: the per-item [`sync_state`] automaton and the [`conflict`] engine.
 
 pub mod conflict;
+pub mod guard;
 pub mod sync_state;
 
 pub use conflict::{
     classify, compare_versions, conflict_copy_name, resolve, Change, ConflictKind, ConflictPolicy,
     Resolution, Versus,
 };
+pub use guard::{DeleteGuard, Direction, GuardVerdict};
 pub use sync_state::{SyncEvent, SyncState};
