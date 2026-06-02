@@ -18,6 +18,7 @@
 //! cached token (from `login`) is loaded and auto-refreshed.
 
 use clap::{Parser, Subcommand};
+use isyncyou_core::guard::{DeleteGuard, Direction, GuardVerdict};
 use isyncyou_core::{AccountConfig, Config};
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::Store;
@@ -596,12 +597,15 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
 
     // Materialize the ingested changes to disk: write new/changed files into the
     // account's sync root (the remote→local half that makes files actually appear).
-    let sync_root = cfg
+    let acc = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
-        .map(|a| a.sync_root.clone())
         .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let sync_root = acc.sync_root.clone();
+    let trash_root = acc.archive_root.join(".isyncyou-trash");
+    let dg = cfg.sync.delete_guard.clone();
+
     let mat = connectors::materialize_downloads(&store, &client, account, &sync_root)
         .map_err(|e| e.to_string())?;
     println!(
@@ -611,6 +615,42 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
         mat.failed,
         sync_root.display()
     );
+
+    // Mirror remote deletions locally — move removed files into the trash (kept
+    // outside the sync root), but only after the mass-delete guard approves the
+    // batch, so a runaway remote wipe can't silently empty the local folder.
+    let pending = connectors::pending_local_deletes(&store, account, &sync_root)
+        .map_err(|e| e.to_string())?;
+    if !pending.is_empty() {
+        let guard = DeleteGuard {
+            max_absolute: dg.max_absolute,
+            max_fraction: dg.max_fraction,
+            fraction_min_total: dg.fraction_min_total,
+        };
+        let remaining = store
+            .count_by_service(account, "onedrive")
+            .map_err(|e| e.to_string())? as usize;
+        match guard.evaluate(
+            pending.len(),
+            remaining + pending.len(),
+            Direction::CloudToLocal,
+        ) {
+            GuardVerdict::Block { reason } => {
+                println!(
+                    "delete guard held back {} local deletion(s): {reason}",
+                    pending.len()
+                );
+            }
+            GuardVerdict::Proceed => {
+                let n = connectors::apply_local_deletes(&sync_root, &trash_root, &pending)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "removed {n} local item(s) (moved to {})",
+                    trash_root.display()
+                );
+            }
+        }
+    }
     Ok(())
 }
 

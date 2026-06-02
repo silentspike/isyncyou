@@ -429,6 +429,19 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// **Every** item of a service, including tombstones (`deleted_at` set). Used
+    /// by local-delete materialization, which must both find tombstoned items and
+    /// walk their (possibly also-deleted) ancestor chain to rebuild local paths.
+    pub fn all_items_by_service(&self, account: &str, service: &str) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND service=?2
+             ORDER BY item_type, name"
+        ))?;
+        let rows = stmt.query_map(params![account, service], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Set an item's `sync_state` (e.g. mark a downloaded item `clean`). Returns
     /// whether a row matched.
     pub fn set_sync_state(
