@@ -1,11 +1,10 @@
-//! `isyncyou-change-source` — Pluggable change detection: inotify (desktop) | eBPF/fanotify (server) + periodic reconciler.
+//! `isyncyou-change-source` — pluggable change detection.
 //!
-//! Phase 0 skeleton: structure only, no implementation yet.
+//! Filesystem events (inotify on the desktop, eBPF/fanotify on the server) are an
+//! accelerator; the [`reconcile`] periodic diff is the source of truth. This crate
+//! currently provides that authoritative reconciler; the event watchers are added
+//! behind the same interface.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod reconcile;
+
+pub use reconcile::{reconcile, Entry, ReconcileChange};
