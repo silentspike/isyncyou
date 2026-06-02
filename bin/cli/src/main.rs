@@ -69,10 +69,28 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
+    /// Restore one archived item back to the cloud (re-create via Graph).
+    Restore {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// One of mail|calendar|contacts|todo.
+        #[arg(long)]
+        service: String,
+        /// The archived item's `remote_id`.
+        #[arg(long)]
+        id: String,
+        /// Graph **write** access token (Mail/Calendars/Contacts/Tasks.ReadWrite).
+        #[arg(long, env = "ISYNCYOU_TOKEN")]
+        token: Option<String>,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
 const SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
+/// Services with a restore path (OneNote pages can't be re-created via a simple POST).
+const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo"];
 
 fn main() {
     let cli = Cli::parse();
@@ -102,6 +120,13 @@ fn run(command: Command) -> Result<(), String> {
         } => cmd_backup(
             &config, &account, service, body_limit, &cal_start, &cal_end, token,
         ),
+        Command::Restore {
+            config,
+            account,
+            service,
+            id,
+            token,
+        } => cmd_restore(&config, &account, &service, &id, token),
     }
 }
 
@@ -318,6 +343,65 @@ fn cmd_backup(
     Ok(())
 }
 
+fn cmd_restore(
+    config: &Path,
+    account: &str,
+    service: &str,
+    id: &str,
+    token: Option<String>,
+) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    if !RESTORE_SERVICES.contains(&service) {
+        return Err(format!(
+            "service '{service}' has no restore path (expected one of {})",
+            RESTORE_SERVICES.join("|")
+        ));
+    }
+    let token = token.ok_or("no access token (pass --token or set ISYNCYOU_TOKEN)")?;
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let archive_root = acc.archive_root.clone();
+    let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
+
+    let item = store
+        .get_item(account, service, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no archived {service} item '{id}' for account '{account}'"))?;
+    let rel = item
+        .local_path
+        .as_deref()
+        .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
+    let path = archive_root.join(rel);
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+
+    let client = isyncyou_graph::GraphClient::new(token);
+    let new_id = match service {
+        "mail" => connectors::restore_message(&client, &bytes)?,
+        "calendar" => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            connectors::restore_event(&client, &v)?
+        }
+        "contacts" => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            connectors::restore_contact(&client, &v)?
+        }
+        "todo" => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let list = item
+                .parent_remote_id
+                .as_deref()
+                .ok_or("archived task has no parent list id")?;
+            connectors::restore_task(&client, list, &v)?
+        }
+        _ => unreachable!("validated against RESTORE_SERVICES"),
+    };
+    println!("restored {service} item '{id}' as '{new_id}'");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +523,81 @@ mod tests {
     #[test]
     fn backup_requires_account() {
         assert!(parse(&["isyncyou", "backup", "--token", "T"]).is_err());
+    }
+
+    #[test]
+    fn parses_restore() {
+        let c = parse(&[
+            "isyncyou",
+            "restore",
+            "--account",
+            "a",
+            "--service",
+            "mail",
+            "--id",
+            "M1",
+            "--token",
+            "T",
+        ])
+        .unwrap();
+        assert_eq!(
+            c.command,
+            Command::Restore {
+                config: "isyncyou.toml".into(),
+                account: "a".into(),
+                service: "mail".into(),
+                id: "M1".into(),
+                token: Some("T".into()),
+            }
+        );
+    }
+
+    /// Writes a minimal one-account config whose archive_root is `arch`.
+    fn write_config(dir: &std::path::Path, arch: &std::path::Path) -> PathBuf {
+        let p = dir.join("c.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[[accounts]]\nid=\"a\"\nusername=\"a@outlook.com\"\nsync_root=\"{}/od\"\narchive_root=\"{}\"\n",
+                dir.display(),
+                arch.display()
+            ),
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn restore_rejects_unknown_service() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-rs1-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        let err = cmd_restore(&p, "a", "onenote", "x", Some("T".into())).unwrap_err();
+        assert!(err.contains("no restore path"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_errors_when_item_has_no_archived_body() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-rs2-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a", "calendar", "e1", "Ev", "event",
+                ))
+                .unwrap();
+        } // drop -> release the store lock before cmd_restore reopens it
+        let err = cmd_restore(&p, "a", "calendar", "e1", Some("T".into())).unwrap_err();
+        assert!(err.contains("no archived body"), "got: {err}");
+        // a missing id is reported distinctly
+        let err2 = cmd_restore(&p, "a", "calendar", "missing", Some("T".into())).unwrap_err();
+        assert!(err2.contains("no archived calendar item"), "got: {err2}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
