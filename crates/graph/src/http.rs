@@ -201,6 +201,39 @@ impl GraphClient {
         Err(UploadError::Incomplete)
     }
 
+    /// Replace an item's content **only if** its `etag` still matches, so a
+    /// concurrent cloud change is never silently overwritten (plan A3). Returns
+    /// the updated drive item on success, or `None` on `412 Precondition Failed`
+    /// (the cloud changed since we last saw it — a conflict to resolve, not clobber).
+    pub fn replace_content_if_match(
+        &self,
+        item_id: &str,
+        data: &[u8],
+        etag: &str,
+    ) -> Result<Option<serde_json::Value>, UploadError> {
+        let url = format!("{GRAPH}/me/drive/items/{item_id}/content");
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::IF_MATCH, etag)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 201 => Ok(Some(
+                resp.json::<serde_json::Value>()
+                    .map_err(|e| UploadError::Parse(e.to_string()))?,
+            )),
+            412 => Ok(None),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            }),
+        }
+    }
+
     /// Delete a drive item by id (used for test cleanup on the throwaway account).
     pub fn delete_item(&self, item_id: &str) -> Result<(), UploadError> {
         let url = format!("{GRAPH}/me/drive/items/{item_id}");
