@@ -95,6 +95,16 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
+    /// Move an account's archive directory to a new location (no re-download).
+    Migrate {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// Destination archive root (must be empty or not yet exist).
+        #[arg(long)]
+        new_archive_root: PathBuf,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
@@ -142,6 +152,11 @@ fn run(command: Command) -> Result<(), String> {
             id,
             token,
         } => cmd_restore(&config, &account, &service, &id, token),
+        Command::Migrate {
+            config,
+            account,
+            new_archive_root,
+        } => cmd_migrate(&config, &account, &new_archive_root),
     }
 }
 
@@ -446,6 +461,87 @@ fn cmd_restore(
     Ok(())
 }
 
+/// Recursively copy `src` into `dst` (used as the cross-filesystem fallback).
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Move `old` to `new`: a same-filesystem rename, else copy + remove.
+fn move_dir(old: &Path, new: &Path) -> Result<(), String> {
+    if let Some(parent) = new.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // An empty destination dir is fine; remove it so rename can take the name.
+    if new.exists() {
+        std::fs::remove_dir(new).map_err(|e| {
+            format!(
+                "destination {} must be an empty directory: {e}",
+                new.display()
+            )
+        })?;
+    }
+    if std::fs::rename(old, new).is_ok() {
+        return Ok(());
+    }
+    // Cross-device or other rename failure: copy then remove the original.
+    copy_dir_all(old, new)?;
+    std::fs::remove_dir_all(old).map_err(|e| e.to_string())
+}
+
+fn cmd_migrate(config: &Path, account: &str, new_root: &Path) -> Result<(), String> {
+    let mut cfg = load_config(config)?;
+    let old = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?
+        .archive_root
+        .clone();
+    let new = new_root.to_path_buf();
+
+    if new == old {
+        return Err("new archive root equals the current one".into());
+    }
+    if new.starts_with(&old) {
+        return Err("new archive root must not be inside the current one".into());
+    }
+    if !old.exists() {
+        return Err(format!(
+            "current archive root {} does not exist",
+            old.display()
+        ));
+    }
+    if new.exists() && new.read_dir().map_err(|e| e.to_string())?.next().is_some() {
+        return Err(format!("destination {} is not empty", new.display()));
+    }
+
+    move_dir(&old, &new)?;
+
+    // local_path is relative to archive_root, so only the config needs updating.
+    for a in &mut cfg.accounts {
+        if a.id == account {
+            a.archive_root = new.clone();
+        }
+    }
+    cfg.save(config)?;
+    println!(
+        "migrated account '{account}' archive: {} -> {}",
+        old.display(),
+        new.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +787,78 @@ mod tests {
         // a missing id is reported distinctly
         let err2 = cmd_restore(&p, "a", "calendar", "missing", Some("T".into())).unwrap_err();
         assert!(err2.contains("no archived calendar item"), "got: {err2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_migrate() {
+        let c = parse(&[
+            "isyncyou",
+            "migrate",
+            "--account",
+            "a",
+            "--new-archive-root",
+            "/data/new",
+        ])
+        .unwrap();
+        assert_eq!(
+            c.command,
+            Command::Migrate {
+                config: "isyncyou.toml".into(),
+                account: "a".into(),
+                new_archive_root: "/data/new".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn migrate_moves_archive_and_updates_config() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-mig-a-{}", std::process::id()));
+        let old = dir.join("old");
+        let new = dir.join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        let p = write_config(&dir, &old);
+        {
+            let store = Store::open(old.join(".isyncyou-store.db")).unwrap();
+            let mut it = isyncyou_store::Item::new("a", "mail", "m1", "Hi", "message");
+            it.local_path = Some("mail/aa/bb/x.eml".into());
+            store.upsert_item(&it).unwrap();
+        }
+        let body = old.join("mail/aa/bb");
+        std::fs::create_dir_all(&body).unwrap();
+        std::fs::write(body.join("x.eml"), b"From: a\r\n").unwrap();
+
+        cmd_migrate(&p, "a", &new).unwrap();
+
+        assert!(!old.exists(), "old archive removed");
+        assert!(new.join(".isyncyou-store.db").exists());
+        assert!(new.join("mail/aa/bb/x.eml").exists());
+        // config now points at the new root
+        let cfg = load_config(&p).unwrap();
+        assert_eq!(cfg.accounts[0].archive_root, new);
+        // store reopens at the new root and the relative body still resolves
+        let store = Store::open(new.join(".isyncyou-store.db")).unwrap();
+        let it = store.get_item("a", "mail", "m1").unwrap().unwrap();
+        assert!(new.join(it.local_path.unwrap()).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_rejects_bad_targets() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-mig-b-{}", std::process::id()));
+        let old = dir.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        let p = write_config(&dir, &old);
+        assert!(cmd_migrate(&p, "a", &old).unwrap_err().contains("equals"));
+        assert!(cmd_migrate(&p, "a", &old.join("sub"))
+            .unwrap_err()
+            .contains("inside"));
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("f"), b"x").unwrap();
+        assert!(cmd_migrate(&p, "a", &other)
+            .unwrap_err()
+            .contains("not empty"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
