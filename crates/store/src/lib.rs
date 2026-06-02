@@ -28,7 +28,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE items (
@@ -76,6 +76,38 @@ END;
 CREATE TRIGGER items_au AFTER UPDATE ON items BEGIN
     INSERT INTO items_fts(items_fts, rowid, name) VALUES ('delete', old.id, old.name);
     INSERT INTO items_fts(rowid, name) VALUES (new.id, new.name);
+END;
+"#;
+
+/// Schema v2: a separate, optional body-text index (plan §9 — search must cover
+/// mail bodies, not just names). Kept out of `items` so the metadata table stays
+/// lean and the body index can be rebuilt or disabled independently. The
+/// `bodies_fts` external-content table mirrors `bodies` via triggers, exactly as
+/// `items_fts` mirrors `items`.
+const MIGRATION_V2: &str = r#"
+CREATE TABLE bodies (
+    id          INTEGER PRIMARY KEY,
+    account_id  TEXT NOT NULL,
+    service     TEXT NOT NULL,
+    remote_id   TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    UNIQUE(account_id, service, remote_id)
+);
+CREATE VIRTUAL TABLE bodies_fts USING fts5(
+    body,
+    content='bodies',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER bodies_ai AFTER INSERT ON bodies BEGIN
+    INSERT INTO bodies_fts(rowid, body) VALUES (new.id, new.body);
+END;
+CREATE TRIGGER bodies_ad AFTER DELETE ON bodies BEGIN
+    INSERT INTO bodies_fts(bodies_fts, rowid, body) VALUES ('delete', old.id, old.body);
+END;
+CREATE TRIGGER bodies_au AFTER UPDATE ON bodies BEGIN
+    INSERT INTO bodies_fts(bodies_fts, rowid, body) VALUES ('delete', old.id, old.body);
+    INSERT INTO bodies_fts(rowid, body) VALUES (new.id, new.body);
 END;
 "#;
 
@@ -394,6 +426,37 @@ impl Store {
         let rows = stmt.query_map(params![account, query], row_to_item)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Index (or re-index) an item's extracted body text for full-text search
+    /// (plan §9). Idempotent per `(account, service, remote_id)`.
+    pub fn index_body(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO bodies (account_id, service, remote_id, body)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id, service, remote_id) DO UPDATE SET body = excluded.body",
+            params![account, service, remote_id, body],
+        )?;
+        Ok(())
+    }
+
+    /// Full-text search over indexed bodies within an account. Returns matching
+    /// `(service, remote_id)` pairs, best-ranked first.
+    pub fn search_bodies(&self, account: &str, query: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.service, b.remote_id
+             FROM bodies_fts f JOIN bodies b ON b.id = f.rowid
+             WHERE bodies_fts MATCH ?2 AND b.account_id = ?1
+             ORDER BY rank",
+        )?;
+        let rows = stmt.query_map(params![account, query], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
@@ -422,8 +485,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if v < 1 {
         conn.execute_batch(MIGRATION_V1)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
+    if v < 2 {
+        conn.execute_batch(MIGRATION_V2)?;
+    }
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -501,6 +567,43 @@ mod tests {
             Some("TOKEN2")
         );
         assert_eq!(s.delta_generation("a", "onedrive", "").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn body_fts_indexes_searches_updates_and_scopes() {
+        let s = Store::open_in_memory().unwrap();
+        s.index_body(
+            "a",
+            "mail",
+            "m1",
+            "The quarterly invoice is attached, total 1200 EUR",
+        )
+        .unwrap();
+        s.index_body("a", "mail", "m2", "Lunch on Friday?").unwrap();
+        s.index_body("b", "mail", "m3", "invoice for the other account")
+            .unwrap();
+
+        // match by body content, account-scoped
+        let hits = s.search_bodies("a", "invoice").unwrap();
+        assert_eq!(hits, vec![("mail".to_string(), "m1".to_string())]);
+        // other account isolated
+        assert_eq!(
+            s.search_bodies("b", "invoice").unwrap(),
+            vec![("mail".to_string(), "m3".to_string())]
+        );
+        // diacritics-insensitive tokenizer
+        s.index_body("a", "calendar", "e1", "Geschäftsführung Meeting")
+            .unwrap();
+        assert_eq!(s.search_bodies("a", "geschaftsfuhrung").unwrap().len(), 1);
+
+        // re-index replaces (old terms gone, new terms found) — single row
+        s.index_body("a", "mail", "m1", "now about shipping logistics")
+            .unwrap();
+        assert!(s.search_bodies("a", "invoice").unwrap().is_empty());
+        assert_eq!(
+            s.search_bodies("a", "shipping").unwrap(),
+            vec![("mail".to_string(), "m1".to_string())]
+        );
     }
 
     #[test]
