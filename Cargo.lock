@@ -1336,6 +1336,7 @@ dependencies = [
  "isyncyou-change-source",
  "isyncyou-connectors",
  "isyncyou-core",
+ "isyncyou-dbus-status",
  "isyncyou-engine",
  "isyncyou-fuse",
  "isyncyou-graph",

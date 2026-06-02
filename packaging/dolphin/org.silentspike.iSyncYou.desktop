@@ -1,0 +1,25 @@
+[Desktop Entry]
+# KF6/Plasma 6 ServiceMenu (modern Type=Application form). NoDisplay keeps it out
+# of the application launcher; it only appears in Dolphin's right-click menu.
+# MimeType=all/all is the KDE pseudo-type for "every file and folder" — required so
+# the menu shows on any selection. (desktop-file-validate does not know this
+# KDE-specific pseudo-type and flags it; KDE's own service menus use it too.)
+Type=Application
+Name=iSyncYou
+Icon=folder-sync
+Exec=isyncyou dolphin-status %f
+MimeType=all/all;
+Actions=Status;OpenWindow;
+X-KDE-Submenu=iSyncYou
+X-KDE-Priority=TopLevel
+NoDisplay=true
+
+[Desktop Action Status]
+Name=Show sync status
+Icon=folder-sync
+Exec=isyncyou dolphin-status %f
+
+[Desktop Action OpenWindow]
+Name=Open iSyncYou status window
+Icon=folder-sync
+Exec=isyncyou-statusbar
