@@ -4,25 +4,31 @@
 //! These render **our own canonical Graph JSON** (calendar / contacts / todo /
 //! onenote) into a fixed HTML skeleton with every value HTML-escaped — so the
 //! output is safe *by construction*: no untrusted markup reaches the page, no
-//! scripts run, and nothing is fetched (no images, no links followed). A raw
-//! `.eml` (or any non-JSON body) is shown as escaped source, never rendered.
+//! scripts run, and nothing is fetched (no images, no links followed).
 //!
-//! The pages are meant to be served with [`VIEWER_CSP`] as a `Content-Security-
-//! Policy` header (the router does this), which is a second, independent layer:
-//! even if a value somehow carried markup, the browser would still load nothing.
+//! A mail message's own `text/html` body is rendered through an **allowlist
+//! sanitizer** ([`sanitize_mail_html`], over `ammonia`/`html5ever`): scripts,
+//! event handlers and embedded styles are dropped, and only `cid:`/`data:`/
+//! `mailto:` URLs survive, so remote images (tracking pixels) and `javascript:`
+//! links can't load. Any other raw body (or a plain-text mail) is shown as
+//! escaped source.
 //!
-//! A *rich* HTML mail renderer (parse + allowlist-sanitize the message's own
-//! `text/html` body) is deliberately out of scope here: doing it safely needs a
-//! battle-tested HTML-sanitizer dependency (e.g. `ammonia`/`html5ever`), an
-//! architectural addition to this otherwise dependency-light crate. Until then,
-//! mail is viewable as inert source via this viewer and as inert bytes via
-//! `/api/v1/body`.
+//! Every page is served with a `Content-Security-Policy` ([`VIEWER_CSP`] or
+//! [`MAIL_CSP`]) as both a response header and a `<meta>` — a second, independent
+//! layer: even if markup slipped through, the browser still loads nothing remote.
 
 use serde_json::Value;
 
 /// Strict CSP for a viewer page: load nothing, run nothing; only the inline
 /// stylesheet in the page itself is permitted.
 pub const VIEWER_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; \
+     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// CSP for the sanitized mail viewer: like [`VIEWER_CSP`] but allows **inline
+/// `data:` images** (which survive sanitization) while still blocking every
+/// remote fetch — so a tracking pixel can never load even if one slipped past
+/// the sanitizer.
+pub const MAIL_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; \
      base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// Cap on rendered raw-source length, so a pathological message can't produce a
@@ -55,20 +61,28 @@ h1{font-size:20px;margin:0 0 4px}\
 .v{flex:1;white-space:pre-wrap;word-break:break-word}\
 .body{margin-top:16px;padding:12px;background:#16171a;border-radius:6px;white-space:pre-wrap;word-break:break-word}\
 .src{margin-top:16px;padding:12px;background:#16171a;border-radius:6px;overflow:auto;white-space:pre-wrap;word-break:break-word}\
+.mail{margin-top:16px;padding:12px;background:#16171a;border-radius:6px;overflow:auto}\
+.mail img{max-width:100%}\
 .note{margin-top:16px;color:#9aa0a6;font-size:12px}";
 
-/// Wrap rendered inner HTML in a complete, self-contained, locked-down page.
-pub fn page(title: &str, inner: &str) -> String {
+/// Wrap rendered inner HTML in a complete, self-contained, locked-down page,
+/// embedding `csp` as a `<meta>` CSP (a second layer beside the response header).
+pub fn page_with_csp(title: &str, inner: &str, csp: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\
 <title>{title}</title><style>{style}</style></head>\
 <body><div class=\"wrap\">{inner}</div></body></html>",
-        csp = escape(VIEWER_CSP),
+        csp = escape(csp),
         title = escape(title),
         style = STYLE,
         inner = inner,
     )
+}
+
+/// Wrap rendered inner HTML in a locked-down page (strict [`VIEWER_CSP`]).
+pub fn page(title: &str, inner: &str) -> String {
+    page_with_csp(title, inner, VIEWER_CSP)
 }
 
 /// Render a header (title + kind label).
@@ -296,6 +310,35 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
     i
 }
 
+/// Sanitize a mail message's own `text/html` body into safe, inert markup.
+///
+/// Uses the `ammonia` allowlist sanitizer (battle-tested over `html5ever`):
+/// scripts, event handlers, `<iframe>`/`<object>`/`<style>` etc. are dropped, and
+/// — via the restricted scheme set — **only `cid:`/`data:`/`mailto:` URLs
+/// survive**, so remote images (tracking pixels), `javascript:` links, and remote
+/// stylesheets cannot load. Links keep their text but get `rel=noopener…`.
+pub fn sanitize_mail_html(raw: &str) -> String {
+    let schemes: std::collections::HashSet<&str> = ["cid", "data", "mailto"].into_iter().collect();
+    let mut b = ammonia::Builder::default();
+    b.url_schemes(schemes)
+        .link_rel(Some("noopener noreferrer nofollow"));
+    b.clean(raw).to_string()
+}
+
+/// Render a mail message's `text/html` body as a safe, CSP-locked page: the body
+/// is sanitized (above) and the page carries [`MAIL_CSP`] so even a slipped-past
+/// remote URL can't fetch. `subject` is shown escaped as the heading.
+pub fn mail_page(subject: &str, raw_html: &str) -> String {
+    let clean = sanitize_mail_html(raw_html);
+    let inner = format!(
+        "{header}<div class=\"note\">Sanitized view — scripts removed; external images \
+         and links are blocked. Use \u{201c}raw\u{201d} for the original source.</div>\
+<div class=\"mail\">{clean}</div>",
+        header = header("Mail", subject),
+    );
+    page_with_csp(subject, &inner, MAIL_CSP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +429,45 @@ mod tests {
         let p = page("T", "<p>x</p>");
         assert!(p.contains("Content-Security-Policy"));
         assert!(p.contains("default-src &#39;none&#39;"));
+    }
+
+    #[test]
+    fn sanitize_strips_scripts_and_blocks_remote_resources() {
+        let dirty = "<p>Hi</p><script>steal()</script>\
+<img src=\"https://tracker.example/p.gif\">\
+<a href=\"https://evil.test\" onclick=\"x()\">link</a>\
+<img src=\"data:image/png;base64,AAAA\">";
+        let clean = sanitize_mail_html(dirty);
+        assert!(clean.contains("<p>Hi</p>"), "safe markup lost: {clean}");
+        assert!(!clean.contains("steal"), "script body survived: {clean}");
+        assert!(
+            !clean.contains("onclick"),
+            "event handler survived: {clean}"
+        );
+        assert!(
+            !clean.contains("https://tracker"),
+            "remote img src survived: {clean}"
+        );
+        assert!(
+            !clean.contains("https://evil"),
+            "remote href survived: {clean}"
+        );
+        assert!(clean.contains("link"), "link text should remain: {clean}");
+        assert!(
+            clean.contains("data:image/png"),
+            "inline data image should survive: {clean}"
+        );
+    }
+
+    #[test]
+    fn mail_page_is_csp_locked_and_shows_escaped_subject() {
+        let p = mail_page("Hello <there>", "<p>body</p>");
+        assert!(
+            p.contains("Hello &lt;there&gt;"),
+            "subject not escaped: {p}"
+        );
+        assert!(p.contains("img-src data:"), "mail CSP missing: {p}");
+        assert!(p.contains("<p>body</p>"), "sanitized body missing");
+        assert!(!p.contains("<script"), "no scripts in a mail page");
     }
 }
