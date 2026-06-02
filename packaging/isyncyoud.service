@@ -1,0 +1,41 @@
+# iSyncYou engine daemon — systemd *user* service (plan §14).
+#
+# Install:
+#   install -m755 isyncyoud ~/.local/bin/
+#   mkdir -p ~/.config/isyncyou && cp isyncyou.toml.sample ~/.config/isyncyou/isyncyou.toml
+#   install -Dm644 isyncyoud.service ~/.config/systemd/user/isyncyoud.service
+#   # EDIT ReadWritePaths below to match your sync_root + archive_root, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now isyncyoud
+#
+# The web UI is then served on http://127.0.0.1:8765/.
+
+[Unit]
+Description=iSyncYou engine daemon (local web UI + backup/sync)
+Documentation=https://github.com/silentspike/isyncyou
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/isyncyoud --config %h/.config/isyncyou/isyncyou.toml
+Restart=on-failure
+RestartSec=5
+
+# Hardening (plan §11): a read-only filesystem with writes granted only to this
+# service's own data dirs. EDIT ReadWritePaths to match your config.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=%h/.config/isyncyou %h/.local/share/isyncyou %h/OneDrive %h/iSyncYou
+
+[Install]
+WantedBy=default.target
