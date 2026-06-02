@@ -24,6 +24,8 @@
   th { color: #8e9db3; font-weight: 600; }
   .badge { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: #18233a; color: #8ec6ff; }
   .muted { color: #8e9db3; }
+  td a { color: #8ec6ff; text-decoration: none; }
+  td a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -54,11 +56,17 @@ async function api(path) { const r = await fetch(path); return r.json(); }
 function render(items) {
   const tb = document.getElementById("rows");
   if (!items.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">No items.</td></tr>'; return; }
-  tb.innerHTML = items.map(it => `<tr>
-    <td><span class="badge">${it.item_type}</span></td>
-    <td>${escapeHtml(it.name)}</td>
-    <td class="muted">${it.remote_mtime || ""}</td>
-    <td>${it.has_body ? "✓" : "—"}</td></tr>`).join("");
+  tb.innerHTML = items.map(it => {
+    const name = escapeHtml(it.name);
+    const cell = it.has_body
+      ? `<a href="/api/v1/body?account=${encodeURIComponent(account)}&service=${encodeURIComponent(it.service)}&id=${encodeURIComponent(it.remote_id)}" target="_blank" rel="noopener">${name}</a>`
+      : name;
+    return `<tr>
+      <td><span class="badge">${it.item_type}</span></td>
+      <td>${cell}</td>
+      <td class="muted">${it.remote_mtime || ""}</td>
+      <td>${it.has_body ? "✓" : "—"}</td></tr>`;
+  }).join("");
 }
 function escapeHtml(s) { return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
