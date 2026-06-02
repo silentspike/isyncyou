@@ -806,6 +806,8 @@ dependencies = [
  "isyncyou-graph",
  "isyncyou-pathmap",
  "isyncyou-store",
+ "isyncyou-webui",
+ "serde_json",
 ]
 
 [[package]]
@@ -888,6 +890,16 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "isyncyou-webui"
+version = "0.1.0"
+dependencies = [
+ "isyncyou-core",
+ "isyncyou-store",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

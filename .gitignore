@@ -31,3 +31,7 @@ llm-*.md
 *.sqlite
 .env
 .DS_Store
+
+# Browser-automation + LLM scratch artifacts (never committed)
+.playwright-cli/
+llm-*.log
