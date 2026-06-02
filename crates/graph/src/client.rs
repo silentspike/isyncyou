@@ -42,6 +42,12 @@ impl Response {
 /// Abstract HTTP GET. The real implementation adds auth headers, TLS, etc.
 pub trait Transport {
     fn get(&mut self, url: &str) -> Response;
+
+    /// Wait out a retry backoff before re-issuing a throttled request. The
+    /// default is a **no-op** so unit-test mocks don't actually sleep; the real
+    /// HTTP transport overrides it to sleep `delay`. Honoring this is what lets a
+    /// `429`/`5xx` survive (plan §5: full speed → on 429 back off → resume).
+    fn backoff(&self, _delay: Duration) {}
 }
 
 /// The result of a completed delta walk.
@@ -87,12 +93,16 @@ pub fn run_delta<T: Transport>(
     let mut items: Vec<serde_json::Value> = Vec::new();
     let mut resynced = false;
     let mut retries = 0u32;
+    // Drives the backoff between retries: full speed until a 429/5xx, then honor
+    // Retry-After / exponential backoff, decaying back to full speed on success.
+    let mut pacer = crate::throttle::Pacer::new();
 
     loop {
         let resp = transport.get(&url);
         match classify(resp.status, resp.retry_after) {
             GraphAction::Ok => {
                 retries = 0;
+                pacer.update(crate::throttle::Outcome::Ok); // decay toward full speed
                 let body = resp.body.ok_or(DeltaError::MissingBody)?;
                 if let Some(arr) = body.get("value").and_then(|v| v.as_array()) {
                     items.extend(arr.iter().cloned());
@@ -110,12 +120,16 @@ pub fn run_delta<T: Transport>(
                 }
                 return Err(DeltaError::NoCursor);
             }
-            GraphAction::Retry { .. } => {
+            GraphAction::Retry { after } => {
                 retries += 1;
                 if retries > max_retries {
                     return Err(DeltaError::TooManyRetries);
                 }
-                // same url; the real driver sleeps Pacer::current_delay() here.
+                // Honor Retry-After (or exponential backoff) BEFORE retrying the
+                // same url — otherwise a real 429 burns the whole retry budget in
+                // a few milliseconds and the walk fails under load.
+                let delay = pacer.update(crate::throttle::Outcome::Retry { after });
+                transport.backoff(delay);
                 continue;
             }
             GraphAction::Resync => {
@@ -196,6 +210,87 @@ mod tests {
         assert_eq!(
             run_delta(&mut t, "base", None, 3),
             Err(DeltaError::TooManyRetries)
+        );
+    }
+
+    /// Records the backoff delays without sleeping, so we can assert run_delta
+    /// actually waits between retries (the throttle fix) at unit-test speed.
+    struct BackoffSpy {
+        queue: Vec<Response>,
+        calls: usize,
+        waited: std::cell::RefCell<Vec<Duration>>,
+    }
+    impl Transport for BackoffSpy {
+        fn get(&mut self, _url: &str) -> Response {
+            let r = self.queue[self.calls].clone();
+            self.calls += 1;
+            r
+        }
+        fn backoff(&self, delay: Duration) {
+            self.waited.borrow_mut().push(delay);
+        }
+    }
+
+    #[test]
+    fn retry_backs_off_exponentially_without_retry_after() {
+        let mut t = BackoffSpy {
+            queue: vec![
+                Response::status(429),
+                Response::status(503),
+                Response::ok(json!({ "value": [{"id": "a"}], "@odata.deltaLink": "T" })),
+            ],
+            calls: 0,
+            waited: std::cell::RefCell::new(Vec::new()),
+        };
+        let out = run_delta(&mut t, "base", None, 5).unwrap();
+        assert_eq!(out.items.len(), 1);
+        let w = t.waited.borrow();
+        assert_eq!(w.len(), 2, "one backoff per throttle response");
+        assert!(w[0] > Duration::ZERO, "must wait, not retry instantly");
+        assert!(w[1] > w[0], "backoff must grow without Retry-After: {w:?}");
+    }
+
+    #[test]
+    fn retry_honors_server_retry_after() {
+        let mut t = BackoffSpy {
+            queue: vec![
+                Response {
+                    status: 429,
+                    retry_after: Some(Duration::from_secs(7)),
+                    body: None,
+                },
+                Response::ok(json!({ "value": [], "@odata.deltaLink": "T" })),
+            ],
+            calls: 0,
+            waited: std::cell::RefCell::new(Vec::new()),
+        };
+        run_delta(&mut t, "base", None, 5).unwrap();
+        assert_eq!(t.waited.borrow().as_slice(), &[Duration::from_secs(7)]);
+    }
+
+    #[test]
+    fn success_decays_backoff_back_toward_full_speed() {
+        // throttle once (sets backoff high), then several successful pages: the
+        // pacer should decay so a later throttle starts low again, not stay high.
+        let mut t = BackoffSpy {
+            queue: vec![
+                Response::status(429),
+                Response::ok(json!({ "value": [{"id": "a"}], "@odata.nextLink": "u2" })),
+                Response::ok(json!({ "value": [{"id": "b"}], "@odata.nextLink": "u3" })),
+                Response::status(429),
+                Response::ok(json!({ "value": [{"id": "c"}], "@odata.deltaLink": "T" })),
+            ],
+            calls: 0,
+            waited: std::cell::RefCell::new(Vec::new()),
+        };
+        run_delta(&mut t, "base", None, 5).unwrap();
+        let w = t.waited.borrow();
+        // both throttles start from the same base step (decay reset to full speed
+        // between them), so the second isn't larger than the first.
+        assert_eq!(w.len(), 2);
+        assert!(
+            w[1] <= w[0],
+            "decay should reset backoff between throttles: {w:?}"
         );
     }
 
