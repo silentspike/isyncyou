@@ -958,6 +958,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "isyncyou-core",
+ "isyncyou-engine",
+ "isyncyou-graph",
+ "isyncyou-pathmap",
+ "isyncyou-store",
  "isyncyou-webui",
 ]
 
