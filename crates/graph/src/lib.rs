@@ -14,6 +14,7 @@
 //! OAuth (Auth-Code+PKCE / device-code) and the live HTTP client are layered on
 //! top of these and exercised against the test account separately.
 
+pub mod auth;
 pub mod client;
 pub mod error;
 #[cfg(feature = "http")]
@@ -24,6 +25,7 @@ pub mod upload;
 #[cfg(feature = "http")]
 pub use http::GraphClient;
 
+pub use auth::{TokenCache, TokenResponse};
 pub use client::{run_delta, DeltaError, DeltaOutcome, Response, Transport};
 pub use error::{classify, GraphAction};
 pub use throttle::{Outcome, Pacer};
