@@ -662,6 +662,21 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
         .map_err(|e| e.to_string())?;
         println!("uploaded {uploaded} new local file(s) to the cloud");
     }
+
+    // Push locally-modified files up, guarded by an If-Match etag check so a
+    // concurrent cloud change is reported as a conflict, never silently clobbered.
+    let modifies =
+        connectors::scan_local_modifies(&store, account, &sync_root).map_err(|e| e.to_string())?;
+    if !modifies.is_empty() {
+        let mr = connectors::apply_local_modifies(
+            &client, &store, &mut map, account, &sync_root, &modifies,
+        )
+        .map_err(|e| e.to_string())?;
+        println!(
+            "modified: {} uploaded, {} conflict(s) held back, {} failed",
+            mr.uploaded, mr.conflicts, mr.failed
+        );
+    }
     Ok(())
 }
 

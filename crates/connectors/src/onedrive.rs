@@ -476,6 +476,108 @@ pub fn push_local_creates<W: RemoteWriter>(
     Ok(uploaded)
 }
 
+/// Replaces an item's content only if its etag still matches (so a concurrent
+/// cloud change is never silently overwritten — A3). Abstracted so the modify
+/// driver is unit-testable with a mock. `Ok(Some(item))` = replaced;
+/// `Ok(None)` = conflict (cloud changed, not overwritten).
+pub trait ContentReplacer {
+    fn replace_if_match(
+        &self,
+        item_id: &str,
+        data: &[u8],
+        etag: &str,
+    ) -> Result<Option<Value>, String>;
+}
+
+#[cfg(feature = "http")]
+impl ContentReplacer for isyncyou_graph::GraphClient {
+    fn replace_if_match(
+        &self,
+        item_id: &str,
+        data: &[u8],
+        etag: &str,
+    ) -> Result<Option<Value>, String> {
+        self.replace_content_if_match(item_id, data, etag)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// What one local→remote modify pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModifyReport {
+    pub uploaded: usize,
+    /// Cloud also changed since the last sync — reported, never overwritten.
+    pub conflicts: usize,
+    pub failed: usize,
+}
+
+/// Find tracked files whose on-disk size differs from the stored size — local
+/// **modifies**. Size-only: a same-size in-place edit is missed (a v1 limit),
+/// but there are no false positives (a freshly downloaded file matches its stored
+/// size). Returns `(remote_id, rel, etag)`; an item without a stored etag is
+/// skipped (the conditional replace needs one).
+pub fn scan_local_modifies(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+) -> Result<Vec<(String, PathBuf, String)>, SyncError> {
+    let items = store.all_items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut out = Vec::new();
+    for it in &items {
+        if it.deleted_at.is_some() || it.item_type != "file" {
+            continue;
+        }
+        let rel = match local_rel_path(&by_id, it) {
+            Some(p) => p,
+            None => continue,
+        };
+        let local_size = match std::fs::metadata(sync_root.join(&rel)) {
+            Ok(m) => m.len() as i64,
+            Err(_) => continue, // not on disk → not a modify (handled elsewhere)
+        };
+        if Some(local_size) != it.size {
+            if let Some(etag) = it.etag.clone() {
+                out.push((it.remote_id.clone(), rel, etag));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Upload local modifies with an If-Match guard: replace the cloud content only
+/// if its etag still matches, so a concurrent cloud change is reported as a
+/// conflict and **never silently overwritten** (A3). On success the store item is
+/// refreshed (new size/etag, `clean`).
+pub fn apply_local_modifies<R: ContentReplacer>(
+    replacer: &R,
+    store: &Store,
+    map: &mut MappingTable,
+    account: &str,
+    sync_root: &Path,
+    modifies: &[(String, PathBuf, String)],
+) -> Result<ModifyReport, SyncError> {
+    let mut report = ModifyReport::default();
+    for (id, rel, etag) in modifies {
+        let data = match std::fs::read(sync_root.join(rel)) {
+            Ok(d) => d,
+            Err(_) => {
+                report.failed += 1;
+                continue;
+            }
+        };
+        match replacer.replace_if_match(id, &data, etag) {
+            Ok(Some(item)) => {
+                ingest_item(store, map, account, &item, "", "clean")?;
+                report.uploaded += 1;
+            }
+            Ok(None) => report.conflicts += 1,
+            Err(_) => report.failed += 1,
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +958,122 @@ mod tests {
         );
     }
 
+    /// A replacer that either echoes a refreshed item (replaced) or signals a
+    /// conflict, controllable per test.
+    struct MockReplacer {
+        conflict: bool,
+        calls: std::cell::RefCell<Vec<(String, usize, String)>>,
+    }
+    impl ContentReplacer for MockReplacer {
+        fn replace_if_match(
+            &self,
+            item_id: &str,
+            data: &[u8],
+            etag: &str,
+        ) -> Result<Option<Value>, String> {
+            self.calls
+                .borrow_mut()
+                .push((item_id.to_string(), data.len(), etag.to_string()));
+            if self.conflict {
+                Ok(None)
+            } else {
+                Ok(Some(json!({
+                    "id": item_id,
+                    "name": "note.txt",
+                    "parentReference": { "id": "F1" },
+                    "size": data.len(),
+                    "eTag": "etag-new"
+                })))
+            }
+        }
+    }
+
+    fn store_with_tracked_file(size: i64) -> (Store, tempfile::TempDir) {
+        let store = Store::open_in_memory().unwrap();
+        let mut folder = Item::new("acc", SERVICE, "F1", "Docs", "folder");
+        folder.local_path = Some("Docs".into());
+        store.upsert_item(&folder).unwrap();
+        let mut f = Item::new("acc", SERVICE, "a1", "note.txt", "file");
+        f.parent_remote_id = Some("F1".into());
+        f.local_path = Some("note.txt".into());
+        f.size = Some(size);
+        f.etag = Some("etag-old".into());
+        store.upsert_item(&f).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Docs")).unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn scan_local_modifies_detects_size_change_only() {
+        let (store, dir) = store_with_tracked_file(2); // store says size=2
+                                                       // write a different-sized local file -> modify
+        std::fs::write(dir.path().join("Docs").join("note.txt"), b"changed").unwrap();
+        let m = scan_local_modifies(&store, "acc", dir.path()).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, "a1");
+        assert_eq!(m[0].1, PathBuf::from("Docs/note.txt"));
+        assert_eq!(m[0].2, "etag-old");
+
+        // same size as stored -> not a modify
+        let (store2, dir2) = store_with_tracked_file(2);
+        std::fs::write(dir2.path().join("Docs").join("note.txt"), b"hi").unwrap(); // 2 bytes
+        assert!(scan_local_modifies(&store2, "acc", dir2.path())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn apply_local_modifies_uploads_then_refreshes_store() {
+        let (store, dir) = store_with_tracked_file(2);
+        std::fs::write(dir.path().join("Docs").join("note.txt"), b"changed").unwrap();
+        let mut map = MappingTable::new();
+        let r = MockReplacer {
+            conflict: false,
+            calls: Default::default(),
+        };
+        let modifies = vec![(
+            "a1".into(),
+            PathBuf::from("Docs/note.txt"),
+            "etag-old".into(),
+        )];
+        let report =
+            apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), &modifies).unwrap();
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(report.conflicts, 0);
+        // the conditional replace was called with the stored etag
+        assert_eq!(r.calls.borrow()[0].2, "etag-old");
+        // store refreshed: new size + etag, clean
+        let it = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(it.size, Some(7)); // "changed"
+        assert_eq!(it.etag.as_deref(), Some("etag-new"));
+        assert_eq!(it.sync_state, "clean");
+    }
+
+    #[test]
+    fn apply_local_modifies_reports_conflict_without_overwrite() {
+        let (store, dir) = store_with_tracked_file(2);
+        std::fs::write(dir.path().join("Docs").join("note.txt"), b"changed").unwrap();
+        let mut map = MappingTable::new();
+        let r = MockReplacer {
+            conflict: true, // cloud changed -> 412
+            calls: Default::default(),
+        };
+        let modifies = vec![(
+            "a1".into(),
+            PathBuf::from("Docs/note.txt"),
+            "etag-old".into(),
+        )];
+        let report =
+            apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), &modifies).unwrap();
+        assert_eq!(report.uploaded, 0);
+        assert_eq!(report.conflicts, 1);
+        // store NOT changed (no silent overwrite): old size/etag remain
+        let it = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(it.size, Some(2));
+        assert_eq!(it.etag.as_deref(), Some("etag-old"));
+    }
+
     /// Live local→remote: upload via the connector + GraphClient, confirm the
     /// store has a clean row, then push-delete (removes from OneDrive + tombstones).
     #[cfg(feature = "http")]
@@ -1110,5 +1328,58 @@ mod tests {
         assert_eq!(got.get("name").and_then(Value::as_str), Some("up.txt"));
         eprintln!("uploaded new local file -> cloud item {}", up.remote_id);
         client.delete(&up.remote_id).expect("cleanup");
+    }
+
+    /// Live local→remote modify: upload a file, sync + materialize it, edit it
+    /// locally (changing its size), then push the modify with an If-Match guard
+    /// and confirm the cloud content updated. Needs the write token.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_local_modify_replaces_cloud_content() {
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_local_modify_replaces_cloud_content: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let item = client
+            .upload("/iSyncYou-modtest/m.txt", b"original")
+            .expect("upload");
+        let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
+
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
+        let base = tempfile::tempdir().unwrap();
+        let sync_root = base.path().join("od");
+        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        let local = sync_root.join("iSyncYou-modtest").join("m.txt");
+        assert!(local.exists(), "file should have materialized");
+
+        // edit locally (size changes) and push the modify
+        let new_content = b"original + MODIFIED locally";
+        std::fs::write(&local, new_content).unwrap();
+        let modifies = scan_local_modifies(&store, "acc", &sync_root).unwrap();
+        assert!(
+            modifies.iter().any(|(mid, _, _)| mid == &id),
+            "the edited file should be a detected modify"
+        );
+        let report =
+            apply_local_modifies(&client, &store, &mut map, "acc", &sync_root, &modifies).unwrap();
+        assert!(report.uploaded >= 1, "modify should upload: {report:?}");
+
+        // confirm the cloud content now matches the local edit
+        let cloud = client.download_content(&id).expect("download");
+        assert_eq!(
+            cloud, new_content,
+            "cloud content should match the local edit"
+        );
+        eprintln!("modify uploaded; cloud content updated for {id}");
+        client.delete(&id).expect("cleanup");
     }
 }
