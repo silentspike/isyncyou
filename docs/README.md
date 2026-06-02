@@ -15,6 +15,7 @@ Public-facing docs. The detailed design (SDD) is maintained internally.
 - [packaging-daemon-model.md](packaging-daemon-model.md) — daemon vs. GUI packaging & distribution.
 - [html-viewer-security.md](html-viewer-security.md) — safe rendering of archived items (escape + CSP).
 - [test-chaos-matrix.md](test-chaos-matrix.md) — chaos / data-loss matrix and how each case is verified.
+- [acceptance-v0.1.md](acceptance-v0.1.md) — v0.1 acceptance gate: A1–A10 evidence + live test-account verification.
 
 ## Planned artifacts
 
