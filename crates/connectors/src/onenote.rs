@@ -228,6 +228,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_incremental_sync_onenote() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {

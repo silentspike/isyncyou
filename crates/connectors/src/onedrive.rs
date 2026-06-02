@@ -370,6 +370,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_push_upload_then_delete() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
@@ -414,6 +415,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_incremental_sync() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {

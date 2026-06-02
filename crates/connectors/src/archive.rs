@@ -415,6 +415,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_archive_calendar_bodies() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
@@ -465,6 +466,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_archive_todo_bodies() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
@@ -510,6 +512,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_archive_onenote_bodies() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {

@@ -504,6 +504,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_incremental_sync_mail() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
@@ -534,6 +535,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_download_message_bodies() {
+        let _gate = crate::live_test_gate();
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {

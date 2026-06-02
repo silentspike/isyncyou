@@ -343,6 +343,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_restore_event_roundtrip() {
+        let _gate = crate::live_test_gate();
         use isyncyou_graph::Transport;
         let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
             Ok(t) if !t.is_empty() => t,
@@ -403,6 +404,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_restore_task_roundtrip() {
+        let _gate = crate::live_test_gate();
         use isyncyou_graph::Transport;
         let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
             Ok(t) if !t.is_empty() => t,
@@ -470,6 +472,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_restore_contact_roundtrip() {
+        let _gate = crate::live_test_gate();
         use isyncyou_graph::Transport;
         let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
             Ok(t) if !t.is_empty() => t,
@@ -515,6 +518,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn live_restore_message_roundtrip() {
+        let _gate = crate::live_test_gate();
         use isyncyou_graph::Transport;
         let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
             Ok(t) if !t.is_empty() => t,
