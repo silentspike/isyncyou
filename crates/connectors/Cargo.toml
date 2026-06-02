@@ -8,3 +8,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+isyncyou-graph = { path = "../graph" }
+isyncyou-store = { path = "../store" }
+isyncyou-pathmap = { path = "../pathmap" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+# Enable the live reqwest transport (pulls graph's http feature).
+http = ["isyncyou-graph/http"]
+
+[dev-dependencies]
+tempfile = "3"
