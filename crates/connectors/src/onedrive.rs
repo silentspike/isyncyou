@@ -643,17 +643,39 @@ pub fn scan_local_modifies(
             Some(p) => p,
             None => continue,
         };
-        let local_size = match std::fs::metadata(sync_root.join(&rel)) {
-            Ok(m) => m.len() as i64,
-            Err(_) => continue, // not on disk → not a modify (handled elsewhere)
-        };
-        if Some(local_size) != it.size {
+        if is_local_modified(&sync_root.join(&rel), it) {
             if let Some(etag) = it.etag.clone() {
                 out.push((it.remote_id.clone(), rel, etag));
             }
         }
     }
     Ok(out)
+}
+
+/// Decide whether a tracked file's on-disk copy differs from the cloud version,
+/// cheapest check first (the rclone-style ladder):
+/// 1. size+mtime match → unchanged (no read);
+/// 2. size differs → modified;
+/// 3. size matches but mtime differs → confirm by content hash (QuickXorHash), so
+///    a same-size in-place edit is caught while a pure mtime touch is not a false
+///    modify. Without a stored hash this falls back to the size verdict
+///    (unchanged), so it never regresses on synthetic items.
+fn is_local_modified(full: &Path, it: &Item) -> bool {
+    let meta = match std::fs::metadata(full) {
+        Ok(m) => m,
+        Err(_) => return false, // not on disk → not a modify (delete is handled elsewhere)
+    };
+    if local_file_matches(full, it) {
+        return false;
+    }
+    if it.size != Some(meta.len() as i64) {
+        return true;
+    }
+    // size matches but mtime differs: only a content hash can decide.
+    match (&it.quickxorhash, std::fs::read(full)) {
+        (Some(stored), Ok(data)) => crate::quickxor::quickxor_base64(&data) != *stored,
+        _ => false,
+    }
 }
 
 /// Upload local modifies with an If-Match guard: replace the cloud content only
@@ -1200,12 +1222,48 @@ mod tests {
         assert_eq!(m[0].1, PathBuf::from("Docs/note.txt"));
         assert_eq!(m[0].2, "etag-old");
 
-        // same size as stored -> not a modify
+        // same size as stored, no stored hash -> not a modify (size-only fallback)
         let (store2, dir2) = store_with_tracked_file(2);
         std::fs::write(dir2.path().join("Docs").join("note.txt"), b"hi").unwrap(); // 2 bytes
         assert!(scan_local_modifies(&store2, "acc", dir2.path())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn scan_local_modifies_catches_same_size_edit_via_hash() {
+        let store = Store::open_in_memory().unwrap();
+        let mut folder = Item::new("acc", SERVICE, "F1", "Docs", "folder");
+        folder.local_path = Some("Docs".into());
+        store.upsert_item(&folder).unwrap();
+        let mut f = Item::new("acc", SERVICE, "a1", "n.txt", "file");
+        f.parent_remote_id = Some("F1".into());
+        f.local_path = Some("n.txt".into());
+        f.size = Some(5);
+        f.etag = Some("etag-old".into());
+        f.remote_mtime = Some("2024-01-02T03:04:05Z".into());
+        f.quickxorhash = Some(crate::quickxor::quickxor_base64(b"hello")); // cloud content
+        store.upsert_item(&f).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Docs")).unwrap();
+        let path = dir.path().join("Docs").join("n.txt");
+
+        // same content as the cloud, but mtime touched (now != stored): the hash
+        // matches, so it is NOT a modify (no false positive on a pure touch).
+        std::fs::write(&path, b"hello").unwrap();
+        assert!(
+            scan_local_modifies(&store, "acc", dir.path())
+                .unwrap()
+                .is_empty(),
+            "same content with a touched mtime must not be a modify"
+        );
+
+        // same SIZE but different content: only the hash reveals the edit.
+        std::fs::write(&path, b"world").unwrap(); // 5 bytes, != "hello"
+        let m = scan_local_modifies(&store, "acc", dir.path()).unwrap();
+        assert_eq!(m.len(), 1, "a same-size edit must be detected via the hash");
+        assert_eq!(m[0].0, "a1");
     }
 
     #[test]
