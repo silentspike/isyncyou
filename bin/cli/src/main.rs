@@ -1,6 +1,7 @@
 //! `isyncyou` — command-line interface for the iSyncYou engine.
 //!
 //! Wires the config, store and connectors into a usable tool:
+//! - `init`    — scaffold a starter config (template or a validated account)
 //! - `check`   — validate a config file
 //! - `status`  — show tracked-item counts + delta cursor for an account
 //! - `sync`    — run one incremental OneDrive sync for an account
@@ -15,7 +16,7 @@
 //! cached token (from `login`) is loaded and auto-refreshed.
 
 use clap::{Parser, Subcommand};
-use isyncyou_core::Config;
+use isyncyou_core::{AccountConfig, Config};
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::Store;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 enum Command {
+    /// Scaffold a starter configuration file.
+    Init {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        sync_root: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        /// Overwrite an existing config file.
+        #[arg(long)]
+        force: bool,
+    },
     /// Validate a configuration file.
     Check {
         #[arg(long, default_value = "isyncyou.toml")]
@@ -170,6 +187,14 @@ fn main() {
 
 fn run(command: Command) -> Result<(), String> {
     match command {
+        Command::Init {
+            config,
+            account,
+            username,
+            sync_root,
+            archive_root,
+            force,
+        } => cmd_init(&config, account, username, sync_root, archive_root, force),
         Command::Check { config } => cmd_check(&config),
         Command::Status { config, account } => cmd_status(&config, &account),
         Command::Sync {
@@ -301,6 +326,54 @@ fn store_path(cfg: &Config, account: &str) -> Result<PathBuf, String> {
         .find(|a| a.id == account)
         .ok_or_else(|| format!("no account '{account}' in config"))?;
     Ok(acc.archive_root.join(".isyncyou-store.db"))
+}
+
+/// Documented starter template (shared with the release archive's sample).
+const CONFIG_TEMPLATE: &str = include_str!("../../../packaging/isyncyou.toml.sample");
+
+fn cmd_init(
+    config: &Path,
+    account: Option<String>,
+    username: Option<String>,
+    sync_root: Option<PathBuf>,
+    archive_root: Option<PathBuf>,
+    force: bool,
+) -> Result<(), String> {
+    if config.exists() && !force {
+        return Err(format!(
+            "{} already exists (use --force to overwrite)",
+            config.display()
+        ));
+    }
+    match (account, username, sync_root, archive_root) {
+        (Some(id), Some(user), Some(sr), Some(ar)) => {
+            let cfg = Config {
+                accounts: vec![AccountConfig {
+                    id,
+                    username: user,
+                    sync_root: sr,
+                    archive_root: ar,
+                }],
+                ..Default::default()
+            };
+            cfg.validate()
+                .map_err(|errs| format!("invalid config: {}", errs.join("; ")))?;
+            cfg.save(config)?;
+            println!(
+                "wrote config for account '{}' to {}",
+                cfg.accounts[0].id,
+                config.display()
+            );
+        }
+        _ => {
+            std::fs::write(config, CONFIG_TEMPLATE).map_err(|e| e.to_string())?;
+            println!(
+                "wrote a starter template to {} — edit it, then run `isyncyou check`",
+                config.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_check(path: &Path) -> Result<(), String> {
@@ -702,6 +775,52 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn init_writes_validated_account_config() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-init-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("isyncyou.toml");
+        cmd_init(
+            &p,
+            Some("a".into()),
+            Some("a@outlook.com".into()),
+            Some(dir.join("od")),
+            Some(dir.join("arch")),
+            false,
+        )
+        .unwrap();
+        let cfg = load_config(&p).unwrap(); // parses + validates
+        assert_eq!(cfg.accounts[0].id, "a");
+        // refuses overwrite without --force, allows with
+        assert!(cmd_init(&p, None, None, None, None, false)
+            .unwrap_err()
+            .contains("already exists"));
+        cmd_init(&p, None, None, None, None, true).unwrap(); // template, forced
+                                                             // a template-initialised config is itself valid
+        load_config(&p).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_rejects_invalid_account() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-init2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("isyncyou.toml");
+        // sync_root == archive_root is invalid -> nothing is written
+        let err = cmd_init(
+            &p,
+            Some("a".into()),
+            Some("a@o".into()),
+            Some(dir.join("same")),
+            Some(dir.join("same")),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid config"), "got: {err}");
+        assert!(!p.exists(), "invalid config must not be written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
