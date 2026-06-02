@@ -39,12 +39,34 @@ jobs:
           (cd dist && sha256sum isyncyou-linux-x86_64.tar.gz > isyncyou-linux-x86_64.tar.gz.sha256)
           ls -la dist dist/isyncyou
 
+      - name: Build AppImage
+        run: |
+          # squashfs-tools (mksquashfs) + appimagetool are the only host deps; the
+          # runner has passwordless sudo. appimagetool is cached in $HOME across runs.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools
+          tool="$HOME/appimagetool"
+          if [ ! -x "$tool" ]; then
+            curl -fsSL -o "$tool" \
+              "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+            chmod +x "$tool"
+          fi
+          # FUSE may be unavailable in the container → extract-and-run instead.
+          APPIMAGETOOL="$tool" APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 \
+            bash packaging/build-appimage.sh target/release dist
+          (cd dist && sha256sum isyncyou-x86_64.AppImage > isyncyou-x86_64.AppImage.sha256)
+          # smoke-test the produced AppImage runs and reports its version
+          APPIMAGE_EXTRACT_AND_RUN=1 dist/isyncyou-x86_64.AppImage --version
+          ls -la dist
+
       - uses: actions/upload-artifact@v7
         with:
           name: isyncyou-binaries
           path: |
             dist/isyncyou-linux-x86_64.tar.gz
             dist/isyncyou-linux-x86_64.tar.gz.sha256
+            dist/isyncyou-x86_64.AppImage
+            dist/isyncyou-x86_64.AppImage.sha256
             dist/isyncyou/
 
       - name: Publish RC prerelease (on push to main)
@@ -57,6 +79,8 @@ jobs:
           files: |
             dist/isyncyou-linux-x86_64.tar.gz
             dist/isyncyou-linux-x86_64.tar.gz.sha256
+            dist/isyncyou-x86_64.AppImage
+            dist/isyncyou-x86_64.AppImage.sha256
           body: |
             Automated RC build from `${{ github.sha }}`.
 
@@ -67,4 +91,6 @@ jobs:
           files: |
             dist/isyncyou-linux-x86_64.tar.gz
             dist/isyncyou-linux-x86_64.tar.gz.sha256
+            dist/isyncyou-x86_64.AppImage
+            dist/isyncyou-x86_64.AppImage.sha256
           generate_release_notes: true
