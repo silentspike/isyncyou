@@ -138,12 +138,13 @@ impl ApiResponse {
             headers: Vec::new(),
         }
     }
-    /// An HTML page locked down with a strict `Content-Security-Policy` header —
-    /// used by the rendered item viewers, which must never load anything.
-    fn html_locked(body: &str) -> Self {
+    /// An HTML page locked down with a `Content-Security-Policy` **header** (a
+    /// second layer beside the page's `<meta>` CSP) — used by the rendered item
+    /// viewers, which must never load anything remote.
+    fn html_with_csp(body: &str, csp: &str) -> Self {
         let mut r = Self::html(body);
         r.headers
-            .push(("Content-Security-Policy".into(), view::VIEWER_CSP.into()));
+            .push(("Content-Security-Policy".into(), csp.into()));
         r
     }
     fn error(status: u16, message: &str) -> Self {
@@ -321,20 +322,16 @@ impl Router {
         }
     }
 
-    /// Serve an item's archived body bytes. The content-type is forced to a
-    /// **non-executable** type (the browser must never run scripts/trackers
-    /// embedded in a backed-up mail/page — the full sanitized viewer is later
-    /// work), and the resolved path must stay under the account's archive_root.
     /// Read an item's archived body bytes, path-safely. Returns `(relative_path,
-    /// bytes)` or the `ApiResponse` to send on failure. The resolved file must
-    /// stay under the account's `archive_root` (defense against `..`/symlink
-    /// traversal). Shared by [`Self::body`] and [`Self::view`].
+    /// bytes, item_name)` or the `ApiResponse` to send on failure. The resolved
+    /// file must stay under the account's `archive_root` (defense against
+    /// `..`/symlink traversal). Shared by [`Self::body`] and [`Self::view`].
     fn read_archived(
         &self,
         account: &str,
         service: &str,
         id: &str,
-    ) -> Result<(String, Vec<u8>), ApiResponse> {
+    ) -> Result<(String, Vec<u8>, String), ApiResponse> {
         let acc = self
             .config
             .accounts
@@ -343,17 +340,20 @@ impl Router {
             .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
         let archive_root = acc.archive_root.clone();
         let store = self.open(Some(account))?;
-        let rel = match store.get_item(account, service, id) {
-            Ok(Some(it)) => it
-                .local_path
-                .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?,
+        let (rel, name) = match store.get_item(account, service, id) {
+            Ok(Some(it)) => {
+                let rel = it
+                    .local_path
+                    .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?;
+                (rel, it.name)
+            }
             Ok(None) => return Err(ApiResponse::error(404, "item not found")),
             Err(e) => return Err(ApiResponse::error(500, &format!("query: {e}"))),
         };
         let path = archive_root.join(&rel);
         match (path.canonicalize(), archive_root.canonicalize()) {
             (Ok(p), Ok(root)) if p.starts_with(&root) => match std::fs::read(&p) {
-                Ok(bytes) => Ok((rel, bytes)),
+                Ok(bytes) => Ok((rel, bytes, name)),
                 Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
             },
             (Ok(_), Ok(_)) => Err(ApiResponse::error(400, "body path escapes archive root")),
@@ -369,7 +369,7 @@ impl Router {
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
         match self.read_archived(account, service, id) {
-            Ok((rel, bytes)) => ApiResponse {
+            Ok((rel, bytes, _name)) => ApiResponse {
                 status: 200,
                 content_type: safe_content_type(&rel).into(),
                 body: bytes,
@@ -381,22 +381,22 @@ impl Router {
 
     /// Render an archived item as a **safe, self-contained HTML page**: our own
     /// canonical JSON (calendar/contacts/todo/onenote) is escaped into a fixed
-    /// skeleton — no untrusted markup, no scripts, no external resources — and a
-    /// raw `.eml`/non-JSON body is shown as escaped source. The response carries
-    /// a strict `Content-Security-Policy` so a browser loads nothing. A rich,
-    /// sanitized HTML mail *renderer* (allowlist parser) is deliberately separate
-    /// follow-up work (it needs an HTML-sanitizer dependency).
+    /// skeleton — no untrusted markup, no scripts, no external resources. A mail
+    /// `.eml` is rendered through an allowlist HTML **sanitizer** (scripts/handlers
+    /// dropped, remote resources blocked); any other raw body is shown as escaped
+    /// source. Every page carries a strict `Content-Security-Policy` so the browser
+    /// loads nothing remote even if something slipped past.
     fn view(&self, req: &ApiRequest) -> ApiResponse {
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
-        let (rel, bytes) = match self.read_archived(account, service, id) {
+        let (rel, bytes, name) = match self.read_archived(account, service, id) {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let page = if rel.ends_with(".json") {
-            match serde_json::from_slice::<Value>(&bytes) {
+        if rel.ends_with(".json") {
+            let page = match serde_json::from_slice::<Value>(&bytes) {
                 Ok(v) => view::render_item(service, &v),
                 Err(e) => view::page(
                     "Unreadable item",
@@ -405,12 +405,24 @@ impl Router {
                         view::escape(&e.to_string())
                     ),
                 ),
+            };
+            return ApiResponse::html_with_csp(&page, view::VIEWER_CSP);
+        }
+        // A mail `.eml` with an HTML part is rendered sanitized; otherwise (plain
+        // mail, or any other raw body) we show escaped source.
+        if service == "mail" {
+            if let Some(html) = isyncyou_connectors::extract_html(&bytes) {
+                let subject = if name.is_empty() { "Message" } else { &name };
+                return ApiResponse::html_with_csp(
+                    &view::mail_page(subject, &html),
+                    view::MAIL_CSP,
+                );
             }
-        } else {
-            // .eml or other raw body: show escaped source (inert, never executed).
-            view::source_page(service, &String::from_utf8_lossy(&bytes))
-        };
-        ApiResponse::html_locked(&page)
+        }
+        ApiResponse::html_with_csp(
+            &view::source_page(service, &String::from_utf8_lossy(&bytes)),
+            view::VIEWER_CSP,
+        )
     }
 
     fn search(&self, req: &ApiRequest) -> ApiResponse {
