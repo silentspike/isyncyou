@@ -32,7 +32,7 @@ jobs:
           for b in isyncyoud isyncyou isyncyou-doctor; do
             [ -f "target/release/$b" ] && install -m755 "target/release/$b" "dist/isyncyou/$b"
           done
-          cp packaging/isyncyou.toml.sample packaging/README.md dist/isyncyou/
+          cp packaging/isyncyou.toml.sample packaging/README.md packaging/isyncyoud.service dist/isyncyou/
           (cd dist/isyncyou && for b in isyncyou isyncyoud isyncyou-doctor; do [ -f "$b" ] && sha256sum "$b"; done > SHA256SUMS)
           # one distributable archive: binaries + sample config + README
           tar -C dist -czf dist/isyncyou-linux-x86_64.tar.gz isyncyou
