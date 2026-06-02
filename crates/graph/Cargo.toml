@@ -9,3 +9,9 @@ authors.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+
+[features]
+# Live HTTP transport (reqwest + rustls). Off by default so the pure-logic build
+# stays fast and dependency-light; enable for live tests / the daemon.
+http = ["dep:reqwest"]
