@@ -21,5 +21,6 @@ isyncyou-connectors = { path = "../../crates/connectors", features = ["http"] }
 isyncyou-graph = { path = "../../crates/graph", features = ["http"] }
 isyncyou-engine = { path = "../../crates/engine" }
 isyncyou-fuse = { path = "../../crates/fuse" }
+isyncyou-pbs = { path = "../../crates/pbs" }
 isyncyou-webui = { path = "../../gui/webui" }
 isyncyou-change-source = { version = "0.1.0", path = "../../crates/change-source" }

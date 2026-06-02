@@ -69,12 +69,32 @@ impl Default for SyncConfig {
     }
 }
 
+/// Optional Proxmox Backup Server target (plan §9.2/§12). No secret lives here —
+/// `password_file` points at a file holding the PBS password / API-token secret,
+/// so the config can be shared/committed without leaking credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PbsConfig {
+    /// PBS repository, e.g. `user@realm@host:datastore` (or `…!token@…`).
+    pub repository: String,
+    /// Path to a file containing the PBS password / API-token secret.
+    pub password_file: PathBuf,
+    /// TLS fingerprint for a self-signed PBS certificate (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// PBS namespace isolating iSyncYou snapshots from other backups (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
 /// The full configuration document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub accounts: Vec<AccountConfig>,
     pub sync: SyncConfig,
+    /// Optional PBS backup target (snapshot/restore of the store).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pbs: Option<PbsConfig>,
 }
 
 impl Config {
