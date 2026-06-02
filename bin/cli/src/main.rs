@@ -228,6 +228,10 @@ enum Command {
         /// Empty directory to mount at (`fusermount -u <dir>` or Ctrl-C to unmount).
         #[arg(long)]
         mountpoint: PathBuf,
+        /// Mount read-write: edits to a hydrated file are uploaded on close.
+        /// Needs a write token.
+        #[arg(long)]
+        writable: bool,
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
@@ -382,8 +386,9 @@ fn run(command: Command) -> Result<(), String> {
             config,
             account,
             mountpoint,
+            writable,
             token,
-        } => cmd_mount(&config, &account, &mountpoint, token),
+        } => cmd_mount(&config, &account, &mountpoint, writable, token),
         Command::PbsBackup { config, account } => cmd_pbs_backup(&config, &account),
         Command::PbsRestore {
             config,
@@ -475,17 +480,35 @@ impl isyncyou_fuse::Hydrator for GraphHydrator {
     }
 }
 
+/// Uploads edited placeholder files back to OneDrive (write-back mount).
+#[cfg(unix)]
+struct GraphUploader {
+    client: isyncyou_graph::GraphClient,
+}
+#[cfg(unix)]
+impl isyncyou_fuse::Uploader for GraphUploader {
+    fn upload(&self, remote_id: &str, data: &[u8]) -> Result<(), String> {
+        self.client
+            .put_content(remote_id, data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(unix)]
 fn cmd_mount(
     config: &Path,
     account: &str,
     mountpoint: &Path,
+    writable: bool,
     token: Option<String>,
 ) -> Result<(), String> {
     let cfg = load_config(config)?;
-    let token = resolve_token(&cfg, account, token, false)?;
+    // write-back needs Files.ReadWrite (which also covers reads); read-only uses
+    // the read token.
+    let token = resolve_token(&cfg, account, token, writable)?;
     // snapshot the tree, then drop the store so its single-instance lock is free
-    // while we're mounted (hydration goes through Graph, not the store).
+    // while we're mounted (hydration/upload go through Graph, not the store).
     let tree = {
         let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
         let items = store
@@ -493,14 +516,20 @@ fn cmd_mount(
             .map_err(|e| e.to_string())?;
         isyncyou_fuse::Tree::from_items(&items)
     };
-    let fs = isyncyou_fuse::PlaceholderFs::new(
+    let mut fs = isyncyou_fuse::PlaceholderFs::new(
         tree,
         Box::new(GraphHydrator {
-            client: isyncyou_graph::GraphClient::new(token),
+            client: isyncyou_graph::GraphClient::new(token.clone()),
         }),
     );
+    if writable {
+        fs = fs.with_uploader(Box::new(GraphUploader {
+            client: isyncyou_graph::GraphClient::new(token),
+        }));
+    }
+    let mode = if writable { "read-write" } else { "read-only" };
     println!(
-        "mounting OneDrive placeholders at {} (`fusermount -u` or Ctrl-C to unmount)…",
+        "mounting OneDrive placeholders ({mode}) at {} (`fusermount -u` or Ctrl-C to unmount)…",
         mountpoint.display()
     );
     isyncyou_fuse::mount(fs, mountpoint).map_err(|e| format!("mount: {e}"))
