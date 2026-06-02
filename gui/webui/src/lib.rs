@@ -18,6 +18,9 @@ use isyncyou_store::{Item, Store};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+mod serve;
+pub use serve::{format_http, parse_request_line, serve};
+
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
 pub const INDEX_HTML: &str = include_str!("index.html");
 
