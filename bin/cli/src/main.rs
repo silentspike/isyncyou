@@ -9,8 +9,10 @@
 //! - `restore` — re-create an archived item in the cloud
 //! - `migrate` — move an account's archive directory
 //! - `serve`   — serve the local web UI
+//! - `login`   — device-code sign-in; caches the account token for later commands
 //!
-//! Until OAuth lands (#40) the access token is supplied via `--token`/`ISYNCYOU_TOKEN`.
+//! Token resolution: `--token`/`ISYNCYOU_TOKEN` wins; otherwise the per-account
+//! cached token (from `login`) is loaded and auto-refreshed.
 
 use clap::{Parser, Subcommand};
 use isyncyou_core::Config;
@@ -117,12 +119,46 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: String,
     },
+    /// Sign in (device-code) and cache the account's token for later commands.
+    Login {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// Sign in for write operations (restore) instead of read-only backup.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
 const SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 /// Services with a restore path (OneNote pages can't be re-created via a simple POST).
 const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo"];
+
+// Public client app registrations + scopes for the test/personal accounts.
+const READ_CLIENT: &str = "cee80dd9-c13e-4dbb-9d4c-73eb4987d447";
+const WRITE_CLIENT: &str = "a90d9140-3a62-46d0-907b-f2b7b61a573a";
+const READ_SCOPES: &[&str] = &[
+    "Files.Read",
+    "Mail.Read",
+    "Calendars.Read",
+    "Contacts.Read",
+    "Tasks.Read",
+    "Notes.Read",
+    "offline_access",
+];
+const WRITE_SCOPES: &[&str] = &[
+    "Files.ReadWrite",
+    "Mail.ReadWrite",
+    "Mail.Send",
+    "Calendars.ReadWrite",
+    "Contacts.ReadWrite",
+    "Tasks.ReadWrite",
+    "offline_access",
+];
+const READ_CACHE: &str = ".isyncyou-token-read.json";
+const WRITE_CACHE: &str = ".isyncyou-token-write.json";
 
 fn main() {
     let cli = Cli::parse();
@@ -170,7 +206,79 @@ fn run(command: Command) -> Result<(), String> {
             new_archive_root,
         } => cmd_migrate(&config, &account, &new_archive_root),
         Command::Serve { config, bind } => cmd_serve(&config, &bind),
+        Command::Login {
+            config,
+            account,
+            write,
+        } => cmd_login(&config, &account, write),
     }
+}
+
+/// Account's token-cache path for the read or write app.
+fn token_cache_path(cfg: &Config, account: &str, write: bool) -> Result<PathBuf, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    Ok(acc
+        .archive_root
+        .join(if write { WRITE_CACHE } else { READ_CACHE }))
+}
+
+/// Resolve an access token: an explicit `--token`/`ISYNCYOU_TOKEN` wins; otherwise
+/// the per-account cached token is loaded and auto-refreshed (run `login` first).
+fn resolve_token(
+    cfg: &Config,
+    account: &str,
+    token: Option<String>,
+    write: bool,
+) -> Result<String, String> {
+    if let Some(t) = token {
+        return Ok(t);
+    }
+    let cache = token_cache_path(cfg, account, write)?;
+    if !cache.exists() {
+        let kind = if write { " --write" } else { "" };
+        return Err(format!(
+            "no access token: pass --token / set ISYNCYOU_TOKEN, or run `isyncyou login --account {account}{kind}`"
+        ));
+    }
+    let (client, scopes) = if write {
+        (WRITE_CLIENT, WRITE_SCOPES)
+    } else {
+        (READ_CLIENT, READ_SCOPES)
+    };
+    let now = unix_now().parse::<u64>().unwrap_or(0);
+    isyncyou_graph::auth::flow::ensure_access_token(&cache, client, scopes, now)
+}
+
+fn cmd_login(config: &Path, account: &str, write: bool) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let cache = token_cache_path(&cfg, account, write)?;
+    if let Some(parent) = cache.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let (client, scopes) = if write {
+        (WRITE_CLIENT, WRITE_SCOPES)
+    } else {
+        (READ_CLIENT, READ_SCOPES)
+    };
+    let now = unix_now().parse::<u64>().unwrap_or(0);
+    let tokens = isyncyou_graph::auth::flow::device_code_login(client, scopes, now, |dc| {
+        eprintln!(
+            "To sign in, open {} and enter code: {}",
+            dc.verification_uri, dc.user_code
+        );
+        eprintln!("{}", dc.message);
+    })?;
+    tokens.save(&cache).map_err(|e| e.to_string())?;
+    println!(
+        "login OK for '{account}' ({}); token cached at {}",
+        if write { "write" } else { "read" },
+        cache.display()
+    );
+    Ok(())
 }
 
 fn cmd_serve(config: &Path, bind: &str) -> Result<(), String> {
@@ -237,7 +345,7 @@ fn unix_now() -> String {
 
 fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), String> {
     let cfg = load_config(config)?;
-    let token = token.ok_or("no access token (pass --token or set ISYNCYOU_TOKEN)")?;
+    let token = resolve_token(&cfg, account, token, false)?;
     let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
     let mut map = MappingTable::new();
     let mut client = isyncyou_graph::GraphClient::new(token);
@@ -269,7 +377,7 @@ fn cmd_backup(
     token: Option<String>,
 ) -> Result<(), String> {
     let cfg = load_config(config)?;
-    let token = token.ok_or("no access token (pass --token or set ISYNCYOU_TOKEN)")?;
+    let token = resolve_token(&cfg, account, token, false)?;
     let acc = cfg
         .accounts
         .iter()
@@ -462,7 +570,7 @@ fn cmd_restore(
             RESTORE_SERVICES.join("|")
         ));
     }
-    let token = token.ok_or("no access token (pass --token or set ISYNCYOU_TOKEN)")?;
+    let token = resolve_token(&cfg, account, token, true)?;
     let acc = cfg
         .accounts
         .iter()
@@ -758,6 +866,45 @@ mod tests {
         assert!(search_account(&cfg, "a", "nonexistentterm")
             .unwrap()
             .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_login() {
+        let c = parse(&["isyncyou", "login", "--account", "a", "--write"]).unwrap();
+        assert_eq!(
+            c.command,
+            Command::Login {
+                config: "isyncyou.toml".into(),
+                account: "a".into(),
+                write: true,
+            }
+        );
+        let c2 = parse(&["isyncyou", "login", "--account", "a"]).unwrap();
+        match c2.command {
+            Command::Login { write, .. } => assert!(!write),
+            other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_token_prefers_explicit_else_requires_login() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-tok-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        let cfg = load_config(&p).unwrap();
+        // explicit token wins, no cache needed
+        assert_eq!(
+            resolve_token(&cfg, "a", Some("TOK".into()), false).unwrap(),
+            "TOK"
+        );
+        // no token + no cached login -> a clear error pointing at `login`
+        let err = resolve_token(&cfg, "a", None, false).unwrap_err();
+        assert!(err.contains("isyncyou login"), "got: {err}");
+        // write variant points at --write
+        let werr = resolve_token(&cfg, "a", None, true).unwrap_err();
+        assert!(werr.contains("--write"), "got: {werr}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
