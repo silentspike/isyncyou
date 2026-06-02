@@ -4,14 +4,38 @@
 //! import (Personal accounts have no mailbox import): a fresh item is POSTed from
 //! the canonical JSON with server-managed fields (ids, etags, timestamps, links,
 //! occurrence type) dropped, so Graph assigns new ones. The new item carries the
-//! rich metadata that round-trips cleanly. This module starts with calendar
-//! events; mail/tasks/contacts follow the same shape.
+//! rich metadata that round-trips cleanly.
+//!
+//! Everything goes through one path-based [`Restorer`] (create/delete a resource
+//! by its Graph path); each `restore_*` helper picks the writable fields for its
+//! type and posts to the right collection.
 
 use serde_json::{Map, Value};
 
-/// The event fields Graph accepts on `POST /me/events`. Building the payload from
-/// a whitelist (rather than stripping a denylist) guarantees the create is
-/// accepted even as Graph adds new read-only fields over time.
+/// Re-creates and (for restore-undo / test cleanup) deletes cloud resources by
+/// their Graph collection / resource path. Abstracted so the restore helpers are
+/// unit-testable with a mock and live-tested with the real client.
+pub trait Restorer {
+    /// POST `body` to a collection path (e.g. `/me/events`); return the created
+    /// resource JSON.
+    fn create(&self, collection_path: &str, body: &Value) -> Result<Value, String>;
+    /// DELETE a resource path (e.g. `/me/events/{id}`).
+    fn delete(&self, resource_path: &str) -> Result<(), String>;
+}
+
+#[cfg(feature = "http")]
+impl Restorer for isyncyou_graph::GraphClient {
+    fn create(&self, collection_path: &str, body: &Value) -> Result<Value, String> {
+        self.post_json(collection_path, body)
+            .map_err(|e| e.to_string())
+    }
+    fn delete(&self, resource_path: &str) -> Result<(), String> {
+        self.delete_url(resource_path).map_err(|e| e.to_string())
+    }
+}
+
+/// Fields Graph accepts on `POST /me/events`. A whitelist (not a denylist)
+/// guarantees the create is accepted even as Graph adds read-only fields.
 const EVENT_WRITABLE: &[&str] = &[
     "subject",
     "body",
@@ -33,12 +57,48 @@ const EVENT_WRITABLE: &[&str] = &[
     "hideAttendees",
 ];
 
-/// Build a POST-able event payload from a stored/fetched event, keeping only
-/// writable fields (drops `id`/etag/timestamps/links/`type`, etc.).
-pub fn sanitize_event(event: &Value) -> Value {
+/// Fields Graph accepts on `POST /me/todo/lists/{id}/tasks`.
+const TASK_WRITABLE: &[&str] = &[
+    "title",
+    "body",
+    "importance",
+    "status",
+    "isReminderOn",
+    "reminderDateTime",
+    "dueDateTime",
+    "startDateTime",
+    "completedDateTime",
+    "categories",
+    "recurrence",
+];
+
+/// Fields Graph accepts on `POST /me/contacts`.
+const CONTACT_WRITABLE: &[&str] = &[
+    "givenName",
+    "surname",
+    "middleName",
+    "nickName",
+    "displayName",
+    "title",
+    "companyName",
+    "jobTitle",
+    "department",
+    "emailAddresses",
+    "businessPhones",
+    "homePhones",
+    "mobilePhone",
+    "homeAddress",
+    "businessAddress",
+    "personalNotes",
+    "birthday",
+    "categories",
+];
+
+/// Keep only the whitelisted, non-null fields of an object.
+fn pick(value: &Value, keys: &[&str]) -> Value {
     let mut out = Map::new();
-    if let Some(obj) = event.as_object() {
-        for &k in EVENT_WRITABLE {
+    if let Some(obj) = value.as_object() {
+        for &k in keys {
             match obj.get(k) {
                 Some(v) if !v.is_null() => {
                     out.insert(k.to_string(), v.clone());
@@ -50,36 +110,58 @@ pub fn sanitize_event(event: &Value) -> Value {
     Value::Object(out)
 }
 
-/// Re-creates (and, for test cleanup, deletes) a calendar event in the cloud.
-pub trait EventRestorer {
-    fn create_event(&self, event: &Value) -> Result<Value, String>;
-    fn delete_event(&self, id: &str) -> Result<(), String>;
+/// Build a POST-able event payload (drops id/etag/timestamps/links/`type`, etc.).
+pub fn sanitize_event(event: &Value) -> Value {
+    pick(event, EVENT_WRITABLE)
+}
+/// Build a POST-able task payload.
+pub fn sanitize_task(task: &Value) -> Value {
+    pick(task, TASK_WRITABLE)
+}
+/// Build a POST-able contact payload.
+pub fn sanitize_contact(contact: &Value) -> Value {
+    pick(contact, CONTACT_WRITABLE)
 }
 
-#[cfg(feature = "http")]
-impl EventRestorer for isyncyou_graph::GraphClient {
-    fn create_event(&self, event: &Value) -> Result<Value, String> {
-        self.post_json("/me/events", event)
-            .map_err(|e| e.to_string())
-    }
-    fn delete_event(&self, id: &str) -> Result<(), String> {
-        self.delete_url(&format!("/me/events/{id}"))
-            .map_err(|e| e.to_string())
-    }
-}
-
-/// Restore one calendar event: sanitize → create → return the new event id.
-pub fn restore_event<R: EventRestorer>(restorer: &R, event: &Value) -> Result<String, String> {
-    let payload = sanitize_event(event);
-    if payload.as_object().map(Map::is_empty).unwrap_or(true) {
-        return Err("event has no restorable fields".into());
-    }
-    let created = restorer.create_event(&payload)?;
+fn created_id(created: Value) -> Result<String, String> {
     created
         .get("id")
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| "create response had no id".into())
+}
+
+fn require_nonempty(p: &Value, what: &str) -> Result<(), String> {
+    if p.as_object().map(Map::is_empty).unwrap_or(true) {
+        Err(format!("{what} has no restorable fields"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Restore one calendar event: sanitize → `POST /me/events` → new event id.
+pub fn restore_event<R: Restorer>(restorer: &R, event: &Value) -> Result<String, String> {
+    let payload = sanitize_event(event);
+    require_nonempty(&payload, "event")?;
+    created_id(restorer.create("/me/events", &payload)?)
+}
+
+/// Restore one task into `list_id`: sanitize → `POST .../tasks` → new task id.
+pub fn restore_task<R: Restorer>(
+    restorer: &R,
+    list_id: &str,
+    task: &Value,
+) -> Result<String, String> {
+    let payload = sanitize_task(task);
+    require_nonempty(&payload, "task")?;
+    created_id(restorer.create(&format!("/me/todo/lists/{list_id}/tasks"), &payload)?)
+}
+
+/// Restore one contact: sanitize → `POST /me/contacts` → new contact id.
+pub fn restore_contact<R: Restorer>(restorer: &R, contact: &Value) -> Result<String, String> {
+    let payload = sanitize_contact(contact);
+    require_nonempty(&payload, "contact")?;
+    created_id(restorer.create("/me/contacts", &payload)?)
 }
 
 #[cfg(test)]
@@ -88,96 +170,125 @@ mod tests {
     use serde_json::json;
     use std::cell::RefCell;
 
+    /// Records every (path, body) created and every path deleted; echoes a new id.
     struct MockRestorer {
-        posted: RefCell<Option<Value>>,
+        created: RefCell<Vec<(String, Value)>>,
         deleted: RefCell<Vec<String>>,
     }
     impl MockRestorer {
         fn new() -> Self {
             MockRestorer {
-                posted: RefCell::new(None),
+                created: RefCell::new(Vec::new()),
                 deleted: RefCell::new(Vec::new()),
             }
         }
     }
-    impl EventRestorer for MockRestorer {
-        fn create_event(&self, event: &Value) -> Result<Value, String> {
-            *self.posted.borrow_mut() = Some(event.clone());
-            Ok(json!({ "id": "NEWEV", "subject": event.get("subject") }))
+    impl Restorer for MockRestorer {
+        fn create(&self, path: &str, body: &Value) -> Result<Value, String> {
+            self.created
+                .borrow_mut()
+                .push((path.to_string(), body.clone()));
+            Ok(json!({ "id": "NEW", "echo": body }))
         }
-        fn delete_event(&self, id: &str) -> Result<(), String> {
-            self.deleted.borrow_mut().push(id.to_string());
+        fn delete(&self, path: &str) -> Result<(), String> {
+            self.deleted.borrow_mut().push(path.to_string());
             Ok(())
         }
     }
 
     fn full_event() -> Value {
         json!({
-            "id": "AAMkOLD",
-            "@odata.etag": "W/\"abc\"",
-            "changeKey": "abc",
-            "createdDateTime": "2026-01-01T00:00:00Z",
-            "lastModifiedDateTime": "2026-01-02T00:00:00Z",
-            "webLink": "https://outlook.live.com/...",
-            "iCalUId": "040000...",
+            "id": "AAMkOLD", "@odata.etag": "W/\"abc\"", "changeKey": "abc",
+            "createdDateTime": "2026-01-01T00:00:00Z", "lastModifiedDateTime": "2026-01-02T00:00:00Z",
+            "webLink": "https://outlook.live.com/...", "iCalUId": "040000...",
             "type": "singleInstance",
             "organizer": { "emailAddress": { "address": "backupslave@outlook.com" } },
             "subject": "Quarterly review",
             "body": { "contentType": "html", "content": "<p>agenda</p>" },
             "start": { "dateTime": "2026-03-01T09:00:00", "timeZone": "UTC" },
             "end": { "dateTime": "2026-03-01T10:00:00", "timeZone": "UTC" },
-            "location": { "displayName": "Room 1" },
-            "categories": ["Blue category"],
-            "isAllDay": false
+            "location": { "displayName": "Room 1" }, "categories": ["Blue category"], "isAllDay": false
+        })
+    }
+    fn full_task() -> Value {
+        json!({
+            "id": "TASKOLD", "@odata.etag": "W/\"t\"", "createdDateTime": "2026-01-01T00:00:00Z",
+            "lastModifiedDateTime": "2026-01-02T00:00:00Z",
+            "title": "Write report", "status": "notStarted", "importance": "high",
+            "body": { "content": "draft the Q2 report", "contentType": "text" },
+            "dueDateTime": { "dateTime": "2026-03-10T00:00:00", "timeZone": "UTC" }
+        })
+    }
+    fn full_contact() -> Value {
+        json!({
+            "id": "CTOLD", "@odata.etag": "W/\"c\"", "createdDateTime": "2026-01-01T00:00:00Z",
+            "displayName": "Ada Lovelace", "givenName": "Ada", "surname": "Lovelace",
+            "emailAddresses": [{ "address": "ada@example.com", "name": "Ada Lovelace" }],
+            "mobilePhone": "+1 555 0100"
         })
     }
 
     #[test]
-    fn sanitize_keeps_writable_drops_server_fields() {
+    fn sanitize_event_keeps_writable_drops_server_fields() {
         let s = sanitize_event(&full_event());
-        // server-managed fields gone
         for k in [
             "id",
             "@odata.etag",
             "changeKey",
             "createdDateTime",
-            "lastModifiedDateTime",
             "webLink",
-            "iCalUId",
             "type",
             "organizer",
         ] {
             assert!(s.get(k).is_none(), "{k} should be stripped");
         }
-        // writable fields preserved
         assert_eq!(s.get("subject").unwrap(), "Quarterly review");
-        assert!(s.get("start").is_some());
-        assert!(s.get("end").is_some());
-        assert_eq!(s.get("categories").unwrap(), &json!(["Blue category"]));
+        assert!(s.get("start").is_some() && s.get("end").is_some());
     }
 
     #[test]
-    fn restore_event_posts_sanitized_and_returns_new_id() {
+    fn restore_event_posts_to_events_path_sanitized() {
         let m = MockRestorer::new();
-        let id = restore_event(&m, &full_event()).unwrap();
-        assert_eq!(id, "NEWEV");
-        let posted = m.posted.borrow();
-        let posted = posted.as_ref().unwrap();
-        assert!(posted.get("id").is_none(), "must not post the old id");
-        assert_eq!(posted.get("subject").unwrap(), "Quarterly review");
+        assert_eq!(restore_event(&m, &full_event()).unwrap(), "NEW");
+        let c = m.created.borrow();
+        assert_eq!(c[0].0, "/me/events");
+        assert!(c[0].1.get("id").is_none());
+        assert_eq!(c[0].1.get("subject").unwrap(), "Quarterly review");
     }
 
     #[test]
-    fn event_without_writable_fields_is_rejected() {
+    fn restore_task_posts_to_list_path_sanitized() {
         let m = MockRestorer::new();
-        let err = restore_event(&m, &json!({ "id": "x", "@odata.etag": "y" })).unwrap_err();
-        assert!(err.contains("no restorable fields"));
-        assert!(m.posted.borrow().is_none());
+        assert_eq!(restore_task(&m, "LIST1", &full_task()).unwrap(), "NEW");
+        let c = m.created.borrow();
+        assert_eq!(c[0].0, "/me/todo/lists/LIST1/tasks");
+        assert!(c[0].1.get("id").is_none() && c[0].1.get("@odata.etag").is_none());
+        assert_eq!(c[0].1.get("title").unwrap(), "Write report");
+        assert_eq!(c[0].1.get("importance").unwrap(), "high");
     }
 
-    /// Live round-trip: fetch one of the account's events, restore it as a new
-    /// event, verify the subject matches, then delete the copy. Needs feature
-    /// `http` + `ISYNCYOU_TEST_WRITE_TOKEN` carrying `Calendars.ReadWrite`.
+    #[test]
+    fn restore_contact_posts_to_contacts_path_sanitized() {
+        let m = MockRestorer::new();
+        assert_eq!(restore_contact(&m, &full_contact()).unwrap(), "NEW");
+        let c = m.created.borrow();
+        assert_eq!(c[0].0, "/me/contacts");
+        assert!(c[0].1.get("id").is_none());
+        assert_eq!(c[0].1.get("displayName").unwrap(), "Ada Lovelace");
+        assert!(c[0].1.get("emailAddresses").is_some());
+    }
+
+    #[test]
+    fn empty_payloads_are_rejected() {
+        let m = MockRestorer::new();
+        assert!(restore_event(&m, &json!({ "id": "x" })).is_err());
+        assert!(restore_task(&m, "L", &json!({ "id": "x" })).is_err());
+        assert!(restore_contact(&m, &json!({ "id": "x" })).is_err());
+        assert!(m.created.borrow().is_empty());
+    }
+
+    /// Live round-trip: fetch one event, restore it, verify subject, delete copy.
+    /// Needs `http` + `ISYNCYOU_TEST_WRITE_TOKEN` (`Calendars.ReadWrite`).
     #[cfg(feature = "http")]
     #[test]
     fn live_restore_event_roundtrip() {
@@ -192,24 +303,23 @@ mod tests {
             }
         };
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let list = client.get("https://graph.microsoft.com/v1.0/me/events?$top=1");
-        let body = match list.body {
+        let body = match client
+            .get("https://graph.microsoft.com/v1.0/me/events?$top=1")
+            .body
+        {
             Some(b) => b,
             None => {
-                eprintln!(
-                    "events list returned no body (HTTP {}); skipping",
-                    list.status
-                );
+                eprintln!("events list returned no body; skipping");
                 return;
             }
         };
-        let event = body
+        let Some(event) = body
             .get("value")
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
-            .cloned();
-        let Some(event) = event else {
-            eprintln!("account has no events to restore; skipping");
+            .cloned()
+        else {
+            eprintln!("no events to restore; skipping");
             return;
         };
         let subject = event
@@ -217,29 +327,135 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-
         let new_id = restore_event(&client, &event).expect("restore should succeed");
-        assert!(!new_id.is_empty());
-
         let restored = client
             .get(&format!(
                 "https://graph.microsoft.com/v1.0/me/events/{new_id}"
             ))
             .body
-            .expect("GET restored event should have a body");
+            .expect("GET restored event");
         assert_eq!(
             restored
                 .get("subject")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            subject,
-            "restored event subject must match the original"
+            subject
         );
         eprintln!("restored event '{subject}' as {new_id}");
-
         client
-            .delete_event(&new_id)
-            .expect("cleanup delete should succeed");
-        eprintln!("cleaned up restored event {new_id}");
+            .delete(&format!("/me/events/{new_id}"))
+            .expect("cleanup");
+    }
+
+    /// Live round-trip: fetch one task list + a task, restore into that list,
+    /// verify the title, delete the copy. Needs `Tasks.ReadWrite`.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_restore_task_roundtrip() {
+        use isyncyou_graph::Transport;
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_restore_task_roundtrip: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let lists = client
+            .get("https://graph.microsoft.com/v1.0/me/todo/lists?$top=1")
+            .body
+            .and_then(|b| {
+                b.get("value")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .cloned()
+            });
+        let Some(list) = lists else {
+            eprintln!("no task lists; skipping");
+            return;
+        };
+        let list_id = list.get("id").and_then(Value::as_str).unwrap().to_string();
+        let task = client
+            .get(&format!(
+                "https://graph.microsoft.com/v1.0/me/todo/lists/{list_id}/tasks?$top=1"
+            ))
+            .body
+            .and_then(|b| {
+                b.get("value")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .cloned()
+            });
+        let Some(task) = task else {
+            eprintln!("no tasks in the first list; skipping");
+            return;
+        };
+        let title = task
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let new_id = restore_task(&client, &list_id, &task).expect("restore task should succeed");
+        let restored = client
+            .get(&format!(
+                "https://graph.microsoft.com/v1.0/me/todo/lists/{list_id}/tasks/{new_id}"
+            ))
+            .body
+            .expect("GET restored task");
+        assert_eq!(
+            restored.get("title").and_then(Value::as_str).unwrap_or(""),
+            title
+        );
+        eprintln!("restored task '{title}' as {new_id} in list {list_id}");
+        client
+            .delete(&format!("/me/todo/lists/{list_id}/tasks/{new_id}"))
+            .expect("cleanup");
+    }
+
+    /// Live round-trip: create a synthetic contact (the account has none to
+    /// fetch), verify it, delete it. Needs `Contacts.ReadWrite`.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_restore_contact_roundtrip() {
+        use isyncyou_graph::Transport;
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_restore_contact_roundtrip: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let synthetic = json!({
+            "id": "SHOULD_BE_STRIPPED",
+            "@odata.etag": "W/\"x\"",
+            "displayName": "iSyncYou Restore Test",
+            "givenName": "iSyncYou",
+            "surname": "RestoreTest",
+            "emailAddresses": [{ "address": "isyncyou-test@example.com", "name": "iSyncYou Restore Test" }],
+            "mobilePhone": "+1 555 0123"
+        });
+        let new_id = restore_contact(&client, &synthetic).expect("restore contact should succeed");
+        let restored = client
+            .get(&format!(
+                "https://graph.microsoft.com/v1.0/me/contacts/{new_id}"
+            ))
+            .body
+            .expect("GET restored contact");
+        assert_eq!(
+            restored
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "iSyncYou Restore Test"
+        );
+        eprintln!("restored synthetic contact as {new_id}");
+        client
+            .delete(&format!("/me/contacts/{new_id}"))
+            .expect("cleanup");
     }
 }
