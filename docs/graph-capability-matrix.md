@@ -1,6 +1,8 @@
 # Microsoft Graph Capability Matrix (Personal/Family)
 
-> Status: draft · Phase -1 spike (#35) · Test account: `backupslave@outlook.com` (dedicated throwaway)
+> Status: spike findings + **live-verified by the Rust connectors** (see the
+> "iSyncYou connector status" section at the bottom) · Phase -1 spike (#35) ·
+> Test account: `backupslave@outlook.com` (dedicated throwaway)
 > Apps: `backup_read` (`cee80dd9…`, full read scopes) · `backup_write` (`a90d9140…`, full write scopes except OneNote)
 > Authority: `https://login.microsoftonline.com/consumers` (PersonalMicrosoftAccount)
 
@@ -105,3 +107,27 @@ Two evidence sources:
 ## Reuse decision
 
 Mail/Calendar/ToDo/Categories Graph behaviour + the SQLite/FTS5 data model + restore logic + viewer templates are **already proven in `/backup`** and are reused (re-implemented in Rust) for iSyncYou Phase 2. The spike effort concentrates on the genuinely new/risky parts: **OneDrive bidirectional sync** (done here) + Contacts + OneNote write enablement.
+
+---
+
+## iSyncYou connector status (live-verified in Rust)
+
+The connectors are now implemented in the `isyncyou-connectors` crate and each was
+run live against `backupslave` (env-gated tests; CI without a token skips). This
+**closes the spike's open items**: OneDrive `410`→resync and delete→tombstone are
+implemented and unit-tested; Contacts is implemented and the live default-collection
+delta + cursor were verified; OneNote uses a full-list reconcile (no delta).
+
+| Service | Connector | Index live result | Body live result |
+|---|---|---|---|
+| OneDrive | `onedrive` (bidirectional) | delta + cursor + `410`-resync + tombstones | resumable up/download, byte-identical |
+| Mail | `mail` (per-folder delta) | 8 folders, 162 messages | 3 `.eml` downloaded (68,937 B) |
+| Calendar | `calendar` (windowed delta) | 1 calendar, 9 events | 3 event JSON archived |
+| Contacts | `contacts` (default + folders) | default delta + cursor (0 contacts present) | — |
+| ToDo | `todo` (per-list delta) | 2 lists, 5 tasks | 3 task JSON archived |
+| OneNote | `onenote` (full-list reconcile) | walk ran (0 pages — no notebook) | HTML body endpoint wired |
+
+End-to-end via the CLI: `isyncyou backup` indexed 162 mails / 9 events / 5 tasks and
+archived bodies to a sharded store in one run; `isyncyou restore` re-created an
+archived event in the cloud (then cleanup-deleted it). Restore detail in
+[`restore-fidelity-matrix.md`](restore-fidelity-matrix.md).
