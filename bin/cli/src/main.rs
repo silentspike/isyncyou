@@ -1,10 +1,14 @@
 //! `isyncyou` — command-line interface for the iSyncYou engine.
 //!
 //! Wires the config, store and connectors into a usable tool:
-//! - `check`  — validate a config file
-//! - `status` — show tracked-item counts + delta cursor for an account
-//! - `sync`   — run one incremental OneDrive sync for an account
-//! - `backup` — index + archive M365 services (mail/calendar/contacts/todo/onenote)
+//! - `check`   — validate a config file
+//! - `status`  — show tracked-item counts + delta cursor for an account
+//! - `sync`    — run one incremental OneDrive sync for an account
+//! - `backup`  — index + archive M365 services (mail/calendar/contacts/todo/onenote)
+//! - `search`  — full-text search the archive (item names + indexed mail bodies)
+//! - `restore` — re-create an archived item in the cloud
+//! - `migrate` — move an account's archive directory
+//! - `serve`   — serve the local web UI
 //!
 //! Until OAuth lands (#40) the access token is supplied via `--token`/`ISYNCYOU_TOKEN`.
 
@@ -305,9 +309,16 @@ fn cmd_backup(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                // Index body text for full-text search when enabled (privacy/space opt-in).
+                let indexed = if cfg.sync.body_index {
+                    connectors::index_mail_bodies(&store, account, &archive_root, 0)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    0
+                };
                 format!(
-                    "mail: {} folders, {} indexed, {} deleted; {} .eml archived ({} bytes)",
-                    r.folders, r.upserted, r.deleted, b.downloaded, b.bytes
+                    "mail: {} folders, {} indexed, {} deleted; {} .eml archived ({} bytes); {} bodies FTS-indexed",
+                    r.folders, r.upserted, r.deleted, b.downloaded, b.bytes, indexed
                 )
             }
             "calendar" => {
@@ -395,9 +406,29 @@ fn search_account(
     query: &str,
 ) -> Result<Vec<isyncyou_store::Item>, String> {
     let store = Store::open(store_path(cfg, account)?).map_err(|e| e.to_string())?;
-    store
+    // names (subjects/titles/filenames) ...
+    let mut hits = store
         .search_names(account, query)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let mut seen: std::collections::HashSet<(String, String)> = hits
+        .iter()
+        .map(|i| (i.service.clone(), i.remote_id.clone()))
+        .collect();
+    // ... merged with indexed bodies (e.g. mail text), de-duplicated.
+    for (service, remote_id) in store
+        .search_bodies(account, query)
+        .map_err(|e| e.to_string())?
+    {
+        if seen.insert((service.clone(), remote_id.clone())) {
+            if let Some(it) = store
+                .get_item(account, &service, &remote_id)
+                .map_err(|e| e.to_string())?
+            {
+                hits.push(it);
+            }
+        }
+    }
+    Ok(hits)
 }
 
 fn cmd_search(config: &Path, account: &str, query: &str) -> Result<(), String> {
@@ -727,6 +758,33 @@ mod tests {
         assert!(search_account(&cfg, "a", "nonexistentterm")
             .unwrap()
             .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_account_includes_body_hits() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-sb-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a", "mail", "m1", "Receipt", "message",
+                ))
+                .unwrap();
+            store
+                .index_body("a", "mail", "m1", "the warranty covers two years")
+                .unwrap();
+        }
+        let cfg = load_config(&p).unwrap();
+        // a term only in the body (not the name) is found via the body index
+        let hits = search_account(&cfg, "a", "warranty").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].remote_id, "m1");
+        // a name term still works, and results are not duplicated
+        assert_eq!(search_account(&cfg, "a", "receipt").unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
