@@ -62,8 +62,37 @@ impl Report {
 /// Minimum free space (bytes) below which disk is flagged.
 const MIN_FREE: u64 = 100 * 1024 * 1024; // 100 MiB
 
+/// Sibling binaries the install should provide next to the doctor.
+const SIBLING_BINS: &[&str] = &["isyncyou", "isyncyoud"];
+
+/// Install-integrity check: are the sibling binaries present in `dir`?
+fn check_install(dir: &Path) -> (Level, String) {
+    let missing: Vec<&str> = SIBLING_BINS
+        .iter()
+        .copied()
+        .filter(|b| !dir.join(b).exists())
+        .collect();
+    if missing.is_empty() {
+        (Level::Ok, format!("{} present", SIBLING_BINS.join(" + ")))
+    } else {
+        (
+            Level::Warn,
+            format!("missing sibling binaries: {}", missing.join(", ")),
+        )
+    }
+}
+
 fn run_checks(config_path: &Path) -> Report {
     let mut r = Report::default();
+
+    // Install integrity: the CLI + daemon should sit next to the doctor.
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        let (lvl, det) = check_install(&dir);
+        r.push("install", lvl, det);
+    }
 
     let cfg = match Config::load(config_path) {
         Ok(c) => {
@@ -128,6 +157,22 @@ fn run_checks(config_path: &Path) -> Report {
                 Level::Warn,
                 "could not determine free space",
             ),
+        }
+
+        // auth: a cached login token lets the daemon/CLI run unattended
+        let read_tok = acc.archive_root.join(".isyncyou-token-read.json");
+        if read_tok.exists() {
+            r.push(
+                &format!("auth[{}]", acc.id),
+                Level::Ok,
+                "login token cached",
+            );
+        } else {
+            r.push(
+                &format!("auth[{}]", acc.id),
+                Level::Warn,
+                "no cached login token — run `isyncyou login`",
+            );
         }
     }
 
@@ -198,9 +243,58 @@ mod tests {
     #[test]
     fn missing_config_is_fail() {
         let r = run_checks(Path::new("/nonexistent/iSyncYou-doctor-xyz.toml"));
-        assert_eq!(r.checks.len(), 1);
-        assert_eq!(r.checks[0].level, Level::Fail);
+        // an install check may precede it, but a missing config is a hard fail
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "config" && c.level == Level::Fail));
         assert_eq!(r.worst(), Level::Fail);
+    }
+
+    #[test]
+    fn check_install_present_vs_missing() {
+        let dir = std::env::temp_dir().join(format!("doctor-inst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // missing -> warn
+        assert_eq!(check_install(&dir).0, Level::Warn);
+        // present -> ok
+        for b in SIBLING_BINS {
+            std::fs::write(dir.join(b), b"x").unwrap();
+        }
+        assert_eq!(check_install(&dir).0, Level::Ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_login_token_is_an_auth_warning() {
+        let dir = std::env::temp_dir().join(format!("doctor-auth-{}", std::process::id()));
+        let arch = dir.join("archive");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = dir.join("c.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[[accounts]]\nid=\"a\"\nusername=\"a@x\"\nsync_root=\"{}/od\"\narchive_root=\"{}\"\n",
+                dir.display(),
+                arch.display()
+            ),
+        )
+        .unwrap();
+        let r = run_checks(&p);
+        // no cached token -> an auth warning, but not a hard fail
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "auth[a]" && c.level == Level::Warn));
+        assert_ne!(r.worst(), Level::Fail);
+        // with a token file present -> auth ok
+        std::fs::write(arch.join(".isyncyou-token-read.json"), b"{}").unwrap();
+        let r2 = run_checks(&p);
+        assert!(r2
+            .checks
+            .iter()
+            .any(|c| c.name == "auth[a]" && c.level == Level::Ok));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
