@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iSyncYou — Archive</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #0c121d; color: #e6edf6; }
+  header { padding: 16px 20px; background: #111a28; border-bottom: 1px solid #1d2942; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .logo { width: 26px; height: 26px; border-radius: 7px; background: #1d4ed8; }
+  main { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 59px); }
+  nav { border-right: 1px solid #1d2942; padding: 14px; }
+  nav h2 { font-size: 12px; text-transform: uppercase; color: #8e9db3; letter-spacing: .05em; }
+  nav button { display: block; width: 100%; text-align: left; margin: 2px 0; padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; color: #cdd6e4; cursor: pointer; }
+  nav button:hover, nav button.active { background: #18233a; color: #fff; }
+  section { padding: 18px 22px; }
+  .bar { display: flex; gap: 10px; margin-bottom: 14px; }
+  select, input { background: #0f1626; color: #e6edf6; border: 1px solid #25324e; border-radius: 8px; padding: 8px 10px; }
+  input { flex: 1; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #18233a; font-size: 14px; }
+  th { color: #8e9db3; font-weight: 600; }
+  .badge { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: #18233a; color: #8ec6ff; }
+  .muted { color: #8e9db3; }
+</style>
+</head>
+<body>
+<header><div class="logo"></div><h1>iSyncYou — Archive</h1><span class="muted" id="acct"></span></header>
+<main>
+  <nav>
+    <h2>Account</h2>
+    <select id="account"></select>
+    <h2 style="margin-top:18px">Service</h2>
+    <div id="services"></div>
+  </nav>
+  <section>
+    <div class="bar">
+      <input id="q" placeholder="Search names / subjects…">
+      <button onclick="doSearch()">Search</button>
+    </div>
+    <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+    </table>
+  </section>
+</main>
+<script>
+const SERVICES = ["mail", "calendar", "contacts", "todo", "onenote"];
+let account = null, service = "mail";
+
+async function api(path) { const r = await fetch(path); return r.json(); }
+
+function render(items) {
+  const tb = document.getElementById("rows");
+  if (!items.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">No items.</td></tr>'; return; }
+  tb.innerHTML = items.map(it => `<tr>
+    <td><span class="badge">${it.item_type}</span></td>
+    <td>${escapeHtml(it.name)}</td>
+    <td class="muted">${it.remote_mtime || ""}</td>
+    <td>${it.has_body ? "✓" : "—"}</td></tr>`).join("");
+}
+function escapeHtml(s) { return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+async function loadItems() {
+  const d = await api(`/api/v1/items?account=${encodeURIComponent(account)}&service=${service}`);
+  render(d.items || []);
+}
+async function doSearch() {
+  const q = document.getElementById("q").value.trim();
+  if (!q) return loadItems();
+  const d = await api(`/api/v1/search?account=${encodeURIComponent(account)}&q=${encodeURIComponent(q)}`);
+  render(d.hits || []);
+}
+function pickService(s) {
+  service = s;
+  [...document.querySelectorAll("#services button")].forEach(b => b.classList.toggle("active", b.textContent === s));
+  loadItems();
+}
+async function init() {
+  document.getElementById("services").innerHTML =
+    SERVICES.map(s => `<button onclick="pickService('${s}')"${s===service?' class="active"':''}>${s}</button>`).join("");
+  const d = await api("/api/v1/accounts");
+  const sel = document.getElementById("account");
+  sel.innerHTML = (d.accounts || []).map(a => `<option value="${a.id}">${escapeHtml(a.username)}</option>`).join("");
+  sel.onchange = () => { account = sel.value; loadItems(); };
+  if (d.accounts && d.accounts.length) { account = d.accounts[0].id; document.getElementById("acct").textContent = d.accounts[0].username; loadItems(); }
+}
+init();
+</script>
+</body>
+</html>
