@@ -10,6 +10,7 @@
 //!
 //! This completes the Phase-2 backup connector set.
 
+pub mod archive;
 pub mod calendar;
 mod common;
 pub mod contacts;
@@ -19,6 +20,9 @@ pub mod onenote;
 pub mod restore;
 pub mod todo;
 
+pub use archive::{
+    backup_calendar_bodies, backup_contacts_bodies, backup_json_bodies, ArchiveReport, JsonFetcher,
+};
 pub use calendar::{incremental_sync_calendar, CalendarReport};
 pub use contacts::{incremental_sync_contacts, ContactsReport};
 pub use mail::{backup_message_bodies, incremental_sync_mail, BodyReport, MailReport, MimeFetcher};
