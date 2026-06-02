@@ -383,6 +383,19 @@ mod tests {
     }
 
     #[test]
+    fn index_lists_all_store_services() {
+        // every service that can hold archived items is a browsable tab
+        for svc in [
+            "onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("\"{svc}\"")),
+                "web UI is missing the '{svc}' service tab"
+            );
+        }
+    }
+
+    #[test]
     fn accounts_lists_configured_accounts() {
         let (_d, router) = setup();
         let resp = router.route(&ApiRequest::get("/api/v1/accounts"));
