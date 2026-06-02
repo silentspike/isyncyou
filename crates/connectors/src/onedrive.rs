@@ -256,6 +256,55 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Days since the Unix epoch for a civil (proleptic-Gregorian) date — Howard
+/// Hinnant's algorithm. `month` is 1..=12.
+fn days_from_civil(y: i64, month: i64, d: i64) -> i64 {
+    let y = if month <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12; // Mar=0 … Feb=11
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parse a Graph RFC3339 timestamp (e.g. `2024-01-02T03:04:05Z` or with
+/// fractional seconds) into seconds since the Unix epoch. Assumes UTC (Graph
+/// returns `Z`); fractional seconds and any trailing zone are ignored. Returns
+/// `None` on a malformed string — best-effort, never panics.
+fn rfc3339_to_unix(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let num = |a: usize, b: usize| s.get(a..b)?.parse::<i64>().ok();
+    let y = num(0, 4)?;
+    let mo = num(5, 7)?;
+    let d = num(8, 10)?;
+    let h = num(11, 13)?;
+    let mi = num(14, 16)?;
+    let se = num(17, 19)?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Best-effort: set a just-materialized file's mtime to its cloud
+/// `lastModifiedDateTime`, so local timestamps mirror the cloud (plan §6) instead
+/// of showing the download time. Silently does nothing on a bad timestamp or a
+/// platform that rejects the set.
+fn set_file_mtime(path: &Path, remote_mtime: &str) {
+    if let Some(secs) = rfc3339_to_unix(remote_mtime) {
+        if secs >= 0 {
+            if let Ok(f) = std::fs::File::open(path) {
+                let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+                let _ = f.set_modified(when);
+            }
+        }
+    }
+}
+
 /// Materialize **remote-dirty** OneDrive items to disk under `sync_root`: create
 /// folders, download file content, write it atomically, and mark each item
 /// `clean` so a re-run skips it. This is the missing half of the remote→local
@@ -304,6 +353,10 @@ pub fn materialize_downloads<D: Downloader>(
                 match downloader.download(&it.remote_id) {
                     Ok(bytes) => match atomic_write(&full, &bytes) {
                         Ok(()) => {
+                            // mirror the cloud's last-modified time onto the local file
+                            if let Some(mt) = &it.remote_mtime {
+                                set_file_mtime(&full, mt);
+                            }
                             store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
                             report.downloaded += 1;
                         }
@@ -798,6 +851,7 @@ mod tests {
         file.parent_remote_id = Some("F1".into());
         file.local_path = Some("IMG.jpg".into());
         file.sync_state = "remote_dirty".into();
+        file.remote_mtime = Some("2024-01-02T03:04:05Z".into());
         store.upsert_item(&file).unwrap();
 
         let dl = MockDownloader(
@@ -814,6 +868,16 @@ mod tests {
         // the file is on disk under Photos/ with the right content
         let path = dir.path().join("Photos").join("IMG.jpg");
         assert_eq!(std::fs::read(&path).unwrap(), b"JPEGDATA");
+        // its mtime mirrors the cloud lastModifiedDateTime (2024-01-02T03:04:05Z)
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(
+            secs, 1_704_164_645,
+            "mtime should match the cloud timestamp"
+        );
         // no stray temp file left in the folder
         let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("Photos"))
             .unwrap()
@@ -840,6 +904,23 @@ mod tests {
         let r2 = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
         assert_eq!(r2.downloaded, 0);
         assert_eq!(r2.dirs_created, 0);
+    }
+
+    #[test]
+    fn rfc3339_to_unix_parses_utc_timestamps() {
+        assert_eq!(rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_to_unix("2024-01-02T03:04:05Z"), Some(1_704_164_645));
+        // fractional seconds + zone are ignored (seconds-resolution)
+        assert_eq!(
+            rfc3339_to_unix("2024-01-02T03:04:05.678Z"),
+            Some(1_704_164_645)
+        );
+        // a leap-day date computes correctly
+        assert_eq!(rfc3339_to_unix("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+        // malformed → None, never panics
+        assert_eq!(rfc3339_to_unix(""), None);
+        assert_eq!(rfc3339_to_unix("not-a-date"), None);
+        assert_eq!(rfc3339_to_unix("2024-13-01T00:00:00Z"), None);
     }
 
     #[test]
