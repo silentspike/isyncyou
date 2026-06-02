@@ -233,6 +233,20 @@ impl GraphClient {
             .map_err(|e| UploadError::Transport(e.to_string()))
     }
 
+    /// GET a Graph resource as JSON (by-ref, unlike the `&mut self` [`Transport`]
+    /// poll loop). `url` may be absolute or a `/me/...` path. Used to fetch a
+    /// single item's canonical JSON for the content archive.
+    pub fn get_json(&self, url: &str) -> Result<serde_json::Value, UploadError> {
+        let url = abs(url);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        json_or_err(resp)
+    }
+
     /// Download a drive item's content by id (follows the redirect to the
     /// pre-signed download URL).
     pub fn download_content(&self, item_id: &str) -> Result<Vec<u8>, UploadError> {
