@@ -140,9 +140,10 @@ async function showOverview() {
   const ov = document.getElementById("overview");
   ov.hidden = false;
   if (!account) { ov.textContent = "No account configured."; return; }
-  const [st, cfg] = await Promise.all([
+  const [st, cfg, act] = await Promise.all([
     api(`/api/v1/status?account=${encodeURIComponent(account)}`),
     api("/api/v1/settings"),
+    api(`/api/v1/activity?account=${encodeURIComponent(account)}&limit=10`),
   ]);
   const cards = (st.services || []).map(s =>
     `<div class="card"><div class="n">${s.items} <small>items</small></div>
@@ -166,7 +167,17 @@ async function showOverview() {
        <dt>Body index (FTS)</dt><dd>${sy.body_index ? "on" : "off"}</dd>
        <dt>Change source</dt><dd>${escapeHtml(sy.change_source || "?")}</dd>
        <dt>Delete guard</dt><dd>max ${dg.max_absolute ?? "?"} abs / ${dg.max_fraction ?? "?"} fraction (min ${dg.fraction_min_total ?? "?"})</dd>
-     </dl>`;
+     </dl>` + activityHtml(act.runs || []);
+}
+function activityHtml(runs) {
+  if (!runs.length) return `<h3>Recent activity</h3><div class="muted">No runs recorded yet.</div>`;
+  const rows = runs.map(r => {
+    const ok = r.status === "ok";
+    const dot = `<span style="color:${ok ? "#4ade80" : "#f87171"}">${ok ? "●" : "●"}</span>`;
+    return `<tr><td>${dot}</td><td>${escapeHtml(r.kind)}</td>
+      <td>${escapeHtml(r.summary)}</td><td class="muted">${escapeHtml(r.finished_at)}</td></tr>`;
+  }).join("");
+  return `<h3>Recent activity</h3><table><tbody>${rows}</tbody></table>`;
 }
 async function init() {
   document.getElementById("services").innerHTML =

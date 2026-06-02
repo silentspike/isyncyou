@@ -10,6 +10,7 @@
 //! - `GET /`                      → the static UI page
 //! - `GET /api/v1/accounts`       → configured accounts
 //! - `GET /api/v1/settings`                  → effective sync settings + account roots
+//! - `GET /api/v1/activity?account[&limit]`  → recent engine runs (activity log)
 //! - `GET /api/v1/status?account`            → per-service archive counts overview
 //! - `GET /api/v1/items?account&service`     → archived items of a service
 //! - `GET /api/v1/item?account&service&id`   → one item's metadata
@@ -171,6 +172,7 @@ impl Router {
             "/" => ApiResponse::html(INDEX_HTML),
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
+            "/api/v1/activity" => self.activity(req),
             "/api/v1/status" => self.status(req),
             "/api/v1/items" => self.items(req),
             "/api/v1/item" => self.item(req),
@@ -220,6 +222,43 @@ impl Router {
             })
             .collect();
         ApiResponse::ok_json(&json!({ "sync": sync, "accounts": accounts }))
+    }
+
+    /// Recent engine runs for an account (the activity history), newest first.
+    fn activity(&self, req: &ApiRequest) -> ApiResponse {
+        let account = match req.q("account") {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "missing 'account'"),
+        };
+        let limit = req
+            .q("limit")
+            .and_then(|l| l.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(50)
+            .min(500);
+        let store = match self.open(Some(account)) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        match store.recent_runs(account, limit) {
+            Ok(runs) => {
+                let arr: Vec<Value> = runs
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "id": r.id,
+                            "kind": r.kind,
+                            "started_at": r.started_at,
+                            "finished_at": r.finished_at,
+                            "status": r.status,
+                            "summary": r.summary,
+                        })
+                    })
+                    .collect();
+                ApiResponse::ok_json(&json!({ "runs": arr, "count": arr.len() }))
+            }
+            Err(e) => ApiResponse::error(500, &format!("query: {e}")),
+        }
     }
 
     /// Per-account archive overview: for each non-empty service, the tracked-item
@@ -654,14 +693,52 @@ mod tests {
         for needle in [
             "/api/v1/status",
             "/api/v1/settings",
+            "/api/v1/activity",
             "showOverview",
             "Overview",
+            "Recent activity",
         ] {
             assert!(
                 INDEX_HTML.contains(needle),
                 "web UI is missing '{needle}' (overview dashboard wiring)"
             );
         }
+    }
+
+    #[test]
+    fn activity_lists_recent_runs_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .add_run("a", "sync", "t1", "t2", "ok", "1 up")
+                .unwrap();
+            store
+                .add_run("a", "backup", "t3", "t4", "ok", "mail 5")
+                .unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let v = body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a")));
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["runs"][0]["kind"], "backup"); // newest first
+        assert_eq!(v["runs"][0]["summary"], "mail 5");
+        assert_eq!(v["runs"][1]["kind"], "sync");
+        // missing account -> 400
+        assert_eq!(
+            router.route(&ApiRequest::get("/api/v1/activity")).status,
+            400
+        );
     }
 
     #[test]
