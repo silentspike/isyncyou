@@ -9,6 +9,7 @@
 //! capability-token auth):
 //! - `GET /`                      → the static UI page
 //! - `GET /api/v1/accounts`       → configured accounts
+//! - `GET /api/v1/status?account`            → per-service archive counts overview
 //! - `GET /api/v1/items?account&service`     → archived items of a service
 //! - `GET /api/v1/item?account&service&id`   → one item's metadata
 //! - `GET /api/v1/body?account&service&id`   → archived body bytes (inert)
@@ -26,6 +27,11 @@ pub use serve::{format_http, parse_request_line, serve};
 
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
 pub const INDEX_HTML: &str = include_str!("index.html");
+
+/// Services that can hold archived items (mirrors the CLI's `status`).
+const STATUS_SERVICES: &[&str] = &[
+    "onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared",
+];
 
 /// A parsed inbound request (method + path + decoded query pairs).
 #[derive(Debug, Clone)]
@@ -162,6 +168,7 @@ impl Router {
         match req.path.as_str() {
             "/" => ApiResponse::html(INDEX_HTML),
             "/api/v1/accounts" => self.accounts(),
+            "/api/v1/status" => self.status(req),
             "/api/v1/items" => self.items(req),
             "/api/v1/item" => self.item(req),
             "/api/v1/body" => self.body(req),
@@ -187,6 +194,46 @@ impl Router {
             .map(|a| json!({ "id": a.id, "username": a.username }))
             .collect();
         ApiResponse::ok_json(&json!({ "accounts": accounts }))
+    }
+
+    /// Per-account archive overview: for each non-empty service, the tracked-item
+    /// count and how many have an archived body, plus whether a OneDrive delta
+    /// cursor exists. Mirrors the CLI's `status` for the browser dashboard.
+    fn status(&self, req: &ApiRequest) -> ApiResponse {
+        let account = match req.q("account") {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "missing 'account'"),
+        };
+        let store = match self.open(Some(account)) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let mut services = Vec::new();
+        let (mut total_items, mut total_archived) = (0usize, 0usize);
+        for &svc in STATUS_SERVICES {
+            match store.items_by_service(account, svc) {
+                Ok(items) if !items.is_empty() => {
+                    let archived = items.iter().filter(|i| i.local_path.is_some()).count();
+                    total_items += items.len();
+                    total_archived += archived;
+                    services.push(json!({
+                        "service": svc, "items": items.len(), "archived": archived,
+                    }));
+                }
+                Ok(_) => {}
+                Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+            }
+        }
+        let onedrive_cursor = store
+            .get_delta_cursor(account, "onedrive", "")
+            .map(|c| c.is_some())
+            .unwrap_or(false);
+        ApiResponse::ok_json(&json!({
+            "account": account,
+            "services": services,
+            "totals": { "items": total_items, "archived": total_archived },
+            "onedrive_cursor": onedrive_cursor,
+        }))
     }
 
     fn open(&self, account: Option<&str>) -> Result<Store, ApiResponse> {
@@ -460,6 +507,50 @@ mod tests {
                 "web UI is missing the '{svc}' service tab"
             );
         }
+    }
+
+    #[test]
+    fn status_reports_per_service_counts_and_totals() {
+        let (_d, router) = setup();
+        let resp = router.route(&ApiRequest::get("/api/v1/status?account=a"));
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        assert_eq!(v["account"], "a");
+        // setup(): mail has m1 (with body) + m2 (no body); calendar has e1 (no body)
+        let mail = v["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["service"] == "mail")
+            .unwrap();
+        assert_eq!(mail["items"], 2);
+        assert_eq!(mail["archived"], 1);
+        let cal = v["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["service"] == "calendar")
+            .unwrap();
+        assert_eq!(cal["items"], 1);
+        assert_eq!(cal["archived"], 0);
+        // empty services are omitted; totals aggregate across services
+        assert!(v["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["service"] != "contacts"));
+        assert_eq!(v["totals"]["items"], 3);
+        assert_eq!(v["totals"]["archived"], 1);
+        assert_eq!(v["onedrive_cursor"], false);
+
+        // missing account -> 400, unknown account -> 404
+        assert_eq!(router.route(&ApiRequest::get("/api/v1/status")).status, 400);
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=ghost"))
+                .status,
+            404
+        );
     }
 
     #[test]
