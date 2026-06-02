@@ -848,6 +848,11 @@ dependencies = [
 [[package]]
 name = "isyncyou-daemon"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "isyncyou-core",
+ "isyncyou-webui",
+]
 
 [[package]]
 name = "isyncyou-doctor"
