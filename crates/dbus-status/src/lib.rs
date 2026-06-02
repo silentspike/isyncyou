@@ -61,6 +61,18 @@ impl OverlayStatus {
             OverlayStatus::Unknown => "unknown",
         }
     }
+
+    /// Parse a wire string (the inverse of [`as_str`](Self::as_str)) back into a
+    /// status; anything unrecognised is [`OverlayStatus::Unknown`].
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "synced" => OverlayStatus::Synced,
+            "syncing" => OverlayStatus::Syncing,
+            "error" => OverlayStatus::Error,
+            "ignored" => OverlayStatus::Ignored,
+            _ => OverlayStatus::Unknown,
+        }
+    }
 }
 
 /// Answers overlay-status queries by path. Implemented by [`StoreStatusProvider`]
@@ -182,10 +194,39 @@ mod dbus {
             .map_err(|e| e.to_string())?;
         rt.block_on(async move { serve(provider).await.map_err(|e| e.to_string()) })
     }
+
+    /// Client: ask the running provider for a single path's overlay status over the
+    /// session bus. Used by `isyncyou dolphin-status` (the ServiceMenu action /
+    /// "fallback without overlays"). Errors if the daemon is not running / there is
+    /// no session bus.
+    pub fn status_via_bus(path: &Path) -> Result<super::OverlayStatus, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        rt.block_on(async {
+            let conn = zbus::Connection::session()
+                .await
+                .map_err(|e| e.to_string())?;
+            let proxy = zbus::Proxy::new(
+                &conn,
+                BUS_NAME,
+                OBJECT_PATH,
+                "org.silentspike.iSyncYou.FileStatus",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let wire: String = proxy
+                .call("Status", &(path.to_string_lossy().as_ref(),))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(super::OverlayStatus::from_wire(&wire))
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use dbus::{serve, serve_blocking, BUS_NAME, OBJECT_PATH};
+pub use dbus::{serve, serve_blocking, status_via_bus, BUS_NAME, OBJECT_PATH};
 
 #[cfg(test)]
 mod tests {
@@ -234,7 +275,11 @@ mod tests {
             (OverlayStatus::Unknown, "unknown"),
         ] {
             assert_eq!(s.as_str(), w);
+            // The client side parses the same wire string back (round-trip).
+            assert_eq!(OverlayStatus::from_wire(w), s);
         }
+        // Anything unrecognised parses as Unknown.
+        assert_eq!(OverlayStatus::from_wire("bogus"), OverlayStatus::Unknown);
     }
 
     #[test]

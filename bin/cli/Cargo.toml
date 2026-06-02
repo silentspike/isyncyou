@@ -28,3 +28,7 @@ isyncyou-change-source = { version = "0.1.0", path = "../../crates/change-source
 # on other targets (e.g. Windows builds).
 [target.'cfg(unix)'.dependencies]
 isyncyou-fuse = { path = "../../crates/fuse" }
+
+# The `dolphin-status` command (DBus client for the KDE ServiceMenu) is Linux-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+isyncyou-dbus-status = { path = "../../crates/dbus-status" }
