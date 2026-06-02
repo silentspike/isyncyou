@@ -290,6 +290,30 @@ fn rfc3339_to_unix(s: &str) -> Option<i64> {
     Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se)
 }
 
+/// True if the local file already matches the store record by **size + mtime**,
+/// so a re-download would be redundant (e.g. after a `410` resync re-marked
+/// everything `remote_dirty`). Cheap heuristic; a content hash would be
+/// definitive (a follow-up). A file without a stored size/mtime never matches.
+fn local_file_matches(path: &Path, it: &Item) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if it.size != Some(meta.len() as i64) {
+        return false;
+    }
+    match (&it.remote_mtime, meta.modified().ok()) {
+        (Some(rm), Some(m)) => {
+            let local = m
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+            rfc3339_to_unix(rm).filter(|s| *s >= 0).map(|s| s as u64) == local
+        }
+        _ => false,
+    }
+}
+
 /// Best-effort: set a just-materialized file's mtime to its cloud
 /// `lastModifiedDateTime`, so local timestamps mirror the cloud (plan §6) instead
 /// of showing the download time. Silently does nothing on a bad timestamp or a
@@ -310,9 +334,10 @@ fn set_file_mtime(path: &Path, remote_mtime: &str) {
 /// `clean` so a re-run skips it. This is the missing half of the remote→local
 /// sync (ingest records metadata; this writes the actual files).
 ///
-/// v1 scope: downloads + folder creation only. Local deletion of removed items
-/// (with the mass-delete guard) and quickXorHash-based skip are follow-ups; the
-/// `clean` state-marking already prevents redundant re-downloads.
+/// A file already on disk with a matching size + mtime is skipped (no
+/// re-download), so a `410` resync that re-marks everything `remote_dirty`
+/// doesn't re-fetch the whole drive. A content-hash match would be definitive;
+/// that's a follow-up.
 pub fn materialize_downloads<D: Downloader>(
     store: &Store,
     downloader: &D,
@@ -346,6 +371,11 @@ pub fn materialize_downloads<D: Downloader>(
                     }
                     Err(_) => report.failed += 1,
                 }
+            } else if local_file_matches(&full, it) {
+                // already on disk with the same size + mtime — skip the download
+                // (e.g. a 410 resync re-marked everything remote_dirty).
+                store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                report.skipped += 1;
             } else {
                 if let Some(parent) = full.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -935,6 +965,52 @@ mod tests {
         let r = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
         assert_eq!(r.failed, 1);
         assert_eq!(r.downloaded, 0);
+    }
+
+    #[test]
+    fn materialize_skips_file_already_present_and_unchanged() {
+        let store = Store::open_in_memory().unwrap();
+        let mut file = Item::new("acc", SERVICE, "a1", "doc.txt", "file");
+        file.local_path = Some("doc.txt".into());
+        file.sync_state = "remote_dirty".into();
+        file.size = Some(5);
+        file.remote_mtime = Some("2024-01-02T03:04:05Z".into());
+        store.upsert_item(&file).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, b"hello").unwrap(); // size 5 matches
+        set_file_mtime(&path, "2024-01-02T03:04:05Z"); // mtime matches
+
+        // a downloader that errors on any call — so a skip is provable (no download)
+        let dl = MockDownloader(HashMap::new());
+        let report = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        assert_eq!(report.skipped, 1, "unchanged file should be skipped");
+        assert_eq!(report.downloaded, 0);
+        assert_eq!(
+            report.failed, 0,
+            "must not attempt a download for an unchanged file"
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "a1")
+                .unwrap()
+                .unwrap()
+                .sync_state,
+            "clean"
+        );
+
+        // a size change defeats the skip → it attempts a (here failing) download
+        std::fs::write(&path, b"changed!!").unwrap(); // size 9 != 5
+        store
+            .set_sync_state("acc", SERVICE, "a1", "remote_dirty")
+            .unwrap();
+        let r2 = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        assert_eq!(r2.skipped, 0);
+        assert_eq!(
+            r2.failed, 1,
+            "size mismatch must trigger a re-download attempt"
+        );
     }
 
     #[test]
