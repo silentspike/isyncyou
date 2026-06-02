@@ -36,7 +36,8 @@ pub use mail::{
 };
 pub use mime::{extract_html, extract_text};
 pub use onedrive::{
-    incremental_sync, push_delete, push_upload, RemoteWriter, SyncError, SyncReport,
+    incremental_sync, materialize_downloads, push_delete, push_upload, Downloader,
+    MaterializeReport, RemoteWriter, SyncError, SyncReport,
 };
 pub use onenote::{incremental_sync_onenote, OneNoteReport};
 pub use restore::{
