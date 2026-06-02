@@ -11,6 +11,10 @@ authors.workspace = true
 serde_json = { workspace = true }
 isyncyou-core = { path = "../../crates/core" }
 isyncyou-store = { path = "../../crates/store" }
+# MIME HTML extraction for the mail viewer (no `http` feature → no reqwest).
+isyncyou-connectors = { path = "../../crates/connectors" }
+# Battle-tested allowlist HTML sanitizer for the mail viewer (MIT).
+ammonia = "4"
 
 [dev-dependencies]
 tempfile = "3"

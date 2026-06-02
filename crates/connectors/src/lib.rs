@@ -34,7 +34,7 @@ pub use mail::{
     backup_message_bodies, incremental_sync_mail, index_mail_bodies, BodyReport, MailReport,
     MimeFetcher,
 };
-pub use mime::extract_text;
+pub use mime::{extract_html, extract_text};
 pub use onedrive::{
     incremental_sync, push_delete, push_upload, RemoteWriter, SyncError, SyncReport,
 };
