@@ -778,6 +778,16 @@ fn unix_now() -> String {
     )
 }
 
+/// Short host label for conflict-copy names (`*-<host>-safeBackup-NNNN`). Best
+/// effort: $HOSTNAME, else "local".
+fn local_host() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|h| h.split('.').next().unwrap_or(&h).to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
 /// One full bidirectional sync pass for an account: pull the remote delta into
 /// the store, materialize it to disk, then mirror local creates/modifies/deletes
 /// up to the cloud (each guarded as appropriate). Shared by the one-shot and the
@@ -873,15 +883,19 @@ fn sync_pass(
     }
 
     // Push locally-modified files up, guarded by an If-Match etag check so a
-    // concurrent cloud change is reported as a conflict, never silently clobbered.
+    // concurrent cloud change is never silently clobbered. On a conflict the local
+    // edit is kept as a `*-<host>-safeBackup-NNNN` copy and the cloud version is
+    // re-downloaded (keep-both, plan §10).
     let modifies =
         connectors::scan_local_modifies(store, account, &sync_root).map_err(|e| e.to_string())?;
     if !modifies.is_empty() {
-        let mr =
-            connectors::apply_local_modifies(client, store, map, account, &sync_root, &modifies)
-                .map_err(|e| e.to_string())?;
+        let host = local_host();
+        let mr = connectors::apply_local_modifies(
+            client, store, map, account, &sync_root, &host, &modifies,
+        )
+        .map_err(|e| e.to_string())?;
         println!(
-            "modified: {} uploaded, {} conflict(s) held back, {} failed",
+            "modified: {} uploaded, {} kept as conflict copy, {} failed",
             mr.uploaded, mr.conflicts, mr.failed
         );
     }
