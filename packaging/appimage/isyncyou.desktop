@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=iSyncYou
+Comment=Personal OneDrive sync + Microsoft 365 backup
+Exec=isyncyou
+Icon=isyncyou
+Categories=Utility;Network;
+Terminal=true
