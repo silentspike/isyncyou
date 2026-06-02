@@ -1,0 +1,21 @@
+# iSyncYou configuration — copy to `isyncyou.toml` and edit.
+#
+# Validate with:  isyncyou check --config isyncyou.toml
+
+# One block per Microsoft account. `sync_root` and `archive_root` must differ.
+[[accounts]]
+id = "primary"                          # stable id used on the CLI (--account)
+username = "you@outlook.com"
+sync_root = "/home/you/OneDrive"        # bidirectionally-synced OneDrive folder
+archive_root = "/home/you/iSyncYou"     # backup/archive for mail/calendar/etc.
+
+[sync]
+trash_retention_days = 30
+body_index = false                      # index mail bodies for full-text search
+                                        # (opt-in: more disk + indexes message text)
+change_source = "inotify"               # inotify | reconcile_only | ebpf
+
+[sync.delete_guard]
+max_absolute = 1000                     # block a batch deleting >= this many items
+max_fraction = 0.5                      # ...or >= this fraction of the library
+fraction_min_total = 10                 # (fraction rule applies above this size)
