@@ -14,3 +14,4 @@ isyncyou-pathmap = { path = "../pathmap" }
 # The orchestration drives the live engine, so the http transport is always on.
 isyncyou-graph = { path = "../graph", features = ["http"] }
 isyncyou-connectors = { path = "../connectors", features = ["http"] }
+serde_json = { workspace = true }
