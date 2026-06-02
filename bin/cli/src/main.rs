@@ -258,6 +258,13 @@ enum Command {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
     },
+    /// Print a path's sync status by asking the running daemon over DBus (the KDE
+    /// Dolphin ServiceMenu action / "fallback without overlays"). Linux-only.
+    #[cfg(target_os = "linux")]
+    DolphinStatus {
+        /// File or folder to query (Dolphin passes the selected item via `%f`).
+        path: PathBuf,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
@@ -396,7 +403,45 @@ fn run(command: Command) -> Result<(), String> {
             into,
         } => cmd_pbs_restore(&config, &snapshot, &into),
         Command::PbsList { config } => cmd_pbs_list(&config),
+        #[cfg(target_os = "linux")]
+        Command::DolphinStatus { path } => cmd_dolphin_status(&path),
     }
+}
+
+/// Ask the running daemon (over the session bus) for a path's sync status and show
+/// it: print one line and, if `notify-send` is available, raise a desktop
+/// notification (so the Dolphin ServiceMenu action gives visible feedback).
+#[cfg(target_os = "linux")]
+fn cmd_dolphin_status(path: &Path) -> Result<(), String> {
+    use isyncyou_dbus_status::OverlayStatus;
+    let status = isyncyou_dbus_status::status_via_bus(path).map_err(|e| {
+        format!(
+            "could not reach the iSyncYou daemon on the session bus: {e}. Is `isyncyoud` running?"
+        )
+    })?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let (label, urgency) = match status {
+        OverlayStatus::Synced => ("In sync with the cloud", "low"),
+        OverlayStatus::Syncing => ("Sync in progress", "low"),
+        OverlayStatus::Error => ("Sync conflict / error — needs attention", "critical"),
+        OverlayStatus::Ignored => ("Not synced (trashed/ignored)", "low"),
+        OverlayStatus::Unknown => ("Not tracked by iSyncYou", "low"),
+    };
+    println!("{name}: {} ({})", status.as_str(), label);
+    // Best-effort desktop notification; never fail the command if it is absent.
+    let _ = std::process::Command::new("notify-send")
+        .args([
+            "--app-name=iSyncYou",
+            "--icon=folder-sync",
+            &format!("--urgency={urgency}"),
+            &format!("iSyncYou — {name}"),
+            label,
+        ])
+        .status();
+    Ok(())
 }
 
 /// Account's token-cache path for the read or write app.
