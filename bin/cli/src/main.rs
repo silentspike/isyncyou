@@ -677,6 +677,38 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
             mr.uploaded, mr.conflicts, mr.failed
         );
     }
+
+    // Mirror local deletions to the cloud — a materialized file the user removed
+    // is deleted remotely, but only after the mass-delete guard approves it.
+    let local_deletes =
+        connectors::scan_local_deletes(&store, account, &sync_root).map_err(|e| e.to_string())?;
+    if !local_deletes.is_empty() {
+        let guard = DeleteGuard {
+            max_absolute: dg.max_absolute,
+            max_fraction: dg.max_fraction,
+            fraction_min_total: dg.fraction_min_total,
+        };
+        let remaining = store
+            .count_by_service(account, "onedrive")
+            .map_err(|e| e.to_string())? as usize;
+        match guard.evaluate(local_deletes.len(), remaining, Direction::LocalToCloud) {
+            GuardVerdict::Block { reason } => {
+                println!(
+                    "delete guard held back {} cloud deletion(s): {reason}",
+                    local_deletes.len()
+                );
+            }
+            GuardVerdict::Proceed => {
+                let mut deleted = 0;
+                for id in &local_deletes {
+                    connectors::push_delete(&client, &store, account, id, &now)
+                        .map_err(|e| e.to_string())?;
+                    deleted += 1;
+                }
+                println!("deleted {deleted} item(s) on the cloud (mirrored local deletions)");
+            }
+        }
+    }
     Ok(())
 }
 

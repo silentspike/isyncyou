@@ -476,6 +476,34 @@ pub fn push_local_creates<W: RemoteWriter>(
     Ok(uploaded)
 }
 
+/// Find tracked files that were materialized (`clean`) but whose local copy is
+/// now **missing** — local **deletes** to mirror to the cloud. Only `clean`
+/// items qualify, so a not-yet-downloaded `remote_dirty` file (never on disk) is
+/// never mistaken for a local deletion. Returns the affected `remote_id`s; the
+/// caller applies the mass-delete guard before pushing the deletions.
+pub fn scan_local_deletes(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+) -> Result<Vec<String>, SyncError> {
+    let items = store.all_items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut out = Vec::new();
+    for it in &items {
+        if it.deleted_at.is_some() || it.item_type != "file" || it.sync_state != "clean" {
+            continue;
+        }
+        let rel = match local_rel_path(&by_id, it) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !sync_root.join(&rel).exists() {
+            out.push(it.remote_id.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Replaces an item's content only if its etag still matches (so a concurrent
 /// cloud change is never silently overwritten — A3). Abstracted so the modify
 /// driver is unit-testable with a mock. `Ok(Some(item))` = replaced;
@@ -1074,6 +1102,34 @@ mod tests {
         assert_eq!(it.etag.as_deref(), Some("etag-old"));
     }
 
+    #[test]
+    fn scan_local_deletes_only_clean_files_now_missing() {
+        let store = Store::open_in_memory().unwrap();
+        // a clean (materialized) file that the user deleted locally
+        let mut gone = Item::new("acc", SERVICE, "gone", "gone.txt", "file");
+        gone.local_path = Some("gone.txt".into());
+        gone.sync_state = "clean".into();
+        store.upsert_item(&gone).unwrap();
+        // a clean file still present locally
+        let mut kept = Item::new("acc", SERVICE, "kept", "kept.txt", "file");
+        kept.local_path = Some("kept.txt".into());
+        kept.sync_state = "clean".into();
+        store.upsert_item(&kept).unwrap();
+        // a not-yet-downloaded (remote_dirty) file, also absent on disk
+        let mut pending = Item::new("acc", SERVICE, "pending", "pending.txt", "file");
+        pending.local_path = Some("pending.txt".into());
+        pending.sync_state = "remote_dirty".into();
+        store.upsert_item(&pending).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept.txt"), b"here").unwrap(); // only kept exists
+
+        let deletes = scan_local_deletes(&store, "acc", dir.path()).unwrap();
+        // gone.txt: clean + missing -> delete. kept.txt: present -> no.
+        // pending.txt: missing but remote_dirty (never downloaded) -> NOT a delete.
+        assert_eq!(deletes, vec!["gone".to_string()]);
+    }
+
     /// Live local→remote: upload via the connector + GraphClient, confirm the
     /// store has a clean row, then push-delete (removes from OneDrive + tombstones).
     #[cfg(feature = "http")]
@@ -1381,5 +1437,56 @@ mod tests {
         );
         eprintln!("modify uploaded; cloud content updated for {id}");
         client.delete(&id).expect("cleanup");
+    }
+
+    /// Live local→remote delete: upload a file, sync + materialize it, remove it
+    /// locally, then scan + push the deletion and confirm it's gone on OneDrive.
+    /// Needs the write token.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_local_delete_removes_from_cloud() {
+        use isyncyou_graph::Transport;
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_local_delete_removes_from_cloud: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let item = client
+            .upload("/iSyncYou-deltest2/d.txt", b"to be deleted")
+            .expect("upload");
+        let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
+
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
+        let base = tempfile::tempdir().unwrap();
+        let sync_root = base.path().join("od");
+        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        let local = sync_root.join("iSyncYou-deltest2").join("d.txt");
+        assert!(local.exists(), "file should have materialized");
+
+        // user deletes it locally → scan + push the cloud deletion
+        std::fs::remove_file(&local).unwrap();
+        let deletes = scan_local_deletes(&store, "acc", &sync_root).unwrap();
+        assert!(
+            deletes.contains(&id),
+            "the removed file should be a detected local delete"
+        );
+        for did in &deletes {
+            push_delete(&client, &store, "acc", did, "t2").expect("cloud delete");
+        }
+
+        // confirm it's gone on the cloud (404)
+        let resp = client.get(&format!(
+            "https://graph.microsoft.com/v1.0/me/drive/items/{id}"
+        ));
+        assert_eq!(resp.status, 404, "item should be gone on the cloud");
+        eprintln!("local deletion mirrored: cloud item {id} is gone");
     }
 }
