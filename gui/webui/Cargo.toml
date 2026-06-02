@@ -1,0 +1,16 @@
+[package]
+name = "isyncyou-webui"
+description = "Local web UI API: pure request router over the store/config (served by the daemon)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+isyncyou-core = { path = "../../crates/core" }
+isyncyou-store = { path = "../../crates/store" }
+
+[dev-dependencies]
+tempfile = "3"
