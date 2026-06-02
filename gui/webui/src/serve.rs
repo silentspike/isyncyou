@@ -6,10 +6,32 @@
 //! handling requests sequentially means each per-request [`Store`] open holds the
 //! single-instance lock only momentarily, with no contention. (The production
 //! daemon, which keeps stores open, will front this with an async server.)
+//!
+//! Two transports share one [`handle`]: TCP ([`serve`]) for the opt-in remote
+//! case, and a **Unix-domain socket** ([`serve_unix`]) — the desktop default per
+//! plan §11, where filesystem permissions (mode 0600) are the access control.
 
 use crate::{ApiRequest, ApiResponse, Router};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+
+/// A connection we can both read the request from and write the response to.
+/// We need a second read handle (for the `BufReader`) while still writing to the
+/// stream, so the trait yields a cloned reader. Implemented for TCP + Unix.
+trait Conn: Read + Write {
+    fn clone_reader(&self) -> std::io::Result<Box<dyn Read>>;
+}
+impl Conn for TcpStream {
+    fn clone_reader(&self) -> std::io::Result<Box<dyn Read>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+}
+#[cfg(unix)]
+impl Conn for std::os::unix::net::UnixStream {
+    fn clone_reader(&self) -> std::io::Result<Box<dyn Read>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+}
 
 /// Parse an HTTP request line (`"GET /path?x=1 HTTP/1.1"`) into `(method, target)`.
 pub fn parse_request_line(line: &str) -> Option<(String, String)> {
@@ -48,8 +70,8 @@ pub fn format_http(resp: &ApiResponse) -> Vec<u8> {
     out
 }
 
-fn handle(stream: &mut TcpStream, router: &Router) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+fn handle<S: Conn>(stream: &mut S, router: &Router) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.clone_reader()?);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
         return Ok(()); // client closed
@@ -87,6 +109,32 @@ pub fn serve(addr: &str, router: Router) -> std::io::Result<()> {
             eprintln!("connection error: {e}");
         }
         // best-effort: drain anything unread so the client sees a clean close
+        let _ = stream.read(&mut [0u8; 0]);
+    }
+    Ok(())
+}
+
+/// Bind a **Unix-domain socket** at `path` and serve `router` forever (the
+/// desktop default, plan §11). A stale socket file is removed first; the socket
+/// is created with mode 0600 so only the owner can talk to the engine — the
+/// access control for the local API. Returns only on a fatal bind/accept error.
+#[cfg(unix)]
+pub fn serve_unix(path: &std::path::Path, router: Router) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    // A leftover socket from a previous run would make bind() fail with EADDRINUSE.
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    eprintln!("iSyncYou web UI listening on unix:{}", path.display());
+    for stream in listener.incoming() {
+        let mut stream = stream?;
+        if let Err(e) = handle(&mut stream, &router) {
+            eprintln!("connection error: {e}");
+        }
         let _ = stream.read(&mut [0u8; 0]);
     }
     Ok(())
@@ -153,5 +201,37 @@ mod tests {
         conn.read_to_string(&mut buf).unwrap();
         assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "got: {buf}");
         assert!(buf.contains("\"accounts\""), "body: {buf}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_unix_responds_and_is_owner_only() {
+        use isyncyou_core::Config;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let router = Router::new(Config::default());
+        let dir = std::env::temp_dir().join(format!("isyncyou-uds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("api.sock");
+        // mirror serve_unix()'s bind + 0600 + single-connection handler
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // the socket is owner-only (no group/other access) — the access control
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "socket must not be group/other accessible");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = handle(&mut stream, &router);
+            }
+        });
+        let mut conn = UnixStream::connect(&sock).unwrap();
+        conn.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut buf = String::new();
+        conn.read_to_string(&mut buf).unwrap();
+        assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "got: {buf}");
+        assert!(buf.contains("\"accounts\""), "body: {buf}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
