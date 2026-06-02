@@ -1,11 +1,9 @@
-//! `isyncyou-connectors` — Connector trait + onedrive/mail/calendar/contacts/todo/onenote modules.
+//! `isyncyou-connectors` — per-service connectors.
 //!
-//! Phase 0 skeleton: structure only, no implementation yet.
+//! Currently the OneDrive connector ([`onedrive`]): it ingests a Graph delta walk
+//! into the store (remote → local). Mail/Calendar/Contacts/ToDo/OneNote connectors
+//! (Phase 2) follow behind the same shape.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod onedrive;
+
+pub use onedrive::{incremental_sync, SyncError, SyncReport};
