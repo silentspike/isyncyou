@@ -1,0 +1,17 @@
+[package]
+name = "isyncyou-statusbar-app"
+description = "On-screen status-bar window (winit + softbuffer) presenting the statusbar renderer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "isyncyou-statusbar"
+path = "src/main.rs"
+
+[dependencies]
+isyncyou-statusbar = { path = "../statusbar" }
+winit = "0.30"
+softbuffer = "0.4"
