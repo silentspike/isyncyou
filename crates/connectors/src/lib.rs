@@ -14,6 +14,7 @@ pub mod archive;
 pub mod calendar;
 mod common;
 pub mod contacts;
+pub mod export;
 pub mod mail;
 pub mod mime;
 pub mod onedrive;
@@ -28,6 +29,7 @@ pub use archive::{
 };
 pub use calendar::{incremental_sync_calendar, CalendarReport};
 pub use contacts::{incremental_sync_contacts, ContactsReport};
+pub use export::{contact_to_vcard, event_to_ics};
 pub use mail::{
     backup_message_bodies, incremental_sync_mail, index_mail_bodies, BodyReport, MailReport,
     MimeFetcher,

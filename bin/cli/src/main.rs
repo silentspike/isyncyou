@@ -8,6 +8,7 @@
 //! - `backup`  — index + archive M365 services (mail/calendar/contacts/todo/onenote)
 //! - `search`  — full-text search the archive (item names + indexed mail bodies)
 //! - `restore` — re-create an archived item in the cloud
+//! - `export`  — export archived events/contacts to .ics / .vcf
 //! - `migrate` — move an account's archive directory
 //! - `serve`   — serve the local web UI
 //! - `login`   — device-code sign-in; caches the account token for later commands
@@ -126,6 +127,19 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
+    /// Export archived items to interchange files (.ics / .vcf).
+    Export {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// calendar (-> .ics) or contacts (-> .vcf).
+        #[arg(long)]
+        service: String,
+        /// Output directory (created if missing).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Move an account's archive directory to a new location (no re-download).
     Migrate {
         #[arg(long, default_value = "isyncyou.toml")]
@@ -242,6 +256,12 @@ fn run(command: Command) -> Result<(), String> {
             id,
             token,
         } => cmd_restore(&config, &account, &service, &id, token),
+        Command::Export {
+            config,
+            account,
+            service,
+            out,
+        } => cmd_export(&config, &account, &service, &out),
         Command::Migrate {
             config,
             account,
@@ -870,6 +890,67 @@ fn move_dir(old: &Path, new: &Path) -> Result<(), String> {
     std::fs::remove_dir_all(old).map_err(|e| e.to_string())
 }
 
+/// Filesystem-safe filename from a Graph id (which may contain `/`, `=`, …).
+fn safe_filename(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn cmd_export(config: &Path, account: &str, service: &str, out: &Path) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let archive_root = acc.archive_root.clone();
+    let (item_type, ext): (&str, &str) = match service {
+        "calendar" => ("event", "ics"),
+        "contacts" => ("contact", "vcf"),
+        other => return Err(format!("export supports calendar|contacts, not '{other}'")),
+    };
+    let convert: fn(&serde_json::Value) -> String = match service {
+        "calendar" => connectors::event_to_ics,
+        "contacts" => connectors::contact_to_vcard,
+        _ => unreachable!(),
+    };
+
+    let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let mut n = 0usize;
+    let mut skipped = 0usize;
+    for item in store
+        .items_by_type(account, service, item_type)
+        .map_err(|e| e.to_string())?
+    {
+        let rel = match item.local_path.as_deref() {
+            Some(p) => p,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let bytes = std::fs::read(archive_root.join(rel)).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let text = convert(&v);
+        let fname = format!("{}.{ext}", safe_filename(&item.remote_id));
+        std::fs::write(out.join(fname), text).map_err(|e| e.to_string())?;
+        n += 1;
+    }
+    println!(
+        "exported {n} {service} item(s) to {} ({skipped} without an archived body skipped)",
+        out.display()
+    );
+    Ok(())
+}
+
 fn cmd_migrate(config: &Path, account: &str, new_root: &Path) -> Result<(), String> {
     let mut cfg = load_config(config)?;
     let old = cfg
@@ -1409,6 +1490,43 @@ mod tests {
         // a missing id is reported distinctly
         let err2 = cmd_restore(&p, "a", "calendar", "missing", Some("T".into())).unwrap_err();
         assert!(err2.contains("no archived calendar item"), "got: {err2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmd_export_writes_ics_from_archived_event() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-exp-{}", std::process::id()));
+        let arch = dir.join("arch");
+        let out = dir.join("out");
+        std::fs::create_dir_all(arch.join("calendar/aa/bb")).unwrap();
+        let p = write_config(&dir, &arch);
+        std::fs::write(
+            arch.join("calendar/aa/bb/e.json"),
+            br#"{"id":"E1","iCalUId":"UID1","subject":"Standup","start":{"dateTime":"2026-03-01T09:00:00"},"end":{"dateTime":"2026-03-01T09:15:00"}}"#,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut e = isyncyou_store::Item::new("a", "calendar", "E1", "Standup", "event");
+            e.local_path = Some("calendar/aa/bb/e.json".into());
+            store.upsert_item(&e).unwrap();
+            // an event without a body is skipped (not exported)
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a", "calendar", "E2", "NoBody", "event",
+                ))
+                .unwrap();
+        }
+        cmd_export(&p, "a", "calendar", &out).unwrap();
+        let ics = std::fs::read_to_string(out.join("E1.ics")).unwrap();
+        assert!(ics.contains("BEGIN:VEVENT") && ics.contains("UID:UID1"));
+        assert!(ics.contains("DTSTART:20260301T090000"));
+        // only the archived event was written
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+        // unsupported service is rejected
+        assert!(cmd_export(&p, "a", "mail", &out)
+            .unwrap_err()
+            .contains("supports calendar|contacts"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
