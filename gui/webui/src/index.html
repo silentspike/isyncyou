@@ -67,7 +67,7 @@
 const SERVICES = ["onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared"];
 // injected by the daemon's `/` handler; empty disables the restore UI (read-only).
 const CAP_TOKEN = "__CAP_TOKEN__";
-const RESTORABLE = ["mail", "calendar", "contacts", "todo"];
+const RESTORABLE = ["mail", "calendar", "contacts", "todo", "onenote"];
 let account = null, service = "mail";
 
 async function api(path) { const r = await fetch(path); return r.json(); }
