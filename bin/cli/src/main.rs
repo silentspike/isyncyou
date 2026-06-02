@@ -18,7 +18,6 @@
 //! cached token (from `login`) is loaded and auto-refreshed.
 
 use clap::{Parser, Subcommand};
-use isyncyou_core::guard::{DeleteGuard, Direction, GuardVerdict};
 use isyncyou_core::{AccountConfig, Config};
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::Store;
@@ -788,10 +787,10 @@ fn local_host() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// One full bidirectional sync pass for an account: pull the remote delta into
-/// the store, materialize it to disk, then mirror local creates/modifies/deletes
-/// up to the cloud (each guarded as appropriate). Shared by the one-shot and the
-/// `--watch` paths.
+/// One full bidirectional sync pass for an account (delta → materialize → mirror
+/// local creates/modifies/deletes up). Thin wrapper over [`isyncyou_engine::sync_once`]
+/// — the orchestration is shared with the daemon's background scheduler — that
+/// prints the one-line summary and returns it for the activity log.
 fn sync_pass(
     cfg: &Config,
     account: &str,
@@ -799,138 +798,9 @@ fn sync_pass(
     client: &mut isyncyou_graph::GraphClient,
     map: &mut MappingTable,
 ) -> Result<String, String> {
-    let now = unix_now();
-    let report = connectors::incremental_sync(client, store, map, account, &now)
-        .map_err(|e| e.to_string())?;
-    let summary = format!(
-        "sync: {} upserted, {} deleted, {} skipped{}",
-        report.upserted,
-        report.deleted,
-        report.skipped,
-        if report.resynced {
-            " (full resync)"
-        } else {
-            ""
-        }
-    );
+    let report = isyncyou_engine::sync_once(cfg, account, store, client, map, &local_host())?;
+    let summary = report.summary();
     println!("{summary}");
-
-    // Materialize the ingested changes to disk: write new/changed files into the
-    // account's sync root (the remote→local half that makes files actually appear).
-    let acc = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let sync_root = acc.sync_root.clone();
-    let trash_root = acc.archive_root.join(".isyncyou-trash");
-    let dg = cfg.sync.delete_guard.clone();
-
-    let mat = connectors::materialize_downloads(store, client, account, &sync_root)
-        .map_err(|e| e.to_string())?;
-    println!(
-        "materialized: {} downloaded, {} folders, {} failed -> {}",
-        mat.downloaded,
-        mat.dirs_created,
-        mat.failed,
-        sync_root.display()
-    );
-
-    // Mirror remote deletions locally — move removed files into the trash (kept
-    // outside the sync root), but only after the mass-delete guard approves the
-    // batch, so a runaway remote wipe can't silently empty the local folder.
-    let pending =
-        connectors::pending_local_deletes(store, account, &sync_root).map_err(|e| e.to_string())?;
-    if !pending.is_empty() {
-        let guard = DeleteGuard {
-            max_absolute: dg.max_absolute,
-            max_fraction: dg.max_fraction,
-            fraction_min_total: dg.fraction_min_total,
-        };
-        let remaining = store
-            .count_by_service(account, "onedrive")
-            .map_err(|e| e.to_string())? as usize;
-        match guard.evaluate(
-            pending.len(),
-            remaining + pending.len(),
-            Direction::CloudToLocal,
-        ) {
-            GuardVerdict::Block { reason } => {
-                println!(
-                    "delete guard held back {} local deletion(s): {reason}",
-                    pending.len()
-                );
-            }
-            GuardVerdict::Proceed => {
-                let n = connectors::apply_local_deletes(&sync_root, &trash_root, &pending)
-                    .map_err(|e| e.to_string())?;
-                println!(
-                    "removed {n} local item(s) (moved to {})",
-                    trash_root.display()
-                );
-            }
-        }
-    }
-
-    // Push brand-new local files up to the cloud (the local→remote create half).
-    let creates =
-        connectors::scan_local_creates(store, account, &sync_root).map_err(|e| e.to_string())?;
-    if !creates.is_empty() {
-        let uploaded =
-            connectors::push_local_creates(client, store, map, account, &sync_root, &creates)
-                .map_err(|e| e.to_string())?;
-        println!("uploaded {uploaded} new local file(s) to the cloud");
-    }
-
-    // Push locally-modified files up, guarded by an If-Match etag check so a
-    // concurrent cloud change is never silently clobbered. On a conflict the local
-    // edit is kept as a `*-<host>-safeBackup-NNNN` copy and the cloud version is
-    // re-downloaded (keep-both, plan §10).
-    let modifies =
-        connectors::scan_local_modifies(store, account, &sync_root).map_err(|e| e.to_string())?;
-    if !modifies.is_empty() {
-        let host = local_host();
-        let mr = connectors::apply_local_modifies(
-            client, store, map, account, &sync_root, &host, &modifies,
-        )
-        .map_err(|e| e.to_string())?;
-        println!(
-            "modified: {} uploaded, {} kept as conflict copy, {} failed",
-            mr.uploaded, mr.conflicts, mr.failed
-        );
-    }
-
-    // Mirror local deletions to the cloud — a materialized file the user removed
-    // is deleted remotely, but only after the mass-delete guard approves it.
-    let local_deletes =
-        connectors::scan_local_deletes(store, account, &sync_root).map_err(|e| e.to_string())?;
-    if !local_deletes.is_empty() {
-        let guard = DeleteGuard {
-            max_absolute: dg.max_absolute,
-            max_fraction: dg.max_fraction,
-            fraction_min_total: dg.fraction_min_total,
-        };
-        let remaining = store
-            .count_by_service(account, "onedrive")
-            .map_err(|e| e.to_string())? as usize;
-        match guard.evaluate(local_deletes.len(), remaining, Direction::LocalToCloud) {
-            GuardVerdict::Block { reason } => {
-                println!(
-                    "delete guard held back {} cloud deletion(s): {reason}",
-                    local_deletes.len()
-                );
-            }
-            GuardVerdict::Proceed => {
-                let mut deleted = 0;
-                for id in &local_deletes {
-                    connectors::push_delete(client, store, account, id, &now)
-                        .map_err(|e| e.to_string())?;
-                    deleted += 1;
-                }
-                println!("deleted {deleted} item(s) on the cloud (mirrored local deletions)");
-            }
-        }
-    }
     Ok(summary)
 }
 

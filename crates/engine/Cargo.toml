@@ -1,0 +1,16 @@
+[package]
+name = "isyncyou-engine"
+description = "Sync orchestration: one bidirectional OneDrive pass, shared by the CLI and the daemon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+isyncyou-core = { path = "../core" }
+isyncyou-store = { path = "../store" }
+isyncyou-pathmap = { path = "../pathmap" }
+# The orchestration drives the live engine, so the http transport is always on.
+isyncyou-graph = { path = "../graph", features = ["http"] }
+isyncyou-connectors = { path = "../connectors", features = ["http"] }
