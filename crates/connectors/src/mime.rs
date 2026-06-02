@@ -32,6 +32,41 @@ pub fn extract_text(eml: &[u8]) -> String {
     out
 }
 
+/// Extract the **raw (decoded) HTML** of the first `text/html` part of an `.eml`,
+/// if any. Unlike [`extract_text`] (which strips tags for the search index), this
+/// keeps the markup so a sanitizing viewer can render it. Returns `None` when the
+/// message is plain-text only. Best-effort and never panics.
+pub fn extract_html(eml: &[u8]) -> Option<String> {
+    let (headers, body) = split_headers(eml);
+    extract_html_part(&headers, body)
+}
+
+/// Walk a MIME entity, returning the decoded body of the first `text/html` part.
+fn extract_html_part(headers: &[u8], body: &[u8]) -> Option<String> {
+    let ctype = header_value(headers, "content-type").unwrap_or_default();
+    let ctype_l = ctype.to_ascii_lowercase();
+
+    if ctype_l.starts_with("multipart/") {
+        let boundary = ct_param(&ctype, "boundary")?;
+        for part in split_multipart(body, &boundary) {
+            let (ph, pb) = split_headers(&part);
+            if let Some(html) = extract_html_part(&ph, pb) {
+                return Some(html);
+            }
+        }
+        return None;
+    }
+
+    if ctype_l.starts_with("text/html") {
+        let cte = header_value(headers, "content-transfer-encoding")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let decoded = decode_body(body, &cte);
+        return Some(String::from_utf8_lossy(&decoded).into_owned());
+    }
+    None
+}
+
 /// Split a MIME entity into its raw header block and body bytes at the first
 /// blank line (CRLF or LF).
 fn split_headers(data: &[u8]) -> (Vec<u8>, &[u8]) {
@@ -390,5 +425,28 @@ mod tests {
         let _ = extract_text(b"no headers at all just text");
         let _ = extract_text(b"Content-Type: multipart/mixed; boundary=X\r\n\r\nno parts");
         let _ = extract_text(b"=?utf-8?B?broken");
+        let _ = extract_html(b"");
+        let _ = extract_html(b"Content-Type: multipart/mixed; boundary=X\r\n\r\nno parts");
+    }
+
+    #[test]
+    fn extract_html_returns_raw_markup_of_html_part() {
+        // multipart/alternative: text/plain + text/html — extract_html picks the HTML
+        let eml = b"Content-Type: multipart/alternative; boundary=B\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\n\r\nplain version\r\n\
+--B\r\nContent-Type: text/html\r\n\r\n<p>Hello <b>world</b></p>\r\n\
+--B--\r\n";
+        let html = extract_html(eml).expect("should find an html part");
+        assert!(html.contains("<b>world</b>"), "raw markup lost: {html:?}");
+        assert!(html.contains("<p>Hello"), "markup: {html:?}");
+    }
+
+    #[test]
+    fn extract_html_decodes_quoted_printable_and_is_none_for_plain() {
+        let qp = b"Content-Type: text/html\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<p>caf=C3=A9</p>";
+        assert!(extract_html(qp).unwrap().contains("café"), "qp not decoded");
+        // a plain-text-only message has no HTML part
+        let plain = b"Content-Type: text/plain\r\n\r\njust text";
+        assert_eq!(extract_html(plain), None);
     }
 }

@@ -43,16 +43,29 @@ canonicalized file path must stay under the account's `archive_root`, else `400`
 Ids come from our own hash-sharded store, but the guard is defense-in-depth
 against `..`/symlink traversal. Shared with `/api/v1/body`.
 
-## What is deliberately NOT done yet
+## Sanitized HTML mail rendering
 
-A **rich, sanitized HTML mail renderer** — parsing a message's own `text/html`
-body and rendering it through an allowlist (so the mail looks like mail, with
-inline `cid:`/`data:` images, neutralized external resources, `rel=noopener`
-links) — is out of scope here. Doing it safely needs a battle-tested HTML
-sanitizer/parser dependency (e.g. `ammonia` + `html5ever`), a real addition to
-the otherwise dependency-light crate; hand-rolling one would be an XSS risk. Until
-that dependency decision is made, mail is viewable as inert escaped source via
-`/api/v1/view` and as inert bytes via `/api/v1/body`. Tracked under #25.
+A mail message's own `text/html` body is rendered through an **allowlist
+sanitizer** — `ammonia` (over `html5ever`), the battle-tested choice (hand-rolling
+an HTML sanitizer would be an XSS risk). `gui/webui/src/view.rs::sanitize_mail_html`
+configures it to:
+
+- drop `<script>`, event-handler attributes, `<iframe>`/`<object>`/`<style>` and
+  other dangerous elements (ammonia's allowlist default), and
+- restrict URL schemes to `cid:` / `data:` / `mailto:` only — so remote image
+  `src` (tracking pixels), `javascript:` links and remote stylesheets are stripped;
+  links keep their text and gain `rel="noopener noreferrer nofollow"`.
+
+The mail page is served with [`MAIL_CSP`] (`default-src 'none'; img-src data:; …`)
+as header + `<meta>`, so even a slipped-past remote URL cannot fetch. The HTML
+part is extracted from the archived `.eml` by `connectors::extract_html` (MIME
+walk, transfer-decoding); a plain-text-only mail falls back to escaped source.
+
+### Still open
+
+`cid:` inline images are not yet resolved to their MIME parts (they render as
+broken images); a safe external-link **open dialog** (plan §13) is not built — for
+now external links are neutralized to plain text.
 
 ## Tests
 
