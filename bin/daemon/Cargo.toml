@@ -15,3 +15,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 isyncyou-core = { path = "../../crates/core" }
 isyncyou-webui = { path = "../../gui/webui" }
+isyncyou-engine = { path = "../../crates/engine" }
+isyncyou-store = { path = "../../crates/store" }
+isyncyou-pathmap = { path = "../../crates/pathmap" }
+isyncyou-graph = { path = "../../crates/graph", features = ["http"] }

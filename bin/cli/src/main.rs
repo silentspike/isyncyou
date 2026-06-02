@@ -214,20 +214,12 @@ const SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 /// Services with a restore path (OneNote pages can't be re-created via a simple POST).
 const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo"];
 
-// Public client app registrations + scopes for the test/personal accounts.
-const READ_CLIENT: &str = "cee80dd9-c13e-4dbb-9d4c-73eb4987d447";
+// Public client app registrations + scopes. The read app is the SSOT in
+// `engine::auth` (the daemon resolves the same unattended token); the CLI just
+// points at it. The write app (restore) is CLI-only.
+const READ_CLIENT: &str = isyncyou_engine::auth::READ_CLIENT;
 const WRITE_CLIENT: &str = "a90d9140-3a62-46d0-907b-f2b7b61a573a";
-const READ_SCOPES: &[&str] = &[
-    "Files.Read",
-    "Mail.Read",
-    "Calendars.Read",
-    "Contacts.Read",
-    "Tasks.Read",
-    "Notes.Read",
-    // User.Read lets `setup` confirm the connected identity via GET /me (plan §11).
-    "User.Read",
-    "offline_access",
-];
+const READ_SCOPES: &[&str] = isyncyou_engine::auth::READ_SCOPES;
 const WRITE_SCOPES: &[&str] = &[
     "Files.ReadWrite",
     "Mail.ReadWrite",
@@ -237,7 +229,7 @@ const WRITE_SCOPES: &[&str] = &[
     "Tasks.ReadWrite",
     "offline_access",
 ];
-const READ_CACHE: &str = ".isyncyou-token-read.json";
+const READ_CACHE: &str = isyncyou_engine::auth::READ_CACHE_FILE;
 const WRITE_CACHE: &str = ".isyncyou-token-write.json";
 
 fn main() {

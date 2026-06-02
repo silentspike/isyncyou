@@ -158,11 +158,25 @@ impl ApiResponse {
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
+    /// Optional store-access gate, shared with a background syncer (the daemon's
+    /// scheduler). When set, the whole request is serialized against the syncer so
+    /// the per-request `Store::open` never races the single-instance file lock the
+    /// sync pass holds. `None` for the CLI's single-threaded `serve` (no syncer).
+    gate: Option<std::sync::Arc<std::sync::Mutex<()>>>,
 }
 
 impl Router {
     pub fn new(config: Config) -> Self {
-        Router { config }
+        Router { config, gate: None }
+    }
+
+    /// Build a router that serializes store access against an external syncer via
+    /// the shared `gate` mutex (used by the daemon, which also runs scheduled syncs).
+    pub fn with_gate(config: Config, gate: std::sync::Arc<std::sync::Mutex<()>>) -> Self {
+        Router {
+            config,
+            gate: Some(gate),
+        }
     }
 
     /// Dispatch one request to a response. Never panics; unknown routes → 404.
@@ -170,6 +184,12 @@ impl Router {
         if req.method != "GET" {
             return ApiResponse::error(405, "method not allowed");
         }
+        // Hold the store-access gate (if any) for the whole request so a concurrent
+        // sync pass and this request never both hold the store's single-instance lock.
+        let _gate = self
+            .gate
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         match req.path.as_str() {
             "/" => ApiResponse::html(INDEX_HTML),
             "/api/v1/accounts" => self.accounts(),
@@ -601,6 +621,21 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert!(resp.content_type.starts_with("text/html"));
         assert!(String::from_utf8_lossy(&resp.body).contains("iSyncYou"));
+    }
+
+    #[test]
+    fn gated_router_serves_and_releases_the_gate() {
+        // a router built with a shared store-access gate acquires it per request
+        // and releases it afterwards, so the daemon's sync thread and the web UI
+        // never hold the store's single-instance lock at the same time.
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router = Router::with_gate(Config::default(), gate.clone());
+        let resp = router.route(&ApiRequest::get("/api/v1/accounts"));
+        assert_eq!(resp.status, 200);
+        assert!(
+            gate.try_lock().is_ok(),
+            "the gate must be free again once the request returns"
+        );
     }
 
     #[test]

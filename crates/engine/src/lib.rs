@@ -78,6 +78,84 @@ fn unix_now() -> String {
         .to_string()
 }
 
+/// Read-app OAuth identity + cached-token resolution — the SSOT for the
+/// unattended read token both the CLI and the daemon use to sync without a fresh
+/// interactive login (a cached `login`/`setup` token is refreshed silently).
+pub mod auth {
+    use isyncyou_core::Config;
+    use std::path::PathBuf;
+
+    /// Public client app registration for read/backup scopes.
+    pub const READ_CLIENT: &str = "cee80dd9-c13e-4dbb-9d4c-73eb4987d447";
+    /// Delegated read scopes (User.Read lets `setup` confirm the identity).
+    pub const READ_SCOPES: &[&str] = &[
+        "Files.Read",
+        "Mail.Read",
+        "Calendars.Read",
+        "Contacts.Read",
+        "Tasks.Read",
+        "Notes.Read",
+        "User.Read",
+        "offline_access",
+    ];
+    /// Per-account cached read-token file (under the account's archive root).
+    pub const READ_CACHE_FILE: &str = ".isyncyou-token-read.json";
+
+    /// Where an account's cached read token lives.
+    pub fn read_token_cache_path(cfg: &Config, account: &str) -> Option<PathBuf> {
+        cfg.accounts
+            .iter()
+            .find(|a| a.id == account)
+            .map(|a| a.archive_root.join(READ_CACHE_FILE))
+    }
+
+    /// Resolve a usable read access token for `account` from its cached login,
+    /// refreshing silently. Errors (rather than blocking) when no token is cached —
+    /// the daemon then skips that account until the user runs `login`/`setup`.
+    pub fn resolve_cached_read_token(cfg: &Config, account: &str) -> Result<String, String> {
+        let cache = read_token_cache_path(cfg, account)
+            .ok_or_else(|| format!("no account '{account}' in config"))?;
+        if !cache.exists() {
+            return Err(format!(
+                "no cached token for '{account}' (run `isyncyou login`/`setup` once)"
+            ));
+        }
+        let now = super::unix_now().parse::<u64>().unwrap_or(0);
+        isyncyou_graph::auth::flow::ensure_access_token(&cache, READ_CLIENT, READ_SCOPES, now)
+    }
+
+    /// Public client app registration for write scopes (restore + bidirectional sync).
+    pub const WRITE_CLIENT: &str = "a90d9140-3a62-46d0-907b-f2b7b61a573a";
+    /// Scopes a bidirectional OneDrive sync needs — read+write of files only (not
+    /// the mail/calendar/notes write scopes, which are for restore). A subset of
+    /// what `login --write` consented, so a silent refresh succeeds.
+    pub const SYNC_SCOPES: &[&str] = &["Files.ReadWrite", "offline_access"];
+    /// Per-account cached write-token file (under the account's archive root).
+    pub const WRITE_CACHE_FILE: &str = ".isyncyou-token-write.json";
+
+    /// Where an account's cached write token lives.
+    pub fn write_token_cache_path(cfg: &Config, account: &str) -> Option<PathBuf> {
+        cfg.accounts
+            .iter()
+            .find(|a| a.id == account)
+            .map(|a| a.archive_root.join(WRITE_CACHE_FILE))
+    }
+
+    /// Resolve a read+write file token for unattended **bidirectional** sync from
+    /// the cached `login --write`, refreshing silently. Errors (skip) when absent.
+    pub fn resolve_cached_sync_token(cfg: &Config, account: &str) -> Result<String, String> {
+        let cache = write_token_cache_path(cfg, account)
+            .ok_or_else(|| format!("no account '{account}' in config"))?;
+        if !cache.exists() {
+            return Err(format!(
+                "no cached write token for '{account}' (run `isyncyou login --write` once)"
+            ));
+        }
+        let now = super::unix_now().parse::<u64>().unwrap_or(0);
+        isyncyou_graph::auth::flow::ensure_access_token(&cache, WRITE_CLIENT, SYNC_SCOPES, now)
+    }
+}
+
 /// Run one full bidirectional sync pass for `account` against an already-open
 /// `store`: pull the remote delta into the store, materialize it to disk, then
 /// mirror local creates / modifies (If-Match, keep-both) / deletes up to the
