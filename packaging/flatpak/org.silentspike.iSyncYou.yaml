@@ -1,0 +1,42 @@
+# Flatpak manifest for the iSyncYou status-bar GUI (plan §15: GUI as Flatpak).
+# The daemon/CLI ship as a host package (AppImage); this packages the native
+# status-bar window. Built in-sandbox with the rust SDK extension so the binary
+# matches the runtime's glibc.
+app-id: org.silentspike.iSyncYou
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: isyncyou-statusbar
+finish-args:
+  # the own renderer draws via X11/Wayland; no webkit, no portal needed
+  - --socket=fallback-x11
+  - --socket=wayland
+  # talk to the local daemon / Microsoft Graph
+  - --share=network
+  # the user's OneDrive sync folder (tighten per install)
+  - --filesystem=home
+modules:
+  - name: isyncyou-statusbar
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/isyncyou-statusbar/cargo
+      build-args:
+        # cargo fetches crates from the network during the build
+        - --share=network
+    build-commands:
+      - cargo build --release -p isyncyou-statusbar-app
+      - install -Dm755 target/release/isyncyou-statusbar /app/bin/isyncyou-statusbar
+      - install -Dm644 packaging/flatpak/org.silentspike.iSyncYou.desktop
+        /app/share/applications/org.silentspike.iSyncYou.desktop
+      - install -Dm644 packaging/appimage/isyncyou.png
+        /app/share/icons/hicolor/256x256/apps/org.silentspike.iSyncYou.png
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git

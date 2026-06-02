@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=iSyncYou
+Comment=Personal OneDrive sync — status bar
+Exec=isyncyou-statusbar
+Icon=org.silentspike.iSyncYou
+Categories=Utility;Network;
+Terminal=false
