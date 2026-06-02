@@ -6,4 +6,6 @@
 
 pub mod onedrive;
 
-pub use onedrive::{incremental_sync, SyncError, SyncReport};
+pub use onedrive::{
+    incremental_sync, push_delete, push_upload, RemoteWriter, SyncError, SyncReport,
+};

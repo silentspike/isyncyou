@@ -23,6 +23,8 @@ pub enum SyncError {
     Delta(DeltaError),
     #[error("malformed delta item: {0}")]
     Malformed(String),
+    #[error("remote: {0}")]
+    Remote(String),
 }
 
 impl From<DeltaError> for SyncError {
@@ -60,7 +62,7 @@ pub fn incremental_sync<T: Transport>(
         ..Default::default()
     };
     for item in &out.items {
-        match ingest_item(store, map, account, item, now)? {
+        match ingest_item(store, map, account, item, now, "remote_dirty")? {
             Ingest::Upserted => report.upserted += 1,
             Ingest::Deleted => report.deleted += 1,
             Ingest::Skipped => report.skipped += 1,
@@ -83,6 +85,7 @@ fn ingest_item(
     account: &str,
     item: &Value,
     now: &str,
+    state: &str,
 ) -> Result<Ingest, SyncError> {
     let id = item
         .get("id")
@@ -134,9 +137,62 @@ fn ingest_item(
         .pointer("/fileSystemInfo/lastModifiedDateTime")
         .and_then(Value::as_str)
         .map(String::from);
-    it.sync_state = "remote_dirty".into();
+    it.sync_state = state.into();
     store.upsert_item(&it)?;
     Ok(Ingest::Upserted)
+}
+
+/// Abstraction over the remote write operations, so the local→remote push driver
+/// is unit-testable with a mock and live-tested with the real client.
+pub trait RemoteWriter {
+    /// Upload `data` to `dest_path`; returns the created drive item JSON.
+    fn upload(&self, dest_path: &str, data: &[u8]) -> Result<Value, String>;
+    /// Delete a drive item by id.
+    fn delete(&self, item_id: &str) -> Result<(), String>;
+}
+
+#[cfg(feature = "http")]
+impl RemoteWriter for isyncyou_graph::GraphClient {
+    fn upload(&self, dest_path: &str, data: &[u8]) -> Result<Value, String> {
+        // 10 MiB fragments (320 KiB-aligned) for the resumable path.
+        self.upload_file(dest_path, data, 10 * 1024 * 1024)
+            .map_err(|e| e.to_string())
+    }
+    fn delete(&self, item_id: &str) -> Result<(), String> {
+        self.delete_item(item_id).map_err(|e| e.to_string())
+    }
+}
+
+/// Push a local file to the cloud: upload it, then ingest the returned item into
+/// the store as `clean`. Returns the new remote id.
+pub fn push_upload<W: RemoteWriter>(
+    writer: &W,
+    store: &Store,
+    map: &mut MappingTable,
+    account: &str,
+    dest_path: &str,
+    data: &[u8],
+) -> Result<String, SyncError> {
+    let item = writer.upload(dest_path, data).map_err(SyncError::Remote)?;
+    ingest_item(store, map, account, &item, "", "clean")?;
+    item.get("id")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| SyncError::Malformed("upload response had no id".into()))
+}
+
+/// Push a local deletion to the cloud: delete the remote item, then tombstone it
+/// in the store.
+pub fn push_delete<W: RemoteWriter>(
+    writer: &W,
+    store: &Store,
+    account: &str,
+    remote_id: &str,
+    now: &str,
+) -> Result<(), SyncError> {
+    writer.delete(remote_id).map_err(SyncError::Remote)?;
+    store.mark_deleted(account, SERVICE, remote_id, now)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -238,6 +294,117 @@ mod tests {
                 .as_deref(),
             Some("C2")
         );
+    }
+
+    /// Records ops and returns a canned drive item for uploads.
+    struct MockWriter {
+        uploaded: std::cell::RefCell<Vec<(String, usize)>>,
+        deleted: std::cell::RefCell<Vec<String>>,
+    }
+    impl MockWriter {
+        fn new() -> Self {
+            MockWriter {
+                uploaded: Default::default(),
+                deleted: Default::default(),
+            }
+        }
+    }
+    impl RemoteWriter for MockWriter {
+        fn upload(&self, dest_path: &str, data: &[u8]) -> Result<Value, String> {
+            self.uploaded
+                .borrow_mut()
+                .push((dest_path.to_string(), data.len()));
+            let name = dest_path.rsplit('/').next().unwrap_or(dest_path);
+            Ok(json!({
+                "id": "NEWID",
+                "name": name,
+                "parentReference": { "id": "root1" },
+                "size": data.len(),
+                "file": { "hashes": { "quickXorHash": "UP==" } }
+            }))
+        }
+        fn delete(&self, item_id: &str) -> Result<(), String> {
+            self.deleted.borrow_mut().push(item_id.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn push_upload_stores_clean_item() {
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let w = MockWriter::new();
+        let id = push_upload(&w, &store, &mut map, "acc", "/Docs/note.txt", b"hello").unwrap();
+        assert_eq!(id, "NEWID");
+        assert_eq!(
+            w.uploaded.borrow().as_slice(),
+            &[("/Docs/note.txt".to_string(), 5)]
+        );
+        let it = store.get_item("acc", SERVICE, "NEWID").unwrap().unwrap();
+        assert_eq!(it.name, "note.txt");
+        assert_eq!(it.sync_state, "clean");
+        assert_eq!(it.size, Some(5));
+    }
+
+    #[test]
+    fn push_delete_tombstones_after_remote_delete() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "X1", "x.txt", "file"))
+            .unwrap();
+        let w = MockWriter::new();
+        push_delete(&w, &store, "acc", "X1", "2026-06-02T00:00:00Z").unwrap();
+        assert_eq!(w.deleted.borrow().as_slice(), &["X1".to_string()]);
+        assert!(store
+            .get_item("acc", SERVICE, "X1")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_some());
+    }
+
+    /// Live local→remote: upload via the connector + GraphClient, confirm the
+    /// store has a clean row, then push-delete (removes from OneDrive + tombstones).
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_push_upload_then_delete() {
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_push_upload_then_delete: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let client = isyncyou_graph::GraphClient::new(token);
+        let data = b"isyncyou connector push test".to_vec();
+        let id = push_upload(
+            &client,
+            &store,
+            &mut map,
+            "backupslave",
+            "/iSyncYou-livetest/push.txt",
+            &data,
+        )
+        .expect("push_upload should succeed");
+        let it = store
+            .get_item("backupslave", SERVICE, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(it.sync_state, "clean");
+        eprintln!("pushed item {id} (state={})", it.sync_state);
+        push_delete(&client, &store, "backupslave", &id, "2026-06-02T00:00:00Z")
+            .expect("push_delete should succeed");
+        assert!(store
+            .get_item("backupslave", SERVICE, &id)
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_some());
+        eprintln!("deleted item {id}");
     }
 
     /// Live end-to-end: real OneDrive delta -> store, against the throwaway
