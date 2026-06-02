@@ -92,8 +92,11 @@ fn run(args: &Args) -> Result<(), String> {
     }
 
     match &args.socket {
+        // Unix-domain socket (desktop default) — unavailable on non-Unix; there a
+        // --socket is ignored and the daemon serves over TCP.
+        #[cfg(unix)]
         Some(path) => isyncyou_webui::serve_unix(path, router).map_err(|e| format!("serve: {e}")),
-        None => isyncyou_webui::serve(&args.bind, router).map_err(|e| format!("serve: {e}")),
+        _ => isyncyou_webui::serve(&args.bind, router).map_err(|e| format!("serve: {e}")),
     }
 }
 

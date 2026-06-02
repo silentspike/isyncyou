@@ -218,6 +218,8 @@ enum Command {
     },
     /// Mount the account's OneDrive tree as an on-demand placeholder filesystem:
     /// files appear with their real size but download only when first read.
+    /// (Unix-only — FUSE.)
+    #[cfg(unix)]
     Mount {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
@@ -375,6 +377,7 @@ fn run(command: Command) -> Result<(), String> {
             account,
             write,
         } => cmd_login(&config, &account, write),
+        #[cfg(unix)]
         Command::Mount {
             config,
             account,
@@ -459,9 +462,11 @@ fn cmd_login(config: &Path, account: &str, write: bool) -> Result<(), String> {
 }
 
 /// Hydrates placeholder files by downloading their content from OneDrive.
+#[cfg(unix)]
 struct GraphHydrator {
     client: isyncyou_graph::GraphClient,
 }
+#[cfg(unix)]
 impl isyncyou_fuse::Hydrator for GraphHydrator {
     fn fetch(&self, remote_id: &str) -> Result<Vec<u8>, String> {
         self.client
@@ -470,6 +475,7 @@ impl isyncyou_fuse::Hydrator for GraphHydrator {
     }
 }
 
+#[cfg(unix)]
 fn cmd_mount(
     config: &Path,
     account: &str,
@@ -570,8 +576,11 @@ fn cmd_serve(config: &Path, bind: &str, socket: Option<PathBuf>) -> Result<(), S
     let cfg = load_config(config)?;
     let router = isyncyou_webui::Router::new(cfg);
     match socket {
+        // Unix-domain socket is the desktop default; on non-Unix targets it isn't
+        // available, so any --socket is ignored and we serve over TCP.
+        #[cfg(unix)]
         Some(path) => isyncyou_webui::serve_unix(&path, router).map_err(|e| format!("serve: {e}")),
-        None => isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}")),
+        _ => isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}")),
     }
 }
 
