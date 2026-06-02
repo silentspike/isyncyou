@@ -387,16 +387,54 @@ fn cmd_check(path: &Path) -> Result<(), String> {
     }
 }
 
+/// All services a status report covers.
+const STATUS_SERVICES: &[&str] = &[
+    "onedrive", "mail", "calendar", "contacts", "todo", "onenote",
+];
+
+/// Per-service counts for an account's archive.
+struct AccountStatus {
+    /// `(service, item_count, with_archived_body)` for non-empty services.
+    services: Vec<(String, usize, usize)>,
+    onedrive_cursor: bool,
+}
+
+fn account_status(cfg: &Config, account: &str) -> Result<AccountStatus, String> {
+    let store = Store::open(store_path(cfg, account)?).map_err(|e| e.to_string())?;
+    let mut services = Vec::new();
+    for &svc in STATUS_SERVICES {
+        let items = store
+            .items_by_service(account, svc)
+            .map_err(|e| e.to_string())?;
+        if !items.is_empty() {
+            let archived = items.iter().filter(|i| i.local_path.is_some()).count();
+            services.push((svc.to_string(), items.len(), archived));
+        }
+    }
+    let onedrive_cursor = store
+        .get_delta_cursor(account, "onedrive", "")
+        .map_err(|e| e.to_string())?
+        .is_some();
+    Ok(AccountStatus {
+        services,
+        onedrive_cursor,
+    })
+}
+
 fn cmd_status(config: &Path, account: &str) -> Result<(), String> {
     let cfg = load_config(config)?;
-    let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
-    let cursor = store
-        .get_delta_cursor(account, "onedrive", "")
-        .map_err(|e| e.to_string())?;
+    let st = account_status(&cfg, account)?;
     println!("account: {account}");
+    if st.services.is_empty() {
+        println!("  (nothing tracked yet — run `isyncyou backup`)");
+    } else {
+        for (svc, items, archived) in &st.services {
+            println!("  {svc}: {items} item(s), {archived} with archived body");
+        }
+    }
     println!(
         "onedrive delta cursor: {}",
-        if cursor.is_some() {
+        if st.onedrive_cursor {
             "present"
         } else {
             "none (never synced)"
@@ -871,6 +909,43 @@ mod tests {
     #[test]
     fn sync_requires_account() {
         assert!(parse(&["isyncyou", "sync", "--config", "c.toml"]).is_err());
+    }
+
+    #[test]
+    fn account_status_counts_per_service() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-st-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut m1 = isyncyou_store::Item::new("a", "mail", "m1", "Hi", "message");
+            m1.local_path = Some("mail/aa/bb/x.eml".into());
+            store.upsert_item(&m1).unwrap();
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a", "mail", "m2", "Yo", "message",
+                ))
+                .unwrap();
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a", "calendar", "e1", "Ev", "event",
+                ))
+                .unwrap();
+            store.set_delta_cursor("a", "onedrive", "", "CUR").unwrap();
+        }
+        let cfg = load_config(&p).unwrap();
+        let st = account_status(&cfg, "a").unwrap();
+        let mail = st.services.iter().find(|(s, ..)| s == "mail").unwrap();
+        assert_eq!((mail.1, mail.2), (2, 1)); // 2 messages, 1 archived
+        assert!(st
+            .services
+            .iter()
+            .any(|(s, n, _)| s == "calendar" && *n == 1));
+        // empty services are omitted
+        assert!(!st.services.iter().any(|(s, ..)| s == "todo"));
+        assert!(st.onedrive_cursor);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
