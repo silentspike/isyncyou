@@ -231,8 +231,6 @@ enum Command {
 
 /// The M365 backup services this CLI knows how to drive.
 const SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
-/// Services with a restore path (OneNote pages can't be re-created via a simple POST).
-const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo"];
 
 // Public client app registrations + scopes. The read app is the SSOT in
 // `engine::auth` (the daemon resolves the same unattended token); the CLI just
@@ -1263,29 +1261,27 @@ fn cmd_restore(
     token: Option<String>,
 ) -> Result<(), String> {
     let cfg = load_config(config)?;
-    let acc = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let archive_root = acc.archive_root.clone();
-    let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
-
-    let item = store
-        .get_item(account, service, id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no archived {service} item '{id}' for account '{account}'"))?;
-    let rel = item
-        .local_path
-        .as_deref()
-        .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
-    let path = archive_root.join(rel);
-    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
     // restore-local: recover the archived body to a directory (any service, no
     // token, no network). Distinct from `export` (bulk .ics/.vcf) — this is a
     // single-item recovery of the exact archived bytes.
     if let Some(dir) = to_local {
+        let acc = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .ok_or_else(|| format!("no account '{account}' in config"))?;
+        let archive_root = acc.archive_root.clone();
+        let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
+        let item = store
+            .get_item(account, service, id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no archived {service} item '{id}' for account '{account}'"))?;
+        let rel = item
+            .local_path
+            .as_deref()
+            .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
+        let bytes = std::fs::read(archive_root.join(rel)).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let out = local_restore_path(&dir, &item.name, rel);
         std::fs::write(&out, &bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
@@ -1293,36 +1289,10 @@ fn cmd_restore(
         return Ok(());
     }
 
-    // restore-cloud: re-create via Graph (needs the write token).
-    if !RESTORE_SERVICES.contains(&service) {
-        return Err(format!(
-            "service '{service}' has no cloud restore path (expected one of {}); \
-             use --to-local to recover its archived body to a file",
-            RESTORE_SERVICES.join("|")
-        ));
-    }
+    // restore-cloud: re-create via Graph (write token). The engine opens the store
+    // and re-creates the item — shared with the daemon's web-UI restore action.
     let token = resolve_token(&cfg, account, token, true)?;
-    let client = isyncyou_graph::GraphClient::new(token);
-    let new_id = match service {
-        "mail" => connectors::restore_message(&client, &bytes)?,
-        "calendar" => {
-            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            connectors::restore_event(&client, &v)?
-        }
-        "contacts" => {
-            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            connectors::restore_contact(&client, &v)?
-        }
-        "todo" => {
-            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            let list = item
-                .parent_remote_id
-                .as_deref()
-                .ok_or("archived task has no parent list id")?;
-            connectors::restore_task(&client, list, &v)?
-        }
-        _ => unreachable!("validated against RESTORE_SERVICES"),
-    };
+    let new_id = isyncyou_engine::restore_cloud(&cfg, account, service, id, token)?;
     println!("restored {service} item '{id}' as '{new_id}'");
     Ok(())
 }
