@@ -14,6 +14,8 @@
 //! - `serve`   — serve the local web UI
 //! - `login`   — device-code sign-in; caches the account token for later commands
 //! - `mount`   — mount the OneDrive tree as an on-demand placeholder filesystem (FUSE)
+//! - `pbs-backup`/`pbs-restore`/`pbs-list` — snapshot the store to Proxmox Backup
+//!   Server / restore a snapshot into a temp store (needs a `[pbs]` config)
 //!
 //! Token resolution: `--token`/`ISYNCYOU_TOKEN` wins; otherwise the per-account
 //! cached token (from `login`) is loaded and auto-refreshed.
@@ -227,6 +229,29 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
+    /// Snapshot an account's store to Proxmox Backup Server (needs a [pbs] config).
+    PbsBackup {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+    },
+    /// Restore a PBS snapshot into a directory (a temporary restore store, never live).
+    PbsRestore {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        /// Snapshot path, e.g. `host/isyncyou-<account>/<timestamp>` (see `pbs-list`).
+        #[arg(long)]
+        snapshot: String,
+        /// Empty/new directory to restore into.
+        #[arg(long)]
+        into: PathBuf,
+    },
+    /// List the snapshots in the configured PBS repository.
+    PbsList {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
@@ -356,6 +381,13 @@ fn run(command: Command) -> Result<(), String> {
             mountpoint,
             token,
         } => cmd_mount(&config, &account, &mountpoint, token),
+        Command::PbsBackup { config, account } => cmd_pbs_backup(&config, &account),
+        Command::PbsRestore {
+            config,
+            snapshot,
+            into,
+        } => cmd_pbs_restore(&config, &snapshot, &into),
+        Command::PbsList { config } => cmd_pbs_list(&config),
     }
 }
 
@@ -466,6 +498,72 @@ fn cmd_mount(
         mountpoint.display()
     );
     isyncyou_fuse::mount(fs, mountpoint).map_err(|e| format!("mount: {e}"))
+}
+
+/// Build a PBS client from the config's `[pbs]` section, reading the password from
+/// the configured file (never stored in the config itself).
+fn build_pbs(cfg: &Config) -> Result<isyncyou_pbs::Pbs, String> {
+    let p = cfg
+        .pbs
+        .as_ref()
+        .ok_or("no [pbs] section in config — add repository + password_file")?;
+    let password = std::fs::read_to_string(&p.password_file)
+        .map_err(|e| format!("read pbs password_file {}: {e}", p.password_file.display()))?
+        .trim()
+        .to_string();
+    let mut pbs = isyncyou_pbs::Pbs::new(&p.repository, password);
+    pbs.fingerprint = p.fingerprint.clone();
+    pbs.namespace = p.namespace.clone();
+    Ok(pbs)
+}
+
+fn cmd_pbs_backup(config: &Path, account: &str) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let pbs = build_pbs(&cfg)?;
+    // stage a consistent DB snapshot + a manifest, then push the dir as one pxar
+    let stage =
+        std::env::temp_dir().join(format!("isyncyou-pbs-{}-{}", account, std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    {
+        let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
+        store
+            .backup_to(stage.join("store.db"))
+            .map_err(|e| format!("snapshot store: {e}"))?;
+    }
+    let manifest = serde_json::json!({
+        "account": account,
+        "schema_version": isyncyou_store::SCHEMA_VERSION,
+        "created_unix": unix_now(),
+    });
+    std::fs::write(
+        stage.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let snap = pbs.backup(&format!("isyncyou-{account}"), &stage)?;
+    let _ = std::fs::remove_dir_all(&stage);
+    println!("backed up account '{account}' store to PBS snapshot {snap}");
+    Ok(())
+}
+
+fn cmd_pbs_restore(config: &Path, snapshot: &str, into: &Path) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let pbs = build_pbs(&cfg)?;
+    std::fs::create_dir_all(into).map_err(|e| format!("create {}: {e}", into.display()))?;
+    pbs.restore(snapshot, into)?;
+    println!(
+        "restored snapshot {snapshot} into {} (temporary restore store — NOT the live store)",
+        into.display()
+    );
+    Ok(())
+}
+
+fn cmd_pbs_list(config: &Path) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let pbs = build_pbs(&cfg)?;
+    print!("{}", pbs.list()?);
+    Ok(())
 }
 
 fn cmd_serve(config: &Path, bind: &str, socket: Option<PathBuf>) -> Result<(), String> {
