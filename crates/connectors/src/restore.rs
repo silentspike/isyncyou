@@ -164,6 +164,29 @@ pub fn restore_contact<R: Restorer>(restorer: &R, contact: &Value) -> Result<Str
     created_id(restorer.create("/me/contacts", &payload)?)
 }
 
+/// Re-creates a mail message from its full MIME (`.eml`). Separate from
+/// [`Restorer`] because mail restore posts raw MIME, not a sanitized JSON
+/// object: the whole message (headers, body, attachments) round-trips verbatim.
+pub trait MessageCreator {
+    fn create_message_from_mime(&self, mime: &[u8]) -> Result<Value, String>;
+}
+
+#[cfg(feature = "http")]
+impl MessageCreator for isyncyou_graph::GraphClient {
+    fn create_message_from_mime(&self, mime: &[u8]) -> Result<Value, String> {
+        isyncyou_graph::GraphClient::create_message_from_mime(self, mime).map_err(|e| e.to_string())
+    }
+}
+
+/// Restore one mail message from its `.eml` MIME: the created message lands in
+/// Drafts (Graph's behaviour for a MIME create); returns the new message id.
+pub fn restore_message<C: MessageCreator>(creator: &C, mime: &[u8]) -> Result<String, String> {
+    if mime.is_empty() {
+        return Err("message MIME is empty".into());
+    }
+    created_id(creator.create_message_from_mime(mime)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +308,34 @@ mod tests {
         assert!(restore_task(&m, "L", &json!({ "id": "x" })).is_err());
         assert!(restore_contact(&m, &json!({ "id": "x" })).is_err());
         assert!(m.created.borrow().is_empty());
+    }
+
+    struct MockMessageCreator {
+        last: RefCell<Vec<u8>>,
+    }
+    impl MessageCreator for MockMessageCreator {
+        fn create_message_from_mime(&self, mime: &[u8]) -> Result<Value, String> {
+            *self.last.borrow_mut() = mime.to_vec();
+            Ok(json!({ "id": "MSG1", "isDraft": true }))
+        }
+    }
+
+    #[test]
+    fn restore_message_passes_mime_and_returns_id() {
+        let m = MockMessageCreator {
+            last: RefCell::new(Vec::new()),
+        };
+        let mime = b"From: a@example.com\r\nSubject: Hi\r\n\r\nBody\r\n";
+        assert_eq!(restore_message(&m, mime).unwrap(), "MSG1");
+        assert_eq!(m.last.borrow().as_slice(), mime);
+    }
+
+    #[test]
+    fn restore_message_rejects_empty_mime() {
+        let m = MockMessageCreator {
+            last: RefCell::new(Vec::new()),
+        };
+        assert!(restore_message(&m, b"").is_err());
     }
 
     /// Live round-trip: fetch one event, restore it, verify subject, delete copy.
@@ -456,6 +507,52 @@ mod tests {
         eprintln!("restored synthetic contact as {new_id}");
         client
             .delete(&format!("/me/contacts/{new_id}"))
+            .expect("cleanup");
+    }
+
+    /// Live round-trip: re-create a mail message from synthetic MIME (lands in
+    /// Drafts), verify the subject, delete it. Needs `Mail.ReadWrite`.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_restore_message_roundtrip() {
+        use isyncyou_graph::Transport;
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_restore_message_roundtrip: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let mime = b"MIME-Version: 1.0\r\n\
+From: iSyncYou Test <isyncyou-test@example.com>\r\n\
+To: backupslave@outlook.com\r\n\
+Subject: iSyncYou MIME restore test\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+This message was re-created from MIME by iSyncYou.\r\n";
+        let new_id = restore_message(&client, mime).expect("restore message should succeed");
+        let restored = client
+            .get(&format!(
+                "https://graph.microsoft.com/v1.0/me/messages/{new_id}"
+            ))
+            .body
+            .expect("GET restored message");
+        assert_eq!(
+            restored
+                .get("subject")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "iSyncYou MIME restore test"
+        );
+        eprintln!(
+            "restored MIME message as {new_id} (isDraft={:?})",
+            restored.get("isDraft")
+        );
+        client
+            .delete(&format!("/me/messages/{new_id}"))
             .expect("cleanup");
     }
 }

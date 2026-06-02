@@ -263,6 +263,38 @@ impl GraphClient {
         json_or_err(resp)
     }
 
+    /// POST a raw body with an explicit `Content-Type` and return the created
+    /// resource. Used for endpoints that don't take JSON — e.g. creating a mail
+    /// message from MIME (`text/plain` + base64 body).
+    pub fn post_raw(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<serde_json::Value, UploadError> {
+        let url = abs(url);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        json_or_err(resp)
+    }
+
+    /// Create a mail message from its full MIME (`.eml`). Graph expects the MIME
+    /// **base64-encoded** with `Content-Type: text/plain`; the message is created
+    /// (in Drafts) and the created resource JSON returned.
+    pub fn create_message_from_mime(&self, mime: &[u8]) -> Result<serde_json::Value, UploadError> {
+        self.post_raw(
+            "/me/messages",
+            "text/plain",
+            base64_encode(mime).into_bytes(),
+        )
+    }
+
     /// DELETE an arbitrary Graph resource (used for restore-test cleanup on the
     /// throwaway account). `url` may be absolute or a `/me/...` path.
     pub fn delete_url(&self, url: &str) -> Result<(), UploadError> {
@@ -292,6 +324,32 @@ fn abs(url: &str) -> String {
     }
 }
 
+/// Standard base64 (RFC 4648, with padding). Small + dependency-free; used to
+/// encode MIME for `POST /me/messages`.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn json_or_err(resp: reqwest::blocking::Response) -> Result<serde_json::Value, UploadError> {
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
@@ -316,6 +374,24 @@ fn enc(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::run_delta;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn abs_prefixes_paths_but_not_urls() {
+        assert_eq!(abs("/me/events"), format!("{GRAPH}/me/events"));
+        assert_eq!(abs("https://x/y"), "https://x/y");
+    }
 
     /// Live OneDrive delta against the test account. Skips unless
     /// `ISYNCYOU_TEST_TOKEN` (a Files.Read bearer token for the throwaway
