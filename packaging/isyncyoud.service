@@ -7,7 +7,8 @@
 #   # EDIT ReadWritePaths below to match your sync_root + archive_root, then:
 #   systemctl --user daemon-reload && systemctl --user enable --now isyncyoud
 #
-# The web UI is then served on http://127.0.0.1:8765/.
+# The web UI is then served on http://127.0.0.1:8765/, and every account with a
+# cached `isyncyou login --write` token is synced every 5 minutes (--sync-secs).
 
 [Unit]
 Description=iSyncYou engine daemon (local web UI + backup/sync)
@@ -17,7 +18,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/isyncyoud --config %h/.config/isyncyou/isyncyou.toml
+ExecStart=%h/.local/bin/isyncyoud --config %h/.config/isyncyou/isyncyou.toml --sync-secs 300
 Restart=on-failure
 RestartSec=5
 
