@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "bin/*", "gui/statusbar", "gui/webui"]
+members = ["crates/*", "bin/*", "gui/statusbar", "gui/statusbar-app", "gui/webui"]
 
 [workspace.package]
 version = "0.1.0"
