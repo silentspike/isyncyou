@@ -66,6 +66,54 @@ pub struct StatusView {
     pub queue: u32,
 }
 
+/// What a click on a status-bar control means. The window layer turns this into
+/// an engine call / a browser launch; the model below stays GUI-framework-free
+/// and headless-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Toggle the engine between paused and running.
+    TogglePause,
+    /// Open the full web UI in the user's browser.
+    OpenBrowser,
+}
+
+/// On-screen rectangles of the two controls, as `(x, y, w, h)`. Shared by
+/// [`render_with`] (which draws them) and [`hit_test`] (which maps a click back
+/// to an [`Action`]) so the drawn buttons and the hit boxes never drift apart.
+const PAUSE_BTN: (f32, f32, f32, f32) = (16.0, 470.0, 150.0, 34.0);
+const BROWSER_BTN: (f32, f32, f32, f32) = (WIDTH as f32 - 16.0 - 174.0, 470.0, 174.0, 34.0);
+
+fn in_rect(x: f32, y: f32, r: (f32, f32, f32, f32)) -> bool {
+    x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
+}
+
+/// Map a click at `(x, y)` (in render pixels) to the control it hit, if any.
+pub fn hit_test(x: f32, y: f32) -> Option<Action> {
+    if in_rect(x, y, PAUSE_BTN) {
+        Some(Action::TogglePause)
+    } else if in_rect(x, y, BROWSER_BTN) {
+        Some(Action::OpenBrowser)
+    } else {
+        None
+    }
+}
+
+/// Apply an [`Action`] to the view model (the headless event-dispatch half).
+/// `TogglePause` flips paused↔running; `OpenBrowser` doesn't change the view (the
+/// caller launches the browser). Returns whether the view changed.
+pub fn apply(view: &mut StatusView, action: Action) -> bool {
+    match action {
+        Action::TogglePause => {
+            view.state = match view.state {
+                SyncState::Paused => SyncState::Synced,
+                _ => SyncState::Paused,
+            };
+            true
+        }
+        Action::OpenBrowser => false,
+    }
+}
+
 fn col(r: u8, g: u8, b: u8) -> Color {
     Color::from_rgba8(r, g, b, 255)
 }
@@ -360,6 +408,52 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
         &format!("{} in Queue", view.queue),
     );
 
+    // action buttons — Pause/Resume + open the full UI. Their rects live in
+    // PAUSE_BTN / BROWSER_BTN so hit_test always matches what's drawn here.
+    let pause_label = if matches!(view.state, SyncState::Paused) {
+        "Fortsetzen"
+    } else {
+        "Pause"
+    };
+    fill_rrect(
+        &mut pm,
+        PAUSE_BTN.0,
+        PAUSE_BTN.1,
+        PAUSE_BTN.2,
+        PAUSE_BTN.3,
+        8.0,
+        col(0x18, 0x23, 0x3a),
+    );
+    text(
+        &mut pm,
+        fs,
+        sc,
+        PAUSE_BTN.0 + 16.0,
+        PAUSE_BTN.1 + 9.0,
+        13.0,
+        col(0xcd, 0xd6, 0xe4),
+        pause_label,
+    );
+    fill_rrect(
+        &mut pm,
+        BROWSER_BTN.0,
+        BROWSER_BTN.1,
+        BROWSER_BTN.2,
+        BROWSER_BTN.3,
+        8.0,
+        col(0x1d, 0x4e, 0xd8),
+    );
+    text(
+        &mut pm,
+        fs,
+        sc,
+        BROWSER_BTN.0 + 16.0,
+        BROWSER_BTN.1 + 9.0,
+        13.0,
+        col(0xff, 0xff, 0xff),
+        "Im Browser \u{00f6}ffnen",
+    );
+
     // footer hint
     fill_rect(
         &mut pm,
@@ -452,6 +546,36 @@ mod tests {
     fn render_png_has_png_signature() {
         let png = render_png(&sample());
         assert_eq!(&png[1..4], b"PNG", "expected PNG signature");
+    }
+
+    #[test]
+    fn hit_test_maps_clicks_to_controls() {
+        // a point inside each button's rect → its action
+        let pc = (PAUSE_BTN.0 + 5.0, PAUSE_BTN.1 + 5.0);
+        assert_eq!(hit_test(pc.0, pc.1), Some(Action::TogglePause));
+        let bc = (BROWSER_BTN.0 + 5.0, BROWSER_BTN.1 + 5.0);
+        assert_eq!(hit_test(bc.0, bc.1), Some(Action::OpenBrowser));
+        // empty space (the header) hits nothing
+        assert_eq!(hit_test(5.0, 5.0), None);
+        // just outside the pause button (right edge) hits nothing
+        assert_eq!(
+            hit_test(PAUSE_BTN.0 + PAUSE_BTN.2 + 1.0, PAUSE_BTN.1 + 5.0),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_toggles_pause_and_browser_is_inert() {
+        let mut v = sample();
+        v.state = SyncState::Synced;
+        assert!(apply(&mut v, Action::TogglePause));
+        assert_eq!(v.state, SyncState::Paused);
+        assert!(apply(&mut v, Action::TogglePause));
+        assert_eq!(v.state, SyncState::Synced);
+        // OpenBrowser changes nothing in the model
+        let before = v.state.clone();
+        assert!(!apply(&mut v, Action::OpenBrowser));
+        assert_eq!(v.state, before);
     }
 
     #[test]
