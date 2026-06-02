@@ -148,6 +148,7 @@ impl Router {
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/items" => self.items(req),
             "/api/v1/item" => self.item(req),
+            "/api/v1/body" => self.body(req),
             "/api/v1/search" => self.search(req),
             _ => ApiResponse::error(404, "not found"),
         }
@@ -215,6 +216,48 @@ impl Router {
         }
     }
 
+    /// Serve an item's archived body bytes. The content-type is forced to a
+    /// **non-executable** type (the browser must never run scripts/trackers
+    /// embedded in a backed-up mail/page — the full sanitized viewer is later
+    /// work), and the resolved path must stay under the account's archive_root.
+    fn body(&self, req: &ApiRequest) -> ApiResponse {
+        let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
+            (Some(a), Some(s), Some(i)) => (a, s, i),
+            _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
+        };
+        let acc = match self.config.accounts.iter().find(|a| a.id == account) {
+            Some(a) => a,
+            None => return ApiResponse::error(404, "unknown account"),
+        };
+        let archive_root = acc.archive_root.clone();
+        let store = match self.open(Some(account)) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let rel = match store.get_item(account, service, id) {
+            Ok(Some(it)) => match it.local_path {
+                Some(p) => p,
+                None => return ApiResponse::error(404, "item has no archived body"),
+            },
+            Ok(None) => return ApiResponse::error(404, "item not found"),
+            Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+        };
+        let path = archive_root.join(&rel);
+        // Defense in depth: the resolved body must stay under archive_root.
+        match (path.canonicalize(), archive_root.canonicalize()) {
+            (Ok(p), Ok(root)) if p.starts_with(&root) => match std::fs::read(&p) {
+                Ok(bytes) => ApiResponse {
+                    status: 200,
+                    content_type: safe_content_type(&rel).into(),
+                    body: bytes,
+                },
+                Err(e) => ApiResponse::error(500, &format!("read: {e}")),
+            },
+            (Ok(_), Ok(_)) => ApiResponse::error(400, "body path escapes archive root"),
+            _ => ApiResponse::error(404, "archived body file missing"),
+        }
+    }
+
     fn search(&self, req: &ApiRequest) -> ApiResponse {
         let q = match req.q("q") {
             Some(q) if !q.is_empty() => q,
@@ -233,6 +276,18 @@ impl Router {
             // An invalid FTS expression is a client error, not a server fault.
             Err(e) => ApiResponse::error(400, &format!("invalid query: {e}")),
         }
+    }
+}
+
+/// A deliberately non-executable content-type for archived bodies: `.json` is
+/// served as JSON; everything else (incl. `.eml` and `.html`) as plain text so a
+/// browser renders it inertly without running scripts, loading trackers, or
+/// treating it as a page.
+fn safe_content_type(rel: &str) -> &'static str {
+    if rel.ends_with(".json") {
+        "application/json; charset=utf-8"
+    } else {
+        "text/plain; charset=utf-8"
     }
 }
 
@@ -367,6 +422,78 @@ mod tests {
         let v = body_json(&resp);
         assert_eq!(v["count"], 1);
         assert_eq!(v["hits"][0]["remote_id"], "m1");
+    }
+
+    #[test]
+    fn body_serves_archived_bytes_with_safe_content_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("calendar/aa/bb")).unwrap();
+        std::fs::create_dir_all(arch.join("mail/cc/dd")).unwrap();
+        std::fs::write(
+            arch.join("calendar/aa/bb/ev.json"),
+            b"{\"id\":\"e1\",\"subject\":\"X\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            arch.join("mail/cc/dd/m.eml"),
+            b"From: a@b\r\nSubject: Hi\r\n",
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut e = Item::new("a", "calendar", "e1", "X", "event");
+            e.local_path = Some("calendar/aa/bb/ev.json".into());
+            store.upsert_item(&e).unwrap();
+            let mut m = Item::new("a", "mail", "m1", "Hi", "message");
+            m.local_path = Some("mail/cc/dd/m.eml".into());
+            store.upsert_item(&m).unwrap();
+            store
+                .upsert_item(&Item::new("a", "calendar", "e2", "NoBody", "event"))
+                .unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+
+        // JSON body -> application/json + the bytes
+        let j = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=calendar&id=e1",
+        ));
+        assert_eq!(j.status, 200);
+        assert!(j.content_type.starts_with("application/json"));
+        assert!(String::from_utf8_lossy(&j.body).contains("\"subject\":\"X\""));
+
+        // .eml body -> served as inert text/plain (never text/html)
+        let m = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=mail&id=m1",
+        ));
+        assert_eq!(m.status, 200);
+        assert!(m.content_type.starts_with("text/plain"));
+        assert!(String::from_utf8_lossy(&m.body).contains("Subject: Hi"));
+
+        // item without a body -> 404, missing params -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/body?account=a&service=calendar&id=e2"
+                ))
+                .status,
+            404
+        );
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/body?account=a&service=calendar"))
+                .status,
+            400
+        );
     }
 
     #[test]
