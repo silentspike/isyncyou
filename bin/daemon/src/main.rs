@@ -68,6 +68,12 @@ fn run(args: &Args) -> Result<(), String> {
     // one of them ever holds a store's single-instance file lock at a time.
     let gate = Arc::new(Mutex::new(()));
 
+    // A per-process capability token gates the destructive restore POST.
+    let cap_token = mint_cap_token();
+    let handler: Arc<dyn isyncyou_webui::RestoreHandler> =
+        Arc::new(DaemonRestore { cfg: cfg.clone() });
+    eprintln!("isyncyoud: restore enabled; capability token: {cap_token}");
+
     let router = if args.sync_secs > 0 {
         let (cfg2, gate2, secs) = (cfg.clone(), gate.clone(), args.sync_secs);
         eprintln!("isyncyoud: background sync every {secs}s");
@@ -75,11 +81,35 @@ fn run(args: &Args) -> Result<(), String> {
         isyncyou_webui::Router::with_gate(cfg, gate)
     } else {
         isyncyou_webui::Router::new(cfg)
-    };
+    }
+    .with_restore(handler, cap_token);
 
     match &args.socket {
         Some(path) => isyncyou_webui::serve_unix(path, router).map_err(|e| format!("serve: {e}")),
         None => isyncyou_webui::serve(&args.bind, router).map_err(|e| format!("serve: {e}")),
+    }
+}
+
+/// Mint a per-process capability token from `/dev/urandom` (hex), with a
+/// pid-based fallback. Required on the destructive restore POST.
+fn mint_cap_token() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => format!("isy-{}-fallback", std::process::id()),
+    }
+}
+
+/// The daemon's destructive-action handler: re-create an archived item in the
+/// cloud using the cached `login --write` (restore-scoped) token.
+struct DaemonRestore {
+    cfg: Config,
+}
+impl isyncyou_webui::RestoreHandler for DaemonRestore {
+    fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String> {
+        let token = isyncyou_engine::auth::resolve_cached_restore_token(&self.cfg, account)?;
+        isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)
     }
 }
 

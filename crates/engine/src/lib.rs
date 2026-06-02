@@ -154,6 +154,94 @@ pub mod auth {
         let now = super::unix_now().parse::<u64>().unwrap_or(0);
         isyncyou_graph::auth::flow::ensure_access_token(&cache, WRITE_CLIENT, SYNC_SCOPES, now)
     }
+
+    /// Full write scopes needed to **restore** items across services (re-create
+    /// mail/events/contacts/tasks). A superset of [`SYNC_SCOPES`].
+    pub const RESTORE_SCOPES: &[&str] = &[
+        "Files.ReadWrite",
+        "Mail.ReadWrite",
+        "Mail.Send",
+        "Calendars.ReadWrite",
+        "Contacts.ReadWrite",
+        "Tasks.ReadWrite",
+        "offline_access",
+    ];
+
+    /// Resolve a full write token (restore scopes) from the cached `login --write`,
+    /// refreshing silently. Used by the daemon's web-UI restore action.
+    pub fn resolve_cached_restore_token(cfg: &Config, account: &str) -> Result<String, String> {
+        let cache = write_token_cache_path(cfg, account)
+            .ok_or_else(|| format!("no account '{account}' in config"))?;
+        if !cache.exists() {
+            return Err(format!(
+                "no cached write token for '{account}' (run `isyncyou login --write` once)"
+            ));
+        }
+        let now = super::unix_now().parse::<u64>().unwrap_or(0);
+        isyncyou_graph::auth::flow::ensure_access_token(&cache, WRITE_CLIENT, RESTORE_SCOPES, now)
+    }
+}
+
+/// Cloud services that can be re-created from their canonical archive.
+pub const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo"];
+
+/// Re-create one archived item back in the cloud via Graph (restore-cloud-item).
+/// Opens the account's store, reads the archived body, and re-creates it through
+/// the connectors. Shared by the CLI's `restore` and the daemon's web-UI restore
+/// action. `token` must carry the write/restore scopes. Returns the new cloud id.
+pub fn restore_cloud(
+    cfg: &Config,
+    account: &str,
+    service: &str,
+    id: &str,
+    token: String,
+) -> Result<String, String> {
+    use isyncyou_connectors as connectors;
+    if !RESTORE_SERVICES.contains(&service) {
+        return Err(format!(
+            "service '{service}' has no cloud restore path (expected one of {}); \
+             use restore --to-local to recover its archived body to a file",
+            RESTORE_SERVICES.join("|")
+        ));
+    }
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let item = store
+        .get_item(account, service, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no archived {service} item '{id}' for account '{account}'"))?;
+    let rel = item
+        .local_path
+        .as_deref()
+        .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
+    let bytes = std::fs::read(acc.archive_root.join(rel)).map_err(|e| e.to_string())?;
+    let client = GraphClient::new(token);
+    let new_id = match service {
+        "mail" => connectors::restore_message(&client, &bytes)?,
+        "calendar" => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            connectors::restore_event(&client, &v)?
+        }
+        "contacts" => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            connectors::restore_contact(&client, &v)?
+        }
+        "todo" => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let list = item
+                .parent_remote_id
+                .as_deref()
+                .ok_or("archived task has no parent list id")?;
+            connectors::restore_task(&client, list, &v)?
+        }
+        _ => unreachable!("validated against RESTORE_SERVICES"),
+    };
+    Ok(new_id)
 }
 
 /// Run one full bidirectional sync pass for `account` against an already-open
