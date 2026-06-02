@@ -25,6 +25,8 @@ pub enum SyncError {
     Malformed(String),
     #[error("remote: {0}")]
     Remote(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<DeltaError> for SyncError {
