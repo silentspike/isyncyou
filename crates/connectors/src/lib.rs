@@ -21,7 +21,8 @@ pub mod restore;
 pub mod todo;
 
 pub use archive::{
-    backup_calendar_bodies, backup_contacts_bodies, backup_json_bodies, ArchiveReport, JsonFetcher,
+    backup_byte_bodies, backup_calendar_bodies, backup_contacts_bodies, backup_json_bodies,
+    backup_onenote_bodies, backup_todo_bodies, ArchiveReport, BytesFetcher, JsonFetcher,
 };
 pub use calendar::{incremental_sync_calendar, CalendarReport};
 pub use contacts::{incremental_sync_contacts, ContactsReport};
