@@ -429,6 +429,23 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Set an item's `sync_state` (e.g. mark a downloaded item `clean`). Returns
+    /// whether a row matched.
+    pub fn set_sync_state(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        state: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE items SET sync_state=?4
+             WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, state],
+        )?;
+        Ok(n > 0)
+    }
+
     /// All non-deleted remote ids for a service. Used by delta-less connectors
     /// (e.g. OneNote) to reconcile deletions: ids present here but absent from a
     /// fresh full list have been removed remotely.
