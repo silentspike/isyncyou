@@ -69,6 +69,16 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
+    /// Full-text search the local archive index (item names/subjects/titles).
+    Search {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// FTS5 query (e.g. "invoice", "report 2026").
+        #[arg(long)]
+        query: String,
+    },
     /// Restore one archived item back to the cloud (re-create via Graph).
     Restore {
         #[arg(long, default_value = "isyncyou.toml")]
@@ -120,6 +130,11 @@ fn run(command: Command) -> Result<(), String> {
         } => cmd_backup(
             &config, &account, service, body_limit, &cal_start, &cal_end, token,
         ),
+        Command::Search {
+            config,
+            account,
+            query,
+        } => cmd_search(&config, &account, &query),
         Command::Restore {
             config,
             account,
@@ -343,6 +358,35 @@ fn cmd_backup(
     Ok(())
 }
 
+/// Run an FTS query against an account's archive index, returning the matches.
+fn search_account(
+    cfg: &Config,
+    account: &str,
+    query: &str,
+) -> Result<Vec<isyncyou_store::Item>, String> {
+    let store = Store::open(store_path(cfg, account)?).map_err(|e| e.to_string())?;
+    store
+        .search_names(account, query)
+        .map_err(|e| e.to_string())
+}
+
+fn cmd_search(config: &Path, account: &str, query: &str) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let hits = search_account(&cfg, account, query)?;
+    if hits.is_empty() {
+        println!("no matches for {query:?}");
+    } else {
+        println!("{} match(es) for {query:?}:", hits.len());
+        for h in &hits {
+            println!(
+                "  [{}/{}] {} ({})",
+                h.service, h.item_type, h.name, h.remote_id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn cmd_restore(
     config: &Path,
     account: &str,
@@ -523,6 +567,56 @@ mod tests {
     #[test]
     fn backup_requires_account() {
         assert!(parse(&["isyncyou", "backup", "--token", "T"]).is_err());
+    }
+
+    #[test]
+    fn parses_search() {
+        let c = parse(&["isyncyou", "search", "--account", "a", "--query", "invoice"]).unwrap();
+        assert_eq!(
+            c.command,
+            Command::Search {
+                config: "isyncyou.toml".into(),
+                account: "a".into(),
+                query: "invoice".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn search_account_finds_matching_items() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-se-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a",
+                    "mail",
+                    "m1",
+                    "Invoice for March",
+                    "message",
+                ))
+                .unwrap();
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a",
+                    "calendar",
+                    "e1",
+                    "Team Standup",
+                    "event",
+                ))
+                .unwrap();
+        }
+        let cfg = load_config(&p).unwrap();
+        let hits = search_account(&cfg, "a", "invoice").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].remote_id, "m1");
+        assert!(search_account(&cfg, "a", "nonexistentterm")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
