@@ -593,6 +593,24 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
             ""
         }
     );
+
+    // Materialize the ingested changes to disk: write new/changed files into the
+    // account's sync root (the remote→local half that makes files actually appear).
+    let sync_root = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .map(|a| a.sync_root.clone())
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let mat = connectors::materialize_downloads(&store, &client, account, &sync_root)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "materialized: {} downloaded, {} folders, {} failed -> {}",
+        mat.downloaded,
+        mat.dirs_created,
+        mat.failed,
+        sync_root.display()
+    );
     Ok(())
 }
 
