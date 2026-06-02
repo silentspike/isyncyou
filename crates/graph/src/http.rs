@@ -89,6 +89,14 @@ impl Transport for GraphClient {
             },
         }
     }
+
+    /// Real transport sleeps out the backoff between retries (the trait default
+    /// is a no-op for unit-test mocks).
+    fn backoff(&self, delay: std::time::Duration) {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
 }
 
 impl GraphClient {
