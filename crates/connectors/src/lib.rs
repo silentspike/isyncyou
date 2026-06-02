@@ -26,5 +26,8 @@ pub use onedrive::{
     incremental_sync, push_delete, push_upload, RemoteWriter, SyncError, SyncReport,
 };
 pub use onenote::{incremental_sync_onenote, OneNoteReport};
-pub use restore::{restore_event, sanitize_event, EventRestorer};
+pub use restore::{
+    restore_contact, restore_event, restore_task, sanitize_contact, sanitize_event, sanitize_task,
+    Restorer,
+};
 pub use todo::{incremental_sync_todo, TodoReport};
