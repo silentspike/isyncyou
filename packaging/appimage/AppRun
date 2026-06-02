@@ -1,0 +1,5 @@
+#!/bin/sh
+# AppImage entrypoint: run the iSyncYou CLI. The daemon (isyncyoud) and doctor
+# (isyncyou-doctor) ship alongside it under usr/bin for `--appimage-extract`.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/isyncyou" "$@"
