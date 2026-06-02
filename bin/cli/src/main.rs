@@ -13,6 +13,7 @@
 //! - `migrate` — move an account's archive directory
 //! - `serve`   — serve the local web UI
 //! - `login`   — device-code sign-in; caches the account token for later commands
+//! - `mount`   — mount the OneDrive tree as an on-demand placeholder filesystem (FUSE)
 //!
 //! Token resolution: `--token`/`ISYNCYOU_TOKEN` wins; otherwise the per-account
 //! cached token (from `login`) is loaded and auto-refreshed.
@@ -213,6 +214,19 @@ enum Command {
         #[arg(long)]
         write: bool,
     },
+    /// Mount the account's OneDrive tree as an on-demand placeholder filesystem:
+    /// files appear with their real size but download only when first read.
+    Mount {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// Empty directory to mount at (`fusermount -u <dir>` or Ctrl-C to unmount).
+        #[arg(long)]
+        mountpoint: PathBuf,
+        #[arg(long, env = "ISYNCYOU_TOKEN")]
+        token: Option<String>,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
@@ -338,6 +352,12 @@ fn run(command: Command) -> Result<(), String> {
             account,
             write,
         } => cmd_login(&config, &account, write),
+        Command::Mount {
+            config,
+            account,
+            mountpoint,
+            token,
+        } => cmd_mount(&config, &account, &mountpoint, token),
     }
 }
 
@@ -406,6 +426,48 @@ fn cmd_login(config: &Path, account: &str, write: bool) -> Result<(), String> {
         cache.display()
     );
     Ok(())
+}
+
+/// Hydrates placeholder files by downloading their content from OneDrive.
+struct GraphHydrator {
+    client: isyncyou_graph::GraphClient,
+}
+impl isyncyou_fuse::Hydrator for GraphHydrator {
+    fn fetch(&self, remote_id: &str) -> Result<Vec<u8>, String> {
+        self.client
+            .download_content(remote_id)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn cmd_mount(
+    config: &Path,
+    account: &str,
+    mountpoint: &Path,
+    token: Option<String>,
+) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let token = resolve_token(&cfg, account, token, false)?;
+    // snapshot the tree, then drop the store so its single-instance lock is free
+    // while we're mounted (hydration goes through Graph, not the store).
+    let tree = {
+        let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
+        let items = store
+            .all_items_by_service(account, "onedrive")
+            .map_err(|e| e.to_string())?;
+        isyncyou_fuse::Tree::from_items(&items)
+    };
+    let fs = isyncyou_fuse::PlaceholderFs::new(
+        tree,
+        Box::new(GraphHydrator {
+            client: isyncyou_graph::GraphClient::new(token),
+        }),
+    );
+    println!(
+        "mounting OneDrive placeholders at {} (`fusermount -u` or Ctrl-C to unmount)…",
+        mountpoint.display()
+    );
+    isyncyou_fuse::mount(fs, mountpoint).map_err(|e| format!("mount: {e}"))
 }
 
 fn cmd_serve(config: &Path, bind: &str, socket: Option<PathBuf>) -> Result<(), String> {
