@@ -387,6 +387,95 @@ pub fn apply_local_deletes(
     Ok(moved)
 }
 
+/// Recursively collect every regular file under `root` (skips our own
+/// `*.isync-tmp` scratch files). Returns absolute paths.
+fn walk_local_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() && !p.to_string_lossy().ends_with(".isync-tmp") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Build a cloud destination path from a sync-root-relative local path, encoding
+/// each segment to a OneDrive-safe name (reverse of the cloud→local mapping).
+fn cloud_dest_path(rel: &Path) -> String {
+    let mut s = String::new();
+    for comp in rel.components() {
+        if let std::path::Component::Normal(os) = comp {
+            s.push('/');
+            s.push_str(&isyncyou_pathmap::to_cloud(&os.to_string_lossy()));
+        }
+    }
+    s
+}
+
+/// Find files under `sync_root` that the store doesn't track yet — local
+/// **creates** to push to the cloud. A file matching a tracked item (even an
+/// un-materialized `remote_dirty` one) is *not* a create; that keeps a brand-new
+/// local file from being confused with a not-yet-downloaded remote file.
+/// (Local *modifies* and *deletes* are handled separately — they need If-Match
+/// conflict handling and the mass-delete guard, respectively.)
+pub fn scan_local_creates(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+) -> Result<Vec<PathBuf>, SyncError> {
+    let items = store.all_items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut tracked: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for it in &items {
+        if it.deleted_at.is_some() {
+            continue;
+        }
+        if let Some(rel) = local_rel_path(&by_id, it) {
+            tracked.insert(rel);
+        }
+    }
+    let mut creates = Vec::new();
+    for full in walk_local_files(sync_root) {
+        if let Ok(rel) = full.strip_prefix(sync_root) {
+            if !tracked.contains(rel) {
+                creates.push(rel.to_path_buf());
+            }
+        }
+    }
+    Ok(creates)
+}
+
+/// Push local-create files up to the cloud: read each, upload to its encoded
+/// cloud path, and ingest the created item into the store (as `clean`). Returns
+/// how many were uploaded.
+pub fn push_local_creates<W: RemoteWriter>(
+    writer: &W,
+    store: &Store,
+    map: &mut MappingTable,
+    account: &str,
+    sync_root: &Path,
+    creates: &[PathBuf],
+) -> Result<usize, SyncError> {
+    let mut uploaded = 0;
+    for rel in creates {
+        let data = std::fs::read(sync_root.join(rel))?;
+        let dest = cloud_dest_path(rel);
+        push_upload(writer, store, map, account, &dest, &data)?;
+        uploaded += 1;
+    }
+    Ok(uploaded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +791,71 @@ mod tests {
         assert_eq!(moved, 0);
     }
 
+    #[test]
+    fn cloud_dest_path_encodes_each_segment() {
+        assert_eq!(
+            cloud_dest_path(&PathBuf::from("Docs/note.txt")),
+            "/Docs/note.txt"
+        );
+        // a forbidden cloud char in a local name is encoded (never raw)
+        let p = cloud_dest_path(&PathBuf::from("a:b/c.txt"));
+        assert!(p.starts_with("/") && p.ends_with("/c.txt"));
+        assert!(!p.contains(':'), "raw forbidden char leaked: {p}");
+    }
+
+    #[test]
+    fn scan_local_creates_finds_only_untracked_files() {
+        let store = Store::open_in_memory().unwrap();
+        // a tracked, materialized file at Docs/note.txt
+        let mut folder = Item::new("acc", SERVICE, "F1", "Docs", "folder");
+        folder.local_path = Some("Docs".into());
+        store.upsert_item(&folder).unwrap();
+        let mut tracked = Item::new("acc", SERVICE, "a1", "note.txt", "file");
+        tracked.parent_remote_id = Some("F1".into());
+        tracked.local_path = Some("note.txt".into());
+        store.upsert_item(&tracked).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let sync_root = dir.path();
+        std::fs::create_dir_all(sync_root.join("Docs")).unwrap();
+        std::fs::write(sync_root.join("Docs").join("note.txt"), b"tracked").unwrap(); // tracked
+        std::fs::write(sync_root.join("Docs").join("new.txt"), b"new").unwrap(); // create
+        std::fs::write(sync_root.join("top.txt"), b"top").unwrap(); // create
+        std::fs::write(sync_root.join("scratch.isync-tmp"), b"x").unwrap(); // ignored
+
+        let mut creates = scan_local_creates(&store, "acc", sync_root).unwrap();
+        creates.sort();
+        assert_eq!(
+            creates,
+            vec![PathBuf::from("Docs/new.txt"), PathBuf::from("top.txt")]
+        );
+    }
+
+    #[test]
+    fn push_local_creates_uploads_each_to_its_cloud_path() {
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let w = MockWriter::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Docs")).unwrap();
+        std::fs::write(dir.path().join("Docs").join("new.txt"), b"hello").unwrap();
+
+        let n = push_local_creates(
+            &w,
+            &store,
+            &mut map,
+            "acc",
+            dir.path(),
+            &[PathBuf::from("Docs/new.txt")],
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            w.uploaded.borrow().as_slice(),
+            &[("/Docs/new.txt".to_string(), 5)]
+        );
+    }
+
     /// Live local→remote: upload via the connector + GraphClient, confirm the
     /// store has a clean row, then push-delete (removes from OneDrive + tombstones).
     #[cfg(feature = "http")]
@@ -902,5 +1056,59 @@ mod tests {
             "local copy should be in the trash"
         );
         eprintln!("remote delete of {id} moved {moved} local item(s) to trash");
+    }
+
+    /// Live local→remote create: drop a new file in a temp sync root, scan +
+    /// push it, confirm it exists on OneDrive, then delete it. Needs the write
+    /// token (`Files.ReadWrite`).
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_local_create_uploads_to_cloud() {
+        use isyncyou_graph::Transport;
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_local_create_uploads_to_cloud: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let dir = tempfile::tempdir().unwrap();
+        let sync_root = dir.path();
+        std::fs::create_dir_all(sync_root.join("iSyncYou-createtest")).unwrap();
+        std::fs::write(
+            sync_root.join("iSyncYou-createtest").join("up.txt"),
+            b"created locally",
+        )
+        .unwrap();
+
+        let creates = scan_local_creates(&store, "acc", sync_root).unwrap();
+        assert!(creates.contains(&PathBuf::from("iSyncYou-createtest/up.txt")));
+        let uploaded =
+            push_local_creates(&client, &store, &mut map, "acc", sync_root, &creates).unwrap();
+        assert!(uploaded >= 1);
+
+        // the store now tracks the uploaded item (push ingests it); verify on cloud
+        let up = store
+            .items_by_service("acc", SERVICE)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.name == "up.txt")
+            .expect("uploaded item should be tracked");
+        let got = client
+            .get(&format!(
+                "https://graph.microsoft.com/v1.0/me/drive/items/{}",
+                up.remote_id
+            ))
+            .body
+            .expect("GET uploaded item");
+        assert_eq!(got.get("name").and_then(Value::as_str), Some("up.txt"));
+        eprintln!("uploaded new local file -> cloud item {}", up.remote_id);
+        client.delete(&up.remote_id).expect("cleanup");
     }
 }
