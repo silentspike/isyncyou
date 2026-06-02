@@ -14,7 +14,7 @@ use isyncyou_core::Config;
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::Store;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug, PartialEq, Eq)]
@@ -74,15 +74,22 @@ fn run(args: &Args) -> Result<(), String> {
         Arc::new(DaemonRestore { cfg: cfg.clone() });
     eprintln!("isyncyoud: restore enabled; capability token: {cap_token}");
 
-    let router = if args.sync_secs > 0 {
-        let (cfg2, gate2, secs) = (cfg.clone(), gate.clone(), args.sync_secs);
-        eprintln!("isyncyoud: background sync every {secs}s");
-        std::thread::spawn(move || sync_loop(cfg2, gate2, secs));
-        isyncyou_webui::Router::with_gate(cfg, gate)
+    let mut router = if args.sync_secs > 0 {
+        isyncyou_webui::Router::with_gate(cfg.clone(), gate.clone())
     } else {
-        isyncyou_webui::Router::new(cfg)
+        isyncyou_webui::Router::new(cfg.clone())
     }
-    .with_restore(handler, cap_token);
+    .with_restore(handler, cap_token.clone());
+
+    // When scheduled sync runs, share a Scheduler so the UI can pause/resume/now.
+    if args.sync_secs > 0 {
+        let secs = args.sync_secs;
+        let sched = Arc::new(Scheduler::default());
+        eprintln!("isyncyoud: background sync every {secs}s (pausable from the UI)");
+        let (cfg2, gate2, sched2) = (cfg, gate, sched.clone());
+        std::thread::spawn(move || sync_loop(cfg2, gate2, secs, sched2));
+        router = router.with_sync_control(sched, cap_token);
+    }
 
     match &args.socket {
         Some(path) => isyncyou_webui::serve_unix(path, router).map_err(|e| format!("serve: {e}")),
@@ -130,12 +137,57 @@ fn local_host() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// Forever: every `secs`, run one sync pass per account. A pass that errors (no
-/// cached token, a network blip) is logged and never kills the loop.
-fn sync_loop(cfg: Config, gate: Arc<Mutex<()>>, secs: u64) {
+/// Shared scheduled-sync control: a `paused` flag and a one-shot `trigger`, with a
+/// condvar the loop waits on so pause/resume/now take effect immediately.
+#[derive(Default)]
+struct SchedState {
+    paused: bool,
+    trigger: bool,
+}
+#[derive(Default)]
+struct Scheduler {
+    state: Mutex<SchedState>,
+    cv: Condvar,
+}
+impl isyncyou_webui::SyncControl for Scheduler {
+    fn pause(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).paused = true;
+        self.cv.notify_all();
+    }
+    fn resume(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).paused = false;
+        self.cv.notify_all();
+    }
+    fn trigger(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).trigger = true;
+        self.cv.notify_all();
+    }
+    fn is_paused(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).paused
+    }
+}
+
+/// Forever: wait up to `secs` (or until the UI triggers/pauses), then run one sync
+/// pass per account unless paused. An explicit `now` trigger always runs. A pass
+/// that errors (no cached token, a network blip) is logged and never kills the loop.
+fn sync_loop(cfg: Config, gate: Arc<Mutex<()>>, secs: u64, sched: Arc<Scheduler>) {
     let host = local_host();
     loop {
-        std::thread::sleep(Duration::from_secs(secs));
+        // wait for the interval to elapse OR an explicit trigger to arrive
+        let run = {
+            let guard = sched.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut guard, res) = sched
+                .cv
+                .wait_timeout_while(guard, Duration::from_secs(secs), |s| !s.trigger)
+                .unwrap_or_else(|e| e.into_inner());
+            let triggered = guard.trigger;
+            guard.trigger = false;
+            // run on an explicit trigger, or on a periodic tick while not paused
+            triggered || (res.timed_out() && !guard.paused)
+        };
+        if !run {
+            continue;
+        }
         for acc in &cfg.accounts {
             match sync_account(&cfg, &acc.id, &gate, &host) {
                 Ok(summary) => eprintln!("isyncyoud: sync {} -> {summary}", acc.id),

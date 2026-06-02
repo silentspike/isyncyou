@@ -162,10 +162,11 @@ async function showOverview() {
   const ov = document.getElementById("overview");
   ov.hidden = false;
   if (!account) { ov.textContent = "No account configured."; return; }
-  const [st, cfg, act] = await Promise.all([
+  const [st, cfg, act, sync] = await Promise.all([
     api(`/api/v1/status?account=${encodeURIComponent(account)}`),
     api("/api/v1/settings"),
     api(`/api/v1/activity?account=${encodeURIComponent(account)}&limit=10`),
+    api("/api/v1/sync/state"),
   ]);
   const cards = (st.services || []).map(s =>
     `<div class="card"><div class="n">${s.items} <small>items</small></div>
@@ -180,8 +181,8 @@ async function showOverview() {
        <div class="card"><div class="n">${t.items ?? 0}</div><div class="l">total items</div></div>
        <div class="card"><div class="n">${t.archived ?? 0}</div><div class="l">archived bodies</div></div>
        <div class="card"><div class="n">${st.onedrive_cursor ? "yes" : "no"}</div><div class="l">OneDrive cursor</div></div>
-     </div>
-     <h3>Settings</h3><dl class="kv">
+     </div>` + syncHtml(sync) +
+    `<h3>Settings</h3><dl class="kv">
        <dt>Account</dt><dd>${escapeHtml(acc.username || account)}</dd>
        <dt>Sync root</dt><dd>${escapeHtml(acc.sync_root || "")}</dd>
        <dt>Archive root</dt><dd>${escapeHtml(acc.archive_root || "")}</dd>
@@ -190,6 +191,26 @@ async function showOverview() {
        <dt>Change source</dt><dd>${escapeHtml(sy.change_source || "?")}</dd>
        <dt>Delete guard</dt><dd>max ${dg.max_absolute ?? "?"} abs / ${dg.max_fraction ?? "?"} fraction (min ${dg.fraction_min_total ?? "?"})</dd>
      </dl>` + activityHtml(act.runs || []);
+}
+// Scheduled-sync control panel (only when the daemon enabled it + we have a token).
+function syncHtml(s) {
+  if (!s || !s.enabled || !CAP_TOKEN) return "";
+  const status = s.paused
+    ? '<span style="color:#fbbf24">paused</span>'
+    : '<span style="color:#4ade80">running</span>';
+  return `<h3>Scheduled sync</h3>
+    <div class="bar" style="align-items:center">
+      <span>Status: ${status}</span>
+      <button onclick="syncCmd('pause')">Pause</button>
+      <button onclick="syncCmd('resume')">Resume</button>
+      <button onclick="syncCmd('now')">Sync now</button>
+    </div>`;
+}
+async function syncCmd(cmd) {
+  try {
+    await fetch(`/api/v1/sync/${cmd}`, { method: "POST", headers: { "X-Capability-Token": CAP_TOKEN } });
+    showOverview();
+  } catch (e) { alert("Sync command failed: " + e); }
 }
 function activityHtml(runs) {
   if (!runs.length) return `<h3>Recent activity</h3><div class="muted">No runs recorded yet.</div>`;

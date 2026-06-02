@@ -172,6 +172,16 @@ pub trait RestoreHandler: Send + Sync {
     fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String>;
 }
 
+/// Controls the daemon's background scheduled sync from the UI: pause/resume the
+/// scheduler and trigger an immediate pass. Injected by the daemon.
+pub trait SyncControl: Send + Sync {
+    fn pause(&self);
+    fn resume(&self);
+    /// Request an immediate sync pass (wakes the scheduler).
+    fn trigger(&self);
+    fn is_paused(&self) -> bool;
+}
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
@@ -187,6 +197,9 @@ pub struct Router {
     /// page can't read it (CSRF defense); paired with POST-only + an owner-only
     /// socket it gates writes (plan §11).
     cap_token: Option<String>,
+    /// Optional scheduled-sync controller (the daemon's). Enables the sync
+    /// pause/resume/now POSTs + the state GET.
+    sync_control: Option<std::sync::Arc<dyn SyncControl>>,
 }
 
 impl Router {
@@ -196,6 +209,7 @@ impl Router {
             gate: None,
             restore: None,
             cap_token: None,
+            sync_control: None,
         }
     }
 
@@ -207,6 +221,7 @@ impl Router {
             gate: Some(gate),
             restore: None,
             cap_token: None,
+            sync_control: None,
         }
     }
 
@@ -221,6 +236,23 @@ impl Router {
         self
     }
 
+    /// Enable the scheduled-sync control POSTs (pause/resume/now), guarded by the
+    /// capability token, plus the read-only state GET (builder style).
+    pub fn with_sync_control(
+        mut self,
+        control: std::sync::Arc<dyn SyncControl>,
+        cap_token: String,
+    ) -> Self {
+        self.sync_control = Some(control);
+        self.cap_token = Some(cap_token);
+        self
+    }
+
+    /// Whether the request carries the configured capability token.
+    fn cap_ok(&self, req: &ApiRequest) -> bool {
+        matches!((&self.cap_token, &req.cap_token), (Some(w), Some(g)) if w == g)
+    }
+
     /// Dispatch one request to a response. Never panics; unknown routes → 404.
     pub fn route(&self, req: &ApiRequest) -> ApiResponse {
         // Hold the store-access gate (if any) for the whole request so a concurrent
@@ -232,6 +264,9 @@ impl Router {
         if req.method == "POST" {
             return match req.path.as_str() {
                 "/api/v1/restore" => self.restore(req),
+                "/api/v1/sync/pause" => self.sync_command(req, |c| c.pause()),
+                "/api/v1/sync/resume" => self.sync_command(req, |c| c.resume()),
+                "/api/v1/sync/now" => self.sync_command(req, |c| c.trigger()),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -253,6 +288,7 @@ impl Router {
             "/api/v1/body" => self.body(req),
             "/api/v1/view" => self.view(req),
             "/api/v1/search" => self.search(req),
+            "/api/v1/sync/state" => self.sync_state(),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -264,12 +300,7 @@ impl Router {
             Some(h) => h,
             None => return ApiResponse::error(404, "restore is not enabled on this server"),
         };
-        // constant-ish check: the request's token must equal the configured one
-        let ok = match (&self.cap_token, &req.cap_token) {
-            (Some(want), Some(got)) => want == got,
-            _ => false,
-        };
-        if !ok {
+        if !self.cap_ok(req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
@@ -283,6 +314,28 @@ impl Router {
                 &json!({ "restored": id, "service": service, "new_id": new_id }),
             ),
             Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Apply a capability-token-guarded scheduled-sync command (pause/resume/now),
+    /// then report the resulting paused state.
+    fn sync_command(&self, req: &ApiRequest, apply: impl Fn(&dyn SyncControl)) -> ApiResponse {
+        let control = match &self.sync_control {
+            Some(c) => c,
+            None => return ApiResponse::error(404, "scheduled sync is not enabled on this server"),
+        };
+        if !self.cap_ok(req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        apply(control.as_ref());
+        ApiResponse::ok_json(&json!({ "paused": control.is_paused() }))
+    }
+
+    /// `GET /api/v1/sync/state` — whether scheduled sync is enabled and paused.
+    fn sync_state(&self) -> ApiResponse {
+        match &self.sync_control {
+            Some(c) => ApiResponse::ok_json(&json!({ "enabled": true, "paused": c.is_paused() })),
+            None => ApiResponse::ok_json(&json!({ "enabled": false, "paused": false })),
         }
     }
 
@@ -767,6 +820,67 @@ mod tests {
             .with_restore(std::sync::Arc::new(OkRestore), "tok123".into())
             .route(&ApiRequest::get("/"));
         assert!(String::from_utf8_lossy(&rw.body).contains("const CAP_TOKEN = \"tok123\""));
+    }
+
+    struct MockSync {
+        paused: std::sync::atomic::AtomicBool,
+        triggered: std::sync::atomic::AtomicBool,
+    }
+    impl SyncControl for MockSync {
+        fn pause(&self) {
+            self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn resume(&self) {
+            self.paused
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn trigger(&self) {
+            self.triggered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn is_paused(&self) -> bool {
+            self.paused.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn sync_control_state_and_token_guarded_commands() {
+        let m = std::sync::Arc::new(MockSync {
+            paused: false.into(),
+            triggered: false.into(),
+        });
+        let router = Router::new(Config::default()).with_sync_control(m.clone(), "s".into());
+        // state is read-only (no token)
+        let st = router.route(&ApiRequest::get("/api/v1/sync/state"));
+        assert!(String::from_utf8_lossy(&st.body).contains("\"enabled\":true"));
+        // pause needs the token, then flips the flag
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", "/api/v1/sync/pause"))
+                .status,
+            401
+        );
+        let ok = router
+            .route(&ApiRequest::new("POST", "/api/v1/sync/pause").with_cap_token(Some("s".into())));
+        assert_eq!(ok.status, 200);
+        assert!(m.is_paused());
+        router.route(
+            &ApiRequest::new("POST", "/api/v1/sync/resume").with_cap_token(Some("s".into())),
+        );
+        assert!(!m.is_paused());
+        router.route(&ApiRequest::new("POST", "/api/v1/sync/now").with_cap_token(Some("s".into())));
+        assert!(m.triggered.load(std::sync::atomic::Ordering::SeqCst));
+        // a router without a controller reports disabled and refuses the POST
+        let ro = Router::new(Config::default());
+        assert!(
+            String::from_utf8_lossy(&ro.route(&ApiRequest::get("/api/v1/sync/state")).body)
+                .contains("\"enabled\":false")
+        );
+        assert_eq!(
+            ro.route(&ApiRequest::new("POST", "/api/v1/sync/now").with_cap_token(Some("s".into())))
+                .status,
+            404
+        );
     }
 
     #[test]
