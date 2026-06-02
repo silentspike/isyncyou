@@ -317,6 +317,76 @@ pub fn materialize_downloads<D: Downloader>(
     Ok(report)
 }
 
+/// A tombstoned item whose local file/dir still exists and should be removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLocalDelete {
+    pub remote_id: String,
+    /// Path relative to the sync root.
+    pub rel: PathBuf,
+}
+
+/// Find OneDrive items tombstoned in the store whose local file/dir still exists
+/// under `sync_root` — the pending remote→local deletions. The caller applies the
+/// mass-delete guard (it owns the config) before calling [`apply_local_deletes`].
+pub fn pending_local_deletes(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+) -> Result<Vec<PendingLocalDelete>, SyncError> {
+    let items = store.all_items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut out = Vec::new();
+    for it in &items {
+        if it.deleted_at.is_none() {
+            continue;
+        }
+        let rel = match local_rel_path(&by_id, it) {
+            Some(p) => p,
+            None => continue,
+        };
+        if sync_root.join(&rel).exists() {
+            out.push(PendingLocalDelete {
+                remote_id: it.remote_id.clone(),
+                rel,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Mirror remote deletions locally **without destroying data**: move each path
+/// into `trash_root`, preserving its layout (plan §9.3 / A9 — the trash lives
+/// outside the sync root). A path already gone (e.g. removed with its parent
+/// folder) is skipped. Returns how many were moved.
+pub fn apply_local_deletes(
+    sync_root: &Path,
+    trash_root: &Path,
+    deletes: &[PendingLocalDelete],
+) -> Result<usize, SyncError> {
+    let mut moved = 0;
+    for d in deletes {
+        let src = sync_root.join(&d.rel);
+        if !src.exists() {
+            continue; // already moved along with an ancestor folder
+        }
+        let dst = trash_root.join(&d.rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => moved += 1,
+            // cross-device fallback for files (rare); leave dirs for the next pass.
+            Err(_) if src.is_file() => {
+                std::fs::copy(&src, &dst)?;
+                std::fs::remove_file(&src)?;
+                moved += 1;
+            }
+            Err(e) => return Err(SyncError::Io(e)),
+        }
+    }
+    Ok(moved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +637,71 @@ mod tests {
         assert_eq!(r.downloaded, 0);
     }
 
+    #[test]
+    fn pending_and_apply_local_deletes_move_tombstoned_files_to_trash() {
+        let store = Store::open_in_memory().unwrap();
+        let mut folder = Item::new("acc", SERVICE, "F1", "Docs", "folder");
+        folder.local_path = Some("Docs".into());
+        store.upsert_item(&folder).unwrap();
+        let mut file = Item::new("acc", SERVICE, "a1", "note.txt", "file");
+        file.parent_remote_id = Some("F1".into());
+        file.local_path = Some("note.txt".into());
+        store.upsert_item(&file).unwrap();
+
+        // it's on disk under sync_root/Docs/note.txt
+        let base = tempfile::tempdir().unwrap();
+        let sync_root = base.path().join("od");
+        let trash_root = base.path().join("trash"); // A9: outside the sync root
+        std::fs::create_dir_all(sync_root.join("Docs")).unwrap();
+        std::fs::write(sync_root.join("Docs").join("note.txt"), b"hi").unwrap();
+
+        // nothing tombstoned yet -> no pending deletes
+        assert!(pending_local_deletes(&store, "acc", &sync_root)
+            .unwrap()
+            .is_empty());
+
+        // the remote item is deleted -> it becomes a pending local delete
+        store
+            .mark_deleted("acc", SERVICE, "a1", "2026-06-02T00:00:00Z")
+            .unwrap();
+        let pending = pending_local_deletes(&store, "acc", &sync_root).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].remote_id, "a1");
+        assert_eq!(pending[0].rel, PathBuf::from("Docs/note.txt"));
+
+        let moved = apply_local_deletes(&sync_root, &trash_root, &pending).unwrap();
+        assert_eq!(moved, 1);
+        // gone from the sync root, present in the trash (outside sync_root)
+        assert!(!sync_root.join("Docs").join("note.txt").exists());
+        assert_eq!(
+            std::fs::read(trash_root.join("Docs").join("note.txt")).unwrap(),
+            b"hi"
+        );
+        assert!(
+            !trash_root.starts_with(&sync_root),
+            "trash must be outside the sync root"
+        );
+
+        // a second pass finds nothing (the local file is gone)
+        assert!(pending_local_deletes(&store, "acc", &sync_root)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn apply_local_deletes_skips_already_gone_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let sync_root = base.path().join("od");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        let targets = vec![PendingLocalDelete {
+            remote_id: "x".into(),
+            rel: PathBuf::from("missing.txt"),
+        }];
+        // path doesn't exist -> moved=0, no error
+        let moved = apply_local_deletes(&sync_root, &base.path().join("trash"), &targets).unwrap();
+        assert_eq!(moved, 0);
+    }
+
     /// Live local→remote: upload via the connector + GraphClient, confirm the
     /// store has a clean row, then push-delete (removes from OneDrive + tombstones).
     #[cfg(feature = "http")]
@@ -708,5 +843,64 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Live end-to-end remote→local **delete**: upload a throwaway file, sync +
+    /// materialize it to disk, delete it on OneDrive, sync again, then confirm the
+    /// local copy is moved to the trash. Needs `ISYNCYOU_TEST_WRITE_TOKEN`.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_remote_delete_moves_local_to_trash() {
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_remote_delete_moves_local_to_trash: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let dest = "/iSyncYou-deltest/del-me.txt";
+
+        // create the file remotely, then sync + materialize it to a temp sync root
+        let item = client
+            .upload(dest, b"delete me")
+            .expect("upload should succeed");
+        let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync should succeed");
+        let base = tempfile::tempdir().unwrap();
+        let sync_root = base.path().join("od");
+        let trash_root = base.path().join("trash");
+        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        let local = sync_root.join("iSyncYou-deltest").join("del-me.txt");
+        assert!(local.exists(), "file should have materialized to disk");
+
+        // delete it on OneDrive, sync again -> tombstone -> local moves to trash
+        client.delete(&id).expect("remote delete should succeed");
+        incremental_sync(&mut client, &store, &mut map, "acc", "t2")
+            .expect("second sync should succeed");
+        let pending = pending_local_deletes(&store, "acc", &sync_root).unwrap();
+        assert!(
+            pending.iter().any(|p| p.remote_id == id),
+            "the deleted file should be a pending local delete"
+        );
+        let moved = apply_local_deletes(&sync_root, &trash_root, &pending).unwrap();
+        assert!(moved >= 1);
+        assert!(
+            !local.exists(),
+            "local copy should be gone from the sync root"
+        );
+        assert!(
+            trash_root
+                .join("iSyncYou-deltest")
+                .join("del-me.txt")
+                .exists(),
+            "local copy should be in the trash"
+        );
+        eprintln!("remote delete of {id} moved {moved} local item(s) to trash");
     }
 }
