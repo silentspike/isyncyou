@@ -890,9 +890,15 @@ mod tests {
         );
         let moved = apply_local_deletes(&sync_root, &trash_root, &pending).unwrap();
         assert!(moved >= 1);
-        assert!(!local.exists(), "local copy should be gone from the sync root");
         assert!(
-            trash_root.join("iSyncYou-deltest").join("del-me.txt").exists(),
+            !local.exists(),
+            "local copy should be gone from the sync root"
+        );
+        assert!(
+            trash_root
+                .join("iSyncYou-deltest")
+                .join("del-me.txt")
+                .exists(),
             "local copy should be in the trash"
         );
         eprintln!("remote delete of {id} moved {moved} local item(s) to trash");
