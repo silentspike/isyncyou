@@ -9,6 +9,7 @@
 //! capability-token auth):
 //! - `GET /`                      → the static UI page
 //! - `GET /api/v1/accounts`       → configured accounts
+//! - `GET /api/v1/settings`                  → effective sync settings + account roots
 //! - `GET /api/v1/status?account`            → per-service archive counts overview
 //! - `GET /api/v1/items?account&service`     → archived items of a service
 //! - `GET /api/v1/item?account&service&id`   → one item's metadata
@@ -168,6 +169,7 @@ impl Router {
         match req.path.as_str() {
             "/" => ApiResponse::html(INDEX_HTML),
             "/api/v1/accounts" => self.accounts(),
+            "/api/v1/settings" => self.settings(),
             "/api/v1/status" => self.status(req),
             "/api/v1/items" => self.items(req),
             "/api/v1/item" => self.item(req),
@@ -194,6 +196,29 @@ impl Router {
             .map(|a| json!({ "id": a.id, "username": a.username }))
             .collect();
         ApiResponse::ok_json(&json!({ "accounts": accounts }))
+    }
+
+    /// The effective configuration the UI's settings view reads: engine-wide sync
+    /// settings + each account's id/username/roots. Fields are **explicitly
+    /// whitelisted** (not a blanket serialize of `Config`) so a future secret-
+    /// bearing config field can never leak here; tokens live in separate files,
+    /// never in the config.
+    fn settings(&self) -> ApiResponse {
+        let sync = serde_json::to_value(&self.config.sync).unwrap_or(Value::Null);
+        let accounts: Vec<Value> = self
+            .config
+            .accounts
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "username": a.username,
+                    "sync_root": a.sync_root,
+                    "archive_root": a.archive_root,
+                })
+            })
+            .collect();
+        ApiResponse::ok_json(&json!({ "sync": sync, "accounts": accounts }))
     }
 
     /// Per-account archive overview: for each non-empty service, the tracked-item
@@ -507,6 +532,24 @@ mod tests {
                 "web UI is missing the '{svc}' service tab"
             );
         }
+    }
+
+    #[test]
+    fn settings_exposes_sync_config_and_account_roots_without_secrets() {
+        let (_d, router) = setup();
+        let resp = router.route(&ApiRequest::get("/api/v1/settings"));
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        // engine-wide sync defaults
+        assert_eq!(v["sync"]["trash_retention_days"], 30);
+        assert_eq!(v["sync"]["body_index"], false);
+        assert_eq!(v["sync"]["delete_guard"]["max_absolute"], 1000);
+        assert_eq!(v["sync"]["change_source"], "inotify");
+        // account roots are surfaced; id/username present
+        assert_eq!(v["accounts"][0]["id"], "a");
+        assert_eq!(v["accounts"][0]["username"], "a@outlook.com");
+        assert!(v["accounts"][0]["sync_root"].is_string());
+        assert!(v["accounts"][0]["archive_root"].is_string());
     }
 
     #[test]
