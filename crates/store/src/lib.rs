@@ -500,6 +500,22 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// The `sync_state` of the live (non-tombstone) item at an on-disk path, or
+    /// `None` if no item maps to that exact `local_path`. Used by the desktop
+    /// DBus status provider to answer Dolphin overlay-icon queries by path.
+    pub fn sync_state_for_local_path(&self, local_path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sync_state FROM items
+                 WHERE local_path = ?1 AND deleted_at IS NULL
+                 LIMIT 1",
+                params![local_path],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// Record a completed engine run (one sync/backup/… pass) in the activity
     /// history. Returns the new run id.
     pub fn add_run(

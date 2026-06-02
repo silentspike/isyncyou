@@ -1,0 +1,17 @@
+[package]
+name = "isyncyou-dbus-status"
+description = "Linux desktop DBus FileStatus provider — exposes per-path sync status for the Dolphin overlay/KIO plugin and context menu."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+isyncyou-store = { path = "../store" }
+
+# zbus + a runtime only on Linux (the only platform with a session bus + KIO).
+# The OverlayStatus mapping + StatusProvider trait stay cross-platform/testable.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { workspace = true, features = ["rt", "macros"] }

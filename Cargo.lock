@@ -1374,11 +1374,21 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "isyncyou-core",
+ "isyncyou-dbus-status",
  "isyncyou-engine",
  "isyncyou-graph",
  "isyncyou-pathmap",
  "isyncyou-store",
  "isyncyou-webui",
+]
+
+[[package]]
+name = "isyncyou-dbus-status"
+version = "0.1.0"
+dependencies = [
+ "isyncyou-store",
+ "tokio",
+ "zbus",
 ]
 
 [[package]]

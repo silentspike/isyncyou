@@ -19,3 +19,4 @@ isyncyou-engine = { path = "../../crates/engine" }
 isyncyou-store = { path = "../../crates/store" }
 isyncyou-pathmap = { path = "../../crates/pathmap" }
 isyncyou-graph = { path = "../../crates/graph", features = ["http"] }
+isyncyou-dbus-status = { path = "../../crates/dbus-status" }
