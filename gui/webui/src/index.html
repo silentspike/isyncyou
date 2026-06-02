@@ -53,8 +53,8 @@
         <input id="q" placeholder="Search names / subjects…">
         <button onclick="doSearch()">Search</button>
       </div>
-      <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th></tr></thead>
-        <tbody id="rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th><th>Restore</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
       </table>
       <div id="more" hidden style="margin-top:14px">
         <button id="more-btn" onclick="loadMore()">Load more</button>
@@ -65,6 +65,9 @@
 </main>
 <script>
 const SERVICES = ["onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared"];
+// injected by the daemon's `/` handler; empty disables the restore UI (read-only).
+const CAP_TOKEN = "__CAP_TOKEN__";
+const RESTORABLE = ["mail", "calendar", "contacts", "todo"];
 let account = null, service = "mail";
 
 async function api(path) { const r = await fetch(path); return r.json(); }
@@ -83,16 +86,35 @@ function rowsHtml(items) {
     const bodyCell = it.has_body
       ? `<a href="/api/v1/body?${q}" target="_blank" rel="noopener">raw</a>`
       : "—";
+    const restoreCell = (CAP_TOKEN && it.has_body && RESTORABLE.includes(it.service))
+      ? `<a href="#" onclick="doRestore('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">restore</a>`
+      : "—";
     return `<tr>
       <td><span class="badge">${it.item_type}</span></td>
       <td>${cell}</td>
       <td class="muted">${it.remote_mtime || ""}</td>
-      <td>${bodyCell}</td></tr>`;
+      <td>${bodyCell}</td>
+      <td>${restoreCell}</td></tr>`;
   }).join("");
 }
 function escapeHtml(s) { return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function escapeJs(s) { return (s || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'"); }
 
-const EMPTY_ROW = '<tr><td colspan="4" class="muted">No items.</td></tr>';
+// Re-create an archived item in the cloud via the daemon's restore POST. The
+// capability token (injected, same-origin) authorizes the destructive action.
+async function doRestore(service, id, el) {
+  if (!confirm(`Restore this ${service} item to the cloud as a new copy?`)) return;
+  if (el) el.textContent = "…";
+  const q = `account=${encodeURIComponent(account)}&service=${encodeURIComponent(service)}&id=${encodeURIComponent(id)}`;
+  try {
+    const r = await fetch(`/api/v1/restore?${q}`, { method: "POST", headers: { "X-Capability-Token": CAP_TOKEN } });
+    const d = await r.json();
+    if (r.ok) { if (el) { el.textContent = "✓ restored"; el.removeAttribute("onclick"); } }
+    else { if (el) el.textContent = "restore"; alert("Restore failed: " + (d.error || r.status)); }
+  } catch (e) { if (el) el.textContent = "restore"; alert("Restore failed: " + e); }
+}
+
+const EMPTY_ROW = '<tr><td colspan="5" class="muted">No items.</td></tr>';
 
 function updateMore(shown) {
   document.getElementById("count").textContent = `${shown} of ${pageTotal}`;

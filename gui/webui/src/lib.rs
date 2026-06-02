@@ -37,12 +37,15 @@ const STATUS_SERVICES: &[&str] = &[
     "onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared",
 ];
 
-/// A parsed inbound request (method + path + decoded query pairs).
+/// A parsed inbound request (method + path + decoded query pairs + an optional
+/// capability token captured from the `X-Capability-Token` header).
 #[derive(Debug, Clone)]
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
     pub query: Vec<(String, String)>,
+    /// The `X-Capability-Token` header value, required for destructive POSTs.
+    pub cap_token: Option<String>,
 }
 
 impl ApiRequest {
@@ -64,7 +67,14 @@ impl ApiRequest {
             method: method.to_string(),
             path: path.to_string(),
             query,
+            cap_token: None,
         }
+    }
+
+    /// Attach a captured capability token (builder style, used by the server).
+    pub fn with_cap_token(mut self, token: Option<String>) -> Self {
+        self.cap_token = token;
+        self
     }
 
     /// Convenience constructor for `GET target`.
@@ -155,6 +165,13 @@ impl ApiResponse {
     }
 }
 
+/// Performs a destructive cloud action on behalf of a POST request. Injected by
+/// the daemon (which owns the Graph/engine stack) so the router itself stays a
+/// pure read surface. Returns the new cloud id on success.
+pub trait RestoreHandler: Send + Sync {
+    fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String>;
+}
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
@@ -163,11 +180,23 @@ pub struct Router {
     /// the per-request `Store::open` never races the single-instance file lock the
     /// sync pass holds. `None` for the CLI's single-threaded `serve` (no syncer).
     gate: Option<std::sync::Arc<std::sync::Mutex<()>>>,
+    /// Optional destructive-action handler (the daemon's restore). `None` => the
+    /// API is read-only and POSTs are refused.
+    restore: Option<std::sync::Arc<dyn RestoreHandler>>,
+    /// Per-process capability token required on destructive POSTs. A cross-site
+    /// page can't read it (CSRF defense); paired with POST-only + an owner-only
+    /// socket it gates writes (plan §11).
+    cap_token: Option<String>,
 }
 
 impl Router {
     pub fn new(config: Config) -> Self {
-        Router { config, gate: None }
+        Router {
+            config,
+            gate: None,
+            restore: None,
+            cap_token: None,
+        }
     }
 
     /// Build a router that serializes store access against an external syncer via
@@ -176,22 +205,45 @@ impl Router {
         Router {
             config,
             gate: Some(gate),
+            restore: None,
+            cap_token: None,
         }
+    }
+
+    /// Enable the destructive restore POST, guarded by `cap_token` (builder style).
+    pub fn with_restore(
+        mut self,
+        handler: std::sync::Arc<dyn RestoreHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.restore = Some(handler);
+        self.cap_token = Some(cap_token);
+        self
     }
 
     /// Dispatch one request to a response. Never panics; unknown routes → 404.
     pub fn route(&self, req: &ApiRequest) -> ApiResponse {
-        if req.method != "GET" {
-            return ApiResponse::error(405, "method not allowed");
-        }
         // Hold the store-access gate (if any) for the whole request so a concurrent
         // sync pass and this request never both hold the store's single-instance lock.
         let _gate = self
             .gate
             .as_ref()
             .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        if req.method == "POST" {
+            return match req.path.as_str() {
+                "/api/v1/restore" => self.restore(req),
+                _ => ApiResponse::error(405, "method not allowed"),
+            };
+        }
+        if req.method != "GET" {
+            return ApiResponse::error(405, "method not allowed");
+        }
         match req.path.as_str() {
-            "/" => ApiResponse::html(INDEX_HTML),
+            // inject the capability token into the page so the (same-origin) UI can
+            // POST restores; empty when restore is disabled, hiding the UI.
+            "/" => ApiResponse::html(
+                &INDEX_HTML.replace("__CAP_TOKEN__", self.cap_token.as_deref().unwrap_or("")),
+            ),
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
             "/api/v1/activity" => self.activity(req),
@@ -202,6 +254,35 @@ impl Router {
             "/api/v1/view" => self.view(req),
             "/api/v1/search" => self.search(req),
             _ => ApiResponse::error(404, "not found"),
+        }
+    }
+
+    /// `POST /api/v1/restore?account&service&id` — re-create an archived item in the
+    /// cloud. Requires the capability token; the actual work is the injected handler.
+    fn restore(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.restore {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "restore is not enabled on this server"),
+        };
+        // constant-ish check: the request's token must equal the configured one
+        let ok = match (&self.cap_token, &req.cap_token) {
+            (Some(want), Some(got)) => want == got,
+            _ => false,
+        };
+        if !ok {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
+            (Some(a), Some(s), Some(i)) if !a.is_empty() && !s.is_empty() && !i.is_empty() => {
+                (a, s, i)
+            }
+            _ => return ApiResponse::error(400, "account, service and id are required"),
+        };
+        match handler.restore(account, service, id) {
+            Ok(new_id) => ApiResponse::ok_json(
+                &json!({ "restored": id, "service": service, "new_id": new_id }),
+            ),
+            Err(e) => ApiResponse::error(500, &e),
         }
     }
 
@@ -635,6 +716,69 @@ mod tests {
         assert!(
             gate.try_lock().is_ok(),
             "the gate must be free again once the request returns"
+        );
+    }
+
+    struct OkRestore;
+    impl RestoreHandler for OkRestore {
+        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
+            Ok("new-cloud-id".into())
+        }
+    }
+
+    #[test]
+    fn restore_post_requires_a_valid_capability_token() {
+        let router = Router::new(Config::default())
+            .with_restore(std::sync::Arc::new(OkRestore), "secret".into());
+        let q = "/api/v1/restore?account=a&service=mail&id=x";
+        // no token / wrong token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // correct token -> 200 + the new cloud id
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("new-cloud-id"));
+        // valid token but missing params -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
+            .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+    }
+
+    #[test]
+    fn index_injects_capability_token_when_restore_enabled() {
+        // read-only router: the placeholder is blanked, so the UI stays read-only
+        let ro = Router::new(Config::default()).route(&ApiRequest::get("/"));
+        let ro_body = String::from_utf8_lossy(&ro.body);
+        assert!(
+            !ro_body.contains("__CAP_TOKEN__"),
+            "placeholder must be replaced"
+        );
+        assert!(
+            ro_body.contains("const CAP_TOKEN = \"\""),
+            "no token when read-only"
+        );
+        // restore-enabled router: the real token is injected for the same-origin UI
+        let rw = Router::new(Config::default())
+            .with_restore(std::sync::Arc::new(OkRestore), "tok123".into())
+            .route(&ApiRequest::get("/"));
+        assert!(String::from_utf8_lossy(&rw.body).contains("const CAP_TOKEN = \"tok123\""));
+    }
+
+    #[test]
+    fn restore_post_refused_when_not_enabled() {
+        // a read-only router (no handler) refuses the POST but still serves GETs
+        let router = Router::new(Config::default());
+        let req = ApiRequest::new("POST", "/api/v1/restore?account=a&service=mail&id=x")
+            .with_cap_token(Some("x".into()));
+        assert_eq!(router.route(&req).status, 404);
+        assert_eq!(
+            router.route(&ApiRequest::get("/api/v1/accounts")).status,
+            200
         );
     }
 

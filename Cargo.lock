@@ -1002,6 +1002,7 @@ dependencies = [
  "isyncyou-graph",
  "isyncyou-pathmap",
  "isyncyou-store",
+ "serde_json",
 ]
 
 [[package]]
