@@ -589,12 +589,12 @@ fn sync_pass(
     store: &Store,
     client: &mut isyncyou_graph::GraphClient,
     map: &mut MappingTable,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let now = unix_now();
     let report = connectors::incremental_sync(client, store, map, account, &now)
         .map_err(|e| e.to_string())?;
-    println!(
-        "sync done: {} upserted, {} deleted, {} skipped{}",
+    let summary = format!(
+        "sync: {} upserted, {} deleted, {} skipped{}",
         report.upserted,
         report.deleted,
         report.skipped,
@@ -604,6 +604,7 @@ fn sync_pass(
             ""
         }
     );
+    println!("{summary}");
 
     // Materialize the ingested changes to disk: write new/changed files into the
     // account's sync root (the remote→local half that makes files actually appear).
@@ -717,7 +718,7 @@ fn sync_pass(
             }
         }
     }
-    Ok(())
+    Ok(summary)
 }
 
 /// Run a sync for an account: one pass, or (with `watch`) a continuous loop that
@@ -737,7 +738,18 @@ fn cmd_sync(
         let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
         let mut map = MappingTable::new();
         let mut client = isyncyou_graph::GraphClient::new(tok);
-        sync_pass(&cfg, account, &store, &mut client, &mut map)
+        let started = unix_now();
+        let result = sync_pass(&cfg, account, &store, &mut client, &mut map);
+        // record the pass in the activity history (success or failure)
+        let finished = unix_now();
+        let (status, summary) = match &result {
+            Ok(s) => ("ok", s.clone()),
+            Err(e) => ("error", e.clone()),
+        };
+        if let Err(e) = store.add_run(account, "sync", &started, &finished, status, &summary) {
+            eprintln!("activity: could not record run: {e}");
+        }
+        result.map(|_| ())
     };
 
     run_pass()?;
