@@ -75,8 +75,12 @@ enum Command {
     Backup {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
+        /// Account id; omit and pass --all-accounts to back up every account.
         #[arg(long)]
-        account: String,
+        account: Option<String>,
+        /// Back up every configured account (mutually exclusive with --account).
+        #[arg(long)]
+        all_accounts: bool,
         /// One of mail|calendar|contacts|todo|onenote; omitted = all.
         #[arg(long)]
         service: Option<String>,
@@ -205,13 +209,21 @@ fn run(command: Command) -> Result<(), String> {
         Command::Backup {
             config,
             account,
+            all_accounts,
             service,
             body_limit,
             cal_start,
             cal_end,
             token,
         } => cmd_backup(
-            &config, &account, service, body_limit, &cal_start, &cal_end, token,
+            &config,
+            account,
+            all_accounts,
+            service,
+            body_limit,
+            &cal_start,
+            &cal_end,
+            token,
         ),
         Command::Search {
             config,
@@ -477,10 +489,31 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
     Ok(())
 }
 
+/// Resolve which accounts a backup run targets.
+fn backup_targets(
+    cfg: &Config,
+    account: Option<&str>,
+    all_accounts: bool,
+) -> Result<Vec<String>, String> {
+    match (all_accounts, account) {
+        (true, Some(_)) => Err("use either --account or --all-accounts, not both".into()),
+        (true, None) => {
+            if cfg.accounts.is_empty() {
+                Err("no accounts configured".into())
+            } else {
+                Ok(cfg.accounts.iter().map(|a| a.id.clone()).collect())
+            }
+        }
+        (false, Some(a)) => Ok(vec![a.to_string()]),
+        (false, None) => Err("specify --account <id> or --all-accounts".into()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_backup(
     config: &Path,
-    account: &str,
+    account: Option<String>,
+    all_accounts: bool,
     service: Option<String>,
     body_limit: usize,
     cal_start: &str,
@@ -488,7 +521,57 @@ fn cmd_backup(
     token: Option<String>,
 ) -> Result<(), String> {
     let cfg = load_config(config)?;
-    let token = resolve_token(&cfg, account, token, false)?;
+    // Validate the service filter once, up front (a bad --service is a user error).
+    if let Some(s) = &service {
+        if !SERVICES.contains(&s.as_str()) {
+            return Err(format!(
+                "unknown service '{s}' (expected one of {})",
+                SERVICES.join("|")
+            ));
+        }
+    }
+    let targets = backup_targets(&cfg, account.as_deref(), all_accounts)?;
+    let multi = targets.len() > 1;
+    let mut failures = Vec::new();
+    for acc in &targets {
+        if multi {
+            println!("== account {acc} ==");
+        }
+        if let Err(e) = backup_one_account(
+            &cfg,
+            acc,
+            service.clone(),
+            body_limit,
+            cal_start,
+            cal_end,
+            token.clone(),
+        ) {
+            eprintln!("account {acc}: error: {e}");
+            failures.push(acc.clone());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "backup failed for {} account(s): {}",
+            failures.len(),
+            failures.join(", ")
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backup_one_account(
+    cfg: &Config,
+    account: &str,
+    service: Option<String>,
+    body_limit: usize,
+    cal_start: &str,
+    cal_end: &str,
+    token: Option<String>,
+) -> Result<(), String> {
+    let token = resolve_token(cfg, account, token, false)?;
     let acc = cfg
         .accounts
         .iter()
@@ -509,7 +592,7 @@ fn cmd_backup(
     };
 
     std::fs::create_dir_all(&archive_root).map_err(|e| e.to_string())?;
-    let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
+    let store = Store::open(store_path(cfg, account)?).map_err(|e| e.to_string())?;
     let mut client = isyncyou_graph::GraphClient::new(token);
     let now = unix_now();
 
@@ -972,7 +1055,8 @@ mod tests {
             c.command,
             Command::Backup {
                 config: "isyncyou.toml".into(),
-                account: "primary".into(),
+                account: Some("primary".into()),
+                all_accounts: false,
                 service: None,
                 body_limit: 0,
                 cal_start: "2015-01-01T00:00:00Z".into(),
@@ -980,6 +1064,41 @@ mod tests {
                 token: Some("T".into()),
             }
         );
+    }
+
+    #[test]
+    fn backup_targets_resolution() {
+        let mut cfg = Config::default();
+        cfg.accounts.push(AccountConfig {
+            id: "a".into(),
+            username: "a@o".into(),
+            sync_root: "/a/od".into(),
+            archive_root: "/a/ar".into(),
+        });
+        cfg.accounts.push(AccountConfig {
+            id: "b".into(),
+            username: "b@o".into(),
+            sync_root: "/b/od".into(),
+            archive_root: "/b/ar".into(),
+        });
+        // single account
+        assert_eq!(backup_targets(&cfg, Some("a"), false).unwrap(), vec!["a"]);
+        // all accounts
+        assert_eq!(
+            backup_targets(&cfg, None, true).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // both -> error; neither -> error
+        assert!(backup_targets(&cfg, Some("a"), true)
+            .unwrap_err()
+            .contains("not both"));
+        assert!(backup_targets(&cfg, None, false)
+            .unwrap_err()
+            .contains("--account"));
+        // all-accounts with empty config -> error
+        assert!(backup_targets(&Config::default(), None, true)
+            .unwrap_err()
+            .contains("no accounts"));
     }
 
     #[test]
@@ -1009,8 +1128,18 @@ mod tests {
     }
 
     #[test]
-    fn backup_requires_account() {
-        assert!(parse(&["isyncyou", "backup", "--token", "T"]).is_err());
+    fn backup_without_account_or_all_errors_at_runtime() {
+        // parses (account is optional) but cmd_backup requires a target selector
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-bkreq-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        let err = cmd_backup(&p, None, false, None, 0, "s", "e", Some("T".into())).unwrap_err();
+        assert!(
+            err.contains("--account") && err.contains("--all-accounts"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1287,8 +1416,17 @@ mod tests {
             "[[accounts]]\nid=\"a\"\nusername=\"a@outlook.com\"\nsync_root=\"/tmp/od\"\narchive_root=\"/tmp/arch\"\n",
         )
         .unwrap();
-        let err =
-            cmd_backup(&p, "a", Some("bogus".into()), 0, "s", "e", Some("T".into())).unwrap_err();
+        let err = cmd_backup(
+            &p,
+            Some("a".into()),
+            false,
+            Some("bogus".into()),
+            0,
+            "s",
+            "e",
+            Some("T".into()),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown service"));
         let _ = std::fs::remove_dir_all(&dir);
     }
