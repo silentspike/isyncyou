@@ -941,6 +941,7 @@ dependencies = [
  "isyncyou-fuse",
  "isyncyou-graph",
  "isyncyou-pathmap",
+ "isyncyou-pbs",
  "isyncyou-store",
  "isyncyou-webui",
  "serde_json",
