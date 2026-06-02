@@ -319,6 +319,41 @@ impl Store {
             .optional()?)
     }
 
+    /// All non-deleted items of a given `item_type` for a service, ordered by
+    /// `remote_id` (stable). Used to drive content downloads (e.g. fetch the MIME
+    /// for every stored mail `message`) and listings.
+    pub fn items_by_type(
+        &self,
+        account: &str,
+        service: &str,
+        item_type: &str,
+    ) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND service=?2 AND item_type=?3 AND deleted_at IS NULL
+             ORDER BY remote_id"
+        ))?;
+        let rows = stmt.query_map(params![account, service, item_type], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Set (or clear) an item's `local_path` — the on-disk location of its
+    /// downloaded body. Returns whether a row matched.
+    pub fn set_local_path(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        local_path: Option<&str>,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE items SET local_path=?4
+             WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, local_path],
+        )?;
+        Ok(n > 0)
+    }
+
     /// All non-deleted remote ids for a service. Used by delta-less connectors
     /// (e.g. OneNote) to reconcile deletions: ids present here but absent from a
     /// fresh full list have been removed remotely.
@@ -469,6 +504,31 @@ mod tests {
         // diacritics-insensitive tokenizer
         s.upsert_item(&item("a", "r4", "Lebenslauf.pdf")).unwrap();
         assert_eq!(s.search_names("a", "lebenslauf").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn items_by_type_and_set_local_path() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m1 = Item::new("a", "mail", "m1", "Hi", "message");
+        m1.parent_remote_id = Some("F1".into());
+        s.upsert_item(&m1).unwrap();
+        s.upsert_item(&Item::new("a", "mail", "F1", "Inbox", "folder"))
+            .unwrap();
+        s.upsert_item(&Item::new("a", "mail", "m2", "Bye", "message"))
+            .unwrap();
+        s.mark_deleted("a", "mail", "m2", "2026-06-02T00:00:00Z")
+            .unwrap();
+        let msgs = s.items_by_type("a", "mail", "message").unwrap();
+        assert_eq!(msgs.len(), 1); // m1 only (m2 tombstoned, F1 is a folder)
+        assert_eq!(msgs[0].remote_id, "m1");
+        assert!(msgs[0].local_path.is_none());
+
+        assert!(s
+            .set_local_path("a", "mail", "m1", Some("mail/ab/cd/x.eml"))
+            .unwrap());
+        let got = s.get_item("a", "mail", "m1").unwrap().unwrap();
+        assert_eq!(got.local_path.as_deref(), Some("mail/ab/cd/x.eml"));
+        assert!(!s.set_local_path("a", "mail", "missing", Some("x")).unwrap());
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub mod todo;
 
 pub use calendar::{incremental_sync_calendar, CalendarReport};
 pub use contacts::{incremental_sync_contacts, ContactsReport};
-pub use mail::{incremental_sync_mail, MailReport};
+pub use mail::{backup_message_bodies, incremental_sync_mail, BodyReport, MailReport, MimeFetcher};
 pub use onedrive::{
     incremental_sync, push_delete, push_upload, RemoteWriter, SyncError, SyncReport,
 };
