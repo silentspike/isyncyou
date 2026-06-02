@@ -7,6 +7,41 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
-- Phase 0: Cargo workspace skeleton (crates, binaries, GUI status-bar stub).
-- CI (fmt, clippy, build, test), secret scanning (Gitleaks), license/advisory gate (cargo-deny).
-- Issue model (Epic / Story / Task) templates and auto-labeling.
+
+**Engine (Phase 1)**
+- Microsoft Graph core: device-code OAuth + token cache + non-interactive refresh,
+  delta walker (pagination, 410→resync), adaptive throttle/429 pacer, resumable
+  upload sessions, reqwest+rustls transport (behind the `http` feature).
+- id-based SQLite store with FTS5 (names + mail bodies), WAL, single-instance lock,
+  migrations; pathmap (reversible cloud↔local codec + persistent mapping table);
+  core (config, conflict engine, mass-delete guard, recovery/journal, sync-state
+  machine); change-source (inotify coalescer + reconciler).
+- OneDrive bidirectional connector (delta→store, resumable up/download, tombstones).
+- Native status-bar renderer (own tiny-skia + cosmic-text, bundled font, headless).
+- A1–A10 acceptance harness (`crates/acceptance`).
+
+**Backup, restore & search (Phase 2)**
+- Connectors for Mail, Calendar, Contacts, ToDo, OneNote: incremental index +
+  on-disk body archive (`.eml` / canonical JSON / page HTML / contact photos).
+- Restore-cloud-item for mail (MIME), calendar, tasks, contacts.
+- Full-text search over names **and mail bodies**; `.ics` / vCard export.
+- Multi-account (per-account stores, `--all-accounts` backup + cross-account search);
+  archive migration.
+- Local web UI: router + minimal HTTP server (accounts / items / item / body /
+  search), served by the daemon; safe inert body serving.
+
+**Tooling & ops**
+- `isyncyou` CLI (init/check/login/status/sync/backup/search/restore/export/migrate/serve);
+  `isyncyoud` daemon (serves the web UI); `isyncyou-doctor`.
+- Release archive (`isyncyou-linux-x86_64.tar.gz`) + hardened `systemd --user` unit.
+- CI (fmt, clippy, build, test), secret scanning (Gitleaks), license/advisory gate
+  (cargo-deny); Epic/Story/Task issue model + auto-labeling.
+- `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
+  mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
+  packaging/daemon model.
+
+### Not yet implemented
+- Native windowed GUI / tray + onboarding wizard (need a display server).
+- Flatpak / AppImage GUI bundling (need the GUI binary + build tooling).
+- restore-from-PBS-snapshot; Event Hub realtime; eBPF/fanotify; FUSE placeholders;
+  Windows/macOS builds; sanitized HTML mail viewer.
