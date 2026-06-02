@@ -52,6 +52,29 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Guided first-run wizard: prompt for account details, write the config,
+    /// and connect the account (reuse a cached token, else device-code sign-in).
+    Setup {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        /// Never prompt; take every value from flags (fails if one is missing).
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        sync_root: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        /// Write the config but skip connecting the account.
+        #[arg(long)]
+        no_connect: bool,
+        /// Overwrite an existing config file.
+        #[arg(long)]
+        force: bool,
+    },
     /// Validate a configuration file.
     Check {
         #[arg(long, default_value = "isyncyou.toml")]
@@ -198,6 +221,8 @@ const READ_SCOPES: &[&str] = &[
     "Contacts.Read",
     "Tasks.Read",
     "Notes.Read",
+    // User.Read lets `setup` confirm the connected identity via GET /me (plan §11).
+    "User.Read",
     "offline_access",
 ];
 const WRITE_SCOPES: &[&str] = &[
@@ -230,6 +255,25 @@ fn run(command: Command) -> Result<(), String> {
             archive_root,
             force,
         } => cmd_init(&config, account, username, sync_root, archive_root, force),
+        Command::Setup {
+            config,
+            non_interactive,
+            account,
+            username,
+            sync_root,
+            archive_root,
+            no_connect,
+            force,
+        } => cmd_setup(
+            &config,
+            non_interactive,
+            account,
+            username,
+            sync_root,
+            archive_root,
+            no_connect,
+            force,
+        ),
         Command::Check { config } => cmd_check(&config),
         Command::Verify { config, account } => cmd_verify(&config, &account),
         Command::Status { config, account } => cmd_status(&config, &account),
@@ -426,6 +470,150 @@ fn cmd_init(
         }
     }
     Ok(())
+}
+
+/// Resolve a setup field: the flag wins; in non-interactive mode a missing
+/// value is an error; otherwise prompt on stderr (Enter accepts `default`).
+fn ask(
+    provided: Option<String>,
+    label: &str,
+    default: Option<&str>,
+    non_interactive: bool,
+) -> Result<String, String> {
+    if let Some(v) = provided {
+        return Ok(v);
+    }
+    if non_interactive {
+        return default
+            .map(str::to_string)
+            .ok_or_else(|| format!("missing required value for '{label}' (--non-interactive)"));
+    }
+    use std::io::Write;
+    match default {
+        Some(d) => eprint!("{label} [{d}]: "),
+        None => eprint!("{label}: "),
+    }
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    let v = line.trim();
+    if v.is_empty() {
+        default
+            .map(str::to_string)
+            .ok_or_else(|| format!("'{label}' is required"))
+    } else {
+        Ok(v.to_string())
+    }
+}
+
+/// Guided first-run: gather account details, write a validated TOML config, then
+/// connect the account. Scriptable end to end via `--non-interactive` + flags.
+#[allow(clippy::too_many_arguments)]
+fn cmd_setup(
+    config: &Path,
+    non_interactive: bool,
+    account: Option<String>,
+    username: Option<String>,
+    sync_root: Option<PathBuf>,
+    archive_root: Option<PathBuf>,
+    no_connect: bool,
+    force: bool,
+) -> Result<(), String> {
+    if config.exists() && !force {
+        return Err(format!(
+            "{} already exists (use --force to overwrite)",
+            config.display()
+        ));
+    }
+    if !non_interactive {
+        eprintln!("iSyncYou first-run setup — press Enter to accept each default.");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+
+    let id = ask(account, "Account id", Some("personal"), non_interactive)?;
+    let user = ask(username, "Microsoft account email", None, non_interactive)?;
+    let sr_default = format!("{home}/OneDrive");
+    let sr = ask(
+        sync_root.map(|p| p.display().to_string()),
+        "Sync folder",
+        Some(&sr_default),
+        non_interactive,
+    )?;
+    let ar_default = format!("{home}/.local/share/isyncyou/{id}");
+    let ar = ask(
+        archive_root.map(|p| p.display().to_string()),
+        "Archive folder",
+        Some(&ar_default),
+        non_interactive,
+    )?;
+
+    let cfg = Config {
+        accounts: vec![AccountConfig {
+            id: id.clone(),
+            username: user,
+            sync_root: PathBuf::from(sr),
+            archive_root: PathBuf::from(ar),
+        }],
+        ..Default::default()
+    };
+    cfg.validate()
+        .map_err(|errs| format!("invalid config: {}", errs.join("; ")))?;
+    cfg.save(config)?;
+    println!("wrote config for account '{id}' to {}", config.display());
+
+    if no_connect {
+        println!("Skipped connect (--no-connect). Run `isyncyou login --account {id}` later.");
+        return Ok(());
+    }
+    connect_account(&cfg, &id, non_interactive)?;
+    println!("Setup complete. Next: `isyncyou sync --account {id}` to sync, or `isyncyou serve` for the web UI.");
+    Ok(())
+}
+
+/// Connect an account: reuse a cached/refreshable read token if one exists, else
+/// device-code sign-in; then confirm the live identity via `GET /me`.
+fn connect_account(cfg: &Config, account: &str, non_interactive: bool) -> Result<(), String> {
+    let cache = token_cache_path(cfg, account, false)?;
+    if let Some(parent) = cache.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let now = unix_now().parse::<u64>().unwrap_or(0);
+    let token = if cache.exists() {
+        isyncyou_graph::auth::flow::ensure_access_token(&cache, READ_CLIENT, READ_SCOPES, now)?
+    } else if non_interactive {
+        println!("No cached token; run `isyncyou login --account {account}` to connect.");
+        return Ok(());
+    } else {
+        let tokens =
+            isyncyou_graph::auth::flow::device_code_login(READ_CLIENT, READ_SCOPES, now, |dc| {
+                eprintln!(
+                    "To connect, open {} and enter code: {}",
+                    dc.verification_uri, dc.user_code
+                );
+                eprintln!("{}", dc.message);
+            })?;
+        tokens.save(&cache).map_err(|e| e.to_string())?;
+        tokens.access_token
+    };
+    let who = confirm_identity(&token)?;
+    println!("connected as {who}");
+    Ok(())
+}
+
+/// Confirm a token is live by reading the signed-in identity (`GET /me`); returns
+/// the user principal name (or display name) the token belongs to.
+fn confirm_identity(token: &str) -> Result<String, String> {
+    let me = isyncyou_graph::GraphClient::new(token)
+        .get_json("/me")
+        .map_err(|e| format!("/me failed: {e}"))?;
+    let who = me
+        .get("userPrincipalName")
+        .and_then(|v| v.as_str())
+        .or_else(|| me.get("displayName").and_then(|v| v.as_str()))
+        .unwrap_or("(unknown)");
+    Ok(who.to_string())
 }
 
 fn cmd_check(path: &Path) -> Result<(), String> {
@@ -1329,6 +1517,109 @@ mod tests {
         assert!(err.contains("invalid config"), "got: {err}");
         assert!(!p.exists(), "invalid config must not be written");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ask_prefers_flag_then_default_then_errors() {
+        // a provided flag value always wins
+        assert_eq!(
+            ask(Some("flagged".into()), "X", Some("def"), true).unwrap(),
+            "flagged"
+        );
+        // non-interactive without a flag falls back to the default
+        assert_eq!(ask(None, "X", Some("def"), true).unwrap(), "def");
+        // non-interactive, no flag and no default -> hard error (e.g. username)
+        let err = ask(None, "Email", None, true).unwrap_err();
+        assert!(
+            err.contains("Email") && err.contains("non-interactive"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn setup_writes_config_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-setup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("isyncyou.toml");
+        // non-interactive + --no-connect: deterministic, no stdin, no network
+        cmd_setup(
+            &p,
+            true,
+            Some("home".into()),
+            Some("me@outlook.com".into()),
+            Some(dir.join("od")),
+            Some(dir.join("arch")),
+            true,
+            false,
+        )
+        .unwrap();
+        // the written TOML parses + validates and preserves every field
+        let cfg = load_config(&p).unwrap();
+        assert_eq!(cfg.accounts.len(), 1);
+        assert_eq!(cfg.accounts[0].id, "home");
+        assert_eq!(cfg.accounts[0].username, "me@outlook.com");
+        assert_eq!(cfg.accounts[0].sync_root, dir.join("od"));
+        assert_eq!(cfg.accounts[0].archive_root, dir.join("arch"));
+        // refuses to clobber an existing config without --force
+        assert!(cmd_setup(
+            &p,
+            true,
+            Some("x".into()),
+            Some("x@o".into()),
+            None,
+            None,
+            true,
+            false
+        )
+        .unwrap_err()
+        .contains("already exists"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_requires_username_in_non_interactive() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-setup2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("isyncyou.toml");
+        // username has no default -> non-interactive setup fails before writing
+        let err = cmd_setup(&p, true, None, None, None, None, true, false).unwrap_err();
+        assert!(err.contains("email") || err.contains("Email"), "got: {err}");
+        assert!(
+            !p.exists(),
+            "no config must be written when a required value is missing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_setup_defaults() {
+        let c = parse(&["isyncyou", "setup"]).unwrap();
+        assert_eq!(
+            c.command,
+            Command::Setup {
+                config: "isyncyou.toml".into(),
+                non_interactive: false,
+                account: None,
+                username: None,
+                sync_root: None,
+                archive_root: None,
+                no_connect: false,
+                force: false,
+            }
+        );
+    }
+
+    // Live: confirm a real backup token resolves to an identity via GET /me.
+    // Gated on ISYNCYOU_TEST_TOKEN so CI without a token skips it.
+    #[test]
+    fn confirm_identity_live() {
+        let Ok(token) = std::env::var("ISYNCYOU_TEST_TOKEN") else {
+            eprintln!("skip confirm_identity_live: ISYNCYOU_TEST_TOKEN unset");
+            return;
+        };
+        let who = confirm_identity(&token).expect("/me should resolve with a valid token");
+        assert!(!who.is_empty() && who != "(unknown)", "got identity: {who}");
+        eprintln!("confirm_identity_live: connected as {who}");
     }
 
     #[test]
