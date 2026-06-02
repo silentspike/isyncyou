@@ -363,6 +363,37 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// One page of a service's non-deleted items (same stable order as
+    /// [`Self::items_by_service`]), so a UI never has to load a whole large
+    /// mailbox at once. `offset`/`limit` are clamped to non-negative by the
+    /// caller's `u32` type.
+    pub fn items_by_service_page(
+        &self,
+        account: &str,
+        service: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL
+             ORDER BY item_type, name
+             LIMIT ?3 OFFSET ?4"
+        ))?;
+        let rows = stmt.query_map(params![account, service, limit, offset], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Count of a service's non-deleted items (the pagination total).
+    pub fn count_by_service(&self, account: &str, service: &str) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM items
+             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL",
+            params![account, service],
+            |r| r.get::<_, i64>(0),
+        )? as u64)
+    }
+
     /// All non-deleted items of a given `item_type` for a service, ordered by
     /// `remote_id` (stable). Used to drive content downloads (e.g. fetch the MIME
     /// for every stored mail `message`) and listings.
