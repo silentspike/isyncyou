@@ -146,18 +146,24 @@ enum Command {
         #[arg(long)]
         query: String,
     },
-    /// Restore one archived item back to the cloud (re-create via Graph).
+    /// Restore one archived item — to a local file (`--to-local`) or back to the
+    /// cloud by re-creating it via Graph (the default).
     Restore {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
         #[arg(long)]
         account: String,
-        /// One of mail|calendar|contacts|todo.
+        /// Service the item belongs to. Cloud restore: mail|calendar|contacts|todo.
+        /// `--to-local` works for any service with an archived body (incl. onenote).
         #[arg(long)]
         service: String,
         /// The archived item's `remote_id`.
         #[arg(long)]
         id: String,
+        /// Recover the archived body to this directory instead of the cloud
+        /// (no token / no network). The file is named after the item.
+        #[arg(long)]
+        to_local: Option<PathBuf>,
         /// Graph **write** access token (Mail/Calendars/Contacts/Tasks.ReadWrite).
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
@@ -308,8 +314,9 @@ fn run(command: Command) -> Result<(), String> {
             account,
             service,
             id,
+            to_local,
             token,
-        } => cmd_restore(&config, &account, &service, &id, token),
+        } => cmd_restore(&config, &account, &service, &id, to_local, token),
         Command::Export {
             config,
             account,
@@ -1151,21 +1158,49 @@ fn cmd_search(
     Ok(())
 }
 
+/// A human, filesystem-safe path under `dir` for a restored item: the item's
+/// name (sanitized to one safe segment) + the archived body's extension,
+/// disambiguated with ` (n)` if a file already exists.
+fn local_restore_path(dir: &Path, name: &str, rel: &str) -> PathBuf {
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let mut stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\:*?\"<>|".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    stem = stem.trim().trim_matches('.').trim().to_string();
+    if stem.is_empty() {
+        stem = "item".to_string();
+    }
+    if stem.chars().count() > 120 {
+        stem = stem.chars().take(120).collect();
+    }
+    (0..)
+        .map(|n| match n {
+            0 => dir.join(format!("{stem}.{ext}")),
+            _ => dir.join(format!("{stem} ({n}).{ext}")),
+        })
+        .find(|p| !p.exists())
+        .unwrap_or_else(|| dir.join(format!("{stem}.{ext}")))
+}
+
 fn cmd_restore(
     config: &Path,
     account: &str,
     service: &str,
     id: &str,
+    to_local: Option<PathBuf>,
     token: Option<String>,
 ) -> Result<(), String> {
     let cfg = load_config(config)?;
-    if !RESTORE_SERVICES.contains(&service) {
-        return Err(format!(
-            "service '{service}' has no restore path (expected one of {})",
-            RESTORE_SERVICES.join("|")
-        ));
-    }
-    let token = resolve_token(&cfg, account, token, true)?;
     let acc = cfg
         .accounts
         .iter()
@@ -1185,6 +1220,26 @@ fn cmd_restore(
     let path = archive_root.join(rel);
     let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
+    // restore-local: recover the archived body to a directory (any service, no
+    // token, no network). Distinct from `export` (bulk .ics/.vcf) — this is a
+    // single-item recovery of the exact archived bytes.
+    if let Some(dir) = to_local {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let out = local_restore_path(&dir, &item.name, rel);
+        std::fs::write(&out, &bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
+        println!("restored {service} item '{id}' to {}", out.display());
+        return Ok(());
+    }
+
+    // restore-cloud: re-create via Graph (needs the write token).
+    if !RESTORE_SERVICES.contains(&service) {
+        return Err(format!(
+            "service '{service}' has no cloud restore path (expected one of {}); \
+             use --to-local to recover its archived body to a file",
+            RESTORE_SERVICES.join("|")
+        ));
+    }
+    let token = resolve_token(&cfg, account, token, true)?;
     let client = isyncyou_graph::GraphClient::new(token);
     let new_id = match service {
         "mail" => connectors::restore_message(&client, &bytes)?,
@@ -1953,6 +2008,7 @@ mod tests {
                 account: "a".into(),
                 service: "mail".into(),
                 id: "M1".into(),
+                to_local: None,
                 token: Some("T".into()),
             }
         );
@@ -1974,13 +2030,45 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_unknown_service() {
-        let dir = std::env::temp_dir().join(format!("isyncyou-cli-rs1-{}", std::process::id()));
+    fn local_restore_path_sanitizes_and_disambiguates() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-lrp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // name -> safe single segment, extension taken from the archived rel path
+        let p = local_restore_path(&dir, "Invoice 03/2026: \"final\"?", "mail/aa/bb/x.eml");
+        assert_eq!(p.parent().unwrap(), dir);
+        let fname = p.file_name().unwrap().to_str().unwrap();
+        assert!(fname.ends_with(".eml"));
+        assert!(!fname.contains('/') && !fname.contains(':') && !fname.contains('"'));
+        // an empty/odd name still yields a usable file, and collisions get ` (n)`
+        std::fs::write(&p, b"x").unwrap();
+        let p2 = local_restore_path(&dir, "Invoice 03/2026: \"final\"?", "mail/aa/bb/x.eml");
+        assert_ne!(p, p2);
+        assert!(p2.file_name().unwrap().to_str().unwrap().contains("(1)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_to_local_recovers_any_service_without_cloud() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-rtl-{}", std::process::id()));
         let arch = dir.join("arch");
-        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(arch.join("onenote/aa")).unwrap();
         let p = write_config(&dir, &arch);
-        let err = cmd_restore(&p, "a", "onenote", "x", Some("T".into())).unwrap_err();
-        assert!(err.contains("no restore path"));
+        // an archived OneNote page (HTML) — onenote has no *cloud* restore path
+        std::fs::write(arch.join("onenote/aa/p.html"), b"<h1>Notes</h1>").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut it = isyncyou_store::Item::new("a", "onenote", "pg1", "Meeting Notes", "page");
+            it.local_path = Some("onenote/aa/p.html".into());
+            store.upsert_item(&it).unwrap();
+        } // release the lock before cmd_restore reopens the store
+          // cloud restore is refused for onenote (and points at --to-local)
+        let err = cmd_restore(&p, "a", "onenote", "pg1", None, Some("T".into())).unwrap_err();
+        assert!(err.contains("no cloud restore path"), "got: {err}");
+        // --to-local recovers the exact archived bytes to a human-named file
+        let out = dir.join("recovered");
+        cmd_restore(&p, "a", "onenote", "pg1", Some(out.clone()), None).unwrap();
+        let f = out.join("Meeting Notes.html");
+        assert_eq!(std::fs::read(&f).unwrap(), b"<h1>Notes</h1>");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1998,10 +2086,10 @@ mod tests {
                 ))
                 .unwrap();
         } // drop -> release the store lock before cmd_restore reopens it
-        let err = cmd_restore(&p, "a", "calendar", "e1", Some("T".into())).unwrap_err();
+        let err = cmd_restore(&p, "a", "calendar", "e1", None, Some("T".into())).unwrap_err();
         assert!(err.contains("no archived body"), "got: {err}");
         // a missing id is reported distinctly
-        let err2 = cmd_restore(&p, "a", "calendar", "missing", Some("T".into())).unwrap_err();
+        let err2 = cmd_restore(&p, "a", "calendar", "missing", None, Some("T".into())).unwrap_err();
         assert!(err2.contains("no archived calendar item"), "got: {err2}");
         let _ = std::fs::remove_dir_all(&dir);
     }
