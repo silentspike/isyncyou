@@ -7,11 +7,13 @@
 //! are stored id-based (service `"contacts"`, `item_type = "contact"`); the
 //! canonical record is the raw JSON, vCard is an export concern handled elsewhere.
 
-use crate::common::fetch_pages;
+use crate::archive::BytesFetcher;
+use crate::common::{fetch_pages, shard_path};
 use crate::onedrive::SyncError;
 use isyncyou_graph::{run_delta, DeltaCursor, Transport};
 use isyncyou_store::{Item, Store};
 use serde_json::Value;
+use std::path::Path;
 
 const SERVICE: &str = "contacts";
 const FOLDERS_URL: &str = "https://graph.microsoft.com/v1.0/me/contactFolders?$top=100";
@@ -187,6 +189,56 @@ fn ingest_contact(
     Ok(Ingest::Upserted)
 }
 
+/// What one contact-photo archive pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhotoReport {
+    /// Photos fetched and written this pass.
+    pub downloaded: usize,
+    /// Contacts skipped because they have no photo (HTTP 404).
+    pub skipped: usize,
+    /// Total bytes written this pass.
+    pub bytes: u64,
+}
+
+/// Archive each stored contact's photo (`GET /me/contacts/{id}/photo/$value`)
+/// as a sibling `.jpg` under `archive_root` (sharded). Contacts without a photo
+/// return 404 and are skipped. `limit` caps one pass (`0` = all).
+pub fn backup_contact_photos<F: BytesFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    limit: usize,
+) -> Result<PhotoReport, SyncError> {
+    let mut report = PhotoReport::default();
+    for c in store.items_by_type(account, SERVICE, "contact")? {
+        if limit != 0 && report.downloaded >= limit {
+            break;
+        }
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/contacts/{}/photo/$value",
+            c.remote_id
+        );
+        match fetcher.fetch_bytes(&url) {
+            Ok(bytes) => {
+                let abs = shard_path(archive_root, SERVICE, &c.remote_id, "jpg");
+                if let Some(parent) = abs.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let tmp = abs.with_extension("jpg.part");
+                std::fs::write(&tmp, &bytes)?;
+                std::fs::rename(&tmp, &abs)?;
+                report.downloaded += 1;
+                report.bytes += bytes.len() as u64;
+            }
+            // No photo set on this contact (or no body) -> skip, don't fail.
+            Err(e) if e.contains("404") => report.skipped += 1,
+            Err(e) => return Err(SyncError::Remote(e)),
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +363,36 @@ mod tests {
             .unwrap()
             .deleted_at
             .is_some());
+    }
+
+    struct MockPhoto;
+    impl BytesFetcher for MockPhoto {
+        fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+            if url.contains("/c1/") {
+                Ok(vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]) // jpeg-ish bytes
+            } else {
+                Err("HTTP 404: ItemNotFound".into()) // no photo set
+            }
+        }
+    }
+
+    #[test]
+    fn contact_photos_written_for_present_skipped_on_404() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "c1", "Has Photo", "contact"))
+            .unwrap();
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "c2", "No Photo", "contact"))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let r = backup_contact_photos(&MockPhoto, &store, "acc", dir.path(), 0).unwrap();
+        assert_eq!(r.downloaded, 1);
+        assert_eq!(r.skipped, 1);
+        assert!(r.bytes > 0);
+        // c1's photo landed at its sharded .jpg path; c2 has none
+        assert!(shard_path(dir.path(), SERVICE, "c1", "jpg").exists());
+        assert!(!shard_path(dir.path(), SERVICE, "c2", "jpg").exists());
     }
 
     /// Live: real default + per-folder contact delta -> store, against the

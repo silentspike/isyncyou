@@ -28,7 +28,7 @@ pub use archive::{
     backup_onenote_bodies, backup_todo_bodies, ArchiveReport, BytesFetcher, JsonFetcher,
 };
 pub use calendar::{incremental_sync_calendar, CalendarReport};
-pub use contacts::{incremental_sync_contacts, ContactsReport};
+pub use contacts::{backup_contact_photos, incremental_sync_contacts, ContactsReport, PhotoReport};
 pub use export::{contact_to_vcard, event_to_ics};
 pub use mail::{
     backup_message_bodies, incremental_sync_mail, index_mail_bodies, BodyReport, MailReport,

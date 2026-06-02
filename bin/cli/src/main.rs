@@ -682,9 +682,17 @@ fn backup_one_account(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                let ph = connectors::backup_contact_photos(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                    body_limit,
+                )
+                .map_err(|e| e.to_string())?;
                 format!(
-                    "contacts: {} folders, {} indexed; {} json archived ({} bytes)",
-                    r.folders, r.upserted, b.archived, b.bytes
+                    "contacts: {} folders, {} indexed; {} json archived ({} bytes); {} photos ({} without)",
+                    r.folders, r.upserted, b.archived, b.bytes, ph.downloaded, ph.skipped
                 )
             }
             "todo" => {
