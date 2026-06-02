@@ -6,8 +6,16 @@
 //! verified pixels equal the on-screen pixels by construction.
 //!
 //! [`render`] returns a [`tiny_skia::Pixmap`]; [`render_png`] encodes it.
+//!
+//! Text uses a **bundled** font (a Latin-1/punctuation/arrows subset of DejaVu
+//! Sans, permissively licensed — see `assets/FONT-LICENSE.md`) loaded into a
+//! [`FontSystem`] with no system-font scan, so glyphs render identically and
+//! deterministically on any machine — including a headless CI box with no fonts
+//! installed.
 
-use cosmic_text::{Attrs, Buffer, Color as CtColor, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{
+    Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache,
+};
 use tiny_skia::{
     Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, Rect,
     SpreadMode, Stroke, Transform,
@@ -15,6 +23,20 @@ use tiny_skia::{
 
 pub const WIDTH: u32 = 380;
 pub const HEIGHT: u32 = 560;
+
+/// The bundled UI font (DejaVu Sans subset). Embedded so text never depends on
+/// system fonts.
+const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSans-subset.ttf");
+/// Family name of [`FONT_DATA`].
+const FONT_FAMILY: &str = "DejaVu Sans";
+
+/// A [`FontSystem`] containing **only** the bundled font (no system scan), so
+/// rendering is deterministic and works on a font-less headless host.
+pub fn bundled_font_system() -> FontSystem {
+    let mut db = cosmic_text::fontdb::Database::new();
+    db.load_font_data(FONT_DATA.to_vec());
+    FontSystem::new_with_locale_and_db("en-US".to_string(), db)
+}
 
 /// Overall sync state shown in the status pill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +168,12 @@ fn text(
 ) {
     let mut buf = Buffer::new(fs, Metrics::new(size, size * 1.3));
     buf.set_size(fs, Some(WIDTH as f32), Some(size * 2.0));
-    buf.set_text(fs, s, Attrs::new(), Shaping::Advanced);
+    buf.set_text(
+        fs,
+        s,
+        Attrs::new().family(Family::Name(FONT_FAMILY)),
+        Shaping::Advanced,
+    );
     buf.shape_until_scroll(fs, false);
     let (pw, ph) = (pm.width(), pm.height());
     let tc = CtColor::rgb(
@@ -167,7 +194,7 @@ fn text(
 
 /// Render the status bar to a pixel buffer (the headless == on-screen image).
 pub fn render(view: &StatusView) -> Pixmap {
-    let mut fs = FontSystem::new();
+    let mut fs = bundled_font_system();
     let mut sc = SwashCache::new();
     render_with(view, &mut fs, &mut sc)
 }
@@ -425,5 +452,35 @@ mod tests {
     fn render_png_has_png_signature() {
         let png = render_png(&sample());
         assert_eq!(&png[1..4], b"PNG", "expected PNG signature");
+    }
+
+    #[test]
+    fn bundled_font_system_loads_only_the_bundled_font() {
+        // Exactly one face (no system scan) => deterministic, font-less-host safe.
+        let fs = bundled_font_system();
+        assert_eq!(fs.db().faces().count(), 1);
+    }
+
+    #[test]
+    fn header_text_renders_glyph_pixels() {
+        // With the bundled font, the white "OneDrive" title paints glyph pixels in
+        // the text band (x 56..200, y 10..48), which holds text only — no shapes.
+        // A font-less render would leave this band at the dark background.
+        let pm = render(&sample());
+        let w = pm.width() as usize;
+        let data = pm.data();
+        let mut bright = 0usize;
+        for y in 10..48usize {
+            for x in 56..200usize {
+                let i = (y * w + x) * 4;
+                if data[i] > 90 && data[i + 1] > 90 && data[i + 2] > 90 {
+                    bright += 1;
+                }
+            }
+        }
+        assert!(
+            bright > 30,
+            "expected bundled-font glyph pixels in the title band, got {bright}"
+        );
     }
 }
