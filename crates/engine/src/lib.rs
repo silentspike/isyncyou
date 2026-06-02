@@ -183,7 +183,7 @@ pub mod auth {
 }
 
 /// Cloud services that can be re-created from their canonical archive.
-pub const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo"];
+pub const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 
 /// Re-create one archived item back in the cloud via Graph (restore-cloud-item).
 /// Opens the account's store, reads the archived body, and re-creates it through
@@ -239,6 +239,8 @@ pub fn restore_cloud(
                 .ok_or("archived task has no parent list id")?;
             connectors::restore_task(&client, list, &v)?
         }
+        // OneNote pages re-create from their archived HTML (not a JSON object).
+        "onenote" => connectors::restore_page(&client, &bytes)?,
         _ => unreachable!("validated against RESTORE_SERVICES"),
     };
     Ok(new_id)

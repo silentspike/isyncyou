@@ -45,8 +45,8 @@ pub use onedrive::{
 pub use onenote::{incremental_sync_onenote, OneNoteReport};
 pub use quickxor::{quickxor, quickxor_base64};
 pub use restore::{
-    restore_contact, restore_event, restore_message, restore_task, sanitize_contact,
-    sanitize_event, sanitize_task, MessageCreator, Restorer,
+    restore_contact, restore_event, restore_message, restore_page, restore_task, sanitize_contact,
+    sanitize_event, sanitize_task, MessageCreator, PageCreator, Restorer,
 };
 pub use shared::{sync_shared_with_me, SharedReport};
 pub use todo::{incremental_sync_todo, TodoReport};

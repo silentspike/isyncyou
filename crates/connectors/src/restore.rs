@@ -187,6 +187,28 @@ pub fn restore_message<C: MessageCreator>(creator: &C, mime: &[u8]) -> Result<St
     created_id(creator.create_message_from_mime(mime)?)
 }
 
+/// Creates a OneNote page from its archived HTML. Separate from [`Restorer`] since
+/// a page can't be re-created by a JSON POST — the HTML is re-posted (plan §6).
+pub trait PageCreator {
+    fn create_page_from_html(&self, html: &[u8]) -> Result<Value, String>;
+}
+
+#[cfg(feature = "http")]
+impl PageCreator for isyncyou_graph::GraphClient {
+    fn create_page_from_html(&self, html: &[u8]) -> Result<Value, String> {
+        isyncyou_graph::GraphClient::create_onenote_page(self, html).map_err(|e| e.to_string())
+    }
+}
+
+/// Restore one OneNote page from its archived HTML body: re-create it in the
+/// default section; returns the new page id.
+pub fn restore_page<C: PageCreator>(creator: &C, html: &[u8]) -> Result<String, String> {
+    if html.is_empty() {
+        return Err("page HTML is empty".into());
+    }
+    created_id(creator.create_page_from_html(html)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +580,40 @@ This message was re-created from MIME by iSyncYou.\r\n";
         client
             .delete(&format!("/me/messages/{new_id}"))
             .expect("cleanup");
+    }
+
+    /// Live round-trip: restore (create) a OneNote page from HTML, then clean it up.
+    /// Needs `http` + `ISYNCYOU_TEST_WRITE_TOKEN` with `Notes.ReadWrite`. OneNote is
+    /// eventually consistent, so the cleanup delete is retried until it propagates
+    /// (a successful delete confirms the page was created).
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_restore_page_roundtrip() {
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_restore_page_roundtrip: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let client = isyncyou_graph::GraphClient::new(token);
+        let html = b"<!DOCTYPE html><html><head><title>iSyncYou page restore test</title></head>\
+                     <body><p>round-trip</p></body></html>";
+        let new_id = restore_page(&client, html).expect("restore_page should create a page");
+        assert!(!new_id.is_empty(), "expected a new page id");
+        eprintln!("restored onenote page {new_id}");
+        // delete with retry — OneNote may 404 a fresh page until it propagates
+        let mut cleaned = false;
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_secs(8));
+            if client.delete_onenote_page(&new_id).is_ok() {
+                cleaned = true;
+                break;
+            }
+        }
+        assert!(cleaned, "failed to clean up restored page {new_id}");
     }
 }
