@@ -1,0 +1,17 @@
+[package]
+name = "isyncyou-acceptance"
+description = "v0.1 acceptance invariants (A1-A10) verified against the real engine crates."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+isyncyou-core = { path = "../core" }
+isyncyou-store = { path = "../store" }
+isyncyou-pathmap = { path = "../pathmap" }
+isyncyou-graph = { path = "../graph" }
+isyncyou-change-source = { path = "../change-source" }
+serde_json = { workspace = true }
+tempfile = "3"
