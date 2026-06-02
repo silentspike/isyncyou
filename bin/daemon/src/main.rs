@@ -68,6 +68,34 @@ fn run(args: &Args) -> Result<(), String> {
     // one of them ever holds a store's single-instance file lock at a time.
     let gate = Arc::new(Mutex::new(()));
 
+    // Desktop integration (plan §13): publish the Dolphin/KIO FileStatus provider
+    // on the session bus so the overlay-icon plugin + ServiceMenu can ask the sync
+    // status of any path. Linux-only and non-fatal — a headless server has no
+    // session bus, so the thread just logs and exits while sync runs unaffected.
+    #[cfg(target_os = "linux")]
+    {
+        let accounts: Vec<isyncyou_dbus_status::AccountRoot> = cfg
+            .accounts
+            .iter()
+            .map(|a| isyncyou_dbus_status::AccountRoot {
+                sync_root: a.sync_root.clone(),
+                store_db: a.archive_root.join(".isyncyou-store.db"),
+            })
+            .collect();
+        if !accounts.is_empty() {
+            std::thread::spawn(move || {
+                let provider = Arc::new(isyncyou_dbus_status::StoreStatusProvider::new(accounts));
+                match isyncyou_dbus_status::serve_blocking(provider) {
+                    Ok(()) => {}
+                    Err(e) => eprintln!(
+                        "isyncyoud: Dolphin DBus status provider not started ({e}); \
+                         overlays disabled, sync unaffected"
+                    ),
+                }
+            });
+        }
+    }
+
     // A per-process capability token gates the destructive restore POST.
     let cap_token = mint_cap_token();
     let handler: Arc<dyn isyncyou_webui::RestoreHandler> =
