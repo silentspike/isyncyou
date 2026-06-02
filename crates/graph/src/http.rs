@@ -210,6 +210,28 @@ impl GraphClient {
             }),
         }
     }
+
+    /// Download a drive item's content by id (follows the redirect to the
+    /// pre-signed download URL).
+    pub fn download_content(&self, item_id: &str) -> Result<Vec<u8>, UploadError> {
+        let url = format!("{GRAPH}/me/drive/items/{item_id}/content");
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(UploadError::Http {
+                status,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            });
+        }
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| UploadError::Transport(e.to_string()))
+    }
 }
 
 fn json_or_err(resp: reqwest::blocking::Response) -> Result<serde_json::Value, UploadError> {
@@ -296,6 +318,14 @@ mod tests {
             .expect("created item should have an id")
             .to_string();
         eprintln!("uploaded {} bytes -> item {id}", data.len());
+
+        // download it back and verify the content round-trips byte-for-byte
+        let downloaded = client
+            .download_content(&id)
+            .expect("download should succeed");
+        assert_eq!(downloaded.len(), data.len(), "downloaded length mismatch");
+        assert_eq!(downloaded, data, "downloaded content must match the upload");
+        eprintln!("downloaded {} bytes, content matches", downloaded.len());
 
         client
             .delete_item(&id)
