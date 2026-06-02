@@ -377,6 +377,34 @@ impl GraphClient {
         )
     }
 
+    /// Create a OneNote page from its archived HTML (`POST /me/onenote/pages`,
+    /// `Content-Type: text/html`), in the default section; returns the created
+    /// page JSON. OneNote pages can't be re-created by a plain JSON POST like other
+    /// items, so restore re-posts the page HTML (plan §6).
+    pub fn create_onenote_page(&self, html: &[u8]) -> Result<serde_json::Value, UploadError> {
+        self.post_raw("/me/onenote/pages", "text/html", html.to_vec())
+    }
+
+    /// Delete a OneNote page by id (`DELETE /me/onenote/pages/{id}`). OneNote is
+    /// eventually consistent, so a freshly-created page may 404 until it propagates;
+    /// callers retry. Used for test cleanup on the throwaway account.
+    pub fn delete_onenote_page(&self, page_id: &str) -> Result<(), UploadError> {
+        let url = format!("{GRAPH}/me/onenote/pages/{page_id}");
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 202 | 204 => Ok(()),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(200).collect(),
+            }),
+        }
+    }
+
     /// DELETE an arbitrary Graph resource (used for restore-test cleanup on the
     /// throwaway account). `url` may be absolute or a `/me/...` path.
     pub fn delete_url(&self, url: &str) -> Result<(), UploadError> {
