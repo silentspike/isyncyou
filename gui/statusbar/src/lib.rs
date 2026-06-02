@@ -38,13 +38,16 @@ pub fn bundled_font_system() -> FontSystem {
     FontSystem::new_with_locale_and_db("en-US".to_string(), db)
 }
 
-/// Overall sync state shown in the status pill.
+/// Overall sync state shown in the status pill. `Synced` is the at-rest/idle
+/// state (nothing pending). `Throttled` and `Error` carry a reason that the
+/// status bar shows prominently so the user never blames the tool or their line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncState {
     Synced,
     Syncing,
     Throttled { wait_secs: u32 },
     Paused,
+    Error { reason: String },
 }
 
 /// One active transfer row.
@@ -308,6 +311,13 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
             col(0xcc, 0xcc, 0xcc),
             "Pausiert".to_string(),
         ),
+        SyncState::Error { .. } => (
+            col(0x45, 0x0a, 0x0a),
+            col(0xb9, 0x1c, 0x1c),
+            col(0xef, 0x44, 0x44),
+            col(0xfc, 0xa5, 0xa5),
+            "Fehler".to_string(),
+        ),
     };
     fill_rrect(&mut pm, pill_x, 16.0, pill_w, 28.0, 14.0, pill_bg);
     let mut sp = Paint::default();
@@ -326,6 +336,29 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
     );
     fill_circle(&mut pm, pill_x + 16.0, 30.0, 4.0, pill_dot);
     text(&mut pm, fs, sc, pill_x + 26.0, 22.0, 12.0, pill_fg, &label);
+
+    // prominent reason banner — only for states the user must understand at a
+    // glance, so they never suspect the tool or their connection (plan §13/§25).
+    let banner: Option<(Color, Color, String)> = match &view.state {
+        // the wait time is already on the pill ("Gedrosselt Ns"); the banner's job
+        // is reassurance — keep it short enough to never clip the strip.
+        SyncState::Throttled { .. } => Some((
+            col(0x44, 0x22, 0x06),
+            col(0xfb, 0xbf, 0x24),
+            "\u{26a0} Von Microsoft gedrosselt (429) \u{2014} nicht deine Leitung".to_string(),
+        )),
+        SyncState::Error { reason } => Some((
+            col(0x45, 0x0a, 0x0a),
+            col(0xfc, 0xa5, 0xa5),
+            format!("\u{26a0} {reason}"),
+        )),
+        _ => None,
+    };
+    if let Some((bg, fg, msg)) = banner {
+        let bw = WIDTH as f32 - 2.0 * pad;
+        fill_rrect(&mut pm, pad, 48.0, bw, 17.0, 6.0, bg);
+        text(&mut pm, fs, sc, pad + 9.0, 51.0, 11.0, fg, &msg);
+    }
 
     // transfer rows
     for (i, t) in view.transfers.iter().take(3).enumerate() {
@@ -540,6 +573,65 @@ mod tests {
         v.state = SyncState::Throttled { wait_secs: 14 };
         let pm = render(&v);
         assert_eq!((pm.width(), pm.height()), (WIDTH, HEIGHT));
+    }
+
+    /// RGB of the pixel at `(x, y)` in a rendered pixmap.
+    fn px(pm: &Pixmap, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * pm.width() + x) * 4) as usize;
+        [pm.data()[i], pm.data()[i + 1], pm.data()[i + 2]]
+    }
+
+    #[test]
+    fn error_state_renders_red() {
+        let mut v = sample();
+        v.state = SyncState::Error {
+            reason: "Token expired — sign in again".into(),
+        };
+        let pm = render(&v);
+        // the otherwise blue/green theme has no strong red; the error pill + banner do.
+        let reddish = pm
+            .data()
+            .chunks_exact(4)
+            .any(|p| p[0] > 120 && p[0] as u16 > p[1] as u16 * 2 && p[0] as u16 > p[2] as u16 * 2);
+        assert!(
+            reddish,
+            "error state must paint a prominent red pill/banner"
+        );
+    }
+
+    #[test]
+    fn reason_banner_only_for_throttled_and_error() {
+        // a point well inside the banner strip (y=48..65), clear of the pill/header
+        let (bx, by) = (40, 56);
+        let bg = {
+            let mut v = sample();
+            v.state = SyncState::Synced;
+            px(&render(&v), bx, by) // no banner: background shows through
+        };
+        for st in [
+            SyncState::Throttled { wait_secs: 9 },
+            SyncState::Error {
+                reason: "disk full".into(),
+            },
+        ] {
+            let mut v = sample();
+            v.state = st.clone();
+            assert_ne!(
+                px(&render(&v), bx, by),
+                bg,
+                "{st:?} must paint a reason banner"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_pauses_from_error() {
+        let mut v = sample();
+        v.state = SyncState::Error {
+            reason: "boom".into(),
+        };
+        assert!(apply(&mut v, Action::TogglePause));
+        assert_eq!(v.state, SyncState::Paused);
     }
 
     #[test]
