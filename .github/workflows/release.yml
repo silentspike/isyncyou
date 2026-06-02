@@ -59,6 +59,23 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN=1 dist/isyncyou-x86_64.AppImage --version
           ls -la dist
 
+      - name: Build Windows binaries (cross via mingw-w64)
+        run: |
+          # The CLI/daemon are cross-platform; the FUSE mount + unix-socket are
+          # cfg(unix)-gated out. Cross-compile with the mingw GNU toolchain.
+          sudo apt-get install -y -qq mingw-w64 zip
+          rustup target add x86_64-pc-windows-gnu
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+          cargo build --release --target x86_64-pc-windows-gnu \
+            -p isyncyou-cli -p isyncyou-daemon
+          mkdir -p dist/isyncyou-windows
+          cp target/x86_64-pc-windows-gnu/release/isyncyou.exe \
+             target/x86_64-pc-windows-gnu/release/isyncyoud.exe \
+             packaging/isyncyou.toml.sample packaging/README.md dist/isyncyou-windows/
+          (cd dist && zip -rq isyncyou-windows-x86_64.zip isyncyou-windows \
+             && sha256sum isyncyou-windows-x86_64.zip > isyncyou-windows-x86_64.zip.sha256)
+          ls -la dist
+
       - uses: actions/upload-artifact@v7
         with:
           name: isyncyou-binaries
@@ -67,6 +84,8 @@ jobs:
             dist/isyncyou-linux-x86_64.tar.gz.sha256
             dist/isyncyou-x86_64.AppImage
             dist/isyncyou-x86_64.AppImage.sha256
+            dist/isyncyou-windows-x86_64.zip
+            dist/isyncyou-windows-x86_64.zip.sha256
             dist/isyncyou/
 
       - name: Publish RC prerelease (on push to main)
@@ -81,6 +100,8 @@ jobs:
             dist/isyncyou-linux-x86_64.tar.gz.sha256
             dist/isyncyou-x86_64.AppImage
             dist/isyncyou-x86_64.AppImage.sha256
+            dist/isyncyou-windows-x86_64.zip
+            dist/isyncyou-windows-x86_64.zip.sha256
           body: |
             Automated RC build from `${{ github.sha }}`.
 
@@ -93,4 +114,6 @@ jobs:
             dist/isyncyou-linux-x86_64.tar.gz.sha256
             dist/isyncyou-x86_64.AppImage
             dist/isyncyou-x86_64.AppImage.sha256
+            dist/isyncyou-windows-x86_64.zip
+            dist/isyncyou-windows-x86_64.zip.sha256
           generate_release_notes: true
