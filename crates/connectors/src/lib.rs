@@ -19,6 +19,7 @@ pub mod mime;
 pub mod onedrive;
 pub mod onenote;
 pub mod restore;
+pub mod shared;
 pub mod todo;
 
 pub use archive::{
@@ -40,4 +41,5 @@ pub use restore::{
     restore_contact, restore_event, restore_message, restore_task, sanitize_contact,
     sanitize_event, sanitize_task, MessageCreator, Restorer,
 };
+pub use shared::{sync_shared_with_me, SharedReport};
 pub use todo::{incremental_sync_todo, TodoReport};
