@@ -1,4 +1,4 @@
-//! Chaos subset for the v0.1 acceptance gate (#61): the four data-loss-prone
+//! Chaos subset for the v0.1 acceptance gate (#19): the four data-loss-prone
 //! failure modes called out in the task — **inotify overflow**, **disk-full**,
 //! **`410 Gone`**, and a **process kill mid-upload** — exercised as named,
 //! adversarial variants beyond the single-criterion A-tests in `mvp.rs`.
