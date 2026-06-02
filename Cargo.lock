@@ -679,6 +679,10 @@ version = "0.1.0"
 [[package]]
 name = "isyncyou-doctor"
 version = "0.1.0"
+dependencies = [
+ "fs2",
+ "isyncyou-core",
+]
 
 [[package]]
 name = "isyncyou-doctor-lib"
