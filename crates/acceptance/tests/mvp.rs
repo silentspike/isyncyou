@@ -1,6 +1,7 @@
 //! v0.1 acceptance criteria A1–A10 (plan §19), verified against the real engine
-//! crates. Each test is one criterion. End-to-end acceptance (install → login →
-//! chaos matrix) additionally needs the assembled daemon + a display (#61).
+//! crates. Each test is one criterion. The consolidated evidence matrix (incl. the
+//! live test-account runs) lives in `docs/acceptance-v0.1.md`. The assembled
+//! daemon + GUI end-to-end walk additionally needs a display (tray work #16/#56).
 
 use isyncyou_change_source::watcher::{Coalescer, RawEvent};
 use isyncyou_core::conflict::{resolve, ConflictKind, ConflictPolicy};
@@ -228,7 +229,7 @@ fn a8_disk_full_is_red() {
 /// A9 — the trash/backup area is kept separate from the synced tree: config
 /// validation refuses an account whose archive_root equals its sync_root, so a
 /// trash/archive write can never land inside the sync root. (Runtime placement of
-/// the `.m365-trash` dir is exercised end-to-end with the daemon, #61.)
+/// the `.m365-trash` dir is exercised end-to-end with the daemon, tray work #16/#56.)
 #[test]
 fn a9_archive_separate_from_sync_root() {
     let mut a = AccountConfig {
