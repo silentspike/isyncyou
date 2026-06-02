@@ -8,6 +8,9 @@ set(CMAKE_AUTOMOC ON)
 # Extra CMake Modules + the standard KDE settings. KDECMakeSettings sets
 # BUILD_SHARED_LIBS ON and the library output directory that
 # kcoreaddons_add_plugin needs to build a shared MODULE (.so) plugin.
+# Target Qt6 before the KDE modules so the system Qt path query uses qtpaths6.
+set(QT_MAJOR_VERSION 6)
+
 find_package(ECM REQUIRED NO_MODULE)
 set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
 include(KDEInstallDirs)

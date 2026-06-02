@@ -18,6 +18,22 @@ from a short-TTL cache and issues an **asynchronous** DBus call, emitting
 overlay is shown — overlays are advisory; the ServiceMenu (one directory up) is
 the always-available fallback.
 
+## How end users get it
+
+End users do **not** compile this. Like the Nextcloud/Dropbox Dolphin overlays,
+it ships as a **native host package** built by the distro's build service against
+that distro's exact KF6 (KIO loads the plugin into Dolphin's own process, so it
+cannot ship inside the app's Flatpak/AppImage). Install the package and it works:
+
+```bash
+sudo zypper install isyncyou-dolphin   # openSUSE; built from ../isyncyou-dolphin.spec
+```
+
+The package installs `isyncyouoverlay.so` to `/usr/lib64/qt6/plugins/kf6/overlayicon/`
+and the ServiceMenu to `/usr/share/kio/servicemenus/`. The sections below are for
+**building from source** (what the package's `%build`/`%install` do, via the
+`../CMakeLists.txt` umbrella project).
+
 ## Build dependencies
 
 - **openSUSE:** `extra-cmake-modules kf6-kio-devel kf6-kcoreaddons-devel qt6-base-devel gcc-c++ cmake`
