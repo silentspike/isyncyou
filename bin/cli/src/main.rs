@@ -71,7 +71,7 @@ enum Command {
         #[arg(long)]
         account: String,
     },
-    /// Run one incremental OneDrive sync for an account.
+    /// Run one incremental OneDrive sync for an account (or keep syncing with --watch).
     Sync {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
@@ -80,6 +80,10 @@ enum Command {
         /// Graph access token (interim, until OAuth #40).
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
+        /// Keep running: watch the sync root and re-sync on local changes (and
+        /// poll the cloud periodically). Ctrl-C to stop.
+        #[arg(long)]
+        watch: bool,
     },
     /// Back up M365 services: index (delta) + archive bodies to the archive root.
     Backup {
@@ -233,7 +237,8 @@ fn run(command: Command) -> Result<(), String> {
             config,
             account,
             token,
-        } => cmd_sync(&config, &account, token),
+            watch,
+        } => cmd_sync(&config, &account, token, watch),
         Command::Backup {
             config,
             account,
@@ -574,14 +579,19 @@ fn unix_now() -> String {
     )
 }
 
-fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), String> {
-    let cfg = load_config(config)?;
-    let token = resolve_token(&cfg, account, token, false)?;
-    let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
-    let mut map = MappingTable::new();
-    let mut client = isyncyou_graph::GraphClient::new(token);
+/// One full bidirectional sync pass for an account: pull the remote delta into
+/// the store, materialize it to disk, then mirror local creates/modifies/deletes
+/// up to the cloud (each guarded as appropriate). Shared by the one-shot and the
+/// `--watch` paths.
+fn sync_pass(
+    cfg: &Config,
+    account: &str,
+    store: &Store,
+    client: &mut isyncyou_graph::GraphClient,
+    map: &mut MappingTable,
+) -> Result<(), String> {
     let now = unix_now();
-    let report = connectors::incremental_sync(&mut client, &store, &mut map, account, &now)
+    let report = connectors::incremental_sync(client, store, map, account, &now)
         .map_err(|e| e.to_string())?;
     println!(
         "sync done: {} upserted, {} deleted, {} skipped{}",
@@ -606,7 +616,7 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
     let trash_root = acc.archive_root.join(".isyncyou-trash");
     let dg = cfg.sync.delete_guard.clone();
 
-    let mat = connectors::materialize_downloads(&store, &client, account, &sync_root)
+    let mat = connectors::materialize_downloads(store, client, account, &sync_root)
         .map_err(|e| e.to_string())?;
     println!(
         "materialized: {} downloaded, {} folders, {} failed -> {}",
@@ -619,8 +629,8 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
     // Mirror remote deletions locally — move removed files into the trash (kept
     // outside the sync root), but only after the mass-delete guard approves the
     // batch, so a runaway remote wipe can't silently empty the local folder.
-    let pending = connectors::pending_local_deletes(&store, account, &sync_root)
-        .map_err(|e| e.to_string())?;
+    let pending =
+        connectors::pending_local_deletes(store, account, &sync_root).map_err(|e| e.to_string())?;
     if !pending.is_empty() {
         let guard = DeleteGuard {
             max_absolute: dg.max_absolute,
@@ -654,24 +664,22 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
 
     // Push brand-new local files up to the cloud (the local→remote create half).
     let creates =
-        connectors::scan_local_creates(&store, account, &sync_root).map_err(|e| e.to_string())?;
+        connectors::scan_local_creates(store, account, &sync_root).map_err(|e| e.to_string())?;
     if !creates.is_empty() {
-        let uploaded = connectors::push_local_creates(
-            &client, &store, &mut map, account, &sync_root, &creates,
-        )
-        .map_err(|e| e.to_string())?;
+        let uploaded =
+            connectors::push_local_creates(client, store, map, account, &sync_root, &creates)
+                .map_err(|e| e.to_string())?;
         println!("uploaded {uploaded} new local file(s) to the cloud");
     }
 
     // Push locally-modified files up, guarded by an If-Match etag check so a
     // concurrent cloud change is reported as a conflict, never silently clobbered.
     let modifies =
-        connectors::scan_local_modifies(&store, account, &sync_root).map_err(|e| e.to_string())?;
+        connectors::scan_local_modifies(store, account, &sync_root).map_err(|e| e.to_string())?;
     if !modifies.is_empty() {
-        let mr = connectors::apply_local_modifies(
-            &client, &store, &mut map, account, &sync_root, &modifies,
-        )
-        .map_err(|e| e.to_string())?;
+        let mr =
+            connectors::apply_local_modifies(client, store, map, account, &sync_root, &modifies)
+                .map_err(|e| e.to_string())?;
         println!(
             "modified: {} uploaded, {} conflict(s) held back, {} failed",
             mr.uploaded, mr.conflicts, mr.failed
@@ -681,7 +689,7 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
     // Mirror local deletions to the cloud — a materialized file the user removed
     // is deleted remotely, but only after the mass-delete guard approves it.
     let local_deletes =
-        connectors::scan_local_deletes(&store, account, &sync_root).map_err(|e| e.to_string())?;
+        connectors::scan_local_deletes(store, account, &sync_root).map_err(|e| e.to_string())?;
     if !local_deletes.is_empty() {
         let guard = DeleteGuard {
             max_absolute: dg.max_absolute,
@@ -701,7 +709,7 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
             GuardVerdict::Proceed => {
                 let mut deleted = 0;
                 for id in &local_deletes {
-                    connectors::push_delete(&client, &store, account, id, &now)
+                    connectors::push_delete(client, store, account, id, &now)
                         .map_err(|e| e.to_string())?;
                     deleted += 1;
                 }
@@ -710,6 +718,62 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Run a sync for an account: one pass, or (with `watch`) a continuous loop that
+/// re-syncs on local filesystem changes and polls the cloud periodically.
+fn cmd_sync(
+    config: &Path,
+    account: &str,
+    token: Option<String>,
+    watch: bool,
+) -> Result<(), String> {
+    // One pass: resolve a fresh token (a cached login auto-refreshes), open the
+    // store, and run the bidirectional pass. Re-resolving per pass keeps a long
+    // `--watch` session authenticated.
+    let run_pass = || -> Result<(), String> {
+        let cfg = load_config(config)?;
+        let tok = resolve_token(&cfg, account, token.clone(), false)?;
+        let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
+        let mut map = MappingTable::new();
+        let mut client = isyncyou_graph::GraphClient::new(tok);
+        sync_pass(&cfg, account, &store, &mut client, &mut map)
+    };
+
+    run_pass()?;
+    if !watch {
+        return Ok(());
+    }
+
+    // Watch mode: react to local changes immediately, and re-sync at least every
+    // poll interval so remote changes (which inotify can't see) are picked up by
+    // the periodic reconcile — the source of truth.
+    let cfg = load_config(config)?;
+    let sync_root = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .map(|a| a.sync_root.clone())
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let watcher = isyncyou_change_source::FsWatcher::start(&sync_root)
+        .map_err(|e| format!("cannot watch {}: {e}", sync_root.display()))?;
+    println!(
+        "watching {} — re-syncing on changes (Ctrl-C to stop)…",
+        sync_root.display()
+    );
+    loop {
+        let changes = watcher.poll(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(2),
+        );
+        if !changes.is_empty() {
+            println!("local change detected ({} item(s))", changes.len());
+        }
+        // a transient failure (e.g. a network blip) must not kill the watch.
+        if let Err(e) = run_pass() {
+            eprintln!("sync pass failed (will retry): {e}");
+        }
+    }
 }
 
 /// Resolve which accounts a run targets (shared by backup + search).
@@ -1335,9 +1399,22 @@ mod tests {
             Command::Sync {
                 config: "c.toml".into(),
                 account: "primary".into(),
-                token: Some("TOK".into())
+                token: Some("TOK".into()),
+                watch: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_sync_watch_flag() {
+        let c = parse(&["isyncyou", "sync", "--account", "a", "--watch"]).unwrap();
+        match c.command {
+            Command::Sync { watch, account, .. } => {
+                assert!(watch);
+                assert_eq!(account, "a");
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
     }
 
     #[test]

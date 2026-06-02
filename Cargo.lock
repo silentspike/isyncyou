@@ -919,6 +919,7 @@ name = "isyncyou-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "isyncyou-change-source",
  "isyncyou-connectors",
  "isyncyou-core",
  "isyncyou-graph",
