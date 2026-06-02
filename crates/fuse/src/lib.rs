@@ -14,8 +14,8 @@
 //! [`Store`]: isyncyou_store::Store
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    Request,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use isyncyou_store::Item;
 use std::collections::HashMap;
@@ -25,6 +25,12 @@ use std::time::{Duration, UNIX_EPOCH};
 /// Fetches a tracked item's full content by its remote id (the cloud download).
 pub trait Hydrator {
     fn fetch(&self, remote_id: &str) -> Result<Vec<u8>, String>;
+}
+
+/// Uploads a tracked item's new content (the cloud write-back). Injected when the
+/// filesystem is mounted read-write; without it the mount is read-only.
+pub trait Uploader {
+    fn upload(&self, remote_id: &str, data: &[u8]) -> Result<(), String>;
 }
 
 /// The root directory's inode (FUSE convention).
@@ -110,6 +116,13 @@ impl Tree {
         self.nodes.get(&ino)
     }
 
+    /// Update a node's reported size (after a write-back upload).
+    pub fn set_size(&mut self, ino: u64, size: u64) {
+        if let Some(n) = self.nodes.get_mut(&ino) {
+            n.size = size;
+        }
+    }
+
     /// Find a child of `parent` by name.
     pub fn lookup(&self, parent: u64, name: &str) -> Option<&Node> {
         self.children
@@ -158,7 +171,12 @@ fn file_attr(node: &Node, uid: u32, gid: u32) -> FileAttr {
 pub struct PlaceholderFs {
     tree: Tree,
     hydrator: Box<dyn Hydrator + Send>,
+    /// Set when mounted read-write; uploads modified files on release.
+    uploader: Option<Box<dyn Uploader + Send>>,
+    /// Per-inode content cache, doubling as the write buffer for dirty inodes.
     cache: HashMap<u64, Vec<u8>>,
+    /// Inodes written since their last upload.
+    dirty: std::collections::HashSet<u64>,
     uid: u32,
     gid: u32,
 }
@@ -168,17 +186,27 @@ impl PlaceholderFs {
         PlaceholderFs {
             tree,
             hydrator,
+            uploader: None,
             cache: HashMap::new(),
+            dirty: std::collections::HashSet::new(),
             // SAFETY: getuid/getgid are always-succeed syscalls with no preconditions.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
     }
 
-    /// Read up to `size` bytes at `offset` from a file inode, hydrating (downloading)
-    /// the whole content on first access and caching it. Returns a POSIX errno on
-    /// failure (`ENOENT` unknown inode, `EISDIR` a directory, `EIO` a fetch error).
-    pub fn read_slice(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+    /// Enable write-back: edits to hydrated files are uploaded on release.
+    pub fn with_uploader(mut self, uploader: Box<dyn Uploader + Send>) -> Self {
+        self.uploader = Some(uploader);
+        self
+    }
+
+    fn is_rw(&self) -> bool {
+        self.uploader.is_some()
+    }
+
+    /// Hydrate `ino`'s content into the cache if not present; returns its remote id.
+    fn ensure_cached(&mut self, ino: u64) -> Result<String, i32> {
         let (is_dir, rid) = {
             let n = self.tree.node(ino).ok_or(libc::ENOENT)?;
             (n.is_dir, n.remote_id.clone())
@@ -190,22 +218,81 @@ impl PlaceholderFs {
             let data = self.hydrator.fetch(&rid).map_err(|_| libc::EIO)?;
             self.cache.insert(ino, data);
         }
+        Ok(rid)
+    }
+
+    /// Read up to `size` bytes at `offset` from a file inode, hydrating (downloading)
+    /// the whole content on first access and caching it. Returns a POSIX errno on
+    /// failure (`ENOENT` unknown inode, `EISDIR` a directory, `EIO` a fetch error).
+    pub fn read_slice(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        self.ensure_cached(ino)?;
         let data = &self.cache[&ino];
         let start = (offset.max(0) as usize).min(data.len());
         let end = start.saturating_add(size as usize).min(data.len());
         Ok(data[start..end].to_vec())
     }
+
+    /// Write `data` at `offset` into a file's cached buffer (extending it as needed)
+    /// and mark the inode dirty. `EROFS` if mounted read-only.
+    pub fn write_at(&mut self, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
+        if !self.is_rw() {
+            return Err(libc::EROFS);
+        }
+        self.ensure_cached(ino)?;
+        let buf = self.cache.get_mut(&ino).unwrap();
+        let off = offset.max(0) as usize;
+        if buf.len() < off + data.len() {
+            buf.resize(off + data.len(), 0);
+        }
+        buf[off..off + data.len()].copy_from_slice(data);
+        self.dirty.insert(ino);
+        Ok(data.len() as u32)
+    }
+
+    /// Truncate/extend a file's cached buffer to `size` and mark it dirty.
+    pub fn truncate(&mut self, ino: u64, size: u64) -> Result<(), i32> {
+        if !self.is_rw() {
+            return Err(libc::EROFS);
+        }
+        // size 0 needs no download; otherwise keep the existing bytes
+        if size == 0 {
+            self.cache.insert(ino, Vec::new());
+        } else {
+            self.ensure_cached(ino)?;
+            self.cache.get_mut(&ino).unwrap().resize(size as usize, 0);
+        }
+        self.dirty.insert(ino);
+        Ok(())
+    }
+
+    /// Upload a dirty inode's buffer to the cloud and update its tracked size.
+    /// A no-op for clean inodes. Called on release/flush.
+    pub fn flush_ino(&mut self, ino: u64) -> Result<(), i32> {
+        if !self.dirty.contains(&ino) {
+            return Ok(());
+        }
+        let rid = self.tree.node(ino).ok_or(libc::ENOENT)?.remote_id.clone();
+        let data = self.cache.get(&ino).cloned().unwrap_or_default();
+        let up = self.uploader.as_ref().ok_or(libc::EROFS)?;
+        up.upload(&rid, &data).map_err(|_| libc::EIO)?;
+        self.dirty.remove(&ino);
+        self.tree.set_size(ino, data.len() as u64);
+        Ok(())
+    }
 }
 
-/// Mount `fs` read-only at `mountpoint` and serve until unmounted
-/// (`fusermount -u <mountpoint>` or Ctrl-C). Blocks for the mount's lifetime.
+/// Mount `fs` at `mountpoint` and serve until unmounted (`fusermount -u
+/// <mountpoint>` or Ctrl-C). Read-only unless the fs has an uploader (write-back).
+/// Blocks for the mount's lifetime.
 pub fn mount(fs: PlaceholderFs, mountpoint: &std::path::Path) -> std::io::Result<()> {
     use fuser::MountOption;
-    let opts = [
-        MountOption::RO,
+    let mut opts = vec![
         MountOption::FSName("isyncyou".to_string()),
         MountOption::Subtype("onedrive".to_string()),
     ];
+    if !fs.is_rw() {
+        opts.push(MountOption::RO);
+    }
     fuser::mount2(fs, mountpoint, &opts)
 }
 
@@ -226,6 +313,87 @@ impl Filesystem for PlaceholderFs {
 
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
         reply.opened(0, 0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        match self.write_at(ino, offset, data) {
+            Ok(n) => reply.written(n),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        // we only honor truncate/extend (size); other attrs are accepted as no-ops
+        if let Some(sz) = size {
+            if let Err(e) = self.truncate(ino, sz) {
+                reply.error(e);
+                return;
+            }
+        }
+        match self.tree.node(ino) {
+            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid)),
+            None => reply.error(libc::ENOENT),
+        }
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        match self.flush_ino(ino) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.flush_ino(ino) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn read(
@@ -359,5 +527,61 @@ mod tests {
         // a directory is EISDIR, an unknown inode ENOENT
         assert_eq!(fs.read_slice(ROOT_INO, 0, 1), Err(libc::EISDIR));
         assert_eq!(fs.read_slice(999, 0, 1), Err(libc::ENOENT));
+    }
+
+    type LastUpload = std::sync::Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
+    struct RecordingUploader {
+        last: LastUpload,
+    }
+    impl Uploader for RecordingUploader {
+        fn upload(&self, remote_id: &str, data: &[u8]) -> Result<(), String> {
+            *self.last.lock().unwrap() = Some((remote_id.to_string(), data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_back_uploads_dirty_buffer_on_flush() {
+        let items = vec![file("f1", None, "data.bin", 11)];
+        let tree = Tree::from_items(&items);
+        let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+        let rec = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hy = Box::new(CountingHydrator {
+            calls: std::cell::RefCell::new(0),
+            data: b"hello world".to_vec(),
+        });
+        let mut fs = PlaceholderFs::new(tree, hy)
+            .with_uploader(Box::new(RecordingUploader { last: rec.clone() }));
+        // `> file` pattern: truncate to 0, then write the new content
+        fs.truncate(ino, 0).unwrap();
+        assert_eq!(fs.write_at(ino, 0, b"updated").unwrap(), 7);
+        fs.flush_ino(ino).unwrap();
+        // the new content was uploaded for the right remote id
+        let (rid, data) = rec.lock().unwrap().clone().unwrap();
+        assert_eq!(rid, "f1");
+        assert_eq!(data, b"updated");
+        // read-back sees the new content and the size is updated
+        assert_eq!(fs.read_slice(ino, 0, 100).unwrap(), b"updated");
+        assert_eq!(fs.tree.node(ino).unwrap().size, 7);
+        // flushing again with nothing dirty is a no-op
+        *rec.lock().unwrap() = None;
+        fs.flush_ino(ino).unwrap();
+        assert!(rec.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn read_only_mount_rejects_writes() {
+        let items = vec![file("f1", None, "x", 3)];
+        let tree = Tree::from_items(&items);
+        let ino = tree.lookup(ROOT_INO, "x").unwrap().ino;
+        let mut fs = PlaceholderFs::new(
+            tree,
+            Box::new(CountingHydrator {
+                calls: std::cell::RefCell::new(0),
+                data: b"abc".to_vec(),
+            }),
+        );
+        assert_eq!(fs.write_at(ino, 0, b"z"), Err(libc::EROFS));
+        assert_eq!(fs.truncate(ino, 0), Err(libc::EROFS));
     }
 }
