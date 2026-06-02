@@ -11,6 +11,8 @@ use isyncyou_graph::{run_delta, DeltaCursor, DeltaError, Transport};
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store, StoreError};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 const ROOT_DELTA: &str = "https://graph.microsoft.com/v1.0/me/drive/root/delta";
 const SERVICE: &str = "onedrive";
@@ -197,6 +199,124 @@ pub fn push_delete<W: RemoteWriter>(
     Ok(())
 }
 
+/// Fetches a drive item's content bytes. Abstracted so materialization is
+/// unit-testable with a mock and live-tested with the real client.
+pub trait Downloader {
+    fn download(&self, remote_id: &str) -> Result<Vec<u8>, String>;
+}
+
+#[cfg(feature = "http")]
+impl Downloader for isyncyou_graph::GraphClient {
+    fn download(&self, remote_id: &str) -> Result<Vec<u8>, String> {
+        self.download_content(remote_id).map_err(|e| e.to_string())
+    }
+}
+
+/// What one materialization pass wrote to disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaterializeReport {
+    pub downloaded: usize,
+    pub dirs_created: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// Guard against a malformed parent cycle when walking to the drive root.
+const MAX_PATH_DEPTH: usize = 256;
+
+/// Build an item's path **relative to the sync root** by walking `parent_remote_id`
+/// up through `by_id`, collecting each ancestor's mapped local name. Stops at the
+/// drive root (whose id is absent from the store). `None` if an item on the chain
+/// has no local name or a cycle is hit.
+fn local_rel_path(by_id: &HashMap<&str, &Item>, it: &Item) -> Option<PathBuf> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut cur = it;
+    for _ in 0..MAX_PATH_DEPTH {
+        parts.push(cur.local_path.as_deref()?);
+        match cur.parent_remote_id.as_deref() {
+            Some(pid) => match by_id.get(pid) {
+                Some(parent) => cur = parent,
+                None => break, // parent is the drive root → done
+            },
+            None => break,
+        }
+    }
+    parts.reverse();
+    Some(parts.iter().collect())
+}
+
+/// Atomic write: temp file in the same dir + rename, so a reader never sees a
+/// partial file and an interrupted download is safe to restart.
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.isync-tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Materialize **remote-dirty** OneDrive items to disk under `sync_root`: create
+/// folders, download file content, write it atomically, and mark each item
+/// `clean` so a re-run skips it. This is the missing half of the remote→local
+/// sync (ingest records metadata; this writes the actual files).
+///
+/// v1 scope: downloads + folder creation only. Local deletion of removed items
+/// (with the mass-delete guard) and quickXorHash-based skip are follow-ups; the
+/// `clean` state-marking already prevents redundant re-downloads.
+pub fn materialize_downloads<D: Downloader>(
+    store: &Store,
+    downloader: &D,
+    account: &str,
+    sync_root: &Path,
+) -> Result<MaterializeReport, SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut report = MaterializeReport::default();
+
+    // Folders first (create the tree), then files, so a file's parent exists.
+    for pass_folders in [true, false] {
+        for it in &items {
+            let is_folder = it.item_type == "folder";
+            if is_folder != pass_folders || it.sync_state != "remote_dirty" {
+                continue;
+            }
+            let rel = match local_rel_path(&by_id, it) {
+                Some(p) => p,
+                None => {
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            let full = sync_root.join(&rel);
+            if is_folder {
+                match std::fs::create_dir_all(&full) {
+                    Ok(()) => {
+                        store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                        report.dirs_created += 1;
+                    }
+                    Err(_) => report.failed += 1,
+                }
+            } else {
+                if let Some(parent) = full.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match downloader.download(&it.remote_id) {
+                    Ok(bytes) => match atomic_write(&full, &bytes) {
+                        Ok(()) => {
+                            store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                            report.downloaded += 1;
+                        }
+                        Err(_) => report.failed += 1,
+                    },
+                    Err(_) => report.failed += 1,
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +485,88 @@ mod tests {
             .is_some());
     }
 
+    /// Returns canned content per remote id; errors for unknown ids.
+    struct MockDownloader(HashMap<String, Vec<u8>>);
+    impl Downloader for MockDownloader {
+        fn download(&self, remote_id: &str) -> Result<Vec<u8>, String> {
+            self.0
+                .get(remote_id)
+                .cloned()
+                .ok_or_else(|| format!("no content for {remote_id}"))
+        }
+    }
+
+    #[test]
+    fn materialize_writes_remote_dirty_files_then_marks_clean() {
+        let store = Store::open_in_memory().unwrap();
+        // a folder under the (absent) drive root, and a file under that folder
+        let mut folder = Item::new("acc", SERVICE, "F1", "Photos", "folder");
+        folder.parent_remote_id = Some("root1".into()); // root id is not in the store
+        folder.local_path = Some("Photos".into());
+        folder.sync_state = "remote_dirty".into();
+        store.upsert_item(&folder).unwrap();
+        let mut file = Item::new("acc", SERVICE, "a1", "IMG.jpg", "file");
+        file.parent_remote_id = Some("F1".into());
+        file.local_path = Some("IMG.jpg".into());
+        file.sync_state = "remote_dirty".into();
+        store.upsert_item(&file).unwrap();
+
+        let dl = MockDownloader(
+            [("a1".to_string(), b"JPEGDATA".to_vec())]
+                .into_iter()
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let report = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        assert_eq!(report.downloaded, 1);
+        assert_eq!(report.dirs_created, 1);
+        assert_eq!(report.failed, 0);
+
+        // the file is on disk under Photos/ with the right content
+        let path = dir.path().join("Photos").join("IMG.jpg");
+        assert_eq!(std::fs::read(&path).unwrap(), b"JPEGDATA");
+        // no stray temp file left in the folder
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("Photos"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != "IMG.jpg")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write left a temp file: {leftovers:?}"
+        );
+        // both items are now clean
+        for id in ["a1", "F1"] {
+            assert_eq!(
+                store
+                    .get_item("acc", SERVICE, id)
+                    .unwrap()
+                    .unwrap()
+                    .sync_state,
+                "clean"
+            );
+        }
+
+        // a second pass downloads nothing (everything is clean)
+        let r2 = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        assert_eq!(r2.downloaded, 0);
+        assert_eq!(r2.dirs_created, 0);
+    }
+
+    #[test]
+    fn materialize_counts_unresolvable_item_as_failed_not_panic() {
+        let store = Store::open_in_memory().unwrap();
+        let mut f = Item::new("acc", SERVICE, "x", "x", "file");
+        f.sync_state = "remote_dirty".into();
+        f.local_path = None; // no local name → path can't be built
+        store.upsert_item(&f).unwrap();
+        let dl = MockDownloader(HashMap::new());
+        let dir = tempfile::tempdir().unwrap();
+        let r = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        assert_eq!(r.failed, 1);
+        assert_eq!(r.downloaded, 0);
+    }
+
     /// Live local→remote: upload via the connector + GraphClient, confirm the
     /// store has a clean row, then push-delete (removes from OneDrive + tombstones).
     #[cfg(feature = "http")]
@@ -443,5 +645,68 @@ mod tests {
             "live sync: upserted={} deleted={} skipped={}",
             report.upserted, report.deleted, report.skipped
         );
+    }
+
+    /// Live remote→local: delta-sync the real drive, then materialize it to a temp
+    /// sync root and confirm at least one file landed on disk with content.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_materialize_downloads() {
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!("skipping live_materialize_downloads: ISYNCYOU_TEST_TOKEN not set");
+                return;
+            }
+        };
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        incremental_sync(&mut client, &store, &mut map, "backupslave", "t")
+            .expect("live sync should succeed");
+        let dir = tempfile::tempdir().unwrap();
+        let report = materialize_downloads(&store, &client, "backupslave", dir.path())
+            .expect("materialize should succeed");
+        eprintln!(
+            "live materialize: downloaded={} dirs={} failed={}",
+            report.downloaded, report.dirs_created, report.failed
+        );
+        // find a materialized file and confirm it has content
+        let mut found = false;
+        for entry in walkdir(dir.path()) {
+            if entry.is_file()
+                && std::fs::metadata(&entry)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found || report.downloaded == 0,
+            "files were downloaded but none landed on disk with content"
+        );
+    }
+
+    /// Tiny recursive file walk for the live test (avoids a walkdir dependency).
+    #[cfg(feature = "http")]
+    fn walkdir(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
     }
 }
