@@ -279,10 +279,26 @@ impl Router {
             Err(e) => return e,
         };
         let account = req.q("account").unwrap_or_default();
-        match store.items_by_service(account, service) {
+        // Page the listing so a large mailbox is never loaded all at once.
+        let limit = clamp_limit(req.q("limit"));
+        let offset = req
+            .q("offset")
+            .and_then(|o| o.parse::<u32>().ok())
+            .unwrap_or(0);
+        let total = match store.count_by_service(account, service) {
+            Ok(t) => t,
+            Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+        };
+        match store.items_by_service_page(account, service, limit, offset) {
             Ok(items) => {
                 let arr: Vec<Value> = items.iter().map(item_json).collect();
-                ApiResponse::ok_json(&json!({ "items": arr, "count": arr.len() }))
+                ApiResponse::ok_json(&json!({
+                    "items": arr,
+                    "count": arr.len(),
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                }))
             }
             Err(e) => ApiResponse::error(500, &format!("query: {e}")),
         }
@@ -432,6 +448,19 @@ impl Router {
         }
         let arr: Vec<Value> = hits.iter().map(item_json).collect();
         ApiResponse::ok_json(&json!({ "query": q, "hits": arr, "count": arr.len() }))
+    }
+}
+
+/// Default and maximum page size for the items listing.
+const DEFAULT_LIMIT: u32 = 200;
+const MAX_LIMIT: u32 = 1000;
+
+/// Parse a `?limit` query value into a sane page size: default when absent/0/bad,
+/// capped so a client can't ask for an unbounded page.
+fn clamp_limit(raw: Option<&str>) -> u32 {
+    match raw.and_then(|l| l.parse::<u32>().ok()) {
+        Some(0) | None => DEFAULT_LIMIT,
+        Some(n) => n.min(MAX_LIMIT),
     }
 }
 
@@ -597,6 +626,16 @@ mod tests {
     }
 
     #[test]
+    fn index_wires_pagination() {
+        for needle in ["loadMore", "&offset=", "&limit=", "more-btn"] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "web UI is missing '{needle}' (pagination wiring)"
+            );
+        }
+    }
+
+    #[test]
     fn index_wires_overview_dashboard() {
         // the embedded UI must call the overview endpoints and expose the panel,
         // so the front-end wiring can't silently regress.
@@ -624,12 +663,92 @@ mod tests {
     }
 
     #[test]
+    fn items_paginate_with_limit_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            // five mail messages; stable order is by (item_type, name)
+            for n in ["a", "b", "c", "d", "e"] {
+                store
+                    .upsert_item(&Item::new("a", "mail", n, format!("msg {n}"), "message"))
+                    .unwrap();
+            }
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+
+        // page 1: limit 2, offset 0 -> first two by name ("msg a", "msg b")
+        let p1 = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=mail&limit=2&offset=0",
+        )));
+        assert_eq!(p1["total"], 5);
+        assert_eq!(p1["count"], 2);
+        assert_eq!(p1["limit"], 2);
+        let names1: Vec<&str> = p1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names1, ["msg a", "msg b"]);
+
+        // page 2: offset 2 -> next two
+        let p2 = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=mail&limit=2&offset=2",
+        )));
+        assert_eq!(p2["total"], 5);
+        assert_eq!(p2["count"], 2);
+        let names2: Vec<&str> = p2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names2, ["msg c", "msg d"]);
+
+        // last page: offset 4 -> one remaining
+        let p3 = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=mail&limit=2&offset=4",
+        )));
+        assert_eq!(p3["count"], 1);
+        assert_eq!(p3["items"][0]["name"], "msg e");
+
+        // an over-large limit is capped; a bad limit falls back to the default
+        assert_eq!(
+            body_json(&router.route(&ApiRequest::get(
+                "/api/v1/items?account=a&service=mail&limit=99999"
+            )))["limit"],
+            1000
+        );
+        assert_eq!(
+            body_json(&router.route(&ApiRequest::get(
+                "/api/v1/items?account=a&service=mail&limit=xyz"
+            )))["limit"],
+            200
+        );
+    }
+
+    #[test]
     fn items_lists_a_service() {
         let (_d, router) = setup();
         let resp = router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail"));
         assert_eq!(resp.status, 200);
         let v = body_json(&resp);
         assert_eq!(v["count"], 2);
+        // pagination metadata: both items fit in the default page
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["offset"], 0);
+        assert_eq!(v["limit"], 200);
         // first by (item_type, name): message "Invoice March" before "Lunch plans"
         let names: Vec<&str> = v["items"]
             .as_array()

@@ -56,6 +56,10 @@
       <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th></tr></thead>
         <tbody id="rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
       </table>
+      <div id="more" hidden style="margin-top:14px">
+        <button id="more-btn" onclick="loadMore()">Load more</button>
+        <span class="muted" id="count"></span>
+      </div>
     </div>
   </section>
 </main>
@@ -65,10 +69,11 @@ let account = null, service = "mail";
 
 async function api(path) { const r = await fetch(path); return r.json(); }
 
-function render(items) {
-  const tb = document.getElementById("rows");
-  if (!items.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">No items.</td></tr>'; return; }
-  tb.innerHTML = items.map(it => {
+const PAGE = 50;
+let pageOffset = 0, pageTotal = 0;
+
+function rowsHtml(items) {
+  return items.map(it => {
     const name = escapeHtml(it.name);
     const q = `account=${encodeURIComponent(account)}&service=${encodeURIComponent(it.service)}&id=${encodeURIComponent(it.remote_id)}`;
     // the name opens the rendered (safe) viewer; a separate link offers raw source
@@ -87,15 +92,38 @@ function render(items) {
 }
 function escapeHtml(s) { return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
+const EMPTY_ROW = '<tr><td colspan="4" class="muted">No items.</td></tr>';
+
+function updateMore(shown) {
+  document.getElementById("count").textContent = `${shown} of ${pageTotal}`;
+  document.getElementById("more").hidden = pageTotal === 0;
+  document.getElementById("more-btn").hidden = shown >= pageTotal;
+}
+
 async function loadItems() {
-  const d = await api(`/api/v1/items?account=${encodeURIComponent(account)}&service=${service}`);
-  render(d.items || []);
+  pageOffset = 0;
+  const d = await api(`/api/v1/items?account=${encodeURIComponent(account)}&service=${service}&limit=${PAGE}&offset=0`);
+  const items = d.items || [];
+  pageTotal = d.total ?? items.length;
+  document.getElementById("rows").innerHTML = items.length ? rowsHtml(items) : EMPTY_ROW;
+  pageOffset = items.length;
+  updateMore(pageOffset);
+}
+async function loadMore() {
+  const d = await api(`/api/v1/items?account=${encodeURIComponent(account)}&service=${service}&limit=${PAGE}&offset=${pageOffset}`);
+  const items = d.items || [];
+  document.getElementById("rows").insertAdjacentHTML("beforeend", rowsHtml(items));
+  pageOffset += items.length;
+  pageTotal = d.total ?? pageTotal;
+  updateMore(pageOffset);
 }
 async function doSearch() {
   const q = document.getElementById("q").value.trim();
   if (!q) return loadItems();
   const d = await api(`/api/v1/search?account=${encodeURIComponent(account)}&q=${encodeURIComponent(q)}`);
-  render(d.hits || []);
+  const hits = d.hits || [];
+  document.getElementById("rows").innerHTML = hits.length ? rowsHtml(hits) : EMPTY_ROW;
+  document.getElementById("more").hidden = true; // search results aren't paginated
 }
 function pickService(s) {
   service = s;
