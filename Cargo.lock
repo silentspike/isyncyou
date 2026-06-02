@@ -925,6 +925,7 @@ version = "0.1.0"
 name = "isyncyou-change-source"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "notify",
  "tempfile",
 ]
