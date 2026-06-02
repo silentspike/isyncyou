@@ -1,6 +1,6 @@
 [package]
 name = "isyncyou-daemon"
-description = "iSyncYou engine daemon (graph/sync/store)."
+description = "iSyncYou engine daemon: serves the local web UI/API (graph/sync/store)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,3 +12,6 @@ name = "isyncyoud"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+isyncyou-core = { path = "../../crates/core" }
+isyncyou-webui = { path = "../../gui/webui" }
