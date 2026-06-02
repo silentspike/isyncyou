@@ -268,14 +268,31 @@ impl Router {
             Err(e) => return e,
         };
         let account = req.q("account").unwrap_or_default();
-        match store.search_names(account, q) {
-            Ok(hits) => {
-                let arr: Vec<Value> = hits.iter().map(item_json).collect();
-                ApiResponse::ok_json(&json!({ "query": q, "hits": arr, "count": arr.len() }))
-            }
+        // names (subjects/titles/filenames) ...
+        let mut hits = match store.search_names(account, q) {
+            Ok(h) => h,
             // An invalid FTS expression is a client error, not a server fault.
-            Err(e) => ApiResponse::error(400, &format!("invalid query: {e}")),
+            Err(e) => return ApiResponse::error(400, &format!("invalid query: {e}")),
+        };
+        // ... merged with indexed bodies (e.g. mail text), de-duplicated.
+        let mut seen: std::collections::HashSet<(String, String)> = hits
+            .iter()
+            .map(|i| (i.service.clone(), i.remote_id.clone()))
+            .collect();
+        match store.search_bodies(account, q) {
+            Ok(body_hits) => {
+                for (service, remote_id) in body_hits {
+                    if seen.insert((service.clone(), remote_id.clone())) {
+                        if let Ok(Some(it)) = store.get_item(account, &service, &remote_id) {
+                            hits.push(it);
+                        }
+                    }
+                }
+            }
+            Err(e) => return ApiResponse::error(400, &format!("invalid query: {e}")),
         }
+        let arr: Vec<Value> = hits.iter().map(item_json).collect();
+        ApiResponse::ok_json(&json!({ "query": q, "hits": arr, "count": arr.len() }))
     }
 }
 
@@ -420,6 +437,36 @@ mod tests {
         let resp = router.route(&ApiRequest::get("/api/v1/search?account=a&q=invoice"));
         assert_eq!(resp.status, 200);
         let v = body_json(&resp);
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["hits"][0]["remote_id"], "m1");
+    }
+
+    #[test]
+    fn search_includes_indexed_body_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .upsert_item(&Item::new("a", "mail", "m1", "Receipt", "message"))
+                .unwrap();
+            store
+                .index_body("a", "mail", "m1", "the warranty covers two years")
+                .unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        // a term only in the mail body is found via the body index
+        let v = body_json(&router.route(&ApiRequest::get("/api/v1/search?account=a&q=warranty")));
         assert_eq!(v["count"], 1);
         assert_eq!(v["hits"][0]["remote_id"], "m1");
     }
