@@ -11,6 +11,8 @@
 //! - `GET /api/v1/accounts`       → configured accounts
 //! - `GET /api/v1/items?account&service`     → archived items of a service
 //! - `GET /api/v1/item?account&service&id`   → one item's metadata
+//! - `GET /api/v1/body?account&service&id`   → archived body bytes (inert)
+//! - `GET /api/v1/view?account&service&id`   → rendered safe HTML viewer page
 //! - `GET /api/v1/search?account&q`          → full-text search over item names
 
 use isyncyou_core::Config;
@@ -19,6 +21,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 mod serve;
+mod view;
 pub use serve::{format_http, parse_request_line, serve};
 
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
@@ -103,6 +106,9 @@ pub struct ApiResponse {
     pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Extra response headers (beyond the always-present content-type / nosniff),
+    /// e.g. a per-response `Content-Security-Policy` for a rendered viewer page.
+    pub headers: Vec<(String, String)>,
 }
 
 impl ApiResponse {
@@ -111,6 +117,7 @@ impl ApiResponse {
             status,
             content_type: "application/json".into(),
             body: serde_json::to_vec(v).unwrap_or_default(),
+            headers: Vec::new(),
         }
     }
     fn ok_json(v: &Value) -> Self {
@@ -121,7 +128,16 @@ impl ApiResponse {
             status: 200,
             content_type: "text/html; charset=utf-8".into(),
             body: body.as_bytes().to_vec(),
+            headers: Vec::new(),
         }
+    }
+    /// An HTML page locked down with a strict `Content-Security-Policy` header —
+    /// used by the rendered item viewers, which must never load anything.
+    fn html_locked(body: &str) -> Self {
+        let mut r = Self::html(body);
+        r.headers
+            .push(("Content-Security-Policy".into(), view::VIEWER_CSP.into()));
+        r
     }
     fn error(status: u16, message: &str) -> Self {
         Self::json(status, &json!({ "error": message }))
@@ -149,6 +165,7 @@ impl Router {
             "/api/v1/items" => self.items(req),
             "/api/v1/item" => self.item(req),
             "/api/v1/body" => self.body(req),
+            "/api/v1/view" => self.view(req),
             "/api/v1/search" => self.search(req),
             _ => ApiResponse::error(404, "not found"),
         }
@@ -220,42 +237,92 @@ impl Router {
     /// **non-executable** type (the browser must never run scripts/trackers
     /// embedded in a backed-up mail/page — the full sanitized viewer is later
     /// work), and the resolved path must stay under the account's archive_root.
+    /// Read an item's archived body bytes, path-safely. Returns `(relative_path,
+    /// bytes)` or the `ApiResponse` to send on failure. The resolved file must
+    /// stay under the account's `archive_root` (defense against `..`/symlink
+    /// traversal). Shared by [`Self::body`] and [`Self::view`].
+    fn read_archived(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), ApiResponse> {
+        let acc = self
+            .config
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
+        let archive_root = acc.archive_root.clone();
+        let store = self.open(Some(account))?;
+        let rel = match store.get_item(account, service, id) {
+            Ok(Some(it)) => it
+                .local_path
+                .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?,
+            Ok(None) => return Err(ApiResponse::error(404, "item not found")),
+            Err(e) => return Err(ApiResponse::error(500, &format!("query: {e}"))),
+        };
+        let path = archive_root.join(&rel);
+        match (path.canonicalize(), archive_root.canonicalize()) {
+            (Ok(p), Ok(root)) if p.starts_with(&root) => match std::fs::read(&p) {
+                Ok(bytes) => Ok((rel, bytes)),
+                Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
+            },
+            (Ok(_), Ok(_)) => Err(ApiResponse::error(400, "body path escapes archive root")),
+            _ => Err(ApiResponse::error(404, "archived body file missing")),
+        }
+    }
+
+    /// Serve an item's archived body bytes inertly (forced non-executable
+    /// content-type). For a *rendered* view use [`Self::view`].
     fn body(&self, req: &ApiRequest) -> ApiResponse {
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
-        let acc = match self.config.accounts.iter().find(|a| a.id == account) {
-            Some(a) => a,
-            None => return ApiResponse::error(404, "unknown account"),
+        match self.read_archived(account, service, id) {
+            Ok((rel, bytes)) => ApiResponse {
+                status: 200,
+                content_type: safe_content_type(&rel).into(),
+                body: bytes,
+                headers: Vec::new(),
+            },
+            Err(e) => e,
+        }
+    }
+
+    /// Render an archived item as a **safe, self-contained HTML page**: our own
+    /// canonical JSON (calendar/contacts/todo/onenote) is escaped into a fixed
+    /// skeleton — no untrusted markup, no scripts, no external resources — and a
+    /// raw `.eml`/non-JSON body is shown as escaped source. The response carries
+    /// a strict `Content-Security-Policy` so a browser loads nothing. A rich,
+    /// sanitized HTML mail *renderer* (allowlist parser) is deliberately separate
+    /// follow-up work (it needs an HTML-sanitizer dependency).
+    fn view(&self, req: &ApiRequest) -> ApiResponse {
+        let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
+            (Some(a), Some(s), Some(i)) => (a, s, i),
+            _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
-        let archive_root = acc.archive_root.clone();
-        let store = match self.open(Some(account)) {
-            Ok(s) => s,
+        let (rel, bytes) = match self.read_archived(account, service, id) {
+            Ok(v) => v,
             Err(e) => return e,
         };
-        let rel = match store.get_item(account, service, id) {
-            Ok(Some(it)) => match it.local_path {
-                Some(p) => p,
-                None => return ApiResponse::error(404, "item has no archived body"),
-            },
-            Ok(None) => return ApiResponse::error(404, "item not found"),
-            Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+        let page = if rel.ends_with(".json") {
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => view::render_item(service, &v),
+                Err(e) => view::page(
+                    "Unreadable item",
+                    &format!(
+                        "<p>archived JSON could not be parsed: {}</p>",
+                        view::escape(&e.to_string())
+                    ),
+                ),
+            }
+        } else {
+            // .eml or other raw body: show escaped source (inert, never executed).
+            view::source_page(service, &String::from_utf8_lossy(&bytes))
         };
-        let path = archive_root.join(&rel);
-        // Defense in depth: the resolved body must stay under archive_root.
-        match (path.canonicalize(), archive_root.canonicalize()) {
-            (Ok(p), Ok(root)) if p.starts_with(&root) => match std::fs::read(&p) {
-                Ok(bytes) => ApiResponse {
-                    status: 200,
-                    content_type: safe_content_type(&rel).into(),
-                    body: bytes,
-                },
-                Err(e) => ApiResponse::error(500, &format!("read: {e}")),
-            },
-            (Ok(_), Ok(_)) => ApiResponse::error(400, "body path escapes archive root"),
-            _ => ApiResponse::error(404, "archived body file missing"),
-        }
+        ApiResponse::html_locked(&page)
     }
 
     fn search(&self, req: &ApiRequest) -> ApiResponse {
@@ -553,6 +620,87 @@ mod tests {
                 .route(&ApiRequest::get("/api/v1/body?account=a&service=calendar"))
                 .status,
             400
+        );
+    }
+
+    #[test]
+    fn view_renders_safe_html_with_csp_and_escapes_untrusted_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("calendar/aa/bb")).unwrap();
+        std::fs::create_dir_all(arch.join("mail/cc/dd")).unwrap();
+        // a calendar event whose subject carries a script payload
+        std::fs::write(
+            arch.join("calendar/aa/bb/ev.json"),
+            br#"{"id":"e1","subject":"<script>alert(1)</script>","location":{"displayName":"Room 1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            arch.join("mail/cc/dd/m.eml"),
+            b"From: a@b\r\nSubject: Hi\r\n\r\nbody",
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut e = Item::new("a", "calendar", "e1", "evt", "event");
+            e.local_path = Some("calendar/aa/bb/ev.json".into());
+            store.upsert_item(&e).unwrap();
+            let mut m = Item::new("a", "mail", "m1", "Hi", "message");
+            m.local_path = Some("mail/cc/dd/m.eml".into());
+            store.upsert_item(&m).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+
+        // calendar JSON -> rendered HTML, subject escaped, with a strict CSP header
+        let v = router.route(&ApiRequest::get(
+            "/api/v1/view?account=a&service=calendar&id=e1",
+        ));
+        assert_eq!(v.status, 200);
+        assert!(v.content_type.starts_with("text/html"));
+        let html = String::from_utf8_lossy(&v.body);
+        assert!(html.contains("Calendar event"));
+        assert!(html.contains("Room 1"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(
+            !html.contains("<script>alert(1)"),
+            "untrusted markup must not be live"
+        );
+        assert!(
+            v.headers.iter().any(
+                |(k, val)| k == "Content-Security-Policy" && val.contains("default-src 'none'")
+            ),
+            "viewer must carry a strict CSP header"
+        );
+
+        // .eml -> escaped inert source, also CSP-locked
+        let m = router.route(&ApiRequest::get(
+            "/api/v1/view?account=a&service=mail&id=m1",
+        ));
+        assert_eq!(m.status, 200);
+        assert!(m.content_type.starts_with("text/html"));
+        assert!(String::from_utf8_lossy(&m.body).contains("Subject: Hi"));
+        assert!(m
+            .headers
+            .iter()
+            .any(|(k, _)| k == "Content-Security-Policy"));
+
+        // unknown item -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/view?account=a&service=mail&id=nope"
+                ))
+                .status,
+            404
         );
     }
 

@@ -58,14 +58,19 @@ function render(items) {
   if (!items.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">No items.</td></tr>'; return; }
   tb.innerHTML = items.map(it => {
     const name = escapeHtml(it.name);
+    const q = `account=${encodeURIComponent(account)}&service=${encodeURIComponent(it.service)}&id=${encodeURIComponent(it.remote_id)}`;
+    // the name opens the rendered (safe) viewer; a separate link offers raw source
     const cell = it.has_body
-      ? `<a href="/api/v1/body?account=${encodeURIComponent(account)}&service=${encodeURIComponent(it.service)}&id=${encodeURIComponent(it.remote_id)}" target="_blank" rel="noopener">${name}</a>`
+      ? `<a href="/api/v1/view?${q}" target="_blank" rel="noopener">${name}</a>`
       : name;
+    const bodyCell = it.has_body
+      ? `<a href="/api/v1/body?${q}" target="_blank" rel="noopener">raw</a>`
+      : "—";
     return `<tr>
       <td><span class="badge">${it.item_type}</span></td>
       <td>${cell}</td>
       <td class="muted">${it.remote_mtime || ""}</td>
-      <td>${it.has_body ? "✓" : "—"}</td></tr>`;
+      <td>${bodyCell}</td></tr>`;
   }).join("");
 }
 function escapeHtml(s) { return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }

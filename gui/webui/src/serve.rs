@@ -29,14 +29,21 @@ pub fn format_http(resp: &ApiResponse) -> Vec<u8> {
         500 => "Internal Server Error",
         _ => "Status",
     };
-    let mut out = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n",
         resp.status,
         reason,
         resp.content_type,
         resp.body.len()
-    )
-    .into_bytes();
+    );
+    for (k, v) in &resp.headers {
+        // header values are crafted in-process (constants); guard against any
+        // accidental CRLF so a value can never inject extra headers.
+        let v = v.replace(['\r', '\n'], " ");
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut out = head.into_bytes();
     out.extend_from_slice(&resp.body);
     out
 }
@@ -61,6 +68,7 @@ fn handle(stream: &mut TcpStream, router: &Router) -> std::io::Result<()> {
             status: 400,
             content_type: "text/plain".into(),
             body: b"bad request line".to_vec(),
+            headers: Vec::new(),
         },
     };
     stream.write_all(&format_http(&resp))?;
@@ -108,6 +116,10 @@ mod tests {
             status: 404,
             content_type: "application/json".into(),
             body: b"{\"error\":\"not found\"}".to_vec(),
+            headers: vec![(
+                "Content-Security-Policy".into(),
+                "default-src 'none'".into(),
+            )],
         };
         let bytes = format_http(&resp);
         let text = String::from_utf8(bytes).unwrap();
@@ -115,6 +127,8 @@ mod tests {
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains("Content-Length: 21\r\n"));
         assert!(text.contains("Connection: close\r\n"));
+        // extra headers are emitted before the blank line
+        assert!(text.contains("Content-Security-Policy: default-src 'none'\r\n"));
         assert!(text.ends_with("{\"error\":\"not found\"}"));
     }
 
