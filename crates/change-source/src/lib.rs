@@ -5,10 +5,14 @@
 //! [`watch`] module is the live inotify (etc.) accelerator that feeds the
 //! coalescer behind that same interface.
 
+#[cfg(target_os = "linux")]
+pub mod fanotify;
 pub mod reconcile;
 pub mod watch;
 pub mod watcher;
 
+#[cfg(target_os = "linux")]
+pub use fanotify::FanotifyWatcher;
 pub use reconcile::{reconcile, Entry, ReconcileChange};
 pub use watch::FsWatcher;
 pub use watcher::{Coalescer, FsChange, RawEvent};
