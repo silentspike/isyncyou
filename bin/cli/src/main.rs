@@ -105,6 +105,14 @@ enum Command {
         #[arg(long)]
         new_archive_root: PathBuf,
     },
+    /// Serve the local web UI (open the printed URL in your browser).
+    Serve {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        /// Address to bind (localhost only by default).
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: String,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
@@ -157,7 +165,14 @@ fn run(command: Command) -> Result<(), String> {
             account,
             new_archive_root,
         } => cmd_migrate(&config, &account, &new_archive_root),
+        Command::Serve { config, bind } => cmd_serve(&config, &bind),
     }
+}
+
+fn cmd_serve(config: &Path, bind: &str) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let router = isyncyou_webui::Router::new(cfg);
+    isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}"))
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
