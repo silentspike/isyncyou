@@ -15,6 +15,7 @@ pub mod calendar;
 mod common;
 pub mod contacts;
 pub mod mail;
+pub mod mime;
 pub mod onedrive;
 pub mod onenote;
 pub mod restore;
@@ -26,7 +27,11 @@ pub use archive::{
 };
 pub use calendar::{incremental_sync_calendar, CalendarReport};
 pub use contacts::{incremental_sync_contacts, ContactsReport};
-pub use mail::{backup_message_bodies, incremental_sync_mail, BodyReport, MailReport, MimeFetcher};
+pub use mail::{
+    backup_message_bodies, incremental_sync_mail, index_mail_bodies, BodyReport, MailReport,
+    MimeFetcher,
+};
+pub use mime::extract_text;
 pub use onedrive::{
     incremental_sync, push_delete, push_upload, RemoteWriter, SyncError, SyncReport,
 };

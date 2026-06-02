@@ -9,6 +9,7 @@
 //! still belongs to the folder reporting it.
 
 use crate::common::{fetch_pages, shard_path};
+use crate::mime::extract_text;
 use crate::onedrive::SyncError;
 use isyncyou_graph::{run_delta, DeltaCursor, Transport};
 use isyncyou_store::{Item, Store};
@@ -169,6 +170,32 @@ pub fn backup_message_bodies<F: MimeFetcher>(
         report.bytes += mime.len() as u64;
     }
     Ok(report)
+}
+
+/// Extract and FTS-index the body text of every downloaded mail message (those
+/// with a local `.eml`), feeding [`Store::index_body`] (plan §9). Idempotent;
+/// `limit` caps one pass (`0` = all). Run after [`backup_message_bodies`].
+pub fn index_mail_bodies(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    limit: usize,
+) -> Result<usize, SyncError> {
+    let mut indexed = 0;
+    for msg in store.items_by_type(account, SERVICE, "message")? {
+        let rel = match msg.local_path.as_deref() {
+            Some(p) if p.ends_with(".eml") => p,
+            _ => continue,
+        };
+        if limit != 0 && indexed >= limit {
+            break;
+        }
+        let bytes = std::fs::read(archive_root.join(rel))?;
+        let text = extract_text(&bytes);
+        store.index_body(account, SERVICE, &msg.remote_id, &text)?;
+        indexed += 1;
+    }
+    Ok(indexed)
 }
 
 /// Ingest one message-delta entry for a given folder.
@@ -424,6 +451,42 @@ mod tests {
     }
 
     #[test]
+    fn index_mail_bodies_extracts_and_indexes_for_search() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // a downloaded message with a real .eml on disk
+        let mut m = Item::new("acc", SERVICE, "m1", "Invoice", "message");
+        m.local_path = Some("mail/aa/bb/m1.eml".into());
+        store.upsert_item(&m).unwrap();
+        // a message without a body is skipped
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "m2", "No body", "message"))
+            .unwrap();
+        let p = dir.path().join("mail/aa/bb");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(
+            p.join("m1.eml"),
+            b"Subject: Invoice\r\nContent-Type: text/plain\r\n\r\nThe quarterly shipment of widgets arrived.\r\n",
+        )
+        .unwrap();
+
+        let n = index_mail_bodies(&store, "acc", dir.path(), 0).unwrap();
+        assert_eq!(n, 1, "only the message with an .eml is indexed");
+        // the body text is now full-text searchable
+        assert_eq!(
+            store.search_bodies("acc", "widgets").unwrap(),
+            vec![("mail".to_string(), "m1".to_string())]
+        );
+        // subject is body-searchable too
+        assert_eq!(store.search_bodies("acc", "invoice").unwrap().len(), 1);
+        // a term not present matches nothing
+        assert!(store
+            .search_bodies("acc", "nonexistentxyz")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn limit_caps_downloads_per_pass() {
         let store = store_with_two_messages();
         let dir = tempfile::tempdir().unwrap();
@@ -507,6 +570,18 @@ mod tests {
             r.downloaded,
             r.bytes,
             bytes.len()
+        );
+
+        // ...then index those bodies and confirm full-text body search works.
+        let n = index_mail_bodies(&store, "backupslave", dir.path(), 0)
+            .expect("body indexing should succeed");
+        assert!(n >= 1, "expected to index at least one body");
+        // 'the' is overwhelmingly common in real mail bodies/subjects
+        let hits = store.search_bodies("backupslave", "the").unwrap();
+        eprintln!("live body index: indexed={n}, 'the' hits={}", hits.len());
+        assert!(
+            !hits.is_empty(),
+            "expected body-search hits for a common word"
         );
     }
 }
