@@ -14,10 +14,12 @@
 //! OAuth (Auth-Code+PKCE / device-code) and the live HTTP client are layered on
 //! top of these and exercised against the test account separately.
 
+pub mod client;
 pub mod error;
 pub mod throttle;
 pub mod upload;
 
+pub use client::{run_delta, DeltaError, DeltaOutcome, Response, Transport};
 pub use error::{classify, GraphAction};
 pub use throttle::{Outcome, Pacer};
 pub use upload::{ChunkPlan, UploadSession};
