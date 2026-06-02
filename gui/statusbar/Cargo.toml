@@ -8,3 +8,5 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+tiny-skia = { workspace = true }
+cosmic-text = { workspace = true }
