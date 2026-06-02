@@ -6,5 +6,7 @@
 //! behind the same interface.
 
 pub mod reconcile;
+pub mod watcher;
 
 pub use reconcile::{reconcile, Entry, ReconcileChange};
+pub use watcher::{Coalescer, FsChange, RawEvent};
