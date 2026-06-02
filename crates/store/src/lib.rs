@@ -211,6 +211,22 @@ impl Store {
         Ok(Store { conn, _lock: None })
     }
 
+    /// Write a consistent snapshot of the database to `dest` via SQLite
+    /// `VACUUM INTO`. Safe while the store is open and being written — it reads a
+    /// single consistent view — so it needs no quiesce. Used for PBS snapshots.
+    /// `dest` must not already exist (VACUUM INTO refuses to overwrite).
+    pub fn backup_to(&self, dest: impl AsRef<Path>) -> Result<()> {
+        let dest = dest.as_ref();
+        if dest.exists() {
+            std::fs::remove_file(dest)?;
+        }
+        let dest_str = dest.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 backup path")
+        })?;
+        self.conn.execute("VACUUM INTO ?1", params![dest_str])?;
+        Ok(())
+    }
+
     fn acquire_lock(path: &Path) -> Result<File> {
         let lock_path = format!("{}.lock", path.display());
         let f = OpenOptions::new()
@@ -857,5 +873,23 @@ mod tests {
             Err(e) => panic!("expected AlreadyRunning, got {e:?}"),
             Ok(_) => panic!("expected AlreadyRunning, got a second store"),
         }
+    }
+
+    #[test]
+    fn backup_to_writes_a_readable_consistent_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("live.db")).unwrap();
+        store
+            .upsert_item(&Item::new("a", "onedrive", "r1", "f.txt", "file"))
+            .unwrap();
+        let snap = dir.path().join("snap.db");
+        store.backup_to(&snap).unwrap();
+        assert!(snap.exists(), "snapshot file must be created");
+        // the snapshot opens as an independent, valid store with the same data
+        let restored = Store::open(&snap).unwrap();
+        assert!(restored.get_item("a", "onedrive", "r1").unwrap().is_some());
+        drop(restored);
+        // VACUUM INTO refuses a pre-existing target; backup_to clears it first
+        store.backup_to(&snap).unwrap();
     }
 }
