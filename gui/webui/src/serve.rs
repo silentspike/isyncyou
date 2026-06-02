@@ -46,6 +46,7 @@ pub fn format_http(resp: &ApiResponse) -> Vec<u8> {
     let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
@@ -76,16 +77,24 @@ fn handle<S: Conn>(stream: &mut S, router: &Router) -> std::io::Result<()> {
     if reader.read_line(&mut request_line)? == 0 {
         return Ok(()); // client closed
     }
-    // Drain headers up to the blank line (we don't need them for GET).
+    // Read headers up to the blank line; capture the capability token for POSTs.
+    let mut cap_token = None;
     loop {
         let mut h = String::new();
         let n = reader.read_line(&mut h)?;
         if n == 0 || h == "\r\n" || h == "\n" {
             break;
         }
+        if let Some((k, v)) = h.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("x-capability-token") {
+                cap_token = Some(v.trim().to_string());
+            }
+        }
     }
     let resp = match parse_request_line(request_line.trim_end()) {
-        Some((method, target)) => router.route(&ApiRequest::new(&method, &target)),
+        Some((method, target)) => {
+            router.route(&ApiRequest::new(&method, &target).with_cap_token(cap_token))
+        }
         None => ApiResponse {
             status: 400,
             content_type: "text/plain".into(),
