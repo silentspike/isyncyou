@@ -8,6 +8,7 @@
 //! identity instead of being lost: we only tombstone a removal if the message
 //! still belongs to the folder reporting it.
 
+use crate::common::fetch_pages;
 use crate::onedrive::SyncError;
 use isyncyou_graph::{run_delta, DeltaCursor, Transport};
 use isyncyou_store::{Item, Store};
@@ -30,34 +31,6 @@ struct Folder {
     id: String,
     name: String,
     parent: Option<String>,
-}
-
-/// Page through a non-delta Graph collection (`value[]` + `@odata.nextLink`).
-/// Mail folders are a plain paged list, not a delta query, so this can't reuse
-/// [`run_delta`] (which requires a terminating `@odata.deltaLink`).
-fn fetch_pages<T: Transport>(transport: &mut T, start_url: &str) -> Result<Vec<Value>, SyncError> {
-    let mut url = start_url.to_string();
-    let mut out = Vec::new();
-    loop {
-        let resp = transport.get(&url);
-        if !(200..300).contains(&resp.status) {
-            return Err(SyncError::Remote(format!(
-                "HTTP {} listing {url}",
-                resp.status
-            )));
-        }
-        let body = resp
-            .body
-            .ok_or_else(|| SyncError::Malformed("empty list page".into()))?;
-        if let Some(arr) = body.get("value").and_then(Value::as_array) {
-            out.extend(arr.iter().cloned());
-        }
-        match body.get("@odata.nextLink").and_then(Value::as_str) {
-            Some(next) => url = next.to_string(),
-            None => break,
-        }
-    }
-    Ok(out)
 }
 
 fn parse_folders(raw: &[Value]) -> Vec<Folder> {
