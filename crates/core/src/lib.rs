@@ -6,6 +6,7 @@
 
 pub mod conflict;
 pub mod guard;
+pub mod recovery;
 pub mod sync_state;
 
 pub use conflict::{
@@ -13,4 +14,5 @@ pub use conflict::{
     Resolution, Versus,
 };
 pub use guard::{DeleteGuard, Direction, GuardVerdict};
+pub use recovery::{atomic_write, HealthStatus, Journal, JournalEntry, SelfCheck};
 pub use sync_state::{SyncEvent, SyncState};
