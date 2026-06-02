@@ -651,6 +651,17 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
             }
         }
     }
+
+    // Push brand-new local files up to the cloud (the local→remote create half).
+    let creates =
+        connectors::scan_local_creates(&store, account, &sync_root).map_err(|e| e.to_string())?;
+    if !creates.is_empty() {
+        let uploaded = connectors::push_local_creates(
+            &client, &store, &mut map, account, &sync_root, &creates,
+        )
+        .map_err(|e| e.to_string())?;
+        println!("uploaded {uploaded} new local file(s) to the cloud");
+    }
     Ok(())
 }
 
