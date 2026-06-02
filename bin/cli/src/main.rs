@@ -3,6 +3,7 @@
 //! Wires the config, store and connectors into a usable tool:
 //! - `init`    — scaffold a starter config (template or a validated account)
 //! - `check`   — validate a config file
+//! - `verify`  — check an account's store + archive integrity
 //! - `status`  — show tracked-item counts + delta cursor for an account
 //! - `sync`    — run one incremental OneDrive sync for an account
 //! - `backup`  — index + archive M365 services (mail/calendar/contacts/todo/onenote)
@@ -54,6 +55,13 @@ enum Command {
     Check {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
+    },
+    /// Check an account's store + archive integrity (schema, missing/empty bodies).
+    Verify {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
     },
     /// Show tracked-item counts and the delta cursor for an account.
     Status {
@@ -218,6 +226,7 @@ fn run(command: Command) -> Result<(), String> {
             force,
         } => cmd_init(&config, account, username, sync_root, archive_root, force),
         Command::Check { config } => cmd_check(&config),
+        Command::Verify { config, account } => cmd_verify(&config, &account),
         Command::Status { config, account } => cmd_status(&config, &account),
         Command::Sync {
             config,
@@ -426,7 +435,7 @@ fn cmd_check(path: &Path) -> Result<(), String> {
 
 /// All services a status report covers.
 const STATUS_SERVICES: &[&str] = &[
-    "onedrive", "mail", "calendar", "contacts", "todo", "onenote",
+    "onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared",
 ];
 
 /// Per-service counts for an account's archive.
@@ -456,6 +465,79 @@ fn account_status(cfg: &Config, account: &str) -> Result<AccountStatus, String> 
         services,
         onedrive_cursor,
     })
+}
+
+/// Outcome of a store/archive integrity check.
+struct VerifyReport {
+    schema_ok: bool,
+    items: usize,
+    with_body: usize,
+    missing_body: usize,
+    empty_body: usize,
+}
+
+impl VerifyReport {
+    fn healthy(&self) -> bool {
+        self.schema_ok && self.missing_body == 0 && self.empty_body == 0
+    }
+}
+
+fn verify_account(cfg: &Config, account: &str) -> Result<VerifyReport, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let archive_root = acc.archive_root.clone();
+    let store = Store::open(store_path(cfg, account)?).map_err(|e| e.to_string())?;
+    let schema_ok =
+        store.schema_version().map_err(|e| e.to_string())? == isyncyou_store::SCHEMA_VERSION;
+    let mut r = VerifyReport {
+        schema_ok,
+        items: 0,
+        with_body: 0,
+        missing_body: 0,
+        empty_body: 0,
+    };
+    for &svc in STATUS_SERVICES {
+        for it in store
+            .items_by_service(account, svc)
+            .map_err(|e| e.to_string())?
+        {
+            r.items += 1;
+            if let Some(rel) = it.local_path {
+                r.with_body += 1;
+                match std::fs::metadata(archive_root.join(&rel)) {
+                    Ok(m) if m.len() == 0 => r.empty_body += 1,
+                    Ok(_) => {}
+                    Err(_) => r.missing_body += 1,
+                }
+            }
+        }
+    }
+    Ok(r)
+}
+
+fn cmd_verify(config: &Path, account: &str) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let r = verify_account(&cfg, account)?;
+    println!("account: {account}");
+    println!("  schema: {}", if r.schema_ok { "ok" } else { "OUTDATED" });
+    println!(
+        "  {} item(s), {} with archived body; {} missing, {} empty",
+        r.items, r.with_body, r.missing_body, r.empty_body
+    );
+    if r.healthy() {
+        println!("verify OK");
+        Ok(())
+    } else {
+        Err(format!(
+            "integrity problems: {} missing + {} empty body file(s){}",
+            r.missing_body,
+            r.empty_body,
+            if r.schema_ok { "" } else { ", schema outdated" }
+        ))
+    }
 }
 
 fn cmd_status(config: &Path, account: &str) -> Result<(), String> {
@@ -1054,6 +1136,46 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("invalid config"), "got: {err}");
         assert!(!p.exists(), "invalid config must not be written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_account_flags_missing_and_empty_bodies() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-vf-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(arch.join("mail/aa/bb")).unwrap();
+        let p = write_config(&dir, &arch);
+        // a good body file
+        std::fs::write(arch.join("mail/aa/bb/ok.eml"), b"From: a\r\n\r\nhi").unwrap();
+        std::fs::write(arch.join("mail/aa/bb/empty.eml"), b"").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut ok = isyncyou_store::Item::new("a", "mail", "ok", "OK", "message");
+            ok.local_path = Some("mail/aa/bb/ok.eml".into());
+            store.upsert_item(&ok).unwrap();
+            let mut miss = isyncyou_store::Item::new("a", "mail", "miss", "Missing", "message");
+            miss.local_path = Some("mail/aa/bb/gone.eml".into()); // file does not exist
+            store.upsert_item(&miss).unwrap();
+            let mut emp = isyncyou_store::Item::new("a", "mail", "emp", "Empty", "message");
+            emp.local_path = Some("mail/aa/bb/empty.eml".into());
+            store.upsert_item(&emp).unwrap();
+            // an item without a body is fine
+            store
+                .upsert_item(&isyncyou_store::Item::new(
+                    "a", "mail", "nob", "NoBody", "message",
+                ))
+                .unwrap();
+        }
+        let cfg = load_config(&p).unwrap();
+        let r = verify_account(&cfg, "a").unwrap();
+        assert!(r.schema_ok);
+        assert_eq!(r.items, 4);
+        assert_eq!(r.with_body, 3);
+        assert_eq!(r.missing_body, 1);
+        assert_eq!(r.empty_body, 1);
+        assert!(!r.healthy());
+        // cmd_verify surfaces the problem as an error
+        assert!(cmd_verify(&p, "a").unwrap_err().contains("missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
