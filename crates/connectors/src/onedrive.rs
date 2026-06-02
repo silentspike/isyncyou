@@ -682,12 +682,33 @@ fn is_local_modified(full: &Path, it: &Item) -> bool {
 /// if its etag still matches, so a concurrent cloud change is reported as a
 /// conflict and **never silently overwritten** (A3). On success the store item is
 /// refreshed (new size/etag, `clean`).
+/// Build an abraunegg-style `safeBackup` conflict-copy file name, e.g.
+/// `report-laptop-safeBackup-0001.txt`. Replicated here (not pulled from
+/// `core::conflict`) to keep `connectors` dependency-light.
+fn conflict_copy_name(fname: &str, host: &str, n: u32) -> String {
+    let (stem, ext) = match fname.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (fname, String::new()),
+    };
+    format!("{stem}-{host}-safeBackup-{n:04}{ext}")
+}
+
+/// First conflict-copy name in `dir` that doesn't already exist (so repeated
+/// conflicts on the same file never clobber an earlier copy).
+fn unique_conflict_copy(dir: &Path, fname: &str, host: &str) -> String {
+    (1..=9999)
+        .map(|n| conflict_copy_name(fname, host, n))
+        .find(|name| !dir.join(name).exists())
+        .unwrap_or_else(|| conflict_copy_name(fname, host, 9999))
+}
+
 pub fn apply_local_modifies<R: ContentReplacer>(
     replacer: &R,
     store: &Store,
     map: &mut MappingTable,
     account: &str,
     sync_root: &Path,
+    host: &str,
     modifies: &[(String, PathBuf, String)],
 ) -> Result<ModifyReport, SyncError> {
     let mut report = ModifyReport::default();
@@ -704,7 +725,28 @@ pub fn apply_local_modifies<R: ContentReplacer>(
                 ingest_item(store, map, account, &item, "", "clean")?;
                 report.uploaded += 1;
             }
-            Ok(None) => report.conflicts += 1,
+            Ok(None) => {
+                // Keep both (plan §10, headless default): the cloud changed, so we
+                // never overwrite it. Move the local edit aside as a conflict copy
+                // (picked up as a new file -> uploaded next pass) and re-mark the
+                // item remote_dirty so the cloud version re-downloads to the original
+                // path. This also breaks the re-conflict loop the old "report only"
+                // path caused (the modified file would re-conflict every sync).
+                let src = sync_root.join(rel);
+                let dir = src
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| sync_root.to_path_buf());
+                let fname = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                let copy = unique_conflict_copy(&dir, fname, host);
+                match std::fs::rename(&src, dir.join(&copy)) {
+                    Ok(()) => {
+                        store.set_sync_state(account, SERVICE, id, "remote_dirty")?;
+                        report.conflicts += 1;
+                    }
+                    Err(_) => report.failed += 1,
+                }
+            }
             Err(_) => report.failed += 1,
         }
     }
@@ -1281,7 +1323,8 @@ mod tests {
             "etag-old".into(),
         )];
         let report =
-            apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), &modifies).unwrap();
+            apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), "host", &modifies)
+                .unwrap();
         assert_eq!(report.uploaded, 1);
         assert_eq!(report.conflicts, 0);
         // the conditional replace was called with the stored etag
@@ -1294,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_local_modifies_reports_conflict_without_overwrite() {
+    fn apply_local_modifies_keeps_both_on_conflict() {
         let (store, dir) = store_with_tracked_file(2);
         std::fs::write(dir.path().join("Docs").join("note.txt"), b"changed").unwrap();
         let mut map = MappingTable::new();
@@ -1308,13 +1351,38 @@ mod tests {
             "etag-old".into(),
         )];
         let report =
-            apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), &modifies).unwrap();
+            apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), "host", &modifies)
+                .unwrap();
         assert_eq!(report.uploaded, 0);
         assert_eq!(report.conflicts, 1);
-        // store NOT changed (no silent overwrite): old size/etag remain
+        // cloud version NOT overwritten: size/etag unchanged...
         let it = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
         assert_eq!(it.size, Some(2));
         assert_eq!(it.etag.as_deref(), Some("etag-old"));
+        // ...but the item is re-marked remote_dirty so the cloud copy re-downloads
+        assert_eq!(it.sync_state, "remote_dirty");
+        // keep-both: the local edit moved to a conflict copy, original path freed
+        let docs = dir.path().join("Docs");
+        assert!(
+            !docs.join("note.txt").exists(),
+            "original must be moved aside"
+        );
+        let copy = docs.join("note-host-safeBackup-0001.txt");
+        assert!(copy.exists(), "conflict copy must exist");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn conflict_copy_name_disambiguates() {
+        assert_eq!(
+            conflict_copy_name("report.txt", "laptop", 1),
+            "report-laptop-safeBackup-0001.txt"
+        );
+        // no extension
+        assert_eq!(
+            conflict_copy_name("README", "host", 2),
+            "README-host-safeBackup-0002"
+        );
     }
 
     #[test]
@@ -1640,8 +1708,10 @@ mod tests {
             modifies.iter().any(|(mid, _, _)| mid == &id),
             "the edited file should be a detected modify"
         );
-        let report =
-            apply_local_modifies(&client, &store, &mut map, "acc", &sync_root, &modifies).unwrap();
+        let report = apply_local_modifies(
+            &client, &store, &mut map, "acc", &sync_root, "host", &modifies,
+        )
+        .unwrap();
         assert!(report.uploaded >= 1, "modify should upload: {report:?}");
 
         // confirm the cloud content now matches the local edit
@@ -1651,6 +1721,88 @@ mod tests {
             "cloud content should match the local edit"
         );
         eprintln!("modify uploaded; cloud content updated for {id}");
+        client.delete(&id).expect("cleanup");
+    }
+
+    /// Live conflict keep-both: upload + materialize a file, advance the cloud
+    /// copy out-of-band (so the stored etag goes stale), then edit locally and push
+    /// the modify. The If-Match must 412; the engine must keep both — move the local
+    /// edit to a `*-host-safeBackup-NNNN` copy and re-mark the item remote_dirty,
+    /// never overwriting the cloud (plan §10 / A3). Needs the write token.
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_modify_conflict_keeps_both() {
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "skipping live_modify_conflict_keeps_both: ISYNCYOU_TEST_WRITE_TOKEN not set"
+                );
+                return;
+            }
+        };
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let item = client
+            .upload("/iSyncYou-conflicttest/c.txt", b"original")
+            .expect("upload");
+        let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
+
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
+        let base = tempfile::tempdir().unwrap();
+        let sync_root = base.path().join("od");
+        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        let local = sync_root.join("iSyncYou-conflicttest").join("c.txt");
+        assert!(local.exists());
+
+        // the etag the store recorded — the engine will send this with If-Match
+        let stale_etag = store
+            .get_item("acc", SERVICE, &id)
+            .unwrap()
+            .unwrap()
+            .etag
+            .expect("stored etag");
+        // advance the cloud copy out-of-band so that etag is now stale
+        client
+            .replace_content_if_match(&id, b"cloud-side change wins", &stale_etag)
+            .expect("out-of-band replace")
+            .expect("etag should still match for the out-of-band write");
+
+        // now edit locally and push — must hit a 412 and keep both
+        std::fs::write(&local, b"my local edit").unwrap();
+        let modifies = scan_local_modifies(&store, "acc", &sync_root).unwrap();
+        let report = apply_local_modifies(
+            &client, &store, &mut map, "acc", &sync_root, "host", &modifies,
+        )
+        .unwrap();
+        assert_eq!(
+            report.uploaded, 0,
+            "must NOT overwrite the cloud: {report:?}"
+        );
+        assert_eq!(
+            report.conflicts, 1,
+            "must register one conflict: {report:?}"
+        );
+
+        // cloud keeps its out-of-band content (no silent overwrite)
+        let cloud = client.download_content(&id).expect("download");
+        assert_eq!(cloud, b"cloud-side change wins");
+        // local edit preserved as a conflict copy; original path freed + remote_dirty
+        let dir = sync_root.join("iSyncYou-conflicttest");
+        assert!(!local.exists(), "original must be moved aside");
+        let copy = dir.join("c-host-safeBackup-0001.txt");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"my local edit");
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, &id)
+                .unwrap()
+                .unwrap()
+                .sync_state,
+            "remote_dirty"
+        );
+        eprintln!("conflict kept both: cloud preserved, local edit -> {copy:?}");
         client.delete(&id).expect("cleanup");
     }
 
