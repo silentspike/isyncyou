@@ -28,7 +28,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE items (
@@ -110,6 +110,31 @@ CREATE TRIGGER bodies_au AFTER UPDATE ON bodies BEGIN
     INSERT INTO bodies_fts(rowid, body) VALUES (new.id, new.body);
 END;
 "#;
+
+const MIGRATION_V3: &str = r#"
+CREATE TABLE runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    summary     TEXT NOT NULL
+);
+CREATE INDEX runs_account ON runs(account_id, id DESC);
+"#;
+
+/// A recorded engine run (one sync/backup/… pass) — the activity history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub id: i64,
+    pub account_id: String,
+    pub kind: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub status: String,
+    pub summary: String,
+}
 
 /// A tracked item, keyed by `(account_id, service, remote_id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +484,45 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Record a completed engine run (one sync/backup/… pass) in the activity
+    /// history. Returns the new run id.
+    pub fn add_run(
+        &self,
+        account: &str,
+        kind: &str,
+        started_at: &str,
+        finished_at: &str,
+        status: &str,
+        summary: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO runs(account_id, kind, started_at, finished_at, status, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![account, kind, started_at, finished_at, status, summary],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The most recent runs for an account, newest first (the activity history).
+    pub fn recent_runs(&self, account: &str, limit: u32) -> Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account_id, kind, started_at, finished_at, status, summary
+             FROM runs WHERE account_id=?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account, limit], |r| {
+            Ok(Run {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                kind: r.get(2)?,
+                started_at: r.get(3)?,
+                finished_at: r.get(4)?,
+                status: r.get(5)?,
+                summary: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// All non-deleted remote ids for a service. Used by delta-less connectors
     /// (e.g. OneNote) to reconcile deletions: ids present here but absent from a
     /// fresh full list have been removed remotely.
@@ -550,6 +614,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 2 {
         conn.execute_batch(MIGRATION_V2)?;
     }
+    if v < 3 {
+        conn.execute_batch(MIGRATION_V3)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -566,6 +633,24 @@ mod tests {
     fn migrates_to_current_version() {
         let s = Store::open_in_memory().unwrap();
         assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn runs_record_and_list_newest_first() {
+        let s = Store::open_in_memory().unwrap();
+        s.add_run("a", "sync", "t1", "t2", "ok", "1 up").unwrap();
+        s.add_run("a", "backup", "t3", "t4", "ok", "mail").unwrap();
+        s.add_run("b", "sync", "t5", "t6", "error", "boom").unwrap();
+        let runs = s.recent_runs("a", 10).unwrap();
+        assert_eq!(runs.len(), 2, "only account a's runs");
+        // newest first
+        assert_eq!(runs[0].kind, "backup");
+        assert_eq!(runs[0].summary, "mail");
+        assert_eq!(runs[1].kind, "sync");
+        assert_eq!(runs[1].status, "ok");
+        // limit is honored
+        assert_eq!(s.recent_runs("a", 1).unwrap().len(), 1);
+        assert_eq!(s.recent_runs("b", 10).unwrap()[0].status, "error");
     }
 
     #[test]
