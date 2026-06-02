@@ -2216,12 +2216,12 @@ mod tests {
     }
 
     #[test]
-    fn restore_to_local_recovers_any_service_without_cloud() {
+    fn restore_to_local_recovers_an_archived_item() {
         let dir = std::env::temp_dir().join(format!("isyncyou-cli-rtl-{}", std::process::id()));
         let arch = dir.join("arch");
         std::fs::create_dir_all(arch.join("onenote/aa")).unwrap();
         let p = write_config(&dir, &arch);
-        // an archived OneNote page (HTML) — onenote has no *cloud* restore path
+        // an archived OneNote page (HTML)
         std::fs::write(arch.join("onenote/aa/p.html"), b"<h1>Notes</h1>").unwrap();
         {
             let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
@@ -2229,10 +2229,8 @@ mod tests {
             it.local_path = Some("onenote/aa/p.html".into());
             store.upsert_item(&it).unwrap();
         } // release the lock before cmd_restore reopens the store
-          // cloud restore is refused for onenote (and points at --to-local)
-        let err = cmd_restore(&p, "a", "onenote", "pg1", None, Some("T".into())).unwrap_err();
-        assert!(err.contains("no cloud restore path"), "got: {err}");
-        // --to-local recovers the exact archived bytes to a human-named file
+          // --to-local recovers the exact archived bytes to a human-named file,
+          // no token / no network — for any service with an archived body.
         let out = dir.join("recovered");
         cmd_restore(&p, "a", "onenote", "pg1", Some(out.clone()), None).unwrap();
         let f = out.join("Meeting Notes.html");
