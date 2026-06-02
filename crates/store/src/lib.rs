@@ -319,6 +319,18 @@ impl Store {
             .optional()?)
     }
 
+    /// All non-deleted remote ids for a service. Used by delta-less connectors
+    /// (e.g. OneNote) to reconcile deletions: ids present here but absent from a
+    /// fresh full list have been removed remotely.
+    pub fn live_remote_ids(&self, account: &str, service: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT remote_id FROM items
+             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![account, service], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Full-text search over file names within an account (FTS5 MATCH).
     pub fn search_names(&self, account: &str, query: &str) -> Result<Vec<Item>> {
         let cols_q = COLS
@@ -457,6 +469,23 @@ mod tests {
         // diacritics-insensitive tokenizer
         s.upsert_item(&item("a", "r4", "Lebenslauf.pdf")).unwrap();
         assert_eq!(s.search_names("a", "lebenslauf").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn live_remote_ids_lists_non_deleted_for_service() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_item(&Item::new("a", "onenote", "p1", "Page 1", "page"))
+            .unwrap();
+        s.upsert_item(&Item::new("a", "onenote", "p2", "Page 2", "page"))
+            .unwrap();
+        s.upsert_item(&Item::new("a", "onedrive", "f1", "f.txt", "file"))
+            .unwrap();
+        s.mark_deleted("a", "onenote", "p2", "2026-06-02T00:00:00Z")
+            .unwrap();
+        let mut ids = s.live_remote_ids("a", "onenote").unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["p1".to_string()]); // p2 tombstoned, f1 other service
+        assert!(s.live_remote_ids("a", "contacts").unwrap().is_empty());
     }
 
     #[test]
