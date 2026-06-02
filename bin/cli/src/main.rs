@@ -96,12 +96,16 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
-    /// Full-text search the local archive index (item names/subjects/titles).
+    /// Full-text search the local archive (item names/subjects/titles + mail bodies).
     Search {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
+        /// Account id; omit and pass --all-accounts to search every account.
         #[arg(long)]
-        account: String,
+        account: Option<String>,
+        /// Search every configured account (mutually exclusive with --account).
+        #[arg(long)]
+        all_accounts: bool,
         /// FTS5 query (e.g. "invoice", "report 2026").
         #[arg(long)]
         query: String,
@@ -228,8 +232,9 @@ fn run(command: Command) -> Result<(), String> {
         Command::Search {
             config,
             account,
+            all_accounts,
             query,
-        } => cmd_search(&config, &account, &query),
+        } => cmd_search(&config, account, all_accounts, &query),
         Command::Restore {
             config,
             account,
@@ -489,8 +494,8 @@ fn cmd_sync(config: &Path, account: &str, token: Option<String>) -> Result<(), S
     Ok(())
 }
 
-/// Resolve which accounts a backup run targets.
-fn backup_targets(
+/// Resolve which accounts a run targets (shared by backup + search).
+fn select_accounts(
     cfg: &Config,
     account: Option<&str>,
     all_accounts: bool,
@@ -530,7 +535,7 @@ fn cmd_backup(
             ));
         }
     }
-    let targets = backup_targets(&cfg, account.as_deref(), all_accounts)?;
+    let targets = select_accounts(&cfg, account.as_deref(), all_accounts)?;
     let multi = targets.len() > 1;
     let mut failures = Vec::new();
     for acc in &targets {
@@ -733,19 +738,38 @@ fn search_account(
     Ok(hits)
 }
 
-fn cmd_search(config: &Path, account: &str, query: &str) -> Result<(), String> {
+fn cmd_search(
+    config: &Path,
+    account: Option<String>,
+    all_accounts: bool,
+    query: &str,
+) -> Result<(), String> {
     let cfg = load_config(config)?;
-    let hits = search_account(&cfg, account, query)?;
-    if hits.is_empty() {
-        println!("no matches for {query:?}");
-    } else {
-        println!("{} match(es) for {query:?}:", hits.len());
-        for h in &hits {
-            println!(
-                "  [{}/{}] {} ({})",
-                h.service, h.item_type, h.name, h.remote_id
-            );
+    let targets = select_accounts(&cfg, account.as_deref(), all_accounts)?;
+    let multi = targets.len() > 1;
+    let mut total = 0usize;
+    for acc in &targets {
+        match search_account(&cfg, acc, query) {
+            Ok(hits) => {
+                if !hits.is_empty() {
+                    if multi {
+                        println!("== account {acc} ==");
+                    }
+                    for h in &hits {
+                        println!(
+                            "  [{}/{}] {} ({})",
+                            h.service, h.item_type, h.name, h.remote_id
+                        );
+                    }
+                    total += hits.len();
+                }
+            }
+            // an account that was never backed up (no store) is just skipped
+            Err(e) => eprintln!("account {acc}: not searchable: {e}"),
         }
+    }
+    if total == 0 {
+        println!("no matches for {query:?}");
     }
     Ok(())
 }
@@ -1067,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_targets_resolution() {
+    fn select_accounts_resolution() {
         let mut cfg = Config::default();
         cfg.accounts.push(AccountConfig {
             id: "a".into(),
@@ -1082,21 +1106,21 @@ mod tests {
             archive_root: "/b/ar".into(),
         });
         // single account
-        assert_eq!(backup_targets(&cfg, Some("a"), false).unwrap(), vec!["a"]);
+        assert_eq!(select_accounts(&cfg, Some("a"), false).unwrap(), vec!["a"]);
         // all accounts
         assert_eq!(
-            backup_targets(&cfg, None, true).unwrap(),
+            select_accounts(&cfg, None, true).unwrap(),
             vec!["a".to_string(), "b".to_string()]
         );
         // both -> error; neither -> error
-        assert!(backup_targets(&cfg, Some("a"), true)
+        assert!(select_accounts(&cfg, Some("a"), true)
             .unwrap_err()
             .contains("not both"));
-        assert!(backup_targets(&cfg, None, false)
+        assert!(select_accounts(&cfg, None, false)
             .unwrap_err()
             .contains("--account"));
         // all-accounts with empty config -> error
-        assert!(backup_targets(&Config::default(), None, true)
+        assert!(select_accounts(&Config::default(), None, true)
             .unwrap_err()
             .contains("no accounts"));
     }
@@ -1149,10 +1173,65 @@ mod tests {
             c.command,
             Command::Search {
                 config: "isyncyou.toml".into(),
-                account: "a".into(),
+                account: Some("a".into()),
+                all_accounts: false,
                 query: "invoice".into(),
             }
         );
+    }
+
+    #[test]
+    fn cmd_search_across_accounts() {
+        // two accounts, each with a distinct item; --all-accounts searches both.
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-xacc-{}", std::process::id()));
+        let a1 = dir.join("a1");
+        let a2 = dir.join("a2");
+        std::fs::create_dir_all(&a1).unwrap();
+        std::fs::create_dir_all(&a2).unwrap();
+        let p = dir.join("c.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[[accounts]]\nid=\"one\"\nusername=\"one@o\"\nsync_root=\"{d}/o1\"\narchive_root=\"{a1}\"\n\
+                 [[accounts]]\nid=\"two\"\nusername=\"two@o\"\nsync_root=\"{d}/o2\"\narchive_root=\"{a2}\"\n",
+                d = dir.display(),
+                a1 = a1.display(),
+                a2 = a2.display(),
+            ),
+        )
+        .unwrap();
+        {
+            let s1 = Store::open(a1.join(".isyncyou-store.db")).unwrap();
+            s1.upsert_item(&isyncyou_store::Item::new(
+                "one",
+                "mail",
+                "m1",
+                "Invoice for one",
+                "message",
+            ))
+            .unwrap();
+            let s2 = Store::open(a2.join(".isyncyou-store.db")).unwrap();
+            s2.upsert_item(&isyncyou_store::Item::new(
+                "two",
+                "mail",
+                "m9",
+                "Invoice for two",
+                "message",
+            ))
+            .unwrap();
+        }
+        let cfg = load_config(&p).unwrap();
+        // each account finds only its own
+        assert_eq!(search_account(&cfg, "one", "invoice").unwrap().len(), 1);
+        assert_eq!(search_account(&cfg, "two", "invoice").unwrap().len(), 1);
+        // the selector resolves both for --all-accounts (the cross-account run)
+        assert_eq!(
+            select_accounts(&cfg, None, true).unwrap(),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        // cmd_search over all accounts completes without error
+        cmd_search(&p, None, true, "invoice").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
