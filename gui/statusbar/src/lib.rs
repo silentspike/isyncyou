@@ -7,11 +7,11 @@
 //!
 //! [`render`] returns a [`tiny_skia::Pixmap`]; [`render_png`] encodes it.
 //!
-//! Text uses a **bundled** font (a Latin-1/punctuation/arrows subset of DejaVu
-//! Sans, permissively licensed — see `assets/FONT-LICENSE.md`) loaded into a
-//! [`FontSystem`] with no system-font scan, so glyphs render identically and
-//! deterministically on any machine — including a headless CI box with no fonts
-//! installed.
+//! Text uses a **bundled** font (JetBrains Mono, SIL OFL-1.1 — see
+//! `assets/JetBrainsMono-OFL.txt`) loaded into a [`FontSystem`] with no
+//! system-font scan, so glyphs render identically and deterministically on any
+//! machine — including a headless CI box with no fonts installed. JetBrains Mono
+//! covers every glyph the UI uses (Latin + German umlauts + arrows ↓↑→ + ⚠/…).
 
 use cosmic_text::{
     Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache,
@@ -24,11 +24,11 @@ use tiny_skia::{
 pub const WIDTH: u32 = 380;
 pub const HEIGHT: u32 = 560;
 
-/// The bundled UI font (DejaVu Sans subset). Embedded so text never depends on
-/// system fonts.
-const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSans-subset.ttf");
+/// The bundled UI font (JetBrains Mono Regular, SIL OFL-1.1). Embedded so text
+/// never depends on system fonts.
+const FONT_DATA: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
 /// Family name of [`FONT_DATA`].
-const FONT_FAMILY: &str = "DejaVu Sans";
+const FONT_FAMILY: &str = "JetBrains Mono";
 
 /// A [`FontSystem`] containing **only** the bundled font (no system scan), so
 /// rendering is deterministic and works on a font-less headless host.
@@ -675,6 +675,15 @@ mod tests {
         // Exactly one face (no system scan) => deterministic, font-less-host safe.
         let fs = bundled_font_system();
         assert_eq!(fs.db().faces().count(), 1);
+        // ...and it is JetBrains Mono (the user-chosen monospace), not a system font.
+        let face = fs.db().faces().next().expect("one bundled face");
+        assert!(
+            face.families
+                .iter()
+                .any(|(name, _)| name.contains("JetBrains Mono")),
+            "bundled face families = {:?}",
+            face.families
+        );
     }
 
     #[test]
