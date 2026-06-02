@@ -597,6 +597,23 @@ mod tests {
     }
 
     #[test]
+    fn index_wires_overview_dashboard() {
+        // the embedded UI must call the overview endpoints and expose the panel,
+        // so the front-end wiring can't silently regress.
+        for needle in [
+            "/api/v1/status",
+            "/api/v1/settings",
+            "showOverview",
+            "Overview",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "web UI is missing '{needle}' (overview dashboard wiring)"
+            );
+        }
+    }
+
+    #[test]
     fn accounts_lists_configured_accounts() {
         let (_d, router) = setup();
         let resp = router.route(&ApiRequest::get("/api/v1/accounts"));

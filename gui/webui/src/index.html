@@ -26,25 +26,37 @@
   .muted { color: #8e9db3; }
   td a { color: #8ec6ff; text-decoration: none; }
   td a:hover { text-decoration: underline; }
+  h3 { font-size: 13px; text-transform: uppercase; color: #8e9db3; letter-spacing: .05em; margin: 22px 0 10px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; }
+  .card { background: #111a28; border: 1px solid #1d2942; border-radius: 10px; padding: 14px 16px; min-width: 130px; }
+  .card .n { font-size: 22px; font-weight: 700; }
+  .card .n small { font-size: 13px; font-weight: 400; color: #8e9db3; }
+  .card .l { color: #8e9db3; font-size: 13px; text-transform: capitalize; }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 14px; max-width: 620px; }
+  .kv dt { color: #8e9db3; } .kv dd { margin: 0; }
 </style>
 </head>
 <body>
 <header><div class="logo"></div><h1>iSyncYou — Archive</h1><span class="muted" id="acct"></span></header>
 <main>
   <nav>
-    <h2>Account</h2>
+    <button id="ov-btn" class="active" onclick="showOverview()">Overview</button>
+    <h2 style="margin-top:18px">Account</h2>
     <select id="account"></select>
     <h2 style="margin-top:18px">Service</h2>
     <div id="services"></div>
   </nav>
   <section>
-    <div class="bar">
-      <input id="q" placeholder="Search names / subjects…">
-      <button onclick="doSearch()">Search</button>
+    <div id="overview" class="muted">Loading…</div>
+    <div id="browse" hidden>
+      <div class="bar">
+        <input id="q" placeholder="Search names / subjects…">
+        <button onclick="doSearch()">Search</button>
+      </div>
+      <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      </table>
     </div>
-    <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
-    </table>
   </section>
 </main>
 <script>
@@ -87,17 +99,56 @@ async function doSearch() {
 }
 function pickService(s) {
   service = s;
+  document.getElementById("ov-btn").classList.remove("active");
   [...document.querySelectorAll("#services button")].forEach(b => b.classList.toggle("active", b.textContent === s));
+  document.getElementById("overview").hidden = true;
+  document.getElementById("browse").hidden = false;
   loadItems();
+}
+async function showOverview() {
+  document.getElementById("ov-btn").classList.add("active");
+  [...document.querySelectorAll("#services button")].forEach(b => b.classList.remove("active"));
+  document.getElementById("browse").hidden = true;
+  const ov = document.getElementById("overview");
+  ov.hidden = false;
+  if (!account) { ov.textContent = "No account configured."; return; }
+  const [st, cfg] = await Promise.all([
+    api(`/api/v1/status?account=${encodeURIComponent(account)}`),
+    api("/api/v1/settings"),
+  ]);
+  const cards = (st.services || []).map(s =>
+    `<div class="card"><div class="n">${s.items} <small>items</small></div>
+     <div class="n" style="font-size:15px">${s.archived} <small>archived</small></div>
+     <div class="l">${escapeHtml(s.service)}</div></div>`).join("")
+    || `<div class="muted">No archived items yet.</div>`;
+  const t = (st.totals || {}), sy = (cfg.sync || {}), dg = (sy.delete_guard || {});
+  const acc = (cfg.accounts || []).find(a => a.id === account) || {};
+  ov.innerHTML =
+    `<h3>Archive overview</h3><div class="cards">${cards}</div>
+     <h3>Totals</h3><div class="cards">
+       <div class="card"><div class="n">${t.items ?? 0}</div><div class="l">total items</div></div>
+       <div class="card"><div class="n">${t.archived ?? 0}</div><div class="l">archived bodies</div></div>
+       <div class="card"><div class="n">${st.onedrive_cursor ? "yes" : "no"}</div><div class="l">OneDrive cursor</div></div>
+     </div>
+     <h3>Settings</h3><dl class="kv">
+       <dt>Account</dt><dd>${escapeHtml(acc.username || account)}</dd>
+       <dt>Sync root</dt><dd>${escapeHtml(acc.sync_root || "")}</dd>
+       <dt>Archive root</dt><dd>${escapeHtml(acc.archive_root || "")}</dd>
+       <dt>Trash retention</dt><dd>${sy.trash_retention_days ?? "?"} days</dd>
+       <dt>Body index (FTS)</dt><dd>${sy.body_index ? "on" : "off"}</dd>
+       <dt>Change source</dt><dd>${escapeHtml(sy.change_source || "?")}</dd>
+       <dt>Delete guard</dt><dd>max ${dg.max_absolute ?? "?"} abs / ${dg.max_fraction ?? "?"} fraction (min ${dg.fraction_min_total ?? "?"})</dd>
+     </dl>`;
 }
 async function init() {
   document.getElementById("services").innerHTML =
-    SERVICES.map(s => `<button onclick="pickService('${s}')"${s===service?' class="active"':''}>${s}</button>`).join("");
+    SERVICES.map(s => `<button onclick="pickService('${s}')">${s}</button>`).join("");
   const d = await api("/api/v1/accounts");
   const sel = document.getElementById("account");
   sel.innerHTML = (d.accounts || []).map(a => `<option value="${a.id}">${escapeHtml(a.username)}</option>`).join("");
-  sel.onchange = () => { account = sel.value; loadItems(); };
-  if (d.accounts && d.accounts.length) { account = d.accounts[0].id; document.getElementById("acct").textContent = d.accounts[0].username; loadItems(); }
+  sel.onchange = () => { account = sel.value; document.getElementById("ov-btn").classList.contains("active") ? showOverview() : loadItems(); };
+  if (d.accounts && d.accounts.length) { account = d.accounts[0].id; document.getElementById("acct").textContent = d.accounts[0].username; }
+  showOverview();
 }
 init();
 </script>
