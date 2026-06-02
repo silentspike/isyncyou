@@ -13,11 +13,11 @@ Public-facing docs. The detailed design (SDD) is maintained internally.
 - [local-api-security.md](local-api-security.md) — local web UI/API security.
 - [auth-token-lifecycle.md](auth-token-lifecycle.md) — OAuth, token storage, invalidation.
 - [packaging-daemon-model.md](packaging-daemon-model.md) — daemon vs. GUI packaging & distribution.
+- [html-viewer-security.md](html-viewer-security.md) — safe rendering of archived items (escape + CSP).
+- [test-chaos-matrix.md](test-chaos-matrix.md) — chaos / data-loss matrix and how each case is verified.
 
 ## Planned artifacts
 
 These will be filled as the corresponding work lands:
 
 - `sqlite-snapshot-consistency.md` — quiesce / WAL checkpoint / PBS (quiesce not yet implemented).
-- `html-viewer-security.md` — sanitized mail viewer (viewer not yet implemented).
-- `test-chaos-matrix.md` — chaos / data-loss matrix (logic-level lives in `crates/acceptance`).

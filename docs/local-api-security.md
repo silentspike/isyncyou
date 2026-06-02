@@ -21,11 +21,19 @@ capability-token auth lands.
 - **No secrets in responses** — item endpoints serialize metadata only
   (`has_body` flag, never the token cache or absolute paths).
 
+- **Rendered viewer is escape-safe + CSP-locked** — `GET /api/v1/view` renders
+  our own canonical JSON with every value HTML-escaped and a raw `.eml` as escaped
+  source, and the response carries a strict `Content-Security-Policy`
+  (`default-src 'none'; …`) so the page loads/runs nothing. See
+  [html-viewer-security.md](html-viewer-security.md).
+
 ## Endpoints
 
-`GET /` (UI), `GET /api/v1/accounts`, `/items?account&service`, `/item?…&id`,
-`/body?…&id`, `/search?account&q` (names + indexed mail bodies). Bad params → `400`,
-unknown account → `404`.
+`GET /` (UI), `GET /api/v1/accounts`, `/settings` (whitelisted sync config +
+account roots, no secrets), `/status?account` (per-service counts),
+`/items?account&service`, `/item?…&id`, `/body?…&id` (inert bytes),
+`/view?…&id` (safe rendered page), `/search?account&q` (names + indexed mail
+bodies). Bad params → `400`, unknown account → `404`.
 
 ## Planned hardening (plan §11 — not yet implemented)
 
