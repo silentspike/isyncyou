@@ -4,11 +4,13 @@
 //!
 //! Currently: the per-item [`sync_state`] automaton and the [`conflict`] engine.
 
+pub mod config;
 pub mod conflict;
 pub mod guard;
 pub mod recovery;
 pub mod sync_state;
 
+pub use config::{AccountConfig, ChangeSource, Config, DeleteGuardConfig, SyncConfig};
 pub use conflict::{
     classify, compare_versions, conflict_copy_name, resolve, Change, ConflictKind, ConflictPolicy,
     Resolution, Versus,
