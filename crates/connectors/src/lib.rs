@@ -45,3 +45,16 @@ pub use restore::{
 };
 pub use shared::{sync_shared_with_me, SharedReport};
 pub use todo::{incremental_sync_todo, TodoReport};
+
+/// Serializes the `live_*` integration tests. They all exercise one shared,
+/// rate-limited throwaway account, so running them concurrently self-throttles
+/// (a `429` storm that can exhaust a single walk's retry budget). Each live test
+/// acquires this process-wide gate first, so they run one at a time regardless
+/// of the test harness's thread count (plan §16: the real test account is
+/// exercised serialized). A panicking test poisons the lock; we recover the
+/// guard so one failure doesn't cascade into "poisoned" failures for the rest.
+#[cfg(test)]
+pub(crate) fn live_test_gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|poison| poison.into_inner())
+}
