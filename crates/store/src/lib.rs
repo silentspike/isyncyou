@@ -319,6 +319,18 @@ impl Store {
             .optional()?)
     }
 
+    /// All non-deleted items of a service (any type), ordered by type then name.
+    /// Drives the web UI's per-service listing.
+    pub fn items_by_service(&self, account: &str, service: &str) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL
+             ORDER BY item_type, name"
+        ))?;
+        let rows = stmt.query_map(params![account, service], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// All non-deleted items of a given `item_type` for a service, ordered by
     /// `remote_id` (stable). Used to drive content downloads (e.g. fetch the MIME
     /// for every stored mail `message`) and listings.
@@ -504,6 +516,24 @@ mod tests {
         // diacritics-insensitive tokenizer
         s.upsert_item(&item("a", "r4", "Lebenslauf.pdf")).unwrap();
         assert_eq!(s.search_names("a", "lebenslauf").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn items_by_service_returns_all_types_non_deleted() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_item(&Item::new("a", "mail", "F1", "Inbox", "folder"))
+            .unwrap();
+        s.upsert_item(&Item::new("a", "mail", "m1", "Hi", "message"))
+            .unwrap();
+        s.upsert_item(&Item::new("a", "calendar", "e1", "Ev", "event"))
+            .unwrap();
+        s.mark_deleted("a", "mail", "m1", "2026-06-02T00:00:00Z")
+            .unwrap();
+        let mail = s.items_by_service("a", "mail").unwrap();
+        assert_eq!(mail.len(), 1); // folder only (message tombstoned)
+        assert_eq!(mail[0].remote_id, "F1");
+        assert_eq!(s.items_by_service("a", "calendar").unwrap().len(), 1);
+        assert!(s.items_by_service("a", "todo").unwrap().is_empty());
     }
 
     #[test]
