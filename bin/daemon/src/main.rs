@@ -19,6 +19,10 @@ struct Args {
     /// Address to bind the local web UI/API (localhost only by default).
     #[arg(long, default_value = "127.0.0.1:8765")]
     bind: String,
+    /// Serve on a Unix-domain socket instead of TCP (owner-only, mode 0600 — the
+    /// desktop default per plan §11). When set, --bind is ignored.
+    #[arg(long)]
+    socket: Option<PathBuf>,
     /// Liveness heartbeat interval in seconds (0 disables).
     #[arg(long, default_value_t = 300)]
     heartbeat_secs: u64,
@@ -26,30 +30,42 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    if let Err(e) = run(&args.config, &args.bind, args.heartbeat_secs) {
+    if let Err(e) = run(&args.config, &args.bind, args.socket, args.heartbeat_secs) {
         eprintln!("isyncyoud: error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(config: &Path, bind: &str, heartbeat_secs: u64) -> Result<(), String> {
+fn run(
+    config: &Path,
+    bind: &str,
+    socket: Option<PathBuf>,
+    heartbeat_secs: u64,
+) -> Result<(), String> {
     let cfg = load_config(config)?;
     let n = cfg.accounts.len();
-    eprintln!("isyncyoud: {n} account(s) configured; serving web UI on http://{bind}/");
+    let where_ = match &socket {
+        Some(p) => format!("unix:{}", p.display()),
+        None => format!("http://{bind}/"),
+    };
+    eprintln!("isyncyoud: {n} account(s) configured; serving web UI on {where_}");
 
     if heartbeat_secs > 0 {
-        let bind = bind.to_string();
+        let where_ = where_.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(heartbeat_secs));
             // Liveness only — no store access (the web UI opens stores per request
             // and holds the single-instance lock momentarily; the daemon must not
             // hold it open).
-            eprintln!("isyncyoud: alive, {n} account(s), web UI on http://{bind}/");
+            eprintln!("isyncyoud: alive, {n} account(s), web UI on {where_}");
         });
     }
 
     let router = isyncyou_webui::Router::new(cfg);
-    isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}"))
+    match socket {
+        Some(path) => isyncyou_webui::serve_unix(&path, router).map_err(|e| format!("serve: {e}")),
+        None => isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}")),
+    }
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
@@ -70,6 +86,7 @@ mod tests {
             Args {
                 config: "isyncyou.toml".into(),
                 bind: "127.0.0.1:8765".into(),
+                socket: None,
                 heartbeat_secs: 300,
             }
         );
@@ -90,6 +107,17 @@ mod tests {
         assert_eq!(a.config, PathBuf::from("/etc/isyncyou.toml"));
         assert_eq!(a.bind, "0.0.0.0:9000");
         assert_eq!(a.heartbeat_secs, 0);
+        assert_eq!(a.socket, None);
+    }
+
+    #[test]
+    fn parses_socket() {
+        let a = Args::try_parse_from(["isyncyoud", "--socket", "/run/user/1000/isyncyou.sock"])
+            .unwrap();
+        assert_eq!(
+            a.socket,
+            Some(PathBuf::from("/run/user/1000/isyncyou.sock"))
+        );
     }
 
     #[test]

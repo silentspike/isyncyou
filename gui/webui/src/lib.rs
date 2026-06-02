@@ -25,6 +25,8 @@ use std::path::PathBuf;
 
 mod serve;
 mod view;
+#[cfg(unix)]
+pub use serve::serve_unix;
 pub use serve::{format_http, parse_request_line, serve};
 
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
