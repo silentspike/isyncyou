@@ -211,13 +211,13 @@ impl GraphClient {
         }
     }
 
-    /// Download a drive item's content by id (follows the redirect to the
-    /// pre-signed download URL).
-    pub fn download_content(&self, item_id: &str) -> Result<Vec<u8>, UploadError> {
-        let url = format!("{GRAPH}/me/drive/items/{item_id}/content");
+    /// GET an arbitrary Graph URL and return the raw response body bytes
+    /// (follows redirects to pre-signed download URLs). Used for binary/content
+    /// endpoints like a drive item's `/content` or a message's `/$value` (MIME).
+    pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, UploadError> {
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .bearer_auth(&self.token)
             .send()
             .map_err(|e| UploadError::Transport(e.to_string()))?;
@@ -231,6 +231,17 @@ impl GraphClient {
         resp.bytes()
             .map(|b| b.to_vec())
             .map_err(|e| UploadError::Transport(e.to_string()))
+    }
+
+    /// Download a drive item's content by id (follows the redirect to the
+    /// pre-signed download URL).
+    pub fn download_content(&self, item_id: &str) -> Result<Vec<u8>, UploadError> {
+        self.get_bytes(&format!("{GRAPH}/me/drive/items/{item_id}/content"))
+    }
+
+    /// Download a mail message's full MIME (`.eml`) by id.
+    pub fn download_message_mime(&self, message_id: &str) -> Result<Vec<u8>, UploadError> {
+        self.get_bytes(&format!("{GRAPH}/me/messages/{message_id}/$value"))
     }
 }
 

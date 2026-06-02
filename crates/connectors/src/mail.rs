@@ -8,11 +8,12 @@
 //! identity instead of being lost: we only tombstone a removal if the message
 //! still belongs to the folder reporting it.
 
-use crate::common::fetch_pages;
+use crate::common::{fetch_pages, shard_path};
 use crate::onedrive::SyncError;
 use isyncyou_graph::{run_delta, DeltaCursor, Transport};
 use isyncyou_store::{Item, Store};
 use serde_json::Value;
+use std::path::Path;
 
 const SERVICE: &str = "mail";
 const FOLDERS_URL: &str = "https://graph.microsoft.com/v1.0/me/mailFolders?$top=100";
@@ -97,6 +98,77 @@ enum Ingest {
     Upserted,
     Deleted,
     Skipped,
+}
+
+/// Fetches a message's full MIME (`.eml`) by id. Abstracted so the body-download
+/// driver is unit-testable with a mock and live-tested with the real client.
+pub trait MimeFetcher {
+    fn fetch_mime(&self, message_id: &str) -> Result<Vec<u8>, String>;
+}
+
+#[cfg(feature = "http")]
+impl MimeFetcher for isyncyou_graph::GraphClient {
+    fn fetch_mime(&self, message_id: &str) -> Result<Vec<u8>, String> {
+        self.download_message_mime(message_id)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// What one body-download pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyReport {
+    /// Messages whose MIME was fetched and written this pass.
+    pub downloaded: usize,
+    /// Messages skipped because their body was already on disk.
+    pub skipped: usize,
+    /// Total bytes written this pass.
+    pub bytes: u64,
+}
+
+/// Download `.eml` MIME for stored mail messages that don't yet have a local
+/// body, writing each (atomically) under `archive_root` in a sharded layout and
+/// recording the relative path in the store. `limit` caps how many are fetched
+/// in one pass (`0` = no limit). Already-downloaded messages are skipped, so
+/// this is safe to call repeatedly and resumes where it left off.
+pub fn backup_message_bodies<F: MimeFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    limit: usize,
+) -> Result<BodyReport, SyncError> {
+    let mut report = BodyReport::default();
+    for msg in store.items_by_type(account, SERVICE, "message")? {
+        if msg.local_path.is_some() {
+            report.skipped += 1;
+            continue;
+        }
+        if limit != 0 && report.downloaded >= limit {
+            break;
+        }
+        let mime = fetcher
+            .fetch_mime(&msg.remote_id)
+            .map_err(SyncError::Remote)?;
+        let abs = shard_path(archive_root, SERVICE, &msg.remote_id, "eml");
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // tmp + rename: a crash never leaves a half-written .eml in place.
+        let tmp = abs.with_extension("eml.part");
+        std::fs::write(&tmp, &mime)?;
+        std::fs::rename(&tmp, &abs)?;
+
+        let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+        store.set_local_path(
+            account,
+            SERVICE,
+            &msg.remote_id,
+            Some(&rel.to_string_lossy()),
+        )?;
+        report.downloaded += 1;
+        report.bytes += mime.len() as u64;
+    }
+    Ok(report)
 }
 
 /// Ingest one message-delta entry for a given folder.
@@ -306,6 +378,64 @@ mod tests {
         );
     }
 
+    struct MockFetcher(Vec<u8>);
+    impl MimeFetcher for MockFetcher {
+        fn fetch_mime(&self, _id: &str) -> Result<Vec<u8>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn store_with_two_messages() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        for (id, sub) in [("m1", "Hello"), ("m2", "Hi")] {
+            let mut it = Item::new("acc", SERVICE, id, sub, "message");
+            it.parent_remote_id = Some("FA".into());
+            store.upsert_item(&it).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn downloads_bodies_and_records_local_path() {
+        let store = store_with_two_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let mime = b"From: a@example.com\r\nSubject: Hello\r\n\r\nBody text\r\n".to_vec();
+        let f = MockFetcher(mime.clone());
+
+        let r = backup_message_bodies(&f, &store, "acc", dir.path(), 0).unwrap();
+        assert_eq!(r.downloaded, 2);
+        assert_eq!(r.skipped, 0);
+        assert_eq!(r.bytes, (mime.len() * 2) as u64);
+
+        // local_path recorded, file present with the MIME content
+        let m1 = store.get_item("acc", SERVICE, "m1").unwrap().unwrap();
+        let rel = m1.local_path.expect("local_path set");
+        assert!(rel.starts_with("mail/"));
+        let path = dir.path().join(&rel);
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), mime);
+        // no leftover .part temp file
+        assert!(!path.with_extension("eml.part").exists());
+
+        // second pass skips already-downloaded bodies
+        let r2 = backup_message_bodies(&f, &store, "acc", dir.path(), 0).unwrap();
+        assert_eq!(r2.downloaded, 0);
+        assert_eq!(r2.skipped, 2);
+    }
+
+    #[test]
+    fn limit_caps_downloads_per_pass() {
+        let store = store_with_two_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let f = MockFetcher(b"x".to_vec());
+        let r = backup_message_bodies(&f, &store, "acc", dir.path(), 1).unwrap();
+        assert_eq!(r.downloaded, 1);
+        // the other message still has no body -> a later pass picks it up
+        let r2 = backup_message_bodies(&f, &store, "acc", dir.path(), 1).unwrap();
+        assert_eq!(r2.downloaded, 1);
+        assert_eq!(r2.skipped, 1);
+    }
+
     /// Live: real per-folder mail delta -> store, against the throwaway account.
     /// Needs feature `http` + `ISYNCYOU_TEST_TOKEN` carrying `Mail.Read`.
     #[cfg(feature = "http")]
@@ -332,6 +462,51 @@ mod tests {
         eprintln!(
             "live mail sync: folders={} upserted={} deleted={} skipped={}",
             report.folders, report.upserted, report.deleted, report.skipped
+        );
+    }
+
+    /// Live: index the mailbox, then download a few real `.eml` bodies and check
+    /// they are valid MIME. Needs feature `http` + `ISYNCYOU_TEST_TOKEN`
+    /// (`Mail.Read`).
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_download_message_bodies() {
+        let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!("skipping live_download_message_bodies: ISYNCYOU_TEST_TOKEN not set");
+                return;
+            }
+        };
+        let store = Store::open_in_memory().unwrap();
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let idx = incremental_sync_mail(&mut client, &store, "backupslave", "2026-06-02T00:00:00Z")
+            .expect("index sync should succeed");
+        if idx.upserted == 0 {
+            eprintln!("no messages to download; skipping body assertions");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = backup_message_bodies(&client, &store, "backupslave", dir.path(), 3)
+            .expect("body download should succeed");
+        assert!(r.downloaded >= 1, "expected at least one .eml");
+        assert!(r.bytes > 0, "expected non-empty MIME");
+
+        // verify one downloaded file is plausibly MIME (has a header line).
+        let one = store
+            .items_by_type("backupslave", SERVICE, "message")
+            .unwrap()
+            .into_iter()
+            .find(|m| m.local_path.is_some())
+            .unwrap();
+        let bytes = std::fs::read(dir.path().join(one.local_path.unwrap())).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(bytes.contains(&b':'), "MIME should contain header colons");
+        eprintln!(
+            "live body download: downloaded={} bytes={} (first file {} bytes)",
+            r.downloaded,
+            r.bytes,
+            bytes.len()
         );
     }
 }
