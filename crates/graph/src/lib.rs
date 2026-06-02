@@ -16,8 +16,13 @@
 
 pub mod client;
 pub mod error;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod throttle;
 pub mod upload;
+
+#[cfg(feature = "http")]
+pub use http::GraphClient;
 
 pub use client::{run_delta, DeltaError, DeltaOutcome, Response, Transport};
 pub use error::{classify, GraphAction};
