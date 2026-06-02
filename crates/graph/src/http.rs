@@ -243,6 +243,53 @@ impl GraphClient {
     pub fn download_message_mime(&self, message_id: &str) -> Result<Vec<u8>, UploadError> {
         self.get_bytes(&format!("{GRAPH}/me/messages/{message_id}/$value"))
     }
+
+    /// POST a JSON body to a Graph collection and return the created resource
+    /// (used by restore: re-create events/tasks/contacts). `url` may be absolute
+    /// or a `/me/...` path (prefixed with the Graph base).
+    pub fn post_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        let url = abs(url);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        json_or_err(resp)
+    }
+
+    /// DELETE an arbitrary Graph resource (used for restore-test cleanup on the
+    /// throwaway account). `url` may be absolute or a `/me/...` path.
+    pub fn delete_url(&self, url: &str) -> Result<(), UploadError> {
+        let url = abs(url);
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 202 | 204 => Ok(()),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(200).collect(),
+            }),
+        }
+    }
+}
+
+/// Prefix a bare `/me/...` path with the Graph base; pass absolute URLs through.
+fn abs(url: &str) -> String {
+    if url.starts_with("http") {
+        url.to_string()
+    } else {
+        format!("{GRAPH}{url}")
+    }
 }
 
 fn json_or_err(resp: reqwest::blocking::Response) -> Result<serde_json::Value, UploadError> {

@@ -16,6 +16,7 @@ pub mod contacts;
 pub mod mail;
 pub mod onedrive;
 pub mod onenote;
+pub mod restore;
 pub mod todo;
 
 pub use calendar::{incremental_sync_calendar, CalendarReport};
@@ -25,4 +26,5 @@ pub use onedrive::{
     incremental_sync, push_delete, push_upload, RemoteWriter, SyncError, SyncReport,
 };
 pub use onenote::{incremental_sync_onenote, OneNoteReport};
+pub use restore::{restore_event, sanitize_event, EventRestorer};
 pub use todo::{incremental_sync_todo, TodoReport};
