@@ -543,6 +543,14 @@ version = "0.1.0"
 [[package]]
 name = "isyncyou-connectors"
 version = "0.1.0"
+dependencies = [
+ "isyncyou-graph",
+ "isyncyou-pathmap",
+ "isyncyou-store",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "isyncyou-core"
