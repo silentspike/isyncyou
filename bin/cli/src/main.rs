@@ -193,6 +193,10 @@ enum Command {
         /// Address to bind (localhost only by default).
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: String,
+        /// Serve on a Unix-domain socket instead of TCP (the desktop default,
+        /// owner-only mode 0600). When set, --bind is ignored.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
     /// Sign in (device-code) and cache the account's token for later commands.
     Login {
@@ -326,7 +330,11 @@ fn run(command: Command) -> Result<(), String> {
             account,
             new_archive_root,
         } => cmd_migrate(&config, &account, &new_archive_root),
-        Command::Serve { config, bind } => cmd_serve(&config, &bind),
+        Command::Serve {
+            config,
+            bind,
+            socket,
+        } => cmd_serve(&config, &bind, socket),
         Command::Login {
             config,
             account,
@@ -402,10 +410,13 @@ fn cmd_login(config: &Path, account: &str, write: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_serve(config: &Path, bind: &str) -> Result<(), String> {
+fn cmd_serve(config: &Path, bind: &str, socket: Option<PathBuf>) -> Result<(), String> {
     let cfg = load_config(config)?;
     let router = isyncyou_webui::Router::new(cfg);
-    isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}"))
+    match socket {
+        Some(path) => isyncyou_webui::serve_unix(&path, router).map_err(|e| format!("serve: {e}")),
+        None => isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}")),
+    }
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
