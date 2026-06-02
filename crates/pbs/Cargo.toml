@@ -1,6 +1,6 @@
 [package]
 name = "isyncyou-pbs"
-description = "Trigger Proxmox Backup Server backup/restore (user never touches Proxmox directly)."
+description = "Trigger Proxmox Backup Server snapshot/restore of the store (plan §9.2/§12)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
