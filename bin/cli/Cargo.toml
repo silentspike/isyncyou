@@ -24,11 +24,9 @@ isyncyou-pbs = { path = "../../crates/pbs" }
 isyncyou-webui = { path = "../../gui/webui" }
 isyncyou-change-source = { version = "0.1.0", path = "../../crates/change-source" }
 
-# FUSE placeholder mount is Unix-only (fuser/libc); the `mount` command is gated out
-# on other targets (e.g. Windows builds).
-[target.'cfg(unix)'.dependencies]
-isyncyou-fuse = { path = "../../crates/fuse" }
-
-# The `dolphin-status` command (DBus client for the KDE ServiceMenu) is Linux-only.
+# Linux-only deps: the FUSE placeholder mount (fuser, mounts via fusermount3) and
+# the `dolphin-status` DBus client. Gated to linux so the cli cross-builds cleanly
+# on Windows AND macOS (the `mount` command is compiled out on both).
 [target.'cfg(target_os = "linux")'.dependencies]
+isyncyou-fuse = { path = "../../crates/fuse" }
 isyncyou-dbus-status = { path = "../../crates/dbus-status" }
