@@ -28,7 +28,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE items (
@@ -143,6 +143,23 @@ ALTER TABLE items ADD COLUMN ical_uid TEXT;
 /// recurrence rule) distinct from its expanded occurrences.
 const MIGRATION_V5: &str = r#"
 ALTER TABLE items ADD COLUMN series_master_id TEXT;
+"#;
+
+/// Schema v6: persisted resumable upload sessions (plan §6/§9). A large OneDrive
+/// upload's session (`uploadUrl` + total + last next-offset) is recorded here so a
+/// process kill mid-upload resumes from the server's `nextExpectedRanges` instead
+/// of restarting. The row is cleared on completion. Keyed by destination path.
+const MIGRATION_V6: &str = r#"
+CREATE TABLE upload_sessions (
+    account_id   TEXT NOT NULL,
+    service      TEXT NOT NULL,
+    dest_path    TEXT NOT NULL,
+    upload_url   TEXT NOT NULL,
+    total        INTEGER NOT NULL,
+    next_offset  INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, service, dest_path)
+);
 "#;
 
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
@@ -559,6 +576,64 @@ impl Store {
             .optional()?)
     }
 
+    /// Persist a resumable upload session for `dest_path` (plan §6/§9) so a process
+    /// kill mid-upload can resume from the server instead of restarting.
+    pub fn save_upload_session(
+        &self,
+        account: &str,
+        service: &str,
+        dest_path: &str,
+        upload_url: &str,
+        total: i64,
+        next_offset: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO upload_sessions
+                 (account_id, service, dest_path, upload_url, total, next_offset)
+               VALUES (?1,?2,?3,?4,?5,?6)
+               ON CONFLICT(account_id, service, dest_path) DO UPDATE SET
+                 upload_url  = excluded.upload_url,
+                 total       = excluded.total,
+                 next_offset = excluded.next_offset",
+            params![account, service, dest_path, upload_url, total, next_offset],
+        )?;
+        Ok(())
+    }
+
+    /// The persisted upload session for `dest_path`, as `(upload_url, total)`, or
+    /// `None` if there is no in-flight session.
+    pub fn get_upload_session(
+        &self,
+        account: &str,
+        service: &str,
+        dest_path: &str,
+    ) -> Result<Option<(String, u64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT upload_url, total FROM upload_sessions
+                 WHERE account_id=?1 AND service=?2 AND dest_path=?3",
+                params![account, service, dest_path],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?)
+    }
+
+    /// Remove a persisted upload session (called on completion or when abandoned).
+    pub fn clear_upload_session(
+        &self,
+        account: &str,
+        service: &str,
+        dest_path: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM upload_sessions
+             WHERE account_id=?1 AND service=?2 AND dest_path=?3",
+            params![account, service, dest_path],
+        )?;
+        Ok(())
+    }
+
     /// Record a completed engine run (one sync/backup/… pass) in the activity
     /// history. Returns the new run id.
     pub fn add_run(
@@ -702,6 +777,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 5 {
         conn.execute_batch(MIGRATION_V5)?;
+    }
+    if v < 6 {
+        conn.execute_batch(MIGRATION_V6)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -961,5 +1039,49 @@ mod tests {
         drop(restored);
         // VACUUM INTO refuses a pre-existing target; backup_to clears it first
         store.backup_to(&snap).unwrap();
+    }
+
+    #[test]
+    fn upload_session_roundtrips_and_clears() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store
+            .get_upload_session("a", "onedrive", "/Big.bin")
+            .unwrap()
+            .is_none());
+        store
+            .save_upload_session("a", "onedrive", "/Big.bin", "https://up/1", 1_048_576, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_upload_session("a", "onedrive", "/Big.bin")
+                .unwrap(),
+            Some(("https://up/1".to_string(), 1_048_576))
+        );
+        // saving again updates url + offset in place (one row per dest)
+        store
+            .save_upload_session(
+                "a",
+                "onedrive",
+                "/Big.bin",
+                "https://up/2",
+                1_048_576,
+                327_680,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_upload_session("a", "onedrive", "/Big.bin")
+                .unwrap()
+                .unwrap()
+                .0,
+            "https://up/2"
+        );
+        store
+            .clear_upload_session("a", "onedrive", "/Big.bin")
+            .unwrap();
+        assert!(store
+            .get_upload_session("a", "onedrive", "/Big.bin")
+            .unwrap()
+            .is_none());
     }
 }
