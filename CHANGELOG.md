@@ -41,7 +41,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   packaging/daemon model.
 
 ### Not yet implemented
-- Native windowed GUI / tray + onboarding wizard (need a display server).
-- Flatpak / AppImage GUI bundling (need the GUI binary + build tooling).
-- restore-from-PBS-snapshot; Event Hub realtime; eBPF/fanotify; FUSE placeholders;
-  Windows/macOS builds; sanitized HTML mail viewer.
+- macOS build (Linux + Windows are built; macOS needs a Mac build host).
+- eBPF change-source backend (the fanotify backend already covers the privileged
+  server case; eBPF would be a further optimization).
+
+### Out of scope (by design)
+- Azure Event Hub realtime push: would require a paid Azure subscription, and
+  iSyncYou takes no paid cloud dependency. Adaptive delta-polling (implemented) is
+  the change-detection mechanism; Graph notifications are only hints anyway, so a
+  delta pull always follows.
