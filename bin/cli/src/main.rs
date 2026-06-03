@@ -2234,7 +2234,8 @@ mod tests {
         std::fs::write(
             &p,
             format!(
-                "[[accounts]]\nid=\"a\"\nusername=\"a@outlook.com\"\nsync_root=\"{}/od\"\narchive_root=\"{}\"\n",
+                "[[accounts]]\nid=\"a\"\nusername=\"a@outlook.com\"\nsync_root=\"{}/od\"\narchive_root=\"{}\"\n\
+                 [restore]\ncloud_restore_enabled=true\n",
                 dir.display(),
                 arch.display()
             ),
@@ -2303,6 +2304,29 @@ mod tests {
         // a missing id is reported distinctly
         let err2 = cmd_restore(&p, "a", "calendar", "missing", None, Some("T".into())).unwrap_err();
         assert!(err2.contains("no archived calendar item"), "got: {err2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_restore_blocked_when_flag_off_at_cli() {
+        // A config that does not opt in (default off) must refuse a cloud restore at
+        // the CLI boundary, before touching the store or network. Local restore
+        // (no token) stays available and is not gated.
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-gate-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = dir.join("c.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[[accounts]]\nid=\"a\"\nusername=\"a@example.com\"\nsync_root=\"{}/od\"\narchive_root=\"{}\"\n",
+                dir.display(),
+                arch.display()
+            ),
+        )
+        .unwrap();
+        let err = cmd_restore(&p, "a", "calendar", "e1", None, Some("T".into())).unwrap_err();
+        assert!(err.contains("cloud restore is disabled"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
