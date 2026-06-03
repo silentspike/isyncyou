@@ -68,7 +68,9 @@ The feature does not ship "mostly safe."
 
 This is deliberately the same shape of problem you hit in payments, message queues,
 and any "call a remote API then record it locally" system. The interesting work is
-not the Graph call — it is making the *retry* correct.
+not the Graph call — it is making the *retry* correct. The full design — schema,
+state transitions, per-service recovery probes and the crash matrix — is specified in
+[ADR-001](docs/adr/001-restore-semantics.md).
 
 ---
 
@@ -154,7 +156,7 @@ The threshold is configurable; the default errs toward stopping.
 
 | You want to see… | Look at |
 |---|---|
-| The restore safety machine | `crates/connectors` (restore) + the operation-ledger ADR in `docs/adr/` |
+| The restore safety machine | `crates/connectors` (restore) + [ADR-001](docs/adr/001-restore-semantics.md) (operation ledger) |
 | id-based reconciliation | `crates/store` (schema + migrations) + `crates/core` (sync-state) |
 | The pacer | `crates/graph` (throttle/retry) |
 | Path correctness | `crates/pathmap` (reversible encode + roundtrip tests) |
