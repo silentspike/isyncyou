@@ -119,7 +119,8 @@ because "AI wrote a lot of code" is worthless without it:
 
 The point of writing this down is that it is reproducible. The protocol — not any
 single clever commit — is what keeps an AI-assisted codebase from accumulating
-plausible-but-wrong code. The detailed engineering protocol lives in `docs/ai/`.
+plausible-but-wrong code. The detailed engineering protocol lives in
+[`docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md`](../ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md).
 
 ---
 
