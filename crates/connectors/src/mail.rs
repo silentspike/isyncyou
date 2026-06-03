@@ -541,13 +541,12 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let report =
-            incremental_sync_mail(&mut client, &store, "backupslave", "2026-06-02T00:00:00Z")
-                .expect("live mail sync should succeed");
+        let report = incremental_sync_mail(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
+            .expect("live mail sync should succeed");
         assert!(report.folders > 0, "expected at least one mail folder");
         // every well-known folder must have a persisted cursor after the walk
         assert!(store
-            .get_delta_cursor("backupslave", SERVICE, "")
+            .get_delta_cursor("testuser", SERVICE, "")
             .unwrap()
             .is_none()); // mail uses per-folder scopes, never the "" whole-service scope
         eprintln!(
@@ -572,21 +571,21 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let idx = incremental_sync_mail(&mut client, &store, "backupslave", "2026-06-02T00:00:00Z")
+        let idx = incremental_sync_mail(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
             .expect("index sync should succeed");
         if idx.upserted == 0 {
             eprintln!("no messages to download; skipping body assertions");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let r = backup_message_bodies(&client, &store, "backupslave", dir.path(), 3)
+        let r = backup_message_bodies(&client, &store, "testuser", dir.path(), 3)
             .expect("body download should succeed");
         assert!(r.downloaded >= 1, "expected at least one .eml");
         assert!(r.bytes > 0, "expected non-empty MIME");
 
         // verify one downloaded file is plausibly MIME (has a header line).
         let one = store
-            .items_by_type("backupslave", SERVICE, "message")
+            .items_by_type("testuser", SERVICE, "message")
             .unwrap()
             .into_iter()
             .find(|m| m.local_path.is_some())
@@ -602,11 +601,11 @@ mod tests {
         );
 
         // ...then index those bodies and confirm full-text body search works.
-        let n = index_mail_bodies(&store, "backupslave", dir.path(), 0)
+        let n = index_mail_bodies(&store, "testuser", dir.path(), 0)
             .expect("body indexing should succeed");
         assert!(n >= 1, "expected to index at least one body");
         // 'the' is overwhelmingly common in real mail bodies/subjects
-        let hits = store.search_bodies("backupslave", "the").unwrap();
+        let hits = store.search_bodies("testuser", "the").unwrap();
         eprintln!("live body index: indexed={n}, 'the' hits={}", hits.len());
         assert!(
             !hits.is_empty(),
