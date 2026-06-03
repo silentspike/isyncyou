@@ -6,7 +6,7 @@ not a byte-identical mailbox import — personal Microsoft accounts have no impo
 API, and a re-create with rich metadata is sufficient (plan §12).
 
 All restores were live round-tripped against the throwaway account
-`backupslave@outlook.com` (fetch/build → restore → verify → cleanup-delete), never
+`testuser@example.com` (fetch/build → restore → verify → cleanup-delete), never
 the real account. Implemented in `isyncyou-connectors::restore`; driven from the
 CLI via `isyncyou restore`.
 

@@ -416,12 +416,12 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
         let report =
-            incremental_sync_contacts(&mut client, &store, "backupslave", "2026-06-02T00:00:00Z")
+            incremental_sync_contacts(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
                 .expect("live contacts sync should succeed");
         // The default collection's cursor must always be persisted, even with
         // zero contacts (proves the delta walk completed).
         assert!(store
-            .get_delta_cursor("backupslave", SERVICE, DEFAULT_SCOPE)
+            .get_delta_cursor("testuser", SERVICE, DEFAULT_SCOPE)
             .unwrap()
             .is_some());
         eprintln!(

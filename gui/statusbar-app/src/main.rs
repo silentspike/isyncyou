@@ -28,7 +28,7 @@ enum UserEvent {
 /// A representative view to render on screen.
 fn sample_view() -> StatusView {
     StatusView {
-        account: "backupslave@outlook.com".into(),
+        account: "testuser@example.com".into(),
         state: SyncState::Syncing,
         transfers: vec![
             Transfer {
