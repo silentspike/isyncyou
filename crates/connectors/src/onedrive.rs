@@ -153,6 +153,17 @@ pub trait RemoteWriter {
     fn upload(&self, dest_path: &str, data: &[u8]) -> Result<Value, String>;
     /// Delete a drive item by id.
     fn delete(&self, item_id: &str) -> Result<(), String>;
+    /// Upload with a **persisted** resumable session (plan §6/§9) so a process kill
+    /// mid-upload resumes instead of restarting. The default ignores `resume` and
+    /// calls [`upload`](Self::upload), so test mocks need no change.
+    fn upload_resumable(
+        &self,
+        dest_path: &str,
+        data: &[u8],
+        _resume: &dyn isyncyou_graph::UploadResumeStore,
+    ) -> Result<Value, String> {
+        self.upload(dest_path, data)
+    }
 }
 
 #[cfg(feature = "http")]
@@ -164,6 +175,44 @@ impl RemoteWriter for isyncyou_graph::GraphClient {
     }
     fn delete(&self, item_id: &str) -> Result<(), String> {
         self.delete_item(item_id).map_err(|e| e.to_string())
+    }
+    fn upload_resumable(
+        &self,
+        dest_path: &str,
+        data: &[u8],
+        resume: &dyn isyncyou_graph::UploadResumeStore,
+    ) -> Result<Value, String> {
+        self.upload_file_resumable(dest_path, data, 10 * 1024 * 1024, resume)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// An [`isyncyou_graph::UploadResumeStore`] backed by the store's `upload_sessions`
+/// table for one account, so large OneDrive uploads survive a process kill.
+struct StoreResume<'a> {
+    store: &'a Store,
+    account: &'a str,
+}
+
+impl isyncyou_graph::UploadResumeStore for StoreResume<'_> {
+    fn load(&self, dest: &str) -> Option<(String, u64)> {
+        self.store
+            .get_upload_session(self.account, SERVICE, dest)
+            .ok()
+            .flatten()
+    }
+    fn save(&self, dest: &str, upload_url: &str, total: u64, next_offset: u64) {
+        let _ = self.store.save_upload_session(
+            self.account,
+            SERVICE,
+            dest,
+            upload_url,
+            total as i64,
+            next_offset as i64,
+        );
+    }
+    fn clear(&self, dest: &str) {
+        let _ = self.store.clear_upload_session(self.account, SERVICE, dest);
     }
 }
 
@@ -177,7 +226,10 @@ pub fn push_upload<W: RemoteWriter>(
     dest_path: &str,
     data: &[u8],
 ) -> Result<String, SyncError> {
-    let item = writer.upload(dest_path, data).map_err(SyncError::Remote)?;
+    let resume = StoreResume { store, account };
+    let item = writer
+        .upload_resumable(dest_path, data, &resume)
+        .map_err(SyncError::Remote)?;
     ingest_item(store, map, account, &item, "", "clean")?;
     item.get("id")
         .and_then(Value::as_str)
@@ -1456,6 +1508,67 @@ mod tests {
             .deleted_at
             .is_some());
         eprintln!("deleted item {id}");
+    }
+
+    /// Live cross-process upload resume (plan §6/§9): "process 1" opens a resumable
+    /// session and persists it (then dies before uploading); "process 2" — a fresh
+    /// client — loads the persisted session and completes the upload **on the same
+    /// uploadUrl** (no new session), proving resume survives a kill. Needs feature
+    /// `http` + `ISYNCYOU_TEST_WRITE_TOKEN` (Files.ReadWrite).
+    #[cfg(feature = "http")]
+    #[test]
+    fn live_upload_resume_survives_process_kill() {
+        use isyncyou_graph::UploadResumeStore;
+        let _gate = crate::live_test_gate();
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!("skipping live_upload_resume_survives_process_kill: no write token");
+                return;
+            }
+        };
+        let dest = "/iSyncYou-livetest/resume-big.bin";
+        let data = vec![0x5au8; 1_200_000]; // ~1.15 MiB → multi-chunk at 320 KiB
+        let store = Store::open_in_memory().unwrap();
+        let resume = StoreResume {
+            store: &store,
+            account: "backupslave",
+        };
+
+        // Process 1: open the session + persist it, then "die" (upload nothing).
+        let client1 = isyncyou_graph::GraphClient::new(token.clone());
+        let s = client1
+            .create_upload_session(dest, data.len() as u64)
+            .expect("create session");
+        resume.save(dest, &s.upload_url, data.len() as u64, 0);
+        let persisted = store
+            .get_upload_session("backupslave", SERVICE, dest)
+            .unwrap()
+            .expect("session persisted before kill");
+        assert_eq!(persisted.0, s.upload_url, "persisted the session uploadUrl");
+
+        // Process 2: a fresh client resumes the persisted session and completes.
+        let client2 = isyncyou_graph::GraphClient::new(token);
+        let item = client2
+            .upload_file_resumable(dest, &data, 320 * 1024, &resume)
+            .expect("resumed upload should complete");
+        // full file uploaded (server-reported size matches)
+        assert_eq!(
+            item.get("size").and_then(Value::as_u64),
+            Some(data.len() as u64),
+            "resumed upload uploaded the whole file"
+        );
+        // session cleared on completion
+        assert!(store
+            .get_upload_session("backupslave", SERVICE, dest)
+            .unwrap()
+            .is_none());
+        let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
+        eprintln!(
+            "resumed + completed upload as item {id} ({} bytes)",
+            data.len()
+        );
+        client2.delete_item(&id).ok();
     }
 
     /// Live end-to-end: real OneDrive delta -> store, against the throwaway

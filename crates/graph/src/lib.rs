@@ -29,7 +29,7 @@ pub use auth::{TokenCache, TokenResponse};
 pub use client::{run_delta, DeltaError, DeltaOutcome, Response, Transport};
 pub use error::{classify, GraphAction};
 pub use throttle::{Outcome, Pacer};
-pub use upload::{ChunkPlan, UploadSession};
+pub use upload::{ChunkPlan, NoopResume, UploadResumeStore, UploadSession};
 
 /// An opaque Microsoft Graph delta token. Never construct or parse the inner
 /// value — it is only ever round-tripped through the store and back to Graph.

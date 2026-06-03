@@ -22,6 +22,31 @@ pub struct ChunkPlan {
     pub content_range: String,
 }
 
+/// A place to persist/resume a large upload's session (plan §6/§9), so a process
+/// kill mid-upload resumes from the server instead of restarting. Implemented by
+/// the connector over the store; keyed by destination path. Defined here (not in
+/// the `http` module) so it is available without the `http` feature.
+pub trait UploadResumeStore {
+    /// Load a persisted session for `dest` as `(upload_url, total)`, if any.
+    fn load(&self, dest: &str) -> Option<(String, u64)>;
+    /// Persist the current session state (upsert).
+    fn save(&self, dest: &str, upload_url: &str, total: u64, next_offset: u64);
+    /// Drop the session (on completion or when abandoned).
+    fn clear(&self, dest: &str);
+}
+
+/// No-op [`UploadResumeStore`]: uploads without persistence — the default for
+/// callers that don't need resume-across-kill.
+pub struct NoopResume;
+
+impl UploadResumeStore for NoopResume {
+    fn load(&self, _dest: &str) -> Option<(String, u64)> {
+        None
+    }
+    fn save(&self, _dest: &str, _upload_url: &str, _total: u64, _next_offset: u64) {}
+    fn clear(&self, _dest: &str) {}
+}
+
 /// Tracks progress of one resumable upload session.
 #[derive(Debug, Clone)]
 pub struct UploadSession {
@@ -36,6 +61,17 @@ impl UploadSession {
             upload_url: upload_url.into(),
             total,
             next_offset: 0,
+        }
+    }
+
+    /// Reconstruct a session at a known offset — used to **resume** a persisted
+    /// session (plan §6/§9) after a process restart, with `next_offset` taken from
+    /// the server's `nextExpectedRanges`.
+    pub fn resume(upload_url: impl Into<String>, total: u64, next_offset: u64) -> Self {
+        UploadSession {
+            upload_url: upload_url.into(),
+            total,
+            next_offset: next_offset.min(total),
         }
     }
 
@@ -167,5 +203,22 @@ mod tests {
         }
         assert!(s.is_complete());
         assert_eq!(s.next_offset(), total);
+    }
+
+    #[test]
+    fn resume_continues_from_a_persisted_offset() {
+        // A session reconstructed at a non-zero offset (as after a process kill +
+        // reload) plans its next chunk from that offset, not from 0.
+        let total = 4 * 1024 * 1024;
+        let s = UploadSession::resume("https://up", total, 1_310_720); // 4 * 320 KiB done
+        assert!(!s.is_complete());
+        let c = s.next_chunk(1024 * 1024).unwrap();
+        assert_eq!(c.start, 1_310_720, "resumes from the persisted offset");
+        // and a fully-done persisted session is complete (nothing left to send)
+        assert!(UploadSession::resume("https://up", total, total)
+            .next_chunk(1024 * 1024)
+            .is_none());
+        // an offset past total is clamped (defensive)
+        assert!(UploadSession::resume("https://up", total, total + 999).is_complete());
     }
 }

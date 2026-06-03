@@ -169,10 +169,44 @@ impl GraphClient {
         data: &[u8],
         max_chunk: u64,
     ) -> Result<serde_json::Value, UploadError> {
+        self.upload_file_resumable(dest_path, data, max_chunk, &crate::NoopResume)
+    }
+
+    /// Like [`upload_file`](Self::upload_file) but persists the resumable session
+    /// via `resume` (plan §6/§9), so a process kill mid-upload resumes from the
+    /// server's `nextExpectedRanges` instead of restarting. On start it reuses a
+    /// persisted session for this exact file (validated via [`upload_status`]); on
+    /// each accepted fragment it records the offset; on completion it clears it.
+    pub fn upload_file_resumable(
+        &self,
+        dest_path: &str,
+        data: &[u8],
+        max_chunk: u64,
+        resume: &dyn crate::UploadResumeStore,
+    ) -> Result<serde_json::Value, UploadError> {
         if (data.len() as u64) <= CHUNK_ALIGN {
-            return self.simple_upload(dest_path, data);
+            return self.simple_upload(dest_path, data); // small file: no session
         }
-        let mut session = self.create_upload_session(dest_path, data.len() as u64)?;
+        let total = data.len() as u64;
+        let mut session = match resume.load(dest_path) {
+            // a persisted session for the *same* file: validate + resume from the
+            // server's offset (handles expiry → fall through to a fresh session).
+            Some((url, persisted_total)) if persisted_total == total => {
+                match self.upload_status(&url) {
+                    Ok(offset) => UploadSession::resume(url, total, offset),
+                    Err(_) => {
+                        resume.clear(dest_path);
+                        self.start_session(dest_path, total, resume)?
+                    }
+                }
+            }
+            other => {
+                if other.is_some() {
+                    resume.clear(dest_path); // stale (file size changed) → drop it
+                }
+                self.start_session(dest_path, total, resume)?
+            }
+        };
         while let Some(plan) = session.next_chunk(max_chunk) {
             let slice = &data[plan.start as usize..=plan.end as usize];
             let resp = self
@@ -200,8 +234,11 @@ impl GraphClient {
                     } else {
                         session.apply_next_expected(&ranges);
                     }
+                    // persist progress so a kill here resumes, not restarts
+                    resume.save(dest_path, &session.upload_url, total, session.next_offset());
                 }
                 200 | 201 => {
+                    resume.clear(dest_path); // done → drop the persisted session
                     return resp
                         .json::<serde_json::Value>()
                         .map_err(|e| UploadError::Parse(e.to_string()));
@@ -216,6 +253,47 @@ impl GraphClient {
             }
         }
         Err(UploadError::Incomplete)
+    }
+
+    /// Create a fresh upload session and persist it at offset 0.
+    fn start_session(
+        &self,
+        dest_path: &str,
+        total: u64,
+        resume: &dyn crate::UploadResumeStore,
+    ) -> Result<UploadSession, UploadError> {
+        let s = self.create_upload_session(dest_path, total)?;
+        resume.save(dest_path, &s.upload_url, total, 0);
+        Ok(s)
+    }
+
+    /// Query a resumable upload session via its (pre-authorized) `uploadUrl` and
+    /// return the next byte offset the server expects (`nextExpectedRanges`).
+    pub fn upload_status(&self, upload_url: &str) -> Result<u64, UploadError> {
+        let resp = self
+            .client
+            .get(upload_url) // pre-authorized URL: no bearer header
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 => {
+                let v = resp.json::<serde_json::Value>().ok();
+                let offset = v
+                    .as_ref()
+                    .and_then(|v| v.get("nextExpectedRanges"))
+                    .and_then(|r| r.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.split('-').next())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                Ok(offset)
+            }
+            s => Err(UploadError::Http {
+                status: s,
+                body: String::new(),
+            }),
+        }
     }
 
     /// Replace an item's content **only if** its `etag` still matches, so a
