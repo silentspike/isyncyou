@@ -40,13 +40,20 @@ impl std::error::Error for UploadError {}
 pub struct GraphClient {
     client: reqwest::blocking::Client,
     token: String,
+    /// When set, GETs send `Prefer: IdType="ImmutableId", outlook.timezone="UTC"`
+    /// (the Outlook immutable-ID policy, plan §6).
+    prefer_immutable_id: bool,
 }
+
+/// The `Prefer` header value for the Outlook immutable-ID policy (plan §6).
+const PREFER_IMMUTABLE_ID: &str = r#"IdType="ImmutableId", outlook.timezone="UTC""#;
 
 impl GraphClient {
     pub fn new(access_token: impl Into<String>) -> Self {
         GraphClient {
             client: reqwest::blocking::Client::new(),
             token: access_token.into(),
+            prefer_immutable_id: false,
         }
     }
 
@@ -55,6 +62,7 @@ impl GraphClient {
         GraphClient {
             client,
             token: access_token.into(),
+            prefer_immutable_id: false,
         }
     }
 }
@@ -69,7 +77,12 @@ fn parse_retry_after(resp: &reqwest::blocking::Response) -> Option<Duration> {
 
 impl Transport for GraphClient {
     fn get(&mut self, url: &str) -> Response {
-        match self.client.get(url).bearer_auth(&self.token).send() {
+        let mut req = self.client.get(url).bearer_auth(&self.token);
+        if self.prefer_immutable_id {
+            // `Prefer` is not in reqwest's well-known header set, so name it directly.
+            req = req.header("Prefer", PREFER_IMMUTABLE_ID);
+        }
+        match req.send() {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let retry_after = parse_retry_after(&resp);
@@ -96,6 +109,10 @@ impl Transport for GraphClient {
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
+    }
+
+    fn set_prefer_immutable_id(&mut self, on: bool) {
+        self.prefer_immutable_id = on;
     }
 }
 
