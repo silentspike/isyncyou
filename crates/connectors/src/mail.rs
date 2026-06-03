@@ -61,6 +61,8 @@ pub fn incremental_sync_mail<T: Transport>(
     account: &str,
     now: &str,
 ) -> Result<MailReport, SyncError> {
+    // Outlook immutable-ID policy (plan §6): make ids stable across folder moves.
+    transport.set_prefer_immutable_id(true);
     let raw = fetch_pages(transport, FOLDERS_URL)?;
     let folders = parse_folders(&raw);
     let mut report = MailReport {
@@ -244,6 +246,16 @@ fn ingest_message(
         .and_then(Value::as_str)
         .or_else(|| msg.get("receivedDateTime").and_then(Value::as_str))
         .map(String::from);
+    // Immutable-ID companions (plan §6): changeKey for optimistic concurrency,
+    // internetMessageId as a move/dedup-stable identifier.
+    it.change_key = msg
+        .get("changeKey")
+        .and_then(Value::as_str)
+        .map(String::from);
+    it.internet_message_id = msg
+        .get("internetMessageId")
+        .and_then(Value::as_str)
+        .map(String::from);
     it.sync_state = "remote_dirty".into();
     store.upsert_item(&it)?;
     Ok(Ingest::Upserted)
@@ -255,13 +267,30 @@ mod tests {
     use isyncyou_graph::client::Response;
     use serde_json::json;
 
-    /// Returns queued responses in strict call order (ignores the url).
-    struct MockTransport(Vec<Response>, usize);
+    /// Returns queued responses in strict call order (ignores the url); records
+    /// whether the immutable-ID policy was enabled by the connector.
+    struct MockTransport {
+        queue: Vec<Response>,
+        calls: usize,
+        prefer_immutable_id: bool,
+    }
+    impl MockTransport {
+        fn new(queue: Vec<Response>) -> Self {
+            MockTransport {
+                queue,
+                calls: 0,
+                prefer_immutable_id: false,
+            }
+        }
+    }
     impl Transport for MockTransport {
         fn get(&mut self, _url: &str) -> Response {
-            let r = self.0[self.1].clone();
-            self.1 += 1;
+            let r = self.queue[self.calls].clone();
+            self.calls += 1;
             r
+        }
+        fn set_prefer_immutable_id(&mut self, on: bool) {
+            self.prefer_immutable_id = on;
         }
     }
 
@@ -273,6 +302,8 @@ mod tests {
             "id": id,
             "subject": subject,
             "@odata.etag": "W/\"CQAAAB\"",
+            "changeKey": "CQAAAB",
+            "internetMessageId": format!("<{id}@mail.example.com>"),
             "receivedDateTime": "2026-01-01T00:00:00Z"
         })
     }
@@ -283,20 +314,22 @@ mod tests {
     #[test]
     fn ingests_folders_messages_and_per_folder_cursors() {
         let store = Store::open_in_memory().unwrap();
-        let mut t = MockTransport(
-            vec![
-                Response::ok(json!({ "value": [folder("FA", "Inbox"), folder("FB", "Archive")] })),
-                Response::ok(
-                    json!({ "value": [msg("m1","Hello"), msg("m2","Hi")], "@odata.deltaLink": "CA" }),
-                ),
-                Response::ok(json!({ "value": [msg("m3","Yo")], "@odata.deltaLink": "CB" })),
-            ],
-            0,
-        );
+        let mut t = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA", "Inbox"), folder("FB", "Archive")] })),
+            Response::ok(
+                json!({ "value": [msg("m1","Hello"), msg("m2","Hi")], "@odata.deltaLink": "CA" }),
+            ),
+            Response::ok(json!({ "value": [msg("m3","Yo")], "@odata.deltaLink": "CB" })),
+        ]);
         let r = incremental_sync_mail(&mut t, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
         assert_eq!(r.folders, 2);
         assert_eq!(r.upserted, 3);
         assert_eq!(r.deleted, 0);
+        // the connector enabled the Outlook immutable-ID policy (plan §6)
+        assert!(
+            t.prefer_immutable_id,
+            "mail sync must request immutable ids"
+        );
 
         // folder tree recorded
         let fa = store.get_item("acc", SERVICE, "FA").unwrap().unwrap();
@@ -310,6 +343,12 @@ mod tests {
         assert_eq!(m1.parent_remote_id.as_deref(), Some("FA"));
         assert_eq!(m1.remote_mtime.as_deref(), Some("2026-01-01T00:00:00Z"));
         assert!(m1.etag.is_some());
+        // immutable-ID companions stored (plan §6)
+        assert_eq!(m1.change_key.as_deref(), Some("CQAAAB"));
+        assert_eq!(
+            m1.internet_message_id.as_deref(),
+            Some("<m1@mail.example.com>")
+        );
         // per-folder cursors persisted
         assert_eq!(
             store
@@ -333,14 +372,11 @@ mod tests {
         // delta reports it @removed. Since it now lives in FB, FA's removal is a
         // move-out and must be skipped (not tombstoned).
         let store = Store::open_in_memory().unwrap();
-        let mut t = MockTransport(
-            vec![
-                Response::ok(json!({ "value": [folder("FB","Archive"), folder("FA","Inbox")] })),
-                Response::ok(json!({ "value": [msg("m1","Moved")], "@odata.deltaLink": "CB" })),
-                Response::ok(json!({ "value": [removed("m1")], "@odata.deltaLink": "CA" })),
-            ],
-            0,
-        );
+        let mut t = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FB","Archive"), folder("FA","Inbox")] })),
+            Response::ok(json!({ "value": [msg("m1","Moved")], "@odata.deltaLink": "CB" })),
+            Response::ok(json!({ "value": [removed("m1")], "@odata.deltaLink": "CA" })),
+        ]);
         let r = incremental_sync_mail(&mut t, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
         assert_eq!(r.upserted, 1);
         assert_eq!(r.deleted, 0);
@@ -354,22 +390,16 @@ mod tests {
     fn real_deletion_in_owning_folder_tombstones() {
         let store = Store::open_in_memory().unwrap();
         // first sync: m9 arrives in FA
-        let mut t1 = MockTransport(
-            vec![
-                Response::ok(json!({ "value": [folder("FA","Inbox")] })),
-                Response::ok(json!({ "value": [msg("m9","Bye")], "@odata.deltaLink": "C1" })),
-            ],
-            0,
-        );
+        let mut t1 = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA","Inbox")] })),
+            Response::ok(json!({ "value": [msg("m9","Bye")], "@odata.deltaLink": "C1" })),
+        ]);
         incremental_sync_mail(&mut t1, &store, "acc", "t").unwrap();
         // second sync: FA reports m9 removed -> it still belongs to FA -> tombstone
-        let mut t2 = MockTransport(
-            vec![
-                Response::ok(json!({ "value": [folder("FA","Inbox")] })),
-                Response::ok(json!({ "value": [removed("m9")], "@odata.deltaLink": "C2" })),
-            ],
-            0,
-        );
+        let mut t2 = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA","Inbox")] })),
+            Response::ok(json!({ "value": [removed("m9")], "@odata.deltaLink": "C2" })),
+        ]);
         let r = incremental_sync_mail(&mut t2, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
         assert_eq!(r.deleted, 1);
         assert!(store
@@ -391,13 +421,10 @@ mod tests {
     #[test]
     fn message_without_subject_gets_placeholder() {
         let store = Store::open_in_memory().unwrap();
-        let mut t = MockTransport(
-            vec![
-                Response::ok(json!({ "value": [folder("FA","Inbox")] })),
-                Response::ok(json!({ "value": [json!({"id":"mx"})], "@odata.deltaLink": "C" })),
-            ],
-            0,
-        );
+        let mut t = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA","Inbox")] })),
+            Response::ok(json!({ "value": [json!({"id":"mx"})], "@odata.deltaLink": "C" })),
+        ]);
         incremental_sync_mail(&mut t, &store, "acc", "t").unwrap();
         assert_eq!(
             store.get_item("acc", SERVICE, "mx").unwrap().unwrap().name,

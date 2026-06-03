@@ -56,6 +56,8 @@ pub fn incremental_sync_calendar<T: Transport>(
     window_end: &str,
     now: &str,
 ) -> Result<CalendarReport, SyncError> {
+    // Outlook immutable-ID policy (plan §6): stable ids + UTC times.
+    transport.set_prefer_immutable_id(true);
     let raw = fetch_pages(transport, CALENDARS_URL)?;
     let calendars = parse_calendars(&raw);
     let mut report = CalendarReport {
@@ -138,6 +140,13 @@ fn ingest_event(
         .get("lastModifiedDateTime")
         .and_then(Value::as_str)
         .map(String::from);
+    // Immutable-ID companions (plan §6): changeKey + iCalUId (stable across the
+    // series and across exports).
+    it.change_key = ev
+        .get("changeKey")
+        .and_then(Value::as_str)
+        .map(String::from);
+    it.ical_uid = ev.get("iCalUId").and_then(Value::as_str).map(String::from);
     it.sync_state = "remote_dirty".into();
     store.upsert_item(&it)?;
     Ok(Ingest::Upserted)
