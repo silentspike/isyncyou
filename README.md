@@ -199,9 +199,11 @@ and `cargo deny` before it can land, and no behaviour is recorded as "done" with
 an executed command and its output as evidence. The interesting design decisions
 (crash-safe restore semantics, the own renderer used as its own headless test
 harness, the id-based reconciliation model) are written up as a case study rather
-than buried in commits. See [`SHOWCASE.md`](SHOWCASE.md) for the 5-minute technical
-tour and [`docs/case-study/fde-case-study.md`](docs/case-study/fde-case-study.md)
-for the longer narrative.
+than buried in commits. The protocol itself is written up in
+[`docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md`](docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md).
+See [`SHOWCASE.md`](SHOWCASE.md) for the 5-minute technical tour and
+[`docs/case-study/fde-case-study.md`](docs/case-study/fde-case-study.md) for the
+longer narrative.
 
 ## Docs
 
