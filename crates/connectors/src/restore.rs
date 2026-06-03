@@ -247,7 +247,7 @@ mod tests {
             "createdDateTime": "2026-01-01T00:00:00Z", "lastModifiedDateTime": "2026-01-02T00:00:00Z",
             "webLink": "https://outlook.live.com/...", "iCalUId": "040000...",
             "type": "singleInstance",
-            "organizer": { "emailAddress": { "address": "backupslave@outlook.com" } },
+            "organizer": { "emailAddress": { "address": "testuser@example.com" } },
             "subject": "Quarterly review",
             "body": { "contentType": "html", "content": "<p>agenda</p>" },
             "start": { "dateTime": "2026-03-01T09:00:00", "timeZone": "UTC" },
@@ -554,7 +554,7 @@ mod tests {
         let mut client = isyncyou_graph::GraphClient::new(token);
         let mime = b"MIME-Version: 1.0\r\n\
 From: iSyncYou Test <isyncyou-test@example.com>\r\n\
-To: backupslave@outlook.com\r\n\
+To: testuser@example.com\r\n\
 Subject: iSyncYou MIME restore test\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\

@@ -1488,21 +1488,18 @@ mod tests {
             &client,
             &store,
             &mut map,
-            "backupslave",
+            "testuser",
             "/iSyncYou-livetest/push.txt",
             &data,
         )
         .expect("push_upload should succeed");
-        let it = store
-            .get_item("backupslave", SERVICE, &id)
-            .unwrap()
-            .unwrap();
+        let it = store.get_item("testuser", SERVICE, &id).unwrap().unwrap();
         assert_eq!(it.sync_state, "clean");
         eprintln!("pushed item {id} (state={})", it.sync_state);
-        push_delete(&client, &store, "backupslave", &id, "2026-06-02T00:00:00Z")
+        push_delete(&client, &store, "testuser", &id, "2026-06-02T00:00:00Z")
             .expect("push_delete should succeed");
         assert!(store
-            .get_item("backupslave", SERVICE, &id)
+            .get_item("testuser", SERVICE, &id)
             .unwrap()
             .unwrap()
             .deleted_at
@@ -1532,7 +1529,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let resume = StoreResume {
             store: &store,
-            account: "backupslave",
+            account: "testuser",
         };
 
         // Process 1: open the session + persist it, then "die" (upload nothing).
@@ -1542,7 +1539,7 @@ mod tests {
             .expect("create session");
         resume.save(dest, &s.upload_url, data.len() as u64, 0);
         let persisted = store
-            .get_upload_session("backupslave", SERVICE, dest)
+            .get_upload_session("testuser", SERVICE, dest)
             .unwrap()
             .expect("session persisted before kill");
         assert_eq!(persisted.0, s.upload_url, "persisted the session uploadUrl");
@@ -1560,7 +1557,7 @@ mod tests {
         );
         // session cleared on completion
         assert!(store
-            .get_upload_session("backupslave", SERVICE, dest)
+            .get_upload_session("testuser", SERVICE, dest)
             .unwrap()
             .is_none());
         let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
@@ -1591,13 +1588,13 @@ mod tests {
             &mut client,
             &store,
             &mut map,
-            "backupslave",
+            "testuser",
             "2026-06-02T00:00:00Z",
         )
         .expect("live incremental sync should succeed");
         assert!(report.upserted > 0, "expected to ingest some items");
         assert!(store
-            .get_delta_cursor("backupslave", SERVICE, "")
+            .get_delta_cursor("testuser", SERVICE, "")
             .unwrap()
             .is_some());
         eprintln!(
@@ -1622,10 +1619,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut map = MappingTable::new();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        incremental_sync(&mut client, &store, &mut map, "backupslave", "t")
+        incremental_sync(&mut client, &store, &mut map, "testuser", "t")
             .expect("live sync should succeed");
         let dir = tempfile::tempdir().unwrap();
-        let report = materialize_downloads(&store, &client, "backupslave", dir.path())
+        let report = materialize_downloads(&store, &client, "testuser", dir.path())
             .expect("materialize should succeed");
         eprintln!(
             "live materialize: downloaded={} dirs={} failed={}",

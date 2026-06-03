@@ -138,7 +138,7 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        match sync_shared_with_me(&mut client, &store, "backupslave") {
+        match sync_shared_with_me(&mut client, &store, "testuser") {
             Ok(r) => eprintln!(
                 "live shared-with-me: items={} upserted={}",
                 r.items, r.upserted

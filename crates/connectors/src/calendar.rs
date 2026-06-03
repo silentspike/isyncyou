@@ -384,7 +384,7 @@ mod tests {
         let report = incremental_sync_calendar(
             &mut client,
             &store,
-            "backupslave",
+            "testuser",
             "2019-01-01T00:00:00Z",
             "2030-01-01T00:00:00Z",
             "2026-06-02T00:00:00Z",

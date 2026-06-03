@@ -1,5 +1,5 @@
 //! `isyncyou-pbs` — trigger Proxmox Backup Server (PBS) snapshot + restore of the
-//! store (plan §9.2 / §12). The user never touches Proxmox: the tool shells out to
+//! store. The user never touches Proxmox directly: the tool shells out to
 //! `proxmox-backup-client`. Restores always land in a **temporary** target (never
 //! the live store) — the caller imports/previews from there.
 //!
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn errors_never_leak_the_password_and_use_env_not_argv() {
-        let mut pbs = Pbs::new("backup@pbs@10.0.0.151:hdd-backup", "secret");
+        let mut pbs = Pbs::new("user@pbs@pbs.example:datastore", "secret");
         pbs.namespace = Some("isyncyou".into());
         pbs.client = "/nonexistent/proxmox-backup-client".into();
         let err = pbs.backup("acct", Path::new("/tmp")).unwrap_err();

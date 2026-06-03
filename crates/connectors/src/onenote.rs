@@ -239,7 +239,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
         let report =
-            incremental_sync_onenote(&mut client, &store, "backupslave", "2026-06-02T00:00:00Z")
+            incremental_sync_onenote(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
                 .expect("live onenote sync should succeed");
         // If the account has any pages, they must be in the store now.
         if report.pages > 0 {

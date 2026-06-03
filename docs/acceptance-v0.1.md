@@ -2,7 +2,7 @@
 
 > **Status: PASS (engine).** Every hard acceptance criterion A1–A10 (plan §19) has a
 > dedicated, passing test, the data-loss/chaos matrix is covered, and the engine has been
-> verified live against the throwaway test account `backupslave@outlook.com`.
+> verified live against the throwaway test account `testuser@example.com`.
 > The one remaining carve-out — the *fully assembled daemon + GUI* end-to-end run
 > (install → login → tray → chaos) — depends on the native status-bar/tray work (#16 / #56)
 > and needs a display server to drive the window; it is not blocked by any unmet A-criterion.
@@ -59,7 +59,7 @@ degrades safely (no data loss, no DB corruption, recovers to green):
 
 ## Live verification against the test account
 
-Run on `backupslave@outlook.com` (disposable, full CRUD) with tokens minted from the cached
+Run on `testuser@example.com` (disposable, full CRUD) with tokens minted from the cached
 dev token caches; every test uses unique prefixes and tears down after itself. Captured this
 session:
 
