@@ -41,7 +41,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   packaging/daemon model.
 
 ### Not yet implemented
-- macOS build (Linux + Windows are built; macOS needs a Mac build host).
 - eBPF change-source backend (the fanotify backend already covers the privileged
   server case; eBPF would be a further optimization).
 
@@ -50,3 +49,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   iSyncYou takes no paid cloud dependency. Adaptive delta-polling (implemented) is
   the change-detection mechanism; Graph notifications are only hints anyway, so a
   delta pull always follows.
+- macOS build: requires Apple hardware or paid cloud-Mac CI minutes (Apple's EULA
+  restricts macOS virtualization to Apple-branded hardware, so it cannot be hosted
+  on the Proxmox/x86 estate). The code is kept mac-ready — the Linux-only bits
+  (FUSE mount, DBus/KIO) are `cfg(target_os = "linux")`-gated, so the CLI/daemon
+  build for macOS once a Mac build host is available. Linux + Windows ship today.
