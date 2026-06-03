@@ -25,7 +25,7 @@ Engine daemon (isyncyoud)
 
 ## Key principles
 
-- **Id-based, stateful delta.** Track items by stable `id`/`immutable_id`, never by path. Delta cursors are opaque and persisted per account+service.
+- **Id-based, stateful delta.** Track items by stable id, never by path. For Outlook resources (mail/calendar/contacts) the connectors send `Prefer: IdType="ImmutableId"` so the stored id is the immutable id (stable across folder moves), and keep its companions (`changeKey`, `internetMessageId`, `iCalUId`). Delta cursors are opaque and persisted per account+service.
 - **No artificial throttle.** Full speed until Graph returns `429`, then honor `Retry-After`, probe, and resume at full speed.
 - **Correctness layer = delta.** Change notifications are hints; a periodic reconciler is the source of truth.
 - **Native status bar, browser for full control.** The own renderer drives the small status bar (headless-verifiable, pixel-accurate). Restore, mail viewing, search and settings run in a local web UI opened in the user's browser — no embedded browser engine.
