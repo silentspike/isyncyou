@@ -17,7 +17,7 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Risk** | Re-creating an archived item in the cloud is a Graph `POST` followed by a local record. The two are not atomic; a crash, network drop, or token expiry between them can make a naive retry `POST` again and create a **duplicate** in the user's real mailbox. |
 | **Impact** | High — silent, user-visible data pollution that is tedious to undo. |
 | **Mitigation** | (a) Cloud-mutating restore is **off by default** (`restore.cloud_restore_enabled = false`), enforced at the engine entry point before any store or network access. (b) The crash-safe design is an operation ledger with an explicit state machine, a content-derived `HMAC-SHA256` idempotency key, reconcile-on-recovery at daemon start, and a crash-injection test matrix. (c) Local-file restore is unaffected and always available. |
-| **Status** | **In progress** — the off-by-default gate is mitigated and tested today; the ledger + crash matrix that would let the gate be turned on safely are being built. See `SHOWCASE.md` §1. |
+| **Status** | **In progress** — the off-by-default gate is mitigated and tested today; the ledger + crash matrix that would let the gate be turned on safely are being built. Design: [ADR-001](../adr/001-restore-semantics.md); overview: `SHOWCASE.md` §1. |
 
 ## R2 — Data at rest is unencrypted
 
