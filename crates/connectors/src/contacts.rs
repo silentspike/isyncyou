@@ -59,6 +59,8 @@ pub fn incremental_sync_contacts<T: Transport>(
     account: &str,
     now: &str,
 ) -> Result<ContactsReport, SyncError> {
+    // Outlook immutable-ID policy (plan §6): stable ids across moves.
+    transport.set_prefer_immutable_id(true);
     let mut report = ContactsReport::default();
 
     // Default (folderless) contacts — parent None, scope DEFAULT_SCOPE.
@@ -184,6 +186,8 @@ fn ingest_contact(
         .get("lastModifiedDateTime")
         .and_then(Value::as_str)
         .map(String::from);
+    // Immutable-ID companion (plan §6).
+    it.change_key = c.get("changeKey").and_then(Value::as_str).map(String::from);
     it.sync_state = "remote_dirty".into();
     store.upsert_item(&it)?;
     Ok(Ingest::Upserted)

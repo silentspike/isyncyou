@@ -48,6 +48,14 @@ pub trait Transport {
     /// HTTP transport overrides it to sleep `delay`. Honoring this is what lets a
     /// `429`/`5xx` survive (plan §5: full speed → on 429 back off → resume).
     fn backoff(&self, _delay: Duration) {}
+
+    /// Opt subsequent GETs into the Outlook **immutable-ID policy** (plan §6):
+    /// send `Prefer: IdType="ImmutableId", outlook.timezone="UTC"` so returned ids
+    /// are stable across folder moves and times are normalized to UTC. Default is a
+    /// **no-op** (mocks + non-Outlook transports ignore it); the real HTTP client
+    /// overrides it. Outlook connectors (mail/calendar/contacts) enable it before
+    /// their delta walk.
+    fn set_prefer_immutable_id(&mut self, _on: bool) {}
 }
 
 /// The result of a completed delta walk.
