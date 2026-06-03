@@ -51,6 +51,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   delta pull always follows.
 - macOS build: requires Apple hardware or paid cloud-Mac CI minutes (Apple's EULA
   restricts macOS virtualization to Apple-branded hardware, so it cannot be hosted
-  on the Proxmox/x86 estate). The code is kept mac-ready — the Linux-only bits
+  on x86 Linux build hosts). The code is kept mac-ready — the Linux-only bits
   (FUSE mount, DBus/KIO) are `cfg(target_os = "linux")`-gated, so the CLI/daemon
   build for macOS once a Mac build host is available. Linux + Windows ship today.

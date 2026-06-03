@@ -269,9 +269,8 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let report =
-            incremental_sync_todo(&mut client, &store, "backupslave", "2026-06-02T00:00:00Z")
-                .expect("live todo sync should succeed");
+        let report = incremental_sync_todo(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
+            .expect("live todo sync should succeed");
         assert!(report.lists > 0, "expected at least one task list");
         eprintln!(
             "live todo sync: lists={} upserted={} deleted={} skipped={}",

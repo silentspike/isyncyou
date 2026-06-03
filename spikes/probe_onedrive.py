@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Phase -1 spike (#35): OneDrive Graph capability probe against the throwaway
-# test account backupslave@outlook.com, using the existing /backup dev token
+# test account testuser@example.com, using the existing /backup dev token
 # caches (~/.config/m365-{read,write}/). Throwaway research artifact, NOT part
 # of the iSyncYou build. No secrets (client IDs are public app registrations).
 
@@ -11,7 +11,7 @@ def tok(app_type, cid, scopes):
     cp=Path.home()/(".config/m365-%s/token_cache.json"%app_type)
     c=msal.SerializableTokenCache(); c.deserialize(cp.read_text())
     app=msal.PublicClientApplication(cid,authority=AUTH,token_cache=c)
-    a=[x for x in app.get_accounts() if x.get("username")=="backupslave@outlook.com"][0]
+    a=[x for x in app.get_accounts() if x.get("username")=="testuser@example.com"][0]
     r=app.acquire_token_silent(scopes,account=a); return r["access_token"]
 RT=tok("read","cee80dd9-c13e-4dbb-9d4c-73eb4987d447",["Files.Read"])
 WT=tok("write","a90d9140-3a62-46d0-907b-f2b7b61a573a",["Files.ReadWrite"])

@@ -428,7 +428,7 @@ mod tests {
         let idx = crate::incremental_sync_calendar(
             &mut client,
             &store,
-            "backupslave",
+            "testuser",
             "2019-01-01T00:00:00Z",
             "2030-01-01T00:00:00Z",
             "2026-06-02T00:00:00Z",
@@ -439,12 +439,12 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let r = backup_calendar_bodies(&client, &store, "backupslave", dir.path(), 3)
+        let r = backup_calendar_bodies(&client, &store, "testuser", dir.path(), 3)
             .expect("archive should succeed");
         assert!(r.archived >= 1, "expected to archive at least one event");
 
         let one = store
-            .items_by_type("backupslave", "calendar", "event")
+            .items_by_type("testuser", "calendar", "event")
             .unwrap()
             .into_iter()
             .find(|i| i.local_path.is_some())
@@ -476,23 +476,19 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let idx = crate::incremental_sync_todo(
-            &mut client,
-            &store,
-            "backupslave",
-            "2026-06-02T00:00:00Z",
-        )
-        .expect("todo index sync should succeed");
+        let idx =
+            crate::incremental_sync_todo(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
+                .expect("todo index sync should succeed");
         if idx.upserted == 0 {
             eprintln!("no tasks to archive; skipping");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let r = backup_todo_bodies(&client, &store, "backupslave", dir.path(), 3)
+        let r = backup_todo_bodies(&client, &store, "testuser", dir.path(), 3)
             .expect("todo archive should succeed");
         assert!(r.archived >= 1);
         let one = store
-            .items_by_type("backupslave", "todo", "task")
+            .items_by_type("testuser", "todo", "task")
             .unwrap()
             .into_iter()
             .find(|i| i.local_path.is_some())
@@ -522,15 +518,15 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        crate::incremental_sync_onenote(&mut client, &store, "backupslave", "2026-06-02T00:00:00Z")
+        crate::incremental_sync_onenote(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
             .expect("onenote index sync should succeed");
         let dir = tempfile::tempdir().unwrap();
-        let r = backup_onenote_bodies(&client, &store, "backupslave", dir.path(), 3)
+        let r = backup_onenote_bodies(&client, &store, "testuser", dir.path(), 3)
             .expect("onenote archive should succeed");
         // every archived page must be a non-empty .html file
         if r.archived > 0 {
             let one = store
-                .items_by_type("backupslave", "onenote", "page")
+                .items_by_type("testuser", "onenote", "page")
                 .unwrap()
                 .into_iter()
                 .find(|i| i.local_path.is_some())

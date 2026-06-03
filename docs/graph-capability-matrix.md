@@ -2,13 +2,13 @@
 
 > Status: spike findings + **live-verified by the Rust connectors** (see the
 > "iSyncYou connector status" section at the bottom) · Phase -1 spike (#35) ·
-> Test account: `backupslave@outlook.com` (dedicated throwaway)
+> Test account: `testuser@example.com` (dedicated throwaway)
 > Apps: `backup_read` (`cee80dd9…`, full read scopes) · `backup_write` (`a90d9140…`, full write scopes except OneNote)
 > Authority: `https://login.microsoftonline.com/consumers` (PersonalMicrosoftAccount)
 
 Two evidence sources:
 - **SPIKE** — proven live against the test account during this spike (commands + responses).
-- **/backup** — already built **and tested** in the `/work/proxmox/backup/` system (FastAPI), TEST-REPORT 2026-02-05 (8/8 features PASS). Re-implemented in Rust for iSyncYou; Graph behaviour is considered proven.
+- **prior art** — already built **and tested** in an earlier Python (FastAPI) implementation (full feature pass). Re-implemented in Rust for iSyncYou; the Graph behaviour is considered proven.
 
 ---
 
@@ -113,7 +113,7 @@ Mail/Calendar/ToDo/Categories Graph behaviour + the SQLite/FTS5 data model + res
 ## iSyncYou connector status (live-verified in Rust)
 
 The connectors are now implemented in the `isyncyou-connectors` crate and each was
-run live against `backupslave` (env-gated tests; CI without a token skips). This
+run live against `testuser` (env-gated tests; CI without a token skips). This
 **closes the spike's open items**: OneDrive `410`→resync and delete→tombstone are
 implemented and unit-tested; Contacts is implemented and the live default-collection
 delta + cursor were verified; OneNote uses a full-list reconcile (no delta).

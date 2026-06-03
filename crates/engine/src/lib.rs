@@ -197,6 +197,20 @@ pub fn restore_cloud(
     token: String,
 ) -> Result<String, String> {
     use isyncyou_connectors as connectors;
+    // Safety gate: cloud-mutating restore is off by default. It re-creates items in
+    // the cloud, and the crash-safe operation ledger that makes a retry idempotent
+    // (so an interrupted restore cannot duplicate a mailbox item) is still being
+    // hardened — so the feature does not ship "mostly safe". Recovering an archived
+    // body to a local file goes through a different path and is never gated here.
+    if !cfg.restore.cloud_restore_enabled {
+        return Err(
+            "cloud restore is disabled (set restore.cloud_restore_enabled = true to \
+             opt in). It re-creates items in the cloud and the crash-safe operation \
+             ledger is still being hardened, so it is off by default. Use \
+             `restore --to-local` to recover an archived body to a file instead."
+                .to_string(),
+        );
+    }
     if !RESTORE_SERVICES.contains(&service) {
         return Err(format!(
             "service '{service}' has no cloud restore path (expected one of {}); \
@@ -385,5 +399,18 @@ mod tests {
         assert!(s.contains("0 upserted"));
         assert!(!s.contains("conflict copies"));
         assert!(!s.contains("held"));
+    }
+
+    #[test]
+    fn restore_cloud_refuses_when_disabled_by_default() {
+        // Default config has restore.cloud_restore_enabled = false. The gate must
+        // fire before any store access or network call, so even a missing account
+        // surfaces the "disabled" message rather than an account-not-found error.
+        let cfg = Config::default();
+        let err = restore_cloud(&cfg, "anyone", "mail", "some-id", "tok".into()).unwrap_err();
+        assert!(
+            err.contains("cloud restore is disabled"),
+            "expected disabled-gate message, got: {err}"
+        );
     }
 }

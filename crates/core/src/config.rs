@@ -1,5 +1,5 @@
-//! TOML configuration — the single source of truth shared by the daemon and GUI
-//! (plan §13). Loaded once, validated, and written back atomically.
+//! TOML configuration — the single source of truth shared by the daemon and GUI.
+//! Loaded once, validated, and written back atomically.
 
 use crate::recovery::atomic_write;
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,7 @@ impl Default for SyncConfig {
     }
 }
 
-/// Optional Proxmox Backup Server target (plan §9.2/§12). No secret lives here —
+/// Optional Proxmox Backup Server target. No secret lives here —
 /// `password_file` points at a file holding the PBS password / API-token secret,
 /// so the config can be shared/committed without leaking credentials.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,12 +86,31 @@ pub struct PbsConfig {
     pub namespace: Option<String>,
 }
 
+/// Cloud-restore safety gate.
+///
+/// Re-creating an item in the cloud is a Graph write followed by a local record,
+/// and the two are not atomic — a crash in between can make a naive retry create a
+/// duplicate in the user's real mailbox. The crash-safe operation-ledger path that
+/// makes those retries idempotent is still being hardened (see `SHOWCASE.md`), so
+/// cloud-mutating restore is **off by default** and must be explicitly enabled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RestoreConfig {
+    /// Allow restore operations that create items in the cloud via Graph. Defaults
+    /// to `false` (the `bool` default) until the operation ledger and its crash
+    /// matrix are complete. Restoring an archived body *to a local file* is always
+    /// allowed and is not gated by this flag.
+    pub cloud_restore_enabled: bool,
+}
+
 /// The full configuration document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub accounts: Vec<AccountConfig>,
     pub sync: SyncConfig,
+    /// Cloud-restore safety gate (off by default).
+    pub restore: RestoreConfig,
     /// Optional PBS backup target (snapshot/restore of the store).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pbs: Option<PbsConfig>,
@@ -185,7 +204,23 @@ mod tests {
         assert_eq!(c.sync.trash_retention_days, 30);
         assert_eq!(c.sync.change_source, ChangeSource::Inotify);
         assert!(!c.sync.body_index);
+        // Cloud-mutating restore is OFF until the operation ledger is complete.
+        assert!(!c.restore.cloud_restore_enabled);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn cloud_restore_stays_off_when_omitted_from_toml() {
+        // A config that never mentions [restore] must not silently enable it.
+        let toml = r#"
+            [[accounts]]
+            id = "primary"
+            username = "primary@example.com"
+            sync_root = "/data/od"
+            archive_root = "/data/archive"
+        "#;
+        let c = Config::from_toml(toml).unwrap();
+        assert!(!c.restore.cloud_restore_enabled);
     }
 
     #[test]
