@@ -16,5 +16,7 @@ OUT="${1:-build-flatpak}"
 flatpak-builder --user --force-clean --install-deps-from=flathub \
     --repo="$OUT/repo" "$OUT/build" "$HERE/org.silentspike.iSyncYou.yaml"
 echo "built into $OUT/repo"
-echo "install: flatpak install --user $OUT/repo org.silentspike.iSyncYou"
+echo "install (the local repo is unsigned, so register it with --no-gpg-verify):"
+echo "  flatpak remote-add --user --no-gpg-verify --if-not-exists isyncyou-local $OUT/repo"
+echo "  flatpak install --user isyncyou-local org.silentspike.iSyncYou"
 echo "run:     flatpak run org.silentspike.iSyncYou"
