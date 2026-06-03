@@ -24,6 +24,9 @@ pub struct CalendarReport {
     pub upserted: usize,
     pub deleted: usize,
     pub skipped: usize,
+    /// Series-master events fetched separately (calendarView returns only the
+    /// expanded occurrences, not the recurring master with its recurrence rule).
+    pub masters: usize,
 }
 
 struct Calendar {
@@ -79,7 +82,13 @@ pub fn incremental_sync_calendar<T: Transport>(
             .get_delta_cursor(account, SERVICE, &cal.id)?
             .map(DeltaCursor::new);
         let out = run_delta(transport, &base, cursor.as_ref(), 5)?;
+        let mut master_ids: Vec<String> = Vec::new();
         for ev in &out.items {
+            if let Some(mid) = ev.get("seriesMasterId").and_then(Value::as_str) {
+                if !master_ids.iter().any(|m| m == mid) {
+                    master_ids.push(mid.to_string());
+                }
+            }
             match ingest_event(store, account, &cal.id, ev, now)? {
                 Ingest::Upserted => report.upserted += 1,
                 Ingest::Deleted => report.deleted += 1,
@@ -87,6 +96,26 @@ pub fn incremental_sync_calendar<T: Transport>(
             }
         }
         store.set_delta_cursor(account, SERVICE, &cal.id, out.cursor.as_str())?;
+
+        // calendarView/delta expands recurring events into occurrences but never
+        // returns the series master, so fetch each referenced master once (plan §6:
+        // master/instances separated). The master carries the recurrence rule; its
+        // occurrences link to it via series_master_id. A master that 404s (deleted)
+        // is skipped — the occurrences still carry the link.
+        for mid in &master_ids {
+            if store.get_item(account, SERVICE, mid)?.is_some() {
+                continue;
+            }
+            let url = format!("https://graph.microsoft.com/v1.0/me/events/{mid}");
+            let resp = transport.get(&url);
+            if (200..300).contains(&resp.status) {
+                if let Some(body) = resp.body {
+                    if let Ingest::Upserted = ingest_event(store, account, &cal.id, &body, now)? {
+                        report.masters += 1;
+                    }
+                }
+            }
+        }
     }
     Ok(report)
 }
@@ -147,6 +176,12 @@ fn ingest_event(
         .and_then(Value::as_str)
         .map(String::from);
     it.ical_uid = ev.get("iCalUId").and_then(Value::as_str).map(String::from);
+    // Series separation (plan §6): an occurrence/exception carries its master's id;
+    // the master row itself and single-instance events have none.
+    it.series_master_id = ev
+        .get("seriesMasterId")
+        .and_then(Value::as_str)
+        .map(String::from);
     it.sync_state = "remote_dirty".into();
     store.upsert_item(&it)?;
     Ok(Ingest::Upserted)
@@ -184,6 +219,46 @@ mod tests {
 
     const WIN_S: &str = "2021-01-01T00:00:00Z";
     const WIN_E: &str = "2029-01-01T00:00:00Z";
+
+    #[test]
+    fn separates_series_master_from_its_occurrences() {
+        // calendarView returns occurrences (each carrying seriesMasterId) but not
+        // the master; the connector fetches the master separately (plan §6).
+        let store = Store::open_in_memory().unwrap();
+        let occ = json!({
+            "id": "OCC1", "subject": "Standup", "type": "occurrence",
+            "seriesMasterId": "MASTER1",
+            "@odata.etag": "W/\"O\"", "lastModifiedDateTime": "2026-02-03T04:05:06Z"
+        });
+        let master = json!({
+            "id": "MASTER1", "subject": "Standup", "type": "seriesMaster",
+            "@odata.etag": "W/\"M\"", "lastModifiedDateTime": "2026-01-01T00:00:00Z",
+            "recurrence": { "pattern": { "type": "daily", "interval": 1 } }
+        });
+        let mut t = MockTransport(
+            vec![
+                Response::ok(json!({ "value": [cal("C1", "Calendar")] })),
+                Response::ok(json!({ "value": [occ], "@odata.deltaLink": "DL" })),
+                // the separate GET /me/events/MASTER1
+                Response::ok(master),
+            ],
+            0,
+        );
+        let r =
+            incremental_sync_calendar(&mut t, &store, "acc", WIN_S, WIN_E, "2026-06-03T00:00:00Z")
+                .unwrap();
+        assert_eq!(r.upserted, 1, "the occurrence");
+        assert_eq!(r.masters, 1, "the series master fetched separately");
+
+        // occurrence links to its master
+        let occ = store.get_item("acc", SERVICE, "OCC1").unwrap().unwrap();
+        assert_eq!(occ.series_master_id.as_deref(), Some("MASTER1"));
+        // master is stored as its own event, with no master of its own
+        let m = store.get_item("acc", SERVICE, "MASTER1").unwrap().unwrap();
+        assert_eq!(m.item_type, "event");
+        assert!(m.series_master_id.is_none(), "the master has no master");
+        assert_eq!(m.parent_remote_id.as_deref(), Some("C1"));
+    }
 
     #[test]
     fn ingests_calendars_events_and_per_calendar_cursors() {

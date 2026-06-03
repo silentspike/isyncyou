@@ -28,7 +28,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE items (
@@ -136,6 +136,15 @@ ALTER TABLE items ADD COLUMN internet_message_id TEXT;
 ALTER TABLE items ADD COLUMN ical_uid TEXT;
 "#;
 
+/// Schema v5: calendar series tracking (plan §6 — series-master/instance/exception
+/// separation). For a recurring event's occurrence/exception this holds the id of
+/// its series master; it is `NULL` for single-instance events and for the master
+/// row itself. Lets the model keep the recurring series (the master, carrying the
+/// recurrence rule) distinct from its expanded occurrences.
+const MIGRATION_V5: &str = r#"
+ALTER TABLE items ADD COLUMN series_master_id TEXT;
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -171,6 +180,9 @@ pub struct Item {
     pub internet_message_id: Option<String>,
     /// `iCalUId` for calendar events, if known (stable across the series).
     pub ical_uid: Option<String>,
+    /// For a recurring event's occurrence/exception: the id of its series master
+    /// (`NULL` for single-instance events and for the master row itself).
+    pub series_master_id: Option<String>,
 }
 
 impl Item {
@@ -200,6 +212,7 @@ impl Item {
             change_key: None,
             internet_message_id: None,
             ical_uid: None,
+            series_master_id: None,
         }
     }
 }
@@ -282,8 +295,8 @@ impl Store {
             r#"INSERT INTO items
                  (account_id, service, remote_id, parent_remote_id, name, local_path,
                   item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at,
-                  change_key, internet_message_id, ical_uid)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+                  change_key, internet_message_id, ical_uid, series_master_id)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
                ON CONFLICT(account_id, service, remote_id) DO UPDATE SET
                  parent_remote_id    = excluded.parent_remote_id,
                  name                = excluded.name,
@@ -298,7 +311,8 @@ impl Store {
                  deleted_at          = excluded.deleted_at,
                  change_key          = excluded.change_key,
                  internet_message_id = excluded.internet_message_id,
-                 ical_uid            = excluded.ical_uid"#,
+                 ical_uid            = excluded.ical_uid,
+                 series_master_id    = excluded.series_master_id"#,
             params![
                 it.account_id,
                 it.service,
@@ -316,7 +330,8 @@ impl Store {
                 it.deleted_at,
                 it.change_key,
                 it.internet_message_id,
-                it.ical_uid
+                it.ical_uid,
+                it.series_master_id
             ],
         )?;
         Ok(())
@@ -646,7 +661,7 @@ impl Store {
 
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
                     item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
-                    change_key, internet_message_id, ical_uid";
+                    change_key, internet_message_id, ical_uid, series_master_id";
 
 fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     Ok(Item {
@@ -667,6 +682,7 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         change_key: r.get(14)?,
         internet_message_id: r.get(15)?,
         ical_uid: r.get(16)?,
+        series_master_id: r.get(17)?,
     })
 }
 
@@ -683,6 +699,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 4 {
         conn.execute_batch(MIGRATION_V4)?;
+    }
+    if v < 5 {
+        conn.execute_batch(MIGRATION_V5)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
