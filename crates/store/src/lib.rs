@@ -28,7 +28,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE items (
@@ -124,6 +124,18 @@ CREATE TABLE runs (
 CREATE INDEX runs_account ON runs(account_id, id DESC);
 "#;
 
+/// Schema v4: the Outlook immutable-ID policy (plan §6). With the
+/// `Prefer: IdType="ImmutableId"` request header the stored `remote_id` is itself
+/// the immutable id (stable across folder moves); these columns hold the companion
+/// identifiers the policy lists for richer de-duplication and restore fidelity:
+/// `changeKey` (optimistic concurrency), `internetMessageId` (mail), `iCalUId`
+/// (calendar). Added with `ALTER TABLE` so existing stores upgrade in place.
+const MIGRATION_V4: &str = r#"
+ALTER TABLE items ADD COLUMN change_key TEXT;
+ALTER TABLE items ADD COLUMN internet_message_id TEXT;
+ALTER TABLE items ADD COLUMN ical_uid TEXT;
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -153,6 +165,12 @@ pub struct Item {
     pub remote_mtime: Option<String>,
     pub sync_state: String,
     pub deleted_at: Option<String>,
+    /// Outlook optimistic-concurrency tag (`changeKey`), if known.
+    pub change_key: Option<String>,
+    /// RFC 2822 `internetMessageId` for mail items, if known.
+    pub internet_message_id: Option<String>,
+    /// `iCalUId` for calendar events, if known (stable across the series).
+    pub ical_uid: Option<String>,
 }
 
 impl Item {
@@ -179,6 +197,9 @@ impl Item {
             remote_mtime: None,
             sync_state: "clean".into(),
             deleted_at: None,
+            change_key: None,
+            internet_message_id: None,
+            ical_uid: None,
         }
     }
 }
@@ -260,20 +281,24 @@ impl Store {
         self.conn.execute(
             r#"INSERT INTO items
                  (account_id, service, remote_id, parent_remote_id, name, local_path,
-                  item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                  item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at,
+                  change_key, internet_message_id, ical_uid)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
                ON CONFLICT(account_id, service, remote_id) DO UPDATE SET
-                 parent_remote_id = excluded.parent_remote_id,
-                 name             = excluded.name,
-                 local_path       = excluded.local_path,
-                 item_type        = excluded.item_type,
-                 etag             = excluded.etag,
-                 ctag             = excluded.ctag,
-                 quickxorhash     = excluded.quickxorhash,
-                 size             = excluded.size,
-                 remote_mtime     = excluded.remote_mtime,
-                 sync_state       = excluded.sync_state,
-                 deleted_at       = excluded.deleted_at"#,
+                 parent_remote_id    = excluded.parent_remote_id,
+                 name                = excluded.name,
+                 local_path          = excluded.local_path,
+                 item_type           = excluded.item_type,
+                 etag                = excluded.etag,
+                 ctag                = excluded.ctag,
+                 quickxorhash        = excluded.quickxorhash,
+                 size                = excluded.size,
+                 remote_mtime        = excluded.remote_mtime,
+                 sync_state          = excluded.sync_state,
+                 deleted_at          = excluded.deleted_at,
+                 change_key          = excluded.change_key,
+                 internet_message_id = excluded.internet_message_id,
+                 ical_uid            = excluded.ical_uid"#,
             params![
                 it.account_id,
                 it.service,
@@ -288,7 +313,10 @@ impl Store {
                 it.size,
                 it.remote_mtime,
                 it.sync_state,
-                it.deleted_at
+                it.deleted_at,
+                it.change_key,
+                it.internet_message_id,
+                it.ical_uid
             ],
         )?;
         Ok(())
@@ -617,7 +645,8 @@ impl Store {
 }
 
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
-                    item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at";
+                    item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
+                    change_key, internet_message_id, ical_uid";
 
 fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     Ok(Item {
@@ -635,6 +664,9 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         remote_mtime: r.get(11)?,
         sync_state: r.get(12)?,
         deleted_at: r.get(13)?,
+        change_key: r.get(14)?,
+        internet_message_id: r.get(15)?,
+        ical_uid: r.get(16)?,
     })
 }
 
@@ -648,6 +680,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 3 {
         conn.execute_batch(MIGRATION_V3)?;
+    }
+    if v < 4 {
+        conn.execute_batch(MIGRATION_V4)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
