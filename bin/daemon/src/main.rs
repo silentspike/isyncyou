@@ -64,6 +64,11 @@ fn run(args: &Args) -> Result<(), String> {
         });
     }
 
+    // Auto-recovery on boot (ADR-001): finish any restore operation left mid-flight
+    // by a previous run *before* serving — reconcile by marker, never blind-retry.
+    // Runs before any thread is spawned, so it needs no store-access gate.
+    recover_pending_restores(&cfg);
+
     // The store-access gate is shared by the web UI and the sync thread so only
     // one of them ever holds a store's single-instance file lock at a time.
     let gate = Arc::new(Mutex::new(()));
@@ -195,6 +200,38 @@ impl isyncyou_webui::SyncControl for Scheduler {
     }
     fn is_paused(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).paused
+    }
+}
+
+/// Finish any restore operations left mid-flight by a previous run, before serving
+/// (ADR-001 auto-recovery on boot). Only the mail path is wired today; an account
+/// with pending operations but no cached write token is logged and retried next
+/// start. Best-effort and never fatal — a recovery failure must not stop the daemon.
+fn recover_pending_restores(cfg: &Config) {
+    for acc in &cfg.accounts {
+        let pending = match isyncyou_engine::pending_mail_restore_count(cfg, &acc.id) {
+            Ok(n) => n,
+            Err(_) => continue, // no store yet / unreadable — nothing to recover
+        };
+        if pending == 0 {
+            continue;
+        }
+        match isyncyou_engine::auth::resolve_cached_restore_token(cfg, &acc.id) {
+            Ok(token) => {
+                match isyncyou_engine::recover_pending_mail_restores(cfg, &acc.id, token) {
+                    Ok((done, failed)) => eprintln!(
+                    "isyncyoud: restore recovery [{}]: {done} completed, {failed} still pending",
+                    acc.id
+                ),
+                    Err(e) => eprintln!("isyncyoud: restore recovery [{}] failed: {e}", acc.id),
+                }
+            }
+            Err(e) => eprintln!(
+                "isyncyoud: restore recovery [{}]: {pending} operation(s) pending but no write \
+                 token ({e}); will retry next start",
+                acc.id
+            ),
+        }
     }
 }
 
