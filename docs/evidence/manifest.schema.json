@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/silentspike/isyncyou/blob/main/docs/evidence/manifest.schema.json",
+  "title": "iSyncYou Evidence Manifest",
+  "description": "A machine-readable record that links requirements to the executed evidence which verifies them. It closes the loop: requirements (docs/requirements) -> tests -> this manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "generated_at", "commit", "entries"],
+  "properties": {
+    "manifest_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Schema major version of this manifest."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the evidence was collected (RFC 3339)."
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "The git commit the evidence was produced against."
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "requirement", "claim", "method", "command", "result"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^EV-[0-9]{3}$",
+          "description": "Unique evidence id, e.g. EV-001."
+        },
+        "requirement": {
+          "type": "string",
+          "pattern": "^REQ-[A-Z]+-[0-9]{3}$",
+          "description": "The requirement this evidence verifies (must exist in docs/requirements)."
+        },
+        "claim": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The specific thing being demonstrated."
+        },
+        "method": {
+          "enum": ["test", "command", "example", "probe"],
+          "description": "How the evidence was produced. 'probe' = a live check against a real account."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The exact command that produced the evidence."
+        },
+        "result": {
+          "enum": ["pass", "fail"],
+          "description": "The observed outcome. A manifest may record failures honestly."
+        },
+        "evidence": {
+          "type": "string",
+          "description": "A captured excerpt of the real output."
+        },
+        "artifact": {
+          "type": "string",
+          "description": "Path or URL to a stored artifact (log, report, screenshot)."
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
