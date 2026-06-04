@@ -21,7 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod mail_restore;
 mod restore_key;
 mod restore_recovery;
-pub use mail_restore::{restore_mail_via_ledger, MailApi, MailSink};
+pub use mail_restore::{
+    pending_mail_restore_count, recover_pending_mail_restores, recover_pending_mail_restores_with,
+    restore_mail_via_ledger, MailApi, MailSink,
+};
 pub use restore_key::{idempotency_key, load_or_create_secret, mail_marker};
 pub use restore_recovery::{recover_restore_op, run_restore_op, RestoreOutcome, RestoreSink};
 
