@@ -10,7 +10,8 @@
       "method": "test",
       "command": "cargo test -p isyncyou-engine restore_cloud_refuses_when_disabled_by_default",
       "result": "pass",
-      "evidence": "test tests::restore_cloud_refuses_when_disabled_by_default ... ok"
+      "evidence": "test tests::restore_cloud_refuses_when_disabled_by_default ... ok",
+      "test": "restore_cloud_refuses_when_disabled_by_default"
     },
     {
       "id": "EV-002",
@@ -19,7 +20,8 @@
       "method": "test",
       "command": "cargo test -p isyncyou-cli restore_to_local_recovers_an_archived_item",
       "result": "pass",
-      "evidence": "test tests::restore_to_local_recovers_an_archived_item ... ok"
+      "evidence": "test tests::restore_to_local_recovers_an_archived_item ... ok",
+      "test": "restore_to_local_recovers_an_archived_item"
     },
     {
       "id": "EV-003",
@@ -38,7 +40,8 @@
       "method": "test",
       "command": "cargo test -p isyncyou-engine c6_concurrent_identical_key_is_rejected_by_ledger",
       "result": "pass",
-      "evidence": "test restore_recovery::tests::c6_concurrent_identical_key_is_rejected_by_ledger ... ok"
+      "evidence": "test restore_recovery::tests::c6_concurrent_identical_key_is_rejected_by_ledger ... ok",
+      "test": "c6_concurrent_identical_key_is_rejected_by_ledger"
     },
     {
       "id": "EV-005",
@@ -47,7 +50,8 @@
       "method": "test",
       "command": "cargo test -p isyncyou-acceptance a2_delete_guard_both_directions",
       "result": "pass",
-      "evidence": "test a2_delete_guard_both_directions ... ok"
+      "evidence": "test a2_delete_guard_both_directions ... ok",
+      "test": "a2_delete_guard_both_directions"
     },
     {
       "id": "EV-006",
@@ -56,7 +60,8 @@
       "method": "test",
       "command": "cargo test -p isyncyou-acceptance a5_upload_resume_survives_kill",
       "result": "pass",
-      "evidence": "test a5_upload_resume_survives_kill ... ok"
+      "evidence": "test a5_upload_resume_survives_kill ... ok",
+      "test": "a5_upload_resume_survives_kill"
     },
     {
       "id": "EV-007",
@@ -65,7 +70,8 @@
       "method": "test",
       "command": "cargo test -p isyncyou-engine key_is_deterministic_and_hex",
       "result": "pass",
-      "evidence": "test restore_key::tests::key_is_deterministic_and_hex ... ok"
+      "evidence": "test restore_key::tests::key_is_deterministic_and_hex ... ok",
+      "test": "key_is_deterministic_and_hex"
     },
     {
       "id": "EV-008",
@@ -75,7 +81,8 @@
       "command": "cargo test -p isyncyou-engine crash_after_post_landed_does_not_duplicate",
       "result": "pass",
       "evidence": "test mail_restore::tests::crash_after_post_landed_does_not_duplicate ... ok",
-      "notes": "Live confirmation that Graph returns a posted Message-ID via an internetMessageId $filter is still pending a write token; cloud_restore_enabled stays false until then."
+      "notes": "Live confirmation that Graph returns a posted Message-ID via an internetMessageId $filter is still pending a write token; cloud_restore_enabled stays false until then.",
+      "test": "crash_after_post_landed_does_not_duplicate"
     },
     {
       "id": "EV-009",
@@ -84,7 +91,8 @@
       "method": "test",
       "command": "cargo test -p isyncyou-engine boot_recovery_reconciles_a_pending_op_without_creating",
       "result": "pass",
-      "evidence": "test mail_restore::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok"
+      "evidence": "test mail_restore::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok",
+      "test": "boot_recovery_reconciles_a_pending_op_without_creating"
     }
   ]
 }
