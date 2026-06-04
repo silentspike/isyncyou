@@ -1,0 +1,62 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-06-04T21:00:00Z",
+  "commit": "16e6ea5c5a02e431b8a006b4aff6ddea137a0ca0",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-RST-001",
+      "claim": "Cloud restore is refused when the opt-in flag is off (default).",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_cloud_refuses_when_disabled_by_default",
+      "result": "pass",
+      "evidence": "test tests::restore_cloud_refuses_when_disabled_by_default ... ok"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-RST-002",
+      "claim": "Local-file restore recovers the exact archived bytes with no token and no network.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-cli restore_to_local_recovers_an_archived_item",
+      "result": "pass",
+      "evidence": "test tests::restore_to_local_recovers_an_archived_item ... ok"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-RST-003",
+      "claim": "A crash after the Graph POST but before the local record does not duplicate the item; recovery reconciles to exactly one.",
+      "method": "example",
+      "command": "cargo run -p isyncyou-engine --example crash_matrix",
+      "result": "pass",
+      "evidence": "C4 crash after POST, before record       Reconciled       1        1  OK  ||  ADR-001 invariant holds: exactly one cloud item in every case, no duplicates.",
+      "artifact": "crates/engine/examples/crash_matrix.rs"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-RST-004",
+      "claim": "A concurrent identical restore is rejected by the ledger's unique idempotency key, so only one item is created.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine c6_concurrent_identical_key_is_rejected_by_ledger",
+      "result": "pass",
+      "evidence": "test restore_recovery::tests::c6_concurrent_identical_key_is_rejected_by_ledger ... ok"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-SYNC-002",
+      "claim": "The mass-delete guard halts an over-threshold deletion in both directions.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-acceptance a2_delete_guard_both_directions",
+      "result": "pass",
+      "evidence": "test a2_delete_guard_both_directions ... ok"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-SYNC-005",
+      "claim": "An interrupted chunked upload resumes from persisted session state across a process kill.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-acceptance a5_upload_resume_survives_kill",
+      "result": "pass",
+      "evidence": "test a5_upload_resume_survives_kill ... ok"
+    }
+  ]
+}
