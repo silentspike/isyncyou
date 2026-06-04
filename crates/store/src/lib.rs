@@ -23,12 +23,14 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("another instance already holds the store lock at {0}")]
     AlreadyRunning(String),
+    #[error("illegal restore-operation transition: {0}")]
+    IllegalTransition(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE items (
@@ -159,6 +161,45 @@ CREATE TABLE upload_sessions (
     next_offset  INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (account_id, service, dest_path)
+);
+"#;
+
+/// Schema v7: the crash-safe cloud-restore operation ledger (see
+/// `docs/adr/001-restore-semantics.md`). `restore_operations` records one row per
+/// restore intent with an explicit state machine; intent is written *before* the
+/// Graph call and the outcome *after* it, so recovery can tell that a `POST` may
+/// have landed and reconcile instead of blind-retrying. `idempotency_key` is unique
+/// per account (the database backstop against duplicate creates), and the lease
+/// columns give a single owner at a time. `restore_steps` is an append-only audit of
+/// every transition (evidence + debuggability).
+const MIGRATION_V7: &str = r#"
+CREATE TABLE restore_operations (
+    op_id            TEXT PRIMARY KEY,
+    account_id       TEXT NOT NULL,
+    service          TEXT NOT NULL,
+    source_item_id   TEXT NOT NULL,
+    idempotency_key  TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    new_cloud_id     TEXT,
+    marker           TEXT,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    lease_owner      TEXT,
+    lease_expires_at INTEGER,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    last_error       TEXT,
+    UNIQUE(account_id, idempotency_key)
+);
+CREATE INDEX idx_restore_ops_open ON restore_operations(account_id, state);
+
+CREATE TABLE restore_steps (
+    op_id      TEXT NOT NULL REFERENCES restore_operations(op_id),
+    seq        INTEGER NOT NULL,
+    from_state TEXT,
+    to_state   TEXT NOT NULL,
+    at         INTEGER NOT NULL,
+    detail     TEXT,
+    PRIMARY KEY (op_id, seq)
 );
 "#;
 
@@ -634,6 +675,170 @@ impl Store {
         Ok(())
     }
 
+    // --- Cloud-restore operation ledger (ADR-001) ---
+
+    /// Create a new restore operation in state `pending`, recording the first audit
+    /// step. `idempotency_key` is unique per account — a second attempt to restore
+    /// identical content collides at the database (returns a `Sqlite` error) rather
+    /// than in the user's mailbox. `now` is unix seconds.
+    pub fn create_restore_operation(
+        &self,
+        op_id: &str,
+        account: &str,
+        service: &str,
+        source_item_id: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO restore_operations
+                 (op_id, account_id, service, source_item_id, idempotency_key,
+                  state, attempts, created_at, updated_at)
+               VALUES (?1,?2,?3,?4,?5,'pending',0,?6,?6)",
+            params![
+                op_id,
+                account,
+                service,
+                source_item_id,
+                idempotency_key,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO restore_steps (op_id, seq, from_state, to_state, at, detail)
+               VALUES (?1, 1, NULL, 'pending', ?2, 'created')",
+            params![op_id, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fetch one restore operation by id.
+    pub fn get_restore_operation(&self, op_id: &str) -> Result<Option<RestoreOperation>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {RESTORE_OP_COLS} FROM restore_operations WHERE op_id=?1"),
+                params![op_id],
+                map_restore_op,
+            )
+            .optional()?)
+    }
+
+    /// Apply a state transition, enforcing the recovery-safe state machine and
+    /// appending an audit step. Optionally persists the created cloud id and/or the
+    /// marker (each only overwrites when `Some`). Rejects an illegal transition with
+    /// [`StoreError::IllegalTransition`] and makes no change. Entering `committing`
+    /// increments `attempts`. `now` is unix seconds.
+    pub fn transition_restore(
+        &self,
+        op_id: &str,
+        to: RestoreState,
+        now: i64,
+        detail: Option<&str>,
+        new_cloud_id: Option<&str>,
+        marker: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let cur: String = tx.query_row(
+            "SELECT state FROM restore_operations WHERE op_id=?1",
+            params![op_id],
+            |r| r.get(0),
+        )?;
+        let from = RestoreState::parse(&cur).ok_or_else(|| {
+            StoreError::IllegalTransition(format!("unknown stored state '{cur}' for {op_id}"))
+        })?;
+        if !from.can_transition_to(to) {
+            return Err(StoreError::IllegalTransition(format!(
+                "{} -> {} ({op_id})",
+                from.as_str(),
+                to.as_str()
+            )));
+        }
+        let bump: i64 = if to == RestoreState::Committing { 1 } else { 0 };
+        tx.execute(
+            "UPDATE restore_operations
+                SET state=?2, updated_at=?3, attempts=attempts+?4,
+                    new_cloud_id=COALESCE(?5,new_cloud_id),
+                    marker=COALESCE(?6,marker)
+              WHERE op_id=?1",
+            params![op_id, to.as_str(), now, bump, new_cloud_id, marker],
+        )?;
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM restore_steps WHERE op_id=?1",
+            params![op_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO restore_steps (op_id, seq, from_state, to_state, at, detail)
+               VALUES (?1,?2,?3,?4,?5,?6)",
+            params![op_id, seq, from.as_str(), to.as_str(), now, detail],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record the most recent error message on an operation (does not change state).
+    pub fn set_restore_error(&self, op_id: &str, error: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE restore_operations SET last_error=?2, updated_at=?3 WHERE op_id=?1",
+            params![op_id, error, now],
+        )?;
+        Ok(())
+    }
+
+    /// Try to take the operation's lease for `owner`, valid for `ttl_secs`. Succeeds
+    /// only if no lease is held or the current one has expired (`<= now`). Returns
+    /// whether the lease was acquired. `now` is unix seconds.
+    pub fn acquire_restore_lease(
+        &self,
+        op_id: &str,
+        owner: &str,
+        now: i64,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE restore_operations
+                SET lease_owner=?2, lease_expires_at=?3
+              WHERE op_id=?1
+                AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?4)",
+            params![op_id, owner, now + ttl_secs, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Release the lease on an operation.
+    pub fn release_restore_lease(&self, op_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE restore_operations SET lease_owner=NULL, lease_expires_at=NULL WHERE op_id=?1",
+            params![op_id],
+        )?;
+        Ok(())
+    }
+
+    /// All non-terminal restore operations for an account, oldest first — the set the
+    /// daemon must drive to a terminal state on startup (auto-recovery).
+    pub fn recoverable_restore_operations(&self, account: &str) -> Result<Vec<RestoreOperation>> {
+        let sql = format!(
+            "SELECT {RESTORE_OP_COLS} FROM restore_operations
+              WHERE account_id=?1 AND state NOT IN ('committed','cancelled')
+              ORDER BY created_at, op_id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![account], map_restore_op)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The ordered audit trail of an operation as `(from_state, to_state)` pairs.
+    pub fn restore_history(&self, op_id: &str) -> Result<Vec<(Option<String>, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_state, to_state FROM restore_steps WHERE op_id=?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![op_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Record a completed engine run (one sync/backup/… pass) in the activity
     /// history. Returns the new run id.
     pub fn add_run(
@@ -761,6 +966,121 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     })
 }
 
+/// The state of one cloud-restore operation in the ledger (ADR-001).
+///
+/// Legal transitions form the recovery-safe machine:
+/// `Pending → PreflightChecked → Committing → Committed | FailedAfterGraphCommit`,
+/// with `FailedAfterGraphCommit` reconciling to `Committed` or resuming to
+/// `Committing` (never a blind retry), and `Pending`/`PreflightChecked` able to
+/// `Cancelled`. `Committed` and `Cancelled` are terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreState {
+    Pending,
+    PreflightChecked,
+    Committing,
+    Committed,
+    FailedAfterGraphCommit,
+    Cancelled,
+}
+
+impl RestoreState {
+    /// Stable string used in the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestoreState::Pending => "pending",
+            RestoreState::PreflightChecked => "preflight_checked",
+            RestoreState::Committing => "committing",
+            RestoreState::Committed => "committed",
+            RestoreState::FailedAfterGraphCommit => "failed_after_graph_commit",
+            RestoreState::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse the database string back to a state.
+    pub fn parse(s: &str) -> Option<RestoreState> {
+        Some(match s {
+            "pending" => RestoreState::Pending,
+            "preflight_checked" => RestoreState::PreflightChecked,
+            "committing" => RestoreState::Committing,
+            "committed" => RestoreState::Committed,
+            "failed_after_graph_commit" => RestoreState::FailedAfterGraphCommit,
+            "cancelled" => RestoreState::Cancelled,
+            _ => return None,
+        })
+    }
+
+    /// Terminal states accept no further transitions.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, RestoreState::Committed | RestoreState::Cancelled)
+    }
+
+    /// Whether `self → to` is a legal transition in the recovery-safe machine.
+    pub fn can_transition_to(self, to: RestoreState) -> bool {
+        use RestoreState::*;
+        matches!(
+            (self, to),
+            (Pending, PreflightChecked)
+                | (Pending, Cancelled)
+                | (PreflightChecked, Committing)
+                | (PreflightChecked, Cancelled)
+                | (Committing, Committed)
+                | (Committing, FailedAfterGraphCommit)
+                | (FailedAfterGraphCommit, Committed)
+                | (FailedAfterGraphCommit, Committing)
+        )
+    }
+}
+
+/// One row of the cloud-restore operation ledger (ADR-001).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreOperation {
+    pub op_id: String,
+    pub account_id: String,
+    pub service: String,
+    pub source_item_id: String,
+    pub idempotency_key: String,
+    pub state: RestoreState,
+    /// The created cloud id, once a commit is confirmed.
+    pub new_cloud_id: Option<String>,
+    /// Service-native id / stamped probe token used only to *find* a possibly
+    /// created item during reconciliation (the ledger row stays authoritative).
+    pub marker: Option<String>,
+    pub attempts: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_error: Option<String>,
+}
+
+/// Column list shared by every `restore_operations` SELECT, in `map_restore_op` order.
+const RESTORE_OP_COLS: &str = "op_id, account_id, service, source_item_id, \
+     idempotency_key, state, new_cloud_id, marker, attempts, lease_owner, \
+     lease_expires_at, created_at, updated_at, last_error";
+
+fn map_restore_op(r: &rusqlite::Row) -> rusqlite::Result<RestoreOperation> {
+    let state_s: String = r.get(5)?;
+    let state = RestoreState::parse(&state_s).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(5, "state".into(), rusqlite::types::Type::Text)
+    })?;
+    Ok(RestoreOperation {
+        op_id: r.get(0)?,
+        account_id: r.get(1)?,
+        service: r.get(2)?,
+        source_item_id: r.get(3)?,
+        idempotency_key: r.get(4)?,
+        state,
+        new_cloud_id: r.get(6)?,
+        marker: r.get(7)?,
+        attempts: r.get(8)?,
+        lease_owner: r.get(9)?,
+        lease_expires_at: r.get(10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+        last_error: r.get(13)?,
+    })
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if v < 1 {
@@ -780,6 +1100,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 6 {
         conn.execute_batch(MIGRATION_V6)?;
+    }
+    if v < 7 {
+        conn.execute_batch(MIGRATION_V7)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -1083,5 +1406,231 @@ mod tests {
             .get_upload_session("a", "onedrive", "/Big.bin")
             .unwrap()
             .is_none());
+    }
+
+    // --- restore operation ledger (ADR-001) ---
+
+    #[test]
+    fn restore_op_create_and_get() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_restore_operation("op1", "a", "mail", "src1", "key1", 100)
+            .unwrap();
+        let op = s.get_restore_operation("op1").unwrap().unwrap();
+        assert_eq!(op.state, RestoreState::Pending);
+        assert_eq!(op.account_id, "a");
+        assert_eq!(op.idempotency_key, "key1");
+        assert_eq!(op.attempts, 0);
+        assert_eq!(op.created_at, 100);
+        assert_eq!(
+            s.restore_history("op1").unwrap(),
+            vec![(None, "pending".to_string())]
+        );
+        assert!(s.get_restore_operation("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_op_happy_path_transitions_and_audit() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_restore_operation("op1", "a", "mail", "src1", "key1", 100)
+            .unwrap();
+        s.transition_restore(
+            "op1",
+            RestoreState::PreflightChecked,
+            101,
+            Some("preflight"),
+            None,
+            None,
+        )
+        .unwrap();
+        s.transition_restore(
+            "op1",
+            RestoreState::Committing,
+            102,
+            None,
+            None,
+            Some("msgid-123"),
+        )
+        .unwrap();
+        s.transition_restore(
+            "op1",
+            RestoreState::Committed,
+            103,
+            None,
+            Some("AAMk-new"),
+            None,
+        )
+        .unwrap();
+        let op = s.get_restore_operation("op1").unwrap().unwrap();
+        assert_eq!(op.state, RestoreState::Committed);
+        assert_eq!(op.attempts, 1); // bumped once, on entering committing
+        assert_eq!(op.new_cloud_id.as_deref(), Some("AAMk-new"));
+        assert_eq!(op.marker.as_deref(), Some("msgid-123"));
+        let hist = s.restore_history("op1").unwrap();
+        assert_eq!(hist.len(), 4);
+        assert_eq!(hist.last().unwrap().1, "committed");
+    }
+
+    #[test]
+    fn restore_op_illegal_transition_is_rejected_and_state_unchanged() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_restore_operation("op1", "a", "mail", "src1", "key1", 100)
+            .unwrap();
+        let err = s
+            .transition_restore("op1", RestoreState::Committed, 101, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::IllegalTransition(_)));
+        assert_eq!(
+            s.get_restore_operation("op1").unwrap().unwrap().state,
+            RestoreState::Pending
+        );
+        assert_eq!(s.restore_history("op1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn restore_op_failed_after_commit_reconciles_or_resumes() {
+        let s = Store::open_in_memory().unwrap();
+        // reconcile path: failed_after_graph_commit -> committed
+        s.create_restore_operation("op1", "a", "mail", "s", "k1", 1)
+            .unwrap();
+        s.transition_restore("op1", RestoreState::PreflightChecked, 2, None, None, None)
+            .unwrap();
+        s.transition_restore("op1", RestoreState::Committing, 3, None, None, None)
+            .unwrap();
+        s.transition_restore(
+            "op1",
+            RestoreState::FailedAfterGraphCommit,
+            4,
+            Some("killed"),
+            None,
+            None,
+        )
+        .unwrap();
+        s.transition_restore(
+            "op1",
+            RestoreState::Committed,
+            5,
+            Some("found in cloud"),
+            Some("id"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_restore_operation("op1").unwrap().unwrap().state,
+            RestoreState::Committed
+        );
+
+        // resume path: failed_after_graph_commit -> committing
+        s.create_restore_operation("op2", "a", "mail", "s", "k2", 1)
+            .unwrap();
+        s.transition_restore("op2", RestoreState::PreflightChecked, 2, None, None, None)
+            .unwrap();
+        s.transition_restore("op2", RestoreState::Committing, 3, None, None, None)
+            .unwrap();
+        s.transition_restore(
+            "op2",
+            RestoreState::FailedAfterGraphCommit,
+            4,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.transition_restore(
+            "op2",
+            RestoreState::Committing,
+            5,
+            Some("not found, resume"),
+            None,
+            None,
+        )
+        .unwrap();
+        let op2 = s.get_restore_operation("op2").unwrap().unwrap();
+        assert_eq!(op2.state, RestoreState::Committing);
+        assert_eq!(op2.attempts, 2); // committing entered twice
+    }
+
+    #[test]
+    fn restore_op_lease_is_single_owner_until_expiry() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_restore_operation("op1", "a", "mail", "s", "k1", 1)
+            .unwrap();
+        assert!(s.acquire_restore_lease("op1", "daemon-A", 100, 30).unwrap()); // expires 130
+        assert!(!s.acquire_restore_lease("op1", "daemon-B", 110, 30).unwrap()); // still held
+        assert!(s.acquire_restore_lease("op1", "daemon-B", 131, 30).unwrap()); // expired -> taken
+        assert_eq!(
+            s.get_restore_operation("op1")
+                .unwrap()
+                .unwrap()
+                .lease_owner
+                .as_deref(),
+            Some("daemon-B")
+        );
+        s.release_restore_lease("op1").unwrap();
+        assert!(s
+            .get_restore_operation("op1")
+            .unwrap()
+            .unwrap()
+            .lease_owner
+            .is_none());
+        assert!(s.acquire_restore_lease("op1", "daemon-C", 5, 30).unwrap()); // free after release
+    }
+
+    #[test]
+    fn restore_op_recoverable_excludes_terminal_and_other_accounts() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_restore_operation("done", "a", "mail", "s", "k1", 1)
+            .unwrap();
+        s.transition_restore("done", RestoreState::Cancelled, 2, None, None, None)
+            .unwrap();
+        s.create_restore_operation("open1", "a", "mail", "s", "k2", 2)
+            .unwrap();
+        s.transition_restore("open1", RestoreState::PreflightChecked, 3, None, None, None)
+            .unwrap();
+        s.create_restore_operation("open2", "a", "mail", "s", "k3", 3)
+            .unwrap(); // pending
+        s.create_restore_operation("other", "b", "mail", "s", "k4", 4)
+            .unwrap(); // other account
+        let rec = s.recoverable_restore_operations("a").unwrap();
+        let ids: Vec<_> = rec.iter().map(|o| o.op_id.as_str()).collect();
+        assert_eq!(ids, vec!["open1", "open2"]);
+    }
+
+    #[test]
+    fn restore_op_idempotency_key_is_unique_per_account() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_restore_operation("op1", "a", "mail", "s", "samekey", 1)
+            .unwrap();
+        // same account + same key -> rejected (duplicate-create backstop)
+        let err = s
+            .create_restore_operation("op2", "a", "mail", "s", "samekey", 2)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)));
+        // same key, different account is fine
+        s.create_restore_operation("op3", "b", "mail", "s", "samekey", 3)
+            .unwrap();
+    }
+
+    #[test]
+    fn restore_state_machine_rules_and_roundtrip() {
+        use RestoreState::*;
+        assert!(Pending.can_transition_to(PreflightChecked));
+        assert!(!Pending.can_transition_to(Committing));
+        assert!(Committing.can_transition_to(FailedAfterGraphCommit));
+        assert!(FailedAfterGraphCommit.can_transition_to(Committed));
+        assert!(FailedAfterGraphCommit.can_transition_to(Committing));
+        assert!(!Committed.can_transition_to(Committing));
+        assert!(Committed.is_terminal());
+        assert!(Cancelled.is_terminal());
+        assert!(!Committing.is_terminal());
+        for st in [
+            Pending,
+            PreflightChecked,
+            Committing,
+            Committed,
+            FailedAfterGraphCommit,
+            Cancelled,
+        ] {
+            assert_eq!(RestoreState::parse(st.as_str()), Some(st));
+        }
     }
 }
