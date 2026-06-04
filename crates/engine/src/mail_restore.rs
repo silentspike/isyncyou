@@ -166,6 +166,85 @@ fn finish_mail_restore<S: RestoreSink>(
     }
 }
 
+/// How many non-terminal **mail** restore operations are pending for `account`.
+/// Cheap (no token, no network) — the daemon uses it to decide whether boot
+/// recovery is worth resolving a token for.
+pub fn pending_mail_restore_count(cfg: &Config, account: &str) -> Result<usize, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    Ok(store
+        .recoverable_restore_operations(account)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|o| o.service == "mail")
+        .count())
+}
+
+/// Read one archived mail item's MIME from an already-open store (no second
+/// `Store::open`, so it is safe to call while holding the store).
+fn archived_mail_bytes(
+    store: &Store,
+    acc: &isyncyou_core::AccountConfig,
+    source_id: &str,
+) -> Result<Vec<u8>, String> {
+    let item = store
+        .get_item(&acc.id, "mail", source_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no archived mail item '{source_id}'"))?;
+    let rel = item
+        .local_path
+        .ok_or_else(|| format!("item '{source_id}' has no archived body"))?;
+    std::fs::read(acc.archive_root.join(&rel)).map_err(|e| e.to_string())
+}
+
+/// Drive every pending mail restore operation for `account` to a terminal state
+/// using `sink` (reconcile by marker, or resume) — the boot-recovery core, with the
+/// cloud abstracted so it is testable. Returns `(recovered, still_failing)`.
+pub fn recover_pending_mail_restores_with<S: RestoreSink>(
+    cfg: &Config,
+    account: &str,
+    sink: &S,
+) -> Result<(usize, usize), String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let ops = store
+        .recoverable_restore_operations(account)
+        .map_err(|e| e.to_string())?;
+    let now = now_secs();
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for op in ops.into_iter().filter(|o| o.service == "mail") {
+        let res = archived_mail_bytes(&store, acc, &op.source_item_id)
+            .and_then(|bytes| recover_restore_op(&store, &op.op_id, &bytes, sink, now).map(|_| ()));
+        match res {
+            Ok(()) => ok += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    Ok((ok, failed))
+}
+
+/// Boot recovery against the live Graph using `token`. Thin wrapper over
+/// [`recover_pending_mail_restores_with`].
+pub fn recover_pending_mail_restores(
+    cfg: &Config,
+    account: &str,
+    token: String,
+) -> Result<(usize, usize), String> {
+    let client = isyncyou_graph::GraphClient::new(token);
+    let sink = MailSink { api: &client };
+    recover_pending_mail_restores_with(cfg, account, &sink)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +366,62 @@ mod tests {
             finish_mail_restore(&s, &op, "acc", "src1", &key, &marker, MIME, &sink, 20).unwrap();
         assert!(!id.is_empty());
         assert_eq!(api.count(), 1);
+    }
+
+    #[test]
+    fn boot_recovery_reconciles_a_pending_op_without_creating() {
+        // A mail restore that crashed after the POST landed leaves a `committing`
+        // op on disk. Boot recovery must reconcile it (find by marker) and create
+        // nothing new.
+        let dir = std::env::temp_dir().join(format!("isyncyou-recover-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(arch.join("mail/aa")).unwrap();
+        std::fs::write(arch.join("mail/aa/m.eml"), MIME).unwrap();
+        let (key, marker) = key_marker();
+        let op_id = format!("acc:{key}");
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut it = isyncyou_store::Item::new("acc", "mail", "src1", "Quarterly", "message");
+            it.local_path = Some("mail/aa/m.eml".into());
+            store.upsert_item(&it).unwrap();
+            store
+                .create_restore_operation(&op_id, "acc", "mail", "src1", &key, 1)
+                .unwrap();
+            store
+                .transition_restore(
+                    &op_id,
+                    RestoreState::PreflightChecked,
+                    2,
+                    None,
+                    None,
+                    Some(&marker),
+                )
+                .unwrap();
+            store
+                .transition_restore(&op_id, RestoreState::Committing, 3, None, None, None)
+                .unwrap();
+            // [CRASH] before committed
+        }
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "acc".into(),
+                username: "you@example.com".into(),
+                sync_root: dir.join("od"),
+                archive_root: arch.clone(),
+            }],
+            ..Default::default()
+        };
+        // the POST had landed -> the fake already holds the message under the marker
+        let api = FakeMailApi::default();
+        api.msgs.borrow_mut().push((marker.clone(), "msg-1".into()));
+        let sink = MailSink { api: &api };
+
+        assert_eq!(pending_mail_restore_count(&cfg, "acc").unwrap(), 1);
+        let (ok, failed) = recover_pending_mail_restores_with(&cfg, "acc", &sink).unwrap();
+        assert_eq!((ok, failed), (1, 0));
+        assert_eq!(api.creates(), 0, "recovery reconciled; no new create");
+        assert_eq!(pending_mail_restore_count(&cfg, "acc").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
