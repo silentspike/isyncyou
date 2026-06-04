@@ -18,7 +18,9 @@ use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod restore_key;
 mod restore_recovery;
+pub use restore_key::{idempotency_key, load_or_create_secret, mail_marker};
 pub use restore_recovery::{recover_restore_op, run_restore_op, RestoreOutcome, RestoreSink};
 
 /// Structured outcome of one [`sync_once`] pass. All counts are best-effort
