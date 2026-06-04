@@ -41,6 +41,66 @@ pub fn extract_html(eml: &[u8]) -> Option<String> {
     extract_html_part(&headers, body)
 }
 
+/// A non-destructive preview of what restoring an archived mail item *would* create
+/// in the cloud, built purely from the archived `.eml`. It contacts nothing — it is
+/// a read of local bytes only — so it is safe to show even when cloud restore is
+/// disabled. Best-effort and never panics on malformed input.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MailPreview {
+    pub subject: Option<String>,
+    pub from: Option<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub date: Option<String>,
+    pub message_id: Option<String>,
+    /// Size of the archived MIME in bytes.
+    pub size_bytes: usize,
+    /// Whether the message carries an HTML alternative.
+    pub has_html: bool,
+    /// A short, whitespace-collapsed snippet of the decoded body text.
+    pub body_snippet: String,
+}
+
+/// Parse an archived `.eml` into a [`MailPreview`]. Reads only; never contacts Graph.
+pub fn mail_preview(eml: &[u8]) -> MailPreview {
+    let (headers, body) = split_headers(eml);
+    MailPreview {
+        subject: header_value(&headers, "subject").map(|s| decode_header_text(&s)),
+        from: header_value(&headers, "from").map(|s| decode_header_text(&s)),
+        to: header_value(&headers, "to")
+            .map(|s| split_addresses(&decode_header_text(&s)))
+            .unwrap_or_default(),
+        cc: header_value(&headers, "cc")
+            .map(|s| split_addresses(&decode_header_text(&s)))
+            .unwrap_or_default(),
+        date: header_value(&headers, "date"),
+        message_id: header_value(&headers, "message-id"),
+        size_bytes: eml.len(),
+        has_html: extract_html(eml).is_some(),
+        body_snippet: snippet(&extract_part(&headers, body), 280),
+    }
+}
+
+/// Split a header address list on commas into trimmed, non-empty entries.
+fn split_addresses(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+/// Collapse runs of whitespace and truncate to `max` characters (on a char
+/// boundary), appending an ellipsis when truncated.
+fn snippet(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let head: String = collapsed.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
 /// Walk a MIME entity, returning the decoded body of the first `text/html` part.
 fn extract_html_part(headers: &[u8], body: &[u8]) -> Option<String> {
     let ctype = header_value(headers, "content-type").unwrap_or_default();
@@ -448,5 +508,48 @@ mod tests {
         // a plain-text-only message has no HTML part
         let plain = b"Content-Type: text/plain\r\n\r\njust text";
         assert_eq!(extract_html(plain), None);
+    }
+
+    #[test]
+    fn mail_preview_parses_headers_and_body_without_network() {
+        let eml = b"Subject: =?utf-8?q?Caf=C3=A9_meeting?=\r\n\
+                    From: Alice <alice@example.com>\r\n\
+                    To: bob@example.com, Carol <carol@example.com>\r\n\
+                    Cc: dave@example.com\r\n\
+                    Date: Mon, 01 Jun 2026 09:00:00 +0000\r\n\
+                    Message-ID: <abc123@example.com>\r\n\
+                    Content-Type: text/plain\r\n\r\n\
+                    Hello   there\n\nthis is the body.";
+        let p = mail_preview(eml);
+        assert_eq!(p.subject.as_deref(), Some("Café meeting"));
+        assert_eq!(p.from.as_deref(), Some("Alice <alice@example.com>"));
+        assert_eq!(p.to, vec!["bob@example.com", "Carol <carol@example.com>"]);
+        assert_eq!(p.cc, vec!["dave@example.com"]);
+        assert_eq!(p.date.as_deref(), Some("Mon, 01 Jun 2026 09:00:00 +0000"));
+        assert_eq!(p.message_id.as_deref(), Some("<abc123@example.com>"));
+        assert!(!p.has_html);
+        assert_eq!(p.size_bytes, eml.len());
+        // body snippet is whitespace-collapsed and excludes the subject line
+        assert_eq!(p.body_snippet, "Hello there this is the body.");
+    }
+
+    #[test]
+    fn mail_preview_flags_html_and_truncates_snippet() {
+        let eml = b"Subject: x\r\nContent-Type: text/html\r\n\r\n<p>hello <b>world</b></p>";
+        let p = mail_preview(eml);
+        assert!(p.has_html);
+        assert!(p.body_snippet.contains("hello"));
+
+        let long_body = "word ".repeat(200);
+        let eml2 = format!("Subject: y\r\nContent-Type: text/plain\r\n\r\n{long_body}");
+        let p2 = mail_preview(eml2.as_bytes());
+        assert!(p2.body_snippet.ends_with('…'));
+        assert_eq!(p2.body_snippet.chars().count(), 281); // 280 + ellipsis
+    }
+
+    #[test]
+    fn mail_preview_never_panics_on_garbage() {
+        let _ = mail_preview(b"this is not an email at all");
+        let _ = mail_preview(b"");
     }
 }
