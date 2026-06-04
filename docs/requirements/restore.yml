@@ -1,0 +1,73 @@
+# Restore requirements — traceable to ADR-001 and to tests.
+# Checked by tools/check_traceability.py.
+requirements:
+  - id: REQ-RST-001
+    title: Cloud restore is opt-in
+    statement: >
+      Restore operations that create items in the cloud must be disabled by default
+      and require an explicit configuration opt-in.
+    rationale: >
+      Cloud restore mutates the user's real mailbox/calendar. While the crash-safe
+      ledger is incomplete, the safe default is off.
+    status: implemented
+    design: docs/adr/001-restore-semantics.md
+    acceptance:
+      - The default configuration has cloud_restore_enabled = false.
+      - A configuration that omits the [restore] table stays off.
+      - engine::restore_cloud refuses before any store access or network call when off.
+      - The CLI refuses a cloud restore at the boundary when the flag is off.
+    verified_by:
+      - test: restore_cloud_refuses_when_disabled_by_default
+      - test: cloud_restore_stays_off_when_omitted_from_toml
+      - test: cloud_restore_blocked_when_flag_off_at_cli
+
+  - id: REQ-RST-002
+    title: Local-file restore is always available and never gated
+    statement: >
+      Recovering an archived item's body to a local file must work without a token,
+      without network access, and regardless of the cloud-restore gate.
+    status: implemented
+    design: docs/adr/001-restore-semantics.md
+    acceptance:
+      - restore --to-local recovers the exact archived bytes to a human-named file.
+      - It works for every service that has an archived body.
+    verified_by:
+      - test: restore_to_local_recovers_an_archived_item
+
+  - id: REQ-RST-003
+    title: A crash between the Graph write and the local record must not duplicate
+    statement: >
+      If the process dies, the network drops, or the token expires after the Graph
+      create but before the local record, recovery must produce exactly one cloud
+      item — never a duplicate, never a loss.
+    rationale: The two steps are not atomic; correctness must come from the retry.
+    status: planned
+    design: docs/adr/001-restore-semantics.md
+    acceptance:
+      - Crash-matrix point C4 (after POST, before local record) yields exactly one item.
+      - Recovery reconciles by marker instead of blind-retrying.
+    verified_by: []   # tests land with the operation-ledger implementation
+
+  - id: REQ-RST-004
+    title: Restore retries are idempotent
+    statement: >
+      Re-attempting a restore of identical content must be recognised as the same
+      operation (content-derived HMAC-SHA256 key + UNIQUE(account, idempotency_key)),
+      not as a new create.
+    status: planned
+    design: docs/adr/001-restore-semantics.md
+    acceptance:
+      - Crash-matrix point C6 (concurrent identical attempt) yields exactly one item.
+    verified_by: []
+
+  - id: REQ-RST-005
+    title: In-flight restores recover automatically on daemon start
+    statement: >
+      On start the daemon must drive every non-terminal restore operation to a
+      terminal state (reconcile or resume) before accepting new restore work.
+    status: planned
+    design: docs/adr/001-restore-semantics.md
+    acceptance:
+      - Operations in preflight_checked / committing / failed_after_graph_commit are
+        reconciled by the per-service probe at startup.
+    verified_by: []

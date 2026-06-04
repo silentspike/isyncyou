@@ -1,0 +1,111 @@
+# Core sync invariants (the v0.1 acceptance criteria A1-A10), as code.
+# Each is verified by a function in crates/acceptance/tests/mvp.rs.
+# Checked by tools/check_traceability.py.
+requirements:
+  - id: REQ-SYNC-001
+    title: No path or name causes data loss
+    statement: >
+      Round-tripping any name through the cloud<->local mapping must be lossless,
+      including reserved names, invalid characters and case conflicts.
+    status: implemented
+    acceptance:
+      - A generated corpus of names round-trips cloud -> local -> cloud unchanged.
+    verified_by:
+      - test: a1_no_path_or_name_data_loss
+
+  - id: REQ-SYNC-002
+    title: Mass-delete guard fires in both directions
+    statement: >
+      A run that would delete or replace more than the configured threshold of items
+      must halt, in either direction.
+    status: implemented
+    acceptance:
+      - Local->cloud and cloud->local bulk deletions above threshold are blocked.
+    verified_by:
+      - test: a2_delete_guard_both_directions
+
+  - id: REQ-SYNC-003
+    title: ETag precondition prevents silent overwrite
+    statement: >
+      Uploads use If-Match so a changed remote is never silently overwritten.
+    status: implemented
+    acceptance:
+      - A precondition failure (412) is surfaced as a conflict, not an overwrite.
+    verified_by:
+      - test: a3_etag_precondition_no_silent_overwrite
+
+  - id: REQ-SYNC-004
+    title: A 410 Gone triggers reconciliation, not blind deletion
+    statement: >
+      An expired delta cursor (410) must trigger a diff-and-apply reconciliation, not
+      a blind delete of local state.
+    status: implemented
+    acceptance:
+      - On 410 the engine reconciles instead of deleting everything.
+    verified_by:
+      - test: a4_gone_triggers_reconciliation
+
+  - id: REQ-SYNC-005
+    title: Upload resume survives a process kill
+    statement: >
+      An interrupted chunked upload resumes from persisted session state across a
+      process restart.
+    status: implemented
+    acceptance:
+      - After a kill mid-upload, the next run resumes rather than restarting.
+    verified_by:
+      - test: a5_upload_resume_survives_kill
+
+  - id: REQ-SYNC-006
+    title: Atomic writes allow a safe restart
+    statement: >
+      Materialized files are written tmp + rename so a crash never leaves a partial
+      file in place of a good one.
+    status: implemented
+    acceptance:
+      - A crash during write leaves either the old file or the complete new one.
+    verified_by:
+      - test: a6_atomic_write_safe_restart
+
+  - id: REQ-SYNC-007
+    title: An inotify overflow forces a full rescan
+    statement: >
+      The watcher is only an accelerator; an IN_Q_OVERFLOW must fall back to a full
+      reconcile so no change is missed.
+    status: implemented
+    acceptance:
+      - An overflow event triggers a rescan rather than dropping events.
+    verified_by:
+      - test: a7_inotify_overflow_forces_rescan
+
+  - id: REQ-SYNC-008
+    title: Disk-full is reported red, without DB corruption
+    statement: >
+      Running out of space surfaces as an error/paused state, never silent corruption.
+    status: implemented
+    acceptance:
+      - A disk-full condition yields a red self-check, store intact.
+    verified_by:
+      - test: a8_disk_full_is_red
+
+  - id: REQ-SYNC-009
+    title: The archive/trash lives outside the sync root
+    statement: >
+      Trash and archive directories must be outside the synced folder so deletions
+      are recoverable and never re-synced.
+    status: implemented
+    acceptance:
+      - The trash path is rejected if it would fall inside the sync root.
+    verified_by:
+      - test: a9_archive_separate_from_sync_root
+
+  - id: REQ-SYNC-010
+    title: Crash recovery passes the invariant checker
+    statement: >
+      After a crash, the journal-based recovery restores a consistent state that
+      passes the invariant checker.
+    status: implemented
+    acceptance:
+      - A simulated crash is recovered and the invariant checker passes.
+    verified_by:
+      - test: a10_crash_recovery_journal
