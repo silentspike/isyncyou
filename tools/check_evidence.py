@@ -46,6 +46,27 @@ def requirement_ids(root: Path) -> set[str]:
     return ids
 
 
+SOURCE_DIRS = ("crates", "bin", "gui")
+
+
+def rust_test_exists(root: Path, name: str) -> bool:
+    """Whether a `fn <name>(` is defined anywhere in the Rust source tree."""
+    import re
+
+    pat = re.compile(r"\bfn\s+" + re.escape(name) + r"\s*\(")
+    for d in SOURCE_DIRS:
+        base = root / d
+        if not base.is_dir():
+            continue
+        for f in base.rglob("*.rs"):
+            try:
+                if pat.search(f.read_text(encoding="utf-8", errors="ignore")):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Evidence-manifest validator")
     ap.add_argument("--root", default=".")
@@ -91,6 +112,19 @@ def main() -> int:
                 errors.append(
                     f"{ev}: requirement '{req}' not found in docs/requirements/*.yml"
                 )
+            # A `test`-method entry must name a real test and that test must exist —
+            # so the evidence is traceable to executable code, not decorative.
+            if entry.get("method") == "test":
+                tname = entry.get("test")
+                if not tname:
+                    errors.append(f"{ev}: method 'test' requires a 'test' field naming the function")
+                elif not rust_test_exists(root, tname):
+                    errors.append(f"{ev}: test '{tname}' not found in the source tree")
+            # Any cited artifact that is a repo-relative file must exist.
+            artifact = entry.get("artifact")
+            if artifact and "/" in artifact and not artifact.startswith(("http://", "https://")):
+                if not (root / artifact).exists():
+                    errors.append(f"{ev}: artifact '{artifact}' does not exist")
 
     n_entries = len(manifest.get("entries", [])) if isinstance(manifest, dict) else 0
     print(f"evidence manifest: {n_entries} entr{'y' if n_entries == 1 else 'ies'} | {manifest_path.name}")
@@ -101,7 +135,10 @@ def main() -> int:
             print(f"  - {e}")
         return 1
 
-    print("OK — manifest is schema-valid and every cited requirement exists.")
+    print(
+        "OK — manifest is schema-valid; every cited requirement exists; every test "
+        "entry names a real test; every artifact exists."
+    )
     return 0
 
 
