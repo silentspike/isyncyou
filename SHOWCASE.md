@@ -55,27 +55,29 @@ possibly-created item during reconciliation, but the **ledger is the source of
 truth** — the marker is only a search hint, never the authority. This avoids the
 classic bug where two weak signals disagree and the code picks the wrong one.
 
-**Auto-recovery on start (designed).** The recovery function (`recover_restore_op`)
-takes any operation not in a terminal state and drives it to one — reconciling by
-marker instead of blind-retrying — so the *intended* daemon path is to run it on
-boot before accepting new work, not as a manual command.
+**Auto-recovery on start.** The recovery function (`recover_restore_op`) takes any
+operation not in a terminal state and drives it to one — reconciling by marker
+instead of blind-retrying. The daemon runs it on boot, before accepting new work,
+so recovery is the normal startup path rather than a manual command.
 
 **Crash matrix.** The proof is a test suite that injects a crash at each unsafe
 point (`before POST`, `after POST / before commit`, `after commit / before marker`)
 and asserts the post-recovery invariant: **exactly one** cloud item, **no** loss.
 
-**Disabled by default.** Until that matrix is green *and wired into the live path*,
+**Disabled by default.** Until the live probe is confirmed (below),
 `cloud_restore_enabled = false`. The feature does not ship "mostly safe."
 
-> **Where this stands today (honest status).** The ledger, the state machine, the
-> recovery function and the crash matrix are implemented and pass — the crash matrix
-> runs against a deliberately non-idempotent fake cloud (see §7). What is **not yet
-> wired**: the live `engine::restore_cloud` path still calls the connectors directly
-> rather than going through the ledger, and the daemon does not yet invoke
-> `recover_restore_op` on boot. So the safety machinery is proven *in isolation*, and
-> cloud restore stays **off by default** until that integration lands. This is also
-> reflected in the README status table (🚧) and in `docs/requirements/restore.yml`
-> (the integration requirements are marked `planned`).
+> **Where this stands today (honest status).** The ledger, state machine, recovery
+> function and crash matrix are implemented and pass (the crash matrix runs against a
+> deliberately non-idempotent fake cloud — see §7). For **mail** this is now *wired
+> into the live path*: `engine::restore_cloud` routes mail through the ledger, and the
+> daemon invokes recovery on boot. The other services still use the direct path
+> (their migration is tracked in `docs/requirements/restore.yml`). The **one
+> remaining gate** before `cloud_restore_enabled` can be flipped is a live
+> confirmation against the test account — that Microsoft Graph returns a posted
+> `Message-ID` via an `internetMessageId` `$filter` — which needs a write token. Until
+> that passes, cloud restore stays **off by default**. The README status table (🚧)
+> and `docs/requirements/restore.yml` reflect the same.
 
 This is deliberately the same shape of problem you hit in payments, message queues,
 and any "call a remote API then record it locally" system. The interesting work is

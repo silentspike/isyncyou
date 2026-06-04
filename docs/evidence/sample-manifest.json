@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-06-04T21:00:00Z",
-  "commit": "16e6ea5c5a02e431b8a006b4aff6ddea137a0ca0",
+  "generated_at": "2026-06-04T23:30:00Z",
+  "commit": "8352a149ea9797ab90bf820e01be974da6e269ef",
   "entries": [
     {
       "id": "EV-001",
@@ -57,6 +57,34 @@
       "command": "cargo test -p isyncyou-acceptance a5_upload_resume_survives_kill",
       "result": "pass",
       "evidence": "test a5_upload_resume_survives_kill ... ok"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-RST-004",
+      "claim": "The content-derived idempotency key is deterministic and per-field sensitive.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine key_is_deterministic_and_hex",
+      "result": "pass",
+      "evidence": "test restore_key::tests::key_is_deterministic_and_hex ... ok"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-RST-003",
+      "claim": "Mail restore is wired through the ledger: a crash after the POST landed reconciles without creating a duplicate (proven against a non-idempotent fake mailbox).",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine crash_after_post_landed_does_not_duplicate",
+      "result": "pass",
+      "evidence": "test mail_restore::tests::crash_after_post_landed_does_not_duplicate ... ok",
+      "notes": "Live confirmation that Graph returns a posted Message-ID via an internetMessageId $filter is still pending a write token; cloud_restore_enabled stays false until then."
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-RST-005",
+      "claim": "The daemon recovers an in-flight mail restore on boot, reconciling without a new create.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine boot_recovery_reconciles_a_pending_op_without_creating",
+      "result": "pass",
+      "evidence": "test mail_restore::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok"
     }
   ]
 }

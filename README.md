@@ -75,7 +75,7 @@ hardening; ⏳ means designed and queued, not built.
 | Full-text search | ✅ | names **and mail bodies**; per-account and cross-account |
 | Export | ✅ | `.ics` / vCard from the archive |
 | Restore — local & re-create | ✅ | re-create archived items in the cloud as **new copies** via Graph |
-| Restore — crash-safe cloud path | 🚧 | operation ledger + crash matrix; **disabled by default until done** |
+| Restore — crash-safe cloud path | 🚧 | ledger wired for mail + daemon boot recovery, crash-matrix-proven; **off by default** until one live Graph-probe check passes |
 | Multi-account | ✅ | per-account stores, cross-account search |
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
