@@ -81,6 +81,34 @@ pub fn mail_preview(eml: &[u8]) -> MailPreview {
     }
 }
 
+/// Return a copy of `eml` whose `Message-ID` header is exactly `message_id`
+/// (replacing any existing one). Used by crash-safe restore to stamp a controlled,
+/// findable marker into the MIME before posting it, so recovery can locate a
+/// possibly-created message by its `internetMessageId`. Headers are rewritten
+/// unfolded with CRLF; the body is preserved byte-for-byte. Never panics.
+pub fn set_message_id(eml: &[u8], message_id: &str) -> Vec<u8> {
+    let (headers, body) = split_headers(eml);
+    let mut out = String::new();
+    out.push_str("Message-ID: ");
+    out.push_str(message_id);
+    out.push_str("\r\n");
+    for line in String::from_utf8_lossy(&headers).split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if line.to_ascii_lowercase().starts_with("message-id:") {
+            continue; // drop the original Message-ID
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
 /// Split a header address list on commas into trimmed, non-empty entries.
 fn split_addresses(s: &str) -> Vec<String> {
     s.split(',')
@@ -551,5 +579,35 @@ mod tests {
     fn mail_preview_never_panics_on_garbage() {
         let _ = mail_preview(b"this is not an email at all");
         let _ = mail_preview(b"");
+    }
+
+    #[test]
+    fn set_message_id_replaces_existing_and_preserves_body() {
+        let eml = b"Subject: Hi\r\nMessage-ID: <old@example.com>\r\nFrom: a@example.com\r\n\r\nbody stays";
+        let out = set_message_id(eml, "<new@restore.invalid>");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("Message-ID: <new@restore.invalid>\r\n"));
+        assert!(
+            !s.contains("<old@example.com>"),
+            "old Message-ID must be gone"
+        );
+        assert_eq!(
+            s.matches("Message-ID:").count(),
+            1,
+            "exactly one Message-ID"
+        );
+        assert!(s.contains("Subject: Hi"));
+        assert!(s.ends_with("\r\n\r\nbody stays"));
+    }
+
+    #[test]
+    fn set_message_id_inserts_when_absent_and_handles_garbage() {
+        let eml = b"Subject: NoId\r\n\r\nthe body";
+        let s = String::from_utf8(set_message_id(eml, "<x@restore.invalid>")).unwrap();
+        assert!(s.starts_with("Message-ID: <x@restore.invalid>\r\n"));
+        assert_eq!(s.matches("Message-ID:").count(), 1);
+        assert!(s.ends_with("\r\n\r\nthe body"));
+        // never panics on header-less input
+        let _ = set_message_id(b"not an email", "<y@restore.invalid>");
     }
 }
