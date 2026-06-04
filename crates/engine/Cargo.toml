@@ -15,3 +15,7 @@ isyncyou-pathmap = { path = "../pathmap" }
 isyncyou-graph = { path = "../graph", features = ["http"] }
 isyncyou-connectors = { path = "../connectors", features = ["http"] }
 serde_json = { workspace = true }
+# Content-derived idempotency key for crash-safe restore (ADR-001). RustCrypto,
+# permissive (MIT/Apache), no system deps.
+hmac = "0.12"
+sha2 = "0.10"
