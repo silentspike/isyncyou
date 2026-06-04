@@ -58,6 +58,10 @@
           "minLength": 1,
           "description": "The exact command that produced the evidence."
         },
+        "test": {
+          "type": "string",
+          "description": "For method=test: the test function name (verified to exist by the checker)."
+        },
         "result": {
           "enum": ["pass", "fail"],
           "description": "The observed outcome. A manifest may record failures honestly."
