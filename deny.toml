@@ -5,6 +5,14 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # fuser (crates/fuse — the on-demand placeholder filesystem) carries an upstream
+    # "unsound" advisory for an uninitialized-memory API. Accepted with eyes open:
+    # the FUSE feature is Linux-only and platform-gated (not on the default path),
+    # and the advisory is an unsoundness note, not a known exploit. Tracked for an
+    # upstream `fuser` bump that resolves it.
+    "RUSTSEC-2021-0154",
+]
 
 [licenses]
 version = 2

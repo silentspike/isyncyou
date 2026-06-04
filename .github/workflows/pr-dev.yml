@@ -1,6 +1,7 @@
 name: PR (dev)
 
 # Fast gate for PRs into `dev`: developers must be able to merge quickly.
+# Runs on GitHub-hosted runners (public-ready: no self-hosted exposure to fork PRs).
 on:
   pull_request:
     branches: [dev]
@@ -16,16 +17,31 @@ concurrency:
 jobs:
   dev-checks:
     name: dev-checks
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: Install Linux GUI build deps
+        # winit / softbuffer (gui/statusbar-app) link against these on Linux.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.14
+        with:
+          command: check
