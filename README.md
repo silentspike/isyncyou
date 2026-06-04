@@ -51,8 +51,8 @@ write." So the correctness has to come from the design:
 Because that surface is dangerous, **cloud restore ships disabled by default**
 (`cloud_restore_enabled = false`) and stays disabled until the ledger and its
 crash tests are complete. That is the central piece of engineering this repo is
-organised to prove — see [`SHOWCASE.md`](SHOWCASE.md) and the
-[case study](docs/case-study/fde-case-study.md).
+organised to prove — see [ADR-001](docs/adr/001-restore-semantics.md) for the full
+restore-safety design.
 
 ---
 
@@ -198,12 +198,10 @@ protocol**: every change is gated on `fmt`, `clippy -D warnings`, the test suite
 and `cargo deny` before it can land, and no behaviour is recorded as "done" without
 an executed command and its output as evidence. The interesting design decisions
 (crash-safe restore semantics, the own renderer used as its own headless test
-harness, the id-based reconciliation model) are written up as a case study rather
-than buried in commits. The protocol itself is written up in
-[`docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md`](docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md).
-See [`SHOWCASE.md`](SHOWCASE.md) for the 5-minute technical tour and
-[`docs/case-study/fde-case-study.md`](docs/case-study/fde-case-study.md) for the
-longer narrative.
+harness, the id-based reconciliation model) are written up as architecture decision
+records, not buried in commits. The protocol itself is in
+[`docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md`](docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md);
+the restore-safety design is [ADR-001](docs/adr/001-restore-semantics.md).
 
 ## Docs
 
