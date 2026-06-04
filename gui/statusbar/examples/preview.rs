@@ -21,7 +21,7 @@ fn main() {
         _ => SyncState::Throttled { wait_secs: 14 },
     };
     let view = StatusView {
-        account: "85476984+obtFusi@users.noreply.github.com".into(),
+        account: "you@example.com".into(),
         state,
         transfers: vec![
             Transfer {

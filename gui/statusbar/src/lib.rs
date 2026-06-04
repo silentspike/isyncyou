@@ -520,7 +520,7 @@ mod tests {
 
     fn sample() -> StatusView {
         StatusView {
-            account: "85476984+obtFusi@users.noreply.github.com".into(),
+            account: "you@example.com".into(),
             state: SyncState::Syncing,
             transfers: vec![
                 Transfer {

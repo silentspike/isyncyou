@@ -1505,6 +1505,17 @@ fn cmd_restore(
 
     // restore-cloud: re-create via Graph (write token). The engine opens the store
     // and re-creates the item — shared with the daemon's web-UI restore action.
+    // Honor the safety gate before touching credentials, so a disabled cloud restore
+    // returns a clear message instead of a token-resolution failure. (The engine
+    // re-checks the same gate as a defense-in-depth backstop.)
+    if !cfg.restore.cloud_restore_enabled {
+        return Err(
+            "cloud restore is disabled (set restore.cloud_restore_enabled = true \
+             to opt in). Use `restore --to-local` to recover an archived body to a file, \
+             or `restore --preview` to inspect it."
+                .to_string(),
+        );
+    }
     let token = resolve_token(&cfg, account, token, true)?;
     let new_id = isyncyou_engine::restore_cloud(&cfg, account, service, id, token)?;
     println!("restored {service} item '{id}' as '{new_id}'");
