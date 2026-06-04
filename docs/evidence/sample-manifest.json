@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-06-04T23:30:00Z",
-  "commit": "8352a149ea9797ab90bf820e01be974da6e269ef",
+  "generated_at": "2026-06-05T08:00:00Z",
+  "commit": "0e3cbd7116d08fb13606303c4899127422eab2ad",
   "entries": [
     {
       "id": "EV-001",
@@ -93,6 +93,16 @@
       "result": "pass",
       "evidence": "test mail_restore::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok",
       "test": "boot_recovery_reconciles_a_pending_op_without_creating"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-RST-003",
+      "claim": "Live: Microsoft Graph preserves a posted Message-ID as internetMessageId and an internetMessageId $filter finds it — the marker probe the crash recovery relies on.",
+      "method": "probe",
+      "command": "python3 tools/live_restore_probe.py",
+      "result": "pass",
+      "evidence": "POST /me/messages -> 201; internetMessageId == posted Message-ID; GET $filter -> 1 match; cleanup DELETE -> 204; VERDICT YES",
+      "artifact": "tools/live_restore_probe.py"
     }
   ]
 }
