@@ -18,8 +18,10 @@ use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod mail_restore;
 mod restore_key;
 mod restore_recovery;
+pub use mail_restore::{restore_mail_via_ledger, MailApi, MailSink};
 pub use restore_key::{idempotency_key, load_or_create_secret, mail_marker};
 pub use restore_recovery::{recover_restore_op, run_restore_op, RestoreOutcome, RestoreSink};
 
@@ -251,6 +253,13 @@ pub fn restore_cloud(
              use restore --to-local to recover its archived body to a file",
             RESTORE_SERVICES.join("|")
         ));
+    }
+    // Mail goes through the crash-safe operation ledger (ADR-001): record intent,
+    // stamp a findable marker, post, and reconcile-not-duplicate on a re-entry after
+    // a crash. The other services still use the direct path (their ledger migration
+    // is tracked in docs/requirements/restore.yml).
+    if service == "mail" {
+        return mail_restore::restore_mail_via_ledger(cfg, account, id, token);
     }
     let (item, bytes) = read_archived_body(cfg, account, service, id)?;
     let client = GraphClient::new(token);
