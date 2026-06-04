@@ -91,7 +91,8 @@ pub struct PbsConfig {
 /// Re-creating an item in the cloud is a Graph write followed by a local record,
 /// and the two are not atomic — a crash in between can make a naive retry create a
 /// duplicate in the user's real mailbox. The crash-safe operation-ledger path that
-/// makes those retries idempotent is still being hardened (see `SHOWCASE.md`), so
+/// makes those retries idempotent is still being hardened (see
+/// `docs/adr/001-restore-semantics.md`), so
 /// cloud-mutating restore is **off by default** and must be explicitly enabled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]

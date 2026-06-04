@@ -4,8 +4,8 @@
   default `false`) already ships; the ledger and crash matrix below are implemented as
   a tracked sequence of changes and gate the flag being safe to turn on.
 - **Date:** 2026-06-03
-- **Related:** [`SHOWCASE.md` §1](../../SHOWCASE.md), risk
-  [R1](../security/risk-register.md), [AI protocol](../ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md).
+- **Related:** risk [R1](../security/risk-register.md),
+  [AI protocol](../ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md).
 
 ---
 
