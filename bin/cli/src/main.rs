@@ -167,6 +167,10 @@ enum Command {
         /// (no token / no network). The file is named after the item.
         #[arg(long)]
         to_local: Option<PathBuf>,
+        /// Inspect what a cloud restore would create, without writing anything
+        /// (no token / no network / not gated). Best detail for mail.
+        #[arg(long)]
+        preview: bool,
         /// Graph **write** access token (Mail/Calendars/Contacts/Tasks.ReadWrite).
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
@@ -365,8 +369,9 @@ fn run(command: Command) -> Result<(), String> {
             service,
             id,
             to_local,
+            preview,
             token,
-        } => cmd_restore(&config, &account, &service, &id, to_local, token),
+        } => cmd_restore(&config, &account, &service, &id, to_local, preview, token),
         Command::Export {
             config,
             account,
@@ -1440,9 +1445,36 @@ fn cmd_restore(
     service: &str,
     id: &str,
     to_local: Option<PathBuf>,
+    preview: bool,
     token: Option<String>,
 ) -> Result<(), String> {
     let cfg = load_config(config)?;
+
+    // restore-preview: inspect what a cloud restore would create, reading only the
+    // local archive. No token, no network, not gated by cloud_restore_enabled.
+    if preview {
+        let p = isyncyou_engine::restore_preview(&cfg, account, service, id)?;
+        println!("{}", p.summary);
+        if let Some(m) = &p.mail {
+            println!("  subject: {}", m.subject.as_deref().unwrap_or("(none)"));
+            println!("  from:    {}", m.from.as_deref().unwrap_or("(none)"));
+            if !m.to.is_empty() {
+                println!("  to:      {}", m.to.join(", "));
+            }
+            if let Some(d) = &m.date {
+                println!("  date:    {d}");
+            }
+            println!(
+                "  size:    {} bytes{}",
+                m.size_bytes,
+                if m.has_html { " (html)" } else { "" }
+            );
+            if !m.body_snippet.is_empty() {
+                println!("  preview: {}", m.body_snippet);
+            }
+        }
+        return Ok(());
+    }
 
     // restore-local: recover the archived body to a directory (any service, no
     // token, no network). Distinct from `export` (bulk .ics/.vcf) — this is a
@@ -2223,6 +2255,7 @@ mod tests {
                 service: "mail".into(),
                 id: "M1".into(),
                 to_local: None,
+                preview: false,
                 token: Some("T".into()),
             }
         );
@@ -2279,9 +2312,40 @@ mod tests {
           // --to-local recovers the exact archived bytes to a human-named file,
           // no token / no network — for any service with an archived body.
         let out = dir.join("recovered");
-        cmd_restore(&p, "a", "onenote", "pg1", Some(out.clone()), None).unwrap();
+        cmd_restore(&p, "a", "onenote", "pg1", Some(out.clone()), false, None).unwrap();
         let f = out.join("Meeting Notes.html");
         assert_eq!(std::fs::read(&f).unwrap(), b"<h1>Notes</h1>");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_preview_inspects_mail_without_token_or_gate() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-prev-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(arch.join("mail/aa")).unwrap();
+        let eml = b"Subject: Quarterly report\r\nFrom: boss@example.com\r\nTo: me@example.com\r\n\
+                    Content-Type: text/plain\r\n\r\nplease review the attached numbers";
+        std::fs::write(arch.join("mail/aa/m.eml"), eml).unwrap();
+        // config WITHOUT [restore] -> cloud_restore_enabled defaults to false
+        let p = dir.join("c.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[[accounts]]\nid=\"a\"\nusername=\"a@example.com\"\nsync_root=\"{}/od\"\narchive_root=\"{}\"\n",
+                dir.display(),
+                arch.display()
+            ),
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut it =
+                isyncyou_store::Item::new("a", "mail", "m1", "Quarterly report", "message");
+            it.local_path = Some("mail/aa/m.eml".into());
+            store.upsert_item(&it).unwrap();
+        }
+        // preview=true, token=None -> succeeds (read-only, no network, not gated)
+        cmd_restore(&p, "a", "mail", "m1", None, true, None).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2299,10 +2363,20 @@ mod tests {
                 ))
                 .unwrap();
         } // drop -> release the store lock before cmd_restore reopens it
-        let err = cmd_restore(&p, "a", "calendar", "e1", None, Some("T".into())).unwrap_err();
+        let err =
+            cmd_restore(&p, "a", "calendar", "e1", None, false, Some("T".into())).unwrap_err();
         assert!(err.contains("no archived body"), "got: {err}");
         // a missing id is reported distinctly
-        let err2 = cmd_restore(&p, "a", "calendar", "missing", None, Some("T".into())).unwrap_err();
+        let err2 = cmd_restore(
+            &p,
+            "a",
+            "calendar",
+            "missing",
+            None,
+            false,
+            Some("T".into()),
+        )
+        .unwrap_err();
         assert!(err2.contains("no archived calendar item"), "got: {err2}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2325,7 +2399,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let err = cmd_restore(&p, "a", "calendar", "e1", None, Some("T".into())).unwrap_err();
+        let err =
+            cmd_restore(&p, "a", "calendar", "e1", None, false, Some("T".into())).unwrap_err();
         assert!(err.contains("cloud restore is disabled"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

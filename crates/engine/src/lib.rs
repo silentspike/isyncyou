@@ -10,11 +10,12 @@
 //! It returns a structured [`SyncReport`] and does **no** printing: the caller
 //! decides how to surface progress (stdout lines, an activity-log row, a metric).
 
+use isyncyou_connectors::MailPreview;
 use isyncyou_core::guard::{DeleteGuard, Direction, GuardVerdict};
 use isyncyou_core::Config;
 use isyncyou_graph::GraphClient;
 use isyncyou_pathmap::MappingTable;
-use isyncyou_store::Store;
+use isyncyou_store::{Item, Store};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Structured outcome of one [`sync_once`] pass. All counts are best-effort
@@ -185,6 +186,34 @@ pub mod auth {
 /// Cloud services that can be re-created from their canonical archive.
 pub const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 
+/// Open the account's store and read one archived item's body bytes. Shared by the
+/// cloud restore and the (read-only) restore preview. Error messages are stable —
+/// the CLI tests assert on them.
+fn read_archived_body(
+    cfg: &Config,
+    account: &str,
+    service: &str,
+    id: &str,
+) -> Result<(Item, Vec<u8>), String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let item = store
+        .get_item(account, service, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no archived {service} item '{id}' for account '{account}'"))?;
+    let rel = item
+        .local_path
+        .clone()
+        .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
+    let bytes = std::fs::read(acc.archive_root.join(&rel)).map_err(|e| e.to_string())?;
+    Ok((item, bytes))
+}
+
 /// Re-create one archived item back in the cloud via Graph (restore-cloud-item).
 /// Opens the account's store, reads the archived body, and re-creates it through
 /// the connectors. Shared by the CLI's `restore` and the daemon's web-UI restore
@@ -218,22 +247,7 @@ pub fn restore_cloud(
             RESTORE_SERVICES.join("|")
         ));
     }
-    let acc = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let store =
-        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
-    let item = store
-        .get_item(account, service, id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no archived {service} item '{id}' for account '{account}'"))?;
-    let rel = item
-        .local_path
-        .as_deref()
-        .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
-    let bytes = std::fs::read(acc.archive_root.join(rel)).map_err(|e| e.to_string())?;
+    let (item, bytes) = read_archived_body(cfg, account, service, id)?;
     let client = GraphClient::new(token);
     let new_id = match service {
         "mail" => connectors::restore_message(&client, &bytes)?,
@@ -258,6 +272,64 @@ pub fn restore_cloud(
         _ => unreachable!("validated against RESTORE_SERVICES"),
     };
     Ok(new_id)
+}
+
+/// A non-destructive preview of what a cloud restore of one archived item *would*
+/// create. Built by reading local archive bytes only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePreview {
+    pub service: String,
+    pub source_item_id: String,
+    /// Size of the archived body in bytes.
+    pub archived_bytes: usize,
+    /// Parsed mail details, present only for `service == "mail"`.
+    pub mail: Option<MailPreview>,
+    /// One-line human summary.
+    pub summary: String,
+}
+
+/// Inspect what restoring `id` to the cloud would create, **without mutating
+/// anything**. Reads only the local archive — no token, no network, and crucially
+/// **not** gated by `cloud_restore_enabled` (a preview is always safe). For mail it
+/// returns a parsed [`MailPreview`]; for other services it reports the archived size.
+pub fn restore_preview(
+    cfg: &Config,
+    account: &str,
+    service: &str,
+    id: &str,
+) -> Result<RestorePreview, String> {
+    if !RESTORE_SERVICES.contains(&service) {
+        return Err(format!(
+            "service '{service}' has no cloud restore path (expected one of {})",
+            RESTORE_SERVICES.join("|")
+        ));
+    }
+    let (_item, bytes) = read_archived_body(cfg, account, service, id)?;
+    let mail = if service == "mail" {
+        Some(isyncyou_connectors::mail_preview(&bytes))
+    } else {
+        None
+    };
+    let summary = match &mail {
+        Some(m) => format!(
+            "mail: \"{}\" from {} ({} byte archive){}",
+            m.subject.as_deref().unwrap_or("(no subject)"),
+            m.from.as_deref().unwrap_or("(unknown sender)"),
+            bytes.len(),
+            if m.has_html { ", html" } else { "" }
+        ),
+        None => format!(
+            "{service}: a {} byte archive would be re-created as a new cloud item",
+            bytes.len()
+        ),
+    };
+    Ok(RestorePreview {
+        service: service.to_string(),
+        source_item_id: id.to_string(),
+        archived_bytes: bytes.len(),
+        mail,
+        summary,
+    })
 }
 
 /// Run one full bidirectional sync pass for `account` against an already-open
@@ -412,5 +484,40 @@ mod tests {
             err.contains("cloud restore is disabled"),
             "expected disabled-gate message, got: {err}"
         );
+    }
+
+    #[test]
+    fn restore_preview_reads_mail_without_token_or_gate() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-eng-preview-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(arch.join("mail/aa")).unwrap();
+        let eml = b"Subject: Hi\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\
+                    Content-Type: text/plain\r\n\r\nbody text here";
+        std::fs::write(arch.join("mail/aa/m.eml"), eml).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut it = Item::new("a", "mail", "m1", "Hi", "message");
+            it.local_path = Some("mail/aa/m.eml".into());
+            store.upsert_item(&it).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a@example.com".into(),
+                sync_root: dir.join("od"),
+                archive_root: arch.clone(),
+            }],
+            ..Default::default()
+        };
+        // Gate is OFF (default) and no token is supplied — preview must still work.
+        assert!(!cfg.restore.cloud_restore_enabled);
+        let p = restore_preview(&cfg, "a", "mail", "m1").unwrap();
+        let m = p.mail.expect("mail preview present");
+        assert_eq!(m.subject.as_deref(), Some("Hi"));
+        assert_eq!(m.from.as_deref(), Some("a@example.com"));
+        assert_eq!(m.to, vec!["b@example.com"]);
+        assert_eq!(p.archived_bytes, eml.len());
+        assert!(p.summary.contains("Hi"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
