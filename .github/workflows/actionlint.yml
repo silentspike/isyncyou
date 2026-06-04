@@ -1,0 +1,24 @@
+name: actionlint
+
+# Lint the workflow files themselves (syntax, expression errors, shellcheck of
+# `run:` blocks, deprecated/incorrect action usage).
+on:
+  pull_request:
+    paths: ['.github/workflows/**']
+  push:
+    branches: [dev, main]
+    paths: ['.github/workflows/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
+        with:
+          fail-on-error: true
