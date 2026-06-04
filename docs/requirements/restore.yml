@@ -45,9 +45,10 @@ requirements:
     design: docs/adr/001-restore-semantics.md
     note: >
       The recovery logic is wired into the live mail restore path and proven against
-      a non-idempotent fake mailbox. The one remaining live confirmation — that
-      Microsoft Graph returns a posted Message-ID via an internetMessageId $filter —
-      needs a write token; cloud_restore_enabled stays false until it passes.
+      a non-idempotent fake mailbox; the marker probe is live-confirmed against the
+      test account (tools/live_restore_probe.py: Graph preserves a posted Message-ID
+      and the internetMessageId $filter finds it). cloud_restore_enabled stays off by
+      default as a deliberate opt-in for a destructive operation.
     acceptance:
       - Crash-matrix point C4 (after POST, before local record) yields exactly one item.
       - Recovery reconciles by marker instead of blind-retrying.
