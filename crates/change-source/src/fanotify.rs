@@ -127,7 +127,15 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let w = FanotifyWatcher::mark_dir(dir.path()).expect("fanotify mark (needs CAP_SYS_ADMIN)");
+        // Even as root, an unprivileged container may lack CAP_SYS_ADMIN and the
+        // fanotify mark fails with EPERM — skip rather than fail in that case.
+        let w = match FanotifyWatcher::mark_dir(dir.path()) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("skip fanotify_reports_a_write_when_root: mark failed ({e})");
+                return;
+            }
+        };
         let f = dir.path().join("note.txt");
         std::fs::write(&f, b"hello").unwrap(); // open+write+close -> FAN_CLOSE_WRITE
         let events = w.poll(Duration::from_secs(2));
