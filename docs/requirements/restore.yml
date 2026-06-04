@@ -41,12 +41,19 @@ requirements:
       create but before the local record, recovery must produce exactly one cloud
       item — never a duplicate, never a loss.
     rationale: The two steps are not atomic; correctness must come from the retry.
-    status: planned
+    status: implemented
     design: docs/adr/001-restore-semantics.md
+    note: >
+      The recovery logic is wired into the live mail restore path and proven against
+      a non-idempotent fake mailbox. The one remaining live confirmation — that
+      Microsoft Graph returns a posted Message-ID via an internetMessageId $filter —
+      needs a write token; cloud_restore_enabled stays false until it passes.
     acceptance:
       - Crash-matrix point C4 (after POST, before local record) yields exactly one item.
       - Recovery reconciles by marker instead of blind-retrying.
-    verified_by: []   # tests land with the operation-ledger implementation
+    verified_by:
+      - test: c4_crash_after_post_before_record_no_duplicate
+      - test: crash_after_post_landed_does_not_duplicate
 
   - id: REQ-RST-004
     title: Restore retries are idempotent
@@ -54,20 +61,30 @@ requirements:
       Re-attempting a restore of identical content must be recognised as the same
       operation (content-derived HMAC-SHA256 key + UNIQUE(account, idempotency_key)),
       not as a new create.
-    status: planned
+    status: implemented
     design: docs/adr/001-restore-semantics.md
     acceptance:
+      - The content-derived key is deterministic and per-field sensitive.
       - Crash-matrix point C6 (concurrent identical attempt) yields exactly one item.
-    verified_by: []
+      - A repeat of identical content returns the same id without a second create.
+    verified_by:
+      - test: key_is_deterministic_and_hex
+      - test: restore_op_idempotency_key_is_unique_per_account
+      - test: c6_concurrent_identical_key_is_rejected_by_ledger
+      - test: happy_path_creates_one_and_is_idempotent_on_repeat
 
   - id: REQ-RST-005
     title: In-flight restores recover automatically on daemon start
     statement: >
       On start the daemon must drive every non-terminal restore operation to a
       terminal state (reconcile or resume) before accepting new restore work.
-    status: planned
+    status: implemented
     design: docs/adr/001-restore-semantics.md
+    note: >
+      The daemon runs recovery before serving; an account with pending ops but no
+      cached write token is logged and retried next start.
     acceptance:
       - Operations in preflight_checked / committing / failed_after_graph_commit are
         reconciled by the per-service probe at startup.
-    verified_by: []
+    verified_by:
+      - test: boot_recovery_reconciles_a_pending_op_without_creating
