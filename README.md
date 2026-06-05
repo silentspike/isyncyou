@@ -173,10 +173,12 @@ unique item prefix and teardown.
 
 This section is deliberately blunt — it is the inverse of the status table.
 
-- **Cloud restore is disabled by default.** It re-creates items as *new copies*
-  (new ids; Microsoft 365 personal accounts offer no byte-identical import). The
-  crash-safe operation ledger that makes retries idempotent is still being built;
-  until it and its crash matrix are green, `cloud_restore_enabled` stays `false`.
+- **Cloud restore is off by default, and mail-only when enabled.** It re-creates
+  items as *new copies* (new ids; Microsoft 365 personal accounts offer no
+  byte-identical import). Only **mail** goes through the crash-safe operation ledger
+  (complete + live-confirmed); calendar / contacts / todo / onenote cloud restore is
+  **refused** until each is ledger-migrated. `cloud_restore_enabled` is `false` by
+  default — a deliberate opt-in, since it writes to a real mailbox.
 - **Data at rest is currently unencrypted.** The SQLite store and cached tokens
   live in plaintext on disk behind file permissions. An at-rest encryption layer
   is designed (a pluggable storage backend) but not yet shipped. Do not point this

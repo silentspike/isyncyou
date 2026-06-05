@@ -156,8 +156,9 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         account: String,
-        /// Service the item belongs to. Cloud restore: mail|calendar|contacts|todo.
-        /// `--to-local` works for any service with an archived body (incl. onenote).
+        /// Service the item belongs to. Cloud restore: **mail only** (crash-safe);
+        /// other services are refused until ledger-migrated. `--to-local` / `--preview`
+        /// work for any service with an archived body (incl. onenote).
         #[arg(long)]
         service: String,
         /// The archived item's `remote_id`.
@@ -1516,6 +1517,13 @@ fn cmd_restore(
                 .to_string(),
         );
     }
+    // Refuse a not-yet-ledger-migrated service before touching credentials, so the
+    // message is "not crash-safe yet" rather than a token error. (Engine re-checks.)
+    if !isyncyou_engine::cloud_restore_service_supported(service) {
+        return Err(isyncyou_engine::unsupported_cloud_restore_service_error(
+            service,
+        ));
+    }
     let token = resolve_token(&cfg, account, token, true)?;
     let new_id = isyncyou_engine::restore_cloud(&cfg, account, service, id, token)?;
     println!("restored {service} item '{id}' as '{new_id}'");
@@ -2370,25 +2378,33 @@ mod tests {
             let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
             store
                 .upsert_item(&isyncyou_store::Item::new(
-                    "a", "calendar", "e1", "Ev", "event",
+                    "a", "mail", "m1", "Subj", "message",
                 ))
                 .unwrap();
         } // drop -> release the store lock before cmd_restore reopens it
-        let err =
-            cmd_restore(&p, "a", "calendar", "e1", None, false, Some("T".into())).unwrap_err();
+          // mail is the ledger-backed cloud path, so it reaches the body check; an item
+          // with no archived body yet errors clearly.
+        let err = cmd_restore(&p, "a", "mail", "m1", None, false, Some("T".into())).unwrap_err();
         assert!(err.contains("no archived body"), "got: {err}");
         // a missing id is reported distinctly
-        let err2 = cmd_restore(
-            &p,
-            "a",
-            "calendar",
-            "missing",
-            None,
-            false,
-            Some("T".into()),
-        )
-        .unwrap_err();
-        assert!(err2.contains("no archived calendar item"), "got: {err2}");
+        let err2 =
+            cmd_restore(&p, "a", "mail", "missing", None, false, Some("T".into())).unwrap_err();
+        assert!(err2.contains("no archived mail item"), "got: {err2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_mail_cloud_restore_refuses_before_token_lookup() {
+        // A non-ledger service must be refused before any token resolution — passing
+        // no token still yields the "not crash-safe yet" message, not a token error.
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-nonmail-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch); // sets cloud_restore_enabled = true
+        for service in ["calendar", "contacts", "todo", "onenote"] {
+            let err = cmd_restore(&p, "a", service, "x", None, false, None).unwrap_err();
+            assert!(err.contains("not crash-safe yet"), "{service}: got: {err}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -103,6 +103,16 @@
       "result": "pass",
       "evidence": "POST /me/messages -> 201; internetMessageId == posted Message-ID; GET $filter -> 1 match; cleanup DELETE -> 204; VERDICT YES",
       "artifact": "tools/live_restore_probe.py"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-RST-006",
+      "claim": "A non-ledger (non-mail) cloud restore is refused before any store access or token lookup, never run via a non-crash-safe direct POST.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_cloud_refuses_non_mail_until_ledger_migrated",
+      "result": "pass",
+      "evidence": "test tests::restore_cloud_refuses_non_mail_until_ledger_migrated ... ok",
+      "test": "restore_cloud_refuses_non_mail_until_ledger_migrated"
     }
   ]
 }

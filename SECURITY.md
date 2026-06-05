@@ -31,8 +31,9 @@ These are documented, deliberate states — not undisclosed weaknesses. The full
 list with mitigations and status lives in the
 [risk register](docs/security/risk-register.md):
 
-- **Cloud-mutating restore is disabled by default** (`restore.cloud_restore_enabled
-  = false`) until its crash-safe operation ledger is complete, so an interrupted
-  restore cannot silently duplicate a mailbox item.
+- **Cloud-mutating restore is off by default and mail-only when enabled**
+  (`restore.cloud_restore_enabled = false`). Only mail is ledger-backed and
+  boot-recovered (so an interrupted restore cannot silently duplicate an item);
+  non-mail cloud re-create is refused until each service is ledger-migrated.
 - **Data at rest is currently unencrypted** (SQLite store + cached tokens, behind
   file permissions). An at-rest encryption layer is designed but not yet shipped.

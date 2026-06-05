@@ -89,3 +89,21 @@ requirements:
         reconciled by the per-service probe at startup.
     verified_by:
       - test: boot_recovery_reconciles_a_pending_op_without_creating
+
+  - id: REQ-RST-006
+    title: Non-ledger cloud restore is refused, not run unsafely
+    statement: >
+      Cloud-mutating restore for a service whose path is not yet crash-safe
+      (ledger-backed) must be refused — never executed via a direct, non-crash-safe
+      POST. Only mail qualifies today.
+    rationale: A direct POST can duplicate the item on a mid-restore crash (ADR-001).
+    status: implemented
+    design: docs/adr/001-restore-semantics.md
+    acceptance:
+      - The engine refuses a non-mail cloud restore before any store/network access.
+      - The CLI refuses before resolving a token.
+      - The daemon web-UI handler refuses before resolving a token.
+    verified_by:
+      - test: restore_cloud_refuses_non_mail_until_ledger_migrated
+      - test: non_mail_cloud_restore_refuses_before_token_lookup
+      - test: restore_handler_refuses_non_mail_before_token_lookup

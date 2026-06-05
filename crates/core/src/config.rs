@@ -94,7 +94,8 @@ pub struct PbsConfig {
 /// makes those retries idempotent is complete and live-confirmed (see
 /// `docs/adr/001-restore-semantics.md`); cloud-mutating restore is still **off by
 /// default** as a deliberate opt-in — it writes to a real mailbox — and must be
-/// explicitly enabled.
+/// explicitly enabled. Even when enabled, only **mail** is ledger-backed today;
+/// other services' cloud restore is refused until they are migrated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RestoreConfig {
