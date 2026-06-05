@@ -12,6 +12,7 @@ requirements:
       - A generated corpus of names round-trips cloud -> local -> cloud unchanged.
     verified_by:
       - test: a1_no_path_or_name_data_loss
+      - test: unicode_normalized_cloud_collisions_are_deduped
 
   - id: REQ-SYNC-002
     title: Mass-delete guard fires in both directions
@@ -109,3 +110,19 @@ requirements:
       - A simulated crash is recovered and the invariant checker passes.
     verified_by:
       - test: a10_crash_recovery_journal
+
+  - id: REQ-SYNC-011
+    title: OneNote page resources are archived beside page HTML
+    statement: >
+      OneNote backup must preserve binary page resources referenced from archived
+      page HTML by fetching safe OneNote resource URLs, storing them locally, and
+      writing a per-page manifest that maps source URLs to local files for later
+      restore replay.
+    status: implemented
+    acceptance:
+      - Resource URLs from img data-fullres-src/src and object data are detected.
+      - Non-OneNote remote URLs are ignored.
+      - Resource bytes are written under the archive root.
+      - A per-page resources manifest maps source URLs to local paths.
+    verified_by:
+      - test: onenote_archives_resource_manifest_from_page_html

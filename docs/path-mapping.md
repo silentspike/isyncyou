@@ -37,6 +37,8 @@ OneDrive does not). Per parent directory it remembers every cloud↔local pair:
   a stable counterpart, suffixing to resolve case collisions.
 - `lookup_cloud(parent, local)` / `lookup_local(parent, cloud)` — reverse lookups.
 
-Because names are tracked per parent and persisted, a move/rename never loses the
-mapping even when the codec alone would be ambiguous. Property-based tests exercise
-thousands of generated names for roundtrip safety.
+Collision keys are lower-case and NFC-normalized, so composed/decomposed Unicode
+spellings such as `Café` and `Cafe` + combining acute are treated as the same cloud
+sibling and deduped. Because names are tracked per parent and persisted, a
+move/rename never loses the mapping even when the codec alone would be ambiguous.
+Property-based tests exercise thousands of generated names for roundtrip safety.

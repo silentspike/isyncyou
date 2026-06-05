@@ -107,3 +107,53 @@ requirements:
       - test: restore_cloud_refuses_non_mail_until_ledger_migrated
       - test: non_mail_cloud_restore_refuses_before_token_lookup
       - test: restore_handler_refuses_non_mail_before_token_lookup
+
+  - id: REQ-RST-007
+    title: Restore write scopes use the personal-account OneNote scope
+    statement: >
+      The restore/write OAuth scope set must request delegated Notes.ReadWrite for
+      OneNote page re-create capability, and must not request the admin-only
+      Notes.ReadWrite.All scope that personal Microsoft accounts cannot grant.
+    rationale: >
+      Plan §11 corrected the OneNote write scope from Notes.ReadWrite.All to
+      Notes.ReadWrite; requesting the wrong scope makes personal-account restore
+      setup impossible.
+    status: implemented
+    acceptance:
+      - RESTORE_SCOPES contains Notes.ReadWrite.
+      - RESTORE_SCOPES does not contain Notes.ReadWrite.All.
+    verified_by:
+      - test: restore_scopes_use_delegated_onenote_write_scope
+
+  - id: REQ-RST-008
+    title: Personal-account contact restore does not attempt unsupported photo upload
+    statement: >
+      Contact photos may be archived locally for inspection/export, but Personal
+      Microsoft account contact restore must not attempt to post photo metadata or
+      upload a contact photo because Microsoft Graph does not support contact-photo
+      update for delegated personal accounts.
+    status: implemented
+    acceptance:
+      - Contact create payloads include writable contact fields.
+      - Contact create payloads drop photo objects and photo sidecar metadata.
+      - The restore fidelity matrix documents the Graph personal-account limitation.
+    verified_by:
+      - test: sanitize_contact_drops_photo_fields_for_personal_account_restore
+
+  - id: REQ-RST-009
+    title: OneNote resource restore uses multipart page-create payloads
+    statement: >
+      OneNote page restore with archived binary resources must use Microsoft
+      Graph's multipart page-create shape: a Presentation HTML part that references
+      binary parts by name, plus separate image/file parts with validated headers.
+    status: implemented
+    acceptance:
+      - Resource-bearing page restore calls the multipart page-create path.
+      - Empty-resource page restore keeps using the plain HTML path.
+      - The multipart body contains a Presentation part and binary data parts.
+      - Multipart part names and content types reject header injection.
+    verified_by:
+      - test: restore_page_with_resources_uses_multipart_parts
+      - test: restore_page_uses_plain_html_when_no_resources
+      - test: onenote_multipart_body_uses_presentation_and_binary_parts
+      - test: onenote_multipart_body_rejects_header_injection

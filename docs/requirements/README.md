@@ -13,7 +13,9 @@ This is the requirements counterpart to the [ADR](../adr/) (decisions) and the
 | File | Area |
 |---|---|
 | [`sync.yml`](sync.yml) | Core sync invariants — the v0.1 acceptance criteria A1–A10 |
-| [`restore.yml`](restore.yml) | Restore safety — the gate (implemented) + the operation-ledger requirements (planned, designed in ADR-001) |
+| [`restore.yml`](restore.yml) | Restore safety — default-off gate, mail ledger/recovery, non-mail refusal, and restore OAuth scope invariants |
+| [`security.yml`](security.yml) | Local API security invariants — TCP Host/Origin boundary, destructive POST guard, and owner-only Unix socket |
+| [`operations.yml`](operations.yml) | Operations invariants — standalone doctor behavior and local health reporting |
 
 ## Schema
 

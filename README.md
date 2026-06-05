@@ -49,10 +49,11 @@ write." So the correctness has to come from the design:
   assert *no duplicate, no loss.*
 
 Because that surface is dangerous, **cloud restore ships disabled by default**
-(`cloud_restore_enabled = false`) and stays disabled until the ledger and its
-crash tests are complete. That is the central piece of engineering this repo is
-organised to prove — see [ADR-001](docs/adr/001-restore-semantics.md) for the full
-restore-safety design.
+(`cloud_restore_enabled = false`). The mail path is now ledger-backed and
+crash-matrix proven; the other services' cloud-mutating paths are refused until
+each is migrated to the same ledger model. That is the central piece of
+engineering this repo is organised to prove — see
+[ADR-001](docs/adr/001-restore-semantics.md) for the full restore-safety design.
 
 ---
 
@@ -71,10 +72,10 @@ hardening; ⏳ means designed and queued, not built.
 | Upload sessions | ✅ | chunked, persisted session state, survives process kill |
 | Store (SQLite + FTS5) | ✅ | id-based schema, additive migrations, WAL, single-instance lock |
 | M365 backup connectors | ✅ | mail, calendar, contacts, ToDo, OneNote — incremental index |
-| Content archive | ✅ | `.eml` / canonical JSON / page HTML / contact photos on disk |
+| Content archive | ✅ | `.eml` / canonical JSON / page HTML + OneNote resources / contact photos on disk |
 | Full-text search | ✅ | names **and mail bodies**; per-account and cross-account |
 | Export | ✅ | `.ics` / vCard from the archive |
-| Restore — local & re-create | ✅ | re-create archived items in the cloud as **new copies** via Graph |
+| Restore — local & connector re-create | ✅ | local restore for archived bodies; connector-level re-create helpers for mail/calendar/tasks/contacts/OneNote |
 | Restore — crash-safe cloud path | ✅ mail · 🚧 other | mail wired through the ledger + daemon boot recovery, crash-matrix-proven, **live-probe confirmed**; **off by default** as an opt-in (it writes to a real mailbox) |
 | Multi-account | ✅ | per-account stores, cross-account search |
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
@@ -82,14 +83,14 @@ hardening; ⏳ means designed and queued, not built.
 | Native status bar + tray (SNI) | 🚧 | own `tiny-skia` + `cosmic-text` renderer; windowed build is display-gated |
 | Dolphin overlay icons | 🚧 | host-side KF6 plugin, packaged separately |
 | FUSE on-demand placeholders | ⏳ | designed; privileged/platform-gated |
-| PBS snapshot restore path | ⏳ | designed; needs a PBS instance |
+| PBS snapshot / temp restore path | ✅ local + live PBS | `VACUUM INTO` staged store + manifest, PBS backup/list/restore CLI; live temp-store round-trip confirmed against a real PBS repository |
 | Acceptance harness (A1–A10) + chaos tests | ✅ | data-loss / crash-point matrix |
 | Release archive + systemd unit | ✅ | tarball + `systemd --user` service |
 
-The release-engineering work this repo is currently building out — a deployed
-staging environment, a full end-to-end suite, a build-once-promote pipeline with
-SBOM and signed artifacts, and at-rest encryption for the store and tokens — is
-tracked openly and is **not** claimed as done.
+The remaining release-engineering work is tracked openly: a deployed staging
+environment and a full end-to-end suite are still not claimed as done. The release
+workflow now generates a CycloneDX SBOM and GitHub artifact attestations for
+release artifacts.
 
 ---
 
@@ -97,11 +98,12 @@ tracked openly and is **not** claimed as done.
 
 - **OneDrive sync** — bidirectional, id-based delta sync with resumable up/download.
 - **M365 backup & archive** — Mail, Calendar, Contacts, ToDo, OneNote: incremental
-  index + on-disk bodies (`.eml` / canonical JSON / page HTML / contact photos),
-  full-text search **including mail bodies**, and `.ics` / vCard export.
-- **Restore** — re-create archived items in the cloud as new copies (mail via MIME,
-  calendar / tasks / contacts via Graph), driven from the CLI. The crash-safe path
-  is gated behind the operation ledger (above).
+  index + on-disk bodies (`.eml` / canonical JSON / page HTML + resource
+  manifests / contact photos), full-text search **including mail bodies**, and
+  `.ics` / vCard export.
+- **Restore** — recover archived bodies locally; re-create archived items as new
+  cloud copies where the service path is safe. Mail is currently wired through the
+  crash-safe ledger; non-mail cloud restore is refused until ledger-migrated.
 - **Local web UI** — the daemon serves a browser UI (account/service browsing,
   search, inert body viewing) on localhost; no embedded browser engine.
 - **Multi-account** — per-account stores; back up and search across all accounts.
@@ -141,7 +143,7 @@ Run the daemon (serving the web UI) as a `systemd --user` service — see
 ```
 isyncyou init      # scaffold a config (template or a validated account)
 isyncyou check     # validate the config
-isyncyou login     # device-code sign-in; caches the token (--write for restore)
+isyncyou login     # device-code sign-in; caches the token (--write for restore, --keyring for desktop keyring)
 isyncyou status    # per-service item + archived-body counts
 isyncyou sync      # one incremental OneDrive sync
 isyncyou backup    # index + archive M365 services (--all-accounts, --service, --body-limit)
@@ -149,7 +151,8 @@ isyncyou search    # full-text search names + mail bodies (--all-accounts)
 isyncyou restore   # re-create an archived item in the cloud
 isyncyou export    # export archived events/contacts to .ics / .vcf
 isyncyou migrate   # move an account's archive directory
-isyncyou serve     # serve the local web UI
+isyncyou serve     # serve the local API on the default owner-only Unix socket
+isyncyou serve --tcp  # optional browser/TCP transport, loopback-only
 ```
 
 Token resolution: `--token` / `ISYNCYOU_TOKEN` wins; otherwise the per-account
@@ -179,17 +182,26 @@ This section is deliberately blunt — it is the inverse of the status table.
   (complete + live-confirmed); calendar / contacts / todo / onenote cloud restore is
   **refused** until each is ledger-migrated. `cloud_restore_enabled` is `false` by
   default — a deliberate opt-in, since it writes to a real mailbox.
-- **Data at rest is currently unencrypted.** The SQLite store and cached tokens
-  live in plaintext on disk behind file permissions. An at-rest encryption layer
-  is designed (a pluggable storage backend) but not yet shipped. Do not point this
-  at sensitive data on a shared machine yet.
+- **Data at rest is only partially protected.** `isyncyou login --keyring`
+  stores token JSON in the desktop Secret Service / KDE Wallet compatible keyring
+  and leaves only a non-secret marker file in the archive root. Headless/file
+  caches are owner-only on Unix (`0600`) and can be AES-256-GCM encrypted when a
+  token-cache secret is configured (`ISYNCYOU_TOKEN_CACHE_KEY_FILE`, systemd
+  credential `isyncyou-token-cache-key`, or `ISYNCYOU_TOKEN_CACHE_KEY`). Without
+  keyring or that secret they still fall back to plaintext for now. The SQLite
+  store can be SQLCipher-encrypted by configuring `ISYNCYOU_STORE_KEY_FILE`,
+  systemd credential `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY`; without that
+  store key, new stores remain plaintext and `isyncyou-doctor` warns. Do not
+  point plaintext stores at sensitive data on a shared machine.
 - **No deployed staging / full E2E suite yet.** There is an acceptance + chaos
   harness, but the end-to-end pipeline against a live environment is being stood
-  up; release artifacts are not yet reproducibly signed.
-- **The windowed GUI, tray, Dolphin overlays, FUSE placeholders and the PBS
-  restore path are platform-gated.** They need a display server, a host-side KF6
-  plugin, privileged mounts, or a PBS instance respectively. The headless engine,
-  CLI and web UI do not depend on any of them.
+  up. Release artifacts are built by CI with a CycloneDX SBOM and signed GitHub
+  artifact attestations, but staging/live-E2E evidence is still separate.
+- **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are
+  platform/environment-gated.** They need a display server, a host-side KF6
+  plugin, or privileged mounts respectively. The PBS path has deterministic local
+  coverage plus a live test-account round-trip, but rerunning that live probe
+  still requires a configured PBS repository.
 - **Personal Vault and some "shared with me" data are not reachable** via Graph for
   third-party clients — these are upstream platform limits, not bugs.
 
@@ -209,7 +221,8 @@ the restore-safety design is [ADR-001](docs/adr/001-restore-semantics.md).
 
 Design notes and matrices live in [`docs/`](docs/) — Graph capability matrix,
 restore-fidelity matrix, sync-state machine, path mapping, delete/trash/conflict
-model, auth/token lifecycle, local-API security, packaging/daemon model.
+model, auth/token lifecycle, SQLite/PBS snapshot consistency, local-API security,
+packaging/daemon model.
 
 ## License
 

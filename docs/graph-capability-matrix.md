@@ -3,7 +3,7 @@
 > Status: spike findings + **live-verified by the Rust connectors** (see the
 > "iSyncYou connector status" section at the bottom) · Phase -1 spike (#35) ·
 > Test account: `testuser@example.com` (dedicated throwaway)
-> Apps: `backup_read` (`cee80dd9…`, full read scopes) · `backup_write` (`a90d9140…`, full write scopes except OneNote)
+> Apps: `backup_read` (`cee80dd9…`, full read scopes) · `backup_write` (`a90d9140…`, write/restore scopes incl. delegated `Notes.ReadWrite`)
 > Authority: `https://login.microsoftonline.com/consumers` (PersonalMicrosoftAccount)
 
 Two evidence sources:
@@ -18,8 +18,8 @@ Two evidence sources:
 |---|---|
 | **Incremental consent**: re-auth only prompts for *new* scopes; previously granted ones are not shown again. | SPIKE (read re-auth showed only Files/Contacts/Notes) |
 | **read app** delegated scopes granted (personal): `User.Read, Mail.Read, Calendars.Read, Contacts.Read, Tasks.Read, Files.Read, Notes.Read` | SPIKE (`granted scopes:` confirmed) |
-| **write app** delegated scopes granted (personal): `User.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, Contacts.ReadWrite, Tasks.ReadWrite, Files.ReadWrite` | SPIKE |
-| **OneNote write blocked on personal**: app registration uses `Notes.ReadWrite.All`, which requires admin consent and is **not grantable on a personal MSA**. OneNote write needs the delegated `Notes.ReadWrite` scope added to the app registration. OneNote **read** (`Notes.Read`) works. | SPIKE (write re-auth deliberately omitted Notes; read consented Notes.Read) |
+| **write app** delegated scopes needed (personal): `User.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, Contacts.ReadWrite, Tasks.ReadWrite, Files.ReadWrite, Notes.ReadWrite` | SPIKE + code invariant (`RESTORE_SCOPES`) |
+| **OneNote write scope correction**: `Notes.ReadWrite.All` requires admin consent and is **not grantable on a personal MSA**; delegated `Notes.ReadWrite` is the personal-account scope and is now enforced in the restore scope set. OneNote **read** (`Notes.Read`) works. | SPIKE + `restore_scopes_use_delegated_onenote_write_scope` |
 | Device-code flow works for headless re-auth; refresh tokens follow the rolling ~90-day inactivity window (read app RT had expired after ~107 days). | SPIKE |
 
 ---
@@ -43,7 +43,9 @@ Two evidence sources:
 
 `spikes/probe_onedrive.py` reproduces all of the above.
 
-**Open OneDrive items:** `410 Gone` resync path (not yet forced); large-file (>60 MiB) multi-chunk; conflictBehavior matrix (fail/replace/rename); delete→tombstone in delta.
+**Remaining OneDrive live items:** large-file (>60 MiB) multi-chunk and the full
+`conflictBehavior` matrix (fail/replace/rename). The `410 Gone` resync path and
+delete→tombstone handling are implemented and unit/acceptance-tested.
 
 ---
 
@@ -88,9 +90,12 @@ Two evidence sources:
 
 ---
 
-## Contacts — **not yet probed**
+## Contacts — **implemented in Rust**
 
-`Contacts.Read` (read) + `Contacts.ReadWrite` (write) are consented on the test account. Endpoints `/me/contactFolders` + `/me/contacts/delta`, vCard fidelity and photos still to verify. → follow-up probe.
+`Contacts.Read` (read) + `Contacts.ReadWrite` (write) are consented on the test
+account. The Rust connector handles the default contacts collection plus contact
+folders; the live test account had no contacts, so the default delta/cursor path
+was verified and photo/body richness remains a fidelity follow-up.
 
 ---
 
@@ -100,13 +105,14 @@ Two evidence sources:
 |---|---|
 | Read notebooks/pages (`Notes.Read`) | works (`/me/onenote/notebooks` `200` in earlier read test) |
 | No delta endpoint | confirmed (plan §6) — use ETag/lastModified polling |
-| **Write blocked on personal** | `Notes.ReadWrite.All` needs admin; add delegated `Notes.ReadWrite` to the app registration to enable restore |
+| **Write scope** | use delegated `Notes.ReadWrite`; never request admin-only `Notes.ReadWrite.All` |
+| Page restore helper | `POST /me/onenote/pages` from archived HTML is implemented as an env-gated connector test when the write token carries `Notes.ReadWrite`; resource-bearing pages use the documented multipart `Presentation` + `name:part` binary-data shape |
 
 ---
 
 ## Reuse decision
 
-Mail/Calendar/ToDo/Categories Graph behaviour + the SQLite/FTS5 data model + restore logic + viewer templates are **already proven in `/backup`** and are reused (re-implemented in Rust) for iSyncYou Phase 2. The spike effort concentrates on the genuinely new/risky parts: **OneDrive bidirectional sync** (done here) + Contacts + OneNote write enablement.
+Mail/Calendar/ToDo/Categories Graph behaviour + the SQLite/FTS5 data model + restore logic + viewer templates are **already proven in `/backup`** and are reused (re-implemented in Rust) for iSyncYou Phase 2. The genuinely new/risky parts are now split: **OneDrive bidirectional sync** and contacts indexing are implemented; OneNote write uses the delegated scope and remains product-gated until its cloud restore path is ledger-migrated. Contact photos are archived locally, but Microsoft Graph's profilePhoto update permission table marks contact-photo update as unsupported for delegated personal Microsoft accounts, so Personal/Family restore does not attempt a photo upload.
 
 ---
 
@@ -125,7 +131,7 @@ delta + cursor were verified; OneNote uses a full-list reconcile (no delta).
 | Calendar | `calendar` (windowed delta) | 1 calendar, 9 events | 3 event JSON archived |
 | Contacts | `contacts` (default + folders) | default delta + cursor (0 contacts present) | — |
 | ToDo | `todo` (per-list delta) | 2 lists, 5 tasks | 3 task JSON archived |
-| OneNote | `onenote` (full-list reconcile) | walk ran (0 pages — no notebook) | HTML body endpoint wired |
+| OneNote | `onenote` (full-list reconcile) | walk ran (0 pages — no notebook) | HTML body + resource manifest archive wired |
 
 End-to-end via the CLI: `isyncyou backup` indexed 162 mails / 9 events / 5 tasks and
 archived bodies to a sharded store in one run; `isyncyou restore` re-created an

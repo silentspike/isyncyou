@@ -35,5 +35,13 @@ list with mitigations and status lives in the
   (`restore.cloud_restore_enabled = false`). Only mail is ledger-backed and
   boot-recovered (so an interrupted restore cannot silently duplicate an item);
   non-mail cloud re-create is refused until each service is ledger-migrated.
-- **Data at rest is currently unencrypted** (SQLite store + cached tokens, behind
-  file permissions). An at-rest encryption layer is designed but not yet shipped.
+- **Data at rest is only partially protected**. `isyncyou login --keyring`
+  stores OAuth token JSON in the desktop Secret Service / KDE Wallet compatible
+  keyring and leaves only a non-secret marker file in the archive root. File
+  caches are owner-only on Unix (`0600`) and can be encrypted when a token-cache
+  secret is configured (`ISYNCYOU_TOKEN_CACHE_KEY_FILE`, systemd credential
+  `isyncyou-token-cache-key`, or `ISYNCYOU_TOKEN_CACHE_KEY`). Without keyring or
+  that secret they still fall back to plaintext for now. The SQLite store can be
+  SQLCipher-encrypted when `ISYNCYOU_STORE_KEY_FILE`, systemd credential
+  `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY` is configured; otherwise new
+  stores remain plaintext and the doctor reports that as a warning.

@@ -1,0 +1,179 @@
+# Local API security requirements.
+# Checked by tools/check_traceability.py.
+requirements:
+  - id: REQ-SEC-001
+    title: Local API is constrained to the intended local boundary
+    statement: >
+      The local API must reject cross-origin TCP requests before routing, avoid
+      destructive GETs, require the configured capability token for destructive
+      POSTs, and keep the optional Unix-domain socket owner-only.
+    status: implemented
+    acceptance:
+      - TCP requests with a non-loopback Host header return 403.
+      - TCP requests with a non-local Origin header return 403.
+      - Restore is POST-only and requires the configured capability token.
+      - Scheduled-sync commands are POST-only and require the configured capability token.
+      - CLI and daemon serving default to the owner-only Unix-socket transport on Unix.
+      - TCP serving is an explicit opt-in via --tcp and remains loopback-only.
+      - The Unix-domain socket is mode 0600.
+    verified_by:
+      - test: tcp_rejects_non_loopback_host_and_origin
+      - test: restore_post_requires_a_valid_capability_token
+      - test: sync_control_state_and_token_guarded_commands
+      - test: parses_serve_defaults_to_unix_socket_transport
+      - test: parses_serve_tcp_opt_in
+      - test: parses_defaults
+      - test: serve_unix_responds_and_is_owner_only
+
+  - id: REQ-SEC-002
+    title: Token cache files are owner-only on Unix
+    statement: >
+      Persisted OAuth token caches must be written with owner-only permissions on
+      Unix systems so a cached refresh token is not group/other-readable even when
+      replacing an existing file.
+    status: implemented
+    acceptance:
+      - Saving a token cache creates or rewrites the file with mode 0600 on Unix.
+      - Existing token cache files with looser mode are tightened on save.
+      - The saved cache still round-trips through the TokenCache loader.
+    verified_by:
+      - test: token_cache_save_is_owner_only_on_unix
+
+  - id: REQ-SEC-003
+    title: Mail viewer maps safe cid images and strips unresolved resources
+    statement: >
+      The sanitized mail viewer must replay archived inline MIME images only when
+      they are safe local image parts, must convert them to data URLs under the
+      mail CSP, and must strip unresolved cid references and remote resources.
+    status: implemented
+    acceptance:
+      - An HTML mail with a matching safe Content-ID image renders a data URL.
+      - Unresolved cid references do not survive sanitization.
+      - SVG inline images are not replayed as safe data images.
+      - Remote image and link URLs are stripped from the sanitized view.
+    verified_by:
+      - test: extract_html_with_inline_images_collects_safe_cid_parts
+      - test: mail_page_maps_cid_images_to_data_urls
+      - test: sanitize_strips_scripts_and_blocks_remote_resources
+
+  - id: REQ-SEC-004
+    title: Archived mail external links require a local confirmation page
+    statement: >
+      The sanitized mail viewer must not preserve direct external http(s) hrefs
+      from archived mail. It must rewrite them to a local confirmation page that
+      displays the escaped target, rejects unsafe schemes, carries a strict CSP,
+      and performs no automatic remote fetch or navigation.
+    status: implemented
+    acceptance:
+      - Direct external href attributes from archived mail do not survive in the mail page.
+      - Safe http(s) targets are available only through /api/v1/open-external.
+      - The confirmation page rejects unsafe schemes such as javascript:.
+      - The confirmation page carries a strict Content-Security-Policy header.
+    verified_by:
+      - test: mail_page_rewrites_external_links_to_confirm_dialog
+      - test: external_link_dialog_page_requires_safe_http_url
+      - test: open_external_confirms_only_safe_http_urls
+
+  - id: REQ-SEC-005
+    title: Destructive restore POSTs are durably audited
+    statement: >
+      A capability-token-authorized cloud restore request from the web UI must append
+      durable per-account audit entries before invoking the destructive handler and
+      after the handler returns, without logging the capability token.
+    status: implemented
+    acceptance:
+      - A started audit entry is written before the restore handler is invoked.
+      - A successful restore writes an ok audit entry with the new cloud id.
+      - A failed restore writes an error audit entry.
+      - Capability tokens are never included in audit summaries.
+    verified_by:
+      - test: restore_post_writes_a_durable_audit_log
+      - test: restore_post_audits_handler_errors
+
+  - id: REQ-SEC-006
+    title: Destructive capability tokens are action-scoped
+    statement: >
+      Local destructive web-UI actions must not all share one token. Restore and
+      scheduled-sync control POSTs must use separate injected capability tokens so
+      one action class cannot authorize the other.
+    status: implemented
+    acceptance:
+      - The restore capability token authorizes restore POSTs only.
+      - The scheduled-sync capability token authorizes sync-control POSTs only.
+      - A rejected cross-token restore does not write an audit entry.
+      - The served UI receives separate restore and sync-control token constants.
+    verified_by:
+      - test: destructive_capability_tokens_are_action_scoped
+      - test: index_injects_separate_capability_tokens_when_enabled
+
+  - id: REQ-SEC-007
+    title: TCP local API cannot bind outside loopback
+    statement: >
+      The TCP web UI/API transport must refuse non-loopback bind addresses before
+      opening a listener, so a misconfigured --bind value cannot expose the local
+      API on LAN or wildcard interfaces.
+    status: implemented
+    acceptance:
+      - Loopback bind addresses such as 127.0.0.1, localhost, and ::1 are accepted.
+      - Wildcard, LAN, and arbitrary hostnames are rejected as bind addresses.
+      - serve() returns a PermissionDenied error before binding a non-loopback address.
+    verified_by:
+      - test: tcp_bind_address_must_be_loopback
+      - test: serve_refuses_non_loopback_bind_address
+
+  - id: REQ-SEC-008
+    title: Token caches can be credential-encrypted at rest
+    statement: >
+      When a token-cache secret is configured, persisted OAuth token caches must
+      be written as an authenticated encrypted envelope instead of plaintext, must
+      not expose access or refresh token strings in the file, and must fail closed
+      when opened with the wrong secret.
+    status: implemented
+    acceptance:
+      - Encrypted token caches round-trip with the correct secret.
+      - Access and refresh token strings are absent from the on-disk envelope.
+      - Opening an encrypted token cache with the wrong secret fails with PermissionDenied.
+      - Credential secret files are trimmed and empty files are rejected.
+    verified_by:
+      - test: token_cache_encrypted_roundtrip_hides_plaintext
+      - test: token_cache_encrypted_roundtrip_rejects_wrong_secret
+      - test: token_cache_secret_file_is_trimmed_and_nonempty
+
+  - id: REQ-SEC-009
+    title: Desktop login can store token caches in the system keyring
+    statement: >
+      Desktop login must be able to store OAuth token JSON in the platform Secret
+      Service / KDE Wallet compatible keyring instead of writing access or refresh
+      tokens to the archive root. The archive-root cache file must be a non-secret
+      marker, and later refresh saves must preserve the keyring backend.
+    status: implemented
+    acceptance:
+      - The login CLI exposes a --keyring mode.
+      - Saving to keyring writes only a marker file on disk.
+      - The marker file does not contain access or refresh token strings.
+      - TokenCache::load resolves a keyring marker back to the cached token.
+      - TokenCache::save preserves an existing keyring marker after refresh.
+    verified_by:
+      - test: parses_login
+      - test: token_cache_keyring_roundtrip_writes_marker_only
+      - test: token_cache_save_preserves_existing_keyring_backend
+
+  - id: REQ-SEC-010
+    title: SQLite stores can be SQLCipher-encrypted at rest
+    statement: >
+      When a store encryption secret is supplied, the SQLite store must be opened
+      through SQLCipher before schema access, must not expose item metadata or
+      body-index content in the database file, must fail closed without the right
+      key, and must preserve encryption when creating PBS/VACUUM snapshots.
+    status: implemented
+    acceptance:
+      - An encrypted store does not have the plaintext SQLite file header.
+      - Item names and indexed body text do not appear in the raw database file.
+      - Opening an encrypted store without a key or with the wrong key fails.
+      - Opening with the correct key returns the stored metadata and FTS body hit.
+      - A backup_to/VACUUM snapshot of an encrypted store remains encrypted.
+      - Store credential files are trimmed and empty files are rejected.
+    verified_by:
+      - test: encrypted_store_hides_plaintext_and_requires_key
+      - test: encrypted_backup_to_keeps_snapshot_encrypted
+      - test: store_secret_file_is_trimmed_and_nonempty

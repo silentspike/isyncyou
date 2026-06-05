@@ -13,12 +13,14 @@ duplicate evidence id, so it can be wired into CI.
 Usage:
     python3 tools/check_evidence.py
     python3 tools/check_evidence.py --manifest docs/evidence/sample-manifest.json
+    python3 tools/check_evidence.py --manifest generated.json --require-head
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,11 +69,45 @@ def rust_test_exists(root: Path, name: str) -> bool:
     return False
 
 
+def git_head(root: Path) -> str | None:
+    """Current Git HEAD, or None if the root is not a Git checkout."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return out.stdout.strip()
+
+
+def git_commit_exists(root: Path, commit: str) -> bool:
+    try:
+        subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", f"{commit}^{{commit}}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Evidence-manifest validator")
     ap.add_argument("--root", default=".")
     ap.add_argument("--manifest", default="docs/evidence/sample-manifest.json")
     ap.add_argument("--schema", default="docs/evidence/manifest.schema.json")
+    ap.add_argument(
+        "--require-head",
+        action="store_true",
+        help="require manifest.commit to equal the current Git HEAD (for generated CI artifacts)",
+    )
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -98,6 +134,17 @@ def main() -> int:
 
     # 2) Cross-checks (only meaningful if the document is structurally an object).
     if isinstance(manifest, dict):
+        head = git_head(root)
+        manifest_commit = manifest.get("commit")
+        if head and isinstance(manifest_commit, str):
+            if not git_commit_exists(root, manifest_commit):
+                errors.append(f"manifest commit does not exist in this repo: {manifest_commit}")
+            if args.require_head and manifest_commit != head:
+                errors.append(
+                    "manifest commit does not match HEAD "
+                    f"(manifest={manifest_commit!r}, HEAD={head})"
+                )
+
         known = requirement_ids(root)
         seen_ev: set[str] = set()
         for entry in manifest.get("entries", []) or []:
@@ -136,8 +183,10 @@ def main() -> int:
         return 1
 
     print(
-        "OK — manifest is schema-valid; every cited requirement exists; every test "
-        "entry names a real test; every artifact exists."
+        "OK — manifest is schema-valid; manifest commit exists"
+        + (" and matches HEAD" if args.require_head else "")
+        + "; every cited requirement exists; every test entry names a real test; "
+        "every artifact exists."
     )
     return 0
 

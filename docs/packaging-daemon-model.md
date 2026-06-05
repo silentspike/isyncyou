@@ -20,11 +20,13 @@ and the GUI has no browser-engine runtime dependency.
 
 ## Daemon deployment (implemented)
 
-`isyncyoud --config <toml> --bind 127.0.0.1:8765` validates the config, serves the
-web UI/API, and logs a periodic liveness heartbeat. It is run as a **systemd
-`--user` service** (`packaging/isyncyoud.service`, hardened per §11) so it starts
-on login and restarts on failure. The daemon never holds a store's single-instance
-lock open (the web UI opens stores per request), so it composes with the CLI.
+`isyncyoud --config <toml>` validates the config, serves the web UI/API on the
+default owner-only Unix socket, and logs a periodic liveness heartbeat. TCP is
+available only as an explicit loopback opt-in (`--tcp --bind 127.0.0.1:8765`). It
+is run as a **systemd `--user` service** (`packaging/isyncyoud.service`, hardened
+per §11) so it starts on login and restarts on failure. The daemon never holds a
+store's single-instance lock open (the web UI opens stores per request), so it
+composes with the CLI.
 
 Scheduled background backup/sync layers on top once the OAuth token store is wired
 so the daemon can mint per-account tokens unattended (the refresh path is
@@ -35,18 +37,27 @@ implemented; only the initial device-code login needs a human — see
 
 `.github/workflows/release.yml` builds release binaries on a self-hosted runner and
 bundles **`isyncyou-linux-x86_64.tar.gz`** = the three binaries + `SHA256SUMS` +
-the documented `isyncyou.toml.sample` + `isyncyoud.service` + a README. On a push
-to `main` it publishes an RC prerelease; a `vX.Y.Z` tag publishes a release. The
-archive was verified end-to-end (built by CI, downloaded, extracted, the binary
-runs, `sha256sum -c` passes).
+the documented `isyncyou.toml.sample` + `isyncyoud.service` + a README. The same
+workflow builds the AppImage and Windows zip, generates
+`dist/isyncyou.sbom.cdx.json` from `cargo metadata --locked`, publishes a top-level
+`dist/SHA256SUMS`, and requests GitHub artifact attestations for the release
+archives, AppImage, Windows zip, SBOM, and checksum file. Consumers can verify the
+published attestation with:
 
-## Distribution (not yet)
+```sh
+gh attestation verify isyncyou-linux-x86_64.tar.gz -R silentspike/isyncyou
+```
 
-- **Flatpak / AppImage** GUI bundling (plan §15) is pending the windowed GUI
-  binary (#56, needs a display server) and the build tooling
-  (`flatpak-builder` / `appimagetool`), neither of which is available in the
-  headless CI environment. The plan's Flatpak `--filesystem` sync-root grant is a
-  manifest concern for that work.
+On a push to `main` the workflow publishes an RC prerelease; a `vX.Y.Z` tag
+publishes a release.
+
+## Distribution scripts (partial)
+
+- **Flatpak / AppImage** packaging files exist under `packaging/flatpak` and
+  `packaging/appimage`. Final GUI-bundle validation is still gated on the
+  windowed status-bar binary, a display-capable environment, and the host tooling
+  (`flatpak-builder` / `appimagetool`). The plan's Flatpak `--filesystem`
+  sync-root grant is a manifest concern for that work.
 - A `musl` fully-static build is possible (the target is installed) once the musl
   C toolchain (`musl-tools`) is present — the bundled SQLite needs a C compiler for
   the target.

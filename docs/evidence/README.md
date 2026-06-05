@@ -17,7 +17,7 @@ traceable, validated fact.
 | File | Purpose |
 |---|---|
 | [`manifest.schema.json`](manifest.schema.json) | JSON Schema (draft 2020-12) defining a manifest's shape |
-| [`sample-manifest.json`](sample-manifest.json) | A real example: six entries citing the actual tests/example and their captured output |
+| [`sample-manifest.json`](sample-manifest.json) | A real example: requirement evidence entries citing the actual tests/examples/probes and their captured output |
 
 ## Schema, in short
 
@@ -36,12 +36,16 @@ each with:
 ## Validating
 
 ```sh
-python3 tools/check_evidence.py        # validates docs/evidence/sample-manifest.json
+python3 tools/check_evidence.py                 # validates docs/evidence/sample-manifest.json
+python3 tools/check_evidence.py --require-head  # for freshly generated CI manifests
 ```
 
-The validator checks the manifest against the schema **and** cross-checks that every
-cited requirement exists in `docs/requirements`. It exits non-zero on any violation,
-so it can run as a required CI check (wired in the public-CI-hardening stage).
+The validator checks the manifest against the schema, verifies the recorded
+`commit` exists in the current Git repository, cross-checks that every cited
+requirement exists in `docs/requirements`, and ensures each `method: test` entry
+names a real Rust test function. With `--require-head`, it also requires
+`commit == HEAD`; use that mode for generated manifests, not for the tracked sample
+file.
 
 ## Why a sample, not a generated manifest
 

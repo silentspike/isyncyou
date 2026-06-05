@@ -34,8 +34,8 @@ state** under the failure — not just that the happy path works.
 | Graph 401/403/404/409/412/416/423/500/503/507 | error classification / retry-vs-fatal | ⏳ partial (classifier unit-tested in `graph`; full matrix E2E) |
 | Token / refresh / subscription / delta-token expired | refresh path; documented invalid-grant blocker | ⏳ partial (refresh coded; live blocked on fresh OAuth) |
 | clock-skew, DST / timezone restore | timezone-pinned reads/exports | ⏳ E2E |
-| Malformed / huge MIME | best-effort MIME extraction, never panics; capped | ✅ (mime unit tests) / ⏳ huge-message E2E |
-| OneNote resources, PBS-snapshot-during-active | resource fetch; quiesce/snapshot | ⏳ blocked (Notes scope / PBS infra) |
+| Malformed / huge MIME | best-effort MIME extraction, never panics; capped; safe `cid:` images replayed only as local data URLs | ✅ (mime/webui unit tests) / ⏳ huge-message E2E |
+| OneNote resources, PBS-snapshot-during-active | resource fetch; `VACUUM INTO` store snapshot + PBS temp restore | ✅ resource archive manifest / ✅ live PBS temp restore; restore-preview import pending |
 | move-folder with 10k children | id-based tracking, parent walk | ⏳ E2E (scale) |
 
 ✅ logic-level test exists · ⏳ awaits E2E or an external prerequisite.
