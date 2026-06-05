@@ -32,6 +32,12 @@ llm-*.md
 .env
 .DS_Store
 
+# Internal showcase / pitch / case-study artifacts — kept local, never in the
+# public repo. The repository shows how we actually work; it is not a
+# built-to-impress storefront.
+SHOWCASE.md
+/docs/case-study/
+
 # Browser-automation + LLM scratch artifacts (never committed)
 .playwright-cli/
 llm-*.log
