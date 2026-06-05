@@ -37,8 +37,39 @@ pub fn extract_text(eml: &[u8]) -> String {
 /// keeps the markup so a sanitizing viewer can render it. Returns `None` when the
 /// message is plain-text only. Best-effort and never panics.
 pub fn extract_html(eml: &[u8]) -> Option<String> {
+    extract_html_with_inline_images(eml).map(|h| h.html)
+}
+
+/// One safe inline MIME image referenced by a `cid:` URL in an HTML mail part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineImage {
+    pub cid: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Decoded HTML plus the owner-addressed inline images that may be safely mapped
+/// from `cid:` to `data:` in the sanitized viewer.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HtmlWithInlineImages {
+    pub html: String,
+    pub inline_images: Vec<InlineImage>,
+}
+
+const MAX_INLINE_IMAGE_BYTES: usize = 512 * 1024;
+
+/// Extract the first decoded HTML part and safe `Content-ID` image parts from an
+/// `.eml`. Only non-SVG image types that the browser can render inertly under a
+/// `data:`-only CSP are returned. Best-effort and never panics.
+pub fn extract_html_with_inline_images(eml: &[u8]) -> Option<HtmlWithInlineImages> {
     let (headers, body) = split_headers(eml);
-    extract_html_part(&headers, body)
+    let mut out = HtmlWithInlineImages::default();
+    collect_html_resources(&headers, body, &mut out);
+    if out.html.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// A non-destructive preview of what restoring an archived mail item *would* create
@@ -129,30 +160,70 @@ fn snippet(text: &str, max: usize) -> String {
     }
 }
 
-/// Walk a MIME entity, returning the decoded body of the first `text/html` part.
-fn extract_html_part(headers: &[u8], body: &[u8]) -> Option<String> {
+/// Walk a MIME entity, collecting the first HTML body and safe inline image parts.
+fn collect_html_resources(headers: &[u8], body: &[u8], out: &mut HtmlWithInlineImages) {
     let ctype = header_value(headers, "content-type").unwrap_or_default();
     let ctype_l = ctype.to_ascii_lowercase();
 
     if ctype_l.starts_with("multipart/") {
-        let boundary = ct_param(&ctype, "boundary")?;
+        let Some(boundary) = ct_param(&ctype, "boundary") else {
+            return;
+        };
         for part in split_multipart(body, &boundary) {
             let (ph, pb) = split_headers(&part);
-            if let Some(html) = extract_html_part(&ph, pb) {
-                return Some(html);
-            }
+            collect_html_resources(&ph, pb, out);
         }
-        return None;
+        return;
     }
 
+    let cte = header_value(headers, "content-transfer-encoding")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if ctype_l.starts_with("text/html") {
-        let cte = header_value(headers, "content-transfer-encoding")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let decoded = decode_body(body, &cte);
-        return Some(String::from_utf8_lossy(&decoded).into_owned());
+        if out.html.is_empty() {
+            let decoded = decode_body(body, &cte);
+            out.html = String::from_utf8_lossy(&decoded).into_owned();
+        }
+        return;
     }
-    None
+
+    let base_type = ctype_l.split(';').next().unwrap_or("").trim();
+    if let Some(content_type) = safe_inline_image_type(base_type) {
+        if let Some(cid) = content_id(headers) {
+            let decoded = decode_body(body, &cte);
+            if !decoded.is_empty() && decoded.len() <= MAX_INLINE_IMAGE_BYTES {
+                out.inline_images.push(InlineImage {
+                    cid,
+                    content_type: content_type.to_string(),
+                    data: decoded,
+                });
+            }
+        }
+    }
+}
+
+fn safe_inline_image_type(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn content_id(headers: &[u8]) -> Option<String> {
+    let raw = header_value(headers, "content-id")?;
+    let id = raw
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
 }
 
 /// Split a MIME entity into its raw header block and body bytes at the first
@@ -536,6 +607,21 @@ mod tests {
         // a plain-text-only message has no HTML part
         let plain = b"Content-Type: text/plain\r\n\r\njust text";
         assert_eq!(extract_html(plain), None);
+    }
+
+    #[test]
+    fn extract_html_with_inline_images_collects_safe_cid_parts() {
+        let eml = b"Content-Type: multipart/related; boundary=B\r\n\r\n\
+--B\r\nContent-Type: text/html\r\n\r\n<p><img src=\"cid:logo@example.test\"></p>\r\n\
+--B\r\nContent-Type: image/png\r\nContent-ID: <logo@example.test>\r\nContent-Transfer-Encoding: base64\r\n\r\nUE5HREFUQQ==\r\n\
+--B\r\nContent-Type: image/svg+xml\r\nContent-ID: <vector@example.test>\r\n\r\n<svg></svg>\r\n\
+--B--\r\n";
+        let html = extract_html_with_inline_images(eml).expect("html part");
+        assert!(html.html.contains("cid:logo@example.test"));
+        assert_eq!(html.inline_images.len(), 1);
+        assert_eq!(html.inline_images[0].cid, "logo@example.test");
+        assert_eq!(html.inline_images[0].content_type, "image/png");
+        assert_eq!(html.inline_images[0].data, b"PNGDATA");
     }
 
     #[test]
