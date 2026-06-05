@@ -34,7 +34,12 @@ Promotion flows `feature → dev → staging → main`, each with its own gate:
 | `staging` | `staging-pass` (`pr-staging.yml`) | full: build/test + cargo-deny + docs (later: integration + UI snapshots) |
 | `main` | `main-pass` (`pr-main.yml`) | release-grade: staging checks + release build |
 
-Always-on: secret scan (Gitleaks), Conventional-Commit PR-title check, auto-labeling.
+Always-on (required on every PR into `dev`/`staging`/`main`): secret scan (Gitleaks),
+Conventional-Commit PR-title check, the **English-only language check** (`language-check`),
+and auto-labeling. The language check fails with the offending `file:line` and how to
+resolve it, so a non-English change is caught, fixed, and re-submitted; legitimate
+non-English (locale files, encoding/MIME test fixtures) is allowlisted in
+`tools/lang_allowlist.txt` or with an inline `lang-allow` marker.
 
 **Automation:**
 - Merging into `dev`/`staging` auto-opens the next-stage promotion PR (`promote.yml`).
@@ -42,3 +47,18 @@ Always-on: secret scan (Gitleaks), Conventional-Commit PR-title check, auto-labe
 - Dependabot PRs auto-merge once the branch gate passes.
 
 CI runs on the project's **self-hosted runners** while the repo is private (no hosted-minutes usage). At public launch this switches back to GitHub-hosted runners.
+
+## Working in parallel (multi-agent)
+
+Multiple agents may work concurrently — each on its own feature branch (and, ideally,
+its own git worktree) — and open PRs into `dev` independently. Branch protection on
+`dev`/`staging`/`main` is `strict` (a PR must be up to date with its base before
+merging), so land one PR at a time per base and rebase the next; this keeps every
+merge tested against the exact tree it lands on.
+
+One agent acts as the **orchestrator**. It owns review (see `.github/CODEOWNERS`) and
+gates promotion to `main`: feature work flows `feature → dev → staging → main`, and the
+orchestrator decides when a `staging → main` promotion is ready and performs that merge.
+The automated gates (build/lint/test, `cargo-deny`, requirements + evidence, secret
+scan, and the English-only `language-check`) are the objective bar every change must
+clear; the orchestrator is the human-in-the-loop judgement on top of them.
