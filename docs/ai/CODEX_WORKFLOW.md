@@ -6,7 +6,7 @@ as a second engineer and adversarial reviewer, and why its output is never trust
 sight.
 
 The implementing agent here is one model; the reviewer is a *different* one (the file is
-named for OpenAI Codex, the CLI that fills this role in practice, but the workflow is
+named for the Codex CLI that fills this role in practice, but the workflow is
 model-agnostic and more than one reviewer is used when a decision is important).
 
 ---
