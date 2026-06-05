@@ -1622,13 +1622,17 @@ dependencies = [
 name = "isyncyou-doctor"
 version = "0.1.0"
 dependencies = [
- "fs2",
- "isyncyou-core",
+ "isyncyou-doctor-lib",
 ]
 
 [[package]]
 name = "isyncyou-doctor-lib"
 version = "0.1.0"
+dependencies = [
+ "fs2",
+ "isyncyou-core",
+ "serde_json",
+]
 
 [[package]]
 name = "isyncyou-engine"
