@@ -8,3 +8,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+isyncyou-core = { path = "../core" }
+fs2 = "0.4"
+serde_json = { workspace = true }

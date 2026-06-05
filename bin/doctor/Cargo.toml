@@ -14,5 +14,4 @@ path = "src/main.rs"
 # Deliberately minimal dependencies: the doctor must run even when the rest of
 # the install is broken.
 [dependencies]
-isyncyou-core = { path = "../../crates/core" }
-fs2 = "0.4"
+isyncyou-doctor-lib = { path = "../../crates/doctor-lib" }
