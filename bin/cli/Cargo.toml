@@ -18,7 +18,7 @@ isyncyou-core = { path = "../../crates/core" }
 isyncyou-store = { path = "../../crates/store" }
 isyncyou-pathmap = { path = "../../crates/pathmap" }
 isyncyou-connectors = { path = "../../crates/connectors", features = ["http"] }
-isyncyou-graph = { path = "../../crates/graph", features = ["http"] }
+isyncyou-graph = { path = "../../crates/graph", features = ["http", "desktop-keyring"] }
 isyncyou-engine = { path = "../../crates/engine" }
 isyncyou-pbs = { path = "../../crates/pbs" }
 isyncyou-webui = { path = "../../gui/webui" }

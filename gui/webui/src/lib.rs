@@ -5,8 +5,7 @@
 //! or socket, so it is fully unit-testable. A thin server adapter (added with the
 //! daemon) binds a listener and forwards each request to [`Router::route`].
 //!
-//! Endpoints (read-only for now; restore/job actions land with the daemon's
-//! capability-token auth):
+//! Endpoints:
 //! - `GET /`                      → the static UI page
 //! - `GET /api/v1/accounts`       → configured accounts
 //! - `GET /api/v1/settings`                  → effective sync settings + account roots
@@ -16,17 +15,22 @@
 //! - `GET /api/v1/item?account&service&id`   → one item's metadata
 //! - `GET /api/v1/body?account&service&id`   → archived body bytes (inert)
 //! - `GET /api/v1/view?account&service&id`   → rendered safe HTML viewer page
+//! - `GET /api/v1/open-external?url=…`        → explicit external-link confirmation
 //! - `GET /api/v1/search?account&q`          → full-text search over item names
+//! - `GET /api/v1/sync/state`                → scheduled-sync state
+//! - `POST /api/v1/restore?account&service&id` → capability-token cloud restore
+//! - `POST /api/v1/sync/{pause,resume,now}`  → capability-token sync control
 
 use isyncyou_core::Config;
 use isyncyou_store::{Item, Store};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod serve;
 mod view;
 #[cfg(unix)]
-pub use serve::serve_unix;
+pub use serve::{default_unix_socket_path, serve_unix};
 pub use serve::{format_http, parse_request_line, serve};
 
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
@@ -193,10 +197,13 @@ pub struct Router {
     /// Optional destructive-action handler (the daemon's restore). `None` => the
     /// API is read-only and POSTs are refused.
     restore: Option<std::sync::Arc<dyn RestoreHandler>>,
-    /// Per-process capability token required on destructive POSTs. A cross-site
-    /// page can't read it (CSRF defense); paired with POST-only + an owner-only
-    /// socket it gates writes (plan §11).
-    cap_token: Option<String>,
+    /// Per-process capability token required for restore POSTs. A cross-site page
+    /// can't read it (CSRF defense); paired with POST-only + an owner-only socket
+    /// it gates cloud mutations (plan §11).
+    restore_cap_token: Option<String>,
+    /// Separate capability token for scheduled-sync control POSTs. Keeping this
+    /// distinct from the restore token limits the blast radius of a leaked token.
+    sync_cap_token: Option<String>,
     /// Optional scheduled-sync controller (the daemon's). Enables the sync
     /// pause/resume/now POSTs + the state GET.
     sync_control: Option<std::sync::Arc<dyn SyncControl>>,
@@ -208,7 +215,8 @@ impl Router {
             config,
             gate: None,
             restore: None,
-            cap_token: None,
+            restore_cap_token: None,
+            sync_cap_token: None,
             sync_control: None,
         }
     }
@@ -220,7 +228,8 @@ impl Router {
             config,
             gate: Some(gate),
             restore: None,
-            cap_token: None,
+            restore_cap_token: None,
+            sync_cap_token: None,
             sync_control: None,
         }
     }
@@ -232,7 +241,7 @@ impl Router {
         cap_token: String,
     ) -> Self {
         self.restore = Some(handler);
-        self.cap_token = Some(cap_token);
+        self.restore_cap_token = Some(cap_token);
         self
     }
 
@@ -244,13 +253,34 @@ impl Router {
         cap_token: String,
     ) -> Self {
         self.sync_control = Some(control);
-        self.cap_token = Some(cap_token);
+        self.sync_cap_token = Some(cap_token);
         self
     }
 
     /// Whether the request carries the configured capability token.
-    fn cap_ok(&self, req: &ApiRequest) -> bool {
-        matches!((&self.cap_token, &req.cap_token), (Some(w), Some(g)) if w == g)
+    fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
+        matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
+    }
+
+    /// Append a durable audit entry to the account activity log. Destructive
+    /// actions call this before invoking the injected handler so the intent is
+    /// recorded even if the process dies after the remote mutation starts.
+    fn audit_account(
+        &self,
+        account: &str,
+        kind: &str,
+        status: &str,
+        summary: &str,
+    ) -> Result<(), String> {
+        let path = self
+            .store_path(account)
+            .ok_or_else(|| format!("unknown account '{account}'"))?;
+        let store = Store::open(path).map_err(|e| e.to_string())?;
+        let now = audit_timestamp();
+        store
+            .add_run(account, kind, &now, &now, status, &audit_summary(summary))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Dispatch one request to a response. Never panics; unknown routes → 404.
@@ -277,7 +307,15 @@ impl Router {
             // inject the capability token into the page so the (same-origin) UI can
             // POST restores; empty when restore is disabled, hiding the UI.
             "/" => ApiResponse::html(
-                &INDEX_HTML.replace("__CAP_TOKEN__", self.cap_token.as_deref().unwrap_or("")),
+                &INDEX_HTML
+                    .replace(
+                        "__RESTORE_CAP_TOKEN__",
+                        self.restore_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__SYNC_CAP_TOKEN__",
+                        self.sync_cap_token.as_deref().unwrap_or(""),
+                    ),
             ),
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
@@ -287,6 +325,7 @@ impl Router {
             "/api/v1/item" => self.item(req),
             "/api/v1/body" => self.body(req),
             "/api/v1/view" => self.view(req),
+            "/api/v1/open-external" => self.open_external(req),
             "/api/v1/search" => self.search(req),
             "/api/v1/sync/state" => self.sync_state(),
             _ => ApiResponse::error(404, "not found"),
@@ -300,7 +339,7 @@ impl Router {
             Some(h) => h,
             None => return ApiResponse::error(404, "restore is not enabled on this server"),
         };
-        if !self.cap_ok(req) {
+        if !Self::cap_ok(&self.restore_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
@@ -309,11 +348,35 @@ impl Router {
             }
             _ => return ApiResponse::error(400, "account, service and id are required"),
         };
+        if let Err(e) = self.audit_account(
+            account,
+            "audit:restore",
+            "started",
+            &format!("restore requested service={service} id={id}"),
+        ) {
+            return ApiResponse::error(500, &format!("audit: {e}"));
+        }
         match handler.restore(account, service, id) {
-            Ok(new_id) => ApiResponse::ok_json(
-                &json!({ "restored": id, "service": service, "new_id": new_id }),
-            ),
-            Err(e) => ApiResponse::error(500, &e),
+            Ok(new_id) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:restore",
+                    "ok",
+                    &format!("restore ok service={service} id={id} new_id={new_id}"),
+                );
+                ApiResponse::ok_json(
+                    &json!({ "restored": id, "service": service, "new_id": new_id }),
+                )
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:restore",
+                    "error",
+                    &format!("restore error service={service} id={id}: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
         }
     }
 
@@ -324,7 +387,7 @@ impl Router {
             Some(c) => c,
             None => return ApiResponse::error(404, "scheduled sync is not enabled on this server"),
         };
-        if !self.cap_ok(req) {
+        if !Self::cap_ok(&self.sync_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
         apply(control.as_ref());
@@ -606,10 +669,19 @@ impl Router {
         // A mail `.eml` with an HTML part is rendered sanitized; otherwise (plain
         // mail, or any other raw body) we show escaped source.
         if service == "mail" {
-            if let Some(html) = isyncyou_connectors::extract_html(&bytes) {
+            if let Some(html) = isyncyou_connectors::extract_html_with_inline_images(&bytes) {
                 let subject = if name.is_empty() { "Message" } else { &name };
+                let inline_images: Vec<_> = html
+                    .inline_images
+                    .iter()
+                    .map(|img| view::InlineImageRef {
+                        cid: &img.cid,
+                        content_type: &img.content_type,
+                        data: &img.data,
+                    })
+                    .collect();
                 return ApiResponse::html_with_csp(
-                    &view::mail_page(subject, &html),
+                    &view::mail_page_with_inline_images(subject, &html.html, &inline_images),
                     view::MAIL_CSP,
                 );
             }
@@ -618,6 +690,20 @@ impl Router {
             &view::source_page(service, &String::from_utf8_lossy(&bytes)),
             view::VIEWER_CSP,
         )
+    }
+
+    /// Confirm before navigating to a URL that came from archived mail. The page
+    /// contains a normal link only after the target has passed a small `http(s)`
+    /// allowlist; it never fetches or opens the target automatically.
+    fn open_external(&self, req: &ApiRequest) -> ApiResponse {
+        let url = match req.q("url") {
+            Some(url) => url,
+            None => return ApiResponse::error(400, "missing 'url'"),
+        };
+        match view::external_link_dialog_page(url) {
+            Some(page) => ApiResponse::html_with_csp(&page, view::VIEWER_CSP),
+            None => ApiResponse::error(400, "unsafe external URL"),
+        }
     }
 
     fn search(&self, req: &ApiRequest) -> ApiResponse {
@@ -656,6 +742,23 @@ impl Router {
         let arr: Vec<Value> = hits.iter().map(item_json).collect();
         ApiResponse::ok_json(&json!({ "query": q, "hits": arr, "count": arr.len() }))
     }
+}
+
+fn audit_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .to_string()
+}
+
+fn audit_summary(summary: &str) -> String {
+    const MAX: usize = 400;
+    let mut out: String = summary.chars().take(MAX).collect();
+    if summary.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Default and maximum page size for the items listing.
@@ -758,6 +861,47 @@ mod tests {
     }
 
     #[test]
+    fn open_external_confirms_only_safe_http_urls() {
+        let router = Router::new(Config::default());
+        let ok = router.route(&ApiRequest::get(
+            "/api/v1/open-external?url=https%3A%2F%2Fexample.test%2Fa%3Fx%3D1",
+        ));
+        assert_eq!(ok.status, 200);
+        assert!(ok.content_type.starts_with("text/html"));
+        let body = String::from_utf8_lossy(&ok.body);
+        assert!(
+            body.contains("href=\"https://example.test/a?x=1\""),
+            "confirmed external link missing: {body}"
+        );
+        assert!(
+            ok.headers.iter().any(
+                |(k, val)| k == "Content-Security-Policy" && val.contains("default-src 'none'")
+            ),
+            "dialog must carry a strict CSP header"
+        );
+
+        let js = router.route(&ApiRequest::get(
+            "/api/v1/open-external?url=javascript%3Aalert%281%29",
+        ));
+        assert_eq!(js.status, 400);
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/open-external"))
+                .status,
+            400
+        );
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/open-external?url=https%3A%2F%2Fexample.test"
+                ))
+                .status,
+            405
+        );
+    }
+
+    #[test]
     fn gated_router_serves_and_releases_the_gate() {
         // a router built with a shared store-access gate acquires it per request
         // and releases it afterwards, so the daemon's sync thread and the web UI
@@ -779,10 +923,17 @@ mod tests {
         }
     }
 
+    struct ErrRestore;
+    impl RestoreHandler for ErrRestore {
+        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
+            Err("graph refused restore".into())
+        }
+    }
+
     #[test]
     fn restore_post_requires_a_valid_capability_token() {
-        let router = Router::new(Config::default())
-            .with_restore(std::sync::Arc::new(OkRestore), "secret".into());
+        let (_d, router) = setup();
+        let router = router.with_restore(std::sync::Arc::new(OkRestore), "secret".into());
         let q = "/api/v1/restore?account=a&service=mail&id=x";
         // no token / wrong token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
@@ -803,23 +954,84 @@ mod tests {
     }
 
     #[test]
-    fn index_injects_capability_token_when_restore_enabled() {
-        // read-only router: the placeholder is blanked, so the UI stays read-only
+    fn restore_post_writes_a_durable_audit_log() {
+        let (_d, router) = setup();
+        let router = router.with_restore(std::sync::Arc::new(OkRestore), "secret".into());
+        let q = "/api/v1/restore?account=a&service=mail&id=m1";
+
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(ok.status, 200);
+
+        let audit =
+            body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=5")));
+        assert_eq!(audit["runs"][0]["kind"], "audit:restore");
+        assert_eq!(audit["runs"][0]["status"], "ok");
+        assert!(audit["runs"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("new_id=new-cloud-id"));
+        assert_eq!(audit["runs"][1]["kind"], "audit:restore");
+        assert_eq!(audit["runs"][1]["status"], "started");
+        assert!(audit["runs"][1]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("service=mail id=m1"));
+        assert!(
+            !audit["runs"][0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("secret"),
+            "capability tokens must never be logged"
+        );
+    }
+
+    #[test]
+    fn restore_post_audits_handler_errors() {
+        let (_d, router) = setup();
+        let router = router.with_restore(std::sync::Arc::new(ErrRestore), "secret".into());
+        let q = "/api/v1/restore?account=a&service=mail&id=m1";
+
+        let err = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(err.status, 500);
+
+        let audit =
+            body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=5")));
+        assert_eq!(audit["runs"][0]["kind"], "audit:restore");
+        assert_eq!(audit["runs"][0]["status"], "error");
+        assert!(audit["runs"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("graph refused restore"));
+        assert_eq!(audit["runs"][1]["status"], "started");
+    }
+
+    #[test]
+    fn index_injects_separate_capability_tokens_when_enabled() {
+        // read-only router: placeholders are blanked, so destructive UI stays hidden
         let ro = Router::new(Config::default()).route(&ApiRequest::get("/"));
         let ro_body = String::from_utf8_lossy(&ro.body);
         assert!(
-            !ro_body.contains("__CAP_TOKEN__"),
+            !ro_body.contains("__RESTORE_CAP_TOKEN__") && !ro_body.contains("__SYNC_CAP_TOKEN__"),
             "placeholder must be replaced"
         );
         assert!(
-            ro_body.contains("const CAP_TOKEN = \"\""),
-            "no token when read-only"
+            ro_body.contains("const RESTORE_CAP_TOKEN = \"\"")
+                && ro_body.contains("const SYNC_CAP_TOKEN = \"\""),
+            "no tokens when read-only"
         );
-        // restore-enabled router: the real token is injected for the same-origin UI
+        // restore/sync-enabled router: distinct real tokens are injected for the
+        // same-origin UI.
+        let sync = std::sync::Arc::new(MockSync {
+            paused: false.into(),
+            triggered: false.into(),
+        });
         let rw = Router::new(Config::default())
-            .with_restore(std::sync::Arc::new(OkRestore), "tok123".into())
+            .with_restore(std::sync::Arc::new(OkRestore), "restore123".into())
+            .with_sync_control(sync, "sync123".into())
             .route(&ApiRequest::get("/"));
-        assert!(String::from_utf8_lossy(&rw.body).contains("const CAP_TOKEN = \"tok123\""));
+        let rw_body = String::from_utf8_lossy(&rw.body);
+        assert!(rw_body.contains("const RESTORE_CAP_TOKEN = \"restore123\""));
+        assert!(rw_body.contains("const SYNC_CAP_TOKEN = \"sync123\""));
     }
 
     struct MockSync {
@@ -881,6 +1093,68 @@ mod tests {
                 .status,
             404
         );
+    }
+
+    #[test]
+    fn destructive_capability_tokens_are_action_scoped() {
+        let (_d, router) = setup();
+        let sync = std::sync::Arc::new(MockSync {
+            paused: false.into(),
+            triggered: false.into(),
+        });
+        let router = router
+            .with_restore(std::sync::Arc::new(OkRestore), "restore-secret".into())
+            .with_sync_control(sync.clone(), "sync-secret".into());
+        let restore_q = "/api/v1/restore?account=a&service=mail&id=m1";
+
+        // The sync token must not authorize a cloud restore.
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", restore_q).with_cap_token(Some("sync-secret".into()))
+                )
+                .status,
+            401
+        );
+        let audit =
+            body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=5")));
+        assert_eq!(
+            audit["count"], 0,
+            "a rejected cross-token restore must not write an audit entry"
+        );
+
+        // The restore token must not authorize scheduler controls.
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/sync/pause")
+                        .with_cap_token(Some("restore-secret".into()))
+                )
+                .status,
+            401
+        );
+        assert!(!sync.is_paused());
+
+        // Each action still succeeds with its own token.
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", restore_q)
+                        .with_cap_token(Some("restore-secret".into()))
+                )
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/sync/pause")
+                        .with_cap_token(Some("sync-secret".into()))
+                )
+                .status,
+            200
+        );
+        assert!(sync.is_paused());
     }
 
     #[test]

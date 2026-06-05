@@ -199,15 +199,17 @@ enum Command {
         #[arg(long)]
         new_archive_root: PathBuf,
     },
-    /// Serve the local web UI (open the printed URL in your browser).
+    /// Serve the local web UI/API.
     Serve {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
-        /// Address to bind (localhost only by default).
+        /// Serve over TCP instead of the default owner-only Unix socket.
+        #[arg(long)]
+        tcp: bool,
+        /// TCP address to bind when --tcp is set (loopback-only).
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: String,
-        /// Serve on a Unix-domain socket instead of TCP (the desktop default,
-        /// owner-only mode 0600). When set, --bind is ignored.
+        /// Unix-domain socket path (owner-only mode 0600). Default: $XDG_RUNTIME_DIR/isyncyou.sock.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -220,6 +222,10 @@ enum Command {
         /// Sign in for write operations (restore) instead of read-only backup.
         #[arg(long)]
         write: bool,
+        /// Store the OAuth token in the desktop Secret Service / KDE Wallet,
+        /// leaving only a non-secret marker file in the archive root.
+        #[arg(long)]
+        keyring: bool,
     },
     /// Mount the account's OneDrive tree as an on-demand placeholder filesystem:
     /// files appear with their real size but download only when first read.
@@ -240,7 +246,7 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
-    /// Snapshot an account's store to Proxmox Backup Server (needs a [pbs] config).
+    /// Snapshot an account's store to Proxmox Backup Server (needs a `pbs` config).
     PbsBackup {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
@@ -386,14 +392,16 @@ fn run(command: Command) -> Result<(), String> {
         } => cmd_migrate(&config, &account, &new_archive_root),
         Command::Serve {
             config,
+            tcp,
             bind,
             socket,
-        } => cmd_serve(&config, &bind, socket),
+        } => cmd_serve(&config, tcp, &bind, socket),
         Command::Login {
             config,
             account,
             write,
-        } => cmd_login(&config, &account, write),
+            keyring,
+        } => cmd_login(&config, &account, write, keyring),
         #[cfg(target_os = "linux")]
         Command::Mount {
             config,
@@ -489,7 +497,7 @@ fn resolve_token(
     isyncyou_graph::auth::flow::ensure_access_token(&cache, client, scopes, now)
 }
 
-fn cmd_login(config: &Path, account: &str, write: bool) -> Result<(), String> {
+fn cmd_login(config: &Path, account: &str, write: bool, keyring: bool) -> Result<(), String> {
     let cfg = load_config(config)?;
     let cache = token_cache_path(&cfg, account, write)?;
     if let Some(parent) = cache.parent() {
@@ -508,12 +516,23 @@ fn cmd_login(config: &Path, account: &str, write: bool) -> Result<(), String> {
         );
         eprintln!("{}", dc.message);
     })?;
-    tokens.save(&cache).map_err(|e| e.to_string())?;
-    println!(
-        "login OK for '{account}' ({}); token cached at {}",
-        if write { "write" } else { "read" },
-        cache.display()
-    );
+    if keyring {
+        tokens
+            .save_to_keyring(&cache)
+            .map_err(|e| format!("store token in desktop keyring: {e}"))?;
+        println!(
+            "login OK for '{account}' ({}); token stored in desktop keyring (marker at {})",
+            if write { "write" } else { "read" },
+            cache.display()
+        );
+    } else {
+        tokens.save(&cache).map_err(|e| e.to_string())?;
+        println!(
+            "login OK for '{account}' ({}); token cached at {}",
+            if write { "write" } else { "read" },
+            cache.display()
+        );
+    }
     Ok(())
 }
 
@@ -652,17 +671,28 @@ fn cmd_pbs_list(config: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_serve(config: &Path, bind: &str, socket: Option<PathBuf>) -> Result<(), String> {
+fn cmd_serve(config: &Path, tcp: bool, bind: &str, socket: Option<PathBuf>) -> Result<(), String> {
     let cfg = load_config(config)?;
     let router = isyncyou_webui::Router::new(cfg);
-    match socket {
-        // Unix-domain socket is the desktop default; on non-Unix targets it isn't
-        // available, so any --socket is ignored and we serve over TCP. (Unix
-        // sockets work on macOS too, so this stays cfg(unix), not linux-only.)
+    match selected_socket(tcp, socket) {
         #[cfg(unix)]
         Some(path) => isyncyou_webui::serve_unix(&path, router).map_err(|e| format!("serve: {e}")),
-        _ => isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}")),
+        None => isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}")),
     }
+}
+
+#[cfg(unix)]
+fn selected_socket(tcp: bool, socket: Option<PathBuf>) -> Option<PathBuf> {
+    if tcp {
+        None
+    } else {
+        Some(socket.unwrap_or_else(isyncyou_webui::default_unix_socket_path))
+    }
+}
+
+#[cfg(not(unix))]
+fn selected_socket(_tcp: bool, _socket: Option<PathBuf>) -> Option<PathBuf> {
+    None
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
@@ -825,7 +855,9 @@ fn cmd_setup(
         return Ok(());
     }
     connect_account(&cfg, &id, non_interactive)?;
-    println!("Setup complete. Next: `isyncyou sync --account {id}` to sync, or `isyncyou serve` for the web UI.");
+    println!(
+        "Setup complete. Next: `isyncyou sync --account {id}` to sync, or `isyncyou serve --tcp` for the browser UI."
+    );
     Ok(())
 }
 
@@ -1892,6 +1924,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_serve_defaults_to_unix_socket_transport() {
+        let c = parse(&["isyncyou", "serve"]).unwrap();
+        match c.command {
+            Command::Serve {
+                config,
+                tcp,
+                bind,
+                socket,
+            } => {
+                assert_eq!(config, PathBuf::from("isyncyou.toml"));
+                assert!(!tcp);
+                assert_eq!(bind, "127.0.0.1:8765");
+                assert!(socket.is_none());
+                #[cfg(unix)]
+                assert!(selected_socket(tcp, socket).is_some());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_serve_tcp_opt_in() {
+        let c = parse(&["isyncyou", "serve", "--tcp", "--bind", "127.0.0.1:9000"]).unwrap();
+        match c.command {
+            Command::Serve {
+                tcp, bind, socket, ..
+            } => {
+                assert!(tcp);
+                assert_eq!(bind, "127.0.0.1:9000");
+                assert!(selected_socket(tcp, socket).is_none());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_sync_with_account_and_token() {
         let c = parse(&[
             "isyncyou",
@@ -2187,18 +2255,30 @@ mod tests {
 
     #[test]
     fn parses_login() {
-        let c = parse(&["isyncyou", "login", "--account", "a", "--write"]).unwrap();
+        let c = parse(&[
+            "isyncyou",
+            "login",
+            "--account",
+            "a",
+            "--write",
+            "--keyring",
+        ])
+        .unwrap();
         assert_eq!(
             c.command,
             Command::Login {
                 config: "isyncyou.toml".into(),
                 account: "a".into(),
                 write: true,
+                keyring: true,
             }
         );
         let c2 = parse(&["isyncyou", "login", "--account", "a"]).unwrap();
         match c2.command {
-            Command::Login { write, .. } => assert!(!write),
+            Command::Login { write, keyring, .. } => {
+                assert!(!write);
+                assert!(!keyring);
+            }
             other => panic!("expected Login, got {other:?}"),
         }
     }

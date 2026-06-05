@@ -1,6 +1,6 @@
 [package]
 name = "isyncyou-api"
-description = "Local API: Unix-socket default; HTTP+TLS+capability-tokens+CSRF for remote."
+description = "Shared local API boundary; current HTTP/Unix adapter lives in gui/webui."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
