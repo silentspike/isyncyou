@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 proptest = "1"

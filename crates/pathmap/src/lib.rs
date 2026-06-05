@@ -18,11 +18,10 @@
 //! The codec is a bijection over names that do not already contain the fullwidth
 //! replacement characters (which essentially never occur in real file names); the
 //! [`MappingTable`] is the backstop for those rare cases and for case collisions.
-//!
-//! TODO: Unicode NFC normalization of comparison keys (HFS+/APFS interop).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use unicode_normalization::UnicodeNormalization;
 
 /// (ASCII character forbidden by OneDrive/Windows, fullwidth look-alike).
 const CHAR_MAP: &[(char, char)] = &[
@@ -109,9 +108,14 @@ pub fn is_reserved(name: &str) -> bool {
         || name.eq_ignore_ascii_case("desktop.ini")
 }
 
-/// Case-insensitive comparison key used to detect OneDrive case collisions.
+/// Case-insensitive, NFC-normalized comparison key used to detect OneDrive case
+/// collisions across Linux and normalization-heavy filesystems such as HFS+/APFS.
 pub fn case_key(name: &str) -> String {
-    name.to_lowercase()
+    name.nfc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .nfc()
+        .collect()
 }
 
 /// Split `name` into `(stem, extension_with_dot)` for suffix insertion.
@@ -279,6 +283,21 @@ mod tests {
         assert_eq!(t.lookup_local("p", &a), Some("Foo.txt"));
         assert_eq!(t.lookup_local("p", &b), Some("foo.txt"));
         assert_eq!(t.lookup_local("p", &c), Some("FOO.txt"));
+    }
+
+    #[test]
+    fn unicode_normalized_cloud_collisions_are_deduped() {
+        let mut t = MappingTable::new();
+        let decomposed = "Cafe\u{301}.txt";
+        let composed = "Caf\u{e9}.txt";
+        assert_eq!(case_key(decomposed), case_key(composed));
+
+        let a = t.assign_cloud_name("p", decomposed);
+        let b = t.assign_cloud_name("p", composed);
+        assert_eq!(a, decomposed);
+        assert_eq!(b, "Caf\u{e9} (2).txt");
+        assert_eq!(t.lookup_local("p", &a), Some(decomposed));
+        assert_eq!(t.lookup_local("p", &b), Some(composed));
     }
 
     #[test]
