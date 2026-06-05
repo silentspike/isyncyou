@@ -4,7 +4,7 @@
 //! per-directory watches, and has no inotify-style queue overflow.
 //!
 //! Like the inotify accelerator, this only lets the engine react quickly; the
-//! periodic [`crate::reconcile`] diff stays the source of truth. Events are
+//! periodic [`crate::reconcile()`] diff stays the source of truth. Events are
 //! reported as [`RawEvent`]s, resolving each event fd to a path via
 //! `/proc/self/fd/<fd>` (then closing it).
 
