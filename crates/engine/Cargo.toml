@@ -12,7 +12,7 @@ isyncyou-core = { path = "../core" }
 isyncyou-store = { path = "../store" }
 isyncyou-pathmap = { path = "../pathmap" }
 # The orchestration drives the live engine, so the http transport is always on.
-isyncyou-graph = { path = "../graph", features = ["http"] }
+isyncyou-graph = { path = "../graph", features = ["http", "desktop-keyring"] }
 isyncyou-connectors = { path = "../connectors", features = ["http"] }
 serde_json = { workspace = true }
 # Content-derived idempotency key for crash-safe restore (ADR-001). RustCrypto,
