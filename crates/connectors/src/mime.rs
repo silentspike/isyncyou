@@ -523,6 +523,7 @@ mod tests {
 
     #[test]
     fn quoted_printable_decodes_umlauts_and_soft_breaks() {
+        // lang-allow: German QP-encoded fixture, present to verify umlaut + soft-break decoding.
         let eml = b"Subject: Test\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nGesch=C3=A4ftsf=C3=BChrung sehr lan=\r\nger Satz.";
         let t = extract_text(eml);
         assert!(t.contains("Geschäftsführung"), "qp not decoded: {t:?}");
