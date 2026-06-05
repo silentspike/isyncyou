@@ -1,0 +1,25 @@
+# Allowlist for tools/check_language.py (the English-only gate).
+#
+# Format (one entry per line; '#' comments and blank lines ignored):
+#   glob:<pattern>   exempt a whole file (e.g. locale files, the font note)
+#   <substring>      skip any line that contains this exact substring
+# You can also place an inline `lang-allow` marker comment on a single source line.
+#
+# Keep this list tight: it is meant for genuinely legitimate non-English text
+# (translation locale files, the font umlaut-coverage note, and test fixtures
+# that exist precisely to verify umlaut / MIME / encoding handling) — not as a
+# way to wave through German UI strings or prose.
+
+# Locale files (intentional translations) + the font umlaut-coverage note + this tooling.
+glob:**/i18n/de*
+glob:**/de.json
+glob:gui/statusbar/assets/FONT-LICENSE.md
+glob:tools/lang_allowlist.txt
+glob:tools/check_language.py
+
+# Legitimate German test fixtures — present only to verify umlaut / MIME / encoding handling.
+Geschäftsführung
+Ähnlich Über
+Äpfel
+äéü
+"ä".repeat

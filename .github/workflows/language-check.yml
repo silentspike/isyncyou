@@ -1,0 +1,28 @@
+name: Language check
+
+# English-only gate: every PR into dev/staging/main is scanned for German text.
+# A failure prints file:line + the offending token + how to resolve it, so an
+# agent gets actionable feedback, fixes the change, and re-submits the PR.
+on:
+  pull_request:
+    branches: [dev, staging, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: language-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  english-only:
+    name: language-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.x"
+      - name: German-language gate
+        run: python3 tools/check_language.py
