@@ -218,7 +218,7 @@ fn run_tray(proxy: EventLoopProxy<UserEvent>) {
     rt.block_on(async move {
         let tray = StatusTray {
             proxy,
-            state_label: "Synchronisiert".into(),
+            state_label: "Synced".into(),
         };
         match tray.spawn().await {
             Ok(_handle) => {
