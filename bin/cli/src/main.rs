@@ -677,6 +677,10 @@ fn cmd_serve(config: &Path, tcp: bool, bind: &str, socket: Option<PathBuf>) -> R
     match selected_socket(tcp, socket) {
         #[cfg(unix)]
         Some(path) => isyncyou_webui::serve_unix(&path, router).map_err(|e| format!("serve: {e}")),
+        // On non-unix targets `selected_socket` always returns None (no unix-socket
+        // transport), so this arm only exists to keep the match exhaustive there.
+        #[cfg(not(unix))]
+        Some(_) => unreachable!("selected_socket returns None on non-unix platforms"),
         None => isyncyou_webui::serve(bind, router).map_err(|e| format!("serve: {e}")),
     }
 }
