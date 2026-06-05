@@ -13,7 +13,7 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -23,6 +23,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("another instance already holds the store lock at {0}")]
     AlreadyRunning(String),
+    #[error("store encryption secret is invalid: {0}")]
+    InvalidStoreSecret(String),
     #[error("illegal restore-operation transition: {0}")]
     IllegalTransition(String),
 }
@@ -31,6 +33,11 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
 pub const SCHEMA_VERSION: i64 = 7;
+
+pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
+pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
+pub const STORE_SYSTEMD_CREDENTIAL: &str = "isyncyou-store-key";
+pub const SYSTEMD_CREDENTIALS_DIR_ENV: &str = "CREDENTIALS_DIRECTORY";
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE items (
@@ -284,7 +291,39 @@ pub struct Store {
 impl Store {
     /// Open (or create) an on-disk store. Acquires an exclusive `<path>.lock`;
     /// returns [`StoreError::AlreadyRunning`] if another instance holds it.
+    ///
+    /// If a store encryption secret is configured via
+    /// [`STORE_KEY_FILE_ENV`], systemd credential
+    /// [`STORE_SYSTEMD_CREDENTIAL`], or [`STORE_KEY_ENV`], the database is opened
+    /// with SQLCipher before any schema access. Existing encrypted stores fail
+    /// closed when the key is absent or wrong; new stores are created encrypted
+    /// when the key is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        match configured_store_key()? {
+            Some(secret) => Self::open_encrypted(path, &secret),
+            None => Self::open_plain(path),
+        }
+    }
+
+    /// Open (or create) a SQLCipher-encrypted store using `secret`.
+    pub fn open_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
+        if secret.is_empty() {
+            return Err(StoreError::InvalidStoreSecret(
+                "secret must not be empty".into(),
+            ));
+        }
+        let path = path.as_ref();
+        let lock = Self::acquire_lock(path)?;
+        let conn = Connection::open(path)?;
+        apply_sqlcipher_key(&conn, secret)?;
+        Self::init(&conn)?;
+        Ok(Store {
+            conn,
+            _lock: Some(lock),
+        })
+    }
+
+    fn open_plain(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let lock = Self::acquire_lock(path)?;
         let conn = Connection::open(path)?;
@@ -306,7 +345,8 @@ impl Store {
     /// Write a consistent snapshot of the database to `dest` via SQLite
     /// `VACUUM INTO`. Safe while the store is open and being written — it reads a
     /// single consistent view — so it needs no quiesce. Used for PBS snapshots.
-    /// `dest` must not already exist (VACUUM INTO refuses to overwrite).
+    /// If `dest` already exists it is removed first, because SQLite's
+    /// `VACUUM INTO` refuses to overwrite.
     pub fn backup_to(&self, dest: impl AsRef<Path>) -> Result<()> {
         let dest = dest.as_ref();
         if dest.exists() {
@@ -939,6 +979,63 @@ impl Store {
     }
 }
 
+pub fn configured_store_key() -> Result<Option<Vec<u8>>> {
+    if let Some(path) = std::env::var_os(STORE_KEY_FILE_ENV) {
+        return read_store_secret_file(Path::new(&path)).map(Some);
+    }
+    if let Some(dir) = std::env::var_os(SYSTEMD_CREDENTIALS_DIR_ENV) {
+        let path = PathBuf::from(dir).join(STORE_SYSTEMD_CREDENTIAL);
+        if path.exists() {
+            return read_store_secret_file(&path).map(Some);
+        }
+    }
+    match std::env::var(STORE_KEY_ENV) {
+        Ok(s) if !s.is_empty() => Ok(Some(s.into_bytes())),
+        _ => Ok(None),
+    }
+}
+
+pub fn read_store_secret_file(path: &Path) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    let trimmed = trim_ascii_whitespace(&bytes);
+    if trimmed.is_empty() {
+        return Err(StoreError::InvalidStoreSecret(format!(
+            "{} is empty",
+            path.display()
+        )));
+    }
+    Ok(trimmed.to_vec())
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn apply_sqlcipher_key(conn: &Connection, secret: &[u8]) -> Result<()> {
+    let len: i32 = secret
+        .len()
+        .try_into()
+        .map_err(|_| StoreError::InvalidStoreSecret("secret is too large".into()))?;
+    let rc = unsafe { rusqlite::ffi::sqlite3_key(conn.handle(), secret.as_ptr().cast(), len) };
+    if rc == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rc),
+            Some("apply SQLCipher key failed".into()),
+        )))
+    }
+}
+
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
                     item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
                     change_key, internet_message_id, ical_uid, series_master_id";
@@ -1362,6 +1459,114 @@ mod tests {
         drop(restored);
         // VACUUM INTO refuses a pre-existing target; backup_to clears it first
         store.backup_to(&snap).unwrap();
+    }
+
+    #[test]
+    fn encrypted_store_hides_plaintext_and_requires_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.db");
+        {
+            let store = Store::open_encrypted(&path, b"correct horse battery staple").unwrap();
+            store
+                .upsert_item(&Item::new(
+                    "a",
+                    "mail",
+                    "r-secret",
+                    "Quarterly super secret plan",
+                    "message",
+                ))
+                .unwrap();
+            store
+                .index_body("a", "mail", "r-secret", "body text with classified details")
+                .unwrap();
+        }
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.starts_with(b"SQLite format 3\0"));
+        assert!(
+            !contains_bytes(&raw, b"super secret"),
+            "raw DB leaked item name"
+        );
+        assert!(
+            !contains_bytes(&raw, b"classified details"),
+            "raw DB leaked body FTS content"
+        );
+
+        assert!(
+            Store::open(&path).is_err(),
+            "encrypted DB opened without key"
+        );
+        assert!(
+            Store::open_encrypted(&path, b"wrong secret").is_err(),
+            "encrypted DB opened with the wrong key"
+        );
+
+        let reopened = Store::open_encrypted(&path, b"correct horse battery staple").unwrap();
+        assert_eq!(
+            reopened
+                .get_item("a", "mail", "r-secret")
+                .unwrap()
+                .unwrap()
+                .name,
+            "Quarterly super secret plan"
+        );
+        assert_eq!(
+            reopened.search_bodies("a", "classified").unwrap(),
+            vec![("mail".to_string(), "r-secret".to_string())]
+        );
+    }
+
+    #[test]
+    fn encrypted_backup_to_keeps_snapshot_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live-encrypted.db");
+        let snap = dir.path().join("snap-encrypted.db");
+        let store = Store::open_encrypted(&live, b"pbs snapshot key").unwrap();
+        store
+            .upsert_item(&Item::new(
+                "a",
+                "onedrive",
+                "r1",
+                "encrypted snapshot file.txt",
+                "file",
+            ))
+            .unwrap();
+        store.backup_to(&snap).unwrap();
+        drop(store);
+
+        let raw = std::fs::read(&snap).unwrap();
+        assert!(!raw.starts_with(b"SQLite format 3\0"));
+        assert!(
+            !contains_bytes(&raw, b"encrypted snapshot file"),
+            "snapshot DB leaked item name"
+        );
+        assert!(
+            Store::open(&snap).is_err(),
+            "encrypted snapshot opened without key"
+        );
+        let restored = Store::open_encrypted(&snap, b"pbs snapshot key").unwrap();
+        assert!(restored.get_item("a", "onedrive", "r1").unwrap().is_some());
+    }
+
+    #[test]
+    fn store_secret_file_is_trimmed_and_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store-key");
+        std::fs::write(&path, b"\n  sqlcipher secret from credential \t\n").unwrap();
+        assert_eq!(
+            read_store_secret_file(&path).unwrap(),
+            b"sqlcipher secret from credential"
+        );
+
+        std::fs::write(&path, b" \n\t ").unwrap();
+        let err = read_store_secret_file(&path).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidStoreSecret(_)));
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[test]
