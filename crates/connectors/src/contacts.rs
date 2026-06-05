@@ -3,7 +3,7 @@
 //! Contacts live in a **default collection** (`/me/contacts`) plus any number of
 //! named **contact folders** (`/me/contactFolders/{id}/contacts`). Both expose a
 //! delta query, so this syncs the default collection first (cursor scope
-//! [`DEFAULT_SCOPE`]) and then each folder (cursor scope = folder id). Contacts
+//! `DEFAULT_SCOPE`) and then each folder (cursor scope = folder id). Contacts
 //! are stored id-based (service `"contacts"`, `item_type = "contact"`); the
 //! canonical record is the raw JSON, vCard is an export concern handled elsewhere.
 

@@ -191,12 +191,42 @@ pub fn restore_message<C: MessageCreator>(creator: &C, mime: &[u8]) -> Result<St
 /// a page can't be re-created by a JSON POST — the HTML is re-posted (plan §6).
 pub trait PageCreator {
     fn create_page_from_html(&self, html: &[u8]) -> Result<Value, String>;
+    fn create_page_from_html_with_resources(
+        &self,
+        html: &[u8],
+        resources: &[OneNoteResourcePart],
+    ) -> Result<Value, String>;
+}
+
+/// One binary resource part for OneNote page restore. The page HTML must refer to
+/// each part as `name:<part_name>` in `img src` / `object data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneNoteResourcePart {
+    pub part_name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
 }
 
 #[cfg(feature = "http")]
 impl PageCreator for isyncyou_graph::GraphClient {
     fn create_page_from_html(&self, html: &[u8]) -> Result<Value, String> {
         isyncyou_graph::GraphClient::create_onenote_page(self, html).map_err(|e| e.to_string())
+    }
+    fn create_page_from_html_with_resources(
+        &self,
+        html: &[u8],
+        resources: &[OneNoteResourcePart],
+    ) -> Result<Value, String> {
+        let parts: Vec<_> = resources
+            .iter()
+            .map(|part| isyncyou_graph::http::OneNotePagePart {
+                name: part.part_name.clone(),
+                content_type: part.content_type.clone(),
+                bytes: part.bytes.clone(),
+            })
+            .collect();
+        isyncyou_graph::GraphClient::create_onenote_page_multipart(self, html, &parts)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -207,6 +237,23 @@ pub fn restore_page<C: PageCreator>(creator: &C, html: &[u8]) -> Result<String, 
         return Err("page HTML is empty".into());
     }
     created_id(creator.create_page_from_html(html)?)
+}
+
+/// Restore one OneNote page from archived HTML plus binary resource parts. Use
+/// this when the HTML has already been rewritten to `name:<part-name>` references
+/// for images/files; with no resources it falls back to the plain HTML path.
+pub fn restore_page_with_resources<C: PageCreator>(
+    creator: &C,
+    html: &[u8],
+    resources: &[OneNoteResourcePart],
+) -> Result<String, String> {
+    if html.is_empty() {
+        return Err("page HTML is empty".into());
+    }
+    if resources.is_empty() {
+        return restore_page(creator, html);
+    }
+    created_id(creator.create_page_from_html_with_resources(html, resources)?)
 }
 
 #[cfg(test)]
@@ -324,6 +371,32 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_contact_drops_photo_fields_for_personal_account_restore() {
+        let payload = sanitize_contact(&json!({
+            "id": "c1",
+            "displayName": "Ada Lovelace",
+            "photo": { "id": "240X240" },
+            "photo@odata.mediaContentType": "image/jpeg",
+            "photo@odata.mediaEtag": "etag",
+            "businessPhones": ["+1 555 0100"]
+        }));
+        assert_eq!(payload.get("displayName").unwrap(), "Ada Lovelace");
+        assert_eq!(
+            payload.get("businessPhones").unwrap(),
+            &json!(["+1 555 0100"])
+        );
+        assert!(
+            payload.get("photo").is_none(),
+            "contact photo metadata must not be posted in the contact create payload"
+        );
+        assert!(
+            payload.get("photo@odata.mediaContentType").is_none()
+                && payload.get("photo@odata.mediaEtag").is_none(),
+            "photo sidecar metadata must not survive sanitize_contact"
+        );
+    }
+
+    #[test]
     fn empty_payloads_are_rejected() {
         let m = MockRestorer::new();
         assert!(restore_event(&m, &json!({ "id": "x" })).is_err());
@@ -358,6 +431,62 @@ mod tests {
             last: RefCell::new(Vec::new()),
         };
         assert!(restore_message(&m, b"").is_err());
+    }
+
+    struct MockPageCreator {
+        plain: RefCell<Vec<Vec<u8>>>,
+        multipart: RefCell<Vec<(Vec<u8>, Vec<OneNoteResourcePart>)>>,
+    }
+    impl PageCreator for MockPageCreator {
+        fn create_page_from_html(&self, html: &[u8]) -> Result<Value, String> {
+            self.plain.borrow_mut().push(html.to_vec());
+            Ok(json!({ "id": "PAGE1" }))
+        }
+        fn create_page_from_html_with_resources(
+            &self,
+            html: &[u8],
+            resources: &[OneNoteResourcePart],
+        ) -> Result<Value, String> {
+            self.multipart
+                .borrow_mut()
+                .push((html.to_vec(), resources.to_vec()));
+            Ok(json!({ "id": "PAGE2" }))
+        }
+    }
+
+    #[test]
+    fn restore_page_uses_plain_html_when_no_resources() {
+        let m = MockPageCreator {
+            plain: RefCell::new(Vec::new()),
+            multipart: RefCell::new(Vec::new()),
+        };
+        let html = br#"<html><body><p>plain page</p></body></html>"#;
+        assert_eq!(restore_page_with_resources(&m, html, &[]).unwrap(), "PAGE1");
+        assert_eq!(m.plain.borrow()[0], html);
+        assert!(m.multipart.borrow().is_empty());
+    }
+
+    #[test]
+    fn restore_page_with_resources_uses_multipart_parts() {
+        let m = MockPageCreator {
+            plain: RefCell::new(Vec::new()),
+            multipart: RefCell::new(Vec::new()),
+        };
+        let html = br#"<html><body><img src="name:imageBlock1" /></body></html>"#;
+        let resources = vec![OneNoteResourcePart {
+            part_name: "imageBlock1".into(),
+            content_type: "image/png".into(),
+            bytes: b"png-bytes".to_vec(),
+        }];
+
+        assert_eq!(
+            restore_page_with_resources(&m, html, &resources).unwrap(),
+            "PAGE2"
+        );
+        assert!(m.plain.borrow().is_empty());
+        let multipart = m.multipart.borrow();
+        assert_eq!(multipart[0].0, html);
+        assert_eq!(multipart[0].1, resources);
     }
 
     /// Live round-trip: fetch one event, restore it, verify subject, delete copy.
