@@ -23,11 +23,13 @@ struct Args {
     /// Configuration file.
     #[arg(long, default_value = "isyncyou.toml")]
     config: PathBuf,
-    /// Address to bind the local web UI/API (localhost only by default).
+    /// Serve over TCP instead of the default owner-only Unix socket.
+    #[arg(long)]
+    tcp: bool,
+    /// TCP address to bind when --tcp is set (loopback-only).
     #[arg(long, default_value = "127.0.0.1:8765")]
     bind: String,
-    /// Serve on a Unix-domain socket instead of TCP (owner-only, mode 0600 — the
-    /// desktop default per plan §11). When set, --bind is ignored.
+    /// Unix-domain socket path (owner-only, mode 0600). Default: $XDG_RUNTIME_DIR/isyncyou.sock.
     #[arg(long)]
     socket: Option<PathBuf>,
     /// Liveness heartbeat interval in seconds (0 disables).
@@ -50,7 +52,8 @@ fn main() {
 fn run(args: &Args) -> Result<(), String> {
     let cfg = load_config(&args.config)?;
     let n = cfg.accounts.len();
-    let where_ = match &args.socket {
+    let socket = selected_socket(args.tcp, args.socket.clone());
+    let where_ = match &socket {
         Some(p) => format!("unix:{}", p.display()),
         None => format!("http://{}/", args.bind),
     };
@@ -124,13 +127,25 @@ fn run(args: &Args) -> Result<(), String> {
         router = router.with_sync_control(sched, cap_token);
     }
 
-    match &args.socket {
-        // Unix-domain socket (desktop default) — unavailable on non-Unix; there a
-        // --socket is ignored and the daemon serves over TCP.
+    match socket {
         #[cfg(unix)]
-        Some(path) => isyncyou_webui::serve_unix(path, router).map_err(|e| format!("serve: {e}")),
-        _ => isyncyou_webui::serve(&args.bind, router).map_err(|e| format!("serve: {e}")),
+        Some(path) => isyncyou_webui::serve_unix(&path, router).map_err(|e| format!("serve: {e}")),
+        None => isyncyou_webui::serve(&args.bind, router).map_err(|e| format!("serve: {e}")),
     }
+}
+
+#[cfg(unix)]
+fn selected_socket(tcp: bool, socket: Option<PathBuf>) -> Option<PathBuf> {
+    if tcp {
+        None
+    } else {
+        Some(socket.unwrap_or_else(isyncyou_webui::default_unix_socket_path))
+    }
+}
+
+#[cfg(not(unix))]
+fn selected_socket(_tcp: bool, _socket: Option<PathBuf>) -> Option<PathBuf> {
+    None
 }
 
 /// Mint a per-process capability token from `/dev/urandom` (hex), with a
@@ -322,12 +337,15 @@ mod tests {
             a,
             Args {
                 config: "isyncyou.toml".into(),
+                tcp: false,
                 bind: "127.0.0.1:8765".into(),
                 socket: None,
                 heartbeat_secs: 300,
                 sync_secs: 0,
             }
         );
+        #[cfg(unix)]
+        assert!(selected_socket(a.tcp, a.socket.clone()).is_some());
     }
 
     #[test]
@@ -344,6 +362,7 @@ mod tests {
             "isyncyoud",
             "--config",
             "/etc/isyncyou.toml",
+            "--tcp",
             "--bind",
             "0.0.0.0:9000",
             "--heartbeat-secs",
@@ -351,9 +370,11 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(a.config, PathBuf::from("/etc/isyncyou.toml"));
+        assert!(a.tcp);
         assert_eq!(a.bind, "0.0.0.0:9000");
         assert_eq!(a.heartbeat_secs, 0);
         assert_eq!(a.socket, None);
+        assert!(selected_socket(a.tcp, a.socket.clone()).is_none());
     }
 
     #[test]
