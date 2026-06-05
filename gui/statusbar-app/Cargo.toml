@@ -10,6 +10,7 @@ authors.workspace = true
 [[bin]]
 name = "isyncyou-statusbar"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 isyncyou-statusbar = { path = "../statusbar" }

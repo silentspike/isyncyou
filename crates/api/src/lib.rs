@@ -1,6 +1,8 @@
-//! `isyncyou-api` — Local API: Unix-socket default; HTTP+TLS+capability-tokens+CSRF for remote.
+//! `isyncyou-api` — shared boundary for the local API.
 //!
-//! Phase 0 skeleton: structure only, no implementation yet.
+//! The current localhost/Unix-socket adapter lives in `gui/webui`; see
+//! `docs/local-api-security.md` for the shipped local boundary and the remaining
+//! remote-admin hardening work.
 
 #[cfg(test)]
 mod tests {

@@ -65,8 +65,9 @@
 </main>
 <script>
 const SERVICES = ["onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared"];
-// injected by the daemon's `/` handler; empty disables the restore UI (read-only).
-const CAP_TOKEN = "__CAP_TOKEN__";
+// injected by the daemon's `/` handler; empty disables the matching destructive UI.
+const RESTORE_CAP_TOKEN = "__RESTORE_CAP_TOKEN__";
+const SYNC_CAP_TOKEN = "__SYNC_CAP_TOKEN__";
 const RESTORABLE = ["mail", "calendar", "contacts", "todo", "onenote"];
 let account = null, service = "mail";
 
@@ -86,7 +87,7 @@ function rowsHtml(items) {
     const bodyCell = it.has_body
       ? `<a href="/api/v1/body?${q}" target="_blank" rel="noopener">raw</a>`
       : "—";
-    const restoreCell = (CAP_TOKEN && it.has_body && RESTORABLE.includes(it.service))
+    const restoreCell = (RESTORE_CAP_TOKEN && it.has_body && RESTORABLE.includes(it.service))
       ? `<a href="#" onclick="doRestore('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">restore</a>`
       : "—";
     return `<tr>
@@ -101,13 +102,13 @@ function escapeHtml(s) { return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;",
 function escapeJs(s) { return (s || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'"); }
 
 // Re-create an archived item in the cloud via the daemon's restore POST. The
-// capability token (injected, same-origin) authorizes the destructive action.
+// restore capability token (injected, same-origin) authorizes this action.
 async function doRestore(service, id, el) {
   if (!confirm(`Restore this ${service} item to the cloud as a new copy?`)) return;
   if (el) el.textContent = "…";
   const q = `account=${encodeURIComponent(account)}&service=${encodeURIComponent(service)}&id=${encodeURIComponent(id)}`;
   try {
-    const r = await fetch(`/api/v1/restore?${q}`, { method: "POST", headers: { "X-Capability-Token": CAP_TOKEN } });
+    const r = await fetch(`/api/v1/restore?${q}`, { method: "POST", headers: { "X-Capability-Token": RESTORE_CAP_TOKEN } });
     const d = await r.json();
     if (r.ok) { if (el) { el.textContent = "✓ restored"; el.removeAttribute("onclick"); } }
     else { if (el) el.textContent = "restore"; alert("Restore failed: " + (d.error || r.status)); }
@@ -194,7 +195,7 @@ async function showOverview() {
 }
 // Scheduled-sync control panel (only when the daemon enabled it + we have a token).
 function syncHtml(s) {
-  if (!s || !s.enabled || !CAP_TOKEN) return "";
+  if (!s || !s.enabled || !SYNC_CAP_TOKEN) return "";
   const status = s.paused
     ? '<span style="color:#fbbf24">paused</span>'
     : '<span style="color:#4ade80">running</span>';
@@ -208,7 +209,7 @@ function syncHtml(s) {
 }
 async function syncCmd(cmd) {
   try {
-    await fetch(`/api/v1/sync/${cmd}`, { method: "POST", headers: { "X-Capability-Token": CAP_TOKEN } });
+    await fetch(`/api/v1/sync/${cmd}`, { method: "POST", headers: { "X-Capability-Token": SYNC_CAP_TOKEN } });
     showOverview();
   } catch (e) { alert("Sync command failed: " + e); }
 }
