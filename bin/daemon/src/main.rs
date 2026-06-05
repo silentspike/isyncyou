@@ -151,6 +151,13 @@ struct DaemonRestore {
 }
 impl isyncyou_webui::RestoreHandler for DaemonRestore {
     fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String> {
+        // Refuse a not-yet-ledger-migrated service before resolving a token, so the
+        // web UI gets the clear "not crash-safe yet" message. (Engine re-checks.)
+        if !isyncyou_engine::cloud_restore_service_supported(service) {
+            return Err(isyncyou_engine::unsupported_cloud_restore_service_error(
+                service,
+            ));
+        }
         let token = isyncyou_engine::auth::resolve_cached_restore_token(&self.cfg, account)?;
         isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)
     }
@@ -372,5 +379,18 @@ mod tests {
         .unwrap();
         assert!(load_config(&p).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_handler_refuses_non_mail_before_token_lookup() {
+        // The web-UI restore handler refuses a not-yet-ledger-migrated service before
+        // any cached-token lookup (so no token is needed to get the clear message).
+        let h = DaemonRestore {
+            cfg: Config::default(),
+        };
+        for service in ["calendar", "contacts", "todo", "onenote"] {
+            let err = isyncyou_webui::RestoreHandler::restore(&h, "a", service, "x").unwrap_err();
+            assert!(err.contains("not crash-safe yet"), "{service}: got: {err}");
+        }
     }
 }

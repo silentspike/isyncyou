@@ -193,8 +193,30 @@ pub mod auth {
     }
 }
 
-/// Cloud services that can be re-created from their canonical archive.
+/// Services with an archived body that can be previewed or restored to a local file.
 pub const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
+
+/// Services whose **cloud-mutating** restore goes through the crash-safe operation
+/// ledger (ADR-001). Only these may be re-created in the cloud; the others are
+/// refused until migrated — a direct POST is not crash-safe (a mid-restore crash
+/// could duplicate the item), and the product does not ship a "mostly safe" path.
+pub const CLOUD_RESTORE_SERVICES: &[&str] = &["mail"];
+
+/// Whether `service`'s cloud restore path is crash-safe (ledger-backed) today.
+pub fn cloud_restore_service_supported(service: &str) -> bool {
+    CLOUD_RESTORE_SERVICES.contains(&service)
+}
+
+/// Stable refusal for a not-yet-ledger-migrated cloud restore — the CLI and daemon
+/// return this *before* resolving a token, so the message is clear, not a token
+/// error.
+pub fn unsupported_cloud_restore_service_error(service: &str) -> String {
+    format!(
+        "cloud restore for '{service}' is not crash-safe yet — only mail is currently \
+         ledger-backed. Use `restore --to-local` to recover the archived body, or \
+         `restore --preview` to inspect it."
+    )
+}
 
 /// Open the account's store and read one archived item's body bytes. Shared by the
 /// cloud restore and the (read-only) restore preview. Error messages are stable —
@@ -235,60 +257,33 @@ pub fn restore_cloud(
     id: &str,
     token: String,
 ) -> Result<String, String> {
-    use isyncyou_connectors as connectors;
-    // Safety gate: cloud-mutating restore is off by default. It re-creates items in
-    // the cloud, and the crash-safe operation ledger that makes a retry idempotent
-    // (so an interrupted restore cannot duplicate a mailbox item) is still being
-    // hardened — so the feature does not ship "mostly safe". Recovering an archived
-    // body to a local file goes through a different path and is never gated here.
+    // Safety gate: cloud-mutating restore is off by default — it re-creates items in
+    // a real mailbox. Recovering an archived body to a local file goes through a
+    // different path and is never gated here.
     if !cfg.restore.cloud_restore_enabled {
         return Err(
             "cloud restore is disabled (set restore.cloud_restore_enabled = true to \
-             opt in). It re-creates items in the cloud and the crash-safe operation \
-             ledger is still being hardened, so it is off by default. Use \
-             `restore --to-local` to recover an archived body to a file instead."
+             opt in). It re-creates items in the cloud. Use `restore --to-local` to \
+             recover an archived body to a file instead."
                 .to_string(),
         );
     }
     if !RESTORE_SERVICES.contains(&service) {
         return Err(format!(
-            "service '{service}' has no cloud restore path (expected one of {}); \
+            "service '{service}' has no restore path (expected one of {}); \
              use restore --to-local to recover its archived body to a file",
             RESTORE_SERVICES.join("|")
         ));
     }
+    // Only crash-safe (ledger-backed) services may mutate the cloud; the rest are
+    // refused until migrated. A direct connector POST is not crash-safe (ADR-001).
+    if !cloud_restore_service_supported(service) {
+        return Err(unsupported_cloud_restore_service_error(service));
+    }
     // Mail goes through the crash-safe operation ledger (ADR-001): record intent,
     // stamp a findable marker, post, and reconcile-not-duplicate on a re-entry after
-    // a crash. The other services still use the direct path (their ledger migration
-    // is tracked in docs/requirements/restore.yml).
-    if service == "mail" {
-        return mail_restore::restore_mail_via_ledger(cfg, account, id, token);
-    }
-    let (item, bytes) = read_archived_body(cfg, account, service, id)?;
-    let client = GraphClient::new(token);
-    let new_id = match service {
-        "mail" => connectors::restore_message(&client, &bytes)?,
-        "calendar" => {
-            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            connectors::restore_event(&client, &v)?
-        }
-        "contacts" => {
-            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            connectors::restore_contact(&client, &v)?
-        }
-        "todo" => {
-            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            let list = item
-                .parent_remote_id
-                .as_deref()
-                .ok_or("archived task has no parent list id")?;
-            connectors::restore_task(&client, list, &v)?
-        }
-        // OneNote pages re-create from their archived HTML (not a JSON object).
-        "onenote" => connectors::restore_page(&client, &bytes)?,
-        _ => unreachable!("validated against RESTORE_SERVICES"),
-    };
-    Ok(new_id)
+    // a crash.
+    mail_restore::restore_mail_via_ledger(cfg, account, id, token)
 }
 
 /// A non-destructive preview of what a cloud restore of one archived item *would*
@@ -501,6 +496,23 @@ mod tests {
             err.contains("cloud restore is disabled"),
             "expected disabled-gate message, got: {err}"
         );
+    }
+
+    #[test]
+    fn restore_cloud_refuses_non_mail_until_ledger_migrated() {
+        // Even with the gate opened, a non-ledger service must be refused before any
+        // store access or Graph write — only mail is crash-safe today.
+        let mut cfg = Config::default();
+        cfg.restore.cloud_restore_enabled = true;
+        for service in ["calendar", "contacts", "todo", "onenote"] {
+            let err = restore_cloud(&cfg, "a", service, "id", "tok".into()).unwrap_err();
+            assert!(
+                err.contains("not crash-safe yet"),
+                "{service}: expected not-crash-safe refusal, got: {err}"
+            );
+        }
+        assert!(!cloud_restore_service_supported("calendar"));
+        assert!(cloud_restore_service_supported("mail"));
     }
 
     #[test]
