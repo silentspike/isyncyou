@@ -3,7 +3,7 @@
 //! mapped to [`RawEvent`]s, batched over a debounce window, and coalesced into
 //! [`FsChange`]s.
 //!
-//! The periodic [`crate::reconcile`] diff stays the source of truth; this watcher
+//! The periodic [`crate::reconcile()`] diff stays the source of truth; this watcher
 //! only lets the engine react quickly to local edits. A watcher error / queue
 //! overflow is therefore not fatal — `poll` returns no specific changes and the
 //! caller falls back to a full reconcile.
