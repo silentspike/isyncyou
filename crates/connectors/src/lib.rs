@@ -5,7 +5,7 @@
 //! - [`mail`] ingests per-folder Outlook message deltas (Phase 2 backup).
 //! - [`calendar`] ingests per-calendar `calendarView` deltas (Phase 2 backup).
 //! - [`contacts`] ingests default + per-folder contact deltas (Phase 2 backup).
-//! - [`todo`] ingests per-list Microsoft To Do task deltas (Phase 2 backup).
+//! - [`mod@todo`] ingests per-list Microsoft To Do task deltas (Phase 2 backup).
 //! - [`onenote`] reconciles the OneNote page list (no delta) (Phase 2 backup).
 //!
 //! This completes the Phase-2 backup connector set.
@@ -26,7 +26,8 @@ pub mod todo;
 
 pub use archive::{
     backup_byte_bodies, backup_calendar_bodies, backup_contacts_bodies, backup_json_bodies,
-    backup_onenote_bodies, backup_todo_bodies, ArchiveReport, BytesFetcher, JsonFetcher,
+    backup_onenote_bodies, backup_onenote_resources, backup_todo_bodies, ArchiveReport,
+    BytesFetcher, JsonFetcher, OneNoteResourceReport,
 };
 pub use calendar::{incremental_sync_calendar, CalendarReport};
 pub use contacts::{backup_contact_photos, incremental_sync_contacts, ContactsReport, PhotoReport};
@@ -35,7 +36,10 @@ pub use mail::{
     backup_message_bodies, incremental_sync_mail, index_mail_bodies, BodyReport, MailReport,
     MimeFetcher,
 };
-pub use mime::{extract_html, extract_text, mail_preview, set_message_id, MailPreview};
+pub use mime::{
+    extract_html, extract_html_with_inline_images, extract_text, mail_preview, set_message_id,
+    HtmlWithInlineImages, InlineImage, MailPreview,
+};
 pub use onedrive::{
     apply_local_deletes, apply_local_modifies, incremental_sync, materialize_downloads,
     pending_local_deletes, push_delete, push_local_creates, push_upload, scan_local_creates,
@@ -45,8 +49,9 @@ pub use onedrive::{
 pub use onenote::{incremental_sync_onenote, OneNoteReport};
 pub use quickxor::{quickxor, quickxor_base64};
 pub use restore::{
-    restore_contact, restore_event, restore_message, restore_page, restore_task, sanitize_contact,
-    sanitize_event, sanitize_task, MessageCreator, PageCreator, Restorer,
+    restore_contact, restore_event, restore_message, restore_page, restore_page_with_resources,
+    restore_task, sanitize_contact, sanitize_event, sanitize_task, MessageCreator,
+    OneNoteResourcePart, PageCreator, Restorer,
 };
 pub use shared::{sync_shared_with_me, SharedReport};
 pub use todo::{incremental_sync_todo, TodoReport};
@@ -58,7 +63,7 @@ pub use todo::{incremental_sync_todo, TodoReport};
 /// of the test harness's thread count (plan §16: the real test account is
 /// exercised serialized). A panicking test poisons the lock; we recover the
 /// guard so one failure doesn't cascade into "poisoned" failures for the rest.
-#[cfg(test)]
+#[cfg(all(test, feature = "http"))]
 pub(crate) fn live_test_gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GATE.lock().unwrap_or_else(|poison| poison.into_inner())

@@ -11,6 +11,14 @@ use std::time::Duration;
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 
+/// One binary data part for a OneNote multipart page-create request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneNotePagePart {
+    pub name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Errors from the live upload/delete path.
 #[derive(Debug)]
 pub enum UploadError {
@@ -175,7 +183,7 @@ impl GraphClient {
     /// Like [`upload_file`](Self::upload_file) but persists the resumable session
     /// via `resume` (plan §6/§9), so a process kill mid-upload resumes from the
     /// server's `nextExpectedRanges` instead of restarting. On start it reuses a
-    /// persisted session for this exact file (validated via [`upload_status`]); on
+    /// persisted session for this exact file (validated via [`Self::upload_status`]); on
     /// each accepted fragment it records the offset; on completion it clears it.
     pub fn upload_file_resumable(
         &self,
@@ -480,6 +488,18 @@ impl GraphClient {
         self.post_raw("/me/onenote/pages", "text/html", html.to_vec())
     }
 
+    /// Create a OneNote page from a `Presentation` HTML part plus binary resource
+    /// parts. The HTML must reference each part as `name:<part-name>` in `img src`
+    /// or `object data`, per Microsoft Graph's OneNote page-create contract.
+    pub fn create_onenote_page_multipart(
+        &self,
+        html: &[u8],
+        parts: &[OneNotePagePart],
+    ) -> Result<serde_json::Value, UploadError> {
+        let (content_type, body) = onenote_multipart_body(html, parts)?;
+        self.post_raw("/me/onenote/pages", &content_type, body)
+    }
+
     /// Delete a OneNote page by id (`DELETE /me/onenote/pages/{id}`). OneNote is
     /// eventually consistent, so a freshly-created page may 404 until it propagates;
     /// callers retry. Used for test cleanup on the throwaway account.
@@ -518,6 +538,86 @@ impl GraphClient {
             }),
         }
     }
+}
+
+/// Build the raw multipart/form-data body Graph expects for OneNote page create
+/// with binary resources. Pure and unit-testable; callers still own rewriting the
+/// archived page HTML to `name:<part-name>` references.
+pub fn onenote_multipart_body(
+    html: &[u8],
+    parts: &[OneNotePagePart],
+) -> Result<(String, Vec<u8>), UploadError> {
+    for part in parts {
+        validate_multipart_token(&part.name, "part name")?;
+        validate_content_type(&part.content_type)?;
+    }
+    let boundary = multipart_boundary(html, parts);
+    let mut body = Vec::new();
+    write_part(
+        &mut body,
+        &boundary,
+        "Presentation",
+        "text/html; charset=utf-8",
+        html,
+    );
+    for part in parts {
+        write_part(
+            &mut body,
+            &boundary,
+            &part.name,
+            &part.content_type,
+            &part.bytes,
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    Ok((format!("multipart/form-data; boundary={boundary}"), body))
+}
+
+fn write_part(body: &mut Vec<u8>, boundary: &str, name: &str, content_type: &str, bytes: &[u8]) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"{name}\"\r\n").as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+fn validate_multipart_token(value: &str, label: &str) -> Result<(), UploadError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(UploadError::Parse(format!(
+            "invalid OneNote multipart {label}: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_content_type(value: &str) -> Result<(), UploadError> {
+    if value.is_empty() || value.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'"')) {
+        return Err(UploadError::Parse(format!(
+            "invalid OneNote multipart content type: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn multipart_boundary(html: &[u8], parts: &[OneNotePagePart]) -> String {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in html {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for part in parts {
+        for b in part.name.as_bytes().iter().chain(part.bytes.iter()) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("isyncyou-{h:016x}")
 }
 
 /// Prefix a bare `/me/...` path with the Graph base; pass absolute URLs through.
@@ -596,6 +696,47 @@ mod tests {
     fn abs_prefixes_paths_but_not_urls() {
         assert_eq!(abs("/me/events"), format!("{GRAPH}/me/events"));
         assert_eq!(abs("https://x/y"), "https://x/y");
+    }
+
+    #[test]
+    fn onenote_multipart_body_uses_presentation_and_binary_parts() {
+        let html = br#"<!DOCTYPE html><html><body><img src="name:imageBlock1" /></body></html>"#;
+        let parts = vec![OneNotePagePart {
+            name: "imageBlock1".into(),
+            content_type: "image/png".into(),
+            bytes: b"\x89PNG\r\nbinary".to_vec(),
+        }];
+
+        let (content_type, body) = onenote_multipart_body(html, &parts).unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary=isyncyou-"));
+        let boundary = content_type.split("boundary=").nth(1).unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(&format!("--{boundary}\r\n")));
+        assert!(text.contains("Content-Disposition: form-data; name=\"Presentation\"\r\n"));
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n\r\n"));
+        assert!(text.contains("Content-Disposition: form-data; name=\"imageBlock1\"\r\n"));
+        assert!(text.contains("Content-Type: image/png\r\n\r\n"));
+        assert!(body.ends_with(format!("--{boundary}--\r\n").as_bytes()));
+        assert!(body
+            .windows(b"\x89PNG\r\nbinary".len())
+            .any(|w| w == b"\x89PNG\r\nbinary"));
+    }
+
+    #[test]
+    fn onenote_multipart_body_rejects_header_injection() {
+        let bad_name = vec![OneNotePagePart {
+            name: "bad\r\nname".into(),
+            content_type: "image/png".into(),
+            bytes: vec![1],
+        }];
+        assert!(onenote_multipart_body(b"<html></html>", &bad_name).is_err());
+
+        let bad_type = vec![OneNotePagePart {
+            name: "imageBlock1".into(),
+            content_type: "image/png\r\nX-Evil: 1".into(),
+            bytes: vec![1],
+        }];
+        assert!(onenote_multipart_body(b"<html></html>", &bad_type).is_err());
     }
 
     /// Live OneDrive delta against the test account. Skips unless
