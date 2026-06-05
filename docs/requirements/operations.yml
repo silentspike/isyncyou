@@ -1,0 +1,100 @@
+# Operational requirements.
+# Checked by tools/check_traceability.py.
+requirements:
+  - id: REQ-OPS-001
+    title: Standalone doctor reports local health without cloud access
+    statement: >
+      The standalone doctor must run without Microsoft Graph or the daemon, hard-fail
+      malformed or missing configuration, and report missing stores or cached login
+      tokens as warnings instead of corrupting state or requiring network access.
+      It must also surface plaintext token caches when no token-cache encryption
+      secret is available, and plaintext or key-missing SQLite store states when
+      store encryption is relevant.
+    status: implemented
+    acceptance:
+      - Missing configuration returns a failing report.
+      - Invalid sync/delete-guard configuration returns a failing report.
+      - A valid account with no store is a warning, not a failure.
+      - A missing cached login token is a warning.
+      - A plaintext cached login token is a warning, including when no token-cache secret is configured.
+      - An encrypted cached login token is ok only when a token-cache secret is available.
+      - A desktop-keyring marker cache is ok because the token secret is not stored on disk.
+      - A plaintext SQLite store is a warning when no store encryption key is configured.
+      - A non-plaintext store header is ok only when a store encryption key is available.
+      - Missing sibling install binaries are detected as an install warning.
+    verified_by:
+      - test: missing_config_is_fail
+      - test: invalid_config_is_fail
+      - test: healthy_config_with_missing_store_is_warn_not_fail
+      - test: missing_login_token_is_an_auth_warning
+      - test: plaintext_login_token_is_an_auth_warning_without_secret
+      - test: encrypted_login_token_with_secret_is_ok
+      - test: keyring_login_token_marker_is_ok_without_plaintext_secret
+      - test: plaintext_store_is_a_warning_until_sqlcipher_keyed
+      - test: non_plaintext_store_is_ok_only_when_store_key_is_available
+      - test: check_install_present_vs_missing
+
+  - id: REQ-OPS-002
+    title: Shared IPC status payloads are stable serde wire types
+    statement: >
+      Engine, CLI, web UI, and native status surfaces must share serializable status
+      payloads instead of ad-hoc per-process strings for service, job, health, and
+      transfer state.
+    status: implemented
+    acceptance:
+      - Service names serialize to the product's canonical lowercase wire names.
+      - Job and transfer statuses serialize as snake_case wire values.
+      - A transfer snapshot round-trips through JSON without losing fields.
+    verified_by:
+      - test: ipc_status_wire_roundtrip
+
+  - id: REQ-OPS-003
+    title: Release artifacts include SBOM and signed provenance
+    statement: >
+      The release workflow must produce a machine-readable SBOM from the locked
+      Cargo dependency graph and request signed artifact attestations for the
+      release archives, AppImage, Windows zip, SBOM, and checksum file.
+    status: implemented
+    acceptance:
+      - A repository tool generates a CycloneDX JSON SBOM from cargo metadata with --locked.
+      - The release workflow uploads the SBOM and top-level SHA256SUMS with the release artifacts.
+      - The release workflow grants id-token and attestations permissions needed for GitHub artifact attestations.
+      - The release workflow requests provenance attestations for built artifacts and an SBOM attestation.
+    verified_by:
+      - file: tools/generate_sbom.py
+      - file: .github/workflows/release.yml
+
+  - id: REQ-OPS-004
+    title: GitHub workflow actions are immutable-pinned
+    statement: >
+      Every external GitHub Actions workflow dependency must be pinned to an
+      immutable 40-character commit SHA instead of a moving branch or version tag.
+      Local repository actions may use local relative paths.
+    status: implemented
+    acceptance:
+      - All external `uses:` references in `.github/workflows/*.yml` use 40-character commit SHAs.
+      - Moving major tags, version tags, and branch refs are rejected by a repository check.
+      - Local relative actions are allowed because they are versioned with the repository commit.
+    verified_by:
+      - file: tools/check_workflow_pins.py
+      - file: .github/workflows/release.yml
+      - file: .github/workflows/pr-main.yml
+      - file: .github/workflows/pr-staging.yml
+
+  - id: REQ-OPS-005
+    title: PBS snapshots restore only into temporary stores
+    statement: >
+      PBS backup must stage a consistent SQLite snapshot plus manifest, upload it
+      through `proxmox-backup-client`, and restore snapshots only into a
+      caller-provided temporary/import directory. A PBS restore must never write
+      directly into the live archive root or live store path.
+    status: implemented
+    acceptance:
+      - pbs-backup stages `store.db` with SQLite `VACUUM INTO` and writes a manifest before upload.
+      - pbs-restore restores `data.pxar` into `--into` and never points at `archive_root`.
+      - PBS credentials are read from `password_file` and passed through child-process environment, not command-line arguments.
+      - A live probe can round-trip against a configured PBS repository and clean up the test snapshot.
+    verified_by:
+      - file: bin/cli/src/main.rs
+      - file: crates/pbs/src/lib.rs
+      - file: tools/live_pbs_roundtrip.py

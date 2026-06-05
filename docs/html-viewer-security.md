@@ -52,26 +52,32 @@ configures it to:
 
 - drop `<script>`, event-handler attributes, `<iframe>`/`<object>`/`<style>` and
   other dangerous elements (ammonia's allowlist default), and
-- restrict URL schemes to `cid:` / `data:` / `mailto:` only — so remote image
-  `src` (tracking pixels), `javascript:` links and remote stylesheets are stripped;
-  links keep their text and gain `rel="noopener noreferrer nofollow"`.
+- map matching archived `cid:` MIME image parts (`image/png`, `image/jpeg`,
+  `image/gif`, `image/webp`, capped at 512 KiB each) to `data:` URLs before
+  sanitization, rewrite external `http(s)` anchors to the local
+  `/api/v1/open-external?url=...` confirmation page, and then restrict surviving
+  URL schemes to `data:` / `mailto:` plus that local dialog URL — so unresolved
+  `cid:` references, remote image `src` (tracking pixels), `javascript:` links
+  and remote stylesheets are stripped; links keep their text and gain
+  `rel="noopener noreferrer nofollow"`.
 
 The mail page is served with [`MAIL_CSP`] (`default-src 'none'; img-src data:; …`)
 as header + `<meta>`, so even a slipped-past remote URL cannot fetch. The HTML
-part is extracted from the archived `.eml` by `connectors::extract_html` (MIME
-walk, transfer-decoding); a plain-text-only mail falls back to escaped source.
+part and safe inline images are extracted from the archived `.eml` by
+`connectors::extract_html_with_inline_images` (MIME walk, transfer-decoding);
+a plain-text-only mail falls back to escaped source. SVG inline images are
+deliberately not replayed as safe data images.
 
-### Still open
-
-`cid:` inline images are not yet resolved to their MIME parts (they render as
-broken images); a safe external-link **open dialog** (plan §13) is not built — for
-now external links are neutralized to plain text.
+External links never open automatically. A clicked archived-mail link first shows
+a CSP-locked local confirmation page that displays the escaped target and accepts
+only `http://` or `https://` URLs; unsafe schemes such as `javascript:` are
+rejected with `400`.
 
 ## Tests
 
 `gui/webui/src/view.rs` unit tests cover escaping of markup/quotes, each renderer
-(event/contact/task/page/generic), the source-page cap on a char boundary, and
-the embedded CSP meta. A router integration test
-(`view_renders_safe_html_with_csp_and_escapes_untrusted_values`) feeds a
-`<script>`-payload subject and asserts it is escaped (not live) and that the
-strict CSP **header** is present.
+(event/contact/task/page/generic), the source-page cap on a char boundary, the
+embedded CSP meta, safe `cid:` mapping, and external-link rewriting. Router
+integration tests feed a `<script>`-payload subject and assert it is escaped (not
+live), that the strict CSP **header** is present, and that
+`/api/v1/open-external` accepts only safe `http(s)` targets.

@@ -19,14 +19,14 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Mitigation** | (a) Cloud-mutating restore is **off by default** (`restore.cloud_restore_enabled = false`), enforced at the engine entry point before any store or network access. (b) The crash-safe design — operation ledger, explicit state machine, content-derived `HMAC-SHA256` idempotency key, reconcile-on-recovery, crash-injection matrix — is implemented and, for **mail**, now **wired into the live `restore_cloud` path with recovery on daemon boot**; it is proven against a non-idempotent fake cloud. The other services are **refused** (no direct, non-crash-safe POST) until each is ledger-migrated (tracked in `docs/requirements/restore.yml`). (c) Local-file restore is unaffected and always available. |
 | **Status** | **Mitigated for mail** — gate + ledger + daemon recovery in place and proven in isolation; the marker probe is **live-confirmed** against the test account (`tools/live_restore_probe.py`: Graph preserves a posted `Message-ID` and the `internetMessageId` `$filter` finds it). Cloud restore stays **off by default** as a deliberate opt-in for a destructive operation. Other services' ledger migration is tracked in `docs/requirements/restore.yml`. Design: [ADR-001](../adr/001-restore-semantics.md). |
 
-## R2 — Data at rest is unencrypted
+## R2 — Data at rest can fall back to plaintext
 
 | | |
 |---|---|
-| **Risk** | The SQLite store (metadata, mail-body index) and cached OAuth tokens live in plaintext on disk, protected only by file permissions. |
+| **Risk** | The SQLite store (metadata, mail-body index) and cached OAuth tokens may live in plaintext on disk when the operator does not configure the keyring or credential-backed encryption paths. |
 | **Impact** | Medium–High — a local attacker or a backup of the home directory exposes tokens and indexed content. |
-| **Mitigation** | Tokens are kept out of logs; the storage layer is designed as a pluggable backend so an `encrypted` backend can replace `plain` without touching callers. Documented in the README and SECURITY.md so no user is misled. |
-| **Status** | **Accepted (temporary)** — explicitly disclosed; do not point iSyncYou at sensitive data on a shared machine yet. At-rest encryption is queued, not shipped. |
+| **Mitigation** | Tokens are kept out of logs; `isyncyou login --keyring` stores token JSON in the desktop Secret Service / KDE Wallet compatible keyring and leaves only a non-secret marker file on disk; file-cache writes are owner-only on Unix (`0600`) and can be AES-256-GCM encrypted when a token-cache secret is supplied via `ISYNCYOU_TOKEN_CACHE_KEY_FILE`, systemd credential `isyncyou-token-cache-key`, or `ISYNCYOU_TOKEN_CACHE_KEY`. SQLite stores can be SQLCipher-encrypted by supplying `ISYNCYOU_STORE_KEY_FILE`, systemd credential `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY`; encrypted stores and their `VACUUM INTO` snapshots fail closed without the correct key. Documented in the README and SECURITY.md so no user is misled. |
+| **Status** | **In progress** — desktop-keyring token storage, credential-backed token-cache encryption, and SQLCipher store encryption are implemented and tested, but plaintext fallback remains when no keyring/secret is configured and existing plaintext stores still require migration/recreation. Do not point plaintext stores at sensitive data on a shared machine. |
 
 ## R3 — Mass deletion from a desynced cursor
 
@@ -52,7 +52,7 @@ README's [Known limitations](../../README.md#known-limitations).
 |---|---|
 | **Risk** | Archived mail can contain hostile HTML, tracking pixels, and active content; rendering it could leak that the message was opened or execute script. |
 | **Impact** | Medium. |
-| **Mitigation** | The mail viewer sanitizes HTML, runs **no JavaScript**, blocks external resource loads (tracking pixels), maps `cid:` references locally, and never auto-opens links or attachments. |
+| **Mitigation** | The mail viewer sanitizes HTML, runs **no JavaScript**, blocks external resource loads (tracking pixels), maps `cid:` references locally, and never auto-opens links or attachments. External `http(s)` links are rewritten to a CSP-locked local confirmation page before the browser can leave the viewer. |
 | **Status** | **Mitigated** — see `docs/html-viewer-security.md`. |
 
 ## R6 — Local API exposure
@@ -61,8 +61,8 @@ README's [Known limitations](../../README.md#known-limitations).
 |---|---|
 | **Risk** | The daemon serves a local API/web UI; if reachable beyond the intended boundary it could allow unauthorized control or destructive actions. |
 | **Impact** | Medium–High. |
-| **Mitigation** | Unix-socket by default (file-permission scoped); HTTP is opt-in only and, when enabled, uses TLS + capability tokens + CSRF protection with no destructive `GET`s; remote access requires pairing/mTLS. |
-| **Status** | **Mitigated** by design — see `docs/local-api-security.md`. |
+| **Mitigation** | TCP binds are loopback-only at runtime (`serve()` rejects `0.0.0.0`, `[::]`, LAN addresses, and arbitrary hostnames before opening a listener); the optional Unix-domain socket is owner-only (`0600`); destructive operations are `POST` only and require action-scoped `X-Capability-Token` values (restore and scheduled-sync control are separate); restore POSTs append durable per-account audit entries before and after the handler runs; the TCP adapter rejects non-loopback `Host` and non-local `Origin` before routing. Remote access, mTLS/pairing, token rotation, and delete/config audit hooks are not shipped. |
+| **Status** | **In progress** — mitigated for local desktop loopback/Unix-socket use; remote/admin exposure hardening remains open. See `docs/local-api-security.md`. |
 
 ## R7 — Supply chain (dependencies)
 
@@ -70,8 +70,8 @@ README's [Known limitations](../../README.md#known-limitations).
 |---|---|
 | **Risk** | A compromised or vulnerable crate could ship in a release. |
 | **Impact** | Medium–High. |
-| **Mitigation** | `cargo deny` runs in the gate (advisories + licenses + bans); Dependabot tracks updates. Reproducible build-once-promote with SBOM and signed artifacts is being stood up. |
-| **Status** | **In progress** — `cargo deny` + Dependabot are active; SBOM/signing are queued. |
+| **Mitigation** | `cargo deny` runs in the gate (advisories + licenses + bans); Dependabot tracks updates. The release workflow generates a CycloneDX SBOM from the locked Cargo graph and requests GitHub artifact attestations for the release archives, AppImage, Windows zip, SBOM, and checksum file. |
+| **Status** | **In progress** — `cargo deny`, Dependabot, SBOM generation, and signed GitHub artifact attestations are wired; deployed staging/full live-E2E evidence is still open. |
 
 ---
 

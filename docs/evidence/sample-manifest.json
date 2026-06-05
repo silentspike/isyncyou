@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-06-05T08:00:00Z",
-  "commit": "0e3cbd7116d08fb13606303c4899127422eab2ad",
+  "generated_at": "2026-06-05T15:44:28Z",
+  "commit": "6d3f021cb60a286ffbec5d89e56bff8e5daa36fd",
   "entries": [
     {
       "id": "EV-001",
@@ -81,7 +81,7 @@
       "command": "cargo test -p isyncyou-engine crash_after_post_landed_does_not_duplicate",
       "result": "pass",
       "evidence": "test mail_restore::tests::crash_after_post_landed_does_not_duplicate ... ok",
-      "notes": "Live confirmation that Graph returns a posted Message-ID via an internetMessageId $filter is still pending a write token; cloud_restore_enabled stays false until then.",
+      "notes": "Live marker-probe confirmation is recorded in EV-010; cloud_restore_enabled stays false by default as a deliberate destructive-operation opt-in.",
       "test": "crash_after_post_landed_does_not_duplicate"
     },
     {
@@ -113,6 +113,206 @@
       "result": "pass",
       "evidence": "test tests::restore_cloud_refuses_non_mail_until_ledger_migrated ... ok",
       "test": "restore_cloud_refuses_non_mail_until_ledger_migrated"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-RST-007",
+      "claim": "Restore OAuth scopes request delegated Notes.ReadWrite and never the admin-only Notes.ReadWrite.All scope.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_scopes_use_delegated_onenote_write_scope",
+      "result": "pass",
+      "evidence": "test tests::restore_scopes_use_delegated_onenote_write_scope ... ok",
+      "test": "restore_scopes_use_delegated_onenote_write_scope"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-SEC-001",
+      "claim": "The local API defaults to an owner-only Unix socket on Unix, while opt-in TCP rejects non-loopback Host and non-local Origin before routing.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-cli parses_serve_defaults_to_unix_socket_transport && cargo test -p isyncyou-cli parses_serve_tcp_opt_in && cargo test -p isyncyou-daemon parses_defaults && cargo test -p isyncyou-webui tcp_rejects_non_loopback_host_and_origin",
+      "result": "pass",
+      "evidence": "test tests::parses_serve_defaults_to_unix_socket_transport ... ok; test tests::parses_serve_tcp_opt_in ... ok; test tests::parses_defaults ... ok; test serve::tests::tcp_rejects_non_loopback_host_and_origin ... ok",
+      "test": "tcp_rejects_non_loopback_host_and_origin"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-OPS-001",
+      "claim": "The standalone doctor hard-fails missing config, treats missing local store/auth cache as warnings, reports plaintext token caches unless protection is configured, and accepts keyring marker caches.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-doctor-lib",
+      "result": "pass",
+      "evidence": "test tests::missing_config_is_fail ... ok; test tests::healthy_config_with_missing_store_is_warn_not_fail ... ok; test tests::missing_login_token_is_an_auth_warning ... ok; test tests::plaintext_login_token_is_an_auth_warning_without_secret ... ok; test tests::encrypted_login_token_with_secret_is_ok ... ok; test tests::keyring_login_token_marker_is_ok_without_plaintext_secret ... ok",
+      "test": "missing_config_is_fail"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-SYNC-001",
+      "claim": "Path mapping dedupes Unicode-composed and Unicode-decomposed sibling names instead of creating an ambiguous cloud collision.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-pathmap unicode_normalized_cloud_collisions_are_deduped",
+      "result": "pass",
+      "evidence": "test tests::unicode_normalized_cloud_collisions_are_deduped ... ok",
+      "test": "unicode_normalized_cloud_collisions_are_deduped"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-OPS-002",
+      "claim": "Shared IPC transfer/status payloads serialize with canonical service/status wire names and round-trip through JSON.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-ipc-types ipc_status_wire_roundtrip",
+      "result": "pass",
+      "evidence": "test tests::ipc_status_wire_roundtrip ... ok",
+      "test": "ipc_status_wire_roundtrip"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-SEC-002",
+      "claim": "TokenCache::save tightens a Unix token-cache file to owner-only mode while preserving loadability.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-graph token_cache_save_is_owner_only_on_unix",
+      "result": "pass",
+      "evidence": "test auth::tests::token_cache_save_is_owner_only_on_unix ... ok",
+      "test": "token_cache_save_is_owner_only_on_unix"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-SEC-003",
+      "claim": "The sanitized mail viewer embeds matching safe cid images as data URLs and strips unresolved cid/remote resources.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-webui mail_page_maps_cid_images_to_data_urls && cargo test -p isyncyou-webui sanitize_strips_scripts_and_blocks_remote_resources && cargo test -p isyncyou-connectors extract_html_with_inline_images_collects_safe_cid_parts",
+      "result": "pass",
+      "evidence": "test view::tests::mail_page_maps_cid_images_to_data_urls ... ok; test view::tests::sanitize_strips_scripts_and_blocks_remote_resources ... ok; test mime::tests::extract_html_with_inline_images_collects_safe_cid_parts ... ok",
+      "test": "mail_page_maps_cid_images_to_data_urls"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-SEC-004",
+      "claim": "Archived-mail external http(s) links are rewritten to a local confirmation page, unsafe schemes are rejected, and the dialog is CSP-locked.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-webui mail_page_rewrites_external_links_to_confirm_dialog && cargo test -p isyncyou-webui external_link_dialog_page_requires_safe_http_url && cargo test -p isyncyou-webui open_external_confirms_only_safe_http_urls",
+      "result": "pass",
+      "evidence": "test view::tests::mail_page_rewrites_external_links_to_confirm_dialog ... ok; test view::tests::external_link_dialog_page_requires_safe_http_url ... ok; test tests::open_external_confirms_only_safe_http_urls ... ok",
+      "test": "open_external_confirms_only_safe_http_urls"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-RST-008",
+      "claim": "Personal-account contact restore keeps writable contact fields but strips photo objects and photo sidecar metadata instead of attempting an unsupported contact-photo upload.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-connectors sanitize_contact_drops_photo_fields_for_personal_account_restore",
+      "result": "pass",
+      "evidence": "test restore::tests::sanitize_contact_drops_photo_fields_for_personal_account_restore ... ok",
+      "test": "sanitize_contact_drops_photo_fields_for_personal_account_restore"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-SYNC-011",
+      "claim": "OneNote page resource URLs from archived HTML are allowlisted, fetched to on-disk resource files, and mapped by a per-page manifest while non-OneNote remote URLs are ignored.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-connectors onenote_archives_resource_manifest_from_page_html",
+      "result": "pass",
+      "evidence": "test archive::tests::onenote_archives_resource_manifest_from_page_html ... ok",
+      "test": "onenote_archives_resource_manifest_from_page_html"
+    },
+    {
+      "id": "EV-022",
+      "requirement": "REQ-SEC-005",
+      "claim": "Capability-token-authorized restore POSTs write durable started/result audit entries without logging the capability token.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-webui restore_post_writes_a_durable_audit_log && cargo test -p isyncyou-webui restore_post_audits_handler_errors",
+      "result": "pass",
+      "evidence": "test tests::restore_post_writes_a_durable_audit_log ... ok; test tests::restore_post_audits_handler_errors ... ok",
+      "test": "restore_post_writes_a_durable_audit_log"
+    },
+    {
+      "id": "EV-023",
+      "requirement": "REQ-RST-009",
+      "claim": "OneNote resource-bearing restore uses a multipart Presentation plus binary data-part payload, while plain pages keep the text/html path.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-connectors restore_page_with_resources_uses_multipart_parts && cargo test -p isyncyou-connectors restore_page_uses_plain_html_when_no_resources && cargo test -p isyncyou-graph --features http onenote_multipart_body_uses_presentation_and_binary_parts && cargo test -p isyncyou-graph --features http onenote_multipart_body_rejects_header_injection",
+      "result": "pass",
+      "evidence": "test restore::tests::restore_page_with_resources_uses_multipart_parts ... ok; test restore::tests::restore_page_uses_plain_html_when_no_resources ... ok; test http::tests::onenote_multipart_body_uses_presentation_and_binary_parts ... ok; test http::tests::onenote_multipart_body_rejects_header_injection ... ok",
+      "test": "restore_page_with_resources_uses_multipart_parts"
+    },
+    {
+      "id": "EV-024",
+      "requirement": "REQ-SEC-006",
+      "claim": "Restore and scheduled-sync web UI POSTs use separate injected capability tokens, and cross-token attempts are rejected.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-webui destructive_capability_tokens_are_action_scoped && cargo test -p isyncyou-webui index_injects_separate_capability_tokens_when_enabled",
+      "result": "pass",
+      "evidence": "test tests::destructive_capability_tokens_are_action_scoped ... ok; test tests::index_injects_separate_capability_tokens_when_enabled ... ok",
+      "test": "destructive_capability_tokens_are_action_scoped"
+    },
+    {
+      "id": "EV-025",
+      "requirement": "REQ-SEC-007",
+      "claim": "The TCP local API refuses wildcard, LAN, and arbitrary-host bind addresses before opening a listener, while preserving loopback binds.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-webui tcp_bind_address_must_be_loopback && cargo test -p isyncyou-webui serve_refuses_non_loopback_bind_address",
+      "result": "pass",
+      "evidence": "test serve::tests::tcp_bind_address_must_be_loopback ... ok; test serve::tests::serve_refuses_non_loopback_bind_address ... ok",
+      "test": "serve_refuses_non_loopback_bind_address"
+    },
+    {
+      "id": "EV-026",
+      "requirement": "REQ-SEC-008",
+      "claim": "Credential-backed token-cache encryption writes an authenticated envelope that hides token strings, round-trips with the right secret, and rejects the wrong secret.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-graph token_cache_encrypted_roundtrip_hides_plaintext && cargo test -p isyncyou-graph token_cache_encrypted_roundtrip_rejects_wrong_secret && cargo test -p isyncyou-graph token_cache_secret_file_is_trimmed_and_nonempty",
+      "result": "pass",
+      "evidence": "test auth::tests::token_cache_encrypted_roundtrip_hides_plaintext ... ok; test auth::tests::token_cache_encrypted_roundtrip_rejects_wrong_secret ... ok; test auth::tests::token_cache_secret_file_is_trimmed_and_nonempty ... ok",
+      "test": "token_cache_encrypted_roundtrip_hides_plaintext"
+    },
+    {
+      "id": "EV-027",
+      "requirement": "REQ-SEC-009",
+      "claim": "Desktop keyring login stores token JSON behind a Secret Service / KDE Wallet compatible keyring entry, leaves only a marker file on disk, and refresh saves preserve the keyring backend.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-graph --features desktop-keyring token_cache_keyring_roundtrip_writes_marker_only && cargo test -p isyncyou-graph --features desktop-keyring token_cache_save_preserves_existing_keyring_backend && cargo test -p isyncyou-cli parses_login",
+      "result": "pass",
+      "evidence": "test auth::tests::token_cache_keyring_roundtrip_writes_marker_only ... ok; test auth::tests::token_cache_save_preserves_existing_keyring_backend ... ok; test tests::parses_login ... ok",
+      "test": "token_cache_keyring_roundtrip_writes_marker_only"
+    },
+    {
+      "id": "EV-028",
+      "requirement": "REQ-SEC-010",
+      "claim": "SQLCipher-backed store encryption hides item metadata and body-index text, fails closed without the right key, and keeps VACUUM/PBS snapshots encrypted.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-store encrypted_store_hides_plaintext_and_requires_key && cargo test -p isyncyou-store encrypted_backup_to_keeps_snapshot_encrypted && cargo test -p isyncyou-store store_secret_file_is_trimmed_and_nonempty",
+      "result": "pass",
+      "evidence": "test tests::encrypted_store_hides_plaintext_and_requires_key ... ok; test tests::encrypted_backup_to_keeps_snapshot_encrypted ... ok; test tests::store_secret_file_is_trimmed_and_nonempty ... ok",
+      "test": "encrypted_store_hides_plaintext_and_requires_key"
+    },
+    {
+      "id": "EV-029",
+      "requirement": "REQ-OPS-003",
+      "claim": "The release path can generate a CycloneDX SBOM from the locked Cargo graph and the release workflow uploads/attests the SBOM and release artifacts.",
+      "method": "command",
+      "command": "python3 tools/generate_sbom.py --output /tmp/isyncyou.sbom.json && python3 -m json.tool /tmp/isyncyou.sbom.json >/dev/null",
+      "result": "pass",
+      "evidence": "wrote /tmp/isyncyou.sbom.json (507 components); CycloneDX 1.5 507 isyncyou-workspace",
+      "artifact": "tools/generate_sbom.py"
+    },
+    {
+      "id": "EV-030",
+      "requirement": "REQ-OPS-004",
+      "claim": "All external GitHub Actions workflow dependencies are pinned to immutable 40-character commit SHAs.",
+      "method": "command",
+      "command": "python3 tools/check_workflow_pins.py",
+      "result": "pass",
+      "evidence": "workflow action pins: 55 action refs checked | 12 workflow file(s); OK - every external workflow action is pinned to a commit SHA.",
+      "artifact": "tools/check_workflow_pins.py"
+    },
+    {
+      "id": "EV-031",
+      "requirement": "REQ-OPS-005",
+      "claim": "Live: PBS backup creates a real snapshot, PBS restore imports it into a temporary directory, the restored manifest/store are readable, and the test snapshot is forgotten.",
+      "method": "probe",
+      "command": "ISYNCYOU_PBS_REPOSITORY='backup@pbs!<temp-token>@10.0.0.151:hdd-backup' ISYNCYOU_PBS_PASSWORD_FILE=<0600 temp file> ISYNCYOU_PBS_FINGERPRINT='E0:51:FA:77:74:A0:D8:9E:A3:BF:43:B8:C8:3A:B1:EF:63:22:EF:B8:01:FE:5D:D4:14:63:F6:F6:58:16:04:E2' python3 tools/live_pbs_roundtrip.py",
+      "result": "pass",
+      "evidence": "backup_snapshot=host/isyncyou-primary/2026-06-05T15:46:31Z; restore_manifest_account=primary; restore_manifest_schema_version=4; restore_store_user_version=4; restore_store_table_count=15; cleanup_snapshot_remaining=0; VERDICT PBS ROUNDTRIP YES; temporary token deleted after probe.",
+      "artifact": "tools/live_pbs_roundtrip.py"
     }
   ]
 }
