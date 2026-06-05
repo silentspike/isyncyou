@@ -167,7 +167,7 @@ pub mod auth {
     }
 
     /// Full write scopes needed to **restore** items across services (re-create
-    /// mail/events/contacts/tasks). A superset of [`SYNC_SCOPES`].
+    /// mail/events/contacts/tasks/OneNote pages). A superset of [`SYNC_SCOPES`].
     pub const RESTORE_SCOPES: &[&str] = &[
         "Files.ReadWrite",
         "Mail.ReadWrite",
@@ -175,6 +175,7 @@ pub mod auth {
         "Calendars.ReadWrite",
         "Contacts.ReadWrite",
         "Tasks.ReadWrite",
+        "Notes.ReadWrite",
         "offline_access",
     ];
 
@@ -513,6 +514,18 @@ mod tests {
         }
         assert!(!cloud_restore_service_supported("calendar"));
         assert!(cloud_restore_service_supported("mail"));
+    }
+
+    #[test]
+    fn restore_scopes_use_delegated_onenote_write_scope() {
+        assert!(
+            auth::RESTORE_SCOPES.contains(&"Notes.ReadWrite"),
+            "OneNote restore must request delegated Notes.ReadWrite, not the admin-only .All scope"
+        );
+        assert!(
+            !auth::RESTORE_SCOPES.contains(&"Notes.ReadWrite.All"),
+            "Personal/Family accounts cannot grant Notes.ReadWrite.All"
+        );
     }
 
     #[test]
