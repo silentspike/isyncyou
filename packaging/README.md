@@ -34,7 +34,8 @@ isyncyou check --config isyncyou.toml
 ```sh
 isyncyou backup --account primary    # index + archive mail/calendar/contacts/todo/onenote
 isyncyou search --account primary --query invoice
-isyncyou serve                        # open the printed URL in your browser
+isyncyou serve                        # local API on the default owner-only Unix socket
+isyncyou serve --tcp                  # optional browser/TCP transport, loopback-only
 ```
 
 Until interactive OAuth login lands, a Graph access token is supplied via
@@ -50,7 +51,9 @@ install -Dm644 isyncyoud.service ~/.config/systemd/user/isyncyoud.service
 systemctl --user daemon-reload && systemctl --user enable --now isyncyoud
 ```
 
-The web UI is then served on <http://127.0.0.1:8765/>.
+The local API is then served on `$XDG_RUNTIME_DIR/isyncyou.sock`. Add
+`--tcp --bind 127.0.0.1:8765` to the service only when a browser/TCP transport is
+explicitly needed.
 
 ## Verify checksums
 
