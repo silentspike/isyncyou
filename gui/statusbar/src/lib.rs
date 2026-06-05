@@ -288,35 +288,35 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
             col(0x15, 0x7f, 0x4e),
             col(0x22, 0xc5, 0x5e),
             col(0x4a, 0xde, 0x80),
-            "Synchronisiert".to_string(),
+            "Synced".to_string(),
         ),
         SyncState::Syncing => (
             col(0x10, 0x24, 0x40),
             col(0x1d, 0x4e, 0xd8),
             col(0x38, 0xbd, 0xf8),
             col(0x8e, 0xc6, 0xff),
-            "Synchronisiert\u{2026}".to_string(),
+            "Syncing\u{2026}".to_string(),
         ),
         SyncState::Throttled { wait_secs } => (
             col(0x44, 0x22, 0x06),
             col(0xa1, 0x62, 0x07),
             col(0xf5, 0x9e, 0x0b),
             col(0xfb, 0xbf, 0x24),
-            format!("Gedrosselt {wait_secs}s"),
+            format!("Throttled {wait_secs}s"),
         ),
         SyncState::Paused => (
             col(0x2a, 0x2a, 0x2a),
             col(0x55, 0x55, 0x55),
             col(0x99, 0x99, 0x99),
             col(0xcc, 0xcc, 0xcc),
-            "Pausiert".to_string(),
+            "Paused".to_string(),
         ),
         SyncState::Error { .. } => (
             col(0x45, 0x0a, 0x0a),
             col(0xb9, 0x1c, 0x1c),
             col(0xef, 0x44, 0x44),
             col(0xfc, 0xa5, 0xa5),
-            "Fehler".to_string(),
+            "Error".to_string(),
         ),
     };
     fill_rrect(&mut pm, pill_x, 16.0, pill_w, 28.0, 14.0, pill_bg);
@@ -340,12 +340,12 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
     // prominent reason banner — only for states the user must understand at a
     // glance, so they never suspect the tool or their connection (plan §13/§25).
     let banner: Option<(Color, Color, String)> = match &view.state {
-        // the wait time is already on the pill ("Gedrosselt Ns"); the banner's job
+        // the wait time is already on the pill ("Throttled Ns"); the banner's job
         // is reassurance — keep it short enough to never clip the strip.
         SyncState::Throttled { .. } => Some((
             col(0x44, 0x22, 0x06),
             col(0xfb, 0xbf, 0x24),
-            "\u{26a0} Von Microsoft gedrosselt (429) \u{2014} nicht deine Leitung".to_string(),
+            "\u{26a0} Throttled by Microsoft (429) \u{2014} not your connection".to_string(),
         )),
         SyncState::Error { reason } => Some((
             col(0x45, 0x0a, 0x0a),
@@ -444,7 +444,7 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
     // action buttons — Pause/Resume + open the full UI. Their rects live in
     // PAUSE_BTN / BROWSER_BTN so hit_test always matches what's drawn here.
     let pause_label = if matches!(view.state, SyncState::Paused) {
-        "Fortsetzen"
+        "Resume"
     } else {
         "Pause"
     };
@@ -484,7 +484,7 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
         BROWSER_BTN.1 + 9.0,
         13.0,
         col(0xff, 0xff, 0xff),
-        "Im Browser \u{00f6}ffnen",
+        "Open in browser",
     );
 
     // footer hint
@@ -504,7 +504,7 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
         HEIGHT as f32 - 28.0,
         11.0,
         col(0x6b, 0x7a, 0x8e),
-        "Restore, Mail & Suche \u{2192} im Browser",
+        "Restore, mail & search \u{2192} in browser",
     );
     pm
 }
