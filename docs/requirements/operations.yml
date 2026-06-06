@@ -98,3 +98,28 @@ requirements:
       - file: bin/cli/src/main.rs
       - file: crates/pbs/src/lib.rs
       - file: tools/live_pbs_roundtrip.py
+
+  - id: REQ-OPS-006
+    title: Evidence can be produced bound to the current commit with captured output
+    statement: >
+      Beyond the curated evidence manifest, the project must be able to generate a
+      manifest that is bound to the exact tree it ran against (its `commit` equals the
+      current Git HEAD) and that carries freshly captured, machine-readable command
+      output for each runnable entry — so an audit artifact is provably current, not a
+      hand-maintained snapshot. Live `probe` entries (which need credentials) are
+      carried over honestly rather than fabricated.
+    rationale: >
+      A hand-curated manifest can drift from the code. A HEAD-pinned generated manifest,
+      validated by check_evidence.py --require-head, closes that gap and is uploadable as
+      a CI artifact (the curated manifest stays the committed source of truth).
+    status: implemented
+    acceptance:
+      - The generator stamps commit = current HEAD and a generated_at timestamp.
+      - For test/command/example entries it runs the command and captures real output, with result set from the exit code.
+      - Live probe entries are carried over with a marker, not re-fabricated.
+      - check_evidence.py --require-head accepts the generated manifest (commit == HEAD).
+      - An optional CI workflow produces and uploads the manifest.
+    verified_by:
+      - file: tools/generate_evidence_manifest.py
+      - file: tools/check_evidence.py
+      - file: .github/workflows/evidence-manifest.yml

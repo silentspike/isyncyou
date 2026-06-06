@@ -47,6 +47,45 @@ pub fn mail_marker(key: &str) -> String {
     format!("<isyncyou-{key}@restore.invalid>")
 }
 
+/// A calendar marker derived from the key: a Microsoft Graph **transactionId** for
+/// `POST /me/events`. Graph uses it for server-side de-duplication — a retry with the
+/// same value returns the existing event instead of creating a second one (confirmed
+/// live in `tools/live_calendar_probe.py`), so calendar crash recovery re-POSTs and
+/// relies on that de-dup. Graph does **not** support a `transactionId` `$filter` query
+/// (HTTP 400), so there is no probe. Kept well under Graph's 256-char transactionId
+/// limit.
+pub fn calendar_marker(key: &str) -> String {
+    format!("isyncyou-restore-{key}")
+}
+
+/// A findable contact marker derived from the key: the **value** stored in a
+/// single-value extended property on `POST /me/contacts`. Confirmed live
+/// (`tools/live_contacts_probe.py`) that Graph accepts the extended property and that
+/// `$filter` on `singleValueExtendedProperties/any(...)` finds it again — so contacts
+/// use the mail-shaped marker-probe model (unlike calendar).
+pub fn contact_marker(key: &str) -> String {
+    format!("isyncyou-restore-{key}")
+}
+
+/// A findable ToDo marker derived from the key: a string embedded in the restored
+/// task **body**. Microsoft To Do has no invisible marker — confirmed live
+/// (`tools/live_todo_probe.py`) that a todoTask rejects a `singleValueExtendedProperties`
+/// `$filter` (HTTP 400) but a body marker round-trips and is found by a LIST scan. So
+/// ToDo uses the weakest probe model (ledger + LIST-scan); the marker is visible in the
+/// restored task body (a documented fidelity trade-off).
+pub fn todo_marker(key: &str) -> String {
+    format!("isyncyou-restore-{key}")
+}
+
+/// A findable OneNote marker derived from the key: a token embedded as an **HTML
+/// comment** in the restored page body — invisible when rendered. Confirmed live
+/// (`tools/live_onenote_probe.py`) that the comment round-trips in the page `/content`
+/// and a LIST + per-page content scan finds it. So OneNote uses the ledger + a
+/// content-scan probe with an *invisible* marker (cleaner than ToDo's visible one).
+pub fn onenote_marker(key: &str) -> String {
+    format!("isyncyou-restore-{key}")
+}
+
 /// Load the per-install restore secret from `path`, creating it (32 random bytes,
 /// owner-only) if it does not exist. The secret is binary and never logged.
 pub fn load_or_create_secret(path: &Path) -> Result<Vec<u8>, String> {
@@ -138,6 +177,29 @@ mod tests {
         let m = mail_marker("deadbeef");
         assert!(m.starts_with("<isyncyou-deadbeef@"));
         assert!(m.ends_with(".invalid>"));
+    }
+
+    #[test]
+    fn calendar_marker_is_a_short_stable_transaction_id() {
+        let m = calendar_marker("deadbeef");
+        assert_eq!(m, "isyncyou-restore-deadbeef");
+        // A 64-hex key keeps the transactionId well under Graph's 256-char limit.
+        assert!(calendar_marker(&"a".repeat(64)).len() < 256);
+    }
+
+    #[test]
+    fn contact_marker_is_a_short_stable_value() {
+        assert_eq!(contact_marker("deadbeef"), "isyncyou-restore-deadbeef");
+    }
+
+    #[test]
+    fn todo_marker_is_a_short_stable_value() {
+        assert_eq!(todo_marker("deadbeef"), "isyncyou-restore-deadbeef");
+    }
+
+    #[test]
+    fn onenote_marker_is_a_short_stable_value() {
+        assert_eq!(onenote_marker("deadbeef"), "isyncyou-restore-deadbeef");
     }
 
     #[test]

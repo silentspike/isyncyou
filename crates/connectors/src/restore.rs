@@ -492,6 +492,7 @@ mod tests {
     /// Live round-trip: fetch one event, restore it, verify subject, delete copy.
     /// Needs `http` + `ISYNCYOU_TEST_WRITE_TOKEN` (`Calendars.ReadWrite`).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_restore_event_roundtrip() {
         let _gate = crate::live_test_gate();
@@ -553,6 +554,7 @@ mod tests {
     /// Live round-trip: fetch one task list + a task, restore into that list,
     /// verify the title, delete the copy. Needs `Tasks.ReadWrite`.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_restore_task_roundtrip() {
         let _gate = crate::live_test_gate();
@@ -621,6 +623,7 @@ mod tests {
     /// Live round-trip: create a synthetic contact (the account has none to
     /// fetch), verify it, delete it. Needs `Contacts.ReadWrite`.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_restore_contact_roundtrip() {
         let _gate = crate::live_test_gate();
@@ -667,6 +670,7 @@ mod tests {
     /// Live round-trip: re-create a mail message from synthetic MIME (lands in
     /// Drafts), verify the subject, delete it. Needs `Mail.ReadWrite`.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_restore_message_roundtrip() {
         let _gate = crate::live_test_gate();
@@ -716,6 +720,7 @@ This message was re-created from MIME by iSyncYou.\r\n";
     /// eventually consistent, so the cleanup delete is retried until it propagates
     /// (a successful delete confirms the page was created).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_restore_page_roundtrip() {
         let _gate = crate::live_test_gate();

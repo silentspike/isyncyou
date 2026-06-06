@@ -62,3 +62,30 @@ orchestrator decides when a `staging → main` promotion is ready and performs t
 The automated gates (build/lint/test, `cargo-deny`, requirements + evidence, secret
 scan, and the English-only `language-check`) are the objective bar every change must
 clear; the orchestrator is the human-in-the-loop judgement on top of them.
+
+### Merge strategy
+
+- **`feature → dev`: squash-merge** — one tidy commit per change on `dev`.
+- **`dev → staging` and `staging → main`: merge commits (not squash)** — promotions
+  carry the underlying commits forward so the three branches stay aligned (squashing a
+  promotion creates a sibling commit with new SHAs and makes the next promotion noisy).
+- **The orchestrator opens the promotion PRs.** The org currently does not allow GitHub
+  Actions to open PRs, so `promote.yml` is a best-effort helper only; opening the
+  `dev → staging` / `staging → main` PR is the orchestrator's deliberate gate. (Enable
+  the org "Allow GitHub Actions to create and approve pull requests" toggle for full
+  auto-promotion.)
+
+### Review policy (solo-merge is intentional)
+
+Branch protection on `dev`/`staging`/`main` sets `required_approving_review_count = 0`:
+a single maintainer may merge their own PR. This is **deliberate** for a
+single-maintainer repository — a human-approval requirement that only the same person
+can satisfy adds ceremony, not safety.
+
+The compensating control is the **automated required-checks gate**, which every PR must
+pass before it can merge and which a self-approval cannot bypass: build/lint/test
+(`dev-checks`/`staging-pass`/`main-pass`), `cargo-deny`, the requirements + evidence
+traceability check, the secret scan (Gitleaks), the Conventional-Commit title check, and
+the English-only `language-check`. `main` additionally has `enforce_admins` so even the
+maintainer cannot push past the gate. When the project gains additional maintainers, set
+`required_approving_review_count = 1` to require cross-review.
