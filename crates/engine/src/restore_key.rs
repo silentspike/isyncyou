@@ -77,6 +77,15 @@ pub fn todo_marker(key: &str) -> String {
     format!("isyncyou-restore-{key}")
 }
 
+/// A findable OneNote marker derived from the key: a token embedded as an **HTML
+/// comment** in the restored page body — invisible when rendered. Confirmed live
+/// (`tools/live_onenote_probe.py`) that the comment round-trips in the page `/content`
+/// and a LIST + per-page content scan finds it. So OneNote uses the ledger + a
+/// content-scan probe with an *invisible* marker (cleaner than ToDo's visible one).
+pub fn onenote_marker(key: &str) -> String {
+    format!("isyncyou-restore-{key}")
+}
+
 /// Load the per-install restore secret from `path`, creating it (32 random bytes,
 /// owner-only) if it does not exist. The secret is binary and never logged.
 pub fn load_or_create_secret(path: &Path) -> Result<Vec<u8>, String> {
@@ -186,6 +195,11 @@ mod tests {
     #[test]
     fn todo_marker_is_a_short_stable_value() {
         assert_eq!(todo_marker("deadbeef"), "isyncyou-restore-deadbeef");
+    }
+
+    #[test]
+    fn onenote_marker_is_a_short_stable_value() {
+        assert_eq!(onenote_marker("deadbeef"), "isyncyou-restore-deadbeef");
     }
 
     #[test]
