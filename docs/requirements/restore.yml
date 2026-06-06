@@ -97,12 +97,12 @@ requirements:
     statement: >
       Cloud-mutating restore for a service whose path is not yet crash-safe
       (ledger-backed) must be refused — never executed via a direct, non-crash-safe
-      POST. Mail, calendar and contacts qualify today; todo and onenote are refused.
+      POST. Mail, calendar, contacts and todo qualify today; only onenote is refused.
     rationale: A direct POST can duplicate the item on a mid-restore crash (ADR-001).
     status: implemented
     design: docs/adr/001-restore-semantics.md
     acceptance:
-      - The engine refuses a not-yet-ledger-backed cloud restore (todo/onenote)
+      - The engine refuses a not-yet-ledger-backed cloud restore (onenote)
         before any store/network access.
       - The CLI refuses before resolving a token.
       - The daemon web-UI handler refuses before resolving a token.
@@ -243,3 +243,45 @@ requirements:
       - test: boot_recovery_reconciles_a_pending_op_without_creating
       - test: happy_path_creates_one_and_is_idempotent_on_repeat
       - file: tools/live_contacts_probe.py
+
+  - id: REQ-RST-012
+    title: ToDo cloud restore is crash-safe (ledger-backed, body marker + LIST scan)
+    statement: >
+      Cloud-mutating ToDo restore must go through the operation ledger (ADR-001): it
+      embeds a marker derived from the content HMAC in the task body, records intent
+      before the POST, and on a re-entry after a crash reconciles by listing the parent
+      task list (all pages) and scanning task bodies for the marker — producing exactly
+      one task, never a duplicate.
+    rationale: >
+      ToDo is the fourth vertical migrated off the refusal list, using the weakest
+      probe. A live probe (tools/live_todo_probe.py) confirmed a todoTask has no
+      invisible marker: a singleValueExtendedProperties $filter is rejected (HTTP 400)
+      and there is no transactionId de-dup, but a body marker round-trips and a LIST
+      scan finds it. The marker is therefore visible in the restored task body — a
+      documented fidelity trade-off. cloud_restore_enabled stays off by default
+      (REQ-RST-001).
+    status: implemented
+    design: docs/adr/001-restore-semantics.md
+    note: >
+      The two Graph calls (create task / list+scan tasks) sit behind the ToDoApi trait
+      so the ledger wiring and recovery are proven against a non-idempotent fake; the
+      sink embeds the marker the recovery scan searches for, scoped to the task's parent
+      list (the archived item's parent_remote_id). The LIST scan follows @odata.nextLink
+      to the end — no silent cap. engine::restore_cloud routes todo to the ledger path
+      and the daemon recovers pending todo operations on boot with the shared write token.
+    acceptance:
+      - todo is in CLOUD_RESTORE_SERVICES and routed by engine::restore_cloud.
+      - The sink embeds the marker in the task body, keeping the original body.
+      - Crash after the POST landed yields exactly one task (found by the body-marker scan).
+      - Crash before the POST landed creates exactly one task on recovery.
+      - Boot recovery reconciles a pending todo op without creating a new task.
+      - A repeat of identical content returns the same id without a second create.
+      - Live: a todoTask body marker round-trips and a LIST scan finds it (probe).
+    verified_by:
+      - test: restore_cloud_routes_todo_past_the_support_gate
+      - test: create_embeds_marker_and_find_scans_for_it
+      - test: crash_after_post_landed_does_not_duplicate
+      - test: crash_before_post_landed_creates_exactly_one_on_recovery
+      - test: boot_recovery_reconciles_a_pending_op_without_creating
+      - test: happy_path_creates_one_and_is_idempotent_on_repeat
+      - file: tools/live_todo_probe.py

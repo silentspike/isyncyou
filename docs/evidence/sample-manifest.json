@@ -107,7 +107,7 @@
     {
       "id": "EV-011",
       "requirement": "REQ-RST-006",
-      "claim": "A not-yet-ledger-backed cloud restore (todo/onenote) is refused before any store access or token lookup, never run via a non-crash-safe direct POST.",
+      "claim": "A not-yet-ledger-backed cloud restore (onenote) is refused before any store access or token lookup, never run via a non-crash-safe direct POST.",
       "method": "test",
       "command": "cargo test -p isyncyou-engine restore_cloud_refuses_unmigrated_services_until_ledger_migrated",
       "result": "pass",
@@ -375,6 +375,37 @@
       "result": "pass",
       "evidence": "POST /me/contacts -> 201; GET $filter singleValueExtendedProperties -> 200, matches: 1; cleanup DELETE -> 204; VERDICT create accepts extended property: YES; $filter finds it: YES",
       "artifact": "tools/live_contacts_probe.py"
+    },
+    {
+      "id": "EV-038",
+      "requirement": "REQ-RST-012",
+      "claim": "ToDo restore is wired through the ledger (weakest probe): the sink embeds the marker in the task body keeping the original content, and recovery reconciles by a LIST scan of the parent list for that marker.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine create_embeds_marker_and_find_scans_for_it",
+      "result": "pass",
+      "evidence": "test restore_todo::tests::create_embeds_marker_and_find_scans_for_it ... ok",
+      "notes": "Crash-safety for todo is proven against a non-idempotent fake by the crash-matrix in restore_todo::tests (happy_path / crash_after_post_landed / crash_before_post_landed / boot_recovery_reconciles_a_pending_op_without_creating); EV-040 is the live confirmation. The body marker is a documented fidelity trade-off (restore-fidelity-matrix).",
+      "test": "create_embeds_marker_and_find_scans_for_it"
+    },
+    {
+      "id": "EV-039",
+      "requirement": "REQ-RST-012",
+      "claim": "engine::restore_cloud routes a todo restore past the crash-safety gate to the todo ledger path (it is not refused as unsupported), reaching the account lookup.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_cloud_routes_todo_past_the_support_gate",
+      "result": "pass",
+      "evidence": "test tests::restore_cloud_routes_todo_past_the_support_gate ... ok",
+      "test": "restore_cloud_routes_todo_past_the_support_gate"
+    },
+    {
+      "id": "EV-040",
+      "requirement": "REQ-RST-012",
+      "claim": "Live: a Microsoft To Do task body marker round-trips and a LIST scan finds the task again, while a singleValueExtendedProperties $filter on a todoTask is rejected (HTTP 400) — establishing the LIST-scan probe the todo crash recovery relies on.",
+      "method": "probe",
+      "command": "python3 tools/live_todo_probe.py",
+      "result": "pass",
+      "evidence": "POST task -> 201; H1 $filter extended property -> 400 (unsupported on todoTask); H3 LIST+scan body for marker -> 200 found: True; cleanup DELETE -> 204; DESIGN: ledger + LIST-scan marker probe",
+      "artifact": "tools/live_todo_probe.py"
     }
   ]
 }
