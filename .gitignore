@@ -45,3 +45,7 @@ llm-*.log
 # Python bytecode cache from the tooling under tools/ (e.g. check_language.py)
 __pycache__/
 *.pyc
+
+# Generated (HEAD-pinned) evidence manifest — produced by tools/generate_evidence_manifest.py
+# as a CI artifact; the curated docs/evidence/sample-manifest.json is the committed source.
+/docs/evidence/generated-manifest.json
