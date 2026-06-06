@@ -49,9 +49,10 @@ write." So the correctness has to come from the design:
   assert *no duplicate, no loss.*
 
 Because that surface is dangerous, **cloud restore ships disabled by default**
-(`cloud_restore_enabled = false`). The mail path is now ledger-backed and
-crash-matrix proven; the other services' cloud-mutating paths are refused until
-each is migrated to the same ledger model. That is the central piece of
+(`cloud_restore_enabled = false`). All five backup services (mail, calendar,
+contacts, ToDo, OneNote) are now ledger-backed and crash-matrix proven, each with a
+live-probe-confirmed crash-recovery marker; a service with no crash-safe path is
+refused rather than run unsafely. That is the central piece of
 engineering this repo is organised to prove — see
 [ADR-001](docs/adr/001-restore-semantics.md) for the full restore-safety design.
 
@@ -76,7 +77,7 @@ hardening; ⏳ means designed and queued, not built.
 | Full-text search | ✅ | names **and mail bodies**; per-account and cross-account |
 | Export | ✅ | `.ics` / vCard from the archive |
 | Restore — local & connector re-create | ✅ | local restore for archived bodies; connector-level re-create helpers for mail/calendar/tasks/contacts/OneNote |
-| Restore — crash-safe cloud path | ✅ mail · 🚧 other | mail wired through the ledger + daemon boot recovery, crash-matrix-proven, **live-probe confirmed**; **off by default** as an opt-in (it writes to a real mailbox) |
+| Restore — crash-safe cloud path | ✅ all services | mail, calendar, contacts, ToDo and OneNote all wired through the ledger + daemon boot recovery, crash-matrix-proven, **live-probe confirmed** (per-service recovery markers: internetMessageId · transactionId de-dup · extended property · body marker · HTML-comment); **off by default** as an opt-in (it writes to the real account) |
 | Multi-account | ✅ | per-account stores, cross-account search |
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
@@ -102,8 +103,8 @@ release artifacts.
   manifests / contact photos), full-text search **including mail bodies**, and
   `.ics` / vCard export.
 - **Restore** — recover archived bodies locally; re-create archived items as new
-  cloud copies where the service path is safe. Mail is currently wired through the
-  crash-safe ledger; non-mail cloud restore is refused until ledger-migrated.
+  cloud copies. All five backup services (mail, calendar, contacts, ToDo, OneNote)
+  are wired through the crash-safe ledger; a service with no crash-safe path is refused.
 - **Local web UI** — the daemon serves a browser UI (account/service browsing,
   search, inert body viewing) on localhost; no embedded browser engine.
 - **Multi-account** — per-account stores; back up and search across all accounts.
@@ -176,12 +177,13 @@ unique item prefix and teardown.
 
 This section is deliberately blunt — it is the inverse of the status table.
 
-- **Cloud restore is off by default, and mail-only when enabled.** It re-creates
-  items as *new copies* (new ids; Microsoft 365 personal accounts offer no
-  byte-identical import). Only **mail** goes through the crash-safe operation ledger
-  (complete + live-confirmed); calendar / contacts / todo / onenote cloud restore is
-  **refused** until each is ledger-migrated. `cloud_restore_enabled` is `false` by
-  default — a deliberate opt-in, since it writes to a real mailbox.
+- **Cloud restore is off by default.** It re-creates items as *new copies* (new ids;
+  Microsoft 365 personal accounts offer no byte-identical import). All five backup
+  services (mail, calendar, contacts, ToDo, OneNote) go through the crash-safe
+  operation ledger (complete + live-confirmed, each with its own recovery marker); a
+  service with no crash-safe path is **refused** rather than run unsafely.
+  `cloud_restore_enabled` is `false` by default — a deliberate opt-in, since it writes
+  to the real account.
 - **Data at rest is only partially protected.** `isyncyou login --keyring`
   stores token JSON in the desktop Secret Service / KDE Wallet compatible keyring
   and leaves only a non-secret marker file in the archive root. Headless/file

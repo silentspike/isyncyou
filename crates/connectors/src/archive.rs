@@ -772,6 +772,7 @@ mod tests {
     /// confirm each file is valid JSON with an `id`. Needs feature `http` +
     /// `ISYNCYOU_TEST_TOKEN` (`Calendars.Read`).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_archive_calendar_bodies() {
         let _gate = crate::live_test_gate();
@@ -823,6 +824,7 @@ mod tests {
     /// Live: index ToDo, archive a few tasks' canonical JSON, confirm valid JSON
     /// with an `id`. Needs feature `http` + `ISYNCYOU_TEST_TOKEN` (`Tasks.Read`).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_archive_todo_bodies() {
         let _gate = crate::live_test_gate();
@@ -865,6 +867,7 @@ mod tests {
     /// notebook, so this proves the walk runs (0 pages is a valid outcome).
     /// Needs feature `http` + `ISYNCYOU_TEST_TOKEN` (`Notes.Read`).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_archive_onenote_bodies() {
         let _gate = crate::live_test_gate();

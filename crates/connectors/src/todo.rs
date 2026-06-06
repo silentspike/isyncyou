@@ -257,6 +257,7 @@ mod tests {
     /// Live: real per-list task delta -> store, against the throwaway account.
     /// Needs feature `http` + `ISYNCYOU_TEST_TOKEN` carrying `Tasks.Read`.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_incremental_sync_todo() {
         let _gate = crate::live_test_gate();

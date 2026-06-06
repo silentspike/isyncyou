@@ -15,6 +15,14 @@ concurrency:
   group: pr-main-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# The self-hosted runner (shared, ~32 GB) runs the compile-heavy jobs in parallel;
+# with the default per-job parallelism a cold `--all-targets` build in each fans out to
+# one rustc per core and the sum OOM-kills the box. Cap per-job parallelism and disable
+# incremental so concurrent cold builds fit in RAM/disk. (GitHub-hosted is unaffected.)
+env:
+  CARGO_BUILD_JOBS: "3"
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   fmt:
     name: fmt
