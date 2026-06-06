@@ -66,14 +66,19 @@ clear; the orchestrator is the human-in-the-loop judgement on top of them.
 ### Merge strategy
 
 - **`feature → dev`: squash-merge** — one tidy commit per change on `dev`.
-- **`dev → staging` and `staging → main`: merge commits (not squash)** — promotions
-  carry the underlying commits forward so the three branches stay aligned (squashing a
-  promotion creates a sibling commit with new SHAs and makes the next promotion noisy).
-- **The orchestrator opens the promotion PRs.** The org currently does not allow GitHub
-  Actions to open PRs, so `promote.yml` is a best-effort helper only; opening the
-  `dev → staging` / `staging → main` PR is the orchestrator's deliberate gate. (Enable
-  the org "Allow GitHub Actions to create and approve pull requests" toggle for full
-  auto-promotion.)
+- **`dev → staging` and `staging → main`: squash-merge** — the repository allows
+  squash merges only (merge commits and rebase merges are disabled in repo settings), so
+  each promotion lands as a single squash commit on the target branch. The three
+  branches therefore have independent histories with the same *content*; reconcile by
+  promoting forward (a promotion PR's diff is the content delta), not by expecting shared
+  SHAs.
+- **The orchestrator opens the promotion PRs** and merges them. The org currently does
+  not allow GitHub Actions to open PRs, so `promote.yml` is a best-effort helper only;
+  opening the `dev → staging` / `staging → main` PR is the orchestrator's deliberate
+  gate. (Enable the org "Allow GitHub Actions to create and approve pull requests" toggle
+  for full auto-promotion.) When a promotion's gate fails for a runner-infra reason (not
+  content), the orchestrator may admin-merge a content-verified promotion; `main` keeps
+  `enforce_admins`, so that requires a deliberate, restored protection toggle.
 
 ### Review policy (solo-merge is intentional)
 
