@@ -992,6 +992,7 @@ mod tests {
     /// access token non-interactively and the cache is persisted valid. Provide
     /// the RT via `ISYNCYOU_TEST_REFRESH_TOKEN` (extracted from the MSAL cache).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_refresh_from_cached_refresh_token() {
         let rt = match std::env::var("ISYNCYOU_TEST_REFRESH_TOKEN") {

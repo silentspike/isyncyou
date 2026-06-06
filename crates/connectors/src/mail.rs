@@ -529,6 +529,7 @@ mod tests {
     /// Live: real per-folder mail delta -> store, against the throwaway account.
     /// Needs feature `http` + `ISYNCYOU_TEST_TOKEN` carrying `Mail.Read`.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_incremental_sync_mail() {
         let _gate = crate::live_test_gate();
@@ -559,6 +560,7 @@ mod tests {
     /// they are valid MIME. Needs feature `http` + `ISYNCYOU_TEST_TOKEN`
     /// (`Mail.Read`).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_download_message_bodies() {
         let _gate = crate::live_test_gate();

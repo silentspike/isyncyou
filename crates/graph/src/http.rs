@@ -742,6 +742,7 @@ mod tests {
     /// Live OneDrive delta against the test account. Skips unless
     /// `ISYNCYOU_TEST_TOKEN` (a Files.Read bearer token for the throwaway
     /// account) is set, so CI without credentials passes.
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_onedrive_delta() {
         let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
@@ -769,6 +770,7 @@ mod tests {
 
     /// Live resumable upload (then cleanup) against the test account. Skips
     /// unless `ISYNCYOU_TEST_WRITE_TOKEN` (a Files.ReadWrite bearer token) is set.
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_onedrive_upload_roundtrip() {
         let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
