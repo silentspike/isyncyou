@@ -74,3 +74,18 @@ clear; the orchestrator is the human-in-the-loop judgement on top of them.
   `dev → staging` / `staging → main` PR is the orchestrator's deliberate gate. (Enable
   the org "Allow GitHub Actions to create and approve pull requests" toggle for full
   auto-promotion.)
+
+### Review policy (solo-merge is intentional)
+
+Branch protection on `dev`/`staging`/`main` sets `required_approving_review_count = 0`:
+a single maintainer may merge their own PR. This is **deliberate** for a
+single-maintainer repository — a human-approval requirement that only the same person
+can satisfy adds ceremony, not safety.
+
+The compensating control is the **automated required-checks gate**, which every PR must
+pass before it can merge and which a self-approval cannot bypass: build/lint/test
+(`dev-checks`/`staging-pass`/`main-pass`), `cargo-deny`, the requirements + evidence
+traceability check, the secret scan (Gitleaks), the Conventional-Commit title check, and
+the English-only `language-check`. `main` additionally has `enforce_admins` so even the
+maintainer cannot push past the gate. When the project gains additional maintainers, set
+`required_approving_review_count = 1` to require cross-review.
