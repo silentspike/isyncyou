@@ -107,12 +107,12 @@
     {
       "id": "EV-011",
       "requirement": "REQ-RST-006",
-      "claim": "A non-ledger (non-mail) cloud restore is refused before any store access or token lookup, never run via a non-crash-safe direct POST.",
+      "claim": "Every backup service (mail/calendar/contacts/todo/onenote) is ledger-backed, and a service with no restore path is rejected before any store access or token lookup, never run via a non-crash-safe direct POST.",
       "method": "test",
-      "command": "cargo test -p isyncyou-engine restore_cloud_refuses_non_mail_until_ledger_migrated",
+      "command": "cargo test -p isyncyou-engine every_backup_service_is_ledger_backed_and_unknown_is_rejected",
       "result": "pass",
-      "evidence": "test tests::restore_cloud_refuses_non_mail_until_ledger_migrated ... ok",
-      "test": "restore_cloud_refuses_non_mail_until_ledger_migrated"
+      "evidence": "test tests::every_backup_service_is_ledger_backed_and_unknown_is_rejected ... ok",
+      "test": "every_backup_service_is_ledger_backed_and_unknown_is_rejected"
     },
     {
       "id": "EV-012",
@@ -313,6 +313,130 @@
       "result": "pass",
       "evidence": "backup_snapshot=host/isyncyou-primary/2026-06-05T15:46:31Z; restore_manifest_account=primary; restore_manifest_schema_version=4; restore_store_user_version=4; restore_store_table_count=15; cleanup_snapshot_remaining=0; VERDICT PBS ROUNDTRIP YES; temporary token deleted after probe.",
       "artifact": "tools/live_pbs_roundtrip.py"
+    },
+    {
+      "id": "EV-032",
+      "requirement": "REQ-RST-010",
+      "claim": "Calendar restore is wired through the ledger: the sink stamps the Graph transactionId marker the crash-recovery probe later searches for, and the event sanitizer drops read-only fields before the POST.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine create_stamps_transaction_id_and_drops_non_writable_fields",
+      "result": "pass",
+      "evidence": "test restore_calendar::tests::create_stamps_transaction_id_and_drops_non_writable_fields ... ok",
+      "notes": "Calendar crash-safety is proven against a fake calendar that models Graph's transactionId de-dup, by the crash-matrix in restore_calendar::tests (happy_path / crash_after_post_landed / crash_before_post_landed / boot_recovery_reconciles_a_pending_op_without_duplicating). Recovery converges via the idempotent re-POST; EV-034 is the live confirmation.",
+      "test": "create_stamps_transaction_id_and_drops_non_writable_fields"
+    },
+    {
+      "id": "EV-033",
+      "requirement": "REQ-RST-010",
+      "claim": "engine::restore_cloud routes a calendar restore past the crash-safety gate to the calendar ledger path (it is not refused as unsupported), reaching the account lookup.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_cloud_routes_calendar_past_the_support_gate",
+      "result": "pass",
+      "evidence": "test tests::restore_cloud_routes_calendar_past_the_support_gate ... ok",
+      "test": "restore_cloud_routes_calendar_past_the_support_gate"
+    },
+    {
+      "id": "EV-034",
+      "requirement": "REQ-RST-010",
+      "claim": "Live: Microsoft Graph honours a posted transactionId on POST /me/events and de-duplicates server-side (re-POST returns the same event id) — the idempotent re-create the calendar crash recovery relies on. A transactionId $filter is not supported (HTTP 400), confirming why recovery re-POSTs instead of probing.",
+      "method": "probe",
+      "command": "python3 tools/live_calendar_probe.py",
+      "result": "pass",
+      "evidence": "POST /me/events -> 201; transactionId preserved; re-POST same transactionId -> 201 same id: True; GET $filter transactionId -> 400 (supported: False); cleanup DELETE -> 204; VERDICT transactionId server-side de-dup: YES",
+      "artifact": "tools/live_calendar_probe.py"
+    },
+    {
+      "id": "EV-035",
+      "requirement": "REQ-RST-011",
+      "claim": "Contacts restore is wired through the ledger (mail-shape): the sink stamps the single-value extended-property marker the recovery probe later searches for, and sanitize_contact drops read-only/photo fields before the POST.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine create_stamps_marker_property_and_drops_non_writable_fields",
+      "result": "pass",
+      "evidence": "test restore_contacts::tests::create_stamps_marker_property_and_drops_non_writable_fields ... ok",
+      "notes": "Crash-safety for contacts is proven against a non-idempotent fake by the crash-matrix in restore_contacts::tests (happy_path / crash_after_post_landed / crash_before_post_landed / boot_recovery_reconciles_a_pending_op_without_creating); EV-037 is the live confirmation.",
+      "test": "create_stamps_marker_property_and_drops_non_writable_fields"
+    },
+    {
+      "id": "EV-036",
+      "requirement": "REQ-RST-011",
+      "claim": "engine::restore_cloud routes a contacts restore past the crash-safety gate to the contacts ledger path (it is not refused as unsupported), reaching the account lookup.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_cloud_routes_contacts_past_the_support_gate",
+      "result": "pass",
+      "evidence": "test tests::restore_cloud_routes_contacts_past_the_support_gate ... ok",
+      "test": "restore_cloud_routes_contacts_past_the_support_gate"
+    },
+    {
+      "id": "EV-037",
+      "requirement": "REQ-RST-011",
+      "claim": "Live: Microsoft Graph accepts a single-value extended property on POST /me/contacts and a singleValueExtendedProperties $filter finds the contact again — the marker probe the contacts crash recovery relies on.",
+      "method": "probe",
+      "command": "python3 tools/live_contacts_probe.py",
+      "result": "pass",
+      "evidence": "POST /me/contacts -> 201; GET $filter singleValueExtendedProperties -> 200, matches: 1; cleanup DELETE -> 204; VERDICT create accepts extended property: YES; $filter finds it: YES",
+      "artifact": "tools/live_contacts_probe.py"
+    },
+    {
+      "id": "EV-038",
+      "requirement": "REQ-RST-012",
+      "claim": "ToDo restore is wired through the ledger (weakest probe): the sink embeds the marker in the task body keeping the original content, and recovery reconciles by a LIST scan of the parent list for that marker.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine create_embeds_marker_and_find_scans_for_it",
+      "result": "pass",
+      "evidence": "test restore_todo::tests::create_embeds_marker_and_find_scans_for_it ... ok",
+      "notes": "Crash-safety for todo is proven against a non-idempotent fake by the crash-matrix in restore_todo::tests (happy_path / crash_after_post_landed / crash_before_post_landed / boot_recovery_reconciles_a_pending_op_without_creating); EV-040 is the live confirmation. The body marker is a documented fidelity trade-off (restore-fidelity-matrix).",
+      "test": "create_embeds_marker_and_find_scans_for_it"
+    },
+    {
+      "id": "EV-039",
+      "requirement": "REQ-RST-012",
+      "claim": "engine::restore_cloud routes a todo restore past the crash-safety gate to the todo ledger path (it is not refused as unsupported), reaching the account lookup.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_cloud_routes_todo_past_the_support_gate",
+      "result": "pass",
+      "evidence": "test tests::restore_cloud_routes_todo_past_the_support_gate ... ok",
+      "test": "restore_cloud_routes_todo_past_the_support_gate"
+    },
+    {
+      "id": "EV-040",
+      "requirement": "REQ-RST-012",
+      "claim": "Live: a Microsoft To Do task body marker round-trips and a LIST scan finds the task again, while a singleValueExtendedProperties $filter on a todoTask is rejected (HTTP 400) — establishing the LIST-scan probe the todo crash recovery relies on.",
+      "method": "probe",
+      "command": "python3 tools/live_todo_probe.py",
+      "result": "pass",
+      "evidence": "POST task -> 201; H1 $filter extended property -> 400 (unsupported on todoTask); H3 LIST+scan body for marker -> 200 found: True; cleanup DELETE -> 204; DESIGN: ledger + LIST-scan marker probe",
+      "artifact": "tools/live_todo_probe.py"
+    },
+    {
+      "id": "EV-041",
+      "requirement": "REQ-RST-013",
+      "claim": "OneNote restore is wired through the ledger: the sink stamps an invisible HTML-comment marker the recovery scan searches for, and recovery reconciles by listing pages and scanning each page's /content.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine create_stamps_invisible_marker_found_by_scan",
+      "result": "pass",
+      "evidence": "test restore_onenote::tests::create_stamps_invisible_marker_found_by_scan ... ok",
+      "notes": "Crash-safety for onenote is proven against a non-idempotent fake by the crash-matrix in restore_onenote::tests (happy_path / crash_after_post_landed / crash_before_post_landed / boot_recovery_reconciles_a_pending_op_without_creating); EV-043 is the live confirmation.",
+      "test": "create_stamps_invisible_marker_found_by_scan"
+    },
+    {
+      "id": "EV-042",
+      "requirement": "REQ-RST-013",
+      "claim": "OneNote restore is resource-aware: load_resources reads the per-page manifest, building multipart parts with re-uploaded bytes and rewriting source URLs to name:<part>; a page with no manifest restores as plain HTML.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine load_resources_builds_parts_and_rewrites_from_manifest && cargo test -p isyncyou-engine missing_manifest_means_plain_html_restore",
+      "result": "pass",
+      "evidence": "test restore_onenote::tests::load_resources_builds_parts_and_rewrites_from_manifest ... ok; test restore_onenote::tests::missing_manifest_means_plain_html_restore ... ok",
+      "test": "load_resources_builds_parts_and_rewrites_from_manifest"
+    },
+    {
+      "id": "EV-043",
+      "requirement": "REQ-RST-013",
+      "claim": "Live: a OneNote page created with an HTML-comment marker round-trips that marker in its /content and a LIST + per-page content scan finds it (and a title $filter also works) — the content-scan probe the onenote crash recovery relies on.",
+      "method": "probe",
+      "command": "python3 tools/live_onenote_probe.py",
+      "result": "pass",
+      "evidence": "POST page -> 201; H1 $filter title -> 200 matches:1; H2 LIST + per-page content scan -> found: True; cleanup DELETE -> 204; DESIGN: ledger + content-scan with invisible comment marker",
+      "artifact": "tools/live_onenote_probe.py"
     }
   ]
 }
