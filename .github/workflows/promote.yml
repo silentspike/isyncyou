@@ -1,40 +1,92 @@
 name: Promote
 
-# Automation: after a merge into dev/staging, open (or keep) the next-stage
-# promotion PR so the dev -> staging -> main path is one click.
+# Autonomous promotion: after a merge into dev (or staging), build the next-stage
+# branch as a tree-overlay of the source onto the target and open a PR that
+# auto-merges once the target's required checks pass. dev -> staging -> main runs
+# hands-off; the final merge into main triggers release.yml (RC publish).
+#
+# Why a PAT (PROMOTE_TOKEN) and not GITHUB_TOKEN:
+#   - a PR opened by GITHUB_TOKEN does NOT trigger the target's required CI, so
+#     auto-merge would wait forever;
+#   - a merge performed by GITHUB_TOKEN does NOT re-trigger this workflow, so the
+#     cascade would stall after the first hop.
+# A fine-grained PAT (contents + pull-requests + workflows, this repo only) avoids
+# both. The tree-overlay keeps the PR clean under squash-only + strict protection
+# (the promo branch is cut from the target, so it is always up to date with it).
 on:
   push:
     branches: [dev, staging]
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: promote-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  open-promotion-pr:
+  promote:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
+      - name: Resolve target + token presence
+        id: cfg
+        env:
+          PAT: ${{ secrets.PROMOTE_TOKEN }}
+        run: |
+          base=""
+          case "$GITHUB_REF_NAME" in
+            dev) base=staging ;;
+            staging) base=main ;;
+          esac
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ -z "$base" ]; then
+            echo "::notice::no promotion target for $GITHUB_REF_NAME"
+          fi
+          if [ -n "$PAT" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PROMOTE_TOKEN not set — autonomous promotion is disabled; open the promotion PR manually."
+          fi
+
+      - name: Checkout (full history, PAT-authenticated)
+        if: steps.cfg.outputs.base != '' && steps.cfg.outputs.ok == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
         with:
-          script: |
-            const next = { dev: 'staging', staging: 'main' };
-            const head = context.ref.replace('refs/heads/', '');
-            const base = next[head];
-            if (!base) { core.info(`no promotion target for ${head}`); return; }
-            const { owner, repo } = context.repo;
-            const open = await github.rest.pulls.list({ owner, repo, base, head: `${owner}:${head}`, state: 'open' });
-            if (open.data.length) { core.info(`promotion PR already open: #${open.data[0].number}`); return; }
-            try {
-              const pr = await github.rest.pulls.create({
-                owner, repo, head, base,
-                title: `chore: promote ${head} to ${base}`,
-                body: `Automated promotion of \`${head}\` into \`${base}\`.`,
-              });
-              core.info(`opened promotion PR #${pr.data.number}`);
-            } catch (e) {
-              core.warning(`could not open promotion PR (${head} -> ${base}): ${e.message}`);
-            }
+          fetch-depth: 0
+          token: ${{ secrets.PROMOTE_TOKEN }}
+
+      - name: Open + auto-merge tree-overlay promotion PR
+        if: steps.cfg.outputs.base != '' && steps.cfg.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
+          BASE: ${{ steps.cfg.outputs.base }}
+          HEAD_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "isyncyou-promote[bot]"
+          git config user.email "isyncyou-promote@users.noreply.github.com"
+          git fetch --quiet origin "$BASE" "$HEAD_BRANCH"
+
+          pb="promote/${HEAD_BRANCH}-to-${BASE}-${GITHUB_RUN_NUMBER}"
+          # cut the promotion branch from the target so it is up to date with it
+          # (satisfies strict protection), then overlay the source branch's exact
+          # tree (handles additions, edits AND deletions).
+          git checkout -B "$pb" "origin/$BASE"
+          git read-tree -u --reset "origin/$HEAD_BRANCH"
+
+          if git diff --cached --quiet; then
+            echo "::notice::nothing to promote — $HEAD_BRANCH already matches $BASE"
+            exit 0
+          fi
+
+          git commit -q -m "chore: promote $HEAD_BRANCH to $BASE (auto)"
+          git push -q origin "$pb"
+
+          gh pr create --base "$BASE" --head "$pb" \
+            --title "chore: promote $HEAD_BRANCH to $BASE (auto)" \
+            --body "Automated tree-overlay promotion of \`$HEAD_BRANCH\` into \`$BASE\`. Auto-merges once the required checks pass."
+
+          # squash auto-merge: completes when the target's required checks are green
+          gh pr merge "$pb" --squash --auto --delete-branch
+          echo "promotion PR opened + set to auto-merge: $pb -> $BASE"
