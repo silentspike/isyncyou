@@ -22,6 +22,7 @@ mod mail_restore;
 mod restore_calendar;
 mod restore_contacts;
 mod restore_key;
+mod restore_onenote;
 mod restore_recovery;
 mod restore_todo;
 pub use mail_restore::{
@@ -38,7 +39,11 @@ pub use restore_contacts::{
 };
 pub use restore_key::{
     calendar_marker, contact_marker, idempotency_key, load_or_create_secret, mail_marker,
-    todo_marker,
+    onenote_marker, todo_marker,
+};
+pub use restore_onenote::{
+    pending_onenote_restore_count, recover_pending_onenote_restores,
+    recover_pending_onenote_restores_with, restore_onenote_via_ledger, OneNoteApi, OneNoteSink,
 };
 pub use restore_recovery::{recover_restore_op, run_restore_op, RestoreOutcome, RestoreSink};
 pub use restore_todo::{
@@ -216,23 +221,25 @@ pub mod auth {
 pub const RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 
 /// Services whose **cloud-mutating** restore goes through the crash-safe operation
-/// ledger (ADR-001). Only these may be re-created in the cloud; the others are
-/// refused until migrated — a direct POST is not crash-safe (a mid-restore crash
-/// could duplicate the item), and the product does not ship a "mostly safe" path.
-pub const CLOUD_RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo"];
+/// ledger (ADR-001). Every backup service is now ledger-backed; a direct, non-ledger
+/// POST is never used (a mid-restore crash could duplicate the item), and the product
+/// does not ship a "mostly safe" path. A service outside this set has no crash-safe
+/// cloud restore and is refused.
+pub const CLOUD_RESTORE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 
 /// Whether `service`'s cloud restore path is crash-safe (ledger-backed) today.
 pub fn cloud_restore_service_supported(service: &str) -> bool {
     CLOUD_RESTORE_SERVICES.contains(&service)
 }
 
-/// Stable refusal for a not-yet-ledger-migrated cloud restore — the CLI and daemon
-/// return this *before* resolving a token, so the message is clear, not a token
-/// error.
+/// Stable refusal for a service that has no crash-safe cloud restore — the CLI and
+/// daemon return this *before* resolving a token, so the message is clear, not a token
+/// error. Every backup service (mail, calendar, contacts, todo, onenote) is ledger-
+/// backed; this fires only for a non-restorable service.
 pub fn unsupported_cloud_restore_service_error(service: &str) -> String {
     format!(
         "cloud restore for '{service}' is not crash-safe yet — only mail, calendar, \
-         contacts and todo are currently ledger-backed. Use `restore --to-local` to \
+         contacts, todo and onenote are ledger-backed. Use `restore --to-local` to \
          recover the archived body, or `restore --preview` to inspect it."
     )
 }
@@ -303,12 +310,14 @@ pub fn restore_cloud(
     // (ADR-001): record intent, stamp a findable marker, post, and
     // reconcile-not-duplicate on a re-entry after a crash. The marker differs per
     // service (mail: internetMessageId; calendar: Graph transactionId de-dup;
-    // contacts: single-value extended property; todo: body marker + LIST scan).
+    // contacts: single-value extended property; todo: body marker + LIST scan;
+    // onenote: invisible HTML-comment marker + page-content scan).
     match service {
         "mail" => mail_restore::restore_mail_via_ledger(cfg, account, id, token),
         "calendar" => restore_calendar::restore_calendar_via_ledger(cfg, account, id, token),
         "contacts" => restore_contacts::restore_contacts_via_ledger(cfg, account, id, token),
         "todo" => restore_todo::restore_todo_via_ledger(cfg, account, id, token),
+        "onenote" => restore_onenote::restore_onenote_via_ledger(cfg, account, id, token),
         // unreachable: cloud_restore_service_supported() gated everything else above.
         other => Err(unsupported_cloud_restore_service_error(other)),
     }
@@ -527,22 +536,24 @@ mod tests {
     }
 
     #[test]
-    fn restore_cloud_refuses_unmigrated_services_until_ledger_migrated() {
-        // Even with the gate opened, a not-yet-ledger-backed service must be refused
-        // before any store access or Graph write — mail, calendar, contacts and todo
-        // are crash-safe today; only onenote remains refused.
+    fn every_backup_service_is_ledger_backed_and_unknown_is_rejected() {
+        // All five backup services are crash-safe (ledger-backed) now.
+        for svc in ["mail", "calendar", "contacts", "todo", "onenote"] {
+            assert!(
+                cloud_restore_service_supported(svc),
+                "{svc} must be ledger-backed"
+            );
+        }
+        // A service with no restore path at all is rejected (distinct message), even
+        // with the gate opened.
         let mut cfg = Config::default();
         cfg.restore.cloud_restore_enabled = true;
-        let err = restore_cloud(&cfg, "a", "onenote", "id", "tok".into()).unwrap_err();
+        let err = restore_cloud(&cfg, "a", "onedrive", "id", "tok".into()).unwrap_err();
         assert!(
-            err.contains("not crash-safe yet"),
-            "onenote: expected not-crash-safe refusal, got: {err}"
+            err.contains("has no restore path"),
+            "onedrive: expected no-restore-path refusal, got: {err}"
         );
-        assert!(cloud_restore_service_supported("mail"));
-        assert!(cloud_restore_service_supported("calendar"));
-        assert!(cloud_restore_service_supported("contacts"));
-        assert!(cloud_restore_service_supported("todo"));
-        assert!(!cloud_restore_service_supported("onenote"));
+        assert!(!cloud_restore_service_supported("onedrive"));
     }
 
     #[test]
@@ -595,6 +606,24 @@ mod tests {
         assert!(
             !err.contains("not crash-safe yet"),
             "todo must not be refused as unsupported, got: {err}"
+        );
+    }
+
+    #[test]
+    fn restore_cloud_routes_onenote_past_the_support_gate() {
+        // OneNote is ledger-backed now: with the gate opened it must pass the
+        // crash-safety check and reach the onenote ledger path, which then fails on
+        // the missing account — proving routing, not a "not crash-safe" refusal.
+        let mut cfg = Config::default();
+        cfg.restore.cloud_restore_enabled = true;
+        let err = restore_cloud(&cfg, "missing", "onenote", "id", "tok".into()).unwrap_err();
+        assert!(
+            err.contains("no account 'missing'"),
+            "expected account-not-found from the onenote ledger path, got: {err}"
+        );
+        assert!(
+            !err.contains("not crash-safe yet"),
+            "onenote must not be refused as unsupported, got: {err}"
         );
     }
 
