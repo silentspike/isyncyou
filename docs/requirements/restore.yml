@@ -82,11 +82,13 @@ requirements:
     status: implemented
     design: docs/adr/001-restore-semantics.md
     note: >
-      The daemon runs recovery before serving; an account with pending ops but no
+      The daemon runs recovery before serving, for each ledger-backed service (mail
+      and calendar) with the one cached write token; an account with pending ops but no
       cached write token is logged and retried next start.
     acceptance:
       - Operations in preflight_checked / committing / failed_after_graph_commit are
         reconciled by the per-service probe at startup.
+      - Each ledger-backed service (mail, calendar) is recovered on start.
     verified_by:
       - test: boot_recovery_reconciles_a_pending_op_without_creating
 
@@ -95,18 +97,19 @@ requirements:
     statement: >
       Cloud-mutating restore for a service whose path is not yet crash-safe
       (ledger-backed) must be refused — never executed via a direct, non-crash-safe
-      POST. Only mail qualifies today.
+      POST. Mail and calendar qualify today; contacts, todo and onenote are refused.
     rationale: A direct POST can duplicate the item on a mid-restore crash (ADR-001).
     status: implemented
     design: docs/adr/001-restore-semantics.md
     acceptance:
-      - The engine refuses a non-mail cloud restore before any store/network access.
+      - The engine refuses a not-yet-ledger-backed cloud restore (contacts/todo/onenote)
+        before any store/network access.
       - The CLI refuses before resolving a token.
       - The daemon web-UI handler refuses before resolving a token.
     verified_by:
-      - test: restore_cloud_refuses_non_mail_until_ledger_migrated
-      - test: non_mail_cloud_restore_refuses_before_token_lookup
-      - test: restore_handler_refuses_non_mail_before_token_lookup
+      - test: restore_cloud_refuses_unmigrated_services_until_ledger_migrated
+      - test: unmigrated_cloud_restore_refuses_before_token_lookup
+      - test: restore_handler_refuses_unmigrated_service_before_token_lookup
 
   - id: REQ-RST-007
     title: Restore write scopes use the personal-account OneNote scope
@@ -157,3 +160,45 @@ requirements:
       - test: restore_page_uses_plain_html_when_no_resources
       - test: onenote_multipart_body_uses_presentation_and_binary_parts
       - test: onenote_multipart_body_rejects_header_injection
+
+  - id: REQ-RST-010
+    title: Calendar cloud restore is crash-safe (ledger-backed, transactionId de-dup)
+    statement: >
+      Cloud-mutating calendar restore must go through the operation ledger (ADR-001):
+      it stamps a Microsoft Graph transactionId derived from the content HMAC, records
+      intent before the POST, and on a re-entry after a crash re-POSTs through the
+      ledger — relying on Graph's server-side transactionId de-duplication to converge
+      to exactly one event, never a duplicate.
+    rationale: >
+      Calendar is the second vertical migrated off the refusal list onto the ledger.
+      Unlike mail, its crash-safety comes from an idempotent create rather than a marker
+      probe: a live probe (tools/live_calendar_probe.py) confirmed that re-POSTing the
+      same transactionId returns the same event id, and that a transactionId $filter
+      query is NOT supported by Graph (HTTP 400) — so recovery re-POSTs instead of
+      querying. cloud_restore_enabled stays off by default (REQ-RST-001).
+    status: implemented
+    design: docs/adr/001-restore-semantics.md
+    note: >
+      The single Graph call (create event) sits behind the CalendarApi trait so the
+      ledger wiring and recovery are proven against a fake calendar that models Graph's
+      transactionId de-dup; the sink stamps the transactionId and the event sanitizer
+      drops read-only fields before the POST. CalendarSink::find_by_marker returns None
+      (no $filter), routing the generic recovery into the idempotent re-create path.
+      engine::restore_cloud routes calendar to the ledger path and the daemon recovers
+      pending calendar operations on boot with the same write token as mail.
+    acceptance:
+      - calendar is in CLOUD_RESTORE_SERVICES and routed by engine::restore_cloud.
+      - The sink stamps the transactionId marker and drops non-writable event fields.
+      - Crash after the POST landed yields exactly one event (de-dup, no duplicate).
+      - Crash before the POST landed creates exactly one event on recovery.
+      - Boot recovery converges a pending calendar op to one event without duplicating.
+      - A repeat of identical content returns the same id without a second event.
+      - Live: re-POSTing the same transactionId returns the same event id (Graph de-dup).
+    verified_by:
+      - test: restore_cloud_routes_calendar_past_the_support_gate
+      - test: create_stamps_transaction_id_and_drops_non_writable_fields
+      - test: crash_after_post_landed_does_not_duplicate
+      - test: crash_before_post_landed_creates_exactly_one_on_recovery
+      - test: boot_recovery_reconciles_a_pending_op_without_duplicating
+      - test: happy_path_creates_one_and_is_idempotent_on_repeat
+      - file: tools/live_calendar_probe.py

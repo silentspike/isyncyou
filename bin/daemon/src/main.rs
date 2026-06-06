@@ -230,26 +230,50 @@ impl isyncyou_webui::SyncControl for Scheduler {
 }
 
 /// Finish any restore operations left mid-flight by a previous run, before serving
-/// (ADR-001 auto-recovery on boot). Only the mail path is wired today; an account
-/// with pending operations but no cached write token is logged and retried next
-/// start. Best-effort and never fatal — a recovery failure must not stop the daemon.
+/// (ADR-001 auto-recovery on boot). Each ledger-backed service (mail, calendar) is
+/// reconciled with the one cached write token; an account with pending operations but
+/// no cached write token is logged and retried next start. Best-effort and never fatal
+/// — a recovery failure must not stop the daemon.
 fn recover_pending_restores(cfg: &Config) {
     for acc in &cfg.accounts {
-        let pending = match isyncyou_engine::pending_mail_restore_count(cfg, &acc.id) {
-            Ok(n) => n,
-            Err(_) => continue, // no store yet / unreadable — nothing to recover
-        };
+        let mail_pending = isyncyou_engine::pending_mail_restore_count(cfg, &acc.id).unwrap_or(0);
+        let cal_pending =
+            isyncyou_engine::pending_calendar_restore_count(cfg, &acc.id).unwrap_or(0);
+        let pending = mail_pending + cal_pending;
         if pending == 0 {
             continue;
         }
         match isyncyou_engine::auth::resolve_cached_restore_token(cfg, &acc.id) {
             Ok(token) => {
-                match isyncyou_engine::recover_pending_mail_restores(cfg, &acc.id, token) {
-                    Ok((done, failed)) => eprintln!(
-                    "isyncyoud: restore recovery [{}]: {done} completed, {failed} still pending",
-                    acc.id
-                ),
-                    Err(e) => eprintln!("isyncyoud: restore recovery [{}] failed: {e}", acc.id),
+                // One token recovers both verticals; report per service.
+                if mail_pending > 0 {
+                    match isyncyou_engine::recover_pending_mail_restores(
+                        cfg,
+                        &acc.id,
+                        token.clone(),
+                    ) {
+                        Ok((done, failed)) => eprintln!(
+                            "isyncyoud: mail restore recovery [{}]: {done} completed, {failed} \
+                             still pending",
+                            acc.id
+                        ),
+                        Err(e) => {
+                            eprintln!("isyncyoud: mail restore recovery [{}] failed: {e}", acc.id)
+                        }
+                    }
+                }
+                if cal_pending > 0 {
+                    match isyncyou_engine::recover_pending_calendar_restores(cfg, &acc.id, token) {
+                        Ok((done, failed)) => eprintln!(
+                            "isyncyoud: calendar restore recovery [{}]: {done} completed, {failed} \
+                             still pending",
+                            acc.id
+                        ),
+                        Err(e) => eprintln!(
+                            "isyncyoud: calendar restore recovery [{}] failed: {e}",
+                            acc.id
+                        ),
+                    }
                 }
             }
             Err(e) => eprintln!(
@@ -407,13 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_handler_refuses_non_mail_before_token_lookup() {
+    fn restore_handler_refuses_unmigrated_service_before_token_lookup() {
         // The web-UI restore handler refuses a not-yet-ledger-migrated service before
         // any cached-token lookup (so no token is needed to get the clear message).
+        // Mail and calendar are ledger-backed and excluded here.
         let h = DaemonRestore {
             cfg: Config::default(),
         };
-        for service in ["calendar", "contacts", "todo", "onenote"] {
+        for service in ["contacts", "todo", "onenote"] {
             let err = isyncyou_webui::RestoreHandler::restore(&h, "a", service, "x").unwrap_err();
             assert!(err.contains("not crash-safe yet"), "{service}: got: {err}");
         }

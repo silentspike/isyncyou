@@ -41,3 +41,7 @@ SHOWCASE.md
 # Browser-automation + LLM scratch artifacts (never committed)
 .playwright-cli/
 llm-*.log
+
+# Python bytecode cache from the tooling under tools/ (e.g. check_language.py)
+__pycache__/
+*.pyc
