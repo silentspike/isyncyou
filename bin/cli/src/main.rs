@@ -156,8 +156,8 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         account: String,
-        /// Service the item belongs to. Cloud restore: **mail, calendar and contacts**
-        /// (crash-safe); other services are refused until ledger-migrated.
+        /// Service the item belongs to. Cloud restore: **mail, calendar, contacts and
+        /// todo** (crash-safe); onenote is refused until ledger-migrated.
         /// `--to-local` / `--preview` work for any service with an archived body
         /// (incl. onenote).
         #[arg(long)]
@@ -2482,15 +2482,13 @@ mod tests {
     fn unmigrated_cloud_restore_refuses_before_token_lookup() {
         // A not-yet-ledger-backed service must be refused before any token resolution —
         // passing no token still yields the "not crash-safe yet" message, not a token
-        // error. Mail, calendar and contacts are ledger-backed and excluded here.
+        // error. Mail, calendar, contacts and todo are ledger-backed and excluded here.
         let dir = std::env::temp_dir().join(format!("isyncyou-cli-nonmail-{}", std::process::id()));
         let arch = dir.join("arch");
         std::fs::create_dir_all(&arch).unwrap();
         let p = write_config(&dir, &arch); // sets cloud_restore_enabled = true
-        for service in ["todo", "onenote"] {
-            let err = cmd_restore(&p, "a", service, "x", None, false, None).unwrap_err();
-            assert!(err.contains("not crash-safe yet"), "{service}: got: {err}");
-        }
+        let err = cmd_restore(&p, "a", "onenote", "x", None, false, None).unwrap_err();
+        assert!(err.contains("not crash-safe yet"), "onenote: got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
