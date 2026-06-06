@@ -23,7 +23,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 **Backup, restore & search (Phase 2)**
 - Connectors for Mail, Calendar, Contacts, ToDo, OneNote: incremental index +
   on-disk body archive (`.eml` / canonical JSON / page HTML / contact photos).
-- Restore-cloud-item for mail (MIME), calendar, tasks, contacts.
+- Crash-safe **cloud restore for all backup services** (mail, calendar, contacts,
+  ToDo, OneNote) through the ADR-001 operation ledger — each with a live-confirmed,
+  per-service recovery marker (internetMessageId / transactionId de-dup / extended
+  property / body marker / HTML-comment); off by default. Plus restore-to-local and a
+  PBS snapshot restore path.
 - Full-text search over names **and mail bodies**; `.ics` / vCard export.
 - Multi-account (per-account stores, `--all-accounts` backup + cross-account search);
   archive migration.
@@ -34,8 +38,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `isyncyou` CLI (init/check/login/status/sync/backup/search/restore/export/migrate/serve);
   `isyncyoud` daemon (serves the web UI); `isyncyou-doctor`.
 - Release archive (`isyncyou-linux-x86_64.tar.gz`) + hardened `systemd --user` unit.
-- CI (fmt, clippy, build, test), secret scanning (Gitleaks), license/advisory gate
-  (cargo-deny); Epic/Story/Task issue model + auto-labeling.
+- CI (fmt, clippy, build, test) on **GitHub-hosted runners** (public-ready — no
+  self-hosted exposure), with a paths-filter so docs-only PRs skip the compile gate;
+  HEAD-pinned evidence-manifest generator; secret scanning (Gitleaks), license/advisory
+  gate (cargo-deny); Epic/Story/Task issue model + auto-labeling.
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
