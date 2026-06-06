@@ -30,7 +30,7 @@ fn main() {
                 percent: 71,
             },
             Transfer {
-                name: "Beleg.pdf".into(),
+                name: "invoice.pdf".into(),
                 up: true,
                 percent: 88,
             },

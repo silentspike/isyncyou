@@ -1,24 +1,79 @@
 # iSyncYou
 
-> *I sync you.* — A personal cloud sync client + Microsoft 365 backup & archive
-> (personal/family accounts) for Linux, written in Rust.
+> *I sync you.* — A personal cloud sync client **and** Microsoft 365 backup &
+> archive (personal/family accounts) for Linux, written in Rust.
 
-[![status](https://img.shields.io/badge/status-private--until--RC-blue)](#current-status)
+[![status](https://img.shields.io/badge/status-release--candidate-blue)](#current-status)
+[![release](https://img.shields.io/github/v/release/silentspike/isyncyou?include_prereleases&sort=semver)](https://github.com/silentspike/isyncyou/releases)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
 [![language](https://img.shields.io/badge/built%20with-Rust-orange)]()
 
-iSyncYou keeps a Linux machine in two-way sync with OneDrive **and** keeps a
-searchable, restorable on-disk archive of the rest of Microsoft 365 — mail,
+iSyncYou keeps a Linux machine in two-way sync with **OneDrive** and keeps a
+searchable, restorable on-disk **archive of the rest of Microsoft 365** — mail,
 calendar, contacts, tasks and notes. It talks to Microsoft Graph directly, tracks
-everything by stable item id (never by path), and stores state in SQLite. There is
-no embedded browser engine and no GUI framework anywhere — the status bar uses an
-own `tiny-skia` + `cosmic-text` renderer, and full control lives in a local web UI
-the daemon serves to your normal browser.
+everything by stable item id (never by path), and stores its state in SQLite.
 
-**This is a working product, not a prototype.** It is private until its first
-release candidate. What follows is honest about what is done, what is being
-hardened, and where the hard engineering actually is.
+There is **no embedded browser engine and no GUI framework anywhere**: the native
+status bar uses an own `tiny-skia` + `cosmic-text` renderer, and full control lives
+in a small **local web UI** the daemon serves to your *own* browser.
+
+This is a working product at the **release-candidate** stage — see the
+[releases](https://github.com/silentspike/isyncyou/releases). What follows is
+honest about what is done, what is still being hardened, and where the hard
+engineering actually is.
+
+---
+
+## Screenshots
+
+**Native status bar** — a tiny tray app rendered by an own engine (no webkit, no
+GTK). It shows live transfers and is deliberately honest about throttling: when
+Microsoft returns `429`, it tells you *it's Microsoft, not your line.*
+
+<p align="center">
+  <img src="docs/assets/statusbar-syncing.png" width="300" alt="Native status bar while syncing: OneDrive header, a 'Syncing…' pill, two live transfer bars (IMG_2024.jpg 71% down, invoice.pdf 88% up), aggregate ↓12.2 / ↑3.2 MB/s and a 14-item queue, with Pause and 'Open in browser' buttons.">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/statusbar-throttled.png" width="300" alt="Native status bar while throttled: an amber 'Throttled 14s' pill and a banner reading 'Throttled by Microsoft (429) — not your connection'.">
+</p>
+
+**Local web UI** — the daemon serves a dark, JS-light archive browser to
+`localhost`. Browse per account and per service, full-text search, view inert
+bodies, and run restores. No browser engine is embedded — it's just your browser.
+
+<p align="center">
+  <img src="docs/assets/webui-overview.png" width="840" alt="Web UI archive overview: per-service item cards (OneDrive, Mail, Calendar, Contacts, ToDo, OneNote), totals (24 items, archived bodies, OneDrive cursor) and a settings panel (sync root, archive root, trash retention, FTS body index, change source, delete guard).">
+</p>
+
+<p align="center">
+  <img src="docs/assets/webui-mail.png" width="840" alt="Web UI mail browser: a search box and a table of archived messages (Type, Name, Modified, Body, Restore) listing subjects like 'Invoice #2041', 'Q3 roadmap review' and 'Team offsite — agenda'.">
+</p>
+
+> The screenshots above are rendered against **synthetic sample data** — no real
+> account is involved.
+
+---
+
+## What it does
+
+- **OneDrive two-way sync** — bidirectional, id-based delta sync with resumable
+  up/download, reversible path mapping, a keep-both conflict engine, and a
+  mass-delete guard in both directions.
+- **Microsoft 365 backup & archive** — Mail, Calendar, Contacts, ToDo and OneNote:
+  incremental index plus on-disk bodies (`.eml` / canonical JSON / page HTML +
+  resource manifests / contact photos), **full-text search including mail bodies**,
+  and `.ics` / vCard export.
+- **Restore** — recover archived bodies locally, or re-create archived items as new
+  cloud copies. All five backup services go through a **crash-safe operation
+  ledger**; a service with no crash-safe path is *refused* rather than run unsafely.
+- **Local web UI** — the daemon serves a browser UI (account/service browsing,
+  search, inert body viewing, restore) on localhost. No embedded browser engine.
+- **Native status bar + tray** — sync status, live transfers, throttle/`429`
+  transparency, pause/resume, "open in browser" — rendered by an own engine.
+- **Multi-account** — per-account stores; back up and search across all accounts.
+
+Personal/family accounts via Microsoft Graph. Stateful and id-based. SQLite + FTS5.
+No webkit/GTK anywhere.
 
 ---
 
@@ -50,9 +105,8 @@ write." So the correctness has to come from the design:
 
 Because that surface is dangerous, **cloud restore ships disabled by default**
 (`cloud_restore_enabled = false`). All five backup services (mail, calendar,
-contacts, ToDo, OneNote) are now ledger-backed and crash-matrix proven, each with a
-live-probe-confirmed crash-recovery marker; a service with no crash-safe path is
-refused rather than run unsafely. That is the central piece of
+contacts, ToDo, OneNote) are ledger-backed and crash-matrix proven, each with a
+live-probe-confirmed crash-recovery marker. That is the central piece of
 engineering this repo is organised to prove — see
 [ADR-001](docs/adr/001-restore-semantics.md) for the full restore-safety design.
 
@@ -76,8 +130,8 @@ hardening; ⏳ means designed and queued, not built.
 | Content archive | ✅ | `.eml` / canonical JSON / page HTML + OneNote resources / contact photos on disk |
 | Full-text search | ✅ | names **and mail bodies**; per-account and cross-account |
 | Export | ✅ | `.ics` / vCard from the archive |
-| Restore — local & connector re-create | ✅ | local restore for archived bodies; connector-level re-create helpers for mail/calendar/tasks/contacts/OneNote |
-| Restore — crash-safe cloud path | ✅ all services | mail, calendar, contacts, ToDo and OneNote all wired through the ledger + daemon boot recovery, crash-matrix-proven, **live-probe confirmed** (per-service recovery markers: internetMessageId · transactionId de-dup · extended property · body marker · HTML-comment); **off by default** as an opt-in (it writes to the real account) |
+| Restore — local & connector re-create | ✅ | local restore for archived bodies; connector-level re-create for mail/calendar/tasks/contacts/OneNote |
+| Restore — crash-safe cloud path | ✅ all services | mail, calendar, contacts, ToDo and OneNote wired through the ledger + daemon boot recovery, crash-matrix-proven, **live-probe confirmed** (per-service recovery markers: internetMessageId · transactionId de-dup · extended property · body marker · HTML-comment); **off by default** as an opt-in (it writes to the real account) |
 | Multi-account | ✅ | per-account stores, cross-account search |
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
@@ -88,58 +142,49 @@ hardening; ⏳ means designed and queued, not built.
 | Acceptance harness (A1–A10) + chaos tests | ✅ | data-loss / crash-point matrix |
 | Release archive + systemd unit | ✅ | tarball + `systemd --user` service |
 
-The remaining release-engineering work is tracked openly: a deployed staging
-environment and a full end-to-end suite are still not claimed as done. The release
-workflow now generates a CycloneDX SBOM and GitHub artifact attestations for
-release artifacts.
+A deployed staging environment and a full end-to-end suite are still **not** claimed
+as done — that release-engineering work is tracked openly in the issues. Release
+artifacts are built by CI with a CycloneDX SBOM and signed GitHub artifact
+attestations.
 
 ---
 
-## What it does
-
-- **OneDrive sync** — bidirectional, id-based delta sync with resumable up/download.
-- **M365 backup & archive** — Mail, Calendar, Contacts, ToDo, OneNote: incremental
-  index + on-disk bodies (`.eml` / canonical JSON / page HTML + resource
-  manifests / contact photos), full-text search **including mail bodies**, and
-  `.ics` / vCard export.
-- **Restore** — recover archived bodies locally; re-create archived items as new
-  cloud copies. All five backup services (mail, calendar, contacts, ToDo, OneNote)
-  are wired through the crash-safe ledger; a service with no crash-safe path is refused.
-- **Local web UI** — the daemon serves a browser UI (account/service browsing,
-  search, inert body viewing) on localhost; no embedded browser engine.
-- **Multi-account** — per-account stores; back up and search across all accounts.
-
-Personal/family accounts via Microsoft Graph. Stateful, id-based. SQLite + FTS5.
-No webkit/GTK anywhere (the native status bar uses an own tiny-skia + cosmic-text
-renderer).
-
-## Architecture
-
-```
-crates/  graph (OAuth/delta/throttle/upload) · store (SQLite+FTS5) · pathmap ·
-         core (config/conflict/guard/recovery/sync-state) · change-source ·
-         connectors (onedrive/mail/calendar/contacts/todo/onenote/shared/restore/
-         export/mime/archive) · acceptance (A1–A10 harness)
-bin/     isyncyou (CLI) · isyncyoud (daemon) · isyncyou-doctor
-gui/     statusbar (own renderer) · webui (router + minimal HTTP server)
-```
-
 ## Install
 
-Grab `isyncyou-linux-x86_64.tar.gz` from a release (or `cargo build --release`),
-then:
+Grab `isyncyou-linux-x86_64.tar.gz` from a
+[release](https://github.com/silentspike/isyncyou/releases) (or build it yourself —
+see [Build & test](#build--test)), then:
 
 ```sh
 sudo install -m755 isyncyou isyncyoud isyncyou-doctor /usr/local/bin/
+
 isyncyou init --account me --username me@outlook.com \
   --sync-root ~/OneDrive --archive-root ~/iSyncYou
 isyncyou check
+isyncyou login            # device-code sign-in (add --write later for restore)
 ```
 
-Run the daemon (serving the web UI) as a `systemd --user` service — see
+Run the daemon (which also serves the web UI) as a `systemd --user` service — see
 [`packaging/isyncyoud.service`](packaging/isyncyoud.service).
 
-## CLI
+## Usage
+
+A first sync + archive, then open the browser UI:
+
+```sh
+isyncyou sync                 # one incremental OneDrive sync
+isyncyou backup               # index + archive all M365 services
+isyncyou status               # per-service item + archived-body counts
+isyncyou search "invoice"     # full-text search across names + mail bodies
+
+isyncyou serve --tcp          # serve the web UI on http://127.0.0.1:8765 (loopback)
+```
+
+Then open `http://127.0.0.1:8765` in your browser for the archive UI shown above.
+By default `serve` listens on an owner-only Unix socket; `--tcp` opts into a
+loopback TCP transport.
+
+### CLI reference
 
 ```
 isyncyou init      # scaffold a config (template or a validated account)
@@ -149,15 +194,30 @@ isyncyou status    # per-service item + archived-body counts
 isyncyou sync      # one incremental OneDrive sync
 isyncyou backup    # index + archive M365 services (--all-accounts, --service, --body-limit)
 isyncyou search    # full-text search names + mail bodies (--all-accounts)
-isyncyou restore   # re-create an archived item in the cloud
+isyncyou restore   # re-create an archived item in the cloud (opt-in)
 isyncyou export    # export archived events/contacts to .ics / .vcf
 isyncyou migrate   # move an account's archive directory
-isyncyou serve     # serve the local API on the default owner-only Unix socket
-isyncyou serve --tcp  # optional browser/TCP transport, loopback-only
+isyncyou serve     # serve the local API/web UI (Unix socket by default; --tcp for loopback)
 ```
 
 Token resolution: `--token` / `ISYNCYOU_TOKEN` wins; otherwise the per-account
 token cached by `login` is loaded and auto-refreshed.
+
+## Architecture
+
+```
+crates/  graph (OAuth/delta/throttle/upload) · store (SQLite+FTS5) · pathmap ·
+         core (config/conflict/guard/recovery/sync-state) · change-source ·
+         connectors (onedrive/mail/calendar/contacts/todo/onenote/shared/restore/
+         export/mime/archive) · acceptance (A1–A10 harness)
+bin/     isyncyou (CLI) · isyncyoud (daemon) · isyncyou-doctor
+gui/     statusbar (own tiny-skia + cosmic-text renderer) · webui (router + minimal HTTP server)
+```
+
+The **same** status-bar renderer draws on screen *and* renders headless to a PNG,
+so the UI is its own visual test harness — no display server, no browser
+automation. The screenshots in this README's status-bar section are produced by
+exactly that path.
 
 ## Build & test
 
@@ -177,33 +237,32 @@ unique item prefix and teardown.
 
 This section is deliberately blunt — it is the inverse of the status table.
 
-- **Cloud restore is off by default.** It re-creates items as *new copies* (new ids;
-  Microsoft 365 personal accounts offer no byte-identical import). All five backup
-  services (mail, calendar, contacts, ToDo, OneNote) go through the crash-safe
-  operation ledger (complete + live-confirmed, each with its own recovery marker); a
-  service with no crash-safe path is **refused** rather than run unsafely.
-  `cloud_restore_enabled` is `false` by default — a deliberate opt-in, since it writes
-  to the real account.
-- **Data at rest is only partially protected.** `isyncyou login --keyring`
-  stores token JSON in the desktop Secret Service / KDE Wallet compatible keyring
-  and leaves only a non-secret marker file in the archive root. Headless/file
-  caches are owner-only on Unix (`0600`) and can be AES-256-GCM encrypted when a
-  token-cache secret is configured (`ISYNCYOU_TOKEN_CACHE_KEY_FILE`, systemd
-  credential `isyncyou-token-cache-key`, or `ISYNCYOU_TOKEN_CACHE_KEY`). Without
-  keyring or that secret they still fall back to plaintext for now. The SQLite
-  store can be SQLCipher-encrypted by configuring `ISYNCYOU_STORE_KEY_FILE`,
-  systemd credential `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY`; without that
-  store key, new stores remain plaintext and `isyncyou-doctor` warns. Do not
-  point plaintext stores at sensitive data on a shared machine.
+- **Cloud restore is off by default.** It re-creates items as *new copies* (new
+  ids; Microsoft 365 personal accounts offer no byte-identical import). All five
+  backup services go through the crash-safe operation ledger (complete +
+  live-confirmed, each with its own recovery marker); a service with no crash-safe
+  path is **refused** rather than run unsafely. `cloud_restore_enabled` is `false`
+  by default — a deliberate opt-in, since it writes to the real account.
+- **Data at rest is only partially protected.** `isyncyou login --keyring` stores
+  token JSON in the desktop Secret Service / KDE Wallet compatible keyring and
+  leaves only a non-secret marker file in the archive root. Headless/file caches are
+  owner-only on Unix (`0600`) and can be AES-256-GCM encrypted when a token-cache
+  secret is configured (`ISYNCYOU_TOKEN_CACHE_KEY_FILE`, systemd credential
+  `isyncyou-token-cache-key`, or `ISYNCYOU_TOKEN_CACHE_KEY`). Without keyring or
+  that secret they still fall back to plaintext for now. The SQLite store can be
+  SQLCipher-encrypted via `ISYNCYOU_STORE_KEY_FILE`, systemd credential
+  `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY`; without that key, new stores remain
+  plaintext and `isyncyou-doctor` warns. Do not point plaintext stores at sensitive
+  data on a shared machine.
 - **No deployed staging / full E2E suite yet.** There is an acceptance + chaos
-  harness, but the end-to-end pipeline against a live environment is being stood
-  up. Release artifacts are built by CI with a CycloneDX SBOM and signed GitHub
-  artifact attestations, but staging/live-E2E evidence is still separate.
+  harness, but the end-to-end pipeline against a live environment is being stood up.
+  Release artifacts are built by CI with a CycloneDX SBOM and signed GitHub artifact
+  attestations, but staging/live-E2E evidence is still separate.
 - **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are
-  platform/environment-gated.** They need a display server, a host-side KF6
-  plugin, or privileged mounts respectively. The PBS path has deterministic local
-  coverage plus a live test-account round-trip, but rerunning that live probe
-  still requires a configured PBS repository.
+  platform/environment-gated.** They need a display server, a host-side KF6 plugin,
+  or privileged mounts respectively. The PBS path has deterministic local coverage
+  plus a live test-account round-trip, but rerunning that live probe still requires a
+  configured PBS repository.
 - **Personal Vault and some "shared with me" data are not reachable** via Graph for
   third-party clients — these are upstream platform limits, not bugs.
 
@@ -226,6 +285,12 @@ restore-fidelity matrix, sync-state machine, path mapping, delete/trash/conflict
 model, auth/token lifecycle, SQLite/PBS snapshot consistency, local-API security,
 packaging/daemon model.
 
+## Contributing
+
+Issues and PRs are welcome. PRs are gated on `fmt`, `clippy -D warnings`, the test
+suite and `cargo deny`; see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and
+[SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+
 ## License
 
-[Apache-2.0](LICENSE). Private until the first release candidate.
+[Apache-2.0](LICENSE).
