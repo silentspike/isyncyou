@@ -156,9 +156,9 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         account: String,
-        /// Service the item belongs to. Cloud restore: **mail only** (crash-safe);
-        /// other services are refused until ledger-migrated. `--to-local` / `--preview`
-        /// work for any service with an archived body (incl. onenote).
+        /// Service the item belongs to. Cloud restore is crash-safe for **all backup
+        /// services** (mail, calendar, contacts, todo, onenote). `--to-local` /
+        /// `--preview` work for any service with an archived body.
         #[arg(long)]
         service: String,
         /// The archived item's `remote_id`.
@@ -2478,17 +2478,17 @@ mod tests {
     }
 
     #[test]
-    fn non_mail_cloud_restore_refuses_before_token_lookup() {
-        // A non-ledger service must be refused before any token resolution — passing
-        // no token still yields the "not crash-safe yet" message, not a token error.
+    fn non_restorable_cloud_restore_refuses_before_token_lookup() {
+        // A service with no crash-safe cloud restore must be refused before any token
+        // resolution — passing no token still yields the refusal, not a token error.
+        // All five backup services are ledger-backed; a non-backup service such as
+        // onedrive is refused here.
         let dir = std::env::temp_dir().join(format!("isyncyou-cli-nonmail-{}", std::process::id()));
         let arch = dir.join("arch");
         std::fs::create_dir_all(&arch).unwrap();
         let p = write_config(&dir, &arch); // sets cloud_restore_enabled = true
-        for service in ["calendar", "contacts", "todo", "onenote"] {
-            let err = cmd_restore(&p, "a", service, "x", None, false, None).unwrap_err();
-            assert!(err.contains("not crash-safe yet"), "{service}: got: {err}");
-        }
+        let err = cmd_restore(&p, "a", "onedrive", "x", None, false, None).unwrap_err();
+        assert!(err.contains("not crash-safe yet"), "onedrive: got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
