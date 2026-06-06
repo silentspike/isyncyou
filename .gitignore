@@ -32,12 +32,6 @@ llm-*.md
 .env
 .DS_Store
 
-# Internal showcase / pitch / case-study artifacts — kept local, never in the
-# public repo. The repository shows how we actually work; it is not a
-# built-to-impress storefront.
-SHOWCASE.md
-/docs/case-study/
-
 # Browser-automation + LLM scratch artifacts (never committed)
 .playwright-cli/
 llm-*.log
@@ -49,3 +43,52 @@ __pycache__/
 # Generated (HEAD-pinned) evidence manifest — produced by tools/generate_evidence_manifest.py
 # as a CI artifact; the curated docs/evidence/sample-manifest.json is the committed source.
 /docs/evidence/generated-manifest.json
+
+# --- Secrets, tokens, credentials: NEVER commit (defense-in-depth) ---
+# OAuth/MSAL token caches live in $HOME (~/.config/m365-{read,write}/token_cache.json),
+# never in the repo — but ignore them defensively in case anything is copied in.
+*token_cache*.json
+token_cache.json
+*.token
+# env files (any variant)
+.env
+.env.*
+*.env
+# private keys / certs / keystores
+*.key
+*.pem
+*.p12
+*.pfx
+*.ppk
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+# credential / secret blobs (extension-anchored so they never match source or secret-scan.yml)
+*.secret
+secrets.json
+secrets.toml
+secrets.yaml
+*.secrets.json
+*credential*.json
+*credential*.toml
+# PBS / storage password files + machine netrc
+*.pw
+.netrc
+.npmrc
+
+# --- Internal notes / scratch docs: never commit (the repo ships only public docs) ---
+# Public docs are explicit (README/CONTRIBUTING/SECURITY/CHANGELOG/CODE_OF_CONDUCT and
+# docs/**). Internal planning/session/scratch notes stay local.
+SHOWCASE.md
+/docs/case-study/
+*.local.md
+*-internal.md
+*.internal.md
+SCRATCH.md
+NOTES.local.md
+/notes/
+PLAN-*.md
+SESSION-*.md
+HANDOFF*.md
+TODO.local.md
