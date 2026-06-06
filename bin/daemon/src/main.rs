@@ -230,50 +230,55 @@ impl isyncyou_webui::SyncControl for Scheduler {
 }
 
 /// Finish any restore operations left mid-flight by a previous run, before serving
-/// (ADR-001 auto-recovery on boot). Each ledger-backed service (mail, calendar) is
-/// reconciled with the one cached write token; an account with pending operations but
-/// no cached write token is logged and retried next start. Best-effort and never fatal
-/// — a recovery failure must not stop the daemon.
+/// (ADR-001 auto-recovery on boot). Each ledger-backed service (mail, calendar,
+/// contacts) is reconciled with the one cached write token; an account with pending
+/// operations but no cached write token is logged and retried next start. Best-effort
+/// and never fatal — a recovery failure must not stop the daemon.
 fn recover_pending_restores(cfg: &Config) {
     for acc in &cfg.accounts {
         let mail_pending = isyncyou_engine::pending_mail_restore_count(cfg, &acc.id).unwrap_or(0);
         let cal_pending =
             isyncyou_engine::pending_calendar_restore_count(cfg, &acc.id).unwrap_or(0);
-        let pending = mail_pending + cal_pending;
+        let contact_pending =
+            isyncyou_engine::pending_contacts_restore_count(cfg, &acc.id).unwrap_or(0);
+        let pending = mail_pending + cal_pending + contact_pending;
         if pending == 0 {
             continue;
         }
         match isyncyou_engine::auth::resolve_cached_restore_token(cfg, &acc.id) {
             Ok(token) => {
-                // One token recovers both verticals; report per service.
-                if mail_pending > 0 {
-                    match isyncyou_engine::recover_pending_mail_restores(
-                        cfg,
-                        &acc.id,
-                        token.clone(),
-                    ) {
-                        Ok((done, failed)) => eprintln!(
-                            "isyncyoud: mail restore recovery [{}]: {done} completed, {failed} \
-                             still pending",
-                            acc.id
-                        ),
-                        Err(e) => {
-                            eprintln!("isyncyoud: mail restore recovery [{}] failed: {e}", acc.id)
-                        }
+                // One token recovers every vertical; report per service.
+                let report = |svc: &str, r: Result<(usize, usize), String>| match r {
+                    Ok((done, failed)) => eprintln!(
+                        "isyncyoud: {svc} restore recovery [{}]: {done} completed, {failed} \
+                         still pending",
+                        acc.id
+                    ),
+                    Err(e) => {
+                        eprintln!("isyncyoud: {svc} restore recovery [{}] failed: {e}", acc.id)
                     }
+                };
+                if mail_pending > 0 {
+                    report(
+                        "mail",
+                        isyncyou_engine::recover_pending_mail_restores(cfg, &acc.id, token.clone()),
+                    );
                 }
                 if cal_pending > 0 {
-                    match isyncyou_engine::recover_pending_calendar_restores(cfg, &acc.id, token) {
-                        Ok((done, failed)) => eprintln!(
-                            "isyncyoud: calendar restore recovery [{}]: {done} completed, {failed} \
-                             still pending",
-                            acc.id
+                    report(
+                        "calendar",
+                        isyncyou_engine::recover_pending_calendar_restores(
+                            cfg,
+                            &acc.id,
+                            token.clone(),
                         ),
-                        Err(e) => eprintln!(
-                            "isyncyoud: calendar restore recovery [{}] failed: {e}",
-                            acc.id
-                        ),
-                    }
+                    );
+                }
+                if contact_pending > 0 {
+                    report(
+                        "contacts",
+                        isyncyou_engine::recover_pending_contacts_restores(cfg, &acc.id, token),
+                    );
                 }
             }
             Err(e) => eprintln!(
@@ -434,11 +439,11 @@ mod tests {
     fn restore_handler_refuses_unmigrated_service_before_token_lookup() {
         // The web-UI restore handler refuses a not-yet-ledger-migrated service before
         // any cached-token lookup (so no token is needed to get the clear message).
-        // Mail and calendar are ledger-backed and excluded here.
+        // Mail, calendar and contacts are ledger-backed and excluded here.
         let h = DaemonRestore {
             cfg: Config::default(),
         };
-        for service in ["contacts", "todo", "onenote"] {
+        for service in ["todo", "onenote"] {
             let err = isyncyou_webui::RestoreHandler::restore(&h, "a", service, "x").unwrap_err();
             assert!(err.contains("not crash-safe yet"), "{service}: got: {err}");
         }

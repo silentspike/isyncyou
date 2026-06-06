@@ -58,6 +58,15 @@ pub fn calendar_marker(key: &str) -> String {
     format!("isyncyou-restore-{key}")
 }
 
+/// A findable contact marker derived from the key: the **value** stored in a
+/// single-value extended property on `POST /me/contacts`. Confirmed live
+/// (`tools/live_contacts_probe.py`) that Graph accepts the extended property and that
+/// `$filter` on `singleValueExtendedProperties/any(...)` finds it again — so contacts
+/// use the mail-shaped marker-probe model (unlike calendar).
+pub fn contact_marker(key: &str) -> String {
+    format!("isyncyou-restore-{key}")
+}
+
 /// Load the per-install restore secret from `path`, creating it (32 random bytes,
 /// owner-only) if it does not exist. The secret is binary and never logged.
 pub fn load_or_create_secret(path: &Path) -> Result<Vec<u8>, String> {
@@ -157,6 +166,11 @@ mod tests {
         assert_eq!(m, "isyncyou-restore-deadbeef");
         // A 64-hex key keeps the transactionId well under Graph's 256-char limit.
         assert!(calendar_marker(&"a".repeat(64)).len() < 256);
+    }
+
+    #[test]
+    fn contact_marker_is_a_short_stable_value() {
+        assert_eq!(contact_marker("deadbeef"), "isyncyou-restore-deadbeef");
     }
 
     #[test]

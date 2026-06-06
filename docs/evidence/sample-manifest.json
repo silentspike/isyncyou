@@ -107,7 +107,7 @@
     {
       "id": "EV-011",
       "requirement": "REQ-RST-006",
-      "claim": "A not-yet-ledger-backed cloud restore (contacts/todo/onenote) is refused before any store access or token lookup, never run via a non-crash-safe direct POST.",
+      "claim": "A not-yet-ledger-backed cloud restore (todo/onenote) is refused before any store access or token lookup, never run via a non-crash-safe direct POST.",
       "method": "test",
       "command": "cargo test -p isyncyou-engine restore_cloud_refuses_unmigrated_services_until_ledger_migrated",
       "result": "pass",
@@ -344,6 +344,37 @@
       "result": "pass",
       "evidence": "POST /me/events -> 201; transactionId preserved; re-POST same transactionId -> 201 same id: True; GET $filter transactionId -> 400 (supported: False); cleanup DELETE -> 204; VERDICT transactionId server-side de-dup: YES",
       "artifact": "tools/live_calendar_probe.py"
+    },
+    {
+      "id": "EV-035",
+      "requirement": "REQ-RST-011",
+      "claim": "Contacts restore is wired through the ledger (mail-shape): the sink stamps the single-value extended-property marker the recovery probe later searches for, and sanitize_contact drops read-only/photo fields before the POST.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine create_stamps_marker_property_and_drops_non_writable_fields",
+      "result": "pass",
+      "evidence": "test restore_contacts::tests::create_stamps_marker_property_and_drops_non_writable_fields ... ok",
+      "notes": "Crash-safety for contacts is proven against a non-idempotent fake by the crash-matrix in restore_contacts::tests (happy_path / crash_after_post_landed / crash_before_post_landed / boot_recovery_reconciles_a_pending_op_without_creating); EV-037 is the live confirmation.",
+      "test": "create_stamps_marker_property_and_drops_non_writable_fields"
+    },
+    {
+      "id": "EV-036",
+      "requirement": "REQ-RST-011",
+      "claim": "engine::restore_cloud routes a contacts restore past the crash-safety gate to the contacts ledger path (it is not refused as unsupported), reaching the account lookup.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine restore_cloud_routes_contacts_past_the_support_gate",
+      "result": "pass",
+      "evidence": "test tests::restore_cloud_routes_contacts_past_the_support_gate ... ok",
+      "test": "restore_cloud_routes_contacts_past_the_support_gate"
+    },
+    {
+      "id": "EV-037",
+      "requirement": "REQ-RST-011",
+      "claim": "Live: Microsoft Graph accepts a single-value extended property on POST /me/contacts and a singleValueExtendedProperties $filter finds the contact again — the marker probe the contacts crash recovery relies on.",
+      "method": "probe",
+      "command": "python3 tools/live_contacts_probe.py",
+      "result": "pass",
+      "evidence": "POST /me/contacts -> 201; GET $filter singleValueExtendedProperties -> 200, matches: 1; cleanup DELETE -> 204; VERDICT create accepts extended property: YES; $filter finds it: YES",
+      "artifact": "tools/live_contacts_probe.py"
     }
   ]
 }
