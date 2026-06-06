@@ -22,17 +22,11 @@ jobs:
   analyze:
     name: Analyze (rust)
     runs-on: ubuntu-latest
-    # CodeQL's Rust support is still experimental: init + autobuild succeed but the
-    # analyze step currently fails on macro-expansion in the extractor. Keep the scan
-    # as best-effort so it does not report a misleading failure.
-    #
-    # This workflow triggers on push/PR to `main`, so it runs on the FIRST public `main`
-    # build automatically (CodeQL is free on public repos; it needs GitHub Advanced
-    # Security while private). PUBLIC-FLIP ACTION (#294, tracked in the public-flip
-    # sweep): confirm the analyze job actually executed on the first public `main` build,
-    # then drop `continue-on-error` to make CodeQL an enforced gate once its Rust
-    # analysis is stable.
-    continue-on-error: true
+    # Enforced gate (#348): the Rust analyze step runs clean on `main` PRs (verified —
+    # every step succeeds on its own, not masked), so a real finding now fails the
+    # build. `Analyze (rust)` is a required status check on `main` via branch
+    # protection. (CodeQL is free on public repos; it needed GitHub Advanced Security
+    # while the repo was private.)
     permissions:
       contents: read
       security-events: write

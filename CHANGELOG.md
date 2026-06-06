@@ -46,6 +46,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   publishes an RC with no manual steps — `promote.yml` opens and auto-merges a
   tree-overlay PR at each stage (PAT-driven, so each stage's required CI runs and
   the merge re-triggers the next hop).
+- CodeQL (Rust SAST) is now an **enforced** gate on `main` (`continue-on-error`
+  removed; required status check) — a real finding fails the build (#348).
+- Release artifacts are **cosign-signed** (keyless / Sigstore, ambient OIDC, no
+  stored key): each binary, the SBOM and `SHA256SUMS` ship a `.cosign.bundle`
+  verifiable with `cosign verify-blob` (#349).
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
