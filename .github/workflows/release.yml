@@ -95,6 +95,24 @@ jobs:
             isyncyou-windows-x86_64.zip \
             isyncyou.sbom.cdx.json > SHA256SUMS)
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign artifacts (cosign keyless / Sigstore)
+        run: |
+          # Keyless signing via ambient GitHub OIDC (id-token: write) — no stored key.
+          # Each .cosign.bundle is self-contained (signature + Fulcio cert + Rekor proof),
+          # verifiable with `cosign verify-blob --bundle <f>.cosign.bundle ...`.
+          for f in \
+            isyncyou-linux-x86_64.tar.gz \
+            isyncyou-x86_64.AppImage \
+            isyncyou-windows-x86_64.zip \
+            isyncyou.sbom.cdx.json \
+            SHA256SUMS; do
+            cosign sign-blob --yes "dist/$f" --bundle "dist/$f.cosign.bundle"
+          done
+          ls -la dist/*.cosign.bundle
+
       - name: Attest release artifact provenance
         uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
         with:
@@ -126,6 +144,7 @@ jobs:
             dist/isyncyou-windows-x86_64.zip.sha256
             dist/SHA256SUMS
             dist/isyncyou.sbom.cdx.json
+            dist/*.cosign.bundle
             dist/isyncyou/
 
       - name: Publish RC prerelease (on push to main)
@@ -144,9 +163,19 @@ jobs:
             dist/isyncyou-windows-x86_64.zip.sha256
             dist/SHA256SUMS
             dist/isyncyou.sbom.cdx.json
+            dist/*.cosign.bundle
           body: |
             Automated RC build from `${{ github.sha }}`.
-            Artifacts include a CycloneDX SBOM and GitHub artifact attestations.
+            Artifacts include a CycloneDX SBOM, GitHub artifact attestations, and
+            cosign (Sigstore) signatures. Verify any artifact, e.g.:
+
+            ```sh
+            cosign verify-blob \
+              --bundle isyncyou-linux-x86_64.tar.gz.cosign.bundle \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp '^https://github.com/silentspike/isyncyou/.github/workflows/release.yml@' \
+              isyncyou-linux-x86_64.tar.gz
+            ```
 
       - name: Publish release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -161,4 +190,5 @@ jobs:
             dist/isyncyou-windows-x86_64.zip.sha256
             dist/SHA256SUMS
             dist/isyncyou.sbom.cdx.json
+            dist/*.cosign.bundle
           generate_release_notes: true
