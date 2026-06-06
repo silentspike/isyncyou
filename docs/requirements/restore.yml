@@ -93,23 +93,24 @@ requirements:
       - test: boot_recovery_reconciles_a_pending_op_without_creating
 
   - id: REQ-RST-006
-    title: Non-ledger cloud restore is refused, not run unsafely
+    title: Only ledger-backed services may mutate the cloud; others are refused
     statement: >
-      Cloud-mutating restore for a service whose path is not yet crash-safe
-      (ledger-backed) must be refused — never executed via a direct, non-crash-safe
-      POST. Mail, calendar, contacts and todo qualify today; only onenote is refused.
+      Cloud-mutating restore must only run for a crash-safe (ledger-backed) service —
+      never via a direct, non-crash-safe POST. Every backup service (mail, calendar,
+      contacts, todo, onenote) is now ledger-backed; a service with no crash-safe cloud
+      restore (e.g. a non-backup service) is refused before any store/network access.
     rationale: A direct POST can duplicate the item on a mid-restore crash (ADR-001).
     status: implemented
     design: docs/adr/001-restore-semantics.md
     acceptance:
-      - The engine refuses a not-yet-ledger-backed cloud restore (onenote)
-        before any store/network access.
+      - Every backup service is reported as ledger-backed (cloud_restore_service_supported).
+      - The engine refuses a non-restorable service before any store/network access.
       - The CLI refuses before resolving a token.
       - The daemon web-UI handler refuses before resolving a token.
     verified_by:
-      - test: restore_cloud_refuses_unmigrated_services_until_ledger_migrated
-      - test: unmigrated_cloud_restore_refuses_before_token_lookup
-      - test: restore_handler_refuses_unmigrated_service_before_token_lookup
+      - test: every_backup_service_is_ledger_backed_and_unknown_is_rejected
+      - test: non_restorable_cloud_restore_refuses_before_token_lookup
+      - test: restore_handler_refuses_non_restorable_service_before_token_lookup
 
   - id: REQ-RST-007
     title: Restore write scopes use the personal-account OneNote scope
@@ -285,3 +286,51 @@ requirements:
       - test: boot_recovery_reconciles_a_pending_op_without_creating
       - test: happy_path_creates_one_and_is_idempotent_on_repeat
       - file: tools/live_todo_probe.py
+
+  - id: REQ-RST-013
+    title: OneNote cloud restore is crash-safe (ledger-backed, invisible comment marker)
+    statement: >
+      Cloud-mutating OneNote restore must go through the operation ledger (ADR-001): it
+      stamps an invisible HTML-comment marker (derived from the content HMAC) in the page
+      body, rewrites archived resource URLs to multipart name:<part> references and
+      re-uploads the bytes, records intent before the POST, and on a re-entry after a
+      crash reconciles by listing pages and scanning each page's /content for the
+      marker — producing exactly one page, never a duplicate.
+    rationale: >
+      OneNote is the fifth and last vertical, completing crash-safe cloud restore for all
+      backup services. A live probe (tools/live_onenote_probe.py) confirmed both a title
+      $filter and an HTML-comment-in-content scan work; the comment is chosen because it
+      is invisible when rendered (cleaner than ToDo's visible marker), at the cost of an
+      O(n) content scan on recovery. Restore is resource-aware (multipart re-upload), so
+      it never depends on the source page's possibly-expired resource URLs.
+      cloud_restore_enabled stays off by default (REQ-RST-001).
+    status: implemented
+    design: docs/adr/001-restore-semantics.md
+    note: >
+      The two Graph calls (create page / list+scan content) sit behind the OneNoteApi
+      trait so the ledger wiring and recovery are proven against a non-idempotent fake;
+      the sink rewrites resource URLs + stamps the comment, and load_resources reads the
+      <page>.resources.json manifest to build the multipart parts. The content scan
+      follows @odata.nextLink to the end — no silent cap. engine::restore_cloud routes
+      onenote to the ledger path and the daemon recovers pending onenote ops on boot.
+      Builds on the multipart page-create shape from REQ-RST-009.
+    acceptance:
+      - onenote is in CLOUD_RESTORE_SERVICES and routed by engine::restore_cloud.
+      - The sink stamps an invisible HTML-comment marker and rewrites resource URLs.
+      - A page with a resource manifest restores via multipart with re-uploaded bytes.
+      - A page with no manifest restores as plain HTML.
+      - Crash after the POST landed yields exactly one page (found by the content scan).
+      - Crash before the POST landed creates exactly one page on recovery.
+      - Boot recovery reconciles a pending onenote op without creating a new page.
+      - A repeat of identical content returns the same id without a second create.
+      - Live: an HTML-comment marker round-trips in page /content and a scan finds it.
+    verified_by:
+      - test: restore_cloud_routes_onenote_past_the_support_gate
+      - test: create_stamps_invisible_marker_found_by_scan
+      - test: load_resources_builds_parts_and_rewrites_from_manifest
+      - test: missing_manifest_means_plain_html_restore
+      - test: crash_after_post_landed_does_not_duplicate
+      - test: crash_before_post_landed_creates_exactly_one_on_recovery
+      - test: boot_recovery_reconciles_a_pending_op_without_creating
+      - test: happy_path_creates_one_and_is_idempotent_on_repeat
+      - file: tools/live_onenote_probe.py

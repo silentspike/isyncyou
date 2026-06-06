@@ -107,12 +107,12 @@
     {
       "id": "EV-011",
       "requirement": "REQ-RST-006",
-      "claim": "A not-yet-ledger-backed cloud restore (onenote) is refused before any store access or token lookup, never run via a non-crash-safe direct POST.",
+      "claim": "Every backup service (mail/calendar/contacts/todo/onenote) is ledger-backed, and a service with no restore path is rejected before any store access or token lookup, never run via a non-crash-safe direct POST.",
       "method": "test",
-      "command": "cargo test -p isyncyou-engine restore_cloud_refuses_unmigrated_services_until_ledger_migrated",
+      "command": "cargo test -p isyncyou-engine every_backup_service_is_ledger_backed_and_unknown_is_rejected",
       "result": "pass",
-      "evidence": "test tests::restore_cloud_refuses_unmigrated_services_until_ledger_migrated ... ok",
-      "test": "restore_cloud_refuses_unmigrated_services_until_ledger_migrated"
+      "evidence": "test tests::every_backup_service_is_ledger_backed_and_unknown_is_rejected ... ok",
+      "test": "every_backup_service_is_ledger_backed_and_unknown_is_rejected"
     },
     {
       "id": "EV-012",
@@ -406,6 +406,37 @@
       "result": "pass",
       "evidence": "POST task -> 201; H1 $filter extended property -> 400 (unsupported on todoTask); H3 LIST+scan body for marker -> 200 found: True; cleanup DELETE -> 204; DESIGN: ledger + LIST-scan marker probe",
       "artifact": "tools/live_todo_probe.py"
+    },
+    {
+      "id": "EV-041",
+      "requirement": "REQ-RST-013",
+      "claim": "OneNote restore is wired through the ledger: the sink stamps an invisible HTML-comment marker the recovery scan searches for, and recovery reconciles by listing pages and scanning each page's /content.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine create_stamps_invisible_marker_found_by_scan",
+      "result": "pass",
+      "evidence": "test restore_onenote::tests::create_stamps_invisible_marker_found_by_scan ... ok",
+      "notes": "Crash-safety for onenote is proven against a non-idempotent fake by the crash-matrix in restore_onenote::tests (happy_path / crash_after_post_landed / crash_before_post_landed / boot_recovery_reconciles_a_pending_op_without_creating); EV-043 is the live confirmation.",
+      "test": "create_stamps_invisible_marker_found_by_scan"
+    },
+    {
+      "id": "EV-042",
+      "requirement": "REQ-RST-013",
+      "claim": "OneNote restore is resource-aware: load_resources reads the per-page manifest, building multipart parts with re-uploaded bytes and rewriting source URLs to name:<part>; a page with no manifest restores as plain HTML.",
+      "method": "test",
+      "command": "cargo test -p isyncyou-engine load_resources_builds_parts_and_rewrites_from_manifest && cargo test -p isyncyou-engine missing_manifest_means_plain_html_restore",
+      "result": "pass",
+      "evidence": "test restore_onenote::tests::load_resources_builds_parts_and_rewrites_from_manifest ... ok; test restore_onenote::tests::missing_manifest_means_plain_html_restore ... ok",
+      "test": "load_resources_builds_parts_and_rewrites_from_manifest"
+    },
+    {
+      "id": "EV-043",
+      "requirement": "REQ-RST-013",
+      "claim": "Live: a OneNote page created with an HTML-comment marker round-trips that marker in its /content and a LIST + per-page content scan finds it (and a title $filter also works) — the content-scan probe the onenote crash recovery relies on.",
+      "method": "probe",
+      "command": "python3 tools/live_onenote_probe.py",
+      "result": "pass",
+      "evidence": "POST page -> 201; H1 $filter title -> 200 matches:1; H2 LIST + per-page content scan -> found: True; cleanup DELETE -> 204; DESIGN: ledger + content-scan with invisible comment marker",
+      "artifact": "tools/live_onenote_probe.py"
     }
   ]
 }
