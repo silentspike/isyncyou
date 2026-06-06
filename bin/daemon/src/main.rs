@@ -231,7 +231,7 @@ impl isyncyou_webui::SyncControl for Scheduler {
 
 /// Finish any restore operations left mid-flight by a previous run, before serving
 /// (ADR-001 auto-recovery on boot). Each ledger-backed service (mail, calendar,
-/// contacts) is reconciled with the one cached write token; an account with pending
+/// contacts, todo) is reconciled with the one cached write token; an account with pending
 /// operations but no cached write token is logged and retried next start. Best-effort
 /// and never fatal — a recovery failure must not stop the daemon.
 fn recover_pending_restores(cfg: &Config) {
@@ -241,7 +241,8 @@ fn recover_pending_restores(cfg: &Config) {
             isyncyou_engine::pending_calendar_restore_count(cfg, &acc.id).unwrap_or(0);
         let contact_pending =
             isyncyou_engine::pending_contacts_restore_count(cfg, &acc.id).unwrap_or(0);
-        let pending = mail_pending + cal_pending + contact_pending;
+        let todo_pending = isyncyou_engine::pending_todo_restore_count(cfg, &acc.id).unwrap_or(0);
+        let pending = mail_pending + cal_pending + contact_pending + todo_pending;
         if pending == 0 {
             continue;
         }
@@ -277,7 +278,17 @@ fn recover_pending_restores(cfg: &Config) {
                 if contact_pending > 0 {
                     report(
                         "contacts",
-                        isyncyou_engine::recover_pending_contacts_restores(cfg, &acc.id, token),
+                        isyncyou_engine::recover_pending_contacts_restores(
+                            cfg,
+                            &acc.id,
+                            token.clone(),
+                        ),
+                    );
+                }
+                if todo_pending > 0 {
+                    report(
+                        "todo",
+                        isyncyou_engine::recover_pending_todo_restores(cfg, &acc.id, token),
                     );
                 }
             }
@@ -439,13 +450,11 @@ mod tests {
     fn restore_handler_refuses_unmigrated_service_before_token_lookup() {
         // The web-UI restore handler refuses a not-yet-ledger-migrated service before
         // any cached-token lookup (so no token is needed to get the clear message).
-        // Mail, calendar and contacts are ledger-backed and excluded here.
+        // Mail, calendar, contacts and todo are ledger-backed and excluded here.
         let h = DaemonRestore {
             cfg: Config::default(),
         };
-        for service in ["todo", "onenote"] {
-            let err = isyncyou_webui::RestoreHandler::restore(&h, "a", service, "x").unwrap_err();
-            assert!(err.contains("not crash-safe yet"), "{service}: got: {err}");
-        }
+        let err = isyncyou_webui::RestoreHandler::restore(&h, "a", "onenote", "x").unwrap_err();
+        assert!(err.contains("not crash-safe yet"), "onenote: got: {err}");
     }
 }

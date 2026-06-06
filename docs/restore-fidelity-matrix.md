@@ -8,10 +8,13 @@ API, and a re-create with rich metadata is sufficient (plan §12).
 Connector-level restore helpers are implemented in `isyncyou-connectors::restore`
 and are unit-tested; live round-trips are env-gated against the throwaway account
 `testuser@example.com` (fetch/build → restore → verify → cleanup-delete), never
-the real account. The product cloud-mutation entry point is stricter: today only
-mail is ledger-backed and accepted by `isyncyou restore`; calendar/contacts/ToDo
-and OneNote cloud restore are refused until each path is migrated to the crash-safe
-operation ledger.
+the real account. The product cloud-mutation entry point is stricter: today mail,
+calendar, contacts and ToDo are ledger-backed and accepted by `isyncyou restore`;
+only OneNote cloud restore is refused until its path is migrated to the crash-safe
+operation ledger. Each ledger-backed service carries a findable crash-recovery
+marker, whose mechanism differs per service (mail: `internetMessageId`; calendar:
+`transactionId` server-side de-dup; contacts: a single-value extended property;
+ToDo: a body marker found by a LIST scan — the one visible marker, noted below).
 
 Legend: **preserved** = round-trips intact · **reset** = server assigns a new
 value · **lossy** = approximated/dropped · **n/a** = not applicable.
@@ -20,7 +23,7 @@ value · **lossy** = approximated/dropped · **n/a** = not applicable.
 |---|---|---|---|---|---|
 | Mail | `POST /me/messages` (base64 MIME, `text/plain`) | full MIME: headers, body (HTML+text), attachments, `internetMessageId` | message `id`; lands in **Drafts** (`isDraft=true`) | original folder placement (a follow-up move); read/flag state | ✅ synthetic MIME → draft → verified → deleted |
 | Calendar | `POST /me/events` | subject, body, start/end, location, attendees, categories, importance, sensitivity, showAs, recurrence, reminders | event `id`, `iCalUId`, `changeKey`, `webLink`, `createdDateTime` | organizer is set to the mailbox owner; recurring events are captured as the series master (with its recurrence rule) **and** their windowed occurrences (linked via `seriesMasterId`) — restoring the master recreates the recurring series, restoring a single occurrence makes a one-off event | ✅ real event 'Team-Standup' re-created → verified → deleted |
-| ToDo | `POST /me/todo/lists/{list}/tasks` | title, body, importance, status, due/start/reminder, categories, recurrence | task `id`, timestamps | restored into the chosen list (original list id if archived) | ✅ real task 'Backup Test Task' re-created → verified → deleted |
+| ToDo | `POST /me/todo/lists/{list}/tasks` | title, body, importance, status, due/start/reminder, categories, recurrence | task `id`, timestamps | restored into the parent list (`parent_remote_id`); **a crash-recovery marker line is appended to the task body** — ToDo has no invisible marker (extended-property `$filter` is unsupported on a todoTask, HTTP 400), so the ledger reconciles by a LIST scan for that body marker (documented visible fidelity trade-off) | ✅ real task 'Backup Test Task' re-created → verified → deleted; body-marker round-trip + LIST scan live-confirmed (`tools/live_todo_probe.py`) |
 | Contacts | `POST /me/contacts` | display/given/sur/middle/nick name, emails, phones, company, jobTitle, addresses, birthday, notes, categories | contact `id`, timestamps | contact photo is archived locally, but Graph contact-photo update is **not supported for delegated personal Microsoft accounts** ([Microsoft Graph profilePhoto update permissions](https://learn.microsoft.com/en-us/graph/api/profilephoto-update?view=graph-rest-1.0)); photo fields are deliberately stripped from contact create payloads | ✅ synthetic contact re-created → verified → deleted |
 | OneNote | `POST /me/onenote/pages` (`text/html` or multipart `Presentation` + binary parts) | page title/body HTML accepted by Graph when the token has `Notes.ReadWrite`; referenced page resources are archived locally with a per-page manifest and connector restore can replay binary parts via Graph's documented `name:part` multipart shape | page `id`, timestamps, section placement | product cloud restore is still refused until the OneNote path is migrated to the crash-safe ledger | ⏳ env-gated connector live test |
 

@@ -67,6 +67,16 @@ pub fn contact_marker(key: &str) -> String {
     format!("isyncyou-restore-{key}")
 }
 
+/// A findable ToDo marker derived from the key: a string embedded in the restored
+/// task **body**. Microsoft To Do has no invisible marker — confirmed live
+/// (`tools/live_todo_probe.py`) that a todoTask rejects a `singleValueExtendedProperties`
+/// `$filter` (HTTP 400) but a body marker round-trips and is found by a LIST scan. So
+/// ToDo uses the weakest probe model (ledger + LIST-scan); the marker is visible in the
+/// restored task body (a documented fidelity trade-off).
+pub fn todo_marker(key: &str) -> String {
+    format!("isyncyou-restore-{key}")
+}
+
 /// Load the per-install restore secret from `path`, creating it (32 random bytes,
 /// owner-only) if it does not exist. The secret is binary and never logged.
 pub fn load_or_create_secret(path: &Path) -> Result<Vec<u8>, String> {
@@ -171,6 +181,11 @@ mod tests {
     #[test]
     fn contact_marker_is_a_short_stable_value() {
         assert_eq!(contact_marker("deadbeef"), "isyncyou-restore-deadbeef");
+    }
+
+    #[test]
+    fn todo_marker_is_a_short_stable_value() {
+        assert_eq!(todo_marker("deadbeef"), "isyncyou-restore-deadbeef");
     }
 
     #[test]
