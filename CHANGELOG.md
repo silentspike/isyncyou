@@ -42,6 +42,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   self-hosted exposure), with a paths-filter so docs-only PRs skip the compile gate;
   HEAD-pinned evidence-manifest generator; secret scanning (Gitleaks), license/advisory
   gate (cargo-deny); Epic/Story/Task issue model + auto-labeling.
+- Autonomous release promotion: a merge to `dev` cascades dev→staging→main and
+  publishes an RC with no manual steps — `promote.yml` opens and auto-merges a
+  tree-overlay PR at each stage (PAT-driven, so each stage's required CI runs and
+  the merge re-triggers the next hop).
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
