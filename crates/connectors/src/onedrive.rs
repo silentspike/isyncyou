@@ -1468,6 +1468,7 @@ mod tests {
     /// Live local→remote: upload via the connector + GraphClient, confirm the
     /// store has a clean row, then push-delete (removes from OneDrive + tombstones).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_push_upload_then_delete() {
         let _gate = crate::live_test_gate();
@@ -1513,6 +1514,7 @@ mod tests {
     /// uploadUrl** (no new session), proving resume survives a kill. Needs feature
     /// `http` + `ISYNCYOU_TEST_WRITE_TOKEN` (Files.ReadWrite).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_upload_resume_survives_process_kill() {
         use isyncyou_graph::UploadResumeStore;
@@ -1571,6 +1573,7 @@ mod tests {
     /// Live end-to-end: real OneDrive delta -> store, against the throwaway
     /// account. Needs feature `http` + `ISYNCYOU_TEST_TOKEN` (Files.Read).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_incremental_sync() {
         let _gate = crate::live_test_gate();
@@ -1606,6 +1609,7 @@ mod tests {
     /// Live remote→local: delta-sync the real drive, then materialize it to a temp
     /// sync root and confirm at least one file landed on disk with content.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_materialize_downloads() {
         let _gate = crate::live_test_gate();
@@ -1670,6 +1674,7 @@ mod tests {
     /// materialize it to disk, delete it on OneDrive, sync again, then confirm the
     /// local copy is moved to the trash. Needs `ISYNCYOU_TEST_WRITE_TOKEN`.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_remote_delete_moves_local_to_trash() {
         let _gate = crate::live_test_gate();
@@ -1729,6 +1734,7 @@ mod tests {
     /// push it, confirm it exists on OneDrive, then delete it. Needs the write
     /// token (`Files.ReadWrite`).
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_local_create_uploads_to_cloud() {
         use isyncyou_graph::Transport;
@@ -1783,6 +1789,7 @@ mod tests {
     /// locally (changing its size), then push the modify with an If-Match guard
     /// and confirm the cloud content updated. Needs the write token.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_local_modify_replaces_cloud_content() {
         let _gate = crate::live_test_gate();
@@ -1840,6 +1847,7 @@ mod tests {
     /// edit to a `*-host-safeBackup-NNNN` copy and re-mark the item remote_dirty,
     /// never overwriting the cloud (plan §10 / A3). Needs the write token.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_modify_conflict_keeps_both() {
         let _gate = crate::live_test_gate();
@@ -1920,6 +1928,7 @@ mod tests {
     /// locally, then scan + push the deletion and confirm it's gone on OneDrive.
     /// Needs the write token.
     #[cfg(feature = "http")]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
     #[test]
     fn live_local_delete_removes_from_cloud() {
         use isyncyou_graph::Transport;
