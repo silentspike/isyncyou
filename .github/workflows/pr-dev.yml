@@ -2,6 +2,10 @@ name: PR (dev)
 
 # Fast gate for PRs into `dev`: developers must be able to merge quickly.
 # Runs on GitHub-hosted runners (public-ready: no self-hosted exposure to fork PRs).
+# A `changes` filter gates the compile-heavy steps: docs/markdown-only PRs skip the
+# build, but the required checks (`dev-checks`, `cargo-deny`) still run and report
+# success (each job always runs; only the heavy steps are conditional), so branch
+# protection is never left waiting.
 on:
   pull_request:
     branches: [dev]
@@ -15,33 +19,67 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/**'
+
   dev-checks:
     name: dev-checks
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: No code/CI changes — skip compile gate
+        if: needs.changes.outputs.code != 'true'
+        run: echo "No Rust/Cargo/CI changes in this PR — compile gate skipped."
       - name: Install Linux GUI build deps
+        if: needs.changes.outputs.code == 'true'
         # winit / softbuffer (gui/statusbar-app) link against these on Linux.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        if: needs.changes.outputs.code == 'true'
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        if: needs.changes.outputs.code == 'true'
       - name: Format
+        if: needs.changes.outputs.code == 'true'
         run: cargo fmt --all --check
       - name: Clippy
+        if: needs.changes.outputs.code == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Unit tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test --workspace
 
   deny:
     name: cargo-deny
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: No dependency/deny changes — skip cargo-deny
+        if: needs.changes.outputs.code != 'true'
+        run: echo "No Cargo/deny.toml changes in this PR — cargo-deny skipped."
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.14
+        if: needs.changes.outputs.code == 'true'
         with:
           command: check
