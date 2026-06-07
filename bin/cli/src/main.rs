@@ -30,7 +30,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use isyncyou_connectors as connectors;
 
 #[derive(Parser, Debug)]
-#[command(name = "isyncyou", version, about = "Personal cloud sync client")]
+#[command(
+    name = "isyncyou",
+    version,
+    about = "Personal cloud sync client + Microsoft 365 backup & archive"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
