@@ -51,6 +51,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Release artifacts are **cosign-signed** (keyless / Sigstore, ambient OIDC, no
   stored key): each binary, the SBOM and `SHA256SUMS` ship a `.cosign.bundle`
   verifiable with `cosign verify-blob` (#349).
+- cargo-deny now installs via the SHA-pinned `cargo-deny-action` in **all** gates
+  (was an unverified `curl | tar` on staging/main) — removes a CI supply-chain
+  gap (#358).
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
