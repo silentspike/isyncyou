@@ -69,21 +69,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
-      - name: Install Linux GUI build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install cargo-deny (prebuilt)
-        run: |
-          if ! cargo deny --version >/dev/null 2>&1; then
-            ver=0.19.8
-            tmp=$(mktemp -d)
-            curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C "$tmp"
-            mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
-            install -m0755 "$tmp"/*/cargo-deny "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-deny"
-          fi
-      - run: cargo deny check
+      # cargo-deny via the official SHA-pinned action (checksum-verified install),
+      # consistent with pr-dev.yml — replaces an unverified curl|tar (#358).
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.14
+        with:
+          command: check
 
   docs:
     name: docs
