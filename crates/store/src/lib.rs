@@ -25,6 +25,8 @@ pub enum StoreError {
     AlreadyRunning(String),
     #[error("store encryption secret is invalid: {0}")]
     InvalidStoreSecret(String),
+    #[error("store at {0} is already encrypted (not a plaintext SQLite file)")]
+    AlreadyEncrypted(String),
     #[error("illegal restore-operation transition: {0}")]
     IllegalTransition(String),
 }
@@ -356,6 +358,123 @@ impl Store {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 backup path")
         })?;
         self.conn.execute("VACUUM INTO ?1", params![dest_str])?;
+        Ok(())
+    }
+
+    /// Migrate an existing **plaintext** store at `path` to a SQLCipher-encrypted
+    /// store, in place and atomically (`<path>.encrypting` + rename + fsync). All
+    /// rows are preserved; the FTS indexes are rebuilt from their content tables.
+    ///
+    /// Key semantics are identical to [`Store::open_encrypted`] by construction:
+    /// only [`apply_sqlcipher_key`] ever touches the key, and the plaintext source
+    /// is attached *from the keyed connection* with an empty `KEY ''` (SQLCipher's
+    /// documented plaintext attach) — so the migrated store opens with the same
+    /// secret later.
+    ///
+    /// Crash-safe + idempotent: the original file is never modified before the
+    /// final atomic rename (a crash mid-migration leaves the plaintext store fully
+    /// usable, plus a stale temp file that the next run removes); migrating an
+    /// already-encrypted store fails with [`StoreError::AlreadyEncrypted`] so a
+    /// re-run after success is a clean, detectable no-op for the caller.
+    pub fn migrate_to_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<()> {
+        let path = path.as_ref();
+        if secret.is_empty() {
+            return Err(StoreError::InvalidStoreSecret(
+                "secret must not be empty".into(),
+            ));
+        }
+        if !is_plaintext_sqlite(path)? {
+            return Err(StoreError::AlreadyEncrypted(path.display().to_string()));
+        }
+        let path_str = path.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 store path")
+        })?;
+
+        // 1. Open the source plaintext store normally: takes the instance lock,
+        //    brings the schema to the current version, and on clean close
+        //    checkpoints + removes the WAL so the file is complete on its own.
+        let copy_tables: Vec<String>;
+        {
+            let src = Self::open_plain(path)?;
+            // Ordinary data tables only: the FTS5 virtual tables and their shadow
+            // tables (`*_fts`, `*_fts_*`) are rebuilt on the target instead.
+            let mut stmt = src.conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' \
+                 AND name NOT LIKE 'sqlite_%' AND sql NOT LIKE 'CREATE VIRTUAL%' \
+                 AND name NOT LIKE '%\\_fts' ESCAPE '\\' \
+                 AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\'",
+            )?;
+            copy_tables = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            src.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        }
+
+        // 2. Build the encrypted target at a sibling temp path. A stale temp from
+        //    a crashed earlier run is removed first (resume = start fresh).
+        let tmp = PathBuf::from(format!("{path_str}.encrypting"));
+        for stale in [
+            tmp.clone(),
+            PathBuf::from(format!("{}-wal", tmp.display())),
+            PathBuf::from(format!("{}-shm", tmp.display())),
+            PathBuf::from(format!("{}.lock", tmp.display())),
+        ] {
+            match std::fs::remove_file(&stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        {
+            let dst = Self::open_encrypted(&tmp, secret)?;
+            dst.conn
+                .execute("ATTACH DATABASE ?1 AS src KEY ''", params![path_str])?;
+            // FK enforcement is per-connection; disable during the bulk copy so
+            // table order cannot matter, re-enable afterwards.
+            dst.conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let copy = || -> Result<()> {
+                dst.conn.execute_batch("BEGIN")?;
+                for t in &copy_tables {
+                    dst.conn.execute_batch(&format!(
+                        "INSERT INTO main.\"{t}\" SELECT * FROM src.\"{t}\""
+                    ))?;
+                }
+                dst.conn
+                    .execute_batch("INSERT INTO items_fts(items_fts) VALUES('rebuild')")?;
+                dst.conn
+                    .execute_batch("INSERT INTO bodies_fts(bodies_fts) VALUES('rebuild')")?;
+                dst.conn.execute_batch("COMMIT")?;
+                Ok(())
+            };
+            if let Err(e) = copy() {
+                let _ = dst.conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+            dst.conn.pragma_update(None, "foreign_keys", "ON")?;
+            dst.conn.execute_batch("DETACH DATABASE src")?;
+            dst.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        }
+        File::open(&tmp)?.sync_all()?;
+
+        // 3. Atomic swap. The source was closed cleanly (no -wal/-shm), but remove
+        //    any stale sidecars defensively: a leftover WAL paired with the new
+        //    encrypted file would be treated as hot journal garbage.
+        for stale in [
+            PathBuf::from(format!("{path_str}-wal")),
+            PathBuf::from(format!("{path_str}-shm")),
+        ] {
+            match std::fs::remove_file(&stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            File::open(dir)?.sync_all()?;
+        }
+        let _ = std::fs::remove_file(format!("{}.lock", tmp.display()));
         Ok(())
     }
 
@@ -1036,6 +1155,21 @@ fn apply_sqlcipher_key(conn: &Connection, secret: &[u8]) -> Result<()> {
     }
 }
 
+/// Whether the file at `path` starts with the plaintext SQLite magic. A
+/// SQLCipher-encrypted database encrypts the header too, so this distinguishes a
+/// plaintext store from an encrypted one without a key.
+fn is_plaintext_sqlite(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut f = File::open(path)?;
+    let mut magic = [0u8; 16];
+    match f.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == b"SQLite format 3\0"),
+        // shorter than a header: not a valid SQLite file either way
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
                     item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
                     change_key, internet_message_id, ical_uid, series_master_id";
@@ -1513,6 +1647,118 @@ mod tests {
         assert_eq!(
             reopened.search_bodies("a", "classified").unwrap(),
             vec![("mail".to_string(), "r-secret".to_string())]
+        );
+    }
+
+    /// Build a plaintext store with data in every copy-relevant shape: items,
+    /// FTS-indexed bodies, and a delta cursor.
+    fn seeded_plain_store(path: &Path) {
+        let store = Store::open(path).unwrap();
+        store
+            .upsert_item(&Item::new(
+                "a",
+                "mail",
+                "m1",
+                "Migration secret subject",
+                "message",
+            ))
+            .unwrap();
+        store
+            .index_body("a", "mail", "m1", "confidential migration body")
+            .unwrap();
+        store
+            .set_delta_cursor("a", "onedrive", "root", "cursor-token-xyz")
+            .unwrap();
+    }
+
+    #[test]
+    fn migrate_to_encrypted_preserves_rows_and_fts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        seeded_plain_store(&path);
+        assert!(std::fs::read(&path)
+            .unwrap()
+            .starts_with(b"SQLite format 3\0"));
+
+        Store::migrate_to_encrypted(&path, b"migration key").unwrap();
+
+        // No temp/sidecar leftovers right after the atomic swap (checked before
+        // any reopen: an open WAL connection legitimately recreates `-wal`).
+        assert!(!dir.path().join("store.db.encrypting").exists());
+        assert!(!dir.path().join("store.db-wal").exists());
+
+        // Encrypted at rest: header gone, known plaintext gone, keyless open fails.
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.starts_with(b"SQLite format 3\0"));
+        assert!(!contains_bytes(&raw, b"Migration secret"));
+        assert!(!contains_bytes(&raw, b"confidential migration"));
+        assert!(Store::open(&path).is_err());
+
+        // Same data through the same key semantics as open_encrypted.
+        let store = Store::open_encrypted(&path, b"migration key").unwrap();
+        assert_eq!(
+            store.get_item("a", "mail", "m1").unwrap().unwrap().name,
+            "Migration secret subject"
+        );
+        assert_eq!(
+            store.search_bodies("a", "confidential").unwrap(),
+            vec![("mail".to_string(), "m1".to_string())]
+        );
+        assert!(!store.search_names("a", "Migration").unwrap().is_empty());
+        assert_eq!(
+            store.get_delta_cursor("a", "onedrive", "root").unwrap(),
+            Some("cursor-token-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn migrate_refuses_empty_secret_and_leaves_store_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        seeded_plain_store(&path);
+
+        let err = Store::migrate_to_encrypted(&path, b"").unwrap_err();
+        assert!(matches!(err, StoreError::InvalidStoreSecret(_)));
+        // Original untouched: still plaintext + fully usable.
+        assert!(std::fs::read(&path)
+            .unwrap()
+            .starts_with(b"SQLite format 3\0"));
+        let store = Store::open(&path).unwrap();
+        assert!(store.get_item("a", "mail", "m1").unwrap().is_some());
+    }
+
+    #[test]
+    fn migrate_already_encrypted_store_is_a_detectable_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            Store::open_encrypted(&path, b"k1").unwrap();
+        }
+        let err = Store::migrate_to_encrypted(&path, b"k1").unwrap_err();
+        assert!(matches!(err, StoreError::AlreadyEncrypted(_)));
+        // Still opens fine afterwards — re-running migration cannot damage it.
+        Store::open_encrypted(&path, b"k1").unwrap();
+    }
+
+    #[test]
+    fn migrate_recovers_from_stale_tmp_of_a_crashed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        seeded_plain_store(&path);
+        // Simulate a crash mid-migration: garbage temp target left behind, the
+        // plaintext original untouched (it is never modified before the rename).
+        std::fs::write(
+            dir.path().join("store.db.encrypting"),
+            b"garbage from crash",
+        )
+        .unwrap();
+
+        Store::migrate_to_encrypted(&path, b"resume key").unwrap();
+
+        let store = Store::open_encrypted(&path, b"resume key").unwrap();
+        assert_eq!(
+            store.get_item("a", "mail", "m1").unwrap().unwrap().name,
+            "Migration secret subject"
         );
     }
 
