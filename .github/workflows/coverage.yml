@@ -1,0 +1,46 @@
+name: Coverage
+
+# Code-coverage gate: measures workspace line coverage with cargo-llvm-cov and
+# fails under a floor, so the test substance is visible and cannot silently rot.
+# Runs on PRs into dev (and on dev/main push for the badge); deliberately NOT part
+# of the dev->staging->main promotion gates, to keep the autonomous cascade fast.
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: Install Linux GUI build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2.81.7
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure coverage (fail under 70% lines)
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov --workspace --summary-only --fail-under-lines 70 \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
