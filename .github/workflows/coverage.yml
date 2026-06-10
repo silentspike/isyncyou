@@ -38,9 +38,9 @@ jobs:
       - uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
         with:
           tool: cargo-llvm-cov
-      - name: Measure coverage (fail under 70% lines)
+      - name: Measure coverage (fail under 75% lines)
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov --workspace --summary-only --fail-under-lines 70 \
+          cargo llvm-cov --workspace --summary-only --fail-under-lines 75 \
             | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
