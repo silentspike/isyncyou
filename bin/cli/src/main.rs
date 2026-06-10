@@ -180,8 +180,8 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
-    /// Delete a single item from the cloud (e.g. tearing down a test restore on a
-    /// throwaway account). Mail only for now. Gated by
+    /// Delete a single item from the cloud (e.g. tearing down a test restore or an
+    /// uploaded file on a throwaway account). `mail` + `onedrive` for now. Gated by
     /// `restore.cloud_restore_enabled` — deletion is at least as destructive as a
     /// cloud re-create — and needs a write token.
     Rm {
@@ -189,7 +189,7 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         account: String,
-        /// Service the item belongs to. Only `mail` is supported for now.
+        /// Service the item belongs to. `mail` or `onedrive` for now.
         #[arg(long)]
         service: String,
         /// The cloud item's id (e.g. a message id).
@@ -1680,15 +1680,19 @@ fn cmd_rm(
                 .to_string(),
         );
     }
-    if service != "mail" {
+    if service != "mail" && service != "onedrive" {
         return Err(format!(
-            "cloud delete supports only 'mail' for now (got '{service}')"
+            "cloud delete supports only 'mail' and 'onedrive' for now (got '{service}')"
         ));
     }
     let token = resolve_token(&cfg, account, token, true)?;
-    isyncyou_graph::GraphClient::new(token)
-        .delete_url(&format!("/me/messages/{id}"))
-        .map_err(|e| format!("delete {service} item '{id}': {e}"))?;
+    let client = isyncyou_graph::GraphClient::new(token);
+    let res = match service {
+        "mail" => client.delete_message(id),
+        "onedrive" => client.delete_item(id),
+        _ => unreachable!("service validated above"),
+    };
+    res.map_err(|e| format!("delete {service} item '{id}': {e}"))?;
     println!("deleted {service} item '{id}'");
     Ok(())
 }
@@ -2611,15 +2615,16 @@ mod tests {
     }
 
     #[test]
-    fn rm_refuses_non_mail_service() {
+    fn rm_refuses_unsupported_service() {
         // write_config sets cloud_restore_enabled = true, so the gate passes and
-        // the service check is what rejects a non-mail service (before any token).
+        // the service check is what rejects an unsupported service (before any
+        // token). mail + onedrive are supported; todo is not.
         let dir = std::env::temp_dir().join(format!("isyncyou-cli-rms-{}", std::process::id()));
         let arch = dir.join("arch");
         std::fs::create_dir_all(&arch).unwrap();
         let p = write_config(&dir, &arch);
         let err = cmd_rm(&p, "a", "todo", "T1", Some("TOK".into())).unwrap_err();
-        assert!(err.contains("only 'mail'"), "got: {err}");
+        assert!(err.contains("only 'mail' and 'onedrive'"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
