@@ -6,6 +6,7 @@
 [![status](https://img.shields.io/badge/status-release--candidate-blue)](#current-status)
 [![release](https://img.shields.io/github/v/release/silentspike/isyncyou?include_prereleases&sort=semver)](https://github.com/silentspike/isyncyou/releases)
 [![coverage](https://github.com/silentspike/isyncyou/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/silentspike/isyncyou/actions/workflows/coverage.yml)
+[![scorecard](https://api.securityscorecards.dev/projects/github.com/silentspike/isyncyou/badge)](https://securityscorecards.dev/viewer/?uri=github.com/silentspike/isyncyou)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
 [![language](https://img.shields.io/badge/built%20with-Rust-orange)]()
