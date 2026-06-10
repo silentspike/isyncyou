@@ -890,6 +890,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_plaintext_cache_migrates_to_encrypted_on_next_save() {
+        // #328 AC-2: a pre-existing plaintext token cache is migrated to the
+        // encrypted-at-rest format by the next save (load -> save roundtrip).
+        let dir =
+            std::env::temp_dir().join(format!("isyncyou-auth-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("token.json");
+        let c = TokenCache::from_response(&resp("LEGACYPLAINTOKEN", Some("RT"), 3600), 5000);
+        std::fs::write(&p, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .contains("LEGACYPLAINTOKEN"));
+
+        let loaded = TokenCache::load(&p).unwrap();
+        loaded.save(&p).unwrap();
+
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains(TOKEN_CACHE_MAGIC), "not migrated to encrypted");
+        assert!(
+            !raw.contains("LEGACYPLAINTOKEN"),
+            "plaintext token survived the migration save"
+        );
+        // and it still round-trips via the auto local key
+        assert_eq!(
+            TokenCache::load(&p).unwrap().access_token,
+            "LEGACYPLAINTOKEN"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn token_cache_encrypted_roundtrip_hides_plaintext() {
         let dir =
             std::env::temp_dir().join(format!("isyncyou-auth-encrypted-{}", std::process::id()));

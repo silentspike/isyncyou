@@ -256,9 +256,11 @@ This section is deliberately blunt — it is the inverse of the status table.
   cache file if it is copied/synced on its own, not against full config-dir read
   access. The SQLite store can be
   SQLCipher-encrypted via `ISYNCYOU_STORE_KEY_FILE`, systemd credential
-  `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY`; without that key, new stores remain
-  plaintext and `isyncyou-doctor` warns. Do not point plaintext stores at sensitive
-  data on a shared machine.
+  `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY`; an existing plaintext store
+  migrates in place with `isyncyou migrate --account <id> --encrypt-store`
+  (atomic; refuses without a configured key). Without a store key, stores remain
+  plaintext and `isyncyou-doctor` warns. Do not point plaintext stores at
+  sensitive data on a shared machine.
 - **No deployed staging / full E2E suite yet.** There is an acceptance + chaos
   harness, but the end-to-end pipeline against a live environment is being stood up.
   Release artifacts are built by CI with a CycloneDX SBOM and signed GitHub artifact
