@@ -23,3 +23,8 @@ updates:
       prefix: "deps"
     labels:
       - "type:deps"
+    ignore:
+      # Pinned to the `@stable` tag SHA on purpose. The `@master` revision makes
+      # `toolchain:` a required input and broke the pipeline once (#373 → #362);
+      # bump deliberately, not automatically.
+      - dependency-name: "dtolnay/rust-toolchain"

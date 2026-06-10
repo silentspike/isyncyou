@@ -1,0 +1,64 @@
+name: Promote watchdog
+
+# Surfaces a STALLED autonomous promotion (#359): an open promote/* PR older than
+# ~15 min usually means its required checks failed or auto-merge cannot complete, so
+# the dev->staging->main cascade is stuck. The default GITHUB_TOKEN posts a visible
+# alert (PR comment + job summary) and fails this run, so a stall never goes
+# unnoticed (it previously only surfaced as GitHub's default failure email).
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: promote-watchdog
+  cancel-in-progress: true
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const STALE_MIN = 15;
+            const now = Date.now();
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const stale = prs.filter(p =>
+              p.head.ref.startsWith('promote/') &&
+              (now - new Date(p.created_at).getTime()) > STALE_MIN * 60 * 1000
+            );
+            if (stale.length === 0) {
+              core.info('no stalled promotions');
+              return;
+            }
+            for (const p of stale) {
+              const ageMin = Math.round((now - new Date(p.created_at).getTime()) / 60000);
+              const msg = `⚠️ **Stalled promotion**: PR #${p.number} (\`${p.head.ref}\` → ` +
+                `\`${p.base.ref}\`) has been open ${ageMin} min. Its required checks likely ` +
+                `failed or auto-merge is stuck — the dev→staging→main cascade is blocked. ` +
+                `Check the PR's checks and either fix forward or close it.`;
+              core.warning(msg);
+              core.summary.addRaw(msg + '\n').write();
+              // throttle: only comment if we have not already in the last hour
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: p.number, per_page: 100,
+              });
+              const recent = comments.some(c =>
+                c.body.includes('Stalled promotion') &&
+                (now - new Date(c.created_at).getTime()) < 60 * 60 * 1000
+              );
+              if (!recent) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: p.number, body: msg,
+                });
+              }
+            }
+            core.setFailed(`${stale.length} stalled promotion(s) detected`);

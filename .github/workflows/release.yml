@@ -49,6 +49,14 @@ jobs:
           (cd dist && sha256sum isyncyou-linux-x86_64.tar.gz > isyncyou-linux-x86_64.tar.gz.sha256)
           ls -la dist dist/isyncyou
 
+      - name: Smoke-test the Linux binary (#362)
+        run: |
+          # The shipped tarball binary must run and report its version (the AppImage
+          # is smoke-tested separately below).
+          tar -xzf dist/isyncyou-linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/isyncyou/isyncyou" --version
+          "$RUNNER_TEMP/isyncyou/isyncyou" --help >/dev/null
+
       - name: Build AppImage
         run: |
           # squashfs-tools (mksquashfs) + appimagetool are the only host deps; the
@@ -112,6 +120,24 @@ jobs:
             cosign sign-blob --yes "dist/$f" --bundle "dist/$f.cosign.bundle"
           done
           ls -la dist/*.cosign.bundle
+
+      - name: Verify our own cosign signatures (self-check, #361)
+        run: |
+          # Fail the release if a signature we just produced does not verify against
+          # the expected workflow identity — catches a signing/identity misconfig
+          # before anything is published.
+          for f in \
+            isyncyou-linux-x86_64.tar.gz \
+            isyncyou-x86_64.AppImage \
+            isyncyou-windows-x86_64.zip \
+            isyncyou.sbom.cdx.json \
+            SHA256SUMS; do
+            cosign verify-blob "dist/$f" \
+              --bundle "dist/$f.cosign.bundle" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp '^https://github\.com/silentspike/isyncyou/\.github/workflows/release\.yml@'
+          done
+          echo "all cosign signatures verified"
 
       - name: Attest release artifact provenance
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4

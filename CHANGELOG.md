@@ -61,6 +61,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Code-coverage gate**: a `coverage.yml` workflow measures workspace line coverage
   with `cargo-llvm-cov` and fails under 70% (currently ~77%), with a README badge so
   the test substance is visible and cannot silently rot.
+- CI/CD hardening: a **promote watchdog** alerts on a stalled autonomous promotion
+  instead of failing silently (#359); `release.yml` **self-verifies its own cosign
+  signatures** before publishing and **smoke-tests the Linux binary** (#361, #362);
+  the Rust toolchain action is unified on the pinned `@stable` SHA and dependabot is
+  told not to bump it (the `@master` revision broke the pipeline once) (#362).
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
