@@ -9,6 +9,6 @@ authors.workspace = true
 
 [dependencies]
 # default-features off => no libfuse link / no pkg-config; mount via fusermount3.
-fuser = { version = "0.16", default-features = false }
+fuser = { version = "0.17", default-features = false }
 libc = "0.2"
 isyncyou-store = { path = "../store" }
