@@ -1710,6 +1710,7 @@ version = "0.1.0"
 dependencies = [
  "isyncyou-statusbar",
  "ksni",
+ "serde_json",
  "softbuffer",
  "tokio",
  "winit",
