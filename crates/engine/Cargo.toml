@@ -18,4 +18,4 @@ serde_json = { workspace = true }
 # Content-derived idempotency key for crash-safe restore (ADR-001). RustCrypto,
 # permissive (MIT/Apache), no system deps.
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
