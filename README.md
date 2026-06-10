@@ -197,6 +197,7 @@ isyncyou sync      # one incremental OneDrive sync
 isyncyou backup    # index + archive M365 services (--all-accounts, --service, --body-limit)
 isyncyou search    # full-text search names + mail bodies (--all-accounts)
 isyncyou restore   # re-create an archived item in the cloud (opt-in)
+isyncyou rm        # delete a cloud item, mail only (opt-in; same gate as restore)
 isyncyou export    # export archived events/contacts to .ics / .vcf
 isyncyou migrate   # move an account's archive directory
 isyncyou serve     # serve the local API/web UI (Unix socket by default; --tcp for loopback)
