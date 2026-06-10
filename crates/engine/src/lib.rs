@@ -419,11 +419,13 @@ pub fn sync_once(
         fraction_min_total: dg.fraction_min_total,
     };
 
-    let mat = connectors::materialize_downloads(store, client, account, &sync_root)
+    let mat = connectors::materialize_downloads(store, client, account, &sync_root, host)
         .map_err(|e| e.to_string())?;
     out.downloaded = mat.downloaded;
     out.dirs_created = mat.dirs_created;
     out.materialize_failed = mat.failed;
+    // download-path keep-both: locally-edited files moved aside before overwrite
+    out.modified_conflicts = mat.conflicts;
 
     // remote -> local deletions (to trash, guarded)
     let pending =
@@ -464,7 +466,7 @@ pub fn sync_once(
         )
         .map_err(|e| e.to_string())?;
         out.modified_uploaded = mr.uploaded;
-        out.modified_conflicts = mr.conflicts;
+        out.modified_conflicts += mr.conflicts;
         out.modified_failed = mr.failed;
     }
 
