@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Build release binaries
         run: cargo build --release --workspace
@@ -114,7 +114,7 @@ jobs:
           ls -la dist/*.cosign.bundle
 
       - name: Attest release artifact provenance
-        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-path: |
             dist/isyncyou-linux-x86_64.tar.gz
@@ -124,7 +124,7 @@ jobs:
             dist/SHA256SUMS
 
       - name: Attest SBOM
-        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-path: |
             dist/isyncyou-linux-x86_64.tar.gz
