@@ -42,7 +42,7 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p dist/isyncyou
-          for b in isyncyoud isyncyou isyncyou-doctor; do
+          for b in isyncyoud isyncyou isyncyou-doctor isyncyou-statusbar; do
             [ -f "target/release/$b" ] && install -m755 "target/release/$b" "dist/isyncyou/$b"
           done
           cp packaging/isyncyou.toml.sample packaging/README.md packaging/isyncyoud.service dist/isyncyou/
