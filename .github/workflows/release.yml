@@ -114,13 +114,26 @@ jobs:
           # Keyless signing via ambient GitHub OIDC (id-token: write) — no stored key.
           # Each .cosign.bundle is self-contained (signature + Fulcio cert + Rekor proof),
           # verifiable with `cosign verify-blob --bundle <f>.cosign.bundle ...`.
+          #
+          # Retried per file: a transient network hiccup against Rekor can land the
+          # entry but lose the response, so cosign's internal retry then sees
+          # 409 createLogEntryConflict and aborts (bit us on the rc.29 build). A
+          # fresh attempt produces a new signature → a new, conflict-free entry.
           for f in \
             isyncyou-linux-x86_64.tar.gz \
             isyncyou-x86_64.AppImage \
             isyncyou-windows-x86_64.zip \
             isyncyou.sbom.cdx.json \
             SHA256SUMS; do
-            cosign sign-blob --yes "dist/$f" --bundle "dist/$f.cosign.bundle"
+            ok=0
+            for attempt in 1 2 3; do
+              if cosign sign-blob --yes "dist/$f" --bundle "dist/$f.cosign.bundle"; then
+                ok=1; break
+              fi
+              echo "::warning::sign-blob failed for $f (attempt $attempt/3), retrying"
+              sleep $((attempt * 5))
+            done
+            [ "$ok" = 1 ] || { echo "::error::signing $f failed after 3 attempts"; exit 1; }
           done
           ls -la dist/*.cosign.bundle
 

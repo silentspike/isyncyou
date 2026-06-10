@@ -62,3 +62,27 @@ jobs:
               }
             }
             core.setFailed(`${stale.length} stalled promotion(s) detected`);
+
+      # A failed release.yml run used to be silent (no PR to comment on): a main
+      # push that builds no RC just disappears. Surface the most recent failure.
+      - name: Flag a failed release run
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'release.yml', per_page: 5,
+            });
+            const latestDone = runs.data.workflow_runs.find(r => r.status === 'completed');
+            if (latestDone && latestDone.conclusion !== 'success') {
+              const msg = `⚠️ **Release run failed**: the most recent completed ` +
+                `release.yml run (#${latestDone.run_number}, ${latestDone.head_sha.slice(0,8)}) ` +
+                `concluded '${latestDone.conclusion}' — the last main push published NO RC. ` +
+                `${latestDone.html_url}`;
+              core.warning(msg);
+              await core.summary.addRaw(msg + '\n').write();
+              core.setFailed('latest release run did not succeed');
+            } else {
+              core.info('latest completed release run is green');
+            }
