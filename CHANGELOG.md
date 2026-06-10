@@ -96,6 +96,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
 
+- **Deployed staging + nightly E2E** (#326): a self-hosted staging instance runs
+  `isyncyoud` (hardened systemd service; SQLCipher store, encrypted token caches)
+  and a nightly E2E against the dedicated throwaway account — backup (all five
+  services), OneDrive sync, search, restore-to-local, verify — with pass/fail
+  pushed to a notification channel. Its first run caught a real `verify` bug.
+
 ### Fixed
 - `isyncyou verify` misread synced **OneDrive** items as archive bodies (their
   `local_path` is a name segment under `sync_root`, resolved through parents) and
