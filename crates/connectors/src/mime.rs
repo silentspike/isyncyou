@@ -581,12 +581,18 @@ mod tests {
 
     #[test]
     fn malformed_input_does_not_panic() {
-        let _ = extract_text(b"");
-        let _ = extract_text(b"no headers at all just text");
-        let _ = extract_text(b"Content-Type: multipart/mixed; boundary=X\r\n\r\nno parts");
+        // empty input → empty extracted text and no HTML part
+        assert!(extract_text(b"").is_empty());
+        assert_eq!(extract_html(b""), None);
+        // headerless garbage has no subject line and no HTML part
+        assert_eq!(extract_html(b"no headers at all just text"), None);
+        // a multipart envelope with no actual parts yields no HTML
+        assert_eq!(
+            extract_html(b"Content-Type: multipart/mixed; boundary=X\r\n\r\nno parts"),
+            None
+        );
+        // a broken RFC2047 encoded-word decodes without panicking
         let _ = extract_text(b"=?utf-8?B?broken");
-        let _ = extract_html(b"");
-        let _ = extract_html(b"Content-Type: multipart/mixed; boundary=X\r\n\r\nno parts");
     }
 
     #[test]
@@ -664,8 +670,16 @@ mod tests {
 
     #[test]
     fn mail_preview_never_panics_on_garbage() {
-        let _ = mail_preview(b"this is not an email at all");
-        let _ = mail_preview(b"");
+        let empty = mail_preview(b"");
+        assert_eq!(empty.subject, None);
+        assert_eq!(empty.size_bytes, 0);
+        assert!(!empty.has_html);
+        assert!(empty.to.is_empty());
+
+        let garbage = mail_preview(b"this is not an email at all");
+        assert_eq!(garbage.subject, None);
+        assert_eq!(garbage.size_bytes, 27);
+        assert!(!garbage.has_html);
     }
 
     #[test]
