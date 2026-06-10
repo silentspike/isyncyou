@@ -262,14 +262,18 @@ This section is deliberately blunt — it is the inverse of the status table.
   (atomic; refuses without a configured key). Without a store key, stores remain
   plaintext and `isyncyou-doctor` warns. Do not point plaintext stores at
   sensitive data on a shared machine.
-- **The nightly staging E2E does not cover every journey yet.** A self-hosted
-  staging deployment runs `isyncyoud` (hardened systemd service, encrypted store +
-  token caches) and a **nightly end-to-end run against the dedicated throwaway
-  account** — backup of all five services, OneDrive sync, search, restore-to-local
-  and verify, with pass/fail pushed to a notification channel. No tokens ever go to
-  CI. Upload/conflict and cloud-restore journeys are still being added to the loop
-  (tracked openly); release artifacts are built by CI with a CycloneDX SBOM, signed
-  GitHub artifact attestations and self-verified cosign signatures.
+- **The nightly staging E2E runs against a live account — treat its findings as
+  the source of truth.** A self-hosted staging deployment runs `isyncyoud`
+  (hardened systemd service, encrypted store + token caches) and a **nightly
+  end-to-end run against the dedicated throwaway account** covering every user
+  journey: backup of all five services, OneDrive sync, **upload + cloud teardown,
+  a real two-profile edit-edit conflict (keep-both verified), cloud restore with
+  teardown, archive migration round-trip, doctor**, search, restore-to-local and
+  verify — plus the web UI (functional + visual regression) and the native status
+  bar, with pass/fail pushed to a notification channel. No tokens ever go to CI.
+  Its first runs caught three real bugs before any release shipped them. Release
+  artifacts are built by CI with a CycloneDX SBOM, signed GitHub artifact
+  attestations and self-verified cosign signatures.
 - **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are
   platform/environment-gated.** They need a display server, a host-side KF6 plugin,
   or privileged mounts respectively. The PBS path has deterministic local coverage

@@ -98,9 +98,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - **Deployed staging + nightly E2E** (#326): a self-hosted staging instance runs
   `isyncyoud` (hardened systemd service; SQLCipher store, encrypted token caches)
-  and a nightly E2E against the dedicated throwaway account — backup (all five
-  services), OneDrive sync, search, restore-to-local, verify — with pass/fail
-  pushed to a notification channel. Its first run caught a real `verify` bug.
+  and a nightly E2E against the dedicated throwaway account covering **every user
+  journey**: backup (all five services), OneDrive sync, upload with cloud teardown,
+  a real two-profile edit-edit **conflict** (keep-both asserted), **cloud restore
+  with teardown** (`rm`), archive **migration** round-trip, **doctor**, search,
+  restore-to-local, verify — plus the web UI (functional + visual regression) and
+  the native status bar — with pass/fail pushed to a notification channel. Its
+  first runs caught three real bugs (a `verify` false positive, the `rm` id
+  encoding, and the download-path edit-edit data loss) before any release shipped
+  them.
 
 - **Status-bar live snapshot** (`isyncyou-statusbar --snapshot out.png [--api host:port]`):
   fetches the first account + the real scheduled-sync state from the daemon's local
