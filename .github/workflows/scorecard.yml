@@ -8,7 +8,7 @@ on:
   schedule:
     - cron: "30 7 * * 1"
   push:
-    branches: [main]
+    branches: [dev] # repo default branch; scorecard-action only supports the default
   workflow_dispatch:
 
 permissions: read-all
