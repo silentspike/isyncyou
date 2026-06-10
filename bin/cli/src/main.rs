@@ -193,15 +193,26 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Move an account's archive directory to a new location (no re-download).
+    /// Move an account's archive directory to a new location (no re-download),
+    /// or encrypt its store in place (`--encrypt-store`).
     Migrate {
         #[arg(long, default_value = "isyncyou.toml")]
         config: PathBuf,
         #[arg(long)]
         account: String,
         /// Destination archive root (must be empty or not yet exist).
+        #[arg(
+            long,
+            required_unless_present = "encrypt_store",
+            conflicts_with = "encrypt_store"
+        )]
+        new_archive_root: Option<PathBuf>,
+        /// Migrate the account's plaintext store to SQLCipher encryption, in place
+        /// and atomically. Requires a configured store key
+        /// (ISYNCYOU_STORE_KEY_FILE, systemd credential, or ISYNCYOU_STORE_KEY) —
+        /// refuses to run without one.
         #[arg(long)]
-        new_archive_root: PathBuf,
+        encrypt_store: bool,
     },
     /// Serve the local web UI/API.
     Serve {
@@ -393,7 +404,16 @@ fn run(command: Command) -> Result<(), String> {
             config,
             account,
             new_archive_root,
-        } => cmd_migrate(&config, &account, &new_archive_root),
+            encrypt_store,
+        } => {
+            if encrypt_store {
+                cmd_migrate_encrypt_store(&config, &account)
+            } else {
+                // clap guarantees presence via required_unless_present
+                let new_root = new_archive_root.expect("clap enforces --new-archive-root");
+                cmd_migrate(&config, &account, &new_root)
+            }
+        }
         Command::Serve {
             config,
             tcp,
@@ -1668,6 +1688,38 @@ fn cmd_export(config: &Path, account: &str, service: &str, out: &Path) -> Result
     Ok(())
 }
 
+/// Encrypt an account's plaintext store in place (atomic temp + rename). Refuses
+/// without a configured store key — there is no silent plaintext path (#328 AC-4).
+fn cmd_migrate_encrypt_store(config: &Path, account: &str) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    let path = store_path(&cfg, account)?;
+    let secret = isyncyou_store::configured_store_key()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "refusing to encrypt: no store key configured — set {}, systemd credential \
+                 '{}', or {} first, so the migrated store can be opened again",
+                isyncyou_store::STORE_KEY_FILE_ENV,
+                isyncyou_store::STORE_SYSTEMD_CREDENTIAL,
+                isyncyou_store::STORE_KEY_ENV,
+            )
+        })?;
+    match Store::migrate_to_encrypted(&path, &secret) {
+        Ok(()) => {
+            println!(
+                "store encrypted: {} (SQLCipher; opens with the configured key)",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(isyncyou_store::StoreError::AlreadyEncrypted(p)) => {
+            println!("store already encrypted: {p} — nothing to do");
+            Ok(())
+        }
+        Err(e) => Err(format!("encrypt store: {e}")),
+    }
+}
+
 fn cmd_migrate(config: &Path, account: &str, new_root: &Path) -> Result<(), String> {
     let mut cfg = load_config(config)?;
     let old = cfg
@@ -2573,9 +2625,36 @@ mod tests {
             Command::Migrate {
                 config: "isyncyou.toml".into(),
                 account: "a".into(),
-                new_archive_root: "/data/new".into(),
+                new_archive_root: Some("/data/new".into()),
+                encrypt_store: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_migrate_encrypt_store_without_new_root() {
+        let c = parse(&["isyncyou", "migrate", "--account", "a", "--encrypt-store"]).unwrap();
+        assert_eq!(
+            c.command,
+            Command::Migrate {
+                config: "isyncyou.toml".into(),
+                account: "a".into(),
+                new_archive_root: None,
+                encrypt_store: true,
+            }
+        );
+        // plain migrate still requires a destination; the two modes are exclusive
+        assert!(parse(&["isyncyou", "migrate", "--account", "a"]).is_err());
+        assert!(parse(&[
+            "isyncyou",
+            "migrate",
+            "--account",
+            "a",
+            "--new-archive-root",
+            "/x",
+            "--encrypt-store"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2626,6 +2705,21 @@ mod tests {
         assert!(cmd_migrate(&p, "a", &other)
             .unwrap_err()
             .contains("not empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_encrypt_store_refuses_without_a_configured_key() {
+        // #328 AC-4: no configured store key → refusal, no silent plaintext copy.
+        // (No test in this workspace sets ISYNCYOU_STORE_KEY* env vars, so reading
+        // the ambient environment here is race-free.)
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-mig-e-{}", std::process::id()));
+        let old = dir.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        let p = write_config(&dir, &old);
+        let err = cmd_migrate_encrypt_store(&p, "a").unwrap_err();
+        assert!(err.contains("refusing to encrypt"), "got: {err}");
+        assert!(err.contains("ISYNCYOU_STORE_KEY"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
