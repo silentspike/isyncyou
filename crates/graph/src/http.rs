@@ -388,9 +388,15 @@ impl GraphClient {
         }
     }
 
+    /// Delete a mail message by id. The id is percent-encoded for the URL path —
+    /// Outlook message ids are base64-ish (`+ / =`), which Graph 404s if left raw.
+    pub fn delete_message(&self, message_id: &str) -> Result<(), UploadError> {
+        self.delete_url(&format!("/me/messages/{}", encode_id(message_id)))
+    }
+
     /// Delete a drive item by id (used for test cleanup on the throwaway account).
     pub fn delete_item(&self, item_id: &str) -> Result<(), UploadError> {
-        let url = format!("{}/me/drive/items/{item_id}", self.base);
+        let url = format!("{}/me/drive/items/{}", self.base, encode_id(item_id));
         let resp = self
             .client
             .delete(&url)
@@ -688,6 +694,23 @@ fn json_or_err(resp: reqwest::blocking::Response) -> Result<serde_json::Value, U
 /// callers use safe names). Full percent-encoding is a later refinement.
 fn enc(path: &str) -> String {
     path.trim_start_matches('/').replace(' ', "%20")
+}
+
+/// Percent-encode an item id for safe inclusion in a URL path segment. Outlook
+/// message ids are base64-ish (contain `+ / =`), which Graph 404s if left raw in
+/// the path; everything outside RFC 3986 unreserved is escaped. Plain alphanumeric
+/// ids (e.g. OneDrive drive-item ids) pass through unchanged.
+fn encode_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1190,6 +1213,29 @@ mod tests {
             UploadError::Http { status, .. } => assert_eq!(status, 403),
             other => panic!("expected Http error, got {other}"),
         }
+    }
+
+    #[test]
+    fn encode_id_escapes_base64_chars_in_outlook_ids() {
+        // plain ids pass through (OneDrive drive-item ids)
+        assert_eq!(encode_id("01ABCDEF-_."), "01ABCDEF-_.");
+        // base64-ish Outlook ids: + / = must be escaped or Graph 404s the path
+        assert_eq!(encode_id("aB+/9=="), "aB%2B%2F9%3D%3D");
+    }
+
+    #[test]
+    fn delete_message_encodes_the_id_in_the_path() {
+        let (base, server) = serve(vec![http_response(204, "No Content", "", "")]);
+        GraphClient::new("tok")
+            .with_base_url(&base)
+            .delete_message("AB+/cd=")
+            .unwrap();
+        let req = &server.join().unwrap()[0];
+        assert!(
+            req.starts_with("DELETE /me/messages/AB%2B%2Fcd%3D"),
+            "id not percent-encoded in path: {}",
+            req.lines().next().unwrap_or("")
+        );
     }
 
     #[test]
