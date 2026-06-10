@@ -119,6 +119,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   token, so a sync that had local changes to push would fail. Matches the daemon.
 
 ### Fixed
+- **Download-path data loss on edit-edit conflicts** (found by the staging E2E's
+  live conflict journey): when a file was edited locally AND remotely between
+  syncs, the one-shot sync downloaded the remote version **over the local edit**
+  with no conflict copy — keep-both only existed on the upload path (If-Match/412).
+  The store now records a **last-synced on-disk reference** per item (schema v8:
+  size/mtime/QuickXorHash, written only by the download/upload paths — the delta
+  ingest overwrites item metadata with new remote values, which is exactly why
+  the edit could not be detected before). Materialize compares the disk file
+  against that reference (size → mtime → hash ladder) and moves a locally-edited
+  file aside as a `safeBackup` conflict copy before writing the cloud version;
+  the summary counts it under `conflict copies`. Pre-v8 items without a reference
+  keep the old behavior instead of spraying conflict copies on ordinary updates.
 - `isyncyou rm --service mail` returned **HTTP 404**: Outlook message ids are
   base64-ish (`+ / =`) and were not percent-encoded in the `DELETE /me/messages/{id}`
   path, so Graph could not find them. Item ids are now URL-encoded
