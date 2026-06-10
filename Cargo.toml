@@ -8,7 +8,10 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/silentspike/isyncyou"
 authors = ["silentspike"]
-rust-version = "1.90"
+# Effective MSRV is set by libsqlite3-sys 0.38 (rusqlite 0.40), whose build script
+# uses `cfg_select` — stabilized in 1.95. Verified empirically: 1.94 fails (E0658),
+# 1.95.0 builds the whole workspace. Guarded by the `msrv` CI job (#408).
+rust-version = "1.95"
 
 # Declared centrally; pulled in by members as features get implemented.
 [workspace.dependencies]
