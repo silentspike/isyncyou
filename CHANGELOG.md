@@ -66,6 +66,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   signatures** before publishing and **smoke-tests the Linux binary** (#361, #362);
   the Rust toolchain action is unified on the pinned `@stable` SHA and dependabot is
   told not to bump it (the `@master` revision broke the pipeline once) (#362).
+- Supply-chain hardening (#360): **OpenSSF Scorecard** workflow + README badge,
+  **`dependency-review`** gate on PRs into dev (fails on high-severity advisories),
+  and **`step-security/harden-runner`** (egress audit) on the release job.
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
