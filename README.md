@@ -261,10 +261,14 @@ This section is deliberately blunt — it is the inverse of the status table.
   (atomic; refuses without a configured key). Without a store key, stores remain
   plaintext and `isyncyou-doctor` warns. Do not point plaintext stores at
   sensitive data on a shared machine.
-- **No deployed staging / full E2E suite yet.** There is an acceptance + chaos
-  harness, but the end-to-end pipeline against a live environment is being stood up.
-  Release artifacts are built by CI with a CycloneDX SBOM and signed GitHub artifact
-  attestations, but staging/live-E2E evidence is still separate.
+- **The nightly staging E2E does not cover every journey yet.** A self-hosted
+  staging deployment runs `isyncyoud` (hardened systemd service, encrypted store +
+  token caches) and a **nightly end-to-end run against the dedicated throwaway
+  account** — backup of all five services, OneDrive sync, search, restore-to-local
+  and verify, with pass/fail pushed to a notification channel. No tokens ever go to
+  CI. Upload/conflict and cloud-restore journeys are still being added to the loop
+  (tracked openly); release artifacts are built by CI with a CycloneDX SBOM, signed
+  GitHub artifact attestations and self-verified cosign signatures.
 - **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are
   platform/environment-gated.** They need a display server, a host-side KF6 plugin,
   or privileged mounts respectively. The PBS path has deterministic local coverage
