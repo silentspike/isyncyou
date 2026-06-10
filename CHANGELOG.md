@@ -109,6 +109,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   UI against live daemon data; errors out instead of inventing data when the daemon
   is unreachable. The binary now ships in the release tarball.
 
+- `isyncyou rm --service mail --id <id>`: delete a single cloud item, behind the
+  same `restore.cloud_restore_enabled` gate as cloud restore and requiring a write
+  token (deletion is at least as destructive as a re-create). Mail only for now;
+  used to tear down a test restore on a throwaway account in the staging E2E.
+- `isyncyou sync` now prefers the cached **write** token when one exists, falling
+  back to the read token (download-only) otherwise — bidirectional sync uploads
+  and deletes, which need write scopes; previously the CLI always used the read
+  token, so a sync that had local changes to push would fail. Matches the daemon.
+
 ### Fixed
 - `isyncyou verify` misread synced **OneDrive** items as archive bodies (their
   `local_path` is a name segment under `sync_root`, resolved through parents) and
