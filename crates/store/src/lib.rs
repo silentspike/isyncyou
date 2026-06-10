@@ -34,7 +34,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -210,6 +210,18 @@ CREATE TABLE restore_steps (
     detail     TEXT,
     PRIMARY KEY (op_id, seq)
 );
+"#;
+
+/// v8: the **last-synced on-disk reference** per item (size / mtime / hash of
+/// the file as it was when last downloaded or uploaded). The delta ingest
+/// overwrites an item's metadata with the NEW remote values, so without this
+/// reference a sync pass cannot tell "stale but clean local file" from
+/// "locally edited file" — which is what download keep-both needs. Set only by
+/// the materialize/upload paths, never by the delta ingest.
+const MIGRATION_V8: &str = r#"
+ALTER TABLE items ADD COLUMN synced_size INTEGER;
+ALTER TABLE items ADD COLUMN synced_mtime_unix INTEGER;
+ALTER TABLE items ADD COLUMN synced_hash TEXT;
 "#;
 
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
@@ -758,6 +770,58 @@ impl Store {
             params![account, service, remote_id, state],
         )?;
         Ok(n > 0)
+    }
+
+    /// Record the **last-synced on-disk reference** for an item: size, mtime and
+    /// content hash of the local file as it was when last downloaded or uploaded.
+    /// Set only by the materialize/upload paths — the delta ingest overwrites the
+    /// item's metadata with new remote values, so this column trio is the only
+    /// way a later pass can tell "stale but clean" from "locally edited".
+    pub fn set_synced_state(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        size: i64,
+        mtime_unix: i64,
+        hash: Option<&str>,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE items SET synced_size=?4, synced_mtime_unix=?5, synced_hash=?6
+             WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, size, mtime_unix, hash],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The last-synced on-disk reference, if one was ever recorded
+    /// (`(size, mtime_unix, hash)`); `None` for items from pre-v8 stores or that
+    /// were never materialized/uploaded.
+    pub fn get_synced_state(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+    ) -> Result<Option<(i64, i64, Option<String>)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT synced_size, synced_mtime_unix, synced_hash FROM items
+                 WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+                params![account, service, remote_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(size), Some(mtime), hash)) => Some((size, mtime, hash)),
+            _ => None,
+        })
     }
 
     /// The `sync_state` of the live (non-tombstone) item at an on-disk path, or
@@ -1335,6 +1399,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 7 {
         conn.execute_batch(MIGRATION_V7)?;
     }
+    if v < 8 {
+        conn.execute_batch(MIGRATION_V8)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1648,6 +1715,28 @@ mod tests {
             reopened.search_bodies("a", "classified").unwrap(),
             vec![("mail".to_string(), "r-secret".to_string())]
         );
+    }
+
+    #[test]
+    fn synced_state_roundtrip_and_default_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path().join("s.db")).unwrap();
+        s.upsert_item(&Item::new("a", "onedrive", "f1", "doc.txt", "file"))
+            .unwrap();
+        // never recorded -> None (pre-v8 stores / never-materialized items)
+        assert_eq!(s.get_synced_state("a", "onedrive", "f1").unwrap(), None);
+        assert!(s
+            .set_synced_state("a", "onedrive", "f1", 42, 1_700_000_000, Some("HASH=="))
+            .unwrap());
+        assert_eq!(
+            s.get_synced_state("a", "onedrive", "f1").unwrap(),
+            Some((42, 1_700_000_000, Some("HASH==".to_string())))
+        );
+        // unknown item -> no row updated, still None
+        assert!(!s
+            .set_synced_state("a", "onedrive", "nope", 1, 1, None)
+            .unwrap());
+        assert_eq!(s.get_synced_state("a", "onedrive", "nope").unwrap(), None);
     }
 
     /// Build a plaintext store with data in every copy-relevant shape: items,
