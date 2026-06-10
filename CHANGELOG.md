@@ -69,6 +69,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Supply-chain hardening (#360): **OpenSSF Scorecard** workflow + README badge,
   **`dependency-review`** gate on PRs into dev (fails on high-severity advisories),
   and **`step-security/harden-runner`** (egress audit) on the release job.
+- **Honest MSRV** (#408): `rust-version` raised 1.90 → **1.95** (the real minimum —
+  libsqlite3-sys 0.38 from rusqlite 0.40 needs `cfg_select`, stabilized in 1.95;
+  verified empirically), plus an `msrv` CI gate that builds on the declared MSRV so
+  a dependency bump can never silently raise it again.
 - **build-once-promote** (#329): the staging/main gates now skip the heavy
   build/test/docs jobs when the promotion's tree is byte-identical to `origin/dev`
   (deterministic re-runs already gated on dev) — the same commit is no longer
