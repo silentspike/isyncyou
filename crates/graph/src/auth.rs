@@ -84,12 +84,19 @@ impl TokenCache {
         match token_cache_file_kind(&bytes)? {
             TokenCacheFileKind::Keyring(marker) => Self::load_from_keyring_marker(&marker),
             TokenCacheFileKind::Encrypted => {
-                let secret = token_cache_secret()?.ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        encrypted_cache_needs_secret_message(),
-                    )
-                })?;
+                let secret = match token_cache_secret()? {
+                    Some(secret) => secret,
+                    // No explicit secret configured: fall back to the auto-generated
+                    // owner-only local key written by `save` (secure-by-default). If
+                    // that is also absent, the cache was sealed with an out-of-band
+                    // secret that is no longer available.
+                    None => read_local_key(path)?.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            encrypted_cache_needs_secret_message(),
+                        )
+                    })?,
+                };
                 Self::load_encrypted_with_secret_bytes(&bytes, &secret)
             }
             TokenCacheFileKind::Plain => {
@@ -103,10 +110,14 @@ impl TokenCache {
             self.save_to_keyring_marker(path, &marker)?;
             return Ok(());
         }
-        let bytes = match token_cache_secret()? {
-            Some(secret) => self.encrypted_bytes_with_secret(&secret)?,
-            None => serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?,
+        // Secure-by-default: with no explicit secret (env/file/systemd) and no
+        // keyring backend, encrypt the cache with an auto-generated, owner-only
+        // local key instead of writing plaintext. See `local_key_path` for scope.
+        let secret = match token_cache_secret()? {
+            Some(secret) => secret,
+            None => load_or_create_local_key(path)?,
         };
+        let bytes = self.encrypted_bytes_with_secret(&secret)?;
         write_token_cache(path, &bytes)
     }
 
@@ -396,6 +407,45 @@ fn encrypted_cache_needs_secret_message() -> String {
     format!(
         "encrypted token cache needs {TOKEN_CACHE_SECRET_FILE_ENV}, systemd credential {TOKEN_CACHE_SYSTEMD_CREDENTIAL}, or {TOKEN_CACHE_SECRET_ENV}"
     )
+}
+
+/// Path of the auto-generated, owner-only local key kept next to the token cache.
+///
+/// It is used only when no explicit secret (env/file/systemd) and no keyring
+/// backend are configured, so the on-disk cache is **encrypted-at-rest by default**
+/// instead of plaintext.
+///
+/// Scope (documented honestly): a local key beside the cache protects the cache
+/// file if it alone is copied, synced, backed up or logged. It does **not** protect
+/// against an attacker with read access to the whole config directory (they obtain
+/// the key too) — for that, use the OS keyring (`login --keyring`) or an
+/// out-of-band `ISYNCYOU_TOKEN_CACHE_KEY*`, both of which take precedence here.
+fn local_key_path(cache_path: &Path) -> PathBuf {
+    let mut p = cache_path.as_os_str().to_os_string();
+    p.push(".key");
+    PathBuf::from(p)
+}
+
+/// Read the auto-generated local key if it exists; never creates it. Returns `None`
+/// when the key file is absent or too short to be a valid key.
+fn read_local_key(cache_path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(local_key_path(cache_path)) {
+        Ok(bytes) if bytes.len() >= TOKEN_CACHE_KEY_LEN => Ok(Some(bytes)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Load the auto-generated local key, creating it (32 CSPRNG bytes, owner-only) if
+/// absent. Written with the same owner-only helper as the cache itself.
+fn load_or_create_local_key(cache_path: &Path) -> std::io::Result<Vec<u8>> {
+    if let Some(key) = read_local_key(cache_path)? {
+        return Ok(key);
+    }
+    let key = random_bytes(TOKEN_CACHE_KEY_LEN)?;
+    write_token_cache(&local_key_path(cache_path), &key)?;
+    Ok(key)
 }
 
 fn random_bytes(len: usize) -> std::io::Result<Vec<u8>> {
@@ -794,6 +844,48 @@ mod tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(TokenCache::load(&p).unwrap().access_token, "AT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_without_secret_encrypts_with_auto_local_key() {
+        let dir =
+            std::env::temp_dir().join(format!("isyncyou-auth-autokey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("token.json");
+        let c = TokenCache::from_response(&resp("ACCESSSECRETXYZ", Some("RT"), 3600), 5000);
+        c.save(&p).unwrap();
+
+        // The cache is encrypted at rest (no plaintext token) by default...
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains(TOKEN_CACHE_MAGIC));
+        assert!(!raw.contains("ACCESSSECRETXYZ"));
+        // ...and an owner-only sibling key file was created.
+        let key_path = local_key_path(&p);
+        assert!(key_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // It round-trips via the same auto key.
+        let back = TokenCache::load(&p).unwrap();
+        assert_eq!(back.access_token, "ACCESSSECRETXYZ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_plaintext_cache_still_loads() {
+        // A pre-existing plaintext cache (written before secure-by-default) must
+        // still load, for backward compatibility.
+        let dir = std::env::temp_dir().join(format!("isyncyou-auth-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("token.json");
+        let c = TokenCache::from_response(&resp("LEGACYTOKEN", Some("RT"), 3600), 5000);
+        std::fs::write(&p, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        let back = TokenCache::load(&p).unwrap();
+        assert_eq!(back.access_token, "LEGACYTOKEN");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

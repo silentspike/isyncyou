@@ -54,6 +54,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - cargo-deny now installs via the SHA-pinned `cargo-deny-action` in **all** gates
   (was an unverified `curl | tar` on staging/main) — removes a CI supply-chain
   gap (#358).
+- The OAuth **token cache is now encrypted at rest by default**: with no keyring and
+  no explicit `ISYNCYOU_TOKEN_CACHE_KEY*` secret, it is AES-256-GCM encrypted with an
+  auto-generated, owner-only local key instead of being written in plaintext (legacy
+  plaintext caches still load). Risk R2 narrowed to the SQLite store.
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
