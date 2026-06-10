@@ -36,10 +36,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
-      - uses: github/codeql-action/init@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.30.5
+      - uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v3.30.5
         with:
           languages: rust
-      - uses: github/codeql-action/autobuild@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.30.5
-      - uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.30.5
+      - uses: github/codeql-action/autobuild@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v3.30.5
+      - uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v3.30.5
         with:
           category: "/language:rust"
