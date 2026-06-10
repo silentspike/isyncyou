@@ -119,6 +119,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   token, so a sync that had local changes to push would fail. Matches the daemon.
 
 ### Fixed
+- `isyncyou rm --service mail` returned **HTTP 404**: Outlook message ids are
+  base64-ish (`+ / =`) and were not percent-encoded in the `DELETE /me/messages/{id}`
+  path, so Graph could not find them. Item ids are now URL-encoded
+  (`GraphClient::delete_message` + `delete_item`). Found by the staging E2E's
+  cloud-restore-with-teardown journey.
+- `isyncyou rm` now also supports `--service onedrive` (deletes a drive item),
+  so the staging E2E can tear down an uploaded file — a one-shot `sync` cannot
+  turn a local delete into a remote delete (downloads are materialized before
+  local-delete detection; that path needs the `watch`/inotify tombstone).
 - `isyncyou verify` misread synced **OneDrive** items as archive bodies (their
   `local_path` is a name segment under `sync_root`, resolved through parents) and
   flagged every synced file as a missing body — a synced tree could never pass
