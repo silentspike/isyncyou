@@ -96,6 +96,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
 
+### Fixed
+- `isyncyou verify` misread synced **OneDrive** items as archive bodies (their
+  `local_path` is a name segment under `sync_root`, resolved through parents) and
+  flagged every synced file as a missing body — a synced tree could never pass
+  verify. Found by the deployed staging environment's first nightly E2E run (#326);
+  OneDrive items are now checked against the sync root via the parent walk.
+
 ### Not yet implemented
 - eBPF change-source backend (the fanotify backend already covers the privileged
   server case; eBPF would be a further optimization).
