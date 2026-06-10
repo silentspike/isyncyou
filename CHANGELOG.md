@@ -58,6 +58,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   no explicit `ISYNCYOU_TOKEN_CACHE_KEY*` secret, it is AES-256-GCM encrypted with an
   auto-generated, owner-only local key instead of being written in plaintext (legacy
   plaintext caches still load). Risk R2 narrowed to the SQLite store.
+- **In-place store encryption migration** (#328): `isyncyou migrate --account <id>
+  --encrypt-store` converts an existing plaintext store to SQLCipher — atomic
+  (temp + rename + fsync; a crash mid-migration leaves the plaintext store fully
+  usable and the next run resumes), preserves all rows and rebuilds the FTS
+  indexes, refuses without a configured store key, and is a detectable no-op on an
+  already-encrypted store. A legacy plaintext **token cache** likewise migrates to
+  the encrypted format on its next save. Risk **R2 → mitigated**.
 - **Code-coverage gate**: a `coverage.yml` workflow measures workspace line coverage
   with `cargo-llvm-cov` and fails under 70% (currently ~77%), with a README badge so
   the test substance is visible and cannot silently rot.
