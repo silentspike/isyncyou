@@ -69,6 +69,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Supply-chain hardening (#360): **OpenSSF Scorecard** workflow + README badge,
   **`dependency-review`** gate on PRs into dev (fails on high-severity advisories),
   and **`step-security/harden-runner`** (egress audit) on the release job.
+- **build-once-promote** (#329): the staging/main gates now skip the heavy
+  build/test/docs jobs when the promotion's tree is byte-identical to `origin/dev`
+  (deterministic re-runs already gated on dev) — the same commit is no longer
+  recompiled at every stage; cheap checks (fmt, cargo-deny, CodeQL) still run, and a
+  diverged tree builds fully.
 - `docs/`: Graph capability + restore-fidelity matrices, sync-state machine, path
   mapping, delete/trash/conflict model, auth/token lifecycle, local-API security,
   packaging/daemon model.
