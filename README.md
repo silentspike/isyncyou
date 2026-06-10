@@ -248,8 +248,11 @@ This section is deliberately blunt — it is the inverse of the status table.
   leaves only a non-secret marker file in the archive root. Headless/file caches are
   owner-only on Unix (`0600`) and can be AES-256-GCM encrypted when a token-cache
   secret is configured (`ISYNCYOU_TOKEN_CACHE_KEY_FILE`, systemd credential
-  `isyncyou-token-cache-key`, or `ISYNCYOU_TOKEN_CACHE_KEY`). Without keyring or
-  that secret they still fall back to plaintext for now. The SQLite store can be
+  `isyncyou-token-cache-key`, or `ISYNCYOU_TOKEN_CACHE_KEY`). Without a keyring or
+  that secret, the token cache is **still encrypted at rest** with an auto-generated,
+  owner-only local key kept beside it (never plaintext); that local key protects the
+  cache file if it is copied/synced on its own, not against full config-dir read
+  access. The SQLite store can be
   SQLCipher-encrypted via `ISYNCYOU_STORE_KEY_FILE`, systemd credential
   `isyncyou-store-key`, or `ISYNCYOU_STORE_KEY`; without that key, new stores remain
   plaintext and `isyncyou-doctor` warns. Do not point plaintext stores at sensitive
