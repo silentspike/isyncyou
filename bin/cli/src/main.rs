@@ -1010,7 +1010,11 @@ fn verify_account(cfg: &Config, account: &str) -> Result<VerifyReport, String> {
         missing_body: 0,
         empty_body: 0,
     };
+    // Backup services: `local_path` is an archive-root-relative body file.
     for &svc in STATUS_SERVICES {
+        if svc == "onedrive" {
+            continue; // synced files, not archive bodies — checked below
+        }
         for it in store
             .items_by_service(account, svc)
             .map_err(|e| e.to_string())?
@@ -1024,6 +1028,29 @@ fn verify_account(cfg: &Config, account: &str) -> Result<VerifyReport, String> {
                     Err(_) => r.missing_body += 1,
                 }
             }
+        }
+    }
+    // OneDrive: `local_path` is only the name *segment*; the synced file lives
+    // under sync_root at the path resolved through its parents. (Previously these
+    // were wrongly checked as archive bodies, so a synced tree failed verify.)
+    let od = store
+        .items_by_service(account, "onedrive")
+        .map_err(|e| e.to_string())?;
+    let by_id: std::collections::HashMap<&str, &isyncyou_store::Item> =
+        od.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+    for it in &od {
+        r.items += 1;
+        if it.local_path.is_none() {
+            continue;
+        }
+        r.with_body += 1;
+        match connectors::local_rel_path(&by_id, it) {
+            Some(rel) => match std::fs::metadata(acc.sync_root.join(rel)) {
+                Ok(m) if m.is_file() && m.len() == 0 => r.empty_body += 1,
+                Ok(_) => {}
+                Err(_) => r.missing_body += 1,
+            },
+            None => r.missing_body += 1,
         }
     }
     Ok(r)
@@ -1958,6 +1985,43 @@ mod tests {
         assert!(!r.healthy());
         // cmd_verify surfaces the problem as an error
         assert!(cmd_verify(&p, "a").unwrap_err().contains("missing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_checks_onedrive_items_against_the_sync_root() {
+        // Regression (found by the staging E2E): onedrive `local_path` is only a
+        // name segment under sync_root — verify used to misread it as an
+        // archive-relative body and flagged every synced file as missing.
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-vfo-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        let sync = dir.join("od");
+        std::fs::create_dir_all(sync.join("Docs")).unwrap();
+        std::fs::write(sync.join("Docs/report.txt"), b"content").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut folder = isyncyou_store::Item::new("a", "onedrive", "fold1", "Docs", "folder");
+            folder.local_path = Some("Docs".into());
+            store.upsert_item(&folder).unwrap();
+            let mut file =
+                isyncyou_store::Item::new("a", "onedrive", "file1", "report.txt", "file");
+            file.local_path = Some("report.txt".into());
+            file.parent_remote_id = Some("fold1".into());
+            store.upsert_item(&file).unwrap();
+            let mut gone = isyncyou_store::Item::new("a", "onedrive", "file2", "gone.txt", "file");
+            gone.local_path = Some("gone.txt".into());
+            gone.parent_remote_id = Some("fold1".into());
+            store.upsert_item(&gone).unwrap();
+        }
+        let cfg = load_config(&p).unwrap();
+        let r = verify_account(&cfg, "a").unwrap();
+        assert_eq!(r.items, 3);
+        assert_eq!(r.with_body, 3);
+        // folder + present file are fine; only the truly absent file is flagged
+        assert_eq!(r.missing_body, 1);
+        assert_eq!(r.empty_body, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
