@@ -280,7 +280,12 @@ const MAX_PATH_DEPTH: usize = 256;
 /// up through `by_id`, collecting each ancestor's mapped local name. Stops at the
 /// drive root (whose id is absent from the store). `None` if an item on the chain
 /// has no local name or a cycle is hit.
-fn local_rel_path(by_id: &HashMap<&str, &Item>, it: &Item) -> Option<PathBuf> {
+///
+/// Public so integrity checks (`isyncyou verify`) can resolve where a synced
+/// OneDrive item lives on disk — its `local_path` is only the name *segment*
+/// (resolved through its parents), unlike the archive-relative body paths of the
+/// backup services.
+pub fn local_rel_path(by_id: &HashMap<&str, &Item>, it: &Item) -> Option<PathBuf> {
     let mut parts: Vec<&str> = Vec::new();
     let mut cur = it;
     for _ in 0..MAX_PATH_DEPTH {
