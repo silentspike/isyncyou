@@ -11,6 +11,30 @@ updates:
       prefix: "deps"
     labels:
       - "type:deps"
+    groups:
+      # RustCrypto crates share the `digest` generation and must move together; a
+      # single grouped PR is mergeable, separate ones are not (sha2 0.11 needs
+      # hmac 0.13 and vice versa).
+      rustcrypto:
+        patterns: ["sha2", "hmac", "digest"]
+    ignore:
+      # Major bumps of these deeply-integrated crates carry breaking API changes and
+      # bring no security fix; migrate them deliberately, not via an auto-opened PR
+      # that just sits red. (rusqlite majors can also raise the effective MSRV past
+      # the declared rust-version, as 0.40 → libsqlite3-sys/cfg_select showed.)
+      # Minor/patch updates still flow normally.
+      - dependency-name: "cosmic-text"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tiny-skia"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "fuser"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rusqlite"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
