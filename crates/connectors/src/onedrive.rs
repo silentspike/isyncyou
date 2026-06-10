@@ -271,6 +271,9 @@ pub struct MaterializeReport {
     pub dirs_created: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Locally-edited files moved aside as `safeBackup` conflict copies before
+    /// the newer cloud version was written (download-path keep-both).
+    pub conflicts: usize,
 }
 
 /// Guard against a malformed parent cycle when walking to the drive root.
@@ -351,6 +354,63 @@ fn rfc3339_to_unix(s: &str) -> Option<i64> {
 /// so a re-download would be redundant (e.g. after a `410` resync re-marked
 /// everything `remote_dirty`). Cheap heuristic; a content hash would be
 /// definitive (a follow-up). A file without a stored size/mtime never matches.
+/// Persist the last-synced on-disk reference for an item from the file that was
+/// just written/uploaded: its actual disk size + mtime, plus the content hash.
+/// Best-effort — a metadata failure only means the next pass treats the item as
+/// reference-less (legacy behavior), never an error.
+fn record_synced_state(
+    store: &Store,
+    account: &str,
+    remote_id: &str,
+    full: &Path,
+    hash: Option<String>,
+) {
+    if let Ok(meta) = std::fs::metadata(full) {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = store.set_synced_state(
+            account,
+            SERVICE,
+            remote_id,
+            meta.len() as i64,
+            mtime,
+            hash.as_deref(),
+        );
+    }
+}
+
+/// Whether the on-disk file was edited since the last sync, judged against the
+/// **last-synced reference** (not the item's current — already remote-updated —
+/// metadata). Same cheap-first ladder as [`is_local_modified`]: size, then
+/// mtime, then a QuickXorHash content check so a pure `touch` is not a conflict.
+fn locally_edited_since_sync(full: &Path, ssize: i64, smtime: i64, shash: Option<&str>) -> bool {
+    let meta = match std::fs::metadata(full) {
+        Ok(m) => m,
+        Err(_) => return false, // nothing on disk → nothing to protect
+    };
+    if meta.len() as i64 != ssize {
+        return true;
+    }
+    let disk_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    if disk_mtime == Some(smtime) {
+        return false;
+    }
+    match (shash, std::fs::read(full)) {
+        (Some(h), Ok(data)) => crate::quickxor::quickxor_base64(&data) != h,
+        // no stored hash / unreadable: same size + different mtime alone is not
+        // enough evidence to declare a conflict
+        _ => false,
+    }
+}
+
 fn local_file_matches(path: &Path, it: &Item) -> bool {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -400,6 +460,7 @@ pub fn materialize_downloads<D: Downloader>(
     downloader: &D,
     account: &str,
     sync_root: &Path,
+    host: &str,
 ) -> Result<MaterializeReport, SyncError> {
     let items = store.items_by_service(account, SERVICE)?;
     let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
@@ -432,8 +493,38 @@ pub fn materialize_downloads<D: Downloader>(
                 // already on disk with the same size + mtime — skip the download
                 // (e.g. a 410 resync re-marked everything remote_dirty).
                 store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                record_synced_state(
+                    store,
+                    account,
+                    &it.remote_id,
+                    &full,
+                    it.quickxorhash.clone(),
+                );
                 report.skipped += 1;
             } else {
+                // Keep-both on the download path too (plan §10): a locally-edited
+                // file must never be clobbered by a newer cloud version. "Locally
+                // edited" = the on-disk file differs from the last-synced reference
+                // (size → mtime → QuickXorHash ladder). The item's own metadata
+                // cannot be used here — the delta ingest already overwrote it with
+                // the NEW remote values. Items without a reference (pre-v8 stores,
+                // never-synced) keep the plain overwrite rather than spraying a
+                // conflict copy for every ordinary remote update.
+                if let Some((ssize, smtime, shash)) =
+                    store.get_synced_state(account, SERVICE, &it.remote_id)?
+                {
+                    if locally_edited_since_sync(&full, ssize, smtime, shash.as_deref()) {
+                        let dir = full
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| sync_root.to_path_buf());
+                        let fname = full.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                        let copy = unique_conflict_copy(&dir, fname, host);
+                        if std::fs::rename(&full, dir.join(&copy)).is_ok() {
+                            report.conflicts += 1;
+                        }
+                    }
+                }
                 if let Some(parent) = full.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -445,6 +536,8 @@ pub fn materialize_downloads<D: Downloader>(
                                 set_file_mtime(&full, mt);
                             }
                             store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                            let hash = Some(crate::quickxor::quickxor_base64(&bytes));
+                            record_synced_state(store, account, &it.remote_id, &full, hash);
                             report.downloaded += 1;
                         }
                         Err(_) => report.failed += 1,
@@ -608,9 +701,13 @@ pub fn push_local_creates<W: RemoteWriter>(
 ) -> Result<usize, SyncError> {
     let mut uploaded = 0;
     for rel in creates {
-        let data = std::fs::read(sync_root.join(rel))?;
+        let full = sync_root.join(rel);
+        let data = std::fs::read(&full)?;
         let dest = cloud_dest_path(rel);
-        push_upload(writer, store, map, account, &dest, &data)?;
+        let id = push_upload(writer, store, map, account, &dest, &data)?;
+        // the uploaded bytes ARE the on-disk state — record the synced reference
+        let hash = Some(crate::quickxor::quickxor_base64(&data));
+        record_synced_state(store, account, &id, &full, hash);
         uploaded += 1;
     }
     Ok(uploaded)
@@ -780,6 +877,9 @@ pub fn apply_local_modifies<R: ContentReplacer>(
         match replacer.replace_if_match(id, &data, etag) {
             Ok(Some(item)) => {
                 ingest_item(store, map, account, &item, "", "clean")?;
+                // the uploaded bytes ARE the on-disk state — record the reference
+                let hash = Some(crate::quickxor::quickxor_base64(&data));
+                record_synced_state(store, account, id, &sync_root.join(rel), hash);
                 report.uploaded += 1;
             }
             Ok(None) => {
@@ -989,6 +1089,140 @@ mod tests {
         }
     }
 
+    /// Seed one tracked file at the sync root: store item (remote_dirty with NEW
+    /// remote metadata, as after a delta ingest) + on-disk content + optionally
+    /// the last-synced reference for that on-disk content.
+    fn seed_edit_edit_scenario(
+        store: &Store,
+        dir: &Path,
+        disk_content: &[u8],
+        record_reference: bool,
+    ) -> std::path::PathBuf {
+        let mut file = Item::new("acc", SERVICE, "c1", "doc.txt", "file");
+        file.local_path = Some("doc.txt".into());
+        file.sync_state = "remote_dirty".into();
+        // NEW remote values (the other side's edit) — already ingested
+        file.size = Some(9);
+        file.remote_mtime = Some("2026-06-10T12:00:00Z".into());
+        store.upsert_item(&file).unwrap();
+        let full = dir.join("doc.txt");
+        std::fs::write(&full, disk_content).unwrap();
+        if record_reference {
+            // reference == current disk state (file was clean at last sync)
+            record_synced_state(
+                store,
+                "acc",
+                "c1",
+                &full,
+                Some(crate::quickxor::quickxor_base64(disk_content)),
+            );
+        }
+        full
+    }
+
+    #[test]
+    fn materialize_keeps_both_when_local_file_was_edited() {
+        // Regression for the data-loss bug the staging E2E found: local edit +
+        // remote edit in the same pass silently overwrote the local edit. The
+        // local edit must survive as a safeBackup conflict copy.
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let full = seed_edit_edit_scenario(&store, dir.path(), b"v1 original", true);
+        // user edits the file AFTER the reference was recorded
+        std::fs::write(&full, b"v2 LOCAL edit").unwrap();
+
+        let dl = MockDownloader(
+            [("c1".to_string(), b"v2 REMOTE".to_vec())]
+                .into_iter()
+                .collect(),
+        );
+        let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
+        assert_eq!(report.conflicts, 1, "local edit must be kept as a copy");
+        assert_eq!(report.downloaded, 1);
+        // original path now holds the cloud version
+        assert_eq!(std::fs::read(&full).unwrap(), b"v2 REMOTE");
+        // the local edit survives in the safeBackup copy
+        let copy = dir.path().join("doc-host-safeBackup-0001.txt");
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            b"v2 LOCAL edit",
+            "local edit was clobbered"
+        );
+    }
+
+    #[test]
+    fn materialize_overwrites_stale_clean_file_without_conflict_copy() {
+        // Counter-case: the local file is untouched since the last sync (disk ==
+        // reference), only the cloud changed — a normal update must NOT spray a
+        // conflict copy.
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let full = seed_edit_edit_scenario(&store, dir.path(), b"v1 original", true);
+
+        let dl = MockDownloader(
+            [("c1".to_string(), b"v2 REMOTE".to_vec())]
+                .into_iter()
+                .collect(),
+        );
+        let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
+        assert_eq!(report.conflicts, 0, "clean update must not create a copy");
+        assert_eq!(report.downloaded, 1);
+        assert_eq!(std::fs::read(&full).unwrap(), b"v2 REMOTE");
+        assert!(!dir.path().join("doc-host-safeBackup-0001.txt").exists());
+    }
+
+    #[test]
+    fn materialize_without_synced_reference_keeps_legacy_overwrite() {
+        // Pre-v8 stores have no reference: keep the old overwrite behavior (no
+        // conflict-copy spray on ordinary updates) rather than guessing.
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let full = seed_edit_edit_scenario(&store, dir.path(), b"whatever is here", false);
+
+        let dl = MockDownloader(
+            [("c1".to_string(), b"v2 REMOTE".to_vec())]
+                .into_iter()
+                .collect(),
+        );
+        let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(std::fs::read(&full).unwrap(), b"v2 REMOTE");
+        assert!(!dir.path().join("doc-host-safeBackup-0001.txt").exists());
+    }
+
+    #[test]
+    fn push_local_creates_records_the_synced_reference() {
+        // The upload path must record the reference, so a later remote edit +
+        // local edit can be told apart by the download keep-both.
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("n.txt"), b"local v1").unwrap();
+        let w = MockWriter::new();
+        let mut map = MappingTable::new();
+        push_local_creates(
+            &w,
+            &store,
+            &mut map,
+            "acc",
+            dir.path(),
+            &[std::path::PathBuf::from("n.txt")],
+        )
+        .unwrap();
+        let id = store
+            .all_items_by_service("acc", SERVICE)
+            .unwrap()
+            .first()
+            .unwrap()
+            .remote_id
+            .clone();
+        let (size, _mtime, hash) = store
+            .get_synced_state("acc", SERVICE, &id)
+            .unwrap()
+            .expect("upload must record the synced reference");
+        assert_eq!(size, 8); // b"local v1"
+        assert_eq!(hash, Some(crate::quickxor::quickxor_base64(b"local v1")));
+    }
+
     #[test]
     fn materialize_writes_remote_dirty_files_then_marks_clean() {
         let store = Store::open_in_memory().unwrap();
@@ -1011,7 +1245,7 @@ mod tests {
                 .collect(),
         );
         let dir = tempfile::tempdir().unwrap();
-        let report = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(report.downloaded, 1);
         assert_eq!(report.dirs_created, 1);
         assert_eq!(report.failed, 0);
@@ -1052,7 +1286,7 @@ mod tests {
         }
 
         // a second pass downloads nothing (everything is clean)
-        let r2 = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        let r2 = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(r2.downloaded, 0);
         assert_eq!(r2.dirs_created, 0);
     }
@@ -1083,7 +1317,7 @@ mod tests {
         store.upsert_item(&f).unwrap();
         let dl = MockDownloader(HashMap::new());
         let dir = tempfile::tempdir().unwrap();
-        let r = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        let r = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(r.failed, 1);
         assert_eq!(r.downloaded, 0);
     }
@@ -1105,7 +1339,7 @@ mod tests {
 
         // a downloader that errors on any call — so a skip is provable (no download)
         let dl = MockDownloader(HashMap::new());
-        let report = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(report.skipped, 1, "unchanged file should be skipped");
         assert_eq!(report.downloaded, 0);
         assert_eq!(
@@ -1126,7 +1360,7 @@ mod tests {
         store
             .set_sync_state("acc", SERVICE, "a1", "remote_dirty")
             .unwrap();
-        let r2 = materialize_downloads(&store, &dl, "acc", dir.path()).unwrap();
+        let r2 = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(r2.skipped, 0);
         assert_eq!(
             r2.failed, 1,
@@ -1631,7 +1865,7 @@ mod tests {
         incremental_sync(&mut client, &store, &mut map, "testuser", "t")
             .expect("live sync should succeed");
         let dir = tempfile::tempdir().unwrap();
-        let report = materialize_downloads(&store, &client, "testuser", dir.path())
+        let report = materialize_downloads(&store, &client, "testuser", dir.path(), "host")
             .expect("materialize should succeed");
         eprintln!(
             "live materialize: downloaded={} dirs={} failed={}",
@@ -1706,7 +1940,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
         let trash_root = base.path().join("trash");
-        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        materialize_downloads(&store, &client, "acc", &sync_root, "host").expect("materialize");
         let local = sync_root.join("iSyncYou-deltest").join("del-me.txt");
         assert!(local.exists(), "file should have materialized to disk");
 
@@ -1818,7 +2052,7 @@ mod tests {
         incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
-        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        materialize_downloads(&store, &client, "acc", &sync_root, "host").expect("materialize");
         let local = sync_root.join("iSyncYou-modtest").join("m.txt");
         assert!(local.exists(), "file should have materialized");
 
@@ -1876,7 +2110,7 @@ mod tests {
         incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
-        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        materialize_downloads(&store, &client, "acc", &sync_root, "host").expect("materialize");
         let local = sync_root.join("iSyncYou-conflicttest").join("c.txt");
         assert!(local.exists());
 
@@ -1958,7 +2192,7 @@ mod tests {
         incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
-        materialize_downloads(&store, &client, "acc", &sync_root).expect("materialize");
+        materialize_downloads(&store, &client, "acc", &sync_root, "host").expect("materialize");
         let local = sync_root.join("iSyncYou-deltest2").join("d.txt");
         assert!(local.exists(), "file should have materialized");
 
