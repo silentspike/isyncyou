@@ -68,6 +68,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Code-coverage gate**: a `coverage.yml` workflow measures workspace line coverage
   with `cargo-llvm-cov` and fails under 70% (currently ~77%), with a README badge so
   the test substance is visible and cannot silently rot.
+- **Deterministic transport tests** (#413): the Graph HTTP transport is now
+  exercised against a local mock server (std-only) — 429/`Retry-After`, network
+  failure → retryable 503, 4xx/5xx classification, malformed JSON, resumable-upload
+  resume/completion/failure, `If-Match`/412 conflict, OneNote multipart, deletes.
+  `graph/http.rs` line coverage 23% → ~87%; workspace ~80%; the coverage floor is
+  raised 70% → 75%. `GraphClient::with_base_url` makes the API base injectable
+  (tests + sovereign-cloud endpoints).
 - CI/CD hardening: a **promote watchdog** alerts on a stalled autonomous promotion
   instead of failing silently (#359); `release.yml` **self-verifies its own cosign
   signatures** before publishing and **smoke-tests the Linux binary** (#361, #362);
