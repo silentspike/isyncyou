@@ -180,6 +180,25 @@ enum Command {
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
     },
+    /// Delete a single item from the cloud (e.g. tearing down a test restore on a
+    /// throwaway account). Mail only for now. Gated by
+    /// `restore.cloud_restore_enabled` — deletion is at least as destructive as a
+    /// cloud re-create — and needs a write token.
+    Rm {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// Service the item belongs to. Only `mail` is supported for now.
+        #[arg(long)]
+        service: String,
+        /// The cloud item's id (e.g. a message id).
+        #[arg(long)]
+        id: String,
+        /// Graph **write** access token (Mail.ReadWrite).
+        #[arg(long, env = "ISYNCYOU_TOKEN")]
+        token: Option<String>,
+    },
     /// Export archived items to interchange files (.ics / .vcf).
     Export {
         #[arg(long, default_value = "isyncyou.toml")]
@@ -394,6 +413,13 @@ fn run(command: Command) -> Result<(), String> {
             preview,
             token,
         } => cmd_restore(&config, &account, &service, &id, to_local, preview, token),
+        Command::Rm {
+            config,
+            account,
+            service,
+            id,
+            token,
+        } => cmd_rm(&config, &account, &service, &id, token),
         Command::Export {
             config,
             account,
@@ -519,6 +545,24 @@ fn resolve_token(
     };
     let now = unix_now().parse::<u64>().unwrap_or(0);
     isyncyou_graph::auth::flow::ensure_access_token(&cache, client, scopes, now)
+}
+
+/// Resolve the token for a sync pass. Bidirectional sync uploads and deletes, so
+/// it needs write scopes — prefer the cached **write** token when one exists, and
+/// fall back to the read token (download-only) otherwise. This mirrors the daemon,
+/// which syncs accounts that have a write token. An explicit `--token` wins.
+fn resolve_sync_token(
+    cfg: &Config,
+    account: &str,
+    token: Option<String>,
+) -> Result<String, String> {
+    if token.is_some() {
+        return resolve_token(cfg, account, token, false);
+    }
+    let has_write = token_cache_path(cfg, account, true)
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    resolve_token(cfg, account, None, has_write)
 }
 
 fn cmd_login(config: &Path, account: &str, write: bool, keyring: bool) -> Result<(), String> {
@@ -1151,7 +1195,7 @@ fn cmd_sync(
     // `--watch` session authenticated.
     let run_pass = || -> Result<(), String> {
         let cfg = load_config(config)?;
-        let tok = resolve_token(&cfg, account, token.clone(), false)?;
+        let tok = resolve_sync_token(&cfg, account, token.clone())?;
         let store = Store::open(store_path(&cfg, account)?).map_err(|e| e.to_string())?;
         let mut map = MappingTable::new();
         let mut client = isyncyou_graph::GraphClient::new(tok);
@@ -1614,6 +1658,38 @@ fn cmd_restore(
     let token = resolve_token(&cfg, account, token, true)?;
     let new_id = isyncyou_engine::restore_cloud(&cfg, account, service, id, token)?;
     println!("restored {service} item '{id}' as '{new_id}'");
+    Ok(())
+}
+
+/// Delete a single cloud item via Graph (write token). Mail only for now. Gated
+/// by `restore.cloud_restore_enabled` — deletion is at least as destructive as a
+/// cloud re-create — so a disabled gate refuses before touching credentials. Used
+/// to tear down a test-restore on a throwaway account.
+fn cmd_rm(
+    config: &Path,
+    account: &str,
+    service: &str,
+    id: &str,
+    token: Option<String>,
+) -> Result<(), String> {
+    let cfg = load_config(config)?;
+    if !cfg.restore.cloud_restore_enabled {
+        return Err(
+            "cloud delete is disabled (set restore.cloud_restore_enabled = true to opt in). \
+             It permanently removes a cloud item."
+                .to_string(),
+        );
+    }
+    if service != "mail" {
+        return Err(format!(
+            "cloud delete supports only 'mail' for now (got '{service}')"
+        ));
+    }
+    let token = resolve_token(&cfg, account, token, true)?;
+    isyncyou_graph::GraphClient::new(token)
+        .delete_url(&format!("/me/messages/{id}"))
+        .map_err(|e| format!("delete {service} item '{id}': {e}"))?;
+    println!("deleted {service} item '{id}'");
     Ok(())
 }
 
@@ -2482,6 +2558,111 @@ mod tests {
                 token: Some("T".into()),
             }
         );
+    }
+
+    #[test]
+    fn parses_rm() {
+        let c = parse(&[
+            "isyncyou",
+            "rm",
+            "--account",
+            "a",
+            "--service",
+            "mail",
+            "--id",
+            "M1",
+            "--token",
+            "T",
+        ])
+        .unwrap();
+        assert_eq!(
+            c.command,
+            Command::Rm {
+                config: "isyncyou.toml".into(),
+                account: "a".into(),
+                service: "mail".into(),
+                id: "M1".into(),
+                token: Some("T".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn rm_refuses_when_cloud_restore_gate_is_off() {
+        // A config without a [restore] section -> cloud_restore_enabled defaults
+        // to false. rm must refuse before touching any credentials.
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-rmg-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = dir.join("c.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[[accounts]]\nid=\"a\"\nusername=\"a@outlook.com\"\nsync_root=\"{}/od\"\narchive_root=\"{}\"\n",
+                dir.display(),
+                arch.display()
+            ),
+        )
+        .unwrap();
+        let err = cmd_rm(&p, "a", "mail", "M1", Some("TOK".into())).unwrap_err();
+        assert!(err.contains("cloud delete is disabled"), "got: {err}");
+        assert!(err.contains("cloud_restore_enabled"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_refuses_non_mail_service() {
+        // write_config sets cloud_restore_enabled = true, so the gate passes and
+        // the service check is what rejects a non-mail service (before any token).
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-rms-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        let err = cmd_rm(&p, "a", "todo", "T1", Some("TOK".into())).unwrap_err();
+        assert!(err.contains("only 'mail'"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_sync_token_prefers_write_then_read() {
+        // Two valid, non-expired plaintext caches with distinct access tokens.
+        // resolve_sync_token must pick the write token when it exists, else read.
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-sst-{}", std::process::id()));
+        let arch = dir.join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let p = write_config(&dir, &arch);
+        let cfg = load_config(&p).unwrap();
+        let write_cache = |access: &str| {
+            format!("{{\"access_token\":\"{access}\",\"refresh_token\":\"RT\",\"expires_at\":9999999999}}")
+        };
+        // read token only -> read is used
+        std::fs::write(
+            arch.join(".isyncyou-token-read.json"),
+            write_cache("READ-TOK"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_sync_token(&cfg, "a", None).unwrap(),
+            "READ-TOK",
+            "no write cache -> read token"
+        );
+        // write token present -> write wins (bidirectional sync needs write scopes)
+        std::fs::write(
+            arch.join(".isyncyou-token-write.json"),
+            write_cache("WRITE-TOK"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_sync_token(&cfg, "a", None).unwrap(),
+            "WRITE-TOK",
+            "write cache present -> write token preferred"
+        );
+        // an explicit token always wins
+        assert_eq!(
+            resolve_sync_token(&cfg, "a", Some("EXPLICIT".into())).unwrap(),
+            "EXPLICIT"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Writes a minimal one-account config whose archive_root is `arch`.
