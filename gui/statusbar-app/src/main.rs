@@ -37,7 +37,7 @@ fn sample_view() -> StatusView {
                 percent: 71,
             },
             Transfer {
-                name: "Beleg.pdf".into(),
+                name: "invoice.pdf".into(),
                 up: true,
                 percent: 88,
             },
@@ -230,7 +230,109 @@ fn run_tray(proxy: EventLoopProxy<UserEvent>) {
     });
 }
 
+/// Minimal HTTP/1.1 GET over loopback TCP (the local API is loopback-only and
+/// plaintext, so no client library is needed). Returns the parsed JSON body.
+fn http_get_json(addr: &str, path: &str) -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+    let mut sock =
+        std::net::TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    write!(
+        sock,
+        "GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|e| e.to_string())?;
+    // Read the head byte-wise up to the terminator, then exactly Content-Length
+    // body bytes — the server may keep the connection open, so reading to EOF
+    // would just hit the timeout.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match sock.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(e) => return Err(format!("read header: {e}")),
+        }
+        if head.len() > 64 * 1024 {
+            return Err("oversized HTTP header".into());
+        }
+    }
+    let head_text = String::from_utf8_lossy(&head);
+    let len: usize = head_text
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(str::to_owned)
+        })
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or("response without Content-Length")?;
+    let mut body = vec![0u8; len];
+    sock.read_exact(&mut body)
+        .map_err(|e| format!("read body: {e}"))?;
+    serde_json::from_slice(&body).map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// Build a [`StatusView`] from the **live daemon** via its local API: the first
+/// account's username plus the real scheduled-sync state. Errors (daemon down,
+/// no account) are surfaced — a snapshot must prove live data, not invent it.
+fn live_view(api: &str) -> Result<StatusView, String> {
+    let accounts = http_get_json(api, "/api/v1/accounts")?;
+    let acc = accounts["accounts"]
+        .as_array()
+        .and_then(|a| a.first())
+        .ok_or("daemon reports no accounts")?;
+    let username = acc["username"].as_str().unwrap_or("?").to_string();
+    let state = http_get_json(api, "/api/v1/sync/state")?;
+    let sync_state = if state["paused"].as_bool().unwrap_or(false) {
+        SyncState::Paused
+    } else {
+        SyncState::Synced
+    };
+    Ok(StatusView {
+        account: username,
+        state: sync_state,
+        transfers: vec![],
+        down_mbps: 0.0,
+        up_mbps: 0.0,
+        queue: 0,
+    })
+}
+
+/// `--snapshot <out.png> [--api <host:port>]`: render the **live** daemon status
+/// headlessly through the same renderer that draws the window (the verified
+/// pixels ARE the screen pixels) and exit — no display server needed. Used by
+/// the staging E2E to verify the native UI against real daemon data.
+fn run_snapshot(out: &str, api: &str) -> Result<(), String> {
+    let view = live_view(api)?;
+    let png = isyncyou_statusbar::render_png(&view);
+    std::fs::write(out, png).map_err(|e| format!("write {out}: {e}"))?;
+    eprintln!(
+        "snapshot: {out} (account {}, state {:?})",
+        view.account, view.state
+    );
+    Ok(())
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--snapshot") {
+        let out = args
+            .get(i + 1)
+            .map(String::as_str)
+            .unwrap_or("statusbar.png");
+        let api = args
+            .iter()
+            .position(|a| a == "--api")
+            .and_then(|j| args.get(j + 1))
+            .map(String::as_str)
+            .unwrap_or("127.0.0.1:8765");
+        if let Err(e) = run_snapshot(out, api) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let deadline = std::env::var("ISYNCYOU_STATUSBAR_EXIT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -249,4 +351,68 @@ fn main() {
         deadline,
     };
     event_loop.run_app(&mut app).expect("run app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One-shot mock API: serves canned JSON bodies for the two endpoints the
+    /// snapshot mode queries, then a temp PNG is rendered from the result.
+    fn serve_api(paused: bool) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                use std::io::{Read, Write};
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && sock.read(&mut b).unwrap_or(0) > 0 {
+                    head.push(b[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let body = if head.contains("/api/v1/accounts") {
+                    r#"{"accounts":[{"id":"a","username":"live@example.com"}]}"#.to_string()
+                } else {
+                    format!(r#"{{"enabled":true,"paused":{paused}}}"#)
+                };
+                write!(
+                    sock,
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn live_view_reads_account_and_sync_state_from_the_daemon_api() {
+        let addr = serve_api(true);
+        let v = live_view(&addr).unwrap();
+        assert_eq!(v.account, "live@example.com");
+        assert!(matches!(v.state, SyncState::Paused));
+    }
+
+    #[test]
+    fn snapshot_writes_a_png_rendered_from_live_data() {
+        let addr = serve_api(false);
+        let out = std::env::temp_dir().join(format!("isy-snap-{}.png", std::process::id()));
+        run_snapshot(out.to_str().unwrap(), &addr).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+        assert!(bytes.len() > 10_000, "implausibly small render");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn live_view_surfaces_a_dead_daemon_instead_of_inventing_data() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        assert!(live_view(&addr).is_err());
+    }
 }
