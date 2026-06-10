@@ -21,6 +21,33 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # build-once-promote (#329): a promotion PR is a tree-overlay of dev, so its
+  # content was already built + tested on dev. When the tree is byte-identical to
+  # origin/dev, the heavy build/test/release-build jobs are deterministic re-runs —
+  # skip them; the cheap checks (fmt, cargo-deny) and CodeQL still run. If dev has
+  # moved on, build fully.
+  content-check:
+    name: content-check
+    runs-on: ubuntu-latest
+    outputs:
+      identical: ${{ steps.t.outputs.identical }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+        with:
+          fetch-depth: 0
+      - id: t
+        run: |
+          git fetch origin dev -q
+          head_tree=$(git rev-parse "HEAD^{tree}")
+          dev_tree=$(git rev-parse "FETCH_HEAD^{tree}")
+          if [ "$head_tree" = "$dev_tree" ]; then
+            echo "identical=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::content == origin/dev ($head_tree); already gated on dev — skipping heavy build/test"
+          else
+            echo "identical=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::content differs from origin/dev — running full build/test"
+          fi
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -37,6 +64,8 @@ jobs:
 
   clippy:
     name: clippy
+    needs: content-check
+    if: needs.content-check.outputs.identical != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
@@ -52,6 +81,8 @@ jobs:
 
   test:
     name: build & test
+    needs: content-check
+    if: needs.content-check.outputs.identical != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
@@ -77,6 +108,8 @@ jobs:
 
   docs:
     name: docs
+    needs: content-check
+    if: needs.content-check.outputs.identical != 'true'
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
@@ -92,6 +125,8 @@ jobs:
 
   release-build:
     name: release build
+    needs: content-check
+    if: needs.content-check.outputs.identical != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
@@ -106,7 +141,7 @@ jobs:
   main-pass:
     name: main-pass
     if: always()
-    needs: [fmt, clippy, test, deny, docs, release-build]
+    needs: [content-check, fmt, clippy, test, deny, docs, release-build]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed
