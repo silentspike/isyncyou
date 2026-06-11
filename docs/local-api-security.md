@@ -62,12 +62,32 @@ endpoints:
 `POST /api/v1/sync/{pause,resume,now}`. Bad params → `400`, unknown account →
 `404`.
 
-## Planned hardening (plan §11 — not yet implemented)
+## Remote access — local-only **by design** (decided 2026-06-11)
+
+The API intentionally has **no remote surface**, and none is planned. The
+listener never binds beyond loopback (`serve()` rejects non-loopback binds), and
+the Unix socket is owner-only. This is a deliberate architecture decision, not a
+gap:
+
+- The target audience runs iSyncYou on the machine they sit at (a desktop
+  client, like the OneDrive client it replaces). Comparable tools
+  (abraunegg/onedrive, rclone's default posture) ship no remote API either.
+- The rare headless-server operator already has a better-audited channel than
+  anything we could hand-build: `ssh -L 8765:127.0.0.1:8765 host` (then open
+  `http://localhost:8765`), or any self-hosted VPN. SSH keys plus decades of
+  hardening beat a home-grown mTLS/pairing/rotation stack.
+- "No open port" is the strongest security posture available; building remote
+  auth would create the very attack surface it then has to defend
+  (risk-register **R6 is accepted by design** on this basis).
+
+The former plan-§11 remote items (mTLS/pairing, remote-admin capability, token
+rotation) were closed as not-planned with this rationale (story S-P3.1). If a
+genuine multi-user server demand ever materializes, the decision can be
+revisited — against real requirements, not speculative ones.
+
+## Planned hardening (still open, local scope)
 
 - A stricter CSRF story for the TCP loopback transport beyond the current
-  Host/Origin boundary and capability-token guard.
-- Separate **remote-admin capability** from the local restore/sync-control tokens
-  before any remote admin surface is exposed.
-- Remote access only via mTLS / pairing + token rotation. Restore POSTs already
-  write a durable per-account audit trail; future delete/config endpoints need the
-  same audit hook before they are exposed remotely.
+  Host/Origin boundary and capability-token guard. Restore POSTs already write a
+  durable per-account audit trail; future delete/config endpoints need the same
+  audit hook.
