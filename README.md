@@ -70,6 +70,10 @@ bodies, and run restores. No browser engine is embedded — it's just your brows
   ledger**; a service with no crash-safe path is *refused* rather than run unsafely.
 - **Local web UI** — the daemon serves a browser UI (account/service browsing,
   search, inert body viewing, restore) on localhost. No embedded browser engine.
+  **Local-only by design**: the API never listens beyond loopback/Unix-socket —
+  for a headless box, tunnel it like any local service
+  (`ssh -L 8765:127.0.0.1:8765 host`) or use your VPN; that keeps the
+  attack surface at zero instead of shipping home-grown remote auth.
 - **Native status bar + tray** — sync status, live transfers, throttle/`429`
   transparency, pause/resume, "open in browser" — rendered by an own engine.
 - **Multi-account** — per-account stores; back up and search across all accounts.
