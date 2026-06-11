@@ -157,6 +157,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   server case; eBPF would be a further optimization).
 
 ### Out of scope (by design)
+- Remote network access to the local API (mTLS/pairing/token-rotation stack):
+  the API is **local-only by design** — no remote listener exists or is planned.
+  The target audience runs iSyncYou on the machine they sit at; the rare
+  headless-server operator tunnels via SSH (`ssh -L 8765:127.0.0.1:8765 host`)
+  or a self-hosted VPN, which is better-audited than any home-grown remote-auth
+  stack. "No open port" is the strongest security posture; risk-register R6 is
+  accepted by design on this basis (story S-P3.1 closed as not-planned).
 - Azure Event Hub realtime push: would require a paid Azure subscription, and
   iSyncYou takes no paid cloud dependency. Adaptive delta-polling (implemented) is
   the change-detection mechanism; Graph notifications are only hints anyway, so a
