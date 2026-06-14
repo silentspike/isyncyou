@@ -68,6 +68,16 @@ pub trait Uploader {
     }
 }
 
+/// Pulls the latest cloud state so the mount reflects changes made elsewhere
+/// (another device, the web UI). Returns the account's current OneDrive items
+/// (the same shape [`Tree::from_items`]/[`Tree::reconcile`] consume, **including
+/// tombstones** so deletions propagate). Injected so this crate stays free of the
+/// Graph/store stack; the daemon's impl runs a delta into the store and returns
+/// `all_items_by_service`. A read-write mount calls it (throttled) on `readdir`.
+pub trait Refresher {
+    fn refresh(&self) -> Result<Vec<Item>, String>;
+}
+
 /// Observes on-demand materializations so the host (the daemon) can surface a
 /// "downloading…/ready" notification. Called only on an actual hydrate (a
 /// cache hit fires nothing). `on_done`'s `ok` is false if the fetch failed.
@@ -336,6 +346,121 @@ impl Tree {
             n.name = sanitize_name(new_name);
         }
     }
+
+    /// The inode currently mapped to a non-empty `remote_id`, if any.
+    fn ino_by_remote(&self, remote_id: &str) -> Option<u64> {
+        if remote_id.is_empty() {
+            return None;
+        }
+        self.nodes
+            .values()
+            .find(|n| n.remote_id == remote_id)
+            .map(|n| n.ino)
+    }
+
+    /// Reconcile the tree against a fresh snapshot of cloud `items` (live +
+    /// tombstones), so changes made elsewhere appear in the mount (#478 P4).
+    ///
+    /// **Inode-stable**: an item already in the tree keeps its inode (open file
+    /// handles + the dirty write buffers keyed by inode survive a refresh); new
+    /// items get fresh inodes; a tombstoned item is removed. Items merely *absent*
+    /// from the snapshot are kept (a lagging delta must not drop them), and
+    /// **local-only nodes** (a file created in the mount, empty `remote_id`, not
+    /// yet uploaded) are always preserved. Returns true if anything changed.
+    pub fn reconcile(&mut self, items: &[Item]) -> bool {
+        let before = self.snapshot_signature();
+        // 1) apply tombstones: drop nodes whose cloud item was deleted
+        let dead: Vec<u64> = items
+            .iter()
+            .filter(|i| i.deleted_at.is_some())
+            .filter_map(|i| self.ino_by_remote(&i.remote_id))
+            .collect();
+        for ino in dead {
+            self.remove(ino);
+        }
+        // 2) upsert live items, reusing inodes for ids already present
+        let live: Vec<&Item> = items.iter().filter(|i| i.deleted_at.is_none()).collect();
+        let mut next = self.nodes.keys().copied().max().unwrap_or(ROOT_INO);
+        let mut ino_of: HashMap<String, u64> = self
+            .nodes
+            .values()
+            .filter(|n| !n.remote_id.is_empty())
+            .map(|n| (n.remote_id.clone(), n.ino))
+            .collect();
+        for it in &live {
+            if !ino_of.contains_key(&it.remote_id) {
+                next += 1;
+                ino_of.insert(it.remote_id.clone(), next);
+            }
+        }
+        for it in &live {
+            let ino = ino_of[&it.remote_id];
+            let parent = it
+                .parent_remote_id
+                .as_deref()
+                .and_then(|p| ino_of.get(p).copied())
+                .unwrap_or(ROOT_INO);
+            self.nodes.insert(
+                ino,
+                Node {
+                    ino,
+                    parent,
+                    name: sanitize_name(&it.name),
+                    is_dir: it.item_type == "folder",
+                    size: it.size.unwrap_or(0).max(0) as u64,
+                    remote_id: it.remote_id.clone(),
+                },
+            );
+        }
+        // 3) rebuild the child index from the (possibly) new parent links; a node
+        //    whose parent vanished re-attaches to the root so it stays reachable
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        let inos: Vec<u64> = self.nodes.keys().copied().collect();
+        for ino in inos {
+            if ino == ROOT_INO {
+                continue;
+            }
+            let parent = self.nodes[&ino].parent;
+            let parent = if self.nodes.contains_key(&parent) {
+                parent
+            } else {
+                if let Some(n) = self.nodes.get_mut(&ino) {
+                    n.parent = ROOT_INO;
+                }
+                ROOT_INO
+            };
+            children.entry(parent).or_default().push(ino);
+        }
+        for v in children.values_mut() {
+            v.sort_unstable();
+        }
+        self.children = children;
+        self.snapshot_signature() != before
+    }
+
+    /// A cheap order-independent fingerprint of (ino, parent, name, size,
+    /// remote_id) used to tell whether a [`reconcile`](Self::reconcile) changed
+    /// anything (for refresh logging).
+    fn snapshot_signature(&self) -> u64 {
+        let mut acc: u64 = 0;
+        for n in self.nodes.values() {
+            let mut h: u64 = 1469598103934665603; // FNV-1a offset basis
+            let mut feed = |bytes: &[u8]| {
+                for &b in bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211);
+                }
+            };
+            feed(&n.ino.to_le_bytes());
+            feed(&n.parent.to_le_bytes());
+            feed(n.name.as_bytes());
+            feed(&n.size.to_le_bytes());
+            feed(n.remote_id.as_bytes());
+            feed(&[n.is_dir as u8]);
+            acc ^= h; // XOR is order-independent across nodes
+        }
+        acc
+    }
 }
 
 #[cfg(unix)]
@@ -391,6 +516,15 @@ pub struct PlaceholderFs {
     dirty: std::collections::HashSet<u64>,
     /// Optional hydration notifier (download started/finished).
     observer: Option<std::sync::Arc<dyn HydrationObserver>>,
+    /// Optional cloud-refresh source (read-write mount): pulls the latest tree so
+    /// changes made elsewhere appear in the mount (#478 P4). Called throttled on
+    /// `readdir`.
+    refresher: Option<Box<dyn Refresher + Send>>,
+    /// When the tree was last refreshed (for the [`refresh_interval`] throttle).
+    last_refresh: Option<std::time::Instant>,
+    /// Minimum spacing between cloud refreshes (a delta runs on the dispatch
+    /// thread, so we don't run one on every `ls`).
+    refresh_interval: Duration,
     uid: u32,
     gid: u32,
 }
@@ -424,10 +558,20 @@ impl PlaceholderFs {
             write_buf: HashMap::new(),
             dirty: std::collections::HashSet::new(),
             observer: None,
+            refresher: None,
+            last_refresh: None,
+            refresh_interval: Duration::from_secs(15),
             // SAFETY: getuid/getgid are always-succeed syscalls with no preconditions.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
+    }
+
+    /// Enable cloud refresh (read-write mount): a throttled `readdir` pulls the
+    /// latest tree via `refresher` so changes from another device/the web appear.
+    pub fn with_refresher(mut self, refresher: Box<dyn Refresher + Send>) -> Self {
+        self.refresher = Some(refresher);
+        self
     }
 
     /// Enable write-back: edits to hydrated files are uploaded on release.
@@ -486,6 +630,35 @@ impl PlaceholderFs {
 
     fn is_rw(&self) -> bool {
         self.uploader.is_some()
+    }
+
+    /// If a `refresher` is set and the throttle window has elapsed, pull the latest
+    /// cloud tree and [`reconcile`](Tree::reconcile) it in (inode-stable; local +
+    /// dirty nodes preserved). Best-effort: a failed/slow refresh logs and leaves
+    /// the current tree intact. Called from `readdir` so browsing the folder shows
+    /// changes made elsewhere (#478 P4).
+    fn maybe_refresh(&mut self) {
+        let Some(refresher) = self.refresher.as_ref() else {
+            return;
+        };
+        let due = match self.last_refresh {
+            Some(t) => t.elapsed() >= self.refresh_interval,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        // mark attempted now (even on failure) so a persistently failing refresh
+        // doesn't run a delta on every single readdir
+        self.last_refresh = Some(std::time::Instant::now());
+        match refresher.refresh() {
+            Ok(items) => {
+                if self.tree.reconcile(&items) {
+                    eprintln!("isyncyou-fuse: mount tree refreshed from cloud");
+                }
+            }
+            Err(e) => eprintln!("isyncyou-fuse: mount refresh skipped: {e}"),
+        }
     }
 
     /// Load a file's bytes into the in-memory write buffer (read-write mount): the
@@ -1205,6 +1378,12 @@ impl Filesystem for PlaceholderFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        // Pull cloud changes before listing — but only on the first call of an
+        // enumeration (offset 0), so a mid-readdir reconcile can't shift the
+        // children under the offset-based paging.
+        if offset == 0 {
+            self.maybe_refresh();
+        }
         let (is_dir, parent) = match self.tree.node(ino) {
             Some(n) => (n.is_dir, n.parent),
             None => {
@@ -1321,6 +1500,47 @@ mod tests {
         t.remove(sub);
         assert!(t.lookup(ROOT_INO, "Renamed").is_none());
         assert!(t.node(sub).is_none());
+    }
+
+    #[test]
+    fn reconcile_is_inode_stable_adds_removes_and_keeps_local() {
+        let mut t = Tree::from_items(&[
+            folder("F1", None, "Docs"),
+            file("f1", Some("F1"), "a.txt", 3),
+        ]);
+        let docs = t.lookup(ROOT_INO, "Docs").unwrap().ino;
+        let a_ino = t.lookup(docs, "a.txt").unwrap().ino;
+        // a local-only file (created in the mount, no cloud id yet) must survive
+        let local = t.insert_file(ROOT_INO, "draft.txt");
+
+        // cloud snapshot: a.txt renamed to b.txt (same id → same inode), new c.txt
+        let changed = t.reconcile(&[
+            folder("F1", None, "Docs"),
+            file("f1", Some("F1"), "b.txt", 9),
+            file("f2", Some("F1"), "c.txt", 1),
+        ]);
+        assert!(changed);
+        // same remote id keeps its inode (open handles + dirty buffers survive)
+        assert_eq!(t.lookup(docs, "b.txt").unwrap().ino, a_ino);
+        assert_eq!(t.lookup(docs, "b.txt").unwrap().size, 9);
+        assert!(t.lookup(docs, "a.txt").is_none());
+        assert!(t.lookup(docs, "c.txt").is_some());
+        // local-only node preserved across the refresh
+        assert!(t.node(local).unwrap().remote_id.is_empty());
+        assert!(t.lookup(ROOT_INO, "draft.txt").is_some());
+
+        // tombstone b.txt → removed; c.txt is *unmentioned* and must NOT be dropped
+        let mut tomb = file("f1", Some("F1"), "b.txt", 9);
+        tomb.deleted_at = Some("2026-01-01".into());
+        assert!(t.reconcile(&[tomb]));
+        assert!(t.lookup(docs, "b.txt").is_none());
+        assert!(t.lookup(docs, "c.txt").is_some());
+
+        // an identical snapshot reports no change
+        assert!(!t.reconcile(&[
+            folder("F1", None, "Docs"),
+            file("f2", Some("F1"), "c.txt", 1),
+        ]));
     }
 
     #[test]
@@ -1852,5 +2072,42 @@ mod fs_tests {
         );
         assert_eq!(fs.write_at(ino, 0, b"z"), Err(libc::EROFS));
         assert_eq!(fs.truncate(ino, 0), Err(libc::EROFS));
+    }
+
+    #[test]
+    fn refresh_is_throttled_and_reconciles_cloud_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct StubRefresher {
+            calls: std::sync::Arc<AtomicUsize>,
+            items: Vec<Item>,
+        }
+        impl Refresher for StubRefresher {
+            fn refresh(&self) -> Result<Vec<Item>, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.items.clone())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut fs = PlaceholderFs::new(
+            Tree::from_items(&[]),
+            Box::new(FailingHydrator),
+            dir.path().join("c"),
+        )
+        .with_refresher(Box::new(StubRefresher {
+            calls: calls.clone(),
+            items: vec![file("f1", None, "fromcloud.txt", 5)],
+        }));
+        // first call: due (never refreshed) → pulls + reconciles the cloud file in
+        fs.maybe_refresh();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(fs.tree.lookup(ROOT_INO, "fromcloud.txt").is_some());
+        // immediate second call: throttled by the default window → no extra pull
+        fs.maybe_refresh();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // open the throttle window → refreshes again
+        fs.refresh_interval = std::time::Duration::from_secs(0);
+        fs.maybe_refresh();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

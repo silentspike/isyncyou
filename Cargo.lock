@@ -1605,6 +1605,7 @@ name = "isyncyou-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "isyncyou-connectors",
  "isyncyou-core",
  "isyncyou-dbus-status",
  "isyncyou-engine",
