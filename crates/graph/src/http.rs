@@ -415,10 +415,15 @@ impl GraphClient {
     /// GET an arbitrary Graph URL and return the raw response body bytes
     /// (follows redirects to pre-signed download URLs). Used for binary/content
     /// endpoints like a drive item's `/content` or a message's `/$value` (MIME).
+    /// `url` may be absolute or a `/me/...` path; a relative path is prefixed with
+    /// the API base (like [`get_json`](Self::get_json)/[`post_json`](Self::post_json))
+    /// — without this, a relative path (e.g. the OneNote page-content URL built by
+    /// the archive driver) has no host and reqwest fails with a builder error.
     pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, UploadError> {
+        let url = self.abs(url);
         let resp = self
             .client
-            .get(url)
+            .get(&url)
             .bearer_auth(&self.token)
             .send()
             .map_err(|e| UploadError::Transport(e.to_string()))?;
@@ -926,6 +931,21 @@ mod tests {
             UploadError::Http { status, .. } => assert_eq!(status, 503),
             other => panic!("expected Http error, got {other}"),
         }
+    }
+
+    #[test]
+    fn get_bytes_prefixes_a_relative_path_with_the_base() {
+        // A relative `/me/...` path (e.g. the OneNote page-content URL the archive
+        // driver builds) must be prefixed with the API base; otherwise reqwest has
+        // no host and fails with a builder error (regression: OneNote body backup).
+        let (base, _s) = serve(vec![http_response(200, "OK", "", "page-html")]);
+        let client = GraphClient::new("tok").with_base_url(base);
+        assert_eq!(
+            client
+                .get_bytes("/me/onenote/pages/p1/content")
+                .expect("relative path must resolve against the base, not builder-error"),
+            b"page-html"
+        );
     }
 
     #[test]
