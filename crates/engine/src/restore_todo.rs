@@ -515,6 +515,7 @@ mod tests {
                 username: "you@example.com".into(),
                 sync_root: dir.join("od"),
                 archive_root: arch.clone(),
+                mount_point: None,
             }],
             ..Default::default()
         };
