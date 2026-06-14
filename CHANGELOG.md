@@ -61,6 +61,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `isyncyou` CLI (init/check/login/status/sync/backup/search/restore/export/migrate/serve;
   Linux: mount/make-available/dolphin-status); `isyncyoud` daemon (serves the web UI,
   hosts the FUSE placeholder mounts + DBus FileStatus); `isyncyou-doctor`.
+- **Token keep-alive**: the daemon proactively silent-refreshes every account's
+  cached read+write tokens on a timer (`--token-refresh-secs`, default 6h) so a
+  long-running daemon never lets a refresh token lapse from inactivity — after the
+  one-time login, auth stays alive with no further user action. Each refresh
+  persists the renewed token; a missing/uncached token is skipped, never fatal.
 - Release archive (`isyncyou-linux-x86_64.tar.gz`) + hardened `systemd --user` unit.
 - CI (fmt, clippy, build, test) on **GitHub-hosted runners** (public-ready — no
   self-hosted exposure), with a paths-filter so docs-only PRs skip the compile gate;
