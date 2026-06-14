@@ -186,6 +186,14 @@ pub trait SyncControl: Send + Sync {
     fn is_paused(&self) -> bool;
 }
 
+/// Reports in-flight FUSE placeholder hydrations (on-demand downloads), so the
+/// status bar can show "downloading N file(s)". Implemented by the daemon's
+/// hydration tracker.
+pub trait HydrationStatus: Send + Sync {
+    /// Display names of files currently materializing.
+    fn active(&self) -> Vec<String>;
+}
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
@@ -207,6 +215,9 @@ pub struct Router {
     /// Optional scheduled-sync controller (the daemon's). Enables the sync
     /// pause/resume/now POSTs + the state GET.
     sync_control: Option<std::sync::Arc<dyn SyncControl>>,
+    /// Optional FUSE hydration status (the daemon's). Enables the in-flight
+    /// download list GET.
+    hydrations: Option<std::sync::Arc<dyn HydrationStatus>>,
 }
 
 impl Router {
@@ -218,6 +229,7 @@ impl Router {
             restore_cap_token: None,
             sync_cap_token: None,
             sync_control: None,
+            hydrations: None,
         }
     }
 
@@ -231,6 +243,7 @@ impl Router {
             restore_cap_token: None,
             sync_cap_token: None,
             sync_control: None,
+            hydrations: None,
         }
     }
 
@@ -254,6 +267,12 @@ impl Router {
     ) -> Self {
         self.sync_control = Some(control);
         self.sync_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the read-only FUSE hydration status GET (builder style).
+    pub fn with_hydrations(mut self, hydrations: std::sync::Arc<dyn HydrationStatus>) -> Self {
+        self.hydrations = Some(hydrations);
         self
     }
 
@@ -328,6 +347,7 @@ impl Router {
             "/api/v1/open-external" => self.open_external(req),
             "/api/v1/search" => self.search(req),
             "/api/v1/sync/state" => self.sync_state(),
+            "/api/v1/hydrations" => self.hydrations_state(),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -400,6 +420,17 @@ impl Router {
             Some(c) => ApiResponse::ok_json(&json!({ "enabled": true, "paused": c.is_paused() })),
             None => ApiResponse::ok_json(&json!({ "enabled": false, "paused": false })),
         }
+    }
+
+    /// In-flight FUSE placeholder hydrations (on-demand downloads). `active` is the
+    /// list of file names currently materializing; `count` its length.
+    fn hydrations_state(&self) -> ApiResponse {
+        let active = self
+            .hydrations
+            .as_ref()
+            .map(|h| h.active())
+            .unwrap_or_default();
+        ApiResponse::ok_json(&json!({ "count": active.len(), "active": active }))
     }
 
     fn store_path(&self, account: &str) -> Option<PathBuf> {
@@ -1094,6 +1125,29 @@ mod tests {
                 .status,
             404
         );
+    }
+
+    #[test]
+    fn hydrations_endpoint_lists_in_flight_downloads() {
+        struct MockHydrations(Vec<String>);
+        impl HydrationStatus for MockHydrations {
+            fn active(&self) -> Vec<String> {
+                self.0.clone()
+            }
+        }
+        // without a provider: empty + count 0 (read-only, no token)
+        let bare = Router::new(Config::default());
+        let r0 = bare.route(&ApiRequest::get("/api/v1/hydrations"));
+        let s0 = String::from_utf8_lossy(&r0.body);
+        assert!(s0.contains("\"count\":0"), "got {s0}");
+        // with a provider: reports the active file names
+        let router = Router::new(Config::default()).with_hydrations(std::sync::Arc::new(
+            MockHydrations(vec!["a.pdf".into(), "b.docx".into()]),
+        ));
+        let r = router.route(&ApiRequest::get("/api/v1/hydrations"));
+        let s = String::from_utf8_lossy(&r.body);
+        assert!(s.contains("\"count\":2"), "got {s}");
+        assert!(s.contains("a.pdf") && s.contains("b.docx"), "got {s}");
     }
 
     #[test]
