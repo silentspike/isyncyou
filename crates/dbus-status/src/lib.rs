@@ -2,7 +2,7 @@
 //!
 //! On Linux/KDE the daemon publishes a session-bus service that answers, for any
 //! filesystem path, the sync **overlay status** (synced / syncing / error /
-//! ignored / unknown). Two consumers query it:
+//! ignored / placeholder / materialized / unknown). Two consumers query it:
 //!
 //! * the Dolphin **`KOverlayIconPlugin`** (C++/KIO bridge in `packaging/dolphin/`)
 //!   — to paint per-file overlay emblems, and
@@ -31,6 +31,12 @@ pub enum OverlayStatus {
     Error,
     /// Tracked but intentionally not synced (trashed/ignored).
     Ignored,
+    /// A FUSE Files-on-Demand placeholder: present in the cloud, browsable, but its
+    /// content is not yet materialized on disk (downloads on first read). #330.
+    Placeholder,
+    /// A FUSE placeholder whose content has been hydrated to the on-disk cache —
+    /// "available offline". #330.
+    Materialized,
     /// Not tracked by iSyncYou (outside a sync root, or unknown to the store).
     Unknown,
 }
@@ -58,6 +64,8 @@ impl OverlayStatus {
             OverlayStatus::Syncing => "syncing",
             OverlayStatus::Error => "error",
             OverlayStatus::Ignored => "ignored",
+            OverlayStatus::Placeholder => "placeholder",
+            OverlayStatus::Materialized => "materialized",
             OverlayStatus::Unknown => "unknown",
         }
     }
@@ -70,6 +78,8 @@ impl OverlayStatus {
             "syncing" => OverlayStatus::Syncing,
             "error" => OverlayStatus::Error,
             "ignored" => OverlayStatus::Ignored,
+            "placeholder" => OverlayStatus::Placeholder,
+            "materialized" => OverlayStatus::Materialized,
             _ => OverlayStatus::Unknown,
         }
     }
@@ -156,7 +166,7 @@ mod dbus {
     #[interface(name = "org.silentspike.iSyncYou.FileStatus")]
     impl FileStatus {
         /// Overlay status for a path: `synced` | `syncing` | `error` | `ignored` |
-        /// `unknown`.
+        /// `placeholder` | `materialized` | `unknown`.
         async fn status(&self, path: String) -> String {
             self.provider.status(Path::new(&path)).as_str().to_string()
         }
@@ -272,6 +282,8 @@ mod tests {
             (OverlayStatus::Syncing, "syncing"),
             (OverlayStatus::Error, "error"),
             (OverlayStatus::Ignored, "ignored"),
+            (OverlayStatus::Placeholder, "placeholder"),
+            (OverlayStatus::Materialized, "materialized"),
             (OverlayStatus::Unknown, "unknown"),
         ] {
             assert_eq!(s.as_str(), w);
