@@ -150,6 +150,8 @@ fn run(args: &Args) -> Result<(), String> {
             let account = acc.id.clone();
             let cfg_m = cfg.clone();
             let tracker = hydration_tracker.clone();
+            // the mount's cloud refresh opens the store, so it shares the gate
+            let gate_r = gate.clone();
             std::thread::spawn(move || {
                 // clear a stale mount from a previous crash, then ensure the dir exists
                 let _ = std::process::Command::new("fusermount3")
@@ -186,10 +188,19 @@ fn run(args: &Args) -> Result<(), String> {
                 )
                 .with_observer(tracker as Arc<dyn isyncyou_fuse::HydrationObserver>);
                 if writable {
-                    fs = fs.with_uploader(Box::new(GraphUploader {
-                        cfg: cfg_m.clone(),
-                        account: account.clone(),
-                    }));
+                    fs = fs
+                        .with_uploader(Box::new(GraphUploader {
+                            cfg: cfg_m.clone(),
+                            account: account.clone(),
+                        }))
+                        // a read-write mount also refreshes from the cloud on browse
+                        // so changes made elsewhere (another device, the web) appear
+                        // (#478 P4). The read-only mount path keeps the static tree.
+                        .with_refresher(Box::new(GraphRefresher {
+                            cfg: cfg_m.clone(),
+                            account: account.clone(),
+                            gate: gate_r,
+                        }));
                 }
                 let mode = if writable { "read-write" } else { "read-only" };
                 eprintln!(
@@ -668,6 +679,42 @@ impl isyncyou_fuse::Uploader for GraphUploader {
             }
         );
         r
+    }
+}
+
+/// Refreshes a read-write placeholder mount from the cloud (unified-folder #478
+/// P4): runs a OneDrive delta into the account's store, then returns the current
+/// items so the mount's tree reconciles in changes made elsewhere (another device,
+/// the web). Read-only (no local-file side effects) — it does not touch the
+/// sync_root, only the store's item index + delta cursor. Opens the store under
+/// the shared gate so it never races the sync thread's single-instance lock.
+#[cfg(target_os = "linux")]
+struct GraphRefresher {
+    cfg: Config,
+    account: String,
+    gate: Arc<Mutex<()>>,
+}
+#[cfg(target_os = "linux")]
+impl isyncyou_fuse::Refresher for GraphRefresher {
+    fn refresh(&self) -> Result<Vec<isyncyou_store::Item>, String> {
+        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let token = isyncyou_engine::auth::resolve_cached_read_token(&self.cfg, &self.account)?;
+        let store_path = self
+            .cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == self.account)
+            .map(|a| a.archive_root.join(".isyncyou-store.db"))
+            .ok_or_else(|| format!("no account '{}'", self.account))?;
+        let store = Store::open(store_path).map_err(|e| e.to_string())?;
+        let mut client = isyncyou_graph::GraphClient::new(token);
+        let mut map = MappingTable::new();
+        let now = unix_now();
+        isyncyou_connectors::incremental_sync(&mut client, &store, &mut map, &self.account, &now)
+            .map_err(|e| e.to_string())?;
+        store
+            .all_items_by_service(&self.account, "onedrive")
+            .map_err(|e| e.to_string())
     }
 }
 
