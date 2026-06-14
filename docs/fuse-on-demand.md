@@ -1,0 +1,89 @@
+# FUSE Files-on-Demand (Linux)
+
+iSyncYou can present an account's whole OneDrive tree as a **read-only placeholder
+filesystem**: every file shows its real size in `stat`, but its bytes are fetched
+from the cloud only on first read, then cached on disk. So a multi-terabyte drive
+browses instantly and downloads only what you open — the OneDrive "Files-on-Demand"
+experience, on Linux, for any file-based application.
+
+This is a **presentation layer over the store**. The authoritative sync path
+(inotify + reconciler against the real `sync_root`) is untouched; the placeholder
+mount is a separate, opt-in `mount_point` that never writes back (write-back is out
+of scope — the mount is strictly read-only).
+
+## How it works
+
+```
+Dolphin / cat / any app        kernel VFS            isyncyoud
+   read(/mnt/.../file)  ──►  FUSE (fusermount3)  ──►  PlaceholderFs
+                                                         │  cached?  ── yes ─► serve from <archive>/.isyncyou-fuse-cache/<id>
+                                                         └─ no ─► hydration worker ─► Graph download ─► atomic write to cache ─► serve
+```
+
+- **Tree.** Built from the account's tracked OneDrive items in the store
+  (`Store::all_items_by_service`); inodes, names and sizes come from the items.
+- **Materialize-on-read.** The first read of a placeholder downloads the whole file
+  via the Graph client into the cache **atomically** (temp file → `fsync` → rename),
+  so a crash mid-download never leaves a partial/corrupt file. Later reads — and
+  reads after a daemon restart — serve from the cache with no network.
+- **Non-blocking.** The mount is served on one FUSE dispatch thread, so a slow
+  download would otherwise freeze the *whole* mount (an `ls` of an unrelated file
+  blocking for seconds). Reads that need a download are handed to a background
+  **hydration worker** (the FUSE reply object is `Send`); metadata operations and
+  reads of already-cached files stay responsive. The single worker also coalesces
+  the kernel's read-ahead: many reads of one file trigger exactly one download.
+- **Token refresh.** A placeholder mount is long-lived, so the cached read token is
+  re-resolved (silent-refresh) **per fetch** rather than captured once at mount time
+  — otherwise downloads would start failing after the token's ~1h lifetime.
+- **Non-fatal.** A missing `/dev/fuse`, no cached token, or an unreadable store is
+  logged and skipped; sync and the web UI run unaffected.
+
+Mount an account by setting `mount_point` in its config (or `isyncyou mount
+--account <id> --mountpoint <dir>`). The daemon clears a stale mount on start
+(`fusermount3 -u`) and re-mounts.
+
+## Download notifications
+
+A hydration emits a desktop notification through the system `notify-send`. Downloads
+within a short window are **batch-coalesced** into a single, in-place-updating toast
+(FUSE serializes reads, so coalescing is time-windowed): "Downloading from
+OneDrive — Fetching N files…", then "N files are ready offline" once the batch
+drains. The same in-flight set is exposed at `/api/v1/hydrations` and shown in the
+status-bar app.
+
+![Download notification](images/kde-download-notification.png)
+
+## Dolphin overlay emblems
+
+The daemon publishes a DBus `FileStatus` service; the Dolphin/KIO
+`KOverlayIconPlugin` (`packaging/dolphin/overlay-plugin/`) paints a per-file emblem.
+For a placeholder mount the overlay reflects the on-demand state:
+
+| State | Emblem | Meaning |
+|---|---|---|
+| `placeholder` | `cloud-download` | in the cloud, not yet on disk — downloads when opened |
+| `syncing` | `emblem-synchronizing-symbolic` | being downloaded right now |
+| `materialized` | `emblem-checked` | hydrated to the local cache — available offline |
+
+Paths outside a placeholder mount keep the normal store-backed sync status
+(`synced` / `syncing` / `error` / `ignored`).
+
+![Dolphin overlays: placeholder, syncing, materialized](images/dolphin-overlay-three-states.png)
+
+"Make available offline" — the Dolphin right-click ServiceMenu action `isyncyou
+make-available %F` — reads the selected files/folders recursively to materialize
+them now (one batch notification).
+
+Because `KOverlayIconPlugin` is pull-based (it queries on repaint with a short cache
+TTL), the transient `syncing` emblem shows on a refresh during a download; the
+download notification is the always-visible in-progress signal.
+
+## Scope / limitations
+
+- **Read-only.** No write-back through the mount.
+- **Blocking reads.** A `read()` blocks until the file is materialized (POSIX); the
+  notification explains the wait. Non-blocking CfAPI-style hydration is not a
+  standardized Linux primitive and is out of scope.
+- **Linux + `/dev/fuse`** required (built with `fuser` default-features-off →
+  `fusermount3`, no `libfuse` build dependency). The overlay plugin additionally
+  needs the host KF6/KIO packages.
