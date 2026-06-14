@@ -321,6 +321,54 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Share file(s)/folder(s) from the OneDrive mount: create a sharing link
+    /// (default — copied to the clipboard, the Dolphin "Share" action), invite by
+    /// email, or list/revoke existing shares. Uses the cached write token
+    /// (`Files.ReadWrite`). The OneDrive root itself is not shareable on personal
+    /// accounts; `--password`/`--expiry` are account/Premium-dependent. Linux-only.
+    #[cfg(target_os = "linux")]
+    Share {
+        #[arg(long, default_value = "isyncyou.toml")]
+        config: PathBuf,
+        /// Sharing-link type (link mode).
+        #[arg(long = "type", value_parser = ["view", "edit", "embed"], default_value = "view")]
+        link_type: String,
+        /// Sharing-link scope (link mode).
+        #[arg(long, value_parser = ["anonymous", "users"], default_value = "anonymous")]
+        scope: String,
+        /// Password-protect the link/invite (account/Premium-dependent).
+        #[arg(long)]
+        password: Option<String>,
+        /// Link/invite expiry, RFC3339 (account/Premium-dependent).
+        #[arg(long)]
+        expiry: Option<String>,
+        /// Invite this email address instead of creating a link (repeatable).
+        #[arg(long, conflicts_with_all = ["list", "revoke"])]
+        email: Vec<String>,
+        /// With --email: grant edit (write) instead of read.
+        #[arg(long, requires = "email")]
+        write: bool,
+        /// With --email: the invitation message.
+        #[arg(long, default_value = "")]
+        message: String,
+        /// With --email: require the recipient to sign in.
+        #[arg(long, requires = "email")]
+        require_signin: bool,
+        /// With --email: create the permission without sending an email.
+        #[arg(long, requires = "email")]
+        no_send: bool,
+        /// List existing permissions for the path(s) instead of sharing.
+        #[arg(long, conflicts_with = "revoke")]
+        list: bool,
+        /// Revoke this permission id (from --list) on the path(s).
+        #[arg(long)]
+        revoke: Option<String>,
+        #[arg(long, env = "ISYNCYOU_TOKEN")]
+        token: Option<String>,
+        /// Files/folders to share (Dolphin passes the selection via `%F`).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
@@ -482,6 +530,38 @@ fn run(command: Command) -> Result<(), String> {
         Command::DolphinStatus { path } => cmd_dolphin_status(&path),
         #[cfg(target_os = "linux")]
         Command::MakeAvailable { paths } => cmd_make_available(&paths),
+        #[cfg(target_os = "linux")]
+        Command::Share {
+            config,
+            link_type,
+            scope,
+            password,
+            expiry,
+            email,
+            write,
+            message,
+            require_signin,
+            no_send,
+            list,
+            revoke,
+            token,
+            paths,
+        } => cmd_share(ShareArgs {
+            config: &config,
+            link_type: &link_type,
+            scope: &scope,
+            password: password.as_deref(),
+            expiry: expiry.as_deref(),
+            emails: &email,
+            write,
+            message: &message,
+            require_signin,
+            no_send,
+            list,
+            revoke: revoke.as_deref(),
+            token,
+            paths: &paths,
+        }),
     }
 }
 
@@ -593,6 +673,212 @@ fn hydrate_path(path: &Path, files: &mut usize, errors: &mut usize) {
         Ok(true) => *files += 1,
         _ => *errors += 1,
     }
+}
+
+/// Grouped arguments for [`cmd_share`]/[`share_one`].
+#[cfg(target_os = "linux")]
+struct ShareArgs<'a> {
+    config: &'a Path,
+    link_type: &'a str,
+    scope: &'a str,
+    password: Option<&'a str>,
+    expiry: Option<&'a str>,
+    emails: &'a [String],
+    write: bool,
+    message: &'a str,
+    require_signin: bool,
+    no_send: bool,
+    list: bool,
+    revoke: Option<&'a str>,
+    token: Option<String>,
+    paths: &'a [PathBuf],
+}
+
+/// Find the account whose `mount_point` or `sync_root` is the longest prefix of
+/// `path`, and return its id + the cloud-relative path (the FUSE-mount path equals
+/// the cloud path). Errors if the path is under no account, or resolves to a root
+/// itself (personal OneDrive cannot share the root DriveItem).
+#[cfg(target_os = "linux")]
+fn owning_account_for_path(cfg: &Config, path: &Path) -> Result<(String, String), String> {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<(String, PathBuf)> = None;
+    for a in &cfg.accounts {
+        let roots = [a.mount_point.clone(), Some(a.sync_root.clone())];
+        for root in roots.into_iter().flatten() {
+            if root.as_os_str().is_empty() {
+                continue;
+            }
+            let root_abs = std::fs::canonicalize(&root).unwrap_or(root);
+            if abs.starts_with(&root_abs) {
+                let longer = best
+                    .as_ref()
+                    .map(|(_, r)| root_abs.as_os_str().len() > r.as_os_str().len())
+                    .unwrap_or(true);
+                if longer {
+                    best = Some((a.id.clone(), root_abs));
+                }
+            }
+        }
+    }
+    let (account, root) = best.ok_or_else(|| {
+        format!(
+            "'{}' is not under any configured account's mount_point or sync_root",
+            path.display()
+        )
+    })?;
+    let rel = abs
+        .strip_prefix(&root)
+        .map_err(|_| "path resolution failed".to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if rel.is_empty() {
+        return Err(
+            "cannot share the OneDrive root itself; select a file or folder inside it".into(),
+        );
+    }
+    Ok((account, rel))
+}
+
+/// Copy `text` to the clipboard, best-effort: `wl-copy` on Wayland, else `xclip`
+/// (X11). Never fatal — the link is always printed to stdout too.
+#[cfg(target_os = "linux")]
+fn clipboard_copy(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let (cmd, cmd_args): (&str, &[&str]) = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        ("wl-copy", &[])
+    } else {
+        ("xclip", &["-selection", "clipboard"])
+    };
+    let mut child = match Command::new(cmd)
+        .args(cmd_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Share one path. `Some(webUrl)` in link mode (the caller copies links to the
+/// clipboard); `None` for invite/list/revoke (which print their own output).
+#[cfg(target_os = "linux")]
+fn share_one(cfg: &Config, path: &Path, args: &ShareArgs) -> Result<Option<String>, String> {
+    let (account, rel) = owning_account_for_path(cfg, path)?;
+    let token = resolve_token(cfg, &account, args.token.clone(), true)?;
+    let client = isyncyou_graph::GraphClient::new(token);
+    let id = client
+        .item_id_for_path(&rel)
+        .map_err(|e| format!("resolve '{rel}': {e}"))?;
+
+    if args.list {
+        let perms = client.list_permissions(&id).map_err(|e| e.to_string())?;
+        println!("{}: {} permission(s)", path.display(), perms.len());
+        for (pid, roles, link, grantee) in &perms {
+            let who = grantee.as_deref().unwrap_or("-");
+            let url = link.as_deref().unwrap_or("-");
+            println!("  {pid}  [{}]  {who}  {url}", roles.join(","));
+        }
+        return Ok(None);
+    }
+    if let Some(perm_id) = args.revoke {
+        client
+            .delete_permission(&id, perm_id)
+            .map_err(|e| e.to_string())?;
+        println!("{}: revoked permission {perm_id}", path.display());
+        return Ok(None);
+    }
+    if !args.emails.is_empty() {
+        let roles: &[&str] = if args.write { &["write"] } else { &["read"] };
+        let ids = client
+            .invite(
+                &id,
+                args.emails,
+                roles,
+                args.require_signin,
+                !args.no_send,
+                args.message,
+                args.expiry,
+                args.password,
+            )
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}: invited {} ({}) — {} permission(s)",
+            path.display(),
+            args.emails.join(", "),
+            if args.write { "write" } else { "read" },
+            ids.len()
+        );
+        return Ok(None);
+    }
+    let link = client
+        .create_link(
+            &id,
+            args.link_type,
+            args.scope,
+            args.password,
+            args.expiry,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(Some(link))
+}
+
+/// `share`: create links / invite / list / revoke for the selected paths. Batch
+/// like `make-available` — a per-path failure is reported, not fatal; only an
+/// all-failed run errors. In link mode the links go to stdout AND the clipboard,
+/// with one desktop notification.
+#[cfg(target_os = "linux")]
+fn cmd_share(args: ShareArgs) -> Result<(), String> {
+    let cfg = load_config(args.config)?;
+    let mut links: Vec<String> = Vec::new();
+    let (mut ok, mut errors) = (0usize, 0usize);
+    for p in args.paths {
+        match share_one(&cfg, p, &args) {
+            Ok(Some(link)) => {
+                println!("{}: {link}", p.display());
+                links.push(link);
+                ok += 1;
+            }
+            Ok(None) => ok += 1,
+            Err(e) => {
+                eprintln!("share: {}: {e}", p.display());
+                errors += 1;
+            }
+        }
+    }
+    if ok == 0 {
+        return Err("share: nothing shared (all paths failed)".into());
+    }
+    if !links.is_empty() {
+        let copied = clipboard_copy(&links.join("\n"));
+        let n = links.len();
+        let body = if copied {
+            format!("Copied {n} link(s) to the clipboard")
+        } else {
+            format!("Created {n} link(s) (clipboard unavailable — see terminal)")
+        };
+        let _ = std::process::Command::new("notify-send")
+            .args([
+                "--app-name=iSyncYou",
+                "--icon=emblem-shared",
+                "iSyncYou — shared",
+                &body,
+            ])
+            .status();
+    }
+    if errors > 0 {
+        eprintln!("share: {errors} path(s) could not be shared");
+    }
+    Ok(())
 }
 
 /// Account's token-cache path for the read or write app.
@@ -2689,6 +2975,100 @@ mod tests {
                 token: Some("T".into()),
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_share() {
+        // default: anonymous view link, no email/list/revoke
+        let c = parse(&["isyncyou", "share", "/mnt/f.txt"]).unwrap();
+        match c.command {
+            Command::Share {
+                link_type,
+                scope,
+                email,
+                list,
+                revoke,
+                paths,
+                ..
+            } => {
+                assert_eq!(link_type, "view");
+                assert_eq!(scope, "anonymous");
+                assert!(email.is_empty() && !list && revoke.is_none());
+                assert_eq!(paths, vec![PathBuf::from("/mnt/f.txt")]);
+            }
+            other => panic!("expected Share, got {other:?}"),
+        }
+        // --type edit
+        assert!(matches!(
+            parse(&["isyncyou", "share", "--type", "edit", "/mnt/f.txt"]).unwrap().command,
+            Command::Share { ref link_type, .. } if link_type == "edit"
+        ));
+        // repeated --email collects all addresses
+        match parse(&[
+            "isyncyou",
+            "share",
+            "--email",
+            "a@b.com",
+            "--email",
+            "c@d.com",
+            "/mnt/f.txt",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Share { email, .. } => {
+                assert_eq!(email, vec!["a@b.com".to_string(), "c@d.com".to_string()])
+            }
+            other => panic!("expected Share, got {other:?}"),
+        }
+        // --list and --revoke parse
+        assert!(parse(&["isyncyou", "share", "--list", "/mnt/f.txt"]).is_ok());
+        assert!(parse(&["isyncyou", "share", "--revoke", "P1", "/mnt/f.txt"]).is_ok());
+        // mutual exclusion: --email conflicts with --list; invalid --type rejected; paths required
+        assert!(parse(&[
+            "isyncyou",
+            "share",
+            "--email",
+            "a@b.com",
+            "--list",
+            "/mnt/f.txt"
+        ])
+        .is_err());
+        assert!(parse(&["isyncyou", "share", "--type", "bogus", "/mnt/f.txt"]).is_err());
+        assert!(parse(&["isyncyou", "share"]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owning_account_for_path_longest_prefix_and_root_reject() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-share-oap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mnt = dir.join("mnt");
+        let sync = dir.join("sync");
+        std::fs::create_dir_all(mnt.join("Docs")).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::write(mnt.join("Docs").join("a.txt"), b"x").unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(AccountConfig {
+            id: "t".into(),
+            username: "t@o".into(),
+            sync_root: sync.clone(),
+            archive_root: dir.join("arch"),
+            mount_point: Some(mnt.clone()),
+        });
+        // a file under the mount resolves to (account, cloud-relative path)
+        let (acc, rel) = owning_account_for_path(&cfg, &mnt.join("Docs").join("a.txt")).unwrap();
+        assert_eq!(acc, "t");
+        assert_eq!(rel, "Docs/a.txt");
+        // the mount root itself is refused (personal OneDrive can't share the root)
+        let err = owning_account_for_path(&cfg, &mnt).unwrap_err();
+        assert!(err.contains("cannot share the OneDrive root"), "got: {err}");
+        // a path under no configured root errors
+        let outside = dir.join("elsewhere.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(owning_account_for_path(&cfg, &outside).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
