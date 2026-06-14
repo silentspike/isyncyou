@@ -18,8 +18,8 @@ use std::collections::HashMap;
 
 #[cfg(unix)]
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -37,6 +37,13 @@ pub trait Hydrator {
 /// filesystem is mounted read-write; without it the mount is read-only.
 pub trait Uploader {
     fn upload(&self, remote_id: &str, data: &[u8]) -> Result<(), String>;
+    /// Create a **new** item at the cloud path `dest_path` (mount-relative, no
+    /// leading slash) with `data`, returning its new remote id. Called when a file
+    /// created in the mount is first flushed. Default errors (mocks without create
+    /// support / a writer that only replaces existing content).
+    fn create(&self, _dest_path: &str, _data: &[u8]) -> Result<String, String> {
+        Err("create not supported".into())
+    }
 }
 
 /// Observes on-demand materializations so the host (the daemon) can surface a
@@ -214,6 +221,48 @@ impl Tree {
             .get(&parent)
             .map(|v| v.iter().filter_map(|i| self.nodes.get(i)).collect())
             .unwrap_or_default()
+    }
+
+    /// Insert a new (cloud-less) file under `parent` and return its inode. The
+    /// `remote_id` is empty until the file is created in the cloud on flush
+    /// ([`PlaceholderFs::flush_ino`] calls [`Uploader::create`], then
+    /// [`set_remote_id`](Self::set_remote_id)).
+    pub fn insert_file(&mut self, parent: u64, name: &str) -> u64 {
+        let ino = self.nodes.keys().copied().max().unwrap_or(ROOT_INO) + 1;
+        self.nodes.insert(
+            ino,
+            Node {
+                ino,
+                parent,
+                name: sanitize_name(name),
+                is_dir: false,
+                size: 0,
+                remote_id: String::new(),
+            },
+        );
+        self.children.entry(parent).or_default().push(ino);
+        ino
+    }
+
+    /// Assign a node's remote id after it has been created in the cloud.
+    pub fn set_remote_id(&mut self, ino: u64, remote_id: String) {
+        if let Some(n) = self.nodes.get_mut(&ino) {
+            n.remote_id = remote_id;
+        }
+    }
+
+    /// The mount-relative cloud path of an inode — its sanitized name and tracked
+    /// ancestors joined by `/`, no leading slash (where a new item is created).
+    pub fn path_of(&self, ino: u64) -> String {
+        let mut parts = Vec::new();
+        let mut cur = ino;
+        while cur != ROOT_INO {
+            let Some(n) = self.nodes.get(&cur) else { break };
+            parts.push(n.name.clone());
+            cur = n.parent;
+        }
+        parts.reverse();
+        parts.join("/")
     }
 }
 
@@ -401,6 +450,23 @@ impl PlaceholderFs {
         Ok(slice(&data))
     }
 
+    /// Create a new (cloud-less) file under `parent` and return its inode: insert a
+    /// tree node, start an empty buffer and mark it dirty so it is created in the
+    /// cloud on the next flush ([`Uploader::create`]) even if never written (an
+    /// empty `touch`). `EROFS` read-only, `EEXIST` if the name already exists.
+    pub fn create_file(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
+        if !self.is_rw() {
+            return Err(libc::EROFS);
+        }
+        if self.tree.lookup(parent, name).is_some() {
+            return Err(libc::EEXIST);
+        }
+        let ino = self.tree.insert_file(parent, name);
+        self.write_buf.insert(ino, Vec::new());
+        self.dirty.insert(ino);
+        Ok(ino)
+    }
+
     /// Write `data` at `offset` into a file's buffer (extending it as needed) and
     /// mark the inode dirty. `EROFS` if mounted read-only.
     pub fn write_at(&mut self, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
@@ -446,7 +512,14 @@ impl PlaceholderFs {
         let rid = self.tree.node(ino).ok_or(libc::ENOENT)?.remote_id.clone();
         let data = self.write_buf.get(&ino).cloned().unwrap_or_default();
         let up = self.uploader.as_ref().ok_or(libc::EROFS)?;
-        up.upload(&rid, &data).map_err(|_| libc::EIO)?;
+        if rid.is_empty() {
+            // new file: create it in the cloud at its path, record the assigned id
+            let path = self.tree.path_of(ino);
+            let new_id = up.create(&path, &data).map_err(|_| libc::EIO)?;
+            self.tree.set_remote_id(ino, new_id);
+        } else {
+            up.upload(&rid, &data).map_err(|_| libc::EIO)?;
+        }
         self.dirty.remove(&ino);
         self.tree.set_size(ino, data.len() as u64);
         Ok(())
@@ -736,6 +809,30 @@ impl Filesystem for PlaceholderFs {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.create_file(parent, name) {
+            Ok(ino) => {
+                let attr = file_attr(self.tree.node(ino).unwrap(), self.uid, self.gid);
+                reply.created(&TTL, &attr, 0, 0, 0);
+            }
+            Err(e) => reply.error(e),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn write(
         &mut self,
         _req: &Request<'_>,
@@ -917,6 +1014,23 @@ mod tests {
         deleted.deleted_at = Some("2026-01-01".into());
         let t2 = Tree::from_items(&[deleted]);
         assert!(t2.children(ROOT_INO).is_empty());
+    }
+
+    #[test]
+    fn insert_file_path_of_and_set_remote_id() {
+        let mut t = Tree::from_items(&[folder("F1", None, "Docs")]);
+        let docs = t.lookup(ROOT_INO, "Docs").unwrap().ino;
+        let ino = t.insert_file(docs, "new.txt");
+        // new node is a cloud-less file under Docs, addressable + path-resolvable
+        assert_eq!(t.path_of(ino), "Docs/new.txt");
+        let n = t.lookup(docs, "new.txt").unwrap();
+        assert!(!n.is_dir && n.remote_id.is_empty());
+        // a top-level new file has no folder prefix
+        let top = t.insert_file(ROOT_INO, "top.txt");
+        assert_eq!(t.path_of(top), "top.txt");
+        // the cloud-assigned id is recorded after creation
+        t.set_remote_id(ino, "RID-1".into());
+        assert_eq!(t.node(ino).unwrap().remote_id, "RID-1");
     }
 
     #[test]
@@ -1199,6 +1313,62 @@ mod fs_tests {
             obs.failed.load(Ordering::SeqCst),
             "failed hydrate must report ok=false"
         );
+    }
+
+    #[test]
+    fn create_file_uploads_new_item_and_records_remote_id() {
+        use std::sync::Mutex;
+        type Created = std::sync::Arc<Mutex<Option<(String, Vec<u8>)>>>;
+        struct CreatingUploader {
+            created: Created,
+        }
+        impl Uploader for CreatingUploader {
+            fn upload(&self, _id: &str, _data: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+            fn create(&self, dest_path: &str, data: &[u8]) -> Result<String, String> {
+                *self.created.lock().unwrap() = Some((dest_path.to_string(), data.to_vec()));
+                Ok("NEWID".to_string())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let created: Created = std::sync::Arc::new(Mutex::new(None));
+        let mut fs = PlaceholderFs::new(
+            Tree::from_items(&[]),
+            Box::new(FailingHydrator),
+            dir.path().join("c"),
+        )
+        .with_uploader(Box::new(CreatingUploader {
+            created: created.clone(),
+        }));
+        // create a new file in the (root of the) mount, write to it, flush
+        let ino = fs.create_file(ROOT_INO, "new.txt").unwrap();
+        assert_eq!(fs.write_at(ino, 0, b"hello new").unwrap(), 9);
+        fs.flush_ino(ino).unwrap();
+        // it was created in the cloud at its path with the written bytes …
+        let (path, data) = created.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            (path.as_str(), data.as_slice()),
+            ("new.txt", b"hello new".as_ref())
+        );
+        // … and the node now carries the cloud-assigned id
+        assert_eq!(fs.tree.node(ino).unwrap().remote_id, "NEWID");
+        // duplicate name is refused
+        assert_eq!(
+            fs.create_file(ROOT_INO, "new.txt").err(),
+            Some(libc::EEXIST)
+        );
+    }
+
+    #[test]
+    fn read_only_mount_rejects_create_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ro = PlaceholderFs::new(
+            Tree::from_items(&[]),
+            Box::new(FailingHydrator),
+            dir.path().join("c"),
+        );
+        assert_eq!(ro.create_file(ROOT_INO, "x").err(), Some(libc::EROFS));
     }
 
     #[test]
