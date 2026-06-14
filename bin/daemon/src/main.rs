@@ -598,6 +598,22 @@ impl isyncyou_fuse::Uploader for GraphUploader {
         );
         r
     }
+    fn create(&self, dest_path: &str, data: &[u8]) -> Result<String, String> {
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &self.account)?;
+        let item = isyncyou_graph::GraphClient::new(token)
+            .upload_file(dest_path, data, 10 * 1024 * 1024)
+            .map_err(|e| e.to_string())?;
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| "create response had no id".to_string())?;
+        eprintln!(
+            "isyncyoud: write-back create {dest_path} ({} bytes) -> {id}",
+            data.len()
+        );
+        Ok(id)
+    }
 }
 
 /// Tracks in-flight FUSE hydrations (on-demand downloads) and surfaces a
