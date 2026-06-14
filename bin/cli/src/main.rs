@@ -310,6 +310,17 @@ enum Command {
         /// File or folder to query (Dolphin passes the selected item via `%f`).
         path: PathBuf,
     },
+    /// "Make available offline": materialize one or more FUSE placeholders by
+    /// reading them, so a daemon-mounted file/folder downloads now instead of on
+    /// first open. A folder is hydrated recursively; reads route through the mount,
+    /// so this triggers the daemon's batch download notification (#330). The KDE
+    /// Dolphin ServiceMenu binds this to a right-click action (`%F`). Linux-only.
+    #[cfg(target_os = "linux")]
+    MakeAvailable {
+        /// Files/folders to download now (Dolphin passes the selection via `%F`).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
 }
 
 /// The M365 backup services this CLI knows how to drive.
@@ -469,6 +480,8 @@ fn run(command: Command) -> Result<(), String> {
         Command::PbsList { config } => cmd_pbs_list(&config),
         #[cfg(target_os = "linux")]
         Command::DolphinStatus { path } => cmd_dolphin_status(&path),
+        #[cfg(target_os = "linux")]
+        Command::MakeAvailable { paths } => cmd_make_available(&paths),
     }
 }
 
@@ -492,6 +505,8 @@ fn cmd_dolphin_status(path: &Path) -> Result<(), String> {
         OverlayStatus::Syncing => ("Sync in progress", "low"),
         OverlayStatus::Error => ("Sync conflict / error — needs attention", "critical"),
         OverlayStatus::Ignored => ("Not synced (trashed/ignored)", "low"),
+        OverlayStatus::Placeholder => ("Online-only (in the cloud) — downloads when opened", "low"),
+        OverlayStatus::Materialized => ("Available offline", "low"),
         OverlayStatus::Unknown => ("Not tracked by iSyncYou", "low"),
     };
     println!("{name}: {} ({})", status.as_str(), label);
@@ -506,6 +521,78 @@ fn cmd_dolphin_status(path: &Path) -> Result<(), String> {
         ])
         .status();
     Ok(())
+}
+
+/// "Make available offline": recursively read the given paths to force the FUSE
+/// placeholders behind them to materialize now. Each file's first read routes
+/// through the daemon mount, which downloads it and fires the batch download
+/// notification (#330 P3); a folder hydrates every file under it. Reading a single
+/// byte triggers full materialization (the mount hydrates whole-file on first
+/// read), so we stream and discard rather than buffering large files in memory.
+#[cfg(target_os = "linux")]
+fn cmd_make_available(paths: &[PathBuf]) -> Result<(), String> {
+    let mut files = 0usize;
+    let mut errors = 0usize;
+    for p in paths {
+        hydrate_path(p, &mut files, &mut errors);
+    }
+    if files == 0 {
+        return Err("no files to make available (paths held no readable files)".into());
+    }
+    println!(
+        "make-available: requested {files} file(s){}",
+        if errors > 0 {
+            format!(", {errors} could not be read")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+/// Recursively trigger materialization of every file at `path`. A read error
+/// (e.g. a hydrate failure deep in a folder) is counted, never fatal — the rest of
+/// the selection still downloads.
+#[cfg(target_os = "linux")]
+fn hydrate_path(path: &Path, files: &mut usize, errors: &mut usize) {
+    use std::io::Read;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            *errors += 1;
+            return;
+        }
+    };
+    if meta.is_dir() {
+        match std::fs::read_dir(path) {
+            Ok(entries) => {
+                for e in entries.flatten() {
+                    hydrate_path(&e.path(), files, errors);
+                }
+            }
+            Err(_) => *errors += 1,
+        }
+        return;
+    }
+    if !meta.is_file() {
+        return; // skip symlinks/special files
+    }
+    // Open and stream to /dev/null; the first read materializes the whole file.
+    let read_ok = std::fs::File::open(path).map(|mut f| {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+        true
+    });
+    match read_ok {
+        Ok(true) => *files += 1,
+        _ => *errors += 1,
+    }
 }
 
 /// Account's token-cache path for the read or write app.
@@ -3024,6 +3111,31 @@ mod tests {
         )
         .unwrap();
         assert!(cmd_check(&p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn make_available_reads_files_recursively() {
+        // hydrate_path recurses a folder and counts each readable file; reading
+        // a placeholder is what triggers the daemon mount to materialize it.
+        let dir = std::env::temp_dir().join(format!("isyncyou-mka-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("sub").join("b.txt"), b"bb").unwrap();
+        let (mut files, mut errors) = (0usize, 0usize);
+        hydrate_path(&dir, &mut files, &mut errors);
+        assert_eq!((files, errors), (2, 0), "two files, no errors");
+        // a single file counts once; a missing path is an error, never a panic
+        let (mut f2, mut e2) = (0usize, 0usize);
+        hydrate_path(&dir.join("a.txt"), &mut f2, &mut e2);
+        assert_eq!((f2, e2), (1, 0));
+        let (mut f3, mut e3) = (0usize, 0usize);
+        hydrate_path(&dir.join("nope"), &mut f3, &mut e3);
+        assert_eq!((f3, e3), (0, 1));
+        // the command errors when the selection holds no readable files
+        assert!(cmd_make_available(&[dir.join("nope")]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
