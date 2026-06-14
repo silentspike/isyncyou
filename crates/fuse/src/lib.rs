@@ -789,15 +789,16 @@ impl Filesystem for PlaceholderFs {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
+        _ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        match self.flush_ino(ino) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
+        // Upload only on release (final close), not on every flush: a write sequence
+        // (e.g. `> file` = truncate-then-write) calls flush mid-edit, which would
+        // upload the empty intermediate and briefly blank the cloud file. release
+        // uploads the final buffer exactly once.
+        reply.ok();
     }
 
     fn release(
