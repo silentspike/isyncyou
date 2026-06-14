@@ -18,4 +18,4 @@ winit = "0.30"
 softbuffer = "0.4"
 ksni = "0.3.4"
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
