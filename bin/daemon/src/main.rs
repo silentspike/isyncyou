@@ -170,8 +170,13 @@ fn run(args: &Args) -> Result<(), String> {
                     eprintln!("isyncyoud: FUSE mount '{account}' skipped: {e}");
                     return;
                 }
+                // Mount read-write when a write token (Files.ReadWrite) is available so
+                // edits in the mount upload to OneDrive (unified-folder #478 P1);
+                // otherwise stay read-only. Uploads re-resolve the token per write.
+                let writable =
+                    isyncyou_engine::auth::resolve_cached_sync_token(&cfg_m, &account).is_ok();
                 let tree = isyncyou_fuse::Tree::from_items(&items);
-                let fs = isyncyou_fuse::PlaceholderFs::new(
+                let mut fs = isyncyou_fuse::PlaceholderFs::new(
                     tree,
                     Box::new(GraphHydrator {
                         cfg: cfg_m.clone(),
@@ -180,8 +185,15 @@ fn run(args: &Args) -> Result<(), String> {
                     cache_dir,
                 )
                 .with_observer(tracker as Arc<dyn isyncyou_fuse::HydrationObserver>);
+                if writable {
+                    fs = fs.with_uploader(Box::new(GraphUploader {
+                        cfg: cfg_m.clone(),
+                        account: account.clone(),
+                    }));
+                }
+                let mode = if writable { "read-write" } else { "read-only" };
                 eprintln!(
-                    "isyncyoud: mounting OneDrive placeholders (read-only) for '{account}' at {}",
+                    "isyncyoud: mounting OneDrive placeholders ({mode}) for '{account}' at {}",
                     mp.display()
                 );
                 if let Err(e) = isyncyou_fuse::mount(fs, &mp) {
@@ -556,6 +568,35 @@ impl isyncyou_fuse::Hydrator for GraphHydrator {
         isyncyou_graph::GraphClient::new(token)
             .download_content(remote_id)
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Uploads an edited FUSE file back to OneDrive (write-back on the read-write mount;
+/// unified-folder #478 P1). Re-resolves the cached write token (Files.ReadWrite) per
+/// upload so a long-lived mount keeps working past the token's lifetime.
+#[cfg(target_os = "linux")]
+struct GraphUploader {
+    cfg: Config,
+    account: String,
+}
+#[cfg(target_os = "linux")]
+impl isyncyou_fuse::Uploader for GraphUploader {
+    fn upload(&self, remote_id: &str, data: &[u8]) -> Result<(), String> {
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &self.account)?;
+        let r = isyncyou_graph::GraphClient::new(token)
+            .put_content(remote_id, data)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        eprintln!(
+            "isyncyoud: write-back upload {remote_id} ({} bytes) -> {}",
+            data.len(),
+            if r.is_ok() {
+                "ok".to_string()
+            } else {
+                format!("ERR {r:?}")
+            }
+        );
+        r
     }
 }
 
