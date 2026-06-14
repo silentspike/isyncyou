@@ -164,6 +164,14 @@ pub trait RemoteWriter {
     ) -> Result<Value, String> {
         self.upload(dest_path, data)
     }
+    /// Set a drive item's `fileSystemInfo.lastModifiedDateTime` (RFC3339 UTC) and
+    /// return the updated item JSON, so an upload preserves the file's original
+    /// timestamp instead of the upload time. The default is a no-op returning
+    /// `Value::Null` (mocks need no change); `push_upload` then keeps the upload
+    /// item's own timestamp.
+    fn set_mtime(&self, _item_id: &str, _rfc3339: &str) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
 }
 
 #[cfg(feature = "http")]
@@ -184,6 +192,13 @@ impl RemoteWriter for isyncyou_graph::GraphClient {
     ) -> Result<Value, String> {
         self.upload_file_resumable(dest_path, data, 10 * 1024 * 1024, resume)
             .map_err(|e| e.to_string())
+    }
+    fn set_mtime(&self, item_id: &str, rfc3339: &str) -> Result<Value, String> {
+        self.patch_json(
+            &format!("/me/drive/items/{item_id}"),
+            &serde_json::json!({ "fileSystemInfo": { "lastModifiedDateTime": rfc3339 } }),
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -225,16 +240,35 @@ pub fn push_upload<W: RemoteWriter>(
     account: &str,
     dest_path: &str,
     data: &[u8],
+    local_mtime_secs: Option<i64>,
 ) -> Result<String, SyncError> {
     let resume = StoreResume { store, account };
     let item = writer
         .upload_resumable(dest_path, data, &resume)
         .map_err(SyncError::Remote)?;
-    ingest_item(store, map, account, &item, "", "clean")?;
-    item.get("id")
+    let id = item
+        .get("id")
         .and_then(Value::as_str)
         .map(String::from)
-        .ok_or_else(|| SyncError::Malformed("upload response had no id".into()))
+        .ok_or_else(|| SyncError::Malformed("upload response had no id".into()))?;
+    // Preserve the file's original timestamp: stamp the item's fileSystemInfo with
+    // the local mtime so the cloud keeps it instead of the upload time. Ingest the
+    // updated item (with the corrected timestamp) when set_mtime returns one.
+    let to_ingest = match local_mtime_secs {
+        Some(secs) => {
+            let updated = writer
+                .set_mtime(&id, &unix_to_rfc3339(secs))
+                .map_err(SyncError::Remote)?;
+            if updated.is_null() {
+                item
+            } else {
+                updated
+            }
+        }
+        None => item,
+    };
+    ingest_item(store, map, account, &to_ingest, "", "clean")?;
+    Ok(id)
 }
 
 /// Push a local deletion to the cloud: delete the remote item, then tombstone it
@@ -348,6 +382,43 @@ fn rfc3339_to_unix(s: &str) -> Option<i64> {
         return None;
     }
     Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Inverse of [`days_from_civil`] (Howard Hinnant's civil-from-days): days since the
+/// Unix epoch → `(year, month, day)`. Valid across the proleptic Gregorian calendar.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Format a Unix timestamp (seconds) as an RFC3339 UTC string
+/// (`YYYY-MM-DDTHH:MM:SSZ`) — the inverse of [`rfc3339_to_unix`]. Used to stamp a
+/// just-uploaded item's `fileSystemInfo.lastModifiedDateTime` with the file's local
+/// mtime so the cloud preserves the original timestamp instead of the upload time.
+fn unix_to_rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// A file's on-disk mtime as Unix seconds, or `None` if unreadable — best-effort
+/// input for preserving the original timestamp on upload.
+fn local_mtime_secs(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
 }
 
 /// True if the local file already matches the store record by **size + mtime**,
@@ -704,7 +775,9 @@ pub fn push_local_creates<W: RemoteWriter>(
         let full = sync_root.join(rel);
         let data = std::fs::read(&full)?;
         let dest = cloud_dest_path(rel);
-        let id = push_upload(writer, store, map, account, &dest, &data)?;
+        // preserve the file's local mtime on the cloud item (best-effort)
+        let local_mtime = local_mtime_secs(&full);
+        let id = push_upload(writer, store, map, account, &dest, &data, local_mtime)?;
         // the uploaded bytes ARE the on-disk state — record the synced reference
         let hash = Some(crate::quickxor::quickxor_base64(&data));
         record_synced_state(store, account, &id, &full, hash);
@@ -752,6 +825,12 @@ pub trait ContentReplacer {
         data: &[u8],
         etag: &str,
     ) -> Result<Option<Value>, String>;
+    /// Set the item's `fileSystemInfo.lastModifiedDateTime` (preserve the local
+    /// mtime after a modify upload), returning the updated item. Default no-op
+    /// (`Value::Null`) so mocks need no change.
+    fn set_mtime(&self, _item_id: &str, _rfc3339: &str) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
 }
 
 #[cfg(feature = "http")]
@@ -764,6 +843,13 @@ impl ContentReplacer for isyncyou_graph::GraphClient {
     ) -> Result<Option<Value>, String> {
         self.replace_content_if_match(item_id, data, etag)
             .map_err(|e| e.to_string())
+    }
+    fn set_mtime(&self, item_id: &str, rfc3339: &str) -> Result<Value, String> {
+        self.patch_json(
+            &format!("/me/drive/items/{item_id}"),
+            &serde_json::json!({ "fileSystemInfo": { "lastModifiedDateTime": rfc3339 } }),
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -876,7 +962,16 @@ pub fn apply_local_modifies<R: ContentReplacer>(
         };
         match replacer.replace_if_match(id, &data, etag) {
             Ok(Some(item)) => {
-                ingest_item(store, map, account, &item, "", "clean")?;
+                // Preserve the file's local mtime on the cloud item (best-effort);
+                // ingest the timestamp-corrected item when set_mtime returns one.
+                let to_ingest = match local_mtime_secs(&sync_root.join(rel)) {
+                    Some(secs) => match replacer.set_mtime(id, &unix_to_rfc3339(secs)) {
+                        Ok(updated) if !updated.is_null() => updated,
+                        _ => item,
+                    },
+                    None => item,
+                };
+                ingest_item(store, map, account, &to_ingest, "", "clean")?;
                 // the uploaded bytes ARE the on-disk state — record the reference
                 let hash = Some(crate::quickxor::quickxor_base64(&data));
                 record_synced_state(store, account, id, &sync_root.join(rel), hash);
@@ -1015,12 +1110,14 @@ mod tests {
     struct MockWriter {
         uploaded: std::cell::RefCell<Vec<(String, usize)>>,
         deleted: std::cell::RefCell<Vec<String>>,
+        mtime_set: std::cell::RefCell<Vec<(String, String)>>,
     }
     impl MockWriter {
         fn new() -> Self {
             MockWriter {
                 uploaded: Default::default(),
                 deleted: Default::default(),
+                mtime_set: Default::default(),
             }
         }
     }
@@ -1042,6 +1139,80 @@ mod tests {
             self.deleted.borrow_mut().push(item_id.to_string());
             Ok(())
         }
+        fn set_mtime(&self, item_id: &str, rfc3339: &str) -> Result<Value, String> {
+            self.mtime_set
+                .borrow_mut()
+                .push((item_id.to_string(), rfc3339.to_string()));
+            // mirror Graph: return the item with the stamped fileSystemInfo
+            Ok(json!({
+                "id": item_id,
+                "name": "note.txt",
+                "parentReference": { "id": "root1" },
+                "size": 5,
+                "file": { "hashes": { "quickXorHash": "UP==" } },
+                "fileSystemInfo": { "lastModifiedDateTime": rfc3339 }
+            }))
+        }
+    }
+
+    #[test]
+    fn unix_to_rfc3339_roundtrips_with_rfc3339_to_unix() {
+        for s in [
+            "2021-03-15T08:30:00Z",
+            "1970-01-01T00:00:00Z",
+            "2024-02-29T23:59:59Z", // leap day
+            "2000-12-31T12:00:00Z",
+        ] {
+            let secs = rfc3339_to_unix(s).unwrap();
+            assert_eq!(unix_to_rfc3339(secs), s, "roundtrip {s}");
+        }
+    }
+
+    #[test]
+    fn push_upload_preserves_local_mtime() {
+        // With a local mtime, push_upload must stamp the cloud item's
+        // fileSystemInfo (preserve the original timestamp) and ingest the corrected
+        // item — not the upload-time one.
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let w = MockWriter::new();
+        let secs = rfc3339_to_unix("2021-03-15T08:30:00Z").unwrap();
+        let id = push_upload(
+            &w,
+            &store,
+            &mut map,
+            "acc",
+            "/Docs/note.txt",
+            b"hello",
+            Some(secs),
+        )
+        .unwrap();
+        // set_mtime was called with the RFC3339 of the local mtime
+        assert_eq!(
+            *w.mtime_set.borrow(),
+            vec![(id.clone(), "2021-03-15T08:30:00Z".to_string())]
+        );
+        // the stored item carries the preserved timestamp, not the upload time
+        let it = store.get_item("acc", SERVICE, &id).unwrap().unwrap();
+        assert_eq!(it.remote_mtime.as_deref(), Some("2021-03-15T08:30:00Z"));
+    }
+
+    #[test]
+    fn push_upload_without_mtime_skips_set_mtime() {
+        let store = Store::open_in_memory().unwrap();
+        let mut map = MappingTable::new();
+        let w = MockWriter::new();
+        push_upload(
+            &w,
+            &store,
+            &mut map,
+            "acc",
+            "/Docs/note.txt",
+            b"hello",
+            None,
+        )
+        .unwrap();
+        assert!(w.mtime_set.borrow().is_empty());
     }
 
     #[test]
@@ -1049,7 +1220,16 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut map = MappingTable::new();
         let w = MockWriter::new();
-        let id = push_upload(&w, &store, &mut map, "acc", "/Docs/note.txt", b"hello").unwrap();
+        let id = push_upload(
+            &w,
+            &store,
+            &mut map,
+            "acc",
+            "/Docs/note.txt",
+            b"hello",
+            None,
+        )
+        .unwrap();
         assert_eq!(id, "NEWID");
         assert_eq!(
             w.uploaded.borrow().as_slice(),
@@ -1731,6 +1911,7 @@ mod tests {
             "testuser",
             "/iSyncYou-livetest/push.txt",
             &data,
+            None,
         )
         .expect("push_upload should succeed");
         let it = store.get_item("testuser", SERVICE, &id).unwrap().unwrap();
