@@ -9,7 +9,7 @@ Name=iSyncYou
 Icon=folder-sync
 Exec=isyncyou dolphin-status %f
 MimeType=all/all;
-Actions=Status;OpenWindow;
+Actions=Status;MakeAvailable;OpenWindow;
 X-KDE-Submenu=iSyncYou
 X-KDE-Priority=TopLevel
 NoDisplay=true
@@ -18,6 +18,14 @@ NoDisplay=true
 Name=Show sync status
 Icon=folder-sync
 Exec=isyncyou dolphin-status %f
+
+[Desktop Action MakeAvailable]
+# Files-on-Demand: download the selected file(s)/folder(s) now instead of on first
+# open. %F passes every selected item; a folder is hydrated recursively. Reads route
+# through the iSyncYou FUSE mount, so this triggers the batch download notification.
+Name=Make available offline (download now)
+Icon=cloud-download
+Exec=isyncyou make-available %F
 
 [Desktop Action OpenWindow]
 Name=Open iSyncYou status window
