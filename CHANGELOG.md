@@ -40,9 +40,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   cache on first read (atomic temp+fsync+rename; crash-safe). Downloads run on a
   background hydration worker so a slow fetch never freezes the mount, coalesce the
   kernel's read-ahead into one download per file, and re-resolve the read token per
-  fetch so a long-lived mount keeps working past the token's lifetime. Read-only;
-  write-back is out of scope. Built with `fuser` default-features-off (`fusermount3`,
-  no `libfuse` build dependency).
+  fetch so a long-lived mount keeps working past the token's lifetime. Read-only
+  for #330; a read-write OneDrive folder follows in #478 (below). Built with
+  `fuser` default-features-off (`fusermount3`, no `libfuse` build dependency).
+- **Read-write OneDrive folder** (#478): the placeholder mount is read-write, so it
+  behaves like the single Windows-OneDrive folder — editing a file uploads it on
+  final close (not on every flush, so `> file` never blanks the cloud copy),
+  creating a file uploads it, and `delete`/`rename`/`mkdir` in the mount map to the
+  matching Graph operation (delete item, move/rename, create folder). The mount
+  reports writable mode bits and re-resolves the write token per operation; if no
+  write token is available it stays read-only.
 - **On-demand download notifications**: batch-coalesced desktop toasts
   ("Downloading from OneDrive — Fetching N files…" → "N files are ready offline"),
   with the in-flight set exposed at `/api/v1/hydrations` and in the status bar.
