@@ -92,3 +92,6 @@ PLAN-*.md
 SESSION-*.md
 HANDOFF*.md
 TODO.local.md
+
+# Dolphin KIO plugin local build dir (host-built, never committed)
+packaging/dolphin/overlay-plugin/build/
