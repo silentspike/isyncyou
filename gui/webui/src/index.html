@@ -53,8 +53,8 @@
         <input id="q" placeholder="Search names / subjects…">
         <button onclick="doSearch()">Search</button>
       </div>
-      <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th><th>Restore</th></tr></thead>
-        <tbody id="rows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+      <table><thead><tr><th>Type</th><th>Name</th><th>Modified</th><th>Body</th><th>Restore</th><th>Share</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
       </table>
       <div id="more" hidden style="margin-top:14px">
         <button id="more-btn" onclick="loadMore()">Load more</button>
@@ -68,7 +68,9 @@ const SERVICES = ["onedrive", "mail", "calendar", "contacts", "todo", "onenote",
 // injected by the daemon's `/` handler; empty disables the matching destructive UI.
 const RESTORE_CAP_TOKEN = "__RESTORE_CAP_TOKEN__";
 const SYNC_CAP_TOKEN = "__SYNC_CAP_TOKEN__";
+const SHARE_CAP_TOKEN = "__SHARE_CAP_TOKEN__";
 const RESTORABLE = ["mail", "calendar", "contacts", "todo", "onenote"];
+const SHAREABLE = ["onedrive"];
 let account = null, service = "mail";
 
 async function api(path) { const r = await fetch(path); return r.json(); }
@@ -90,12 +92,16 @@ function rowsHtml(items) {
     const restoreCell = (RESTORE_CAP_TOKEN && it.has_body && RESTORABLE.includes(it.service))
       ? `<a href="#" onclick="doRestore('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">restore</a>`
       : "—";
+    const shareCell = (SHARE_CAP_TOKEN && SHAREABLE.includes(it.service))
+      ? `<a href="#" onclick="doShare('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">share</a>`
+      : "—";
     return `<tr>
       <td><span class="badge">${it.item_type}</span></td>
       <td>${cell}</td>
       <td class="muted">${it.remote_mtime || ""}</td>
       <td>${bodyCell}</td>
-      <td>${restoreCell}</td></tr>`;
+      <td>${restoreCell}</td>
+      <td>${shareCell}</td></tr>`;
   }).join("");
 }
 function escapeHtml(s) { return (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -115,7 +121,23 @@ async function doRestore(service, id, el) {
   } catch (e) { if (el) el.textContent = "restore"; alert("Restore failed: " + e); }
 }
 
-const EMPTY_ROW = '<tr><td colspan="5" class="muted">No items.</td></tr>';
+// Create an outbound OneDrive sharing link via the daemon's share POST (anonymous
+// view link). The share capability token (injected, same-origin) authorizes it;
+// on success the link is copied to the clipboard and shown inline.
+async function doShare(service, id, el) {
+  if (el) el.textContent = "…";
+  const q = `account=${encodeURIComponent(account)}&service=${encodeURIComponent(service)}&id=${encodeURIComponent(id)}&type=view&scope=anonymous`;
+  try {
+    const r = await fetch(`/api/v1/share?${q}`, { method: "POST", headers: { "X-Capability-Token": SHARE_CAP_TOKEN } });
+    const d = await r.json();
+    if (r.ok && d.webUrl) {
+      try { await navigator.clipboard.writeText(d.webUrl); } catch (e) {}
+      if (el) el.outerHTML = `<a href="${escapeHtml(d.webUrl)}" target="_blank" rel="noopener" title="copied to clipboard">link ✓</a>`;
+    } else { if (el) el.textContent = "share"; alert("Share failed: " + (d.error || r.status)); }
+  } catch (e) { if (el) el.textContent = "share"; alert("Share failed: " + e); }
+}
+
+const EMPTY_ROW = '<tr><td colspan="6" class="muted">No items.</td></tr>';
 
 function updateMore(shown) {
   document.getElementById("count").textContent = `${shown} of ${pageTotal}`;
