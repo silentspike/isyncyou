@@ -176,6 +176,20 @@ pub trait RestoreHandler: Send + Sync {
     fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String>;
 }
 
+/// Creates an outbound sharing link for a OneDrive item on behalf of a POST
+/// request (#494). Injected by the daemon (which owns the Graph stack). Returns
+/// the link's `webUrl`.
+pub trait ShareHandler: Send + Sync {
+    fn share(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+        link_type: &str,
+        scope: &str,
+    ) -> Result<String, String>;
+}
+
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
 /// scheduler and trigger an immediate pass. Injected by the daemon.
 pub trait SyncControl: Send + Sync {
@@ -212,6 +226,11 @@ pub struct Router {
     /// Separate capability token for scheduled-sync control POSTs. Keeping this
     /// distinct from the restore token limits the blast radius of a leaked token.
     sync_cap_token: Option<String>,
+    /// Optional outbound-sharing handler (the daemon's). `None` => the share POST
+    /// is refused.
+    share: Option<std::sync::Arc<dyn ShareHandler>>,
+    /// Separate capability token for share POSTs (distinct blast radius).
+    share_cap_token: Option<String>,
     /// Optional scheduled-sync controller (the daemon's). Enables the sync
     /// pause/resume/now POSTs + the state GET.
     sync_control: Option<std::sync::Arc<dyn SyncControl>>,
@@ -228,6 +247,8 @@ impl Router {
             restore: None,
             restore_cap_token: None,
             sync_cap_token: None,
+            share: None,
+            share_cap_token: None,
             sync_control: None,
             hydrations: None,
         }
@@ -242,6 +263,8 @@ impl Router {
             restore: None,
             restore_cap_token: None,
             sync_cap_token: None,
+            share: None,
+            share_cap_token: None,
             sync_control: None,
             hydrations: None,
         }
@@ -255,6 +278,17 @@ impl Router {
     ) -> Self {
         self.restore = Some(handler);
         self.restore_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the outbound-sharing POST, guarded by `cap_token` (builder style).
+    pub fn with_share(
+        mut self,
+        handler: std::sync::Arc<dyn ShareHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.share = Some(handler);
+        self.share_cap_token = Some(cap_token);
         self
     }
 
@@ -313,6 +347,7 @@ impl Router {
         if req.method == "POST" {
             return match req.path.as_str() {
                 "/api/v1/restore" => self.restore(req),
+                "/api/v1/share" => self.share_link(req),
                 "/api/v1/sync/pause" => self.sync_command(req, |c| c.pause()),
                 "/api/v1/sync/resume" => self.sync_command(req, |c| c.resume()),
                 "/api/v1/sync/now" => self.sync_command(req, |c| c.trigger()),
@@ -334,6 +369,10 @@ impl Router {
                     .replace(
                         "__SYNC_CAP_TOKEN__",
                         self.sync_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__SHARE_CAP_TOKEN__",
+                        self.share_cap_token.as_deref().unwrap_or(""),
                     ),
             ),
             "/api/v1/accounts" => self.accounts(),
@@ -394,6 +433,61 @@ impl Router {
                     "audit:restore",
                     "error",
                     &format!("restore error service={service} id={id}: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// `POST /api/v1/share?account&service&id[&type&scope]` — create an outbound
+    /// sharing link for a OneDrive item. Requires the share capability token; the
+    /// actual Graph call is the injected handler. `type` defaults to `view`, `scope`
+    /// to `anonymous`.
+    fn share_link(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.share {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "sharing is not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.share_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
+            (Some(a), Some(s), Some(i)) if !a.is_empty() && !s.is_empty() && !i.is_empty() => {
+                (a, s, i)
+            }
+            _ => return ApiResponse::error(400, "account, service and id are required"),
+        };
+        let link_type = req.q("type").filter(|t| !t.is_empty()).unwrap_or("view");
+        let scope = req
+            .q("scope")
+            .filter(|s| !s.is_empty())
+            .unwrap_or("anonymous");
+        if let Err(e) = self.audit_account(
+            account,
+            "audit:share",
+            "started",
+            &format!("share requested service={service} id={id} type={link_type} scope={scope}"),
+        ) {
+            return ApiResponse::error(500, &format!("audit: {e}"));
+        }
+        match handler.share(account, service, id, link_type, scope) {
+            Ok(web_url) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:share",
+                    "ok",
+                    &format!("share ok service={service} id={id} type={link_type}"),
+                );
+                ApiResponse::ok_json(
+                    &json!({ "shared": id, "service": service, "type": link_type, "webUrl": web_url }),
+                )
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:share",
+                    "error",
+                    &format!("share error service={service} id={id}: {e}"),
                 );
                 ApiResponse::error(500, &e)
             }
@@ -983,6 +1077,51 @@ mod tests {
         let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
             .with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&bad).status, 400);
+    }
+
+    struct OkShare;
+    impl ShareHandler for OkShare {
+        fn share(
+            &self,
+            _a: &str,
+            _s: &str,
+            _i: &str,
+            _t: &str,
+            _sc: &str,
+        ) -> Result<String, String> {
+            Ok("https://1drv.ms/x/abc".into())
+        }
+    }
+
+    #[test]
+    fn share_post_requires_token_returns_weburl_and_is_disabled_without_handler() {
+        let (_d, router) = setup();
+        let router = router.with_share(std::sync::Arc::new(OkShare), "secret".into());
+        let q = "/api/v1/share?account=a&service=onedrive&id=x";
+        // no token / wrong token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // correct token -> 200 + the webUrl
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("https://1drv.ms/x/abc"));
+        // valid token but missing params -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/share?account=a")
+            .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        // a router without a share handler refuses the POST -> 404
+        let (_d2, plain) = setup();
+        assert_eq!(
+            plain
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())))
+                .status,
+            404
+        );
     }
 
     #[test]
