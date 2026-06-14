@@ -76,13 +76,100 @@ fn run(args: &Args) -> Result<(), String> {
     // one of them ever holds a store's single-instance file lock at a time.
     let gate = Arc::new(Mutex::new(()));
 
-    // Desktop integration (plan §13): publish the Dolphin/KIO FileStatus provider
-    // on the session bus so the overlay-icon plugin + ServiceMenu can ask the sync
-    // status of any path. Linux-only and non-fatal — a headless server has no
-    // session bus, so the thread just logs and exits while sync runs unaffected.
+    // FUSE Files-on-Demand (#330, plan §19): for each account with a `mount_point`,
+    // mount a read-only placeholder view of the whole OneDrive tree. Files
+    // materialize to an on-disk cache on first read. Linux-only and non-fatal: a
+    // missing /dev/fuse, no cached token, or an unreadable store just logs and
+    // skips while everything else runs. The tree is snapshotted under the shared
+    // store gate (so it never races the sync thread's lock); the same snapshot
+    // feeds the DBus status provider's per-account path index (placeholder vs
+    // materialized vs syncing overlays in Dolphin, #330 P4). A daemon restart
+    // re-snapshots and re-mounts.
+    // Shared across all placeholder mounts + the /api/v1/hydrations endpoint.
+    #[cfg(target_os = "linux")]
+    let hydration_tracker = Arc::new(HydrationTracker::new());
+
+    // Desktop integration (plan §13 + #330 P4): publish the Dolphin/KIO FileStatus
+    // provider on the session bus so the overlay-icon plugin + ServiceMenu can ask
+    // the status of any path. The provider is a composite: paths under a FUSE
+    // mount answer placeholder/materialized/syncing from the per-account index +
+    // cache + live hydration set; every other path falls back to the store-backed
+    // sync status. Linux-only and non-fatal — a headless server has no session bus,
+    // so the thread just logs and exits while sync runs unaffected.
     #[cfg(target_os = "linux")]
     {
-        let accounts: Vec<isyncyou_dbus_status::AccountRoot> = cfg
+        // Build each mount's path index under the store gate (so it never races the
+        // sync thread's lock), then hand the same items to the mount thread for the
+        // Tree. An account whose store can't be read is skipped here AND below.
+        let mut fuse_mounts: Vec<FuseMountInfo> = Vec::new();
+        for acc in &cfg.accounts {
+            let Some(mp) = acc.mount_point.clone() else {
+                continue;
+            };
+            let items = {
+                let _guard = gate.lock().unwrap();
+                match Store::open(acc.archive_root.join(".isyncyou-store.db"))
+                    .and_then(|s| s.all_items_by_service(&acc.id, "onedrive"))
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        eprintln!("isyncyoud: FUSE mount '{}' skipped: store: {e}", acc.id);
+                        continue;
+                    }
+                }
+            };
+            let cache_dir = acc.archive_root.join(".isyncyou-fuse-cache");
+            let index = Arc::new(isyncyou_fuse::PlaceholderIndex::from_items(&items));
+            fuse_mounts.push(FuseMountInfo {
+                mount_point: mp.clone(),
+                cache_dir: cache_dir.clone(),
+                index: index.clone(),
+            });
+            // Spawn the mount thread with the already-snapshotted items.
+            let account = acc.id.clone();
+            let cfg_m = cfg.clone();
+            let tracker = hydration_tracker.clone();
+            std::thread::spawn(move || {
+                // clear a stale mount from a previous crash, then ensure the dir exists
+                let _ = std::process::Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(&mp)
+                    .status();
+                if let Err(e) = std::fs::create_dir_all(&mp) {
+                    eprintln!(
+                        "isyncyoud: FUSE mount '{account}' skipped: mkdir {}: {e}",
+                        mp.display()
+                    );
+                    return;
+                }
+                let token = match isyncyou_engine::auth::resolve_cached_read_token(&cfg_m, &account)
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("isyncyoud: FUSE mount '{account}' skipped: {e}");
+                        return;
+                    }
+                };
+                let tree = isyncyou_fuse::Tree::from_items(&items);
+                let fs = isyncyou_fuse::PlaceholderFs::new(
+                    tree,
+                    Box::new(GraphHydrator {
+                        client: isyncyou_graph::GraphClient::new(token),
+                    }),
+                    cache_dir,
+                )
+                .with_observer(tracker as Arc<dyn isyncyou_fuse::HydrationObserver>);
+                eprintln!(
+                    "isyncyoud: mounting OneDrive placeholders (read-only) for '{account}' at {}",
+                    mp.display()
+                );
+                if let Err(e) = isyncyou_fuse::mount(fs, &mp) {
+                    eprintln!("isyncyoud: FUSE mount '{account}' ended: {e}");
+                }
+            });
+        }
+
+        let store_accounts: Vec<isyncyou_dbus_status::AccountRoot> = cfg
             .accounts
             .iter()
             .map(|a| isyncyou_dbus_status::AccountRoot {
@@ -90,96 +177,22 @@ fn run(args: &Args) -> Result<(), String> {
                 store_db: a.archive_root.join(".isyncyou-store.db"),
             })
             .collect();
-        if !accounts.is_empty() {
-            std::thread::spawn(move || {
-                let provider = Arc::new(isyncyou_dbus_status::StoreStatusProvider::new(accounts));
-                match isyncyou_dbus_status::serve_blocking(provider) {
+        if !fuse_mounts.is_empty() || !store_accounts.is_empty() {
+            let provider = Arc::new(DaemonStatusProvider {
+                mounts: fuse_mounts,
+                store: isyncyou_dbus_status::StoreStatusProvider::new(store_accounts),
+                hydration: hydration_tracker.clone(),
+            });
+            std::thread::spawn(
+                move || match isyncyou_dbus_status::serve_blocking(provider) {
                     Ok(()) => {}
                     Err(e) => eprintln!(
                         "isyncyoud: Dolphin DBus status provider not started ({e}); \
                          overlays disabled, sync unaffected"
                     ),
-                }
-            });
-        }
-    }
-
-    // FUSE Files-on-Demand (#330, plan §19): for each account with a `mount_point`,
-    // mount a read-only placeholder view of the whole OneDrive tree. Files
-    // materialize to an on-disk cache on first read. Linux-only and non-fatal: a
-    // missing /dev/fuse, no cached token, or an unreadable store just logs and
-    // skips while everything else runs. The tree is snapshotted under the shared
-    // store gate (so it never races the sync thread's lock), then the store is
-    // dropped before the blocking mount — hydration goes through Graph, not the
-    // store. A daemon restart re-snapshots and re-mounts.
-    // Shared across all placeholder mounts + the /api/v1/hydrations endpoint.
-    #[cfg(target_os = "linux")]
-    let hydration_tracker = Arc::new(HydrationTracker::new());
-    #[cfg(target_os = "linux")]
-    for acc in &cfg.accounts {
-        let Some(mp) = acc.mount_point.clone() else {
-            continue;
-        };
-        let account = acc.id.clone();
-        let archive_root = acc.archive_root.clone();
-        let cfg_m = cfg.clone();
-        let gate_m = gate.clone();
-        let tracker = hydration_tracker.clone();
-        std::thread::spawn(move || {
-            // clear a stale mount from a previous crash, then ensure the dir exists
-            let _ = std::process::Command::new("fusermount3")
-                .arg("-u")
-                .arg(&mp)
-                .status();
-            if let Err(e) = std::fs::create_dir_all(&mp) {
-                eprintln!(
-                    "isyncyoud: FUSE mount '{account}' skipped: mkdir {}: {e}",
-                    mp.display()
-                );
-                return;
-            }
-            let token = match isyncyou_engine::auth::resolve_cached_read_token(&cfg_m, &account) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("isyncyoud: FUSE mount '{account}' skipped: {e}");
-                    return;
-                }
-            };
-            // snapshot the tree under the gate, then drop the store before mounting
-            let tree = {
-                let _guard = gate_m.lock().unwrap();
-                let store = match Store::open(archive_root.join(".isyncyou-store.db")) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("isyncyoud: FUSE mount '{account}' skipped: store: {e}");
-                        return;
-                    }
-                };
-                match store.all_items_by_service(&account, "onedrive") {
-                    Ok(items) => isyncyou_fuse::Tree::from_items(&items),
-                    Err(e) => {
-                        eprintln!("isyncyoud: FUSE mount '{account}' skipped: items: {e}");
-                        return;
-                    }
-                }
-            };
-            let cache_dir = archive_root.join(".isyncyou-fuse-cache");
-            let fs = isyncyou_fuse::PlaceholderFs::new(
-                tree,
-                Box::new(GraphHydrator {
-                    client: isyncyou_graph::GraphClient::new(token),
-                }),
-                cache_dir,
-            )
-            .with_observer(tracker as Arc<dyn isyncyou_fuse::HydrationObserver>);
-            eprintln!(
-                "isyncyoud: mounting OneDrive placeholders (read-only) for '{account}' at {}",
-                mp.display()
+                },
             );
-            if let Err(e) = isyncyou_fuse::mount(fs, &mp) {
-                eprintln!("isyncyoud: FUSE mount '{account}' ended: {e}");
-            }
-        });
+        }
     }
 
     // A per-process capability token gates the destructive restore POST.
@@ -495,6 +508,9 @@ const HYDRATION_DEBOUNCE: Duration = Duration::from_millis(1500);
 struct HydInner {
     /// File names currently materializing.
     active: Vec<String>,
+    /// Remote ids currently materializing — keyed by id (not name) so the overlay
+    /// provider can answer "is this exact file syncing?" without name collisions.
+    active_ids: std::collections::HashSet<String>,
     /// Files started since the current batch began (for the "N ready" message).
     batch_total: u32,
     /// notify-send id of the live toast, reused via --replace-id (0 = none).
@@ -538,7 +554,7 @@ impl HydrationTracker {
 
 #[cfg(target_os = "linux")]
 impl isyncyou_fuse::HydrationObserver for HydrationTracker {
-    fn on_start(&self, name: &str, _remote_id: &str) {
+    fn on_start(&self, name: &str, remote_id: &str) {
         // A genuinely new batch = nothing active AND nothing pending a finalize
         // (batch_total back to 0). Otherwise this start rejoins the current batch
         // (incl. one that drained but is still inside its debounce window).
@@ -546,6 +562,7 @@ impl isyncyou_fuse::HydrationObserver for HydrationTracker {
             let mut s = self.st.lock().unwrap();
             let new_batch = s.active.is_empty() && s.batch_total == 0;
             s.active.push(name.to_string());
+            s.active_ids.insert(remote_id.to_string());
             s.batch_total += 1;
             s.generation += 1; // invalidate any pending finalize
             (new_batch, s.batch_total, s.toast_id)
@@ -559,12 +576,13 @@ impl isyncyou_fuse::HydrationObserver for HydrationTracker {
         self.st.lock().unwrap().toast_id = id;
     }
 
-    fn on_done(&self, name: &str, _remote_id: &str, _ok: bool) {
+    fn on_done(&self, name: &str, remote_id: &str, _ok: bool) {
         let gen = {
             let mut s = self.st.lock().unwrap();
             if let Some(pos) = s.active.iter().position(|n| n == name) {
                 s.active.remove(pos);
             }
+            s.active_ids.remove(remote_id);
             if !s.active.is_empty() {
                 return; // batch still draining
             }
@@ -599,9 +617,93 @@ impl isyncyou_fuse::HydrationObserver for HydrationTracker {
 }
 
 #[cfg(target_os = "linux")]
+impl HydrationTracker {
+    /// Whether a specific remote id is materializing right now (for the overlay
+    /// provider's "syncing" state).
+    fn is_hydrating(&self, remote_id: &str) -> bool {
+        self.st.lock().unwrap().active_ids.contains(remote_id)
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl isyncyou_webui::HydrationStatus for HydrationTracker {
     fn active(&self) -> Vec<String> {
         self.st.lock().unwrap().active.clone()
+    }
+}
+
+/// One placeholder mount's data for the DBus overlay provider: its mount point, the
+/// materialization cache dir, and the path→item index built from the same store
+/// snapshot the mount used (#330 P4).
+#[cfg(target_os = "linux")]
+struct FuseMountInfo {
+    mount_point: PathBuf,
+    cache_dir: PathBuf,
+    index: Arc<isyncyou_fuse::PlaceholderIndex>,
+}
+
+#[cfg(target_os = "linux")]
+impl FuseMountInfo {
+    /// Overlay status for an absolute path under this mount. A directory is a cloud
+    /// container (`Placeholder`); a file is `Syncing` while hydrating, else
+    /// `Materialized` if its cache file exists, else `Placeholder`. A path the
+    /// index doesn't know (e.g. the mount root itself) is `Unknown`.
+    fn status(
+        &self,
+        path: &Path,
+        hydration: &HydrationTracker,
+    ) -> isyncyou_dbus_status::OverlayStatus {
+        use isyncyou_dbus_status::OverlayStatus;
+        let Ok(rel) = path.strip_prefix(&self.mount_point) else {
+            return OverlayStatus::Unknown;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let Some(rid) = self.index.remote_id(&rel) else {
+            return OverlayStatus::Unknown;
+        };
+        if self.index.is_dir(&rel).unwrap_or(false) {
+            return OverlayStatus::Placeholder; // a browsable cloud folder
+        }
+        if hydration.is_hydrating(rid) {
+            return OverlayStatus::Syncing;
+        }
+        if self
+            .cache_dir
+            .join(isyncyou_fuse::cache_file_name(rid))
+            .exists()
+        {
+            OverlayStatus::Materialized
+        } else {
+            OverlayStatus::Placeholder
+        }
+    }
+}
+
+/// The daemon's composite [`isyncyou_dbus_status::StatusProvider`]: paths under a
+/// FUSE placeholder mount answer placeholder/materialized/syncing; every other path
+/// falls back to the store-backed sync status (#330 P4).
+#[cfg(target_os = "linux")]
+struct DaemonStatusProvider {
+    mounts: Vec<FuseMountInfo>,
+    store: isyncyou_dbus_status::StoreStatusProvider,
+    hydration: Arc<HydrationTracker>,
+}
+
+#[cfg(target_os = "linux")]
+impl isyncyou_dbus_status::StatusProvider for DaemonStatusProvider {
+    fn status(&self, path: &Path) -> isyncyou_dbus_status::OverlayStatus {
+        for m in &self.mounts {
+            if path.starts_with(&m.mount_point) {
+                return m.status(path, &self.hydration);
+            }
+        }
+        self.store.status(path)
+    }
+
+    fn roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = self.mounts.iter().map(|m| m.mount_point.clone()).collect();
+        roots.extend(self.store.roots());
+        roots
     }
 }
 
@@ -678,6 +780,59 @@ mod tests {
         )
         .unwrap();
         assert!(load_config(&p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_overlay_status_maps_placeholder_materialized_syncing() {
+        use isyncyou_dbus_status::OverlayStatus;
+        use isyncyou_store::Item;
+        let dir = std::env::temp_dir().join(format!("isy-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mount = dir.join("OneDrive-cloud");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let folder = Item::new("a", "onedrive", "F1", "Docs", "folder");
+        let mut f1 = Item::new("a", "onedrive", "f1", "note.txt", "file");
+        f1.parent_remote_id = Some("F1".into());
+        f1.size = Some(7);
+        let items = vec![folder, f1];
+        let index = Arc::new(isyncyou_fuse::PlaceholderIndex::from_items(&items));
+        let info = FuseMountInfo {
+            mount_point: mount.clone(),
+            cache_dir: cache.clone(),
+            index,
+        };
+        let tracker = HydrationTracker::new();
+
+        // not yet materialized → Placeholder
+        let file_path = mount.join("Docs").join("note.txt");
+        assert_eq!(
+            info.status(&file_path, &tracker),
+            OverlayStatus::Placeholder
+        );
+        // a folder is a cloud container → Placeholder
+        assert_eq!(
+            info.status(&mount.join("Docs"), &tracker),
+            OverlayStatus::Placeholder
+        );
+        // while hydrating (remote id active) → Syncing
+        isyncyou_fuse::HydrationObserver::on_start(&tracker, "note.txt", "f1");
+        assert_eq!(info.status(&file_path, &tracker), OverlayStatus::Syncing);
+        isyncyou_fuse::HydrationObserver::on_done(&tracker, "note.txt", "f1", true);
+        // cache file present → Materialized
+        std::fs::write(cache.join(isyncyou_fuse::cache_file_name("f1")), b"hello").unwrap();
+        assert_eq!(
+            info.status(&file_path, &tracker),
+            OverlayStatus::Materialized
+        );
+        // a path the index doesn't know → Unknown
+        assert_eq!(
+            info.status(&mount.join("nope.bin"), &tracker),
+            OverlayStatus::Unknown
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

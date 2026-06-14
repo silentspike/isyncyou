@@ -74,6 +74,67 @@ fn sanitize_name(s: &str) -> String {
     s.replace(['/', '\0'], "_")
 }
 
+/// The on-disk cache file name for a hydrated item, by its remote id. Kept in sync
+/// with [`PlaceholderFs::cache_path`] so an out-of-process consumer (the daemon's
+/// DBus FileStatus provider, #330 P4) can test "is this placeholder materialized?"
+/// by `cache_dir.join(cache_file_name(remote_id)).exists()`.
+pub fn cache_file_name(remote_id: &str) -> String {
+    sanitize_name(remote_id)
+}
+
+/// A mount-relative **path → item** index over the same store items the [`Tree`] is
+/// built from, for querying placeholder/materialized status from *outside* the
+/// mount (the [`Tree`] itself is moved into the FUSE session and can't be queried).
+///
+/// Cross-platform on purpose (pure data, no FUSE types): the daemon builds one per
+/// mounted account and its DBus FileStatus provider resolves a mount-relative path
+/// to a `remote_id` (→ cache-file existence = materialized) and to dir/file. Names
+/// are sanitized exactly like the [`Tree`], so a path that exists in the mount
+/// resolves here too. Path separator is always `/` (the FUSE mount's separator).
+pub struct PlaceholderIndex {
+    by_path: HashMap<String, (String, bool)>, // rel path -> (remote_id, is_dir)
+}
+
+impl PlaceholderIndex {
+    /// Build the index from an account's OneDrive items (tombstones skipped). A
+    /// path is the sanitized names of the item and its tracked ancestors joined by
+    /// `/`; an item whose parent isn't tracked is top-level (attached to the root,
+    /// matching [`Tree::from_items`]).
+    pub fn from_items(items: &[Item]) -> Self {
+        let live: Vec<&Item> = items.iter().filter(|i| i.deleted_at.is_none()).collect();
+        let by_id: HashMap<&str, &Item> = live.iter().map(|i| (i.remote_id.as_str(), *i)).collect();
+        let mut by_path = HashMap::new();
+        for it in &live {
+            let mut parts = vec![sanitize_name(&it.name)];
+            let mut cur = it.parent_remote_id.as_deref();
+            // walk ancestors; a cycle guard keeps a corrupt store from looping
+            for _ in 0..4096 {
+                let Some(pid) = cur else { break };
+                let Some(p) = by_id.get(pid) else { break };
+                parts.push(sanitize_name(&p.name));
+                cur = p.parent_remote_id.as_deref();
+            }
+            parts.reverse();
+            by_path.insert(
+                parts.join("/"),
+                (it.remote_id.clone(), it.item_type == "folder"),
+            );
+        }
+        Self { by_path }
+    }
+
+    /// The remote id of the item at a mount-relative path (`""` is the mount root,
+    /// which is not an item → `None`).
+    pub fn remote_id(&self, rel_path: &str) -> Option<&str> {
+        self.by_path.get(rel_path).map(|(r, _)| r.as_str())
+    }
+
+    /// Whether the item at a mount-relative path is a directory.
+    pub fn is_dir(&self, rel_path: &str) -> Option<bool> {
+        self.by_path.get(rel_path).map(|(_, d)| *d)
+    }
+}
+
 impl Tree {
     /// Build the tree from an account's OneDrive items (tombstones skipped). An
     /// item whose parent isn't itself tracked (a top-level item, whose parent is
@@ -256,7 +317,7 @@ impl PlaceholderFs {
     /// On-disk cache path for a file's content (one file per remote id; the id is
     /// sanitized so it is always a single safe path segment).
     fn cache_path(&self, remote_id: &str) -> PathBuf {
-        self.cache_dir.join(sanitize_name(remote_id))
+        self.cache_dir.join(cache_file_name(remote_id))
     }
 
     /// Whether a file inode's content is already materialized on disk.
@@ -609,6 +670,43 @@ mod tests {
         deleted.deleted_at = Some("2026-01-01".into());
         let t2 = Tree::from_items(&[deleted]);
         assert!(t2.children(ROOT_INO).is_empty());
+    }
+
+    #[test]
+    fn placeholder_index_resolves_paths_to_items() {
+        let items = vec![
+            folder("F1", None, "Docs"),
+            file("f1", Some("F1"), "note.txt", 7),
+            file("f2", None, "top.bin", 100),
+        ];
+        let idx = PlaceholderIndex::from_items(&items);
+        // nested file resolves by its full mount-relative path
+        assert_eq!(idx.remote_id("Docs/note.txt"), Some("f1"));
+        assert_eq!(idx.is_dir("Docs/note.txt"), Some(false));
+        // the folder itself is a dir
+        assert_eq!(idx.remote_id("Docs"), Some("F1"));
+        assert_eq!(idx.is_dir("Docs"), Some(true));
+        // a top-level file is attached to the root (no folder prefix)
+        assert_eq!(idx.remote_id("top.bin"), Some("f2"));
+        // unknown paths and the mount root resolve to nothing
+        assert_eq!(idx.remote_id("nope.txt"), None);
+        assert_eq!(idx.remote_id(""), None);
+        // a tombstoned item is excluded from the index
+        let mut deleted = file("gone", None, "gone.txt", 5);
+        deleted.deleted_at = Some("2026-01-01".into());
+        assert_eq!(
+            PlaceholderIndex::from_items(&[deleted]).remote_id("gone.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_file_name_matches_index_remote_id_and_is_a_single_segment() {
+        // The DBus provider tests materialization via cache_dir.join(cache_file_name(id));
+        // a remote id with a slash must still be one safe path segment.
+        assert_eq!(cache_file_name("abc"), "abc");
+        assert_eq!(cache_file_name("a/b\0c"), "a_b_c");
+        assert!(!cache_file_name("a/b").contains('/'));
     }
 }
 

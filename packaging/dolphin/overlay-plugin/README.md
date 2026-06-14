@@ -4,13 +4,15 @@ A KDE Frameworks 6 `KOverlayIconPlugin` (KIO) that paints a sync-status emblem o
 files and folders in Dolphin, by asking the running iSyncYou daemon over DBus
 (service `org.silentspike.iSyncYou`, the Rust `isyncyou-dbus-status` crate).
 
-| daemon status | emblem |
-|---|---|
-| `synced`   | `emblem-checked` |
-| `syncing`  | `view-refresh` |
-| `error`    | `emblem-error` |
-| `ignored`  | `emblem-unavailable` |
-| `unknown`  | *(no overlay)* |
+| daemon status | emblem | meaning |
+|---|---|---|
+| `synced`   | `emblem-checked` | in sync with the cloud |
+| `syncing`  | `view-refresh` | transfer / state change in flight |
+| `error`    | `emblem-error` | conflict or error — needs attention |
+| `ignored`  | `emblem-unavailable` | tracked but intentionally not synced |
+| `placeholder`  | `cloud-download` | Files-on-Demand: in the cloud, downloads when opened (#330) |
+| `materialized` | `emblem-checked` | Files-on-Demand placeholder hydrated locally — available offline (#330) |
+| `unknown`  | *(no overlay)* | not tracked by iSyncYou |
 
 `getOverlays()` runs on the GUI thread and must not block, so the plugin answers
 from a short-TTL cache and issues an **asynchronous** DBus call, emitting

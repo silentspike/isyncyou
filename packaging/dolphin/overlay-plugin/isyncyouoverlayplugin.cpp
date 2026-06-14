@@ -36,6 +36,14 @@ QStringList emblemsFor(const QString &status)
     if (status == QLatin1String("ignored")) {
         return {QStringLiteral("emblem-unavailable")};
     }
+    if (status == QLatin1String("placeholder")) {
+        // Files-on-Demand: in the cloud, not yet on disk — downloads when opened.
+        return {QStringLiteral("cloud-download")};
+    }
+    if (status == QLatin1String("materialized")) {
+        // Hydrated to the local cache — available offline.
+        return {QStringLiteral("emblem-checked")};
+    }
     return {}; // unknown / untracked -> no overlay
 }
 }
