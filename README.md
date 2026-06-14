@@ -143,7 +143,8 @@ hardening; ⏳ means designed and queued, not built.
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
 | Native status bar + tray (SNI) | ✅ | tray-first SNI indicator; left-click unfolds a frameless status flyout at the icon (live status) with a link into the web UI; own `tiny-skia` + `cosmic-text` renderer; display-gated |
 | Dolphin overlay icons | ✅ | KF6 KIO plugin: `placeholder` / `syncing` / `materialized` emblems over DBus; host-packaged; Linux/KDE |
-| FUSE on-demand placeholders | ✅ Linux | read-only placeholder mount (browse the whole tree instantly), on-read materialize to an on-disk cache, batch-coalesced download notifications; non-blocking (downloads run off the dispatch thread); needs `/dev/fuse` |
+| FUSE on-demand placeholders | ✅ Linux | placeholder mount (browse the whole tree instantly), on-read materialize to an on-disk cache, batch-coalesced download notifications; read-only mount is non-blocking (downloads run off the dispatch thread); needs `/dev/fuse` |
+| Unified read-write OneDrive folder | ✅ Linux | with a write token the placeholder mount is the single read-write folder (Windows model): edit/create/delete/rename/mkdir → OneDrive, live refresh from the cloud on browse, one KDE Places entry |
 | PBS snapshot / temp restore path | ✅ local + live PBS | `VACUUM INTO` staged store + manifest, PBS backup/list/restore CLI; live temp-store round-trip confirmed against a real PBS repository |
 | Acceptance harness (A1–A10) + chaos tests | ✅ | data-loss / crash-point matrix |
 | Release archive + systemd unit | ✅ | tarball + `systemd --user` service |
@@ -282,10 +283,11 @@ This section is deliberately blunt — it is the inverse of the status table.
   live-verified on Linux/KDE, but remain platform/environment-gated.** They need a
   display server, `/dev/fuse`, or a host-side KF6 plugin respectively, so they are
   exercised by unit tests in CI and verified live on a desktop rather than in
-  headless CI. The FUSE mount is read-only (browse + on-demand download; write-back
-  is out of scope). The PBS path has deterministic local coverage plus a live
-  test-account round-trip, but rerunning that live probe still requires a configured
-  PBS repository.
+  headless CI. With a write token the FUSE mount is the read-write unified OneDrive
+  folder (edit/create/delete/rename/mkdir → OneDrive, live refresh on browse, one
+  Places entry); without one it is a read-only on-demand placeholder view. The PBS
+  path has deterministic local coverage plus a live test-account round-trip, but
+  rerunning that live probe still requires a configured PBS repository.
 - **Personal Vault and some "shared with me" data are not reachable** via Graph for
   third-party clients — these are upstream platform limits, not bugs.
 
@@ -307,7 +309,8 @@ Design notes and matrices live in [`docs/`](docs/) — Graph capability matrix,
 restore-fidelity matrix, sync-state machine, path mapping, delete/trash/conflict
 model, auth/token lifecycle, SQLite/PBS snapshot consistency, local-API security,
 packaging/daemon model, and [FUSE Files-on-Demand](docs/fuse-on-demand.md)
-(placeholder mount, materialize-on-read, download notifications, Dolphin overlays).
+(placeholder mount, materialize-on-read, the read-write unified OneDrive folder with
+live cloud refresh, download notifications, Dolphin overlays).
 
 ## Contributing
 
