@@ -53,7 +53,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   on browse** (throttled `readdir`): a delta runs into the store and the tree
   reconciles inode-stably (open handles + pending local edits preserved, tombstones
   removed), so files added/renamed/deleted on another device or the web appear in
-  the folder without a restart.
+  the folder without a restart. On KDE it is registered as a **single Places sidebar
+  entry** ("OneDrive") — one folder, not a confusing pair.
 - **On-demand download notifications**: batch-coalesced desktop toasts
   ("Downloading from OneDrive — Fetching N files…" → "N files are ready offline"),
   with the in-flight set exposed at `/api/v1/hydrations` and in the status bar.
