@@ -1,10 +1,17 @@
-//! On-screen status-bar window + SNI system-tray icon (plan §13/§24/§25).
+//! SNI system-tray app + on-screen status flyout (plan §13/§24/§25).
 //!
-//! The window presents the headless `isyncyou-statusbar` renderer (so on-screen
-//! pixels equal the verified pixels), and a StatusNotifierItem tray icon (via
-//! `ksni`, pure-DBus) lives in the panel: left-click / "Open" focuses the window,
-//! "Quit" exits. The tray runs on its own thread; menu actions reach the winit
-//! loop through an [`EventLoopProxy`].
+//! iSyncYou lives in the system tray as a StatusNotifierItem (via `ksni`,
+//! pure-DBus) — tray-first: no window opens on startup. Left-click the icon unfolds
+//! a **frameless status panel right at the icon** (Nextcloud/Dropbox-style; the
+//! Plasma host gives the icon coordinates via `Activate`), which dismisses itself on
+//! focus loss. The panel presents the headless `isyncyou-statusbar` renderer (so the
+//! on-screen pixels equal the verified pixels) with the live daemon status and a
+//! button into the full web UI; the right-click menu mirrors those actions and a
+//! live status label. The tray runs on its own thread, refreshes the label from the
+//! daemon API, and reaches the winit loop through an [`EventLoopProxy`].
+//!
+//! Window identity (WM_CLASS / Wayland app_id = [`APP_ID`]) matches the installed
+//! `.desktop` so the panel/task switcher show "iSyncYou".
 //!
 //! Headless smoke-run: set `ISYNCYOU_STATUSBAR_EXIT_MS=<n>` to auto-exit after
 //! `n` ms (used to screenshot the window/tray under Xvfb / on a live session).
@@ -21,7 +28,12 @@ use winit::window::{Window, WindowId};
 /// Messages the tray thread sends to the winit loop.
 #[derive(Debug, Clone)]
 enum UserEvent {
-    FocusWindow,
+    /// Show the status panel as a frameless flyout near the tray icon. `x`/`y` are
+    /// the icon's screen coordinates from the SNI `Activate` (0,0 = auto-place).
+    ShowPopup {
+        x: i32,
+        y: i32,
+    },
     Quit,
 }
 
@@ -48,24 +60,74 @@ fn sample_view() -> StatusView {
     }
 }
 
+/// The app's stable identity: the X11 WM_CLASS / Wayland app_id so the panel,
+/// task switcher and the `.desktop` (StartupWMClass) all show "iSyncYou" with the
+/// right icon instead of the executable/crate name.
+const APP_ID: &str = "org.silentspike.iSyncYou";
+
 struct App {
     view: StatusView,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     cursor: (f64, f64),
     deadline: Option<Instant>,
+    /// Daemon API/web-UI address for the window's "Open in browser" button.
+    api: String,
+    /// Whether the flyout has gained focus since it opened. Closing on focus-loss is
+    /// gated on this so the panel doesn't vanish instantly when it opens unfocused
+    /// (e.g. under focus-stealing prevention).
+    popup_was_focused: bool,
 }
 
 impl App {
-    /// Create the window + surface if absent, else focus the existing one.
-    fn ensure_window(&mut self, el: &ActiveEventLoop) {
+    /// Place the flyout near the tray icon at screen `(x, y)` (from SNI Activate),
+    /// flipped above/below and clamped so it stays fully on the primary monitor.
+    /// `(0, 0)` (menu entry, no coordinates) auto-places it top-right under the panel.
+    fn popup_position(&self, el: &ActiveEventLoop, x: i32, y: i32) -> (i32, i32) {
+        let (sw, sh) = el
+            .primary_monitor()
+            .map(|m| (m.size().width as i32, m.size().height as i32))
+            .unwrap_or((1920, 1080));
+        let (w, h) = (WIDTH as i32, HEIGHT as i32);
+        if x == 0 && y == 0 {
+            return (sw - w - 8, 40);
+        }
+        let px = (x - w / 2).clamp(8, (sw - w - 8).max(8));
+        // click in the lower half (bottom panel) → panel opens upward, else downward
+        let py = if y > sh / 2 {
+            (y - h - 8).max(8)
+        } else {
+            (y + 8).min((sh - h - 8).max(8))
+        };
+        (px, py)
+    }
+
+    /// Create the frameless status flyout near the tray icon, or focus the existing
+    /// one. Borderless + positioned at the icon so it reads as the app "unfolding"
+    /// from the tray (it closes again on focus loss; see [`Self`]'s window_event).
+    fn ensure_window(&mut self, el: &ActiveEventLoop, x: i32, y: i32) {
         if let Some(w) = &self.window {
             w.focus_window();
             return;
         }
-        let attrs = Window::default_attributes()
+        let (px, py) = self.popup_position(el, x, y);
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title("iSyncYou")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_position(winit::dpi::PhysicalPosition::new(px, py))
             .with_inner_size(winit::dpi::LogicalSize::new(WIDTH, HEIGHT));
+        // Set the WM_CLASS (X11) / app_id (Wayland) so the window is identified as
+        // "iSyncYou" and matched to its .desktop. Linux-only (the exts don't exist
+        // elsewhere); applying both backends is harmless — only the active one is used.
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs = WindowAttributesExtX11::with_name(attrs, APP_ID, "iSyncYou");
+            attrs = WindowAttributesExtWayland::with_name(attrs, APP_ID, "iSyncYou");
+        }
         let window = Rc::new(el.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let mut surface =
@@ -78,18 +140,22 @@ impl App {
             .unwrap();
         self.surface = Some(surface);
         self.window = Some(window.clone());
+        self.popup_was_focused = false;
+        window.focus_window();
         window.request_redraw();
     }
 }
 
 impl ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        self.ensure_window(el);
+    fn resumed(&mut self, _el: &ActiveEventLoop) {
+        // Tray-first: do NOT open a window on startup. iSyncYou lives in the system
+        // tray (StatusNotifierItem); the optional status window is created on demand
+        // (tray menu "Status window…"). Left-click opens the web UI in the browser.
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::FocusWindow => self.ensure_window(el),
+            UserEvent::ShowPopup { x, y } => self.ensure_window(el, x, y),
             UserEvent::Quit => el.exit(),
         }
     }
@@ -101,6 +167,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.window = None;
                 self.surface = None;
             }
+            // flyout behavior: dismiss the panel when it loses focus (click elsewhere),
+            // but only once it has actually been focused — otherwise a panel that opens
+            // unfocused would close immediately.
+            WindowEvent::Focused(true) => self.popup_was_focused = true,
+            WindowEvent::Focused(false) if self.popup_was_focused => {
+                self.window = None;
+                self.surface = None;
+            }
             WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -108,7 +182,11 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 if let Some(action) = hit_test(self.cursor.0 as f32, self.cursor.1 as f32) {
-                    if apply(&mut self.view, action) {
+                    // OpenBrowser is launched here (apply() is render-state only); other
+                    // actions just update the view and trigger a redraw.
+                    if matches!(action, isyncyou_statusbar::Action::OpenBrowser) {
+                        open_web_ui(&self.api);
+                    } else if apply(&mut self.view, action) {
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -142,9 +220,23 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// The StatusNotifierItem tray icon: shows the sync status + a menu, and forwards
 /// actions to the window via the [`EventLoopProxy`].
+/// Open the iSyncYou web UI (served by the daemon at `http://<api>/`) in the user's
+/// browser. This is the entry point to the full feature surface — mail/calendar/
+/// contacts restore, search, all services. Best-effort: a missing `xdg-open` just
+/// logs, never crashes the tray.
+fn open_web_ui(api: &str) {
+    let url = format!("http://{api}/");
+    match std::process::Command::new("xdg-open").arg(&url).spawn() {
+        Ok(_) => eprintln!("tray: opening web UI {url}"),
+        Err(e) => eprintln!("tray: could not open {url}: {e}"),
+    }
+}
+
 struct StatusTray {
     proxy: EventLoopProxy<UserEvent>,
     state_label: String,
+    /// Daemon API/web-UI address (`host:port`) for the browser link.
+    api: String,
 }
 
 impl ksni::Tray for StatusTray {
@@ -168,8 +260,10 @@ impl ksni::Tray for StatusTray {
             icon_pixmap: Vec::new(),
         }
     }
-    fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.proxy.send_event(UserEvent::FocusWindow);
+    fn activate(&mut self, x: i32, y: i32) {
+        // Left-click: unfold the status flyout right at the tray icon (x, y are the
+        // icon's screen coordinates).
+        let _ = self.proxy.send_event(UserEvent::ShowPopup { x, y });
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::{MenuItem, StandardItem};
@@ -182,15 +276,25 @@ impl ksni::Tray for StatusTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Open".into(),
+                label: "Show sync status".into(),
+                icon_name: "folder-sync".into(),
                 activate: Box::new(|t: &mut StatusTray| {
-                    let _ = t.proxy.send_event(UserEvent::FocusWindow);
+                    let _ = t.proxy.send_event(UserEvent::ShowPopup { x: 0, y: 0 });
                 }),
                 ..Default::default()
             }
             .into(),
             StandardItem {
+                label: "Open in browser (mail restore, search, …)".into(),
+                icon_name: "internet-web-browser".into(),
+                activate: Box::new(|t: &mut StatusTray| open_web_ui(&t.api)),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
                 label: "Quit".into(),
+                icon_name: "application-exit".into(),
                 activate: Box::new(|t: &mut StatusTray| {
                     let _ = t.proxy.send_event(UserEvent::Quit);
                 }),
@@ -201,9 +305,30 @@ impl ksni::Tray for StatusTray {
     }
 }
 
+/// Derive the tray's status label from the live daemon API: `Synced` / `Syncing
+/// (N)` / `Paused`, or `Offline` if the daemon can't be reached. Blocking (std
+/// TCP, short timeout) — call it off the async executor via `spawn_blocking`.
+fn compute_label(api: &str) -> String {
+    let state = match http_get_json(api, "/api/v1/sync/state") {
+        Ok(s) => s,
+        Err(_) => return "Offline".into(),
+    };
+    if state["paused"].as_bool().unwrap_or(false) {
+        return "Paused".into();
+    }
+    let hyd = http_get_json(api, "/api/v1/hydrations").unwrap_or(serde_json::json!({}));
+    let n = hyd["active"].as_array().map(|a| a.len()).unwrap_or(0);
+    if n > 0 {
+        format!("Syncing ({n})")
+    } else {
+        "Synced".into()
+    }
+}
+
 /// Run the SNI tray on a Tokio runtime (ksni is async); keep it alive for the
-/// process lifetime. Logs and returns if no StatusNotifierWatcher is available.
-fn run_tray(proxy: EventLoopProxy<UserEvent>) {
+/// process lifetime and refresh the live status every few seconds. Logs and returns
+/// if no StatusNotifierWatcher is available.
+fn run_tray(proxy: EventLoopProxy<UserEvent>, api: String) {
     use ksni::TrayMethods;
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -218,12 +343,23 @@ fn run_tray(proxy: EventLoopProxy<UserEvent>) {
     rt.block_on(async move {
         let tray = StatusTray {
             proxy,
-            state_label: "Synced".into(),
+            state_label: "…".into(),
+            api: api.clone(),
         };
         match tray.spawn().await {
-            Ok(_handle) => {
+            Ok(handle) => {
                 eprintln!("tray: StatusNotifierItem registered");
-                std::future::pending::<()>().await;
+                // Reflect the live daemon status in the tray label/tooltip.
+                loop {
+                    let api2 = api.clone();
+                    let label = tokio::task::spawn_blocking(move || compute_label(&api2))
+                        .await
+                        .unwrap_or_else(|_| "Offline".into());
+                    handle
+                        .update(|t: &mut StatusTray| t.state_label = label.clone())
+                        .await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
             }
             Err(e) => eprintln!("tray: no StatusNotifierWatcher / SNI host: {e}"),
         }
@@ -359,6 +495,13 @@ fn main() {
         }
         return;
     }
+    let api = args
+        .iter()
+        .position(|a| a == "--api")
+        .and_then(|j| args.get(j + 1))
+        .map(String::as_str)
+        .unwrap_or("127.0.0.1:8765")
+        .to_string();
     let deadline = std::env::var("ISYNCYOU_STATUSBAR_EXIT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -368,13 +511,18 @@ fn main() {
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    std::thread::spawn(move || run_tray(proxy));
+    let tray_api = api.clone();
+    std::thread::spawn(move || run_tray(proxy, tray_api));
+    // The optional status window shows live daemon data when reachable, else a
+    // representative sample (it is a preview; the tray label is the live status).
     let mut app = App {
-        view: sample_view(),
+        view: live_view(&api).unwrap_or_else(|_| sample_view()),
         window: None,
         surface: None,
         cursor: (0.0, 0.0),
         deadline,
+        api: api.clone(),
+        popup_was_focused: false,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
