@@ -483,6 +483,25 @@ impl GraphClient {
         json_or_err(resp)
     }
 
+    /// PATCH a JSON body onto a Graph resource and return the updated resource.
+    /// `url` may be absolute or a `/me/...` path. Used to update a drive item's
+    /// `fileSystemInfo` (preserve the local mtime on upload).
+    pub fn patch_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        let url = self.abs(url);
+        let resp = self
+            .client
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        json_or_err(resp)
+    }
+
     /// POST a raw body with an explicit `Content-Type` and return the created
     /// resource. Used for endpoints that don't take JSON — e.g. creating a mail
     /// message from MIME (`text/plain` + base64 body).
