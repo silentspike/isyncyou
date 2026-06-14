@@ -39,6 +39,12 @@ struct Args {
     /// seconds (0 = off; the daemon only serves the UI).
     #[arg(long, default_value_t = 0)]
     sync_secs: u64,
+    /// Proactively silent-refresh every account's cached read+write tokens this
+    /// often, in seconds, so a long-running daemon never lets a refresh token lapse
+    /// from inactivity (after the one-time login, auth stays alive with no user
+    /// action). 0 = off. Default 6h.
+    #[arg(long, default_value_t = 21_600)]
+    token_refresh_secs: u64,
 }
 
 fn main() {
@@ -65,6 +71,21 @@ fn run(args: &Args) -> Result<(), String> {
             std::thread::sleep(Duration::from_secs(secs));
             eprintln!("isyncyoud: alive, {n} account(s), web UI on {where_}");
         });
+    }
+
+    // Token keep-alive: proactively refresh every account's read+write tokens on a
+    // timer so the refresh tokens never lapse from inactivity (MSA ~90-day window).
+    // After the one-time login a running daemon keeps auth alive with no user action
+    // — the "set-once, runs-forever" guarantee. Each refresh is silent and persists
+    // the renewed token; a missing/uncached token is skipped (logged), never fatal.
+    if args.token_refresh_secs > 0 && !cfg.accounts.is_empty() {
+        let (cfg_ka, secs) = (cfg.clone(), args.token_refresh_secs);
+        std::thread::spawn(move || token_keepalive_loop(cfg_ka, secs));
+        eprintln!(
+            "isyncyoud: token keep-alive every {}s ({} account(s))",
+            args.token_refresh_secs,
+            cfg.accounts.len()
+        );
     }
 
     // Auto-recovery on boot (ADR-001): finish any restore operation left mid-flight
@@ -476,6 +497,44 @@ fn load_config(path: &Path) -> Result<Config, String> {
     Ok(cfg)
 }
 
+/// Forever: every `secs`, silent-refresh each account's cached **read** and
+/// **write** tokens so their refresh tokens never lapse from inactivity. Read and
+/// write live in separate caches/clients; resolving each renews and persists it
+/// (an access token still valid is reused, but the keep-alive interval is chosen
+/// well above the ~1h access-token lifetime so each pass forces a real refresh and
+/// resets the refresh token's inactivity clock). Best-effort: an account with no
+/// cached token (read or write) is logged and skipped, never fatal.
+fn token_keepalive_loop(cfg: Config, secs: u64) {
+    loop {
+        std::thread::sleep(Duration::from_secs(secs));
+        let mut refreshed = 0usize;
+        for acc in &cfg.accounts {
+            match isyncyou_engine::auth::resolve_cached_read_token(&cfg, &acc.id) {
+                Ok(_) => refreshed += 1,
+                Err(e) => {
+                    eprintln!(
+                        "isyncyoud: token keep-alive (read) [{}] skipped: {e}",
+                        acc.id
+                    )
+                }
+            }
+            match isyncyou_engine::auth::resolve_cached_sync_token(&cfg, &acc.id) {
+                Ok(_) => refreshed += 1,
+                Err(e) => {
+                    eprintln!(
+                        "isyncyoud: token keep-alive (write) [{}] skipped: {e}",
+                        acc.id
+                    )
+                }
+            }
+        }
+        eprintln!(
+            "isyncyoud: token keep-alive: {refreshed} token(s) kept alive across {} account(s)",
+            cfg.accounts.len()
+        );
+    }
+}
+
 /// Hydrates a FUSE placeholder by downloading its content from OneDrive on first
 /// read (the read-only mount path; #330).
 ///
@@ -732,6 +791,7 @@ mod tests {
                 socket: None,
                 heartbeat_secs: 300,
                 sync_secs: 0,
+                token_refresh_secs: 21_600,
             }
         );
         #[cfg(unix)]
@@ -744,6 +804,19 @@ mod tests {
         assert_eq!(a.sync_secs, 300);
         // off by default
         assert_eq!(Args::try_parse_from(["isyncyoud"]).unwrap().sync_secs, 0);
+    }
+
+    #[test]
+    fn parses_token_refresh_secs() {
+        // keep-alive defaults to 6h and is tunable / disablable
+        assert_eq!(
+            Args::try_parse_from(["isyncyoud"])
+                .unwrap()
+                .token_refresh_secs,
+            21_600
+        );
+        let a = Args::try_parse_from(["isyncyoud", "--token-refresh-secs", "0"]).unwrap();
+        assert_eq!(a.token_refresh_secs, 0);
     }
 
     #[test]
