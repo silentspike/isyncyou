@@ -9,7 +9,7 @@ Name=iSyncYou
 Icon=folder-sync
 Exec=isyncyou dolphin-status %f
 MimeType=all/all;
-Actions=Status;MakeAvailable;OpenWindow;
+Actions=Status;MakeAvailable;ShareView;ShareEdit;OpenWindow;
 X-KDE-Submenu=iSyncYou
 X-KDE-Priority=TopLevel
 NoDisplay=true
@@ -26,6 +26,19 @@ Exec=isyncyou dolphin-status %f
 Name=Make available offline (download now)
 Icon=cloud-download
 Exec=isyncyou make-available %F
+
+[Desktop Action ShareView]
+# Create an anonymous read-only OneDrive link for the selection and copy it to the
+# clipboard. %F passes every selected item; one link per file, newline-joined.
+Name=Share — copy view link
+Icon=emblem-shared
+Exec=isyncyou share %F
+
+[Desktop Action ShareEdit]
+# Same, but an edit (read-write) link.
+Name=Share — copy edit link
+Icon=emblem-shared
+Exec=isyncyou share --type edit %F
 
 [Desktop Action OpenWindow]
 Name=Open iSyncYou status window
