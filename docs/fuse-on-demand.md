@@ -72,6 +72,34 @@ The tracked sync path (inotify + reconciler against `sync_root`) remains availab
 for users who want a full eager local copy; the placeholder mount is the on-demand,
 single-folder presentation over the same store.
 
+## Sharing from the folder (#494)
+
+A file/folder in the mount can be shared outward via Microsoft Graph — `isyncyou
+share`, the Dolphin "Share" ServiceMenu actions, or the web-UI "Share" button. The
+cached write token (`Files.ReadWrite`) covers it, so no extra sign-in is needed.
+
+```
+isyncyou share <path>                      # anonymous read-only link → clipboard
+isyncyou share --type edit <path>          # anonymous read-write link
+isyncyou share --email a@b.com [--write] <path>   # invite a person (read|write)
+isyncyou share --list <path>               # show existing permissions
+isyncyou share --revoke <permission-id> <path>    # un-share
+```
+
+- The selected mount path is mapped to its cloud item by path (the mount path *is*
+  the cloud path), then shared by id. `--type view|edit|embed`, `--scope
+  anonymous|users`, `--password`, `--expiry` expose the full Graph option surface.
+- In link mode the link is printed to stdout **and** copied to the clipboard
+  (`wl-copy`/`xclip`, best-effort) with one desktop notification.
+- The Dolphin ServiceMenu binds `ShareView` (`isyncyou share %F`) and `ShareEdit`
+  (`isyncyou share --type edit %F`).
+
+**Personal-account limits (honest):** the OneDrive **root** itself is not shareable
+(select a file/folder inside it); `createLink` is **idempotent** per `(type, scope)`
+— re-sharing returns the same link, not a duplicate; `password`/`expirationDateTime`
+are Premium-dependent and `embed` is personal-only, so they may be refused on a
+free personal account (the basic anonymous view/edit link and email invite are not).
+
 ## Download notifications
 
 A hydration emits a desktop notification through the system `notify-send`. Downloads
