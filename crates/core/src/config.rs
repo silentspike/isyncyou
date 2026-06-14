@@ -45,6 +45,12 @@ pub struct AccountConfig {
     pub sync_root: PathBuf,
     /// Archive/backup directory for the other services.
     pub archive_root: PathBuf,
+    /// Optional FUSE placeholder mount point (Files-on-Demand). When set, the
+    /// daemon mounts a read-only view of the whole OneDrive tree here; files
+    /// materialize on first read. Independent of `sync_root` (which stays the
+    /// bidirectional full sync). Unset = no placeholder mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_point: Option<PathBuf>,
 }
 
 /// Engine-wide sync settings.
@@ -198,7 +204,29 @@ mod tests {
             username: format!("{id}@outlook.com"),
             sync_root: PathBuf::from(format!("/home/u/{id}/OneDrive")),
             archive_root: PathBuf::from(format!("/home/u/{id}/Archive")),
+            mount_point: None,
         }
+    }
+
+    #[test]
+    fn mount_point_is_optional_and_round_trips() {
+        // absent in TOML -> None, and a config without it still parses
+        let toml = "[[accounts]]\nid=\"a\"\nusername=\"a@x.com\"\n\
+                    sync_root=\"/s\"\narchive_root=\"/ar\"\n";
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c.accounts[0].mount_point, None);
+        // None is skipped on serialize (no noise in written configs)
+        assert!(!toml::to_string(&c).unwrap().contains("mount_point"));
+        // a set value round-trips
+        let mut c2 = c.clone();
+        c2.accounts[0].mount_point = Some(PathBuf::from("/home/u/OneDrive-cloud"));
+        let s = toml::to_string(&c2).unwrap();
+        assert!(s.contains("mount_point"));
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(
+            back.accounts[0].mount_point,
+            Some(PathBuf::from("/home/u/OneDrive-cloud"))
+        );
     }
 
     #[test]
