@@ -1608,6 +1608,7 @@ dependencies = [
  "isyncyou-core",
  "isyncyou-dbus-status",
  "isyncyou-engine",
+ "isyncyou-fuse",
  "isyncyou-graph",
  "isyncyou-pathmap",
  "isyncyou-store",

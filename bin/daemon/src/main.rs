@@ -104,6 +104,79 @@ fn run(args: &Args) -> Result<(), String> {
         }
     }
 
+    // FUSE Files-on-Demand (#330, plan §19): for each account with a `mount_point`,
+    // mount a read-only placeholder view of the whole OneDrive tree. Files
+    // materialize to an on-disk cache on first read. Linux-only and non-fatal: a
+    // missing /dev/fuse, no cached token, or an unreadable store just logs and
+    // skips while everything else runs. The tree is snapshotted under the shared
+    // store gate (so it never races the sync thread's lock), then the store is
+    // dropped before the blocking mount — hydration goes through Graph, not the
+    // store. A daemon restart re-snapshots and re-mounts.
+    #[cfg(target_os = "linux")]
+    for acc in &cfg.accounts {
+        let Some(mp) = acc.mount_point.clone() else {
+            continue;
+        };
+        let account = acc.id.clone();
+        let archive_root = acc.archive_root.clone();
+        let cfg_m = cfg.clone();
+        let gate_m = gate.clone();
+        std::thread::spawn(move || {
+            // clear a stale mount from a previous crash, then ensure the dir exists
+            let _ = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mp)
+                .status();
+            if let Err(e) = std::fs::create_dir_all(&mp) {
+                eprintln!(
+                    "isyncyoud: FUSE mount '{account}' skipped: mkdir {}: {e}",
+                    mp.display()
+                );
+                return;
+            }
+            let token = match isyncyou_engine::auth::resolve_cached_read_token(&cfg_m, &account) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("isyncyoud: FUSE mount '{account}' skipped: {e}");
+                    return;
+                }
+            };
+            // snapshot the tree under the gate, then drop the store before mounting
+            let tree = {
+                let _guard = gate_m.lock().unwrap();
+                let store = match Store::open(archive_root.join(".isyncyou-store.db")) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("isyncyoud: FUSE mount '{account}' skipped: store: {e}");
+                        return;
+                    }
+                };
+                match store.all_items_by_service(&account, "onedrive") {
+                    Ok(items) => isyncyou_fuse::Tree::from_items(&items),
+                    Err(e) => {
+                        eprintln!("isyncyoud: FUSE mount '{account}' skipped: items: {e}");
+                        return;
+                    }
+                }
+            };
+            let cache_dir = archive_root.join(".isyncyou-fuse-cache");
+            let fs = isyncyou_fuse::PlaceholderFs::new(
+                tree,
+                Box::new(GraphHydrator {
+                    client: isyncyou_graph::GraphClient::new(token),
+                }),
+                cache_dir,
+            );
+            eprintln!(
+                "isyncyoud: mounting OneDrive placeholders (read-only) for '{account}' at {}",
+                mp.display()
+            );
+            if let Err(e) = isyncyou_fuse::mount(fs, &mp) {
+                eprintln!("isyncyoud: FUSE mount '{account}' ended: {e}");
+            }
+        });
+    }
+
     // A per-process capability token gates the destructive restore POST.
     let cap_token = mint_cap_token();
     let handler: Arc<dyn isyncyou_webui::RestoreHandler> =
@@ -376,6 +449,21 @@ fn load_config(path: &Path) -> Result<Config, String> {
     let cfg = Config::load(path)?;
     cfg.validate().map_err(|errs| errs.join("; "))?;
     Ok(cfg)
+}
+
+/// Hydrates a FUSE placeholder by downloading its content from OneDrive on first
+/// read (the read-only mount path; #330).
+#[cfg(target_os = "linux")]
+struct GraphHydrator {
+    client: isyncyou_graph::GraphClient,
+}
+#[cfg(target_os = "linux")]
+impl isyncyou_fuse::Hydrator for GraphHydrator {
+    fn fetch(&self, remote_id: &str) -> Result<Vec<u8>, String> {
+        self.client
+            .download_content(remote_id)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

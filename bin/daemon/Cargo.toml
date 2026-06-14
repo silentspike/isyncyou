@@ -20,3 +20,7 @@ isyncyou-store = { path = "../../crates/store" }
 isyncyou-pathmap = { path = "../../crates/pathmap" }
 isyncyou-graph = { path = "../../crates/graph", features = ["http"] }
 isyncyou-dbus-status = { path = "../../crates/dbus-status" }
+
+# FUSE placeholder mount is Linux-only; never pulled into a Windows build.
+[target.'cfg(target_os = "linux")'.dependencies]
+isyncyou-fuse = { path = "../../crates/fuse" }
