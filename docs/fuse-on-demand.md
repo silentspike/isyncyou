@@ -1,15 +1,23 @@
 # FUSE Files-on-Demand (Linux)
 
-iSyncYou can present an account's whole OneDrive tree as a **read-only placeholder
+iSyncYou can present an account's whole OneDrive tree as a **placeholder
 filesystem**: every file shows its real size in `stat`, but its bytes are fetched
 from the cloud only on first read, then cached on disk. So a multi-terabyte drive
 browses instantly and downloads only what you open — the OneDrive "Files-on-Demand"
 experience, on Linux, for any file-based application.
 
-This is a **presentation layer over the store**. The authoritative sync path
-(inotify + reconciler against the real `sync_root`) is untouched; the placeholder
-mount is a separate, opt-in `mount_point` that never writes back (write-back is out
-of scope — the mount is strictly read-only).
+With a write token the mount is **read-write**: it is the single OneDrive folder
+(the Windows model — one folder that unifies online, offline and placeholder files),
+not a separate read-only view. Editing, creating, deleting, renaming and `mkdir` in
+the folder propagate to OneDrive, and the folder refreshes from the cloud as you
+browse so changes made on another device or the web appear here too. Without a write
+token it falls back to a strictly read-only placeholder view (the original #330
+behavior).
+
+Mount an account by setting `mount_point` in its config (or `isyncyou mount
+--account <id> --mountpoint <dir>`). On a KDE desktop the daemon registers the mount
+as a **single Places sidebar entry** ("OneDrive") so the one folder is one click
+away. The daemon clears a stale mount on start (`fusermount3 -u`) and re-mounts.
 
 ## How it works
 
@@ -38,9 +46,31 @@ Dolphin / cat / any app        kernel VFS            isyncyoud
 - **Non-fatal.** A missing `/dev/fuse`, no cached token, or an unreadable store is
   logged and skipped; sync and the web UI run unaffected.
 
-Mount an account by setting `mount_point` in its config (or `isyncyou mount
---account <id> --mountpoint <dir>`). The daemon clears a stale mount on start
-(`fusermount3 -u`) and re-mounts.
+## The unified read-write folder (#478)
+
+When a write token (`Files.ReadWrite`) is cached, the mount is read-write — the one
+OneDrive folder, not a read-only view:
+
+- **Edit** a file → uploaded to OneDrive on final close (`release`), not on every
+  `flush`, so a truncate-then-write (`> file`) never blanks the cloud copy in an
+  intermediate step. The original file mtime is preserved.
+- **Create** a file → uploaded on first close (an empty `touch` creates an empty
+  cloud file).
+- **Delete / rename / mkdir** → mapped to the matching Graph operation (delete item,
+  move/rename, create folder). `rmdir` requires an empty directory (POSIX).
+- **Live refresh.** Browsing the folder (a throttled `readdir`, ~15 s) pulls a
+  OneDrive delta into the store and reconciles the tree **inode-stably**: open file
+  handles and pending local edits keep their inode, new cloud items appear, deleted
+  ones disappear. So a file added/renamed/deleted on another device or the web shows
+  up in the folder without restarting the daemon.
+- **Writable bits.** A read-write mount reports owner-writable mode bits so file
+  managers (and a pre-check `access(W_OK)`) allow create/delete/mkdir.
+- **Token per operation.** Each upload/delete/move/refresh re-resolves the cached
+  token (silent refresh), so a long-lived mount keeps working past the ~1h lifetime.
+
+The tracked sync path (inotify + reconciler against `sync_root`) remains available
+for users who want a full eager local copy; the placeholder mount is the on-demand,
+single-folder presentation over the same store.
 
 ## Download notifications
 
@@ -80,7 +110,16 @@ download notification is the always-visible in-progress signal.
 
 ## Scope / limitations
 
-- **Read-only.** No write-back through the mount.
+- **Write token gates read-write.** Without a cached `Files.ReadWrite` token the
+  mount is read-only (the #330 placeholder behavior); with one it is the read-write
+  unified folder (#478).
+- **Blocking I/O on the read-write mount.** The read-write path serves on the single
+  FUSE dispatch thread, so a download or upload blocks other operations until it
+  finishes (the read-only mount keeps the non-blocking hydration worker). A
+  non-blocking read-write mount is future work.
+- **Live refresh is on browse.** Cloud changes appear on a throttled `readdir`, not
+  instantly (no push channel); a directory you are not viewing refreshes the next
+  time you list it.
 - **Blocking reads.** A `read()` blocks until the file is materialized (POSIX); the
   notification explains the wait. Non-blocking CfAPI-style hydration is not a
   standardized Linux primitive and is out of scope.
