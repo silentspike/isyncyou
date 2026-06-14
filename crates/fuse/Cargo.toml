@@ -8,7 +8,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+isyncyou-store = { path = "../store" }
+
+# FUSE + the mount adapter are unix-only (Linux/macOS). The pure `Tree`/`Node`
+# layer stays cross-platform; everything touching `fuser` is `#[cfg(unix)]`-gated
+# so a Windows build of a dependent (the daemon) never pulls libfuse.
+[target.'cfg(unix)'.dependencies]
 # default-features off => no libfuse link / no pkg-config; mount via fusermount3.
 fuser = { version = "0.16", default-features = false }
 libc = "0.2"
-isyncyou-store = { path = "../store" }
+
+[dev-dependencies]
+tempfile = "3"

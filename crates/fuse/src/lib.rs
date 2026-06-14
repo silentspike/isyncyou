@@ -13,13 +13,19 @@
 //!
 //! [`Store`]: isyncyou_store::Store
 
+use isyncyou_store::Item;
+use std::collections::HashMap;
+
+#[cfg(unix)]
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use isyncyou_store::Item;
-use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::OsStr;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Fetches a tracked item's full content by its remote id (the cloud download).
@@ -35,6 +41,7 @@ pub trait Uploader {
 
 /// The root directory's inode (FUSE convention).
 pub const ROOT_INO: u64 = 1;
+#[cfg(unix)]
 const TTL: Duration = Duration::from_secs(1);
 
 /// One node in the placeholder tree.
@@ -141,6 +148,7 @@ impl Tree {
     }
 }
 
+#[cfg(unix)]
 fn file_attr(node: &Node, uid: u32, gid: u32) -> FileAttr {
     let (kind, perm, nlink) = if node.is_dir {
         (FileType::Directory, 0o555, 2)
@@ -166,28 +174,55 @@ fn file_attr(node: &Node, uid: u32, gid: u32) -> FileAttr {
     }
 }
 
-/// The mounted filesystem: the [`Tree`] + an on-demand [`Hydrator`] + a content
-/// cache (per inode, populated on first read).
+/// The mounted filesystem: the [`Tree`] + an on-demand [`Hydrator`] + an on-disk
+/// materialization cache (one file per remote id, written atomically on first
+/// read). The first read of a placeholder downloads it into `cache_dir` via
+/// tmp+rename; later reads — and reads after a daemon restart — serve from disk
+/// with no network. Read-only by default; an [`Uploader`] enables write-back.
+#[cfg(unix)]
 pub struct PlaceholderFs {
     tree: Tree,
     hydrator: Box<dyn Hydrator + Send>,
     /// Set when mounted read-write; uploads modified files on release.
     uploader: Option<Box<dyn Uploader + Send>>,
-    /// Per-inode content cache, doubling as the write buffer for dirty inodes.
-    cache: HashMap<u64, Vec<u8>>,
+    /// Persistent materialization cache: `cache_dir/<remote_id>` holds the
+    /// downloaded bytes of a hydrated file.
+    cache_dir: PathBuf,
+    /// In-memory write buffer for dirty inodes (read-write mount only).
+    write_buf: HashMap<u64, Vec<u8>>,
     /// Inodes written since their last upload.
     dirty: std::collections::HashSet<u64>,
     uid: u32,
     gid: u32,
 }
 
+/// Write `data` to `path` atomically: a sibling temp file is fully written and
+/// fsync'd, then renamed over `path`. A crash mid-materialize leaves either the
+/// previous file or the temp (cleaned next run) — never a partial target.
+#[cfg(unix)]
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("isync-tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+#[cfg(unix)]
 impl PlaceholderFs {
-    pub fn new(tree: Tree, hydrator: Box<dyn Hydrator + Send>) -> Self {
+    /// Create a read-only placeholder filesystem. `cache_dir` is where hydrated
+    /// file content is materialized (created if missing).
+    pub fn new(tree: Tree, hydrator: Box<dyn Hydrator + Send>, cache_dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&cache_dir);
         PlaceholderFs {
             tree,
             hydrator,
             uploader: None,
-            cache: HashMap::new(),
+            cache_dir,
+            write_buf: HashMap::new(),
             dirty: std::collections::HashSet::new(),
             // SAFETY: getuid/getgid are always-succeed syscalls with no preconditions.
             uid: unsafe { libc::getuid() },
@@ -201,12 +236,23 @@ impl PlaceholderFs {
         self
     }
 
-    fn is_rw(&self) -> bool {
-        self.uploader.is_some()
+    /// On-disk cache path for a file's content (one file per remote id; the id is
+    /// sanitized so it is always a single safe path segment).
+    fn cache_path(&self, remote_id: &str) -> PathBuf {
+        self.cache_dir.join(sanitize_name(remote_id))
     }
 
-    /// Hydrate `ino`'s content into the cache if not present; returns its remote id.
-    fn ensure_cached(&mut self, ino: u64) -> Result<String, i32> {
+    /// Whether a file inode's content is already materialized on disk.
+    pub fn is_materialized(&self, ino: u64) -> bool {
+        match self.tree.node(ino) {
+            Some(n) if !n.is_dir => self.cache_path(&n.remote_id).exists(),
+            _ => false,
+        }
+    }
+
+    /// Ensure the file behind `ino` is materialized on disk and return its cache
+    /// path. Downloads (hydrates) atomically on first access; a no-op afterwards.
+    fn ensure_materialized(&mut self, ino: u64) -> Result<PathBuf, i32> {
         let (is_dir, rid) = {
             let n = self.tree.node(ino).ok_or(libc::ENOENT)?;
             (n.is_dir, n.remote_id.clone())
@@ -214,32 +260,67 @@ impl PlaceholderFs {
         if is_dir {
             return Err(libc::EISDIR);
         }
-        if !self.cache.contains_key(&ino) {
+        let path = self.cache_path(&rid);
+        if !path.exists() {
             let data = self.hydrator.fetch(&rid).map_err(|_| libc::EIO)?;
-            self.cache.insert(ino, data);
+            atomic_write(&path, &data).map_err(|_| libc::EIO)?;
+        }
+        Ok(path)
+    }
+
+    fn is_rw(&self) -> bool {
+        self.uploader.is_some()
+    }
+
+    /// Load a file's bytes into the in-memory write buffer (read-write mount): the
+    /// materialized disk copy if present, else a fresh hydrate. Returns remote id.
+    fn ensure_buffered(&mut self, ino: u64) -> Result<String, i32> {
+        let (is_dir, rid) = {
+            let n = self.tree.node(ino).ok_or(libc::ENOENT)?;
+            (n.is_dir, n.remote_id.clone())
+        };
+        if is_dir {
+            return Err(libc::EISDIR);
+        }
+        if !self.write_buf.contains_key(&ino) {
+            let path = self.cache_path(&rid);
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => self.hydrator.fetch(&rid).map_err(|_| libc::EIO)?,
+            };
+            self.write_buf.insert(ino, data);
         }
         Ok(rid)
     }
 
-    /// Read up to `size` bytes at `offset` from a file inode, hydrating (downloading)
-    /// the whole content on first access and caching it. Returns a POSIX errno on
-    /// failure (`ENOENT` unknown inode, `EISDIR` a directory, `EIO` a fetch error).
+    /// Read up to `size` bytes at `offset` from a file inode. The whole file is
+    /// **materialized to disk** (downloaded) on first access; later reads — and
+    /// reads after a restart — come from the on-disk cache with no network. A
+    /// dirty in-memory buffer (pending write-back) takes precedence. Returns a
+    /// POSIX errno on failure (`ENOENT` unknown inode, `EISDIR` dir, `EIO` fetch).
     pub fn read_slice(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        self.ensure_cached(ino)?;
-        let data = &self.cache[&ino];
-        let start = (offset.max(0) as usize).min(data.len());
-        let end = start.saturating_add(size as usize).min(data.len());
-        Ok(data[start..end].to_vec())
+        let slice = |data: &[u8]| {
+            let start = (offset.max(0) as usize).min(data.len());
+            let end = start.saturating_add(size as usize).min(data.len());
+            data[start..end].to_vec()
+        };
+        // pending edits live only in memory until flushed
+        if let Some(buf) = self.write_buf.get(&ino) {
+            return Ok(slice(buf));
+        }
+        let path = self.ensure_materialized(ino)?;
+        let data = std::fs::read(&path).map_err(|_| libc::EIO)?;
+        Ok(slice(&data))
     }
 
-    /// Write `data` at `offset` into a file's cached buffer (extending it as needed)
-    /// and mark the inode dirty. `EROFS` if mounted read-only.
+    /// Write `data` at `offset` into a file's buffer (extending it as needed) and
+    /// mark the inode dirty. `EROFS` if mounted read-only.
     pub fn write_at(&mut self, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
         if !self.is_rw() {
             return Err(libc::EROFS);
         }
-        self.ensure_cached(ino)?;
-        let buf = self.cache.get_mut(&ino).unwrap();
+        self.ensure_buffered(ino)?;
+        let buf = self.write_buf.get_mut(&ino).unwrap();
         let off = offset.max(0) as usize;
         if buf.len() < off + data.len() {
             buf.resize(off + data.len(), 0);
@@ -249,17 +330,20 @@ impl PlaceholderFs {
         Ok(data.len() as u32)
     }
 
-    /// Truncate/extend a file's cached buffer to `size` and mark it dirty.
+    /// Truncate/extend a file's buffer to `size` and mark it dirty.
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<(), i32> {
         if !self.is_rw() {
             return Err(libc::EROFS);
         }
         // size 0 needs no download; otherwise keep the existing bytes
         if size == 0 {
-            self.cache.insert(ino, Vec::new());
+            self.write_buf.insert(ino, Vec::new());
         } else {
-            self.ensure_cached(ino)?;
-            self.cache.get_mut(&ino).unwrap().resize(size as usize, 0);
+            self.ensure_buffered(ino)?;
+            self.write_buf
+                .get_mut(&ino)
+                .unwrap()
+                .resize(size as usize, 0);
         }
         self.dirty.insert(ino);
         Ok(())
@@ -272,7 +356,7 @@ impl PlaceholderFs {
             return Ok(());
         }
         let rid = self.tree.node(ino).ok_or(libc::ENOENT)?.remote_id.clone();
-        let data = self.cache.get(&ino).cloned().unwrap_or_default();
+        let data = self.write_buf.get(&ino).cloned().unwrap_or_default();
         let up = self.uploader.as_ref().ok_or(libc::EROFS)?;
         up.upload(&rid, &data).map_err(|_| libc::EIO)?;
         self.dirty.remove(&ino);
@@ -284,6 +368,7 @@ impl PlaceholderFs {
 /// Mount `fs` at `mountpoint` and serve until unmounted (`fusermount -u
 /// <mountpoint>` or Ctrl-C). Read-only unless the fs has an uploader (write-back).
 /// Blocks for the mount's lifetime.
+#[cfg(unix)]
 pub fn mount(fs: PlaceholderFs, mountpoint: &std::path::Path) -> std::io::Result<()> {
     use fuser::MountOption;
     let mut opts = vec![
@@ -296,6 +381,7 @@ pub fn mount(fs: PlaceholderFs, mountpoint: &std::path::Path) -> std::io::Result
     fuser::mount2(fs, mountpoint, &opts)
 }
 
+#[cfg(unix)]
 impl Filesystem for PlaceholderFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match name.to_str().and_then(|n| self.tree.lookup(parent, n)) {
@@ -497,6 +583,19 @@ mod tests {
         let t2 = Tree::from_items(&[deleted]);
         assert!(t2.children(ROOT_INO).is_empty());
     }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod fs_tests {
+    use super::*;
+
+    fn file(id: &str, parent: Option<&str>, name: &str, size: i64) -> Item {
+        let mut it = Item::new("a", "onedrive", id, name, "file");
+        it.parent_remote_id = parent.map(str::to_string);
+        it.size = Some(size);
+        it
+    }
 
     struct CountingHydrator {
         calls: std::cell::RefCell<usize>,
@@ -509,24 +608,116 @@ mod tests {
         }
     }
 
+    /// A hydrator that always errors — proves a read was served from disk (never
+    /// fetched), or that a failed fetch leaves no file behind.
+    struct FailingHydrator;
+    impl Hydrator for FailingHydrator {
+        fn fetch(&self, _remote_id: &str) -> Result<Vec<u8>, String> {
+            Err("network down".into())
+        }
+    }
+
     #[test]
-    fn read_slice_hydrates_once_then_serves_from_cache() {
+    fn read_materializes_to_disk_atomically_then_serves_locally() {
+        let dir = tempfile::tempdir().unwrap();
         let items = vec![file("f1", None, "data.bin", 11)];
         let tree = Tree::from_items(&items);
         let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
-        let hy = Box::new(CountingHydrator {
-            calls: std::cell::RefCell::new(0),
-            data: b"hello world".to_vec(),
-        });
-        let mut fs = PlaceholderFs::new(tree, hy);
-        // first read hydrates; the second is served from cache
+        let cache = dir.path().join("cache");
+        let mut fs = PlaceholderFs::new(
+            tree,
+            Box::new(CountingHydrator {
+                calls: std::cell::RefCell::new(0),
+                data: b"hello world".to_vec(),
+            }),
+            cache.clone(),
+        );
+        assert!(!fs.is_materialized(ino));
+        // first read hydrates + writes the cache file atomically
         assert_eq!(fs.read_slice(ino, 0, 5).unwrap(), b"hello");
+        assert!(
+            fs.is_materialized(ino),
+            "first read must materialize to disk"
+        );
+        assert_eq!(std::fs::read(cache.join("f1")).unwrap(), b"hello world");
+        assert!(!cache.join("f1.isync-tmp").exists(), "temp must be gone");
+        // subsequent reads come from disk
         assert_eq!(fs.read_slice(ino, 6, 5).unwrap(), b"world");
-        // offset past EOF -> empty, never panics
-        assert_eq!(fs.read_slice(ino, 100, 5).unwrap(), b"");
-        // a directory is EISDIR, an unknown inode ENOENT
+        assert_eq!(fs.read_slice(ino, 100, 5).unwrap(), b""); // past EOF, no panic
+                                                              // a directory is EISDIR, an unknown inode ENOENT
         assert_eq!(fs.read_slice(ROOT_INO, 0, 1), Err(libc::EISDIR));
         assert_eq!(fs.read_slice(999, 0, 1), Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn hydrator_called_only_once_across_many_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![file("f1", None, "data.bin", 3)];
+        let tree = Tree::from_items(&items);
+        let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        struct CountHydrator(std::sync::Arc<AtomicUsize>, Vec<u8>);
+        impl Hydrator for CountHydrator {
+            fn fetch(&self, _id: &str) -> Result<Vec<u8>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(self.1.clone())
+            }
+        }
+        let mut fs = PlaceholderFs::new(
+            tree,
+            Box::new(CountHydrator(counter.clone(), b"abc".to_vec())),
+            dir.path().join("c"),
+        );
+        for _ in 0..4 {
+            fs.read_slice(ino, 0, 3).unwrap();
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "hydrate exactly once, then disk"
+        );
+    }
+
+    #[test]
+    fn cache_survives_a_fresh_fs_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("c");
+        let items = vec![file("f1", None, "data.bin", 11)];
+        // fs1 materializes
+        {
+            let tree = Tree::from_items(&items);
+            let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+            let mut fs = PlaceholderFs::new(
+                tree,
+                Box::new(CountingHydrator {
+                    calls: std::cell::RefCell::new(0),
+                    data: b"hello world".to_vec(),
+                }),
+                cache.clone(),
+            );
+            assert_eq!(fs.read_slice(ino, 0, 11).unwrap(), b"hello world");
+        }
+        // fs2 with a FAILING hydrator still serves the bytes — proves disk reuse
+        let tree = Tree::from_items(&items);
+        let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+        let mut fs2 = PlaceholderFs::new(tree, Box::new(FailingHydrator), cache);
+        assert_eq!(fs2.read_slice(ino, 0, 11).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn failed_hydrate_leaves_no_partial_or_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("c");
+        let items = vec![file("f1", None, "data.bin", 11)];
+        let tree = Tree::from_items(&items);
+        let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+        let mut fs = PlaceholderFs::new(tree, Box::new(FailingHydrator), cache.clone());
+        assert_eq!(fs.read_slice(ino, 0, 5), Err(libc::EIO));
+        // no target and no temp file: nothing partial on disk (AC-4)
+        assert!(!cache.join("f1").exists());
+        assert!(!cache.join("f1.isync-tmp").exists());
+        assert!(!fs.is_materialized(ino));
     }
 
     type LastUpload = std::sync::Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
@@ -542,6 +733,7 @@ mod tests {
 
     #[test]
     fn write_back_uploads_dirty_buffer_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
         let items = vec![file("f1", None, "data.bin", 11)];
         let tree = Tree::from_items(&items);
         let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
@@ -550,17 +742,16 @@ mod tests {
             calls: std::cell::RefCell::new(0),
             data: b"hello world".to_vec(),
         });
-        let mut fs = PlaceholderFs::new(tree, hy)
+        let mut fs = PlaceholderFs::new(tree, hy, dir.path().join("c"))
             .with_uploader(Box::new(RecordingUploader { last: rec.clone() }));
         // `> file` pattern: truncate to 0, then write the new content
         fs.truncate(ino, 0).unwrap();
         assert_eq!(fs.write_at(ino, 0, b"updated").unwrap(), 7);
         fs.flush_ino(ino).unwrap();
-        // the new content was uploaded for the right remote id
         let (rid, data) = rec.lock().unwrap().clone().unwrap();
         assert_eq!(rid, "f1");
         assert_eq!(data, b"updated");
-        // read-back sees the new content and the size is updated
+        // read-back sees the new content (dirty buffer wins) and the size updates
         assert_eq!(fs.read_slice(ino, 0, 100).unwrap(), b"updated");
         assert_eq!(fs.tree.node(ino).unwrap().size, 7);
         // flushing again with nothing dirty is a no-op
@@ -571,6 +762,7 @@ mod tests {
 
     #[test]
     fn read_only_mount_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
         let items = vec![file("f1", None, "x", 3)];
         let tree = Tree::from_items(&items);
         let ino = tree.lookup(ROOT_INO, "x").unwrap().ino;
@@ -580,6 +772,7 @@ mod tests {
                 calls: std::cell::RefCell::new(0),
                 data: b"abc".to_vec(),
             }),
+            dir.path().join("c"),
         );
         assert_eq!(fs.write_at(ino, 0, b"z"), Err(libc::EROFS));
         assert_eq!(fs.truncate(ino, 0), Err(libc::EROFS));
