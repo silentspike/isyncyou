@@ -39,6 +39,14 @@ pub trait Uploader {
     fn upload(&self, remote_id: &str, data: &[u8]) -> Result<(), String>;
 }
 
+/// Observes on-demand materializations so the host (the daemon) can surface a
+/// "downloading…/ready" notification. Called only on an actual hydrate (a
+/// cache hit fires nothing). `on_done`'s `ok` is false if the fetch failed.
+pub trait HydrationObserver: Send + Sync {
+    fn on_start(&self, name: &str, remote_id: &str);
+    fn on_done(&self, name: &str, remote_id: &str, ok: bool);
+}
+
 /// The root directory's inode (FUSE convention).
 pub const ROOT_INO: u64 = 1;
 #[cfg(unix)]
@@ -192,6 +200,8 @@ pub struct PlaceholderFs {
     write_buf: HashMap<u64, Vec<u8>>,
     /// Inodes written since their last upload.
     dirty: std::collections::HashSet<u64>,
+    /// Optional hydration notifier (download started/finished).
+    observer: Option<std::sync::Arc<dyn HydrationObserver>>,
     uid: u32,
     gid: u32,
 }
@@ -224,6 +234,7 @@ impl PlaceholderFs {
             cache_dir,
             write_buf: HashMap::new(),
             dirty: std::collections::HashSet::new(),
+            observer: None,
             // SAFETY: getuid/getgid are always-succeed syscalls with no preconditions.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -233,6 +244,12 @@ impl PlaceholderFs {
     /// Enable write-back: edits to hydrated files are uploaded on release.
     pub fn with_uploader(mut self, uploader: Box<dyn Uploader + Send>) -> Self {
         self.uploader = Some(uploader);
+        self
+    }
+
+    /// Attach a hydration observer (download start/finish notifications).
+    pub fn with_observer(mut self, observer: std::sync::Arc<dyn HydrationObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -253,17 +270,27 @@ impl PlaceholderFs {
     /// Ensure the file behind `ino` is materialized on disk and return its cache
     /// path. Downloads (hydrates) atomically on first access; a no-op afterwards.
     fn ensure_materialized(&mut self, ino: u64) -> Result<PathBuf, i32> {
-        let (is_dir, rid) = {
+        let (is_dir, rid, name) = {
             let n = self.tree.node(ino).ok_or(libc::ENOENT)?;
-            (n.is_dir, n.remote_id.clone())
+            (n.is_dir, n.remote_id.clone(), n.name.clone())
         };
         if is_dir {
             return Err(libc::EISDIR);
         }
         let path = self.cache_path(&rid);
         if !path.exists() {
-            let data = self.hydrator.fetch(&rid).map_err(|_| libc::EIO)?;
-            atomic_write(&path, &data).map_err(|_| libc::EIO)?;
+            // notify only on a real hydrate (a cache hit is silent)
+            if let Some(obs) = &self.observer {
+                obs.on_start(&name, &rid);
+            }
+            let result = self
+                .hydrator
+                .fetch(&rid)
+                .and_then(|data| atomic_write(&path, &data).map_err(|e| e.to_string()));
+            if let Some(obs) = &self.observer {
+                obs.on_done(&name, &rid, result.is_ok());
+            }
+            result.map_err(|_| libc::EIO)?;
         }
         Ok(path)
     }
@@ -758,6 +785,75 @@ mod fs_tests {
         *rec.lock().unwrap() = None;
         fs.flush_ino(ino).unwrap();
         assert!(rec.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn observer_fires_on_hydrate_but_not_on_cache_hit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Default)]
+        struct Obs {
+            starts: AtomicUsize,
+            done_ok: AtomicUsize,
+        }
+        impl HydrationObserver for Obs {
+            fn on_start(&self, _n: &str, _r: &str) {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+            }
+            fn on_done(&self, _n: &str, _r: &str, ok: bool) {
+                if ok {
+                    self.done_ok.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![file("f1", None, "data.bin", 3)];
+        let tree = Tree::from_items(&items);
+        let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+        let obs = std::sync::Arc::new(Obs::default());
+        let mut fs = PlaceholderFs::new(
+            tree,
+            Box::new(CountingHydrator {
+                calls: std::cell::RefCell::new(0),
+                data: b"abc".to_vec(),
+            }),
+            dir.path().join("c"),
+        )
+        .with_observer(obs.clone());
+        // first read hydrates -> one start + one ok-done
+        fs.read_slice(ino, 0, 3).unwrap();
+        // second read is a cache hit -> observer stays silent
+        fs.read_slice(ino, 0, 3).unwrap();
+        assert_eq!(obs.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(obs.done_ok.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn observer_reports_failed_hydrate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        #[derive(Default)]
+        struct Obs {
+            failed: AtomicBool,
+        }
+        impl HydrationObserver for Obs {
+            fn on_start(&self, _n: &str, _r: &str) {}
+            fn on_done(&self, _n: &str, _r: &str, ok: bool) {
+                if !ok {
+                    self.failed.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![file("f1", None, "data.bin", 3)];
+        let tree = Tree::from_items(&items);
+        let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+        let obs = std::sync::Arc::new(Obs::default());
+        let mut fs = PlaceholderFs::new(tree, Box::new(FailingHydrator), dir.path().join("c"))
+            .with_observer(obs.clone());
+        assert_eq!(fs.read_slice(ino, 0, 3), Err(libc::EIO));
+        assert!(
+            obs.failed.load(Ordering::SeqCst),
+            "failed hydrate must report ok=false"
+        );
     }
 
     #[test]
