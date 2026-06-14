@@ -614,6 +614,61 @@ impl isyncyou_fuse::Uploader for GraphUploader {
         );
         Ok(id)
     }
+    fn delete(&self, remote_id: &str) -> Result<(), String> {
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &self.account)?;
+        let r = isyncyou_graph::GraphClient::new(token)
+            .delete_item(remote_id)
+            .map_err(|e| e.to_string());
+        eprintln!(
+            "isyncyoud: write-back delete {remote_id} -> {}",
+            if r.is_ok() {
+                "ok".to_string()
+            } else {
+                format!("ERR {r:?}")
+            }
+        );
+        r
+    }
+    fn mkdir(&self, parent_id: &str, name: &str) -> Result<String, String> {
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &self.account)?;
+        let item = isyncyou_graph::GraphClient::new(token)
+            .create_folder(parent_id, name)
+            .map_err(|e| e.to_string())?;
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| "mkdir response had no id".to_string())?;
+        let under = if parent_id.is_empty() {
+            "root"
+        } else {
+            parent_id
+        };
+        eprintln!("isyncyoud: write-back mkdir {name} under {under} -> {id}");
+        Ok(id)
+    }
+    fn rename(
+        &self,
+        remote_id: &str,
+        new_parent_id: Option<&str>,
+        new_name: &str,
+    ) -> Result<(), String> {
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &self.account)?;
+        let r = isyncyou_graph::GraphClient::new(token)
+            .move_item(remote_id, new_parent_id, new_name)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        eprintln!(
+            "isyncyoud: write-back rename {remote_id} -> {new_name} (reparent={}) {}",
+            new_parent_id.is_some(),
+            if r.is_ok() {
+                "ok".to_string()
+            } else {
+                format!("ERR {r:?}")
+            }
+        );
+        r
+    }
 }
 
 /// Tracks in-flight FUSE hydrations (on-demand downloads) and surfaces a
