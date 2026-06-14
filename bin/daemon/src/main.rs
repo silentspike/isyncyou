@@ -112,6 +112,9 @@ fn run(args: &Args) -> Result<(), String> {
     // store gate (so it never races the sync thread's lock), then the store is
     // dropped before the blocking mount — hydration goes through Graph, not the
     // store. A daemon restart re-snapshots and re-mounts.
+    // Shared across all placeholder mounts + the /api/v1/hydrations endpoint.
+    #[cfg(target_os = "linux")]
+    let hydration_tracker = Arc::new(HydrationTracker::new());
     #[cfg(target_os = "linux")]
     for acc in &cfg.accounts {
         let Some(mp) = acc.mount_point.clone() else {
@@ -121,6 +124,7 @@ fn run(args: &Args) -> Result<(), String> {
         let archive_root = acc.archive_root.clone();
         let cfg_m = cfg.clone();
         let gate_m = gate.clone();
+        let tracker = hydration_tracker.clone();
         std::thread::spawn(move || {
             // clear a stale mount from a previous crash, then ensure the dir exists
             let _ = std::process::Command::new("fusermount3")
@@ -166,7 +170,8 @@ fn run(args: &Args) -> Result<(), String> {
                     client: isyncyou_graph::GraphClient::new(token),
                 }),
                 cache_dir,
-            );
+            )
+            .with_observer(tracker as Arc<dyn isyncyou_fuse::HydrationObserver>);
             eprintln!(
                 "isyncyoud: mounting OneDrive placeholders (read-only) for '{account}' at {}",
                 mp.display()
@@ -189,6 +194,13 @@ fn run(args: &Args) -> Result<(), String> {
         isyncyou_webui::Router::new(cfg.clone())
     }
     .with_restore(handler, cap_token.clone());
+
+    // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
+    #[cfg(target_os = "linux")]
+    {
+        router =
+            router.with_hydrations(hydration_tracker as Arc<dyn isyncyou_webui::HydrationStatus>);
+    }
 
     // When scheduled sync runs, share a Scheduler so the UI can pause/resume/now.
     if args.sync_secs > 0 {
@@ -463,6 +475,133 @@ impl isyncyou_fuse::Hydrator for GraphHydrator {
         self.client
             .download_content(remote_id)
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Tracks in-flight FUSE hydrations (on-demand downloads) and surfaces a
+/// batch-coalesced desktop toast (#330 P3): one "downloading…" notification when
+/// a batch starts, updated in place as more files join, and one "ready"
+/// notification when the batch drains. Also feeds `/api/v1/hydrations` so the
+/// status bar can show the in-flight list. Toasts go through the system
+/// `notify-send` (desktop-only, non-fatal — a headless box just has none).
+/// FUSE serializes reads, so coalescing is time-windowed, not overlap-based: the
+/// "ready" toast is delayed by this debounce and any new download within the
+/// window rejoins the batch (a multi-select / folder fetch = one notification).
+#[cfg(target_os = "linux")]
+const HYDRATION_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct HydInner {
+    /// File names currently materializing.
+    active: Vec<String>,
+    /// Files started since the current batch began (for the "N ready" message).
+    batch_total: u32,
+    /// notify-send id of the live toast, reused via --replace-id (0 = none).
+    toast_id: u32,
+    /// Bumped on every start and every drain; a pending finalize fires only if its
+    /// captured generation still matches (no new activity in the meantime).
+    generation: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct HydrationTracker {
+    st: Arc<Mutex<HydInner>>,
+}
+
+#[cfg(target_os = "linux")]
+impl HydrationTracker {
+    fn new() -> Self {
+        HydrationTracker {
+            st: Arc::new(Mutex::new(HydInner::default())),
+        }
+    }
+
+    /// Show/replace a desktop toast; returns the (possibly new) notification id.
+    /// Non-fatal: if `notify-send` is missing or fails, returns `replace` unchanged.
+    fn toast(summary: &str, body: &str, replace: u32) -> u32 {
+        let mut cmd = std::process::Command::new("notify-send");
+        cmd.arg("--app-name=iSyncYou").arg("--print-id");
+        if replace > 0 {
+            cmd.arg(format!("--replace-id={replace}"));
+        }
+        cmd.arg(summary).arg(body);
+        match cmd.output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(replace),
+            _ => replace,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl isyncyou_fuse::HydrationObserver for HydrationTracker {
+    fn on_start(&self, name: &str, _remote_id: &str) {
+        // A genuinely new batch = nothing active AND nothing pending a finalize
+        // (batch_total back to 0). Otherwise this start rejoins the current batch
+        // (incl. one that drained but is still inside its debounce window).
+        let (new_batch, total, replace) = {
+            let mut s = self.st.lock().unwrap();
+            let new_batch = s.active.is_empty() && s.batch_total == 0;
+            s.active.push(name.to_string());
+            s.batch_total += 1;
+            s.generation += 1; // invalidate any pending finalize
+            (new_batch, s.batch_total, s.toast_id)
+        };
+        let body = if new_batch {
+            format!("Fetching {name}…")
+        } else {
+            format!("Fetching {total} files…")
+        };
+        let id = Self::toast("Downloading from OneDrive", &body, replace);
+        self.st.lock().unwrap().toast_id = id;
+    }
+
+    fn on_done(&self, name: &str, _remote_id: &str, _ok: bool) {
+        let gen = {
+            let mut s = self.st.lock().unwrap();
+            if let Some(pos) = s.active.iter().position(|n| n == name) {
+                s.active.remove(pos);
+            }
+            if !s.active.is_empty() {
+                return; // batch still draining
+            }
+            s.generation += 1;
+            s.generation
+        };
+        // Delay the "ready" toast; a new download within the window rejoins the
+        // batch (bumping generation), which cancels this finalize.
+        let st = self.st.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(HYDRATION_DEBOUNCE);
+            let (total, replace) = {
+                let s = st.lock().unwrap();
+                if s.generation != gen || !s.active.is_empty() {
+                    return; // superseded by newer activity
+                }
+                (s.batch_total, s.toast_id)
+            };
+            let body = if total == 1 {
+                "A file is ready offline".to_string()
+            } else {
+                format!("{total} files are ready offline")
+            };
+            Self::toast("OneDrive", &body, replace);
+            let mut s = st.lock().unwrap();
+            if s.generation == gen {
+                s.batch_total = 0;
+                s.toast_id = 0;
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl isyncyou_webui::HydrationStatus for HydrationTracker {
+    fn active(&self) -> Vec<String> {
+        self.st.lock().unwrap().active.clone()
     }
 }
 
