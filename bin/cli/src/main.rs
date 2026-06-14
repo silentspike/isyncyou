@@ -817,6 +817,7 @@ fn cmd_init(
                     username: user,
                     sync_root: sr,
                     archive_root: ar,
+                    mount_point: None,
                 }],
                 ..Default::default()
             };
@@ -923,6 +924,7 @@ fn cmd_setup(
             username: user,
             sync_root: PathBuf::from(sr),
             archive_root: PathBuf::from(ar),
+            mount_point: None,
         }],
         ..Default::default()
     };
@@ -2293,12 +2295,14 @@ mod tests {
             username: "a@o".into(),
             sync_root: "/a/od".into(),
             archive_root: "/a/ar".into(),
+            mount_point: None,
         });
         cfg.accounts.push(AccountConfig {
             id: "b".into(),
             username: "b@o".into(),
             sync_root: "/b/od".into(),
             archive_root: "/b/ar".into(),
+            mount_point: None,
         });
         // single account
         assert_eq!(select_accounts(&cfg, Some("a"), false).unwrap(), vec!["a"]);
