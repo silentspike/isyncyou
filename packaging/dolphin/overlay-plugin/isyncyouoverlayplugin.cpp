@@ -17,9 +17,11 @@ constexpr char kService[] = "org.silentspike.iSyncYou";
 constexpr char kPath[] = "/org/silentspike/iSyncYou/FileStatus";
 constexpr char kIface[] = "org.silentspike.iSyncYou.FileStatus";
 
-// How long a cached answer is reused before re-querying (ms). Keeps getOverlays()
-// cheap during a repaint storm while still picking up status changes on refresh.
-constexpr qint64 kTtlMs = 5000;
+// How long a cached answer is reused before re-querying (ms). Short enough that a
+// refresh reflects a state change (e.g. placeholder -> syncing -> materialized
+// during an on-demand download) within ~1.5s, but long enough to stay cheap during
+// a repaint storm.
+constexpr qint64 kTtlMs = 1500;
 
 // Map the daemon's status string onto Breeze emblem icon names.
 QStringList emblemsFor(const QString &status)
@@ -28,7 +30,7 @@ QStringList emblemsFor(const QString &status)
         return {QStringLiteral("emblem-checked")};
     }
     if (status == QLatin1String("syncing")) {
-        return {QStringLiteral("view-refresh")};
+        return {QStringLiteral("emblem-synchronizing-symbolic")};
     }
     if (status == QLatin1String("error")) {
         return {QStringLiteral("emblem-error")};

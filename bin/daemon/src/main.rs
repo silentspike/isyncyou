@@ -142,19 +142,19 @@ fn run(args: &Args) -> Result<(), String> {
                     );
                     return;
                 }
-                let token = match isyncyou_engine::auth::resolve_cached_read_token(&cfg_m, &account)
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("isyncyoud: FUSE mount '{account}' skipped: {e}");
-                        return;
-                    }
-                };
+                // Fail-fast: skip the mount cleanly if no read token is resolvable
+                // now. The hydrator itself re-resolves (silent-refresh) per fetch, so
+                // the mount keeps working past the token's ~1h lifetime.
+                if let Err(e) = isyncyou_engine::auth::resolve_cached_read_token(&cfg_m, &account) {
+                    eprintln!("isyncyoud: FUSE mount '{account}' skipped: {e}");
+                    return;
+                }
                 let tree = isyncyou_fuse::Tree::from_items(&items);
                 let fs = isyncyou_fuse::PlaceholderFs::new(
                     tree,
                     Box::new(GraphHydrator {
-                        client: isyncyou_graph::GraphClient::new(token),
+                        cfg: cfg_m.clone(),
+                        account: account.clone(),
                     }),
                     cache_dir,
                 )
@@ -478,14 +478,23 @@ fn load_config(path: &Path) -> Result<Config, String> {
 
 /// Hydrates a FUSE placeholder by downloading its content from OneDrive on first
 /// read (the read-only mount path; #330).
+///
+/// The cached read token is re-resolved **per fetch** (silent-refresh) rather than
+/// captured once at mount time: a placeholder mount is long-lived, so a token
+/// snapshotted at startup would expire after ~1h and then every download would
+/// fail (EIO) until the daemon restarted. `resolve_cached_read_token` is cheap when
+/// the token is still valid (a file read + expiry check) and only hits the network
+/// to refresh, so per-fetch resolution keeps a mount downloading indefinitely.
 #[cfg(target_os = "linux")]
 struct GraphHydrator {
-    client: isyncyou_graph::GraphClient,
+    cfg: Config,
+    account: String,
 }
 #[cfg(target_os = "linux")]
 impl isyncyou_fuse::Hydrator for GraphHydrator {
     fn fetch(&self, remote_id: &str) -> Result<Vec<u8>, String> {
-        self.client
+        let token = isyncyou_engine::auth::resolve_cached_read_token(&self.cfg, &self.account)?;
+        isyncyou_graph::GraphClient::new(token)
             .download_content(remote_id)
             .map_err(|e| e.to_string())
     }

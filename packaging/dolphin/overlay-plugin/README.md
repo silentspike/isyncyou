@@ -7,7 +7,7 @@ files and folders in Dolphin, by asking the running iSyncYou daemon over DBus
 | daemon status | emblem | meaning |
 |---|---|---|
 | `synced`   | `emblem-checked` | in sync with the cloud |
-| `syncing`  | `view-refresh` | transfer / state change in flight |
+| `syncing`  | `emblem-synchronizing-symbolic` | transfer / on-demand download in flight |
 | `error`    | `emblem-error` | conflict or error — needs attention |
 | `ignored`  | `emblem-unavailable` | tracked but intentionally not synced |
 | `placeholder`  | `cloud-download` | Files-on-Demand: in the cloud, downloads when opened (#330) |
