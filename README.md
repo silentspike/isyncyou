@@ -145,6 +145,7 @@ hardening; ⏳ means designed and queued, not built.
 | Dolphin overlay icons | ✅ | KF6 KIO plugin: `placeholder` / `syncing` / `materialized` emblems over DBus; host-packaged; Linux/KDE |
 | FUSE on-demand placeholders | ✅ Linux | placeholder mount (browse the whole tree instantly), on-read materialize to an on-disk cache, batch-coalesced download notifications; read-only mount is non-blocking (downloads run off the dispatch thread); needs `/dev/fuse` |
 | Unified read-write OneDrive folder | ✅ Linux | with a write token the placeholder mount is the single read-write folder (Windows model): edit/create/delete/rename/mkdir → OneDrive, live refresh from the cloud on browse, one KDE Places entry |
+| Outbound sharing (link / invite / permissions) | ✅ | share a file/folder via Graph: `isyncyou share` (link to clipboard, email invite, list/revoke), Dolphin "Share" ServiceMenu, web-UI "Share" button; uses the cached `Files.ReadWrite` token (no extra consent) |
 | PBS snapshot / temp restore path | ✅ local + live PBS | `VACUUM INTO` staged store + manifest, PBS backup/list/restore CLI; live temp-store round-trip confirmed against a real PBS repository |
 | Acceptance harness (A1–A10) + chaos tests | ✅ | data-loss / crash-point matrix |
 | Release archive + systemd unit | ✅ | tarball + `systemd --user` service |
