@@ -141,9 +141,9 @@ hardening; ⏳ means designed and queued, not built.
 | Multi-account | ✅ | per-account stores, cross-account search |
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
-| Native status bar + tray (SNI) | 🚧 | own `tiny-skia` + `cosmic-text` renderer; windowed build is display-gated |
-| Dolphin overlay icons | 🚧 | host-side KF6 plugin, packaged separately |
-| FUSE on-demand placeholders | ⏳ | designed; privileged/platform-gated |
+| Native status bar + tray (SNI) | ✅ | tray-first SNI indicator; left-click unfolds a frameless status flyout at the icon (live status) with a link into the web UI; own `tiny-skia` + `cosmic-text` renderer; display-gated |
+| Dolphin overlay icons | ✅ | KF6 KIO plugin: `placeholder` / `syncing` / `materialized` emblems over DBus; host-packaged; Linux/KDE |
+| FUSE on-demand placeholders | ✅ Linux | read-only placeholder mount (browse the whole tree instantly), on-read materialize to an on-disk cache, batch-coalesced download notifications; non-blocking (downloads run off the dispatch thread); needs `/dev/fuse` |
 | PBS snapshot / temp restore path | ✅ local + live PBS | `VACUUM INTO` staged store + manifest, PBS backup/list/restore CLI; live temp-store round-trip confirmed against a real PBS repository |
 | Acceptance harness (A1–A10) + chaos tests | ✅ | data-loss / crash-point matrix |
 | Release archive + systemd unit | ✅ | tarball + `systemd --user` service |
@@ -278,11 +278,14 @@ This section is deliberately blunt — it is the inverse of the status table.
   Its first runs caught three real bugs before any release shipped them. Release
   artifacts are built by CI with a CycloneDX SBOM, signed GitHub artifact
   attestations and self-verified cosign signatures.
-- **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are
-  platform/environment-gated.** They need a display server, a host-side KF6 plugin,
-  or privileged mounts respectively. The PBS path has deterministic local coverage
-  plus a live test-account round-trip, but rerunning that live probe still requires a
-  configured PBS repository.
+- **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are built and
+  live-verified on Linux/KDE, but remain platform/environment-gated.** They need a
+  display server, `/dev/fuse`, or a host-side KF6 plugin respectively, so they are
+  exercised by unit tests in CI and verified live on a desktop rather than in
+  headless CI. The FUSE mount is read-only (browse + on-demand download; write-back
+  is out of scope). The PBS path has deterministic local coverage plus a live
+  test-account round-trip, but rerunning that live probe still requires a configured
+  PBS repository.
 - **Personal Vault and some "shared with me" data are not reachable** via Graph for
   third-party clients — these are upstream platform limits, not bugs.
 
@@ -303,7 +306,8 @@ the restore-safety design is [ADR-001](docs/adr/001-restore-semantics.md).
 Design notes and matrices live in [`docs/`](docs/) — Graph capability matrix,
 restore-fidelity matrix, sync-state machine, path mapping, delete/trash/conflict
 model, auth/token lifecycle, SQLite/PBS snapshot consistency, local-API security,
-packaging/daemon model.
+packaging/daemon model, and [FUSE Files-on-Demand](docs/fuse-on-demand.md)
+(placeholder mount, materialize-on-read, download notifications, Dolphin overlays).
 
 ## Contributing
 

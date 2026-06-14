@@ -34,9 +34,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Local web UI: router + minimal HTTP server (accounts / items / item / body /
   search), served by the daemon; safe inert body serving.
 
+**Desktop integration (Phase 3, Linux)**
+- **FUSE Files-on-Demand** (#330): a read-only placeholder mount of an account's
+  OneDrive tree — browse the whole tree instantly, files materialize to an on-disk
+  cache on first read (atomic temp+fsync+rename; crash-safe). Downloads run on a
+  background hydration worker so a slow fetch never freezes the mount, coalesce the
+  kernel's read-ahead into one download per file, and re-resolve the read token per
+  fetch so a long-lived mount keeps working past the token's lifetime. Read-only;
+  write-back is out of scope. Built with `fuser` default-features-off (`fusermount3`,
+  no `libfuse` build dependency).
+- **On-demand download notifications**: batch-coalesced desktop toasts
+  ("Downloading from OneDrive — Fetching N files…" → "N files are ready offline"),
+  with the in-flight set exposed at `/api/v1/hydrations` and in the status bar.
+- **Dolphin overlay icons**: the KF6/KIO `KOverlayIconPlugin` paints `placeholder`
+  / `syncing` / `materialized` emblems for placeholder files (and the store-backed
+  `synced`/`syncing`/`error`/`ignored` for synced paths) over the daemon's DBus
+  `FileStatus` service; a "Make available offline" ServiceMenu action
+  (`isyncyou make-available`) hydrates a selection/folder recursively.
+- **Status-tray app** (#460): tray-first SNI indicator — left-click unfolds a
+  frameless live-status flyout at the icon (Nextcloud/Dropbox style) with a link
+  into the web UI (mail restore, search); the tray label reflects the live daemon
+  status; window identity `org.silentspike.iSyncYou` (WM_CLASS/app_id) + launcher
+  `.desktop`.
+
 **Tooling & ops**
-- `isyncyou` CLI (init/check/login/status/sync/backup/search/restore/export/migrate/serve);
-  `isyncyoud` daemon (serves the web UI); `isyncyou-doctor`.
+- `isyncyou` CLI (init/check/login/status/sync/backup/search/restore/export/migrate/serve;
+  Linux: mount/make-available/dolphin-status); `isyncyoud` daemon (serves the web UI,
+  hosts the FUSE placeholder mounts + DBus FileStatus); `isyncyou-doctor`.
 - Release archive (`isyncyou-linux-x86_64.tar.gz`) + hardened `systemd --user` unit.
 - CI (fmt, clippy, build, test) on **GitHub-hosted runners** (public-ready — no
   self-hosted exposure), with a paths-filter so docs-only PRs skip the compile gate;
