@@ -44,6 +44,28 @@ pub trait Uploader {
     fn create(&self, _dest_path: &str, _data: &[u8]) -> Result<String, String> {
         Err("create not supported".into())
     }
+    /// Delete a cloud item (file or folder) by its remote id. Called on
+    /// `unlink`/`rmdir` in the mount. Default errors (read-only writers).
+    fn delete(&self, _remote_id: &str) -> Result<(), String> {
+        Err("delete not supported".into())
+    }
+    /// Create a **new** folder named `name` under the cloud folder `parent_id`
+    /// (an empty id = the drive root), returning the new folder's remote id.
+    /// Called on `mkdir` in the mount. Default errors.
+    fn mkdir(&self, _parent_id: &str, _name: &str) -> Result<String, String> {
+        Err("mkdir not supported".into())
+    }
+    /// Rename and/or move a cloud item. `new_parent_id` is `Some` only when the
+    /// item changes parent (an empty id = the drive root); `None` keeps the
+    /// parent and only renames. Called on `rename` in the mount. Default errors.
+    fn rename(
+        &self,
+        _remote_id: &str,
+        _new_parent_id: Option<&str>,
+        _new_name: &str,
+    ) -> Result<(), String> {
+        Err("rename not supported".into())
+    }
 }
 
 /// Observes on-demand materializations so the host (the daemon) can surface a
@@ -264,14 +286,71 @@ impl Tree {
         parts.reverse();
         parts.join("/")
     }
+
+    /// Insert a new directory under `parent` with an already-assigned cloud
+    /// `remote_id` and return its inode. Unlike a file (created lazily on flush),
+    /// a folder is created in the cloud first (`mkdir`), then recorded here.
+    pub fn insert_dir(&mut self, parent: u64, name: &str, remote_id: String) -> u64 {
+        let ino = self.nodes.keys().copied().max().unwrap_or(ROOT_INO) + 1;
+        self.nodes.insert(
+            ino,
+            Node {
+                ino,
+                parent,
+                name: sanitize_name(name),
+                is_dir: true,
+                size: 0,
+                remote_id,
+            },
+        );
+        self.children.entry(parent).or_default().push(ino);
+        ino
+    }
+
+    /// Remove a node and unlink it from its parent's child list. The caller is
+    /// responsible for POSIX semantics (a directory must be empty). A no-op for
+    /// an unknown inode.
+    pub fn remove(&mut self, ino: u64) {
+        if let Some(n) = self.nodes.remove(&ino) {
+            if let Some(siblings) = self.children.get_mut(&n.parent) {
+                siblings.retain(|&c| c != ino);
+            }
+            self.children.remove(&ino);
+        }
+    }
+
+    /// Re-parent and/or rename a node, keeping the child lists consistent. A
+    /// no-op for an unknown inode.
+    pub fn rename_node(&mut self, ino: u64, new_parent: u64, new_name: &str) {
+        let Some(old_parent) = self.nodes.get(&ino).map(|n| n.parent) else {
+            return;
+        };
+        if old_parent != new_parent {
+            if let Some(siblings) = self.children.get_mut(&old_parent) {
+                siblings.retain(|&c| c != ino);
+            }
+            self.children.entry(new_parent).or_default().push(ino);
+        }
+        if let Some(n) = self.nodes.get_mut(&ino) {
+            n.parent = new_parent;
+            n.name = sanitize_name(new_name);
+        }
+    }
 }
 
 #[cfg(unix)]
-fn file_attr(node: &Node, uid: u32, gid: u32) -> FileAttr {
+fn file_attr(node: &Node, uid: u32, gid: u32, writable: bool) -> FileAttr {
+    // A read-write mount reports owner-writable bits so file managers (and a
+    // pre-check `access(W_OK)` on the parent dir) permit create/unlink/mkdir;
+    // a read-only mount keeps the placeholder bits.
     let (kind, perm, nlink) = if node.is_dir {
-        (FileType::Directory, 0o555, 2)
+        (FileType::Directory, if writable { 0o755 } else { 0o555 }, 2)
     } else {
-        (FileType::RegularFile, 0o444, 1)
+        (
+            FileType::RegularFile,
+            if writable { 0o644 } else { 0o444 },
+            1,
+        )
     };
     FileAttr {
         ino: node.ino,
@@ -524,6 +603,126 @@ impl PlaceholderFs {
         self.tree.set_size(ino, data.len() as u64);
         Ok(())
     }
+
+    /// Delete a cloud item if it carries a remote id. A file created in the mount
+    /// but never flushed has no cloud id yet → nothing to delete remotely.
+    fn delete_remote_if_tracked(&self, remote_id: &str) -> Result<(), i32> {
+        if remote_id.is_empty() {
+            return Ok(());
+        }
+        let up = self.uploader.as_ref().ok_or(libc::EROFS)?;
+        up.delete(remote_id).map_err(|_| libc::EIO)
+    }
+
+    /// Delete a file in the mount → delete the cloud item and drop the tree node.
+    /// `EROFS` read-only, `ENOENT` unknown name, `EISDIR` for a directory (the
+    /// kernel routes a directory delete to [`rmdir_child`](Self::rmdir_child)).
+    pub fn unlink_child(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+        if !self.is_rw() {
+            return Err(libc::EROFS);
+        }
+        let node = self.tree.lookup(parent, name).ok_or(libc::ENOENT)?;
+        if node.is_dir {
+            return Err(libc::EISDIR);
+        }
+        let (ino, rid) = (node.ino, node.remote_id.clone());
+        self.delete_remote_if_tracked(&rid)?;
+        // the materialization cache is keyed by the now-gone remote id; drop it
+        let _ = std::fs::remove_file(self.cache_path(&rid));
+        self.write_buf.remove(&ino);
+        self.dirty.remove(&ino);
+        self.tree.remove(ino);
+        Ok(())
+    }
+
+    /// Remove an **empty** directory in the mount → delete the cloud folder.
+    /// `EROFS` read-only, `ENOENT` unknown, `ENOTDIR` for a file, `ENOTEMPTY` if
+    /// it still has children (POSIX `rmdir` semantics).
+    pub fn rmdir_child(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+        if !self.is_rw() {
+            return Err(libc::EROFS);
+        }
+        let node = self.tree.lookup(parent, name).ok_or(libc::ENOENT)?;
+        if !node.is_dir {
+            return Err(libc::ENOTDIR);
+        }
+        let (ino, rid) = (node.ino, node.remote_id.clone());
+        if !self.tree.children(ino).is_empty() {
+            return Err(libc::ENOTEMPTY);
+        }
+        self.delete_remote_if_tracked(&rid)?;
+        self.tree.remove(ino);
+        Ok(())
+    }
+
+    /// Create a directory in the mount → create the cloud folder immediately
+    /// (a folder has no deferred-flush content, unlike a file) and record its id.
+    /// Returns the new inode. `EROFS` read-only, `EEXIST` duplicate name.
+    pub fn mkdir_child(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
+        if !self.is_rw() {
+            return Err(libc::EROFS);
+        }
+        if self.tree.lookup(parent, name).is_some() {
+            return Err(libc::EEXIST);
+        }
+        let parent_id = self
+            .tree
+            .node(parent)
+            .map(|n| n.remote_id.clone())
+            .unwrap_or_default();
+        let up = self.uploader.as_ref().ok_or(libc::EROFS)?;
+        let new_id = up.mkdir(&parent_id, name).map_err(|_| libc::EIO)?;
+        Ok(self.tree.insert_dir(parent, name, new_id))
+    }
+
+    /// Rename/move a file or directory in the mount → rename/move the cloud item.
+    /// Renames only into a **free** name (an existing target is `EEXIST`). `EROFS`
+    /// read-only, `ENOENT` source missing or destination dir missing, `ENOTDIR`
+    /// if the destination parent is not a directory.
+    pub fn rename_child(
+        &mut self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), i32> {
+        if !self.is_rw() {
+            return Err(libc::EROFS);
+        }
+        let node = self.tree.lookup(parent, name).ok_or(libc::ENOENT)?;
+        let (ino, rid) = (node.ino, node.remote_id.clone());
+        // the destination parent must exist and be a directory
+        match self.tree.node(newparent) {
+            Some(p) if p.is_dir => {}
+            Some(_) => return Err(libc::ENOTDIR),
+            None => return Err(libc::ENOENT),
+        }
+        if self.tree.lookup(newparent, newname).is_some() {
+            return Err(libc::EEXIST);
+        }
+        // a never-flushed new file (no cloud id) is renamed in the tree only; it
+        // is created at its new path on the next flush (path_of follows the node)
+        if !rid.is_empty() {
+            let new_parent_id = if newparent == ROOT_INO {
+                String::new()
+            } else {
+                self.tree
+                    .node(newparent)
+                    .map(|n| n.remote_id.clone())
+                    .unwrap_or_default()
+            };
+            let up = self.uploader.as_ref().ok_or(libc::EROFS)?;
+            let parent_arg = if newparent == parent {
+                None
+            } else {
+                Some(new_parent_id.as_str())
+            };
+            up.rename(&rid, parent_arg, newname)
+                .map_err(|_| libc::EIO)?;
+        }
+        self.tree.rename_node(ino, newparent, newname);
+        Ok(())
+    }
 }
 
 /// Slice `data` to the `[offset, offset+size)` window, clamped to the data length.
@@ -626,14 +825,14 @@ impl MountedFs {
 impl Filesystem for MountedFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match name.to_str().and_then(|n| self.tree.lookup(parent, n)) {
-            Some(n) => reply.entry(&TTL, &file_attr(n, self.uid, self.gid), 0),
+            Some(n) => reply.entry(&TTL, &file_attr(n, self.uid, self.gid, false), 0),
             None => reply.error(libc::ENOENT),
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.tree.node(ino) {
-            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid)),
+            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid, false)),
             None => reply.error(libc::ENOENT),
         }
     }
@@ -791,15 +990,17 @@ pub fn mount(fs: PlaceholderFs, mountpoint: &std::path::Path) -> std::io::Result
 #[cfg(unix)]
 impl Filesystem for PlaceholderFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let rw = self.is_rw();
         match name.to_str().and_then(|n| self.tree.lookup(parent, n)) {
-            Some(n) => reply.entry(&TTL, &file_attr(n, self.uid, self.gid), 0),
+            Some(n) => reply.entry(&TTL, &file_attr(n, self.uid, self.gid, rw), 0),
             None => reply.error(libc::ENOENT),
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        let rw = self.is_rw();
         match self.tree.node(ino) {
-            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid)),
+            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid, rw)),
             None => reply.error(libc::ENOENT),
         }
     }
@@ -825,9 +1026,73 @@ impl Filesystem for PlaceholderFs {
         };
         match self.create_file(parent, name) {
             Ok(ino) => {
-                let attr = file_attr(self.tree.node(ino).unwrap(), self.uid, self.gid);
+                let attr = file_attr(self.tree.node(ino).unwrap(), self.uid, self.gid, true);
                 reply.created(&TTL, &attr, 0, 0, 0);
             }
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.mkdir_child(parent, name) {
+            Ok(ino) => {
+                let attr = file_attr(self.tree.node(ino).unwrap(), self.uid, self.gid, true);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.unlink_child(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.rmdir_child(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.rename_child(parent, name, newparent, newname) {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
@@ -877,8 +1142,9 @@ impl Filesystem for PlaceholderFs {
                 return;
             }
         }
+        let rw = self.is_rw();
         match self.tree.node(ino) {
-            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid)),
+            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid, rw)),
             None => reply.error(libc::ENOENT),
         }
     }
@@ -1034,6 +1300,30 @@ mod tests {
     }
 
     #[test]
+    fn tree_insert_dir_remove_and_rename_node() {
+        let mut t = Tree::from_items(&[folder("F1", None, "Docs")]);
+        let docs = t.lookup(ROOT_INO, "Docs").unwrap().ino;
+        // mkdir records a cloud-assigned id immediately (unlike a lazy file)
+        let sub = t.insert_dir(docs, "Sub", "SUBID".into());
+        let n = t.lookup(docs, "Sub").unwrap();
+        assert!(n.is_dir && n.remote_id == "SUBID");
+        assert_eq!(t.path_of(sub), "Docs/Sub");
+        // rename in place: name changes, parent stays
+        t.rename_node(sub, docs, "Renamed");
+        assert!(t.lookup(docs, "Sub").is_none());
+        assert_eq!(t.path_of(sub), "Docs/Renamed");
+        // move: re-parent to root, drops out of Docs' children
+        t.rename_node(sub, ROOT_INO, "Renamed");
+        assert!(t.lookup(docs, "Renamed").is_none());
+        assert_eq!(t.lookup(ROOT_INO, "Renamed").unwrap().ino, sub);
+        assert_eq!(t.path_of(sub), "Renamed");
+        // remove unlinks from the parent's child list
+        t.remove(sub);
+        assert!(t.lookup(ROOT_INO, "Renamed").is_none());
+        assert!(t.node(sub).is_none());
+    }
+
+    #[test]
     fn placeholder_index_resolves_paths_to_items() {
         let items = vec![
             folder("F1", None, "Docs"),
@@ -1076,6 +1366,11 @@ mod tests {
 mod fs_tests {
     use super::*;
 
+    fn folder(id: &str, parent: Option<&str>, name: &str) -> Item {
+        let mut it = Item::new("a", "onedrive", id, name, "folder");
+        it.parent_remote_id = parent.map(str::to_string);
+        it
+    }
     fn file(id: &str, parent: Option<&str>, name: &str, size: i64) -> Item {
         let mut it = Item::new("a", "onedrive", id, name, "file");
         it.parent_remote_id = parent.map(str::to_string);
@@ -1363,12 +1658,182 @@ mod fs_tests {
     #[test]
     fn read_only_mount_rejects_create_and_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ro = PlaceholderFs::new(
+        let items = vec![file("f1", None, "x", 3)];
+        let tree = Tree::from_items(&items);
+        let mut ro = PlaceholderFs::new(tree, Box::new(FailingHydrator), dir.path().join("c"));
+        // every mutating op is refused without an uploader (read-only mount)
+        assert_eq!(ro.create_file(ROOT_INO, "y").err(), Some(libc::EROFS));
+        assert_eq!(ro.mkdir_child(ROOT_INO, "d").err(), Some(libc::EROFS));
+        assert_eq!(ro.unlink_child(ROOT_INO, "x").err(), Some(libc::EROFS));
+        assert_eq!(ro.rmdir_child(ROOT_INO, "x").err(), Some(libc::EROFS));
+        assert_eq!(
+            ro.rename_child(ROOT_INO, "x", ROOT_INO, "z").err(),
+            Some(libc::EROFS)
+        );
+    }
+
+    /// Records every cloud op a read-write mount issues, so the FUSE-side
+    /// delete/mkdir/rename handlers can be checked without a network.
+    #[derive(Default)]
+    struct CloudOpsRecorder {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+    impl Uploader for CloudOpsRecorder {
+        fn upload(&self, _id: &str, _data: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn create(&self, dest_path: &str, _data: &[u8]) -> Result<String, String> {
+            self.log.lock().unwrap().push(format!("create {dest_path}"));
+            Ok(format!("ID:{dest_path}"))
+        }
+        fn delete(&self, remote_id: &str) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!("delete {remote_id}"));
+            Ok(())
+        }
+        fn mkdir(&self, parent_id: &str, name: &str) -> Result<String, String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("mkdir {name} under [{parent_id}]"));
+            Ok(format!("DIR:{name}"))
+        }
+        fn rename(
+            &self,
+            remote_id: &str,
+            new_parent_id: Option<&str>,
+            new_name: &str,
+        ) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!(
+                "rename {remote_id} -> {new_name} reparent={}",
+                new_parent_id
+                    .map(|p| format!("[{p}]"))
+                    .unwrap_or("no".into())
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mount_mutations_issue_the_right_cloud_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![
+            folder("F1", None, "Docs"),
+            file("f1", Some("F1"), "note.txt", 7),
+            file("f2", None, "top.bin", 100),
+        ];
+        let rec = std::sync::Arc::new(CloudOpsRecorder::default());
+        // a thin Uploader wrapper that forwards to the shared recorder
+        struct Fwd(std::sync::Arc<CloudOpsRecorder>);
+        impl Uploader for Fwd {
+            fn upload(&self, id: &str, d: &[u8]) -> Result<(), String> {
+                self.0.upload(id, d)
+            }
+            fn create(&self, p: &str, d: &[u8]) -> Result<String, String> {
+                self.0.create(p, d)
+            }
+            fn delete(&self, id: &str) -> Result<(), String> {
+                self.0.delete(id)
+            }
+            fn mkdir(&self, p: &str, n: &str) -> Result<String, String> {
+                self.0.mkdir(p, n)
+            }
+            fn rename(&self, id: &str, p: Option<&str>, n: &str) -> Result<(), String> {
+                self.0.rename(id, p, n)
+            }
+        }
+        let mut fs = PlaceholderFs::new(
+            Tree::from_items(&items),
+            Box::new(FailingHydrator),
+            dir.path().join("c"),
+        )
+        .with_uploader(Box::new(Fwd(rec.clone())));
+        let docs = fs.tree.lookup(ROOT_INO, "Docs").unwrap().ino;
+
+        // mkdir → cloud folder created under Docs' id, recorded in the tree with its id
+        let sub = fs.mkdir_child(docs, "Sub").unwrap();
+        assert_eq!(fs.tree.node(sub).unwrap().remote_id, "DIR:Sub");
+        assert!(fs.tree.lookup(docs, "Sub").is_some());
+        // a duplicate folder name is refused before any cloud call
+        assert_eq!(fs.mkdir_child(docs, "Sub").err(), Some(libc::EEXIST));
+
+        // rename in place (same parent) → no reparent
+        fs.rename_child(docs, "note.txt", docs, "renamed.txt")
+            .unwrap();
+        assert!(fs.tree.lookup(docs, "renamed.txt").is_some());
+        assert!(fs.tree.lookup(docs, "note.txt").is_none());
+        // move to root → reparent to the drive root (empty parent id)
+        fs.rename_child(docs, "renamed.txt", ROOT_INO, "moved.txt")
+            .unwrap();
+        assert!(fs.tree.lookup(ROOT_INO, "moved.txt").is_some());
+
+        // unlink a file → cloud delete + node gone
+        fs.unlink_child(ROOT_INO, "top.bin").unwrap();
+        assert!(fs.tree.lookup(ROOT_INO, "top.bin").is_none());
+        // unlink on a directory is EISDIR; rmdir on a file is ENOTDIR
+        assert_eq!(fs.unlink_child(ROOT_INO, "Docs").err(), Some(libc::EISDIR));
+
+        // rmdir refuses a non-empty dir, accepts an empty one
+        assert_eq!(
+            fs.rmdir_child(ROOT_INO, "Docs").err(),
+            Some(libc::ENOTEMPTY)
+        );
+        fs.rmdir_child(docs, "Sub").unwrap();
+        fs.rmdir_child(ROOT_INO, "Docs").unwrap();
+        assert!(fs.tree.lookup(ROOT_INO, "Docs").is_none());
+
+        let log = rec.log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "mkdir Sub under [F1]".to_string(),
+                "rename f1 -> renamed.txt reparent=no".to_string(),
+                "rename f1 -> moved.txt reparent=[]".to_string(),
+                "delete f2".to_string(),
+                "delete DIR:Sub".to_string(),
+                "delete F1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_of_a_never_flushed_new_file_touches_no_cloud_then_creates_at_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = std::sync::Arc::new(CloudOpsRecorder::default());
+        struct Fwd(std::sync::Arc<CloudOpsRecorder>);
+        impl Uploader for Fwd {
+            fn upload(&self, id: &str, d: &[u8]) -> Result<(), String> {
+                self.0.upload(id, d)
+            }
+            fn create(&self, p: &str, d: &[u8]) -> Result<String, String> {
+                self.0.create(p, d)
+            }
+            fn delete(&self, id: &str) -> Result<(), String> {
+                self.0.delete(id)
+            }
+            fn mkdir(&self, p: &str, n: &str) -> Result<String, String> {
+                self.0.mkdir(p, n)
+            }
+            fn rename(&self, id: &str, p: Option<&str>, n: &str) -> Result<(), String> {
+                self.0.rename(id, p, n)
+            }
+        }
+        let mut fs = PlaceholderFs::new(
             Tree::from_items(&[]),
             Box::new(FailingHydrator),
             dir.path().join("c"),
-        );
-        assert_eq!(ro.create_file(ROOT_INO, "x").err(), Some(libc::EROFS));
+        )
+        .with_uploader(Box::new(Fwd(rec.clone())));
+        // create a file but do not flush → it has no cloud id yet
+        let ino = fs.create_file(ROOT_INO, "draft.txt").unwrap();
+        fs.write_at(ino, 0, b"hi").unwrap();
+        // rename it before flush: no cloud rename happens (nothing to rename yet)
+        fs.rename_child(ROOT_INO, "draft.txt", ROOT_INO, "final.txt")
+            .unwrap();
+        assert!(fs.tree.lookup(ROOT_INO, "final.txt").is_some());
+        // flush now creates it at the *new* path, exactly once
+        fs.flush_ino(ino).unwrap();
+        let log = rec.log.lock().unwrap().clone();
+        assert_eq!(log, vec!["create final.txt".to_string()]);
     }
 
     #[test]

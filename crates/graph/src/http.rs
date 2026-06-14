@@ -412,6 +412,49 @@ impl GraphClient {
         }
     }
 
+    /// Create a child folder named `name` under the drive folder `parent_id`
+    /// (an empty id = the drive root). `conflictBehavior: fail` so a duplicate
+    /// name returns a 409 rather than silently auto-renaming (the FUSE layer has
+    /// already refused a duplicate, so a 409 here means a concurrent change).
+    /// Returns the created folder item (its `id` is the new remote id).
+    pub fn create_folder(
+        &self,
+        parent_id: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, UploadError> {
+        let path = if parent_id.is_empty() {
+            "/me/drive/root/children".to_string()
+        } else {
+            format!("/me/drive/items/{}/children", encode_id(parent_id))
+        };
+        let body = serde_json::json!({
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        });
+        self.post_json(&path, &body)
+    }
+
+    /// Rename and/or move a drive item. `new_parent_id` is `Some` only when the
+    /// item changes parent (an empty id = the drive root, addressed by path);
+    /// `None` keeps the current parent and only renames. Returns the updated item.
+    pub fn move_item(
+        &self,
+        item_id: &str,
+        new_parent_id: Option<&str>,
+        new_name: &str,
+    ) -> Result<serde_json::Value, UploadError> {
+        let mut body = serde_json::json!({ "name": new_name });
+        if let Some(pid) = new_parent_id {
+            body["parentReference"] = if pid.is_empty() {
+                serde_json::json!({ "path": "/drive/root:" })
+            } else {
+                serde_json::json!({ "id": pid })
+            };
+        }
+        self.patch_json(&format!("/me/drive/items/{}", encode_id(item_id)), &body)
+    }
+
     /// GET an arbitrary Graph URL and return the raw response body bytes
     /// (follows redirects to pre-signed download URLs). Used for binary/content
     /// endpoints like a drive item's `/content` or a message's `/$value` (MIME).
@@ -1168,6 +1211,53 @@ mod tests {
             .unwrap_err()
         {
             UploadError::Http { status, .. } => assert_eq!(status, 404),
+            other => panic!("expected Http error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn create_folder_posts_to_children_and_returns_new_id() {
+        // top-level (root) folder → POST /me/drive/root/children
+        let (base, server) = serve(vec![http_response(201, "Created", "", "{\"id\":\"D1\"}")]);
+        let out = GraphClient::new("tok")
+            .with_base_url(&base)
+            .create_folder("", "New Folder")
+            .unwrap();
+        assert_eq!(out["id"].as_str(), Some("D1"));
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/drive/root/children"));
+        assert!(seen[0].contains("content-type: application/json"));
+
+        // nested folder → POST under the parent item id
+        let (base2, server2) = serve(vec![http_response(201, "Created", "", "{\"id\":\"D2\"}")]);
+        GraphClient::new("tok")
+            .with_base_url(&base2)
+            .create_folder("PARENT", "Sub")
+            .unwrap();
+        assert!(server2.join().unwrap()[0].starts_with("POST /me/drive/items/PARENT/children"));
+    }
+
+    #[test]
+    fn move_item_patches_the_item_and_classifies_conflict() {
+        // rename in place (no parent change) → PATCH the item id
+        let (base, server) = serve(vec![http_response(200, "OK", "", "{\"id\":\"i1\"}")]);
+        let out = GraphClient::new("tok")
+            .with_base_url(&base)
+            .move_item("i1", None, "renamed.txt")
+            .unwrap();
+        assert_eq!(out["id"].as_str(), Some("i1"));
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("PATCH /me/drive/items/i1"));
+        assert!(seen[0].contains("content-type: application/json"));
+
+        // a name conflict on move surfaces as a classified HTTP error
+        let (base2, _s2) = serve(vec![http_response(409, "Conflict", "", "name exists")]);
+        match GraphClient::new("tok")
+            .with_base_url(&base2)
+            .move_item("i1", Some("P2"), "x")
+            .unwrap_err()
+        {
+            UploadError::Http { status, .. } => assert_eq!(status, 409),
             other => panic!("expected Http error, got {other}"),
         }
     }
