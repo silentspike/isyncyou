@@ -97,15 +97,18 @@ fn run(args: &Args) -> Result<(), String> {
     // one of them ever holds a store's single-instance file lock at a time.
     let gate = Arc::new(Mutex::new(()));
 
-    // FUSE Files-on-Demand (#330, plan §19): for each account with a `mount_point`,
-    // mount a read-only placeholder view of the whole OneDrive tree. Files
-    // materialize to an on-disk cache on first read. Linux-only and non-fatal: a
-    // missing /dev/fuse, no cached token, or an unreadable store just logs and
-    // skips while everything else runs. The tree is snapshotted under the shared
-    // store gate (so it never races the sync thread's lock); the same snapshot
-    // feeds the DBus status provider's per-account path index (placeholder vs
-    // materialized vs syncing overlays in Dolphin, #330 P4). A daemon restart
-    // re-snapshots and re-mounts.
+    // FUSE Files-on-Demand (#330) + the unified read-write OneDrive folder (#478):
+    // for each account with a `mount_point`, mount a placeholder view of the whole
+    // OneDrive tree. Files materialize to an on-disk cache on first read; with a
+    // write token the mount is read-write (edit/create/delete/rename/mkdir →
+    // OneDrive) and refreshes from the cloud on browse, so it behaves like the one
+    // Windows-OneDrive folder. It is registered as a single Places entry (#478 P5).
+    // Linux-only and non-fatal: a missing /dev/fuse, no cached token, or an
+    // unreadable store just logs and skips while everything else runs. The tree is
+    // snapshotted under the shared store gate (so it never races the sync thread's
+    // lock); the same snapshot feeds the DBus status provider's per-account path
+    // index (placeholder vs materialized vs syncing overlays in Dolphin, #330 P4).
+    // A daemon restart re-snapshots and re-mounts.
     // Shared across all placeholder mounts + the /api/v1/hydrations endpoint.
     #[cfg(target_os = "linux")]
     let hydration_tracker = Arc::new(HydrationTracker::new());
@@ -146,6 +149,10 @@ fn run(args: &Args) -> Result<(), String> {
                 cache_dir: cache_dir.clone(),
                 index: index.clone(),
             });
+            // One Places sidebar entry for the single OneDrive folder (#478 P5):
+            // the mount IS the folder, so register only it (no second sync_root
+            // entry — the dual-entry variant was confusing).
+            register_onedrive_place(&mp);
             // Spawn the mount thread with the already-snapshotted items.
             let account = acc.id.clone();
             let cfg_m = cfg.clone();
@@ -339,6 +346,123 @@ fn local_host() -> String {
         .and_then(|h| h.split('.').next().map(str::to_string))
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "local".to_string())
+}
+
+// --- KDE Places integration (unified-folder #478 P5, Linux desktop) ----------
+// Register the placeholder mount as a single Places sidebar entry so the one
+// read-write OneDrive folder is one click away in Dolphin — the Windows model of
+// a single folder, not a confusing pair (sync_root + mount). One entry per
+// account's mount, idempotent (keyed on the file:// href).
+
+/// `~/.local/share/user-places.xbel` (the KDE Places bookmark file), honoring
+/// `XDG_DATA_HOME`. `None` if neither it nor `$HOME` is set.
+#[cfg(target_os = "linux")]
+fn places_file() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .map(|base| base.join("user-places.xbel"))
+}
+
+/// `file://` URI for an absolute path, percent-encoding everything outside the
+/// unreserved set (keeping `/` as the separator).
+#[cfg(target_os = "linux")]
+fn path_to_file_uri(p: &Path) -> String {
+    let mut out = String::from("file://");
+    for b in p.to_string_lossy().bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Minimal XML escaping for text/attribute content.
+#[cfg(target_os = "linux")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A stable hex id for a Places bookmark, derived from its href (FNV-1a) so a
+/// re-run reuses the same `<ID>` rather than spraying duplicates.
+#[cfg(target_os = "linux")]
+fn stable_id(href: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in href.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Add a single KDE Places bookmark for `mount_point` to `xbel_path` if one for
+/// that href isn't already present. Idempotent (keyed on the `file://` href), so
+/// it's safe to call on every daemon start. Returns whether it added an entry.
+#[cfg(target_os = "linux")]
+fn ensure_place_in(
+    xbel_path: &Path,
+    mount_point: &Path,
+    label: &str,
+    icon: &str,
+) -> std::io::Result<bool> {
+    let href = path_to_file_uri(mount_point);
+    let existing = std::fs::read_to_string(xbel_path).unwrap_or_default();
+    if existing.contains(&format!("href=\"{href}\"")) {
+        return Ok(false); // already registered — never duplicate
+    }
+    let bookmark = format!(
+        "  <bookmark href=\"{href}\">\n   <title>{title}</title>\n   <info>\n    \
+         <metadata owner=\"http://freedesktop.org\">\n     <bookmark:icon name=\"{icon}\"/>\n    \
+         </metadata>\n    <metadata owner=\"http://www.kde.org\">\n     <ID>{id}</ID>\n     \
+         <isSystemItem>false</isSystemItem>\n    </metadata>\n   </info>\n  </bookmark>\n",
+        href = href,
+        title = xml_escape(label),
+        icon = icon,
+        id = stable_id(&href),
+    );
+    let header = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE xbel>\n\
+         <xbel xmlns:bookmark=\"http://www.freedesktop.org/standards/desktop-bookmarks\" \
+         xmlns:mime=\"http://www.freedesktop.org/standards/shared-mime-info\" \
+         xmlns:kdepriv=\"http://www.kde.org/kdepriv\">\n";
+    let new_content = if existing.trim().is_empty() {
+        format!("{header}{bookmark}</xbel>\n")
+    } else if let Some(pos) = existing.rfind("</xbel>") {
+        let mut c = existing.clone();
+        c.replace_range(pos..pos, &bookmark);
+        c
+    } else {
+        // no closing tag (unexpected): append our bookmark + a close, don't corrupt
+        format!("{existing}{bookmark}</xbel>\n")
+    };
+    if let Some(parent) = xbel_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(xbel_path, new_content)?;
+    Ok(true)
+}
+
+/// Register the one OneDrive folder (`mount_point`) in the KDE Places sidebar.
+/// Best-effort + non-fatal: a missing data dir / no KDE just logs.
+#[cfg(target_os = "linux")]
+fn register_onedrive_place(mount_point: &Path) {
+    let Some(xbel) = places_file() else {
+        return;
+    };
+    match ensure_place_in(&xbel, mount_point, "OneDrive", "folder-cloud") {
+        Ok(true) => eprintln!(
+            "isyncyoud: registered Places entry 'OneDrive' -> {}",
+            mount_point.display()
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("isyncyoud: Places registration skipped: {e}"),
+    }
 }
 
 /// Shared scheduled-sync control: a `paused` flag and a one-shot `trigger`, with a
@@ -1088,5 +1212,59 @@ mod tests {
         };
         let err = isyncyou_webui::RestoreHandler::restore(&h, "a", "onedrive", "x").unwrap_err();
         assert!(err.contains("not crash-safe yet"), "onedrive: got: {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_uri_and_xml_escape_encode_special_chars() {
+        assert_eq!(
+            path_to_file_uri(Path::new("/home/u/One Drive")),
+            "file:///home/u/One%20Drive"
+        );
+        assert_eq!(
+            path_to_file_uri(Path::new("/a/b-c_d.e~f")),
+            "file:///a/b-c_d.e~f"
+        );
+        assert_eq!(
+            xml_escape("a & b <c> \"d\""),
+            "a &amp; b &lt;c&gt; &quot;d&quot;"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ensure_place_adds_exactly_one_entry_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("isy-places-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let xbel = dir.join("user-places.xbel");
+        let mount = Path::new("/home/u/OneDrive");
+
+        // first call creates the file with one bookmark
+        assert!(ensure_place_in(&xbel, mount, "OneDrive", "folder-cloud").unwrap());
+        let c1 = std::fs::read_to_string(&xbel).unwrap();
+        assert_eq!(c1.matches("<bookmark ").count(), 1);
+        assert!(c1.contains("href=\"file:///home/u/OneDrive\""));
+        assert!(c1.contains("<title>OneDrive</title>"));
+        assert!(c1.trim_end().ends_with("</xbel>"));
+
+        // second call is a no-op (keyed on href) → still exactly one entry
+        assert!(!ensure_place_in(&xbel, mount, "OneDrive", "folder-cloud").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&xbel)
+                .unwrap()
+                .matches("<bookmark ")
+                .count(),
+            1
+        );
+
+        // a *different* mount appends a second, distinct entry without clobbering
+        let other = Path::new("/home/u/OneDrive-Work");
+        assert!(ensure_place_in(&xbel, other, "OneDrive Work", "folder-cloud").unwrap());
+        let c3 = std::fs::read_to_string(&xbel).unwrap();
+        assert_eq!(c3.matches("<bookmark ").count(), 2);
+        assert!(c3.contains("href=\"file:///home/u/OneDrive\""));
+        assert!(c3.contains("href=\"file:///home/u/OneDrive-Work\""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
