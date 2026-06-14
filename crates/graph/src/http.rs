@@ -455,6 +455,147 @@ impl GraphClient {
         self.patch_json(&format!("/me/drive/items/{}", encode_id(item_id)), &body)
     }
 
+    // --- Outbound sharing (#494): share a drive item via a link, an email invite,
+    // or by listing/revoking its permissions. `Files.ReadWrite` covers all of these
+    // (no extra consent). The FUSE-mount-relative path equals the cloud path, so the
+    // CLI resolves a selected path to an id with `item_id_for_path`, then operates
+    // by id (id-addressing is universal; path-addressing here is only the resolve).
+
+    /// Resolve a drive item's id from its drive-relative path (the FUSE-mount path
+    /// equals the cloud path). Per-segment percent-encoded so arbitrary names
+    /// (`:`, spaces, umlauts) resolve. Returns the item `id`.
+    pub fn item_id_for_path(&self, rel_path: &str) -> Result<String, UploadError> {
+        let url = format!("{}/me/drive/root:/{}", self.base, enc_path(rel_path));
+        let v = self.get_json(&url)?;
+        v.get("id")
+            .and_then(|i| i.as_str())
+            .map(String::from)
+            .ok_or_else(|| UploadError::Parse("drive item response had no id".into()))
+    }
+
+    /// Create (or, idempotently per `(link_type, scope)`, return the existing)
+    /// sharing link for an item. `link_type` = `view`/`edit`/`embed`, `scope` =
+    /// `anonymous`/`users`. `password`/`expiry` are account/Premium-dependent on
+    /// personal accounts. Returns the link's `webUrl`.
+    pub fn create_link(
+        &self,
+        item_id: &str,
+        link_type: &str,
+        scope: &str,
+        password: Option<&str>,
+        expiry: Option<&str>,
+        retain_inherited: Option<bool>,
+    ) -> Result<String, UploadError> {
+        let url = format!("/me/drive/items/{}/createLink", encode_id(item_id));
+        let mut body = serde_json::json!({ "type": link_type, "scope": scope });
+        if let Some(p) = password {
+            body["password"] = serde_json::Value::String(p.to_string());
+        }
+        if let Some(e) = expiry {
+            body["expirationDateTime"] = serde_json::Value::String(e.to_string());
+        }
+        if let Some(r) = retain_inherited {
+            body["retainInheritedPermissions"] = serde_json::Value::Bool(r);
+        }
+        let v = self.post_json(&url, &body)?;
+        v.pointer("/link/webUrl")
+            .and_then(|u| u.as_str())
+            .map(String::from)
+            .ok_or_else(|| UploadError::Parse("createLink response had no link.webUrl".into()))
+    }
+
+    /// Invite people to an item by email. `roles` is e.g. `["read"]` or
+    /// `["write"]`. Returns the created permission ids (`value[].id`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn invite(
+        &self,
+        item_id: &str,
+        emails: &[String],
+        roles: &[&str],
+        require_sign_in: bool,
+        send_invitation: bool,
+        message: &str,
+        expiry: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Vec<String>, UploadError> {
+        let url = format!("/me/drive/items/{}/invite", encode_id(item_id));
+        let recipients: Vec<serde_json::Value> = emails
+            .iter()
+            .map(|e| serde_json::json!({ "email": e }))
+            .collect();
+        let mut body = serde_json::json!({
+            "recipients": recipients,
+            "roles": roles,
+            "requireSignIn": require_sign_in,
+            "sendInvitation": send_invitation,
+            "message": message,
+        });
+        if let Some(e) = expiry {
+            body["expirationDateTime"] = serde_json::Value::String(e.to_string());
+        }
+        if let Some(p) = password {
+            body["password"] = serde_json::Value::String(p.to_string());
+        }
+        let v = self.post_json(&url, &body)?;
+        Ok(v.get("value")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.get("id").and_then(|i| i.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// List an item's permissions as `(permission id, roles, link webUrl, grantee
+    /// display name)` tuples.
+    #[allow(clippy::type_complexity)]
+    pub fn list_permissions(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<(String, Vec<String>, Option<String>, Option<String>)>, UploadError> {
+        let url = format!("/me/drive/items/{}/permissions", encode_id(item_id));
+        let v = self.get_json(&url)?;
+        Ok(v.get("value")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| {
+                        let id = p.get("id")?.as_str()?.to_string();
+                        let roles = p
+                            .get("roles")
+                            .and_then(|r| r.as_array())
+                            .map(|r| {
+                                r.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let link = p
+                            .pointer("/link/webUrl")
+                            .and_then(|u| u.as_str())
+                            .map(String::from);
+                        let grantee = p
+                            .pointer("/grantedToV2/user/displayName")
+                            .or_else(|| p.pointer("/grantedTo/user/displayName"))
+                            .and_then(|n| n.as_str())
+                            .map(String::from);
+                        Some((id, roles, link, grantee))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Revoke a permission (un-share) by its id.
+    pub fn delete_permission(&self, item_id: &str, perm_id: &str) -> Result<(), UploadError> {
+        self.delete_url(&format!(
+            "/me/drive/items/{}/permissions/{}",
+            encode_id(item_id),
+            encode_id(perm_id)
+        ))
+    }
+
     /// GET an arbitrary Graph URL and return the raw response body bytes
     /// (follows redirects to pre-signed download URLs). Used for binary/content
     /// endpoints like a drive item's `/content` or a message's `/$value` (MIME).
@@ -763,13 +904,13 @@ fn enc(path: &str) -> String {
     path.trim_start_matches('/').replace(' ', "%20")
 }
 
-/// Percent-encode an item id for safe inclusion in a URL path segment. Outlook
-/// message ids are base64-ish (contain `+ / =`), which Graph 404s if left raw in
-/// the path; everything outside RFC 3986 unreserved is escaped. Plain alphanumeric
-/// ids (e.g. OneDrive drive-item ids) pass through unchanged.
-fn encode_id(id: &str) -> String {
-    let mut out = String::with_capacity(id.len());
-    for b in id.bytes() {
+/// Percent-encode one path segment: every byte outside the RFC 3986 unreserved
+/// set is escaped over its UTF-8 bytes (so `:`, `#`, `?`, `%`, spaces and
+/// non-ASCII like umlauts are all made safe). The shared core of [`encode_id`]
+/// and [`enc_path`].
+fn encode_seg(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for b in seg.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
@@ -778,6 +919,26 @@ fn encode_id(id: &str) -> String {
         }
     }
     out
+}
+
+/// Percent-encode an item id for safe inclusion in a URL path segment. Outlook
+/// message ids are base64-ish (contain `+ / =`), which Graph 404s if left raw in
+/// the path; everything outside RFC 3986 unreserved is escaped. Plain alphanumeric
+/// ids (e.g. OneDrive drive-item ids) pass through unchanged.
+fn encode_id(id: &str) -> String {
+    encode_seg(id)
+}
+
+/// Percent-encode a drive-relative path for `root:/{path}:` addressing: split on
+/// `/`, encode each segment with [`encode_seg`] (so arbitrary OneDrive names —
+/// `:`, spaces, umlauts — resolve), re-join with `/`, strip any leading `/`.
+/// Unlike [`enc`] (space-only) this is safe for user-chosen names.
+fn enc_path(path: &str) -> String {
+    path.trim_matches('/')
+        .split('/')
+        .map(encode_seg)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -1263,6 +1424,142 @@ mod tests {
     }
 
     #[test]
+    fn enc_path_encodes_each_segment_keeps_slash_strips_leading() {
+        // space, ':' (the root:/…: delimiter), '#', '%', and an umlaut are all escaped
+        assert_eq!(
+            // lang-allow: deliberate non-ASCII (umlaut) path-encoding fixture
+            enc_path("Docs/Q3 Report/Übersicht: v#2%.pdf"),
+            "Docs/Q3%20Report/%C3%9Cbersicht%3A%20v%232%25.pdf"
+        );
+        // a leading slash is stripped; '/' stays the separator
+        assert_eq!(enc_path("/a/b.txt"), "a/b.txt");
+        // encode_id (single segment) is unchanged after the encode_seg refactor
+        assert_eq!(encode_id("01ABCDEF-_."), "01ABCDEF-_.");
+        assert_eq!(encode_id("aB+/9=="), "aB%2B%2F9%3D%3D");
+    }
+
+    #[test]
+    fn item_id_for_path_resolves_via_root_path_addressing() {
+        let (base, server) = serve(vec![http_response(200, "OK", "", "{\"id\":\"X1\"}")]);
+        let id = GraphClient::new("tok")
+            .with_base_url(&base)
+            .item_id_for_path("Docs/Q3 Report.txt")
+            .unwrap();
+        assert_eq!(id, "X1");
+        let seen = server.join().unwrap();
+        // path is colon-addressed and each segment encoded (space -> %20)
+        assert!(
+            seen[0].starts_with("GET /me/drive/root:/Docs/Q3%20Report.txt"),
+            "got: {}",
+            seen[0].lines().next().unwrap_or("")
+        );
+
+        // a missing item (404) surfaces as a classified HTTP error
+        let (base2, _s2) = serve(vec![http_response(404, "Not Found", "", "gone")]);
+        match GraphClient::new("tok")
+            .with_base_url(&base2)
+            .item_id_for_path("nope.txt")
+            .unwrap_err()
+        {
+            UploadError::Http { status, .. } => assert_eq!(status, 404),
+            other => panic!("expected Http error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn create_link_posts_createlink_and_returns_weburl() {
+        let (base, server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            "{\"link\":{\"webUrl\":\"https://1drv.ms/x/abc\"}}",
+        )]);
+        let url = GraphClient::new("tok")
+            .with_base_url(&base)
+            .create_link("i1", "view", "anonymous", None, None, None)
+            .unwrap();
+        assert_eq!(url, "https://1drv.ms/x/abc");
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/drive/items/i1/createLink"));
+        assert!(seen[0].contains("content-type: application/json"));
+
+        // a 200 without link.webUrl is a parse error, not a silent empty string
+        let (base2, _s2) = serve(vec![http_response(200, "OK", "", "{\"link\":{}}")]);
+        match GraphClient::new("tok")
+            .with_base_url(&base2)
+            .create_link("i1", "view", "anonymous", None, None, None)
+            .unwrap_err()
+        {
+            UploadError::Parse(_) => {}
+            other => panic!("expected Parse error, got {other}"),
+        }
+
+        // 403 (e.g. premium-gated option) is classified
+        let (base3, _s3) = serve(vec![http_response(403, "Forbidden", "", "no")]);
+        match GraphClient::new("tok")
+            .with_base_url(&base3)
+            .create_link("i1", "view", "anonymous", Some("pw"), None, None)
+            .unwrap_err()
+        {
+            UploadError::Http { status, .. } => assert_eq!(status, 403),
+            other => panic!("expected Http error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn invite_posts_invite_and_returns_permission_ids() {
+        let (base, server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            "{\"value\":[{\"id\":\"perm1\"},{\"id\":\"perm2\"}]}",
+        )]);
+        let ids = GraphClient::new("tok")
+            .with_base_url(&base)
+            .invite(
+                "i1",
+                &["a@b.com".to_string()],
+                &["read"],
+                true,
+                true,
+                "hi",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(ids, vec!["perm1".to_string(), "perm2".to_string()]);
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/drive/items/i1/invite"));
+        assert!(seen[0].contains("content-type: application/json"));
+    }
+
+    #[test]
+    fn list_and_delete_permissions_roundtrip() {
+        let (base, server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            "{\"value\":[{\"id\":\"p1\",\"roles\":[\"read\"],\"link\":{\"webUrl\":\"u\"}}]}",
+        )]);
+        let perms = GraphClient::new("tok")
+            .with_base_url(&base)
+            .list_permissions("i1")
+            .unwrap();
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].0, "p1");
+        assert_eq!(perms[0].1, vec!["read".to_string()]);
+        assert_eq!(perms[0].2.as_deref(), Some("u"));
+        assert!(server.join().unwrap()[0].starts_with("GET /me/drive/items/i1/permissions"));
+
+        let (base2, server2) = serve(vec![http_response(204, "No Content", "", "")]);
+        GraphClient::new("tok")
+            .with_base_url(&base2)
+            .delete_permission("i1", "p1")
+            .unwrap();
+        assert!(server2.join().unwrap()[0].starts_with("DELETE /me/drive/items/i1/permissions/p1"));
+    }
+
+    #[test]
     fn download_content_and_message_mime_fetch_bytes_from_the_base() {
         let (base, server) = serve(vec![
             http_response(200, "OK", "", "file-bytes"),
@@ -1458,5 +1755,50 @@ mod tests {
             .delete_item(&id)
             .expect("cleanup delete should succeed");
         eprintln!("cleaned up test item {id}");
+    }
+
+    /// Live outbound-sharing round-trip against the throwaway account. Skips
+    /// unless `ISYNCYOU_TEST_WRITE_TOKEN` (a Files.ReadWrite bearer token) is set.
+    /// This is the only test that exercises the request *bodies* Graph accepts and
+    /// the personal-account link constraints (the mock server only returns heads).
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
+    #[test]
+    fn live_sharing_roundtrip() {
+        let token = match std::env::var("ISYNCYOU_TEST_WRITE_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!("skipping live_sharing_roundtrip: ISYNCYOU_TEST_WRITE_TOKEN not set");
+                return;
+            }
+        };
+        let client = GraphClient::new(token);
+        let rel = "iSyncYou-livetest/share-roundtrip.txt";
+        let item = client
+            .upload_file(&format!("/{rel}"), b"share me", CHUNK_ALIGN)
+            .expect("upload should succeed");
+        let id = item["id"].as_str().expect("item id").to_string();
+
+        // path -> id resolves to the same item
+        let resolved = client.item_id_for_path(rel).expect("resolve path");
+        assert_eq!(resolved, id, "item_id_for_path must match the uploaded id");
+
+        // anonymous view link → reachable webUrl
+        let url = client
+            .create_link(&id, "view", "anonymous", None, None, None)
+            .expect("createLink");
+        assert!(url.starts_with("https://"), "webUrl: {url}");
+        eprintln!("created view link: {url}");
+
+        // list shows the just-created link permission
+        let perms = client.list_permissions(&id).expect("list permissions");
+        assert!(!perms.is_empty(), "expected at least one permission");
+        eprintln!("permissions: {perms:?}");
+
+        // revoke every permission we can, then cleanup the item
+        for (pid, _, _, _) in &perms {
+            let _ = client.delete_permission(&id, pid);
+        }
+        client.delete_item(&id).expect("cleanup delete");
+        eprintln!("revoked + cleaned up {id}");
     }
 }
