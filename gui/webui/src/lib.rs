@@ -830,6 +830,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                mount_point: None,
             }],
             ..Default::default()
         };
@@ -1294,6 +1295,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                mount_point: None,
             }],
             ..Default::default()
         };
@@ -1340,6 +1342,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                mount_point: None,
             }],
             ..Default::default()
         };
@@ -1469,6 +1472,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                mount_point: None,
             }],
             ..Default::default()
         };
@@ -1513,6 +1517,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                mount_point: None,
             }],
             ..Default::default()
         };
@@ -1583,6 +1588,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                mount_point: None,
             }],
             ..Default::default()
         };
