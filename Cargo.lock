@@ -1660,6 +1660,7 @@ dependencies = [
  "fuser",
  "isyncyou-store",
  "libc",
+ "tempfile",
 ]
 
 [[package]]
