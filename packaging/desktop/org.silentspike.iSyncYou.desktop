@@ -1,0 +1,18 @@
+[Desktop Entry]
+# Application launcher for the iSyncYou system-tray app. Installed to
+# <datadir>/applications/. The tray app (isyncyou-statusbar) lives in the system
+# tray (StatusNotifierItem); left-click opens the web UI, the menu has the rest.
+#
+# StartupWMClass must equal the window's WM_CLASS / Wayland app_id (set in the app
+# via winit with_name, APP_ID = org.silentspike.iSyncYou) so the panel/task switcher
+# group the window as "iSyncYou" with this icon instead of the executable name.
+Type=Application
+Name=iSyncYou
+GenericName=Cloud Sync & Backup
+Comment=OneDrive sync and Microsoft 365 backup — status in the system tray
+Exec=isyncyou-statusbar
+Icon=folder-sync
+Terminal=false
+Categories=Network;FileTransfer;
+StartupWMClass=org.silentspike.iSyncYou
+X-GNOME-UsesNotifications=true
