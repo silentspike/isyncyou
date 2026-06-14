@@ -284,18 +284,44 @@ fn live_view(api: &str) -> Result<StatusView, String> {
         .ok_or("daemon reports no accounts")?;
     let username = acc["username"].as_str().unwrap_or("?").to_string();
     let state = http_get_json(api, "/api/v1/sync/state")?;
-    let sync_state = if state["paused"].as_bool().unwrap_or(false) {
+    let paused = state["paused"].as_bool().unwrap_or(false);
+
+    // In-flight FUSE placeholder downloads (best-effort; absent on a daemon
+    // without a mount). Active hydrations show as downloads + flip state to
+    // Syncing so the bar reflects on-demand fetches.
+    let hyd = http_get_json(api, "/api/v1/hydrations").unwrap_or(serde_json::json!({}));
+    let active: Vec<String> = hyd["active"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let sync_state = if paused {
         SyncState::Paused
-    } else {
+    } else if active.is_empty() {
         SyncState::Synced
+    } else {
+        SyncState::Syncing
     };
+    let transfers = active
+        .iter()
+        .take(3)
+        .map(|name| Transfer {
+            name: name.clone(),
+            up: false,
+            percent: 0,
+        })
+        .collect();
     Ok(StatusView {
         account: username,
         state: sync_state,
-        transfers: vec![],
+        transfers,
         down_mbps: 0.0,
         up_mbps: 0.0,
-        queue: 0,
+        queue: active.len() as u32,
     })
 }
 
@@ -363,7 +389,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
-            for _ in 0..2 {
+            // live_view queries /accounts, /sync/state and /hydrations
+            for _ in 0..3 {
                 let (mut sock, _) = listener.accept().unwrap();
                 use std::io::{Read, Write};
                 let mut head = Vec::new();
@@ -374,6 +401,8 @@ mod tests {
                 let head = String::from_utf8_lossy(&head).to_string();
                 let body = if head.contains("/api/v1/accounts") {
                     r#"{"accounts":[{"id":"a","username":"live@example.com"}]}"#.to_string()
+                } else if head.contains("/api/v1/hydrations") {
+                    r#"{"count":0,"active":[]}"#.to_string()
                 } else {
                     format!(r#"{{"enabled":true,"paused":{paused}}}"#)
                 };
