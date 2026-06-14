@@ -237,6 +237,7 @@ fn a9_archive_separate_from_sync_root() {
         username: "a@outlook.com".into(),
         sync_root: "/home/u/OneDrive".into(),
         archive_root: "/home/u/OneDrive".into(), // same -> invalid
+        mount_point: None,
     };
     let bad = Config {
         accounts: vec![a.clone()],
