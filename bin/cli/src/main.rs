@@ -645,6 +645,14 @@ fn cmd_mount(
     // write-back needs Files.ReadWrite (which also covers reads); read-only uses
     // the read token.
     let token = resolve_token(&cfg, account, token, writable)?;
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    // hydrated file content is materialized here (one file per remote id), beside
+    // the account's archive so it shares the same disk/retention.
+    let cache_dir = acc.archive_root.join(".isyncyou-fuse-cache");
     // snapshot the tree, then drop the store so its single-instance lock is free
     // while we're mounted (hydration/upload go through Graph, not the store).
     let tree = {
@@ -659,6 +667,7 @@ fn cmd_mount(
         Box::new(GraphHydrator {
             client: isyncyou_graph::GraphClient::new(token.clone()),
         }),
+        cache_dir,
     );
     if writable {
         fs = fs.with_uploader(Box::new(GraphUploader {
