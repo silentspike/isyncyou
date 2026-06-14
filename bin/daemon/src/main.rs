@@ -250,14 +250,19 @@ fn run(args: &Args) -> Result<(), String> {
     let cap_token = mint_cap_token();
     let handler: Arc<dyn isyncyou_webui::RestoreHandler> =
         Arc::new(DaemonRestore { cfg: cfg.clone() });
-    eprintln!("isyncyoud: restore enabled; capability token: {cap_token}");
+    // A separate token gates the outbound-share POST (#494) — distinct blast radius.
+    let share_cap_token = mint_cap_token();
+    let share_handler: Arc<dyn isyncyou_webui::ShareHandler> =
+        Arc::new(DaemonShare { cfg: cfg.clone() });
+    eprintln!("isyncyoud: restore + sharing enabled; capability token: {cap_token}");
 
     let mut router = if args.sync_secs > 0 {
         isyncyou_webui::Router::with_gate(cfg.clone(), gate.clone())
     } else {
         isyncyou_webui::Router::new(cfg.clone())
     }
-    .with_restore(handler, cap_token.clone());
+    .with_restore(handler, cap_token.clone())
+    .with_share(share_handler, share_cap_token);
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
     #[cfg(target_os = "linux")]
@@ -328,6 +333,33 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
         }
         let token = isyncyou_engine::auth::resolve_cached_restore_token(&self.cfg, account)?;
         isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)
+    }
+}
+
+/// Web-UI outbound sharing (#494): create a sharing link for a OneDrive item by id
+/// using the cached write token (`Files.ReadWrite`). Only OneDrive drive items are
+/// shareable via `createLink`.
+struct DaemonShare {
+    cfg: Config,
+}
+impl isyncyou_webui::ShareHandler for DaemonShare {
+    fn share(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+        link_type: &str,
+        scope: &str,
+    ) -> Result<String, String> {
+        if service != "onedrive" {
+            return Err(format!(
+                "sharing is only supported for OneDrive items, not '{service}'"
+            ));
+        }
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
+        isyncyou_graph::GraphClient::new(token)
+            .create_link(id, link_type, scope, None, None, None)
+            .map_err(|e| e.to_string())
     }
 }
 
