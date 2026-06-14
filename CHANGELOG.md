@@ -49,7 +49,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   creating a file uploads it, and `delete`/`rename`/`mkdir` in the mount map to the
   matching Graph operation (delete item, move/rename, create folder). The mount
   reports writable mode bits and re-resolves the write token per operation; if no
-  write token is available it stays read-only.
+  write token is available it stays read-only. It also **refreshes from the cloud
+  on browse** (throttled `readdir`): a delta runs into the store and the tree
+  reconciles inode-stably (open handles + pending local edits preserved, tombstones
+  removed), so files added/renamed/deleted on another device or the web appear in
+  the folder without a restart.
 - **On-demand download notifications**: batch-coalesced desktop toasts
   ("Downloading from OneDrive — Fetching N files…" → "N files are ready offline"),
   with the in-flight set exposed at `/api/v1/hydrations` and in the status bar.
