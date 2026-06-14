@@ -25,3 +25,5 @@ isyncyou-dbus-status = { path = "../../crates/dbus-status" }
 # (Desktop toasts use the system `notify-send`, no extra crate.)
 [target.'cfg(target_os = "linux")'.dependencies]
 isyncyou-fuse = { path = "../../crates/fuse" }
+# Live delta into the store for the mount's cloud refresh (#478 P4).
+isyncyou-connectors = { path = "../../crates/connectors", features = ["http"] }
