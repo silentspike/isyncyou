@@ -28,13 +28,18 @@ markup in the localhost origin. The viewer must show the content **inertly**.
 
    ```
    default-src 'none'; style-src 'unsafe-inline'; img-src 'none';
-   base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+   base-uri 'none'; form-action 'none'; frame-ancestors 'self'
    ```
 
    So even if a value somehow carried markup, the browser would load nothing, run
-   no script, fetch no image (no tracking pixels), submit no form, and could not
-   be framed. Only the page's own inline stylesheet is permitted. Header values
-   are CRLF-stripped before emission, so a value can never inject extra headers.
+   no script, fetch no image (no tracking pixels), and submit no form. Only the
+   page's own inline stylesheet is permitted. Header values are CRLF-stripped
+   before emission, so a value can never inject extra headers.
+   `frame-ancestors 'self'` lets the same-origin app shell embed the viewer in its
+   mail reading-pane `<iframe>` (the shell's own CSP is `frame-src 'self'`), while
+   cross-origin framing — the clickjacking vector — stays denied. The mail viewer
+   uses the same CSP but with `img-src data:` for inline images that survive
+   sanitization.
 
 ## Path safety
 
