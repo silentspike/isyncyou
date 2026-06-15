@@ -1644,19 +1644,37 @@ fn cmd_sync(
         .find(|a| a.id == account)
         .map(|a| a.sync_root.clone())
         .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let watcher = isyncyou_change_source::FsWatcher::start(&sync_root)
-        .map_err(|e| format!("cannot watch {}: {e}", sync_root.display()))?;
-    println!(
-        "watching {} — re-syncing on changes (Ctrl-C to stop)…",
-        sync_root.display()
-    );
-    loop {
-        let changes = watcher.poll(
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(2),
+    // Pick the change-source backend from config: the unprivileged inotify
+    // accelerator (default), the privileged mount-wide fanotify backend when
+    // opted in (`change_source = "ebpf"`/`"fanotify"`) and permitted, or none
+    // (reconcile-only). The periodic reconcile below is the source of truth, so
+    // an absent watcher just means we lean on the timer.
+    use isyncyou_change_source::ChangeSource as _;
+    let mut watcher = isyncyou_change_source::select_change_source(&cfg.sync, &sync_root);
+    if watcher.is_some() {
+        println!(
+            "watching {} — re-syncing on changes (Ctrl-C to stop)…",
+            sync_root.display()
         );
-        if !changes.is_empty() {
-            println!("local change detected ({} item(s))", changes.len());
+    } else {
+        println!(
+            "watching {} on a timer (reconcile-only; Ctrl-C to stop)…",
+            sync_root.display()
+        );
+    }
+    loop {
+        match watcher.as_mut() {
+            Some(w) => {
+                let changes = w.poll(
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(2),
+                );
+                if !changes.is_empty() {
+                    println!("local change detected ({} item(s))", changes.len());
+                }
+            }
+            // reconcile-only: no live watcher, just pace the periodic sync.
+            None => std::thread::sleep(std::time::Duration::from_secs(30)),
         }
         // a transient failure (e.g. a network blip) must not kill the watch.
         if let Err(e) = run_pass() {
