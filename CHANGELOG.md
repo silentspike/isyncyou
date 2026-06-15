@@ -78,6 +78,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   OneDrive item. `isyncyou share` now also finds its config at
   `~/.config/isyncyou/isyncyou.toml` when run without `--config` from another
   directory (so GUI launches resolve it).
+- **Privileged mount-wide change source** (#331): an opt-in **fanotify** backend
+  (`change_source = "ebpf"`/`"fanotify"`) behind a common `ChangeSource` trait.
+  Initialized in FID mode (`FAN_REPORT_DFID_NAME`) with a `FAN_MARK_FILESYSTEM`
+  mark, it reports create/modify/move/delete across the whole filesystem without
+  per-directory inotify watches or the `max_user_watches` ceiling, and turns a
+  `FAN_Q_OVERFLOW` into a full rescan (parity with inotify). Selected only when
+  opted in **and** privileged (`CAP_SYS_ADMIN`); it falls back to the unprivileged
+  inotify accelerator otherwise. Wired into both `isyncyou --watch` and the daemon
+  (a per-account watcher wakes the scheduled sync early on local changes). The
+  periodic reconciler stays the source of truth, so a missed event only costs one
+  extra (idempotent) pass.
 - **Status-tray app** (#460): tray-first SNI indicator — left-click unfolds a
   frameless live-status flyout at the icon (Nextcloud/Dropbox style) with a link
   into the web UI (mail restore, search); the tray label reflects the live daemon
@@ -208,11 +219,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   verify. Found by the deployed staging environment's first nightly E2E run (#326);
   OneDrive items are now checked against the sync root via the parent walk.
 
-### Not yet implemented
-- eBPF change-source backend (the fanotify backend already covers the privileged
-  server case; eBPF would be a further optimization).
-
 ### Out of scope (by design)
+- eBPF change-source backend: the privileged mount-wide **fanotify** backend
+  (#331) already covers the server case with zero extra dependencies; an eBPF
+  tracer would add a heavy BPF toolchain (CO-RE/BTF) and a higher privilege
+  ceiling for no acceptance-criteria gain, so it is deliberately not built.
 - Remote network access to the local API (mTLS/pairing/token-rotation stack):
   the API is **local-only by design** — no remote listener exists or is planned.
   The target audience runs iSyncYou on the machine they sit at; the rare
