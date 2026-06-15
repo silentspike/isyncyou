@@ -554,6 +554,55 @@ a:hover { text-decoration: underline; }
 .sheet .kv dt { display: flex; align-items: center; gap: 6px; }
 .sheet .kv dt .icon { color: var(--text-lo); }
 
+/* ============================================================ contacts (avatar cards) */
+.con-wrap { display: flex; gap: var(--sp-3); align-items: flex-start; }
+.con-grid { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--sp-3); min-width: 0; }
+.con-card { display: flex; align-items: center; gap: var(--sp-3); text-align: left; cursor: pointer;
+  transition: border-color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); }
+.con-card:hover { border-color: var(--line-2); transform: translateY(-2px); box-shadow: var(--sh-2); }
+.avatar.con-av { width: 46px; height: 46px; font-size: var(--fs-lg); flex: none;
+  background: linear-gradient(135deg, var(--svc-contacts), color-mix(in oklab, var(--svc-contacts) 50%, var(--accent))); }
+.con-name { font-weight: 600; }
+.con-email { font-size: var(--fs-sm); color: var(--accent); }
+.con-az { display: flex; flex-direction: column; gap: 1px; position: sticky; top: 0; flex: none; }
+.az-letter { width: 22px; height: 20px; border: 0; background: transparent; color: var(--text-lo);
+  font-size: var(--fs-xs); font-weight: 700; border-radius: var(--r-sm); }
+.az-letter:hover { background: var(--accent-soft); color: var(--text-hi); }
+
+/* ============================================================ todo (lists + checklists) */
+.todo-board { display: flex; gap: var(--sp-4); overflow-x: auto; align-items: flex-start; padding-bottom: var(--sp-2); }
+.todo-col { flex: 0 0 300px; padding: var(--sp-3); display: flex; flex-direction: column; gap: 2px; }
+.todo-col-head { display: flex; align-items: center; justify-content: space-between; padding: var(--sp-1) var(--sp-2) var(--sp-3); }
+.todo-col-head .count { font-size: var(--fs-xs); color: var(--text-lo); background: var(--bg-2); padding: 1px var(--sp-2); border-radius: var(--r-full); }
+.todo-task { display: flex; align-items: flex-start; gap: var(--sp-2); width: 100%; text-align: left; border: 0;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3);
+  color: var(--text-hi); margin-bottom: 6px; transition: border-color var(--t-fast) var(--ease); }
+.todo-task:hover { border-color: var(--line-2); background: var(--bg-hover); }
+.todo-check { flex: none; color: var(--text-lo); margin-top: 1px; }
+.todo-check.prog { color: var(--warn); }
+.todo-check.done { color: var(--ok); }
+.todo-task.done .todo-title { text-decoration: line-through; color: var(--text-lo); }
+.todo-title { font-size: var(--fs-md); }
+.todo-meta { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); margin-top: 2px; }
+.todo-flag { color: var(--err); display: inline-flex; }
+.todo-flag .icon { width: 12px; height: 12px; }
+
+/* ============================================================ onenote (page list + reader) */
+.view:has(.note-layout) { padding: 0; overflow: hidden; }
+.note-layout { height: 100%; display: grid; grid-template-columns: 300px 1fr; min-height: 0; }
+.note-layout > * { min-height: 0; min-width: 0; }
+.note-list { border-right: 1px solid var(--line); overflow-y: auto; background: color-mix(in oklab, var(--bg-1) 70%, transparent); }
+.note-item { display: flex; align-items: center; gap: var(--sp-3); width: 100%; text-align: left; border: 0;
+  border-bottom: 1px solid var(--line); border-left: 3px solid transparent; background: transparent;
+  color: var(--text-hi); padding: var(--sp-3) var(--sp-4); }
+.note-item:hover { background: var(--bg-hover); }
+.note-item.active { background: var(--accent-soft); border-left-color: var(--svc-onenote); }
+.note-item .icon { color: var(--svc-onenote); flex: none; }
+.note-reader { display: flex; flex-direction: column; overflow: hidden; background: var(--bg-0); }
+.note-reader-head { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-5); flex: none;
+  border-bottom: 1px solid var(--line); background: color-mix(in oklab, var(--bg-1) 70%, transparent); }
+.note-frame { flex: 1; width: 100%; border: 0; background: var(--bg-0); }
+
 /* ============================================================ responsive: tablet (icon rail) */
 @media (max-width: 1040px) {
   :root { --sidebar-w: 64px; }
