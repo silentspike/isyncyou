@@ -10,19 +10,19 @@
 :root {
   color-scheme: dark;
 
-  /* base surfaces (dark elevation ladder) */
-  --bg-0: #07070b;
-  --bg-1: #0d0d14;
-  --bg-2: #13131d;
-  --bg-3: #1a1a27;
-  --bg-hover: #20202f;
-  --line: color-mix(in oklab, #ffffff 9%, transparent);
-  --line-2: color-mix(in oklab, #ffffff 14%, transparent);
+  /* base surfaces (dark elevation ladder — lifted for clear depth + card contrast) */
+  --bg-0: #0e0e16;
+  --bg-1: #17171f;
+  --bg-2: #1e1e2a;
+  --bg-3: #282836;
+  --bg-hover: #2f2f40;
+  --line: color-mix(in oklab, #ffffff 13%, transparent);
+  --line-2: color-mix(in oklab, #ffffff 20%, transparent);
 
-  /* text */
-  --text-hi: #f4f5fb;
-  --text-mid: #aab1c5;
-  --text-lo: #6b7385;
+  /* text (high contrast on the dark surfaces) */
+  --text-hi: #f8f9fc;
+  --text-mid: #d7dce8;
+  --text-lo: #aab1c4;
 
   /* accent: indigo -> violet */
   --accent: #6366f1;
@@ -151,7 +151,7 @@ a:hover { text-decoration: underline; }
 .sb-account .who b { display: block; color: var(--text-hi); font-weight: 600; font-size: var(--fs-md);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sb-section { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .08em;
-  color: var(--text-lo); padding: var(--sp-3) var(--sp-3) var(--sp-2); }
+  color: var(--text-mid); padding: var(--sp-3) var(--sp-3) var(--sp-2); }
 .nav-item {
   display: flex; align-items: center; gap: var(--sp-3); width: 100%;
   padding: var(--sp-2) var(--sp-3); border: 0; border-radius: var(--r-md);
@@ -257,6 +257,8 @@ a:hover { text-decoration: underline; }
   transition: border-color var(--t-fast) var(--ease);
 }
 .input:focus { border-color: var(--accent-line); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+/* explicit placeholder colour — the browser default is far too dim on dark */
+.input::placeholder, .palette input::placeholder { color: var(--text-lo); opacity: 1; }
 
 /* ============================================================ badges / pills */
 .badge {
@@ -335,10 +337,12 @@ a:hover { text-decoration: underline; }
   animation: pal-in var(--t-mid) var(--ease-spring);
 }
 @keyframes pal-in { from { opacity: 0; transform: translate(-50%, -8px) scale(.98); } }
+.palette { color: var(--text-hi); }
 .palette input { width: 100%; padding: var(--sp-4) var(--sp-5); border: 0; background: transparent; color: var(--text-hi); font-size: var(--fs-lg); }
 .palette input:focus { outline: none; }
 .palette .results { max-height: 50vh; overflow: auto; border-top: 1px solid var(--line); }
-.palette .res { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-5); }
+.palette .res { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-5); color: var(--text-hi); }
+.palette .res .icon { color: var(--text-mid); }
 .palette .res.sel { background: var(--accent-soft); }
 .palette .res .badge { margin-left: auto; }
 
