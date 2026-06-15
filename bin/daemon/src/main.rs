@@ -276,6 +276,16 @@ fn run(args: &Args) -> Result<(), String> {
         let secs = args.sync_secs;
         let sched = Arc::new(Scheduler::default());
         eprintln!("isyncyoud: background sync every {secs}s (pausable from the UI)");
+        // Event-driven accelerator (#331): one change-source watcher per account
+        // wakes this sync loop early on local changes (honoring
+        // `cfg.sync.change_source` — inotify by default, the privileged mount-wide
+        // fanotify backend when opted in + permitted). The periodic timer still
+        // ticks, so the reconciler stays the source of truth even if events are
+        // missed; this only shortens the latency between a local edit and its sync.
+        std::thread::spawn({
+            let (cfg_w, sched_w) = (cfg.clone(), sched.clone());
+            move || watch_loop(cfg_w, sched_w)
+        });
         let (cfg2, gate2, sched2) = (cfg, gate, sched.clone());
         std::thread::spawn(move || sync_loop(cfg2, gate2, secs, sched2));
         router = router.with_sync_control(sched, cap_token);
@@ -664,6 +674,48 @@ fn sync_loop(cfg: Config, gate: Arc<Mutex<()>>, secs: u64, sched: Arc<Scheduler>
                 Err(e) => eprintln!("isyncyoud: sync {} skipped: {e}", acc.id),
             }
         }
+    }
+}
+
+/// Event-driven accelerator (#331): one change-source watcher thread per account.
+/// On any local change under a sync root it wakes [`sync_loop`] early via the same
+/// one-shot trigger the web-UI "sync now" uses — unless paused. Accounts whose
+/// backend is reconcile-only (or where no watcher could start) are left to the
+/// timer. The periodic reconcile stays authoritative, so a missed/dropped event is
+/// harmless; this only shortens the latency between a local edit and its sync.
+fn watch_loop(cfg: Config, sched: Arc<Scheduler>) {
+    use isyncyou_change_source::ChangeSource as _;
+    for acc in &cfg.accounts {
+        let root = acc.sync_root.clone();
+        let account = acc.id.clone();
+        let change_source = cfg.sync.clone();
+        let sched = sched.clone();
+        std::thread::spawn(move || {
+            let Some(mut watcher) =
+                isyncyou_change_source::select_change_source(&change_source, &root)
+            else {
+                // reconcile-only or no watcher available: the periodic timer covers it.
+                return;
+            };
+            eprintln!(
+                "isyncyoud: change accelerator watching {} for '{account}'",
+                root.display()
+            );
+            loop {
+                let changes = watcher.poll(Duration::from_secs(30), Duration::from_secs(2));
+                if changes.is_empty() {
+                    continue;
+                }
+                // Local change → wake the sync loop early, unless paused. Set the
+                // same one-shot trigger as "sync now", atomically with the paused
+                // check so an event never wakes a paused loop.
+                let mut st = sched.state.lock().unwrap_or_else(|e| e.into_inner());
+                if !st.paused {
+                    st.trigger = true;
+                    sched.cv.notify_all();
+                }
+            }
+        });
     }
 }
 

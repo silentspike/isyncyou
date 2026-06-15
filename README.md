@@ -140,6 +140,7 @@ hardening; ⏳ means designed and queued, not built.
 | Restore — crash-safe cloud path | ✅ all services | mail, calendar, contacts, ToDo and OneNote wired through the ledger + daemon boot recovery, crash-matrix-proven, **live-probe confirmed** (per-service recovery markers: internetMessageId · transactionId de-dup · extended property · body marker · HTML-comment); **off by default** as an opt-in (it writes to the real account) |
 | Multi-account | ✅ | per-account stores, cross-account search |
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
+| Change-source backend | ✅ | local-change detection wakes the sync early — an unprivileged inotify accelerator (default) or a privileged mount-wide **fanotify** backend (`change_source = "ebpf"`/`"fanotify"`; Linux, needs `CAP_SYS_ADMIN`, no per-watch limit, overflow-safe; falls back to inotify when unprivileged/unsupported). Wired into `isyncyou --watch` and the daemon; the periodic reconciler stays authoritative |
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
 | Native status bar + tray (SNI) | ✅ | tray-first SNI indicator; left-click unfolds a frameless status flyout at the icon (live status) with a link into the web UI; own `tiny-skia` + `cosmic-text` renderer; display-gated |
 | Dolphin overlay icons | ✅ | KF6 KIO plugin: `placeholder` / `syncing` / `materialized` emblems over DBus; host-packaged; Linux/KDE |
