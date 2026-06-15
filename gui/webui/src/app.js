@@ -71,6 +71,11 @@ const ICONS = {
   circle: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
   check: "M20 6L9 17l-5-5",
   settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z",
+  shield: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
+  "shield-check": "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10zM9 12l2 2 4-4",
+  inbox: "M22 12h-6l-2 3h-4l-2-3H2M5.5 5h13l3.5 7v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z",
+  filter: "M22 3H2l8 9.5V19l4 2v-8.5z",
+  "arrow-down-up": "M3 16l4 4 4-4M7 20V4M21 8l-4-4-4 4M17 4v16",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -166,6 +171,40 @@ function sparkline(points, h = 60) {
   s.append(svg("polyline", { points: line, class: "spark-line" }));
   return s;
 }
+// real activity chart: per-day stacked bars (success vs failed) with axis + legend
+function activityChart(runs, days = 14) {
+  const buckets = Array.from({ length: days }, () => ({ ok: 0, err: 0 }));
+  const now = Date.now();
+  runs.forEach(r => {
+    const t = toDate(r.finished_at || r.started_at); if (!t) return;
+    const diff = Math.floor((now - t.getTime()) / DAY_MS);
+    if (diff >= 0 && diff < days) { const b = buckets[days - 1 - diff]; r.status === "error" ? b.err++ : b.ok++; }
+  });
+  const wrap = el("div", {});
+  if (!runs.length) { wrap.append(el("div", { class: "dim", style: "padding:24px 0;text-align:center", text: "No sync activity recorded yet." })); return wrap; }
+  const W = 560, H = 120, pad = 18, bw = (W - pad * 2) / days, max = Math.max(1, ...buckets.map(b => b.ok + b.err));
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H + 20}`, class: "chart", style: "width:100%;height:auto" });
+  // baseline
+  s.append(svg("line", { x1: pad, y1: H, x2: W - pad, y2: H, stroke: "var(--line-2)", "stroke-width": 1 }));
+  buckets.forEach((b, i) => {
+    const x = pad + i * bw + bw * 0.18, w = bw * 0.64;
+    const total = b.ok + b.err; if (!total) return;
+    const okH = (b.ok / max) * (H - 10), errH = (b.err / max) * (H - 10);
+    if (b.ok) s.append(svg("rect", { x, y: H - okH, width: w, height: okH, rx: 2, fill: "var(--accent)" }));
+    if (b.err) s.append(svg("rect", { x, y: H - okH - errH, width: w, height: errH, rx: 2, fill: "var(--err)" }));
+  });
+  // x ticks: first / mid / last day
+  [[0, days - 1], [Math.floor(days / 2), Math.floor(days / 2)], [days - 1, 0]].forEach(([idx, ago]) => {
+    const d = new Date(now - ago * DAY_MS);
+    const t = svg("text", { x: pad + idx * bw + bw / 2, y: H + 15, "text-anchor": "middle", "font-size": 10, fill: "var(--text-lo)" });
+    t.textContent = d.toLocaleDateString([], { month: "short", day: "numeric" });
+    s.append(t);
+  });
+  wrap.append(s, el("div", { style: "display:flex;gap:16px;margin-top:8px;font-size:12px;color:var(--text-mid)" },
+    el("span", {}, el("span", { style: "display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--accent);margin-right:6px;vertical-align:-1px" }), "Successful"),
+    el("span", {}, el("span", { style: "display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--err);margin-right:6px;vertical-align:-1px" }), "Failed")));
+  return wrap;
+}
 
 /* ---------------------------------------------------------------- api + util */
 const CAP = {
@@ -182,17 +221,22 @@ async function post(path, capToken) {
 }
 const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
 const initials = (s) => (s || "?").trim().split(/[\s@.]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join("") || "?";
+// Activity timestamps come back as unix seconds (audit_timestamp); everything
+// else is an ISO/RFC string. Normalise both to a JS Date.
+function toDate(s) {
+  if (s == null || s === "") return null;
+  if (/^\d{9,11}$/.test(String(s))) return new Date(Number(s) * 1000); // unix seconds
+  const d = new Date(s); return isNaN(d) ? null : d;
+}
 function fmtDate(s) {
-  if (!s) return "";
-  const d = new Date(s); if (isNaN(d)) return s;
+  const d = toDate(s); if (!d) return s ? String(s) : "";
   const now = Date.now(), diff = now - d.getTime();
   if (diff < 864e5 && d.getDate() === new Date().getDate()) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   if (diff < 6048e5) return d.toLocaleDateString([], { weekday: "short" });
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 function fmtFullDate(s) {
-  if (!s) return "";
-  const d = new Date(s); if (isNaN(d)) return s;
+  const d = toDate(s); if (!d) return s ? String(s) : "";
   return d.toLocaleString([], { weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 // Parse an RFC 5322 address ("Name <user@host>" or bare "user@host").
@@ -211,7 +255,7 @@ const SERVICES = [
   { id: "onedrive", label: "OneDrive", icon: "hard-drive" },
   { id: "calendar", label: "Calendar", icon: "calendar" },
   { id: "contacts", label: "Contacts", icon: "users" },
-  { id: "todo", label: "ToDo", icon: "check-square" },
+  { id: "todo", label: "To Do", icon: "check-square" },
   { id: "onenote", label: "OneNote", icon: "notebook" },
 ];
 const RESTORABLE = new Set(["mail", "calendar", "contacts", "todo", "onenote"]);
@@ -233,6 +277,8 @@ function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const nav = el("nav", { class: "nav" },
     SERVICES.map(s => {
+      const cnt = App.counts[s.id];
+      const connected = cnt != null && cnt > 0;
       const item = el("button", {
         class: "nav-item" + (App.route === s.id ? " active" : ""),
         style: `--svc: var(--svc-${s.id})`,
@@ -241,7 +287,9 @@ function renderShell() {
       },
         icon(s.icon),
         el("span", { class: "label", text: s.label }),
-        s.id !== "overview" ? el("span", { class: "count", text: App.counts[s.id] != null ? String(App.counts[s.id]) : "·" }) : null,
+        s.id !== "overview" ? el("span", { class: "nav-meta" },
+          connected ? el("span", { class: "nav-dot", style: `background:var(--svc-${s.id})`, title: "Connected" }) : null,
+          el("span", { class: "count", text: cnt != null ? String(cnt) : "·" })) : null,
       );
       return item;
     }),
@@ -255,6 +303,7 @@ function renderShell() {
     el("div", { class: "sb-section", text: "Library" }),
     nav,
     el("div", { class: "spacer" }),
+    el("div", { class: "sb-section", text: "System" }),
     el("div", { id: "sync-widget", class: "sync-widget" }),
   );
   const topbar = el("header", { class: "topbar" },
@@ -270,26 +319,24 @@ function renderShell() {
   renderSyncWidget();
 }
 
+// Sidebar "Archive health" card: real health pill + last-sync + sync controls.
 async function renderSyncWidget() {
   const box = $("#sync-widget"); if (!box) return;
-  let st = { enabled: false, paused: false };
+  let st = { enabled: false, paused: false }, runs = [];
   try { st = await api("/api/v1/sync/state"); } catch {}
+  if (App.account) { try { runs = (await api("/api/v1/activity?" + qs({ account: App.account, limit: 30 }))).runs || []; } catch {} }
+  const failed = runs.filter(r => r.status === "error").length, last = runs[0];
   clear(box);
-  if (!st.enabled || !CAP.sync) {
-    box.append(el("div", { class: "row" }, el("span", { class: "pill info" }, el("span", { class: "dot" }), "ready")));
-    return;
-  }
-  const pill = st.paused
-    ? el("span", { class: "pill warn" }, el("span", { class: "dot" }), "paused")
-    : el("span", { class: "pill ok" }, el("span", { class: "dot" }), "syncing");
+  const pillCls = !runs.length ? "info" : failed ? "warn" : "ok";
+  const pillTxt = !runs.length ? "Ready" : failed ? `${failed} failed` : "Healthy";
   box.append(
-    el("div", { class: "row" }, pill),
-    el("div", { class: "actions" },
-      el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
-      st.paused
-        ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
-        : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm")),
-    ),
+    el("div", { class: "sw-head" },
+      el("span", { class: "pill " + pillCls }, el("span", { class: "dot" }), pillTxt),
+      (st.enabled && CAP.sync) ? el("div", { class: "sw-actions" },
+        el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
+        st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
+          : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))) : null),
+    el("div", { class: "sw-meta dim" }, last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet"),
   );
 }
 async function syncCmd(cmd) {
@@ -330,9 +377,12 @@ function onRoute() {
 /* ---------------------------------------------------------------- overview (dashboard showpiece) */
 // concrete hues for SVG charts (SVG presentation attributes don't take CSS vars)
 const SVC_COLOR = {
-  overview: "#6366f1", mail: "#6366f1", onedrive: "#38bdf8", calendar: "#fb7185",
-  contacts: "#34d399", todo: "#fbbf24", onenote: "#a855f7", shared: "#94a3b8",
+  overview: "#6366f1", mail: "#6366f1", onedrive: "#3b9eff", calendar: "#e5688f",
+  contacts: "#3fb950", todo: "#d29922", onenote: "#a371f7", shared: "#768390",
 };
+// canonical service display names (consistent everywhere — no "Onedrive"/"Todo")
+const SVC_LABEL = { overview: "Overview", mail: "Mail", onedrive: "OneDrive", calendar: "Calendar", contacts: "Contacts", todo: "To Do", onenote: "OneNote" };
+const svcLabel = (id) => SVC_LABEL[id] || id;
 // bucket runs into per-day counts for the activity sparkline
 function activityBuckets(runs, days = 14) {
   const now = Date.now(), b = new Array(days).fill(0);
@@ -345,79 +395,127 @@ function activityBuckets(runs, days = 14) {
   return b;
 }
 async function renderOverview(view) {
-  const acc0 = App.accounts.find(a => a.id === App.account) || {};
   clear(view).append(
-    el("h1", { class: "view-title" }, "Welcome back" + (acc0.username ? ", " : ""),
-      acc0.username ? el("span", { style: "background:var(--grad-accent);-webkit-background-clip:text;background-clip:text;color:transparent" }, acc0.username.split("@")[0]) : ""),
-    el("p", { class: "view-sub", text: "Your Microsoft 365 archive at a glance." }),
+    el("h1", { class: "view-title", text: "Microsoft 365 archive overview" }),
+    el("p", { class: "view-sub", text: "Backup health, activity and connected services at a glance." }),
+    el("div", { id: "ov-body" }),
   );
-  const grid = el("div", { class: "grid cols-auto stagger" });
-  view.append(grid);
-  for (let i = 0; i < 3; i++) grid.append(el("div", { class: "card stat-tile" }, el("div", { class: "skel", style: "width:50%;height:44px" })));
-  if (!App.account) { clear(grid).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
+  const body = $("#ov-body");
+  body.append(el("div", { class: "card", style: "height:64px" }, el("div", { class: "skel", style: "height:24px;width:40%" })));
+  if (!App.account) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
   try {
-    const [st, cfg, act] = await Promise.all([
+    const [st, act, cfg, sy] = await Promise.all([
       api("/api/v1/status?" + qs({ account: App.account })),
-      api("/api/v1/settings").catch(() => ({})),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 200 })).catch(() => ({ runs: [] })),
+      api("/api/v1/settings").catch(() => ({})),
+      api("/api/v1/sync/state").catch(() => ({})),
     ]);
-    const services = st.services || [];
+    const services = (st.services || []).slice().sort((a, b) => b.items - a.items);
     services.forEach(s => { App.counts[s.service] = s.items; });
     updateNavCounts();
-    // stat tiles with animated count-ups
-    clear(grid);
-    [
-      ["layout-dashboard", st.totals?.items ?? 0, "Total items", true],
-      ["download", st.totals?.archived ?? 0, "Archived bodies", true],
-      ["hard-drive", st.onedrive_cursor ? "Live" : "—", "OneDrive delta", false],
-    ].forEach(([ic, n, l, anim]) => {
-      const num = el("div", { class: "num tnum", text: anim ? "0" : String(n) });
-      grid.append(el("div", { class: "card stat-tile rise" }, el("div", { class: "ico" }, icon(ic)), num, el("div", { class: "lbl", text: l })));
-      if (anim) countUp(num, n);
+    const runs = act.runs || [];
+    const failed = runs.filter(r => r.status === "error").length;
+    const lastRun = runs[0], lastOk = runs.find(r => r.status === "ok");
+    const items = st.totals?.items ?? 0, archived = st.totals?.archived ?? 0;
+    const sync = cfg.sync || {}, acc = (cfg.accounts || []).find(a => a.id === App.account) || {};
+    const healthy = failed === 0;
+    clear(body);
+
+    // ---- status header (the most important line)
+    body.append(el("div", { class: "status-bar" },
+      el("span", { class: "status-health" },
+        el("span", { class: "chip " + (healthy ? "ok" : "warn") }, el("span", { class: "dot" }), healthy ? "Archive healthy" : "Attention needed")),
+      el("div", { class: "status-facts" },
+        el("span", {}, el("b", { text: String(services.length) }), " services connected"),
+        el("span", { class: "sep", text: "·" }),
+        el("span", {}, "Last sync ", el("b", { text: lastRun ? fmtFullDate(lastRun.finished_at) : "never" })),
+        el("span", { class: "sep", text: "·" }),
+        el("span", {}, el("b", { text: String(failed) }), failed === 1 ? " failed run" : " failed runs"),
+        el("span", { class: "sep", text: "·" }),
+        el("span", {}, el("b", { text: items.toLocaleString() }), " items protected")),
+      el("div", { class: "spacer" }),
+      el("div", { class: "status-actions" },
+        CAP.sync ? el("button", { class: "btn primary sm", onclick: () => syncCmd("now") }, icon("refresh-cw", "icon-sm"), "Sync now") : null,
+        el("button", { class: "btn sm", onclick: () => go("settings") }, icon("settings", "icon-sm"), "Settings"))));
+
+    // ---- KPI row (modest numbers + real context)
+    const kpi = el("div", { class: "kpi-row" });
+    const kpiCard = (icn, head, val, unit, ctxEl) => el("div", { class: "card kpi" },
+      el("div", { class: "kpi-head" }, icon(icn, "icon-sm"), head),
+      el("div", { class: "kpi-val" }, String(val), unit ? el("span", { class: "unit", text: unit }) : null),
+      ctxEl || null);
+    kpi.append(
+      kpiCard("layout-dashboard", "Items protected", items.toLocaleString(), "", el("div", { class: "kpi-ctx", text: `across ${services.length} services` })),
+      kpiCard("download", "Archived bodies", archived.toLocaleString(), "", el("div", { class: "kpi-ctx", text: items ? `${Math.round(archived / items * 100)}% have content` : "—" })),
+      kpiCard("rotate-ccw", "Failed runs", failed, "", el("div", { class: "kpi-ctx" }, el("span", { class: "chip " + (failed ? "err" : "ok") }, failed ? "needs review" : "all clear"))),
+      kpiCard("clock", "Trash retention", sync.trash_retention_days ?? "—", "days", el("div", { class: "kpi-ctx", text: sync.body_index ? "full-text index on" : "index off" })));
+    body.append(kpi);
+
+    // ---- main grid: sync activity (real chart) + service breakdown (table)
+    const grid = el("div", { class: "dash-grid" });
+    body.append(grid);
+    grid.append(el("div", { class: "card panel" },
+      el("div", { class: "panel-head" }, icon("clock", "icon-sm"), "Sync activity", el("div", { class: "spacer" }),
+        el("span", { class: "dim", style: "font-size:12px;text-transform:none;letter-spacing:0", text: `${runs.length} runs · 14 days` })),
+      el("div", { class: "panel-body" }, activityChart(runs, 14))));
+    // service breakdown table
+    const tbl = el("table", { class: "svc-table" },
+      el("thead", {}, el("tr", {}, el("th", { text: "Service" }), el("th", { class: "num", text: "Items" }), el("th", { class: "num", text: "Archived" }))),
+    );
+    const tb = el("tbody", {});
+    const maxItems = Math.max(1, ...services.map(s => s.items));
+    services.forEach(s => {
+      const col = SVC_COLOR[s.service] || "#888";
+      tb.append(el("tr", { onclick: () => go(s.service) },
+        el("td", {}, el("div", { class: "svc-cell" }, el("span", { class: "svc-dot", style: `background:${col}` }), svcLabel(s.service))),
+        el("td", { class: "num" }, el("div", { style: "display:flex;align-items:center;gap:8px;justify-content:flex-end" },
+          el("div", { class: "svc-bar", style: "width:64px" }, el("i", { style: `width:${Math.round(s.items / maxItems * 100)}%;background:${col}` })),
+          el("span", { text: s.items.toLocaleString() }))),
+        el("td", { class: "num dim", text: (s.archived ?? 0).toLocaleString() })));
     });
-    // charts
-    if (services.length) {
-      const charts = el("div", { class: "grid stagger", style: "grid-template-columns:repeat(auto-fit,minmax(300px,1fr));margin-top:24px" });
-      view.append(el("h3", { class: "sb-section", text: "Library breakdown" }), charts);
-      // donut + legend (items per service)
-      const legend = el("div", { style: "display:flex;flex-direction:column;gap:7px;min-width:0" });
-      services.forEach(s => legend.append(el("button", {
-        class: "list-row", style: "padding:4px 6px;border:0;background:transparent;gap:8px", onclick: () => go(s.service),
-      },
-        el("span", { style: `width:10px;height:10px;border-radius:3px;flex:none;background:${SVC_COLOR[s.service] || "#888"}` }),
-        el("span", { class: "grow truncate", style: "text-transform:capitalize", text: s.service }),
-        el("span", { class: "tnum dim", text: String(s.items) }))));
-      charts.append(el("div", { class: "card rise", style: "display:flex;gap:20px;align-items:center" },
-        donutChart(services.map(s => ({ value: s.items, color: SVC_COLOR[s.service] || "#888" })), "items"), legend));
-      // bar: items + archived per service
-      charts.append(el("div", { class: "card rise" },
-        el("div", { class: "dim", style: "font-size:12px;margin-bottom:14px" }, "Items per service"),
-        barChart(services.map(s => ({ label: s.service, value: s.items, color: SVC_COLOR[s.service] || "#888" })))));
-      // sparkline: sync activity per day
-      charts.append(el("div", { class: "card rise" },
-        el("div", { class: "dim", style: "font-size:12px;margin-bottom:8px" }, "Sync activity (14 days)"),
-        sparkline(activityBuckets(act.runs || []))));
-    }
-    // recent activity timeline
-    const runs = (act.runs || []).slice(0, 8);
-    const actBox = el("div", { class: "card", style: "margin-top:24px;padding:6px 4px" });
-    if (runs.length) runs.forEach(r => actBox.append(
-      el("div", { class: "list-row", style: "cursor:default" },
-        el("span", { class: "pill " + (r.status === "ok" ? "ok" : r.status === "error" ? "err" : "info") }, el("span", { class: "dot" })),
-        el("div", { class: "grow" }, el("div", { class: "truncate", text: r.summary || r.kind }), el("div", { class: "dim", style: "font-size:12px", text: r.kind })),
-        el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(r.finished_at) })),
-    ));
-    else actBox.append(el("div", { class: "muted", style: "padding:12px", text: "No runs recorded yet." }));
-    view.append(el("h3", { class: "sb-section", text: "Recent activity" }), actBox);
-    // settings summary
-    const sy = cfg.sync || {}, acc = (cfg.accounts || []).find(a => a.id === App.account) || {};
-    const dl = el("dl", { class: "kv" });
-    const kv = (k, v) => { dl.append(el("dt", { text: k }), el("dd", { text: v == null ? "—" : String(v) })); };
-    kv("Account", acc.username || App.account); kv("Sync root", acc.sync_root); kv("Archive root", acc.archive_root);
-    kv("Trash retention", (sy.trash_retention_days ?? "?") + " days"); kv("Body index (FTS)", sy.body_index ? "on" : "off"); kv("Change source", sy.change_source);
-    view.append(el("h3", { class: "sb-section", text: "Settings" }), el("div", { class: "card" }, dl));
-  } catch (e) { clear(grid).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
+    tbl.append(tb);
+    grid.append(el("div", { class: "card panel" },
+      el("div", { class: "panel-head" }, icon("hard-drive", "icon-sm"), "Service breakdown"),
+      el("div", { class: "panel-body", style: "padding-top:var(--sp-2)" }, tbl)));
+
+    // ---- recent runs
+    const runsPanel = el("div", { class: "card panel" }, el("div", { class: "panel-head" }, icon("rotate-ccw", "icon-sm"), "Recent runs"));
+    const recent = runs.slice(0, 6);
+    if (recent.length) recent.forEach(r => {
+      const ok = r.status === "ok";
+      runsPanel.append(el("div", { class: "run-row" },
+        el("span", { class: "chip " + (ok ? "ok" : "err") }, el("span", { class: "dot" }), ok ? "Success" : "Failed"),
+        el("div", { class: "grow", style: "min-width:0" },
+          el("span", { class: "run-kind", text: r.kind || "sync" }),
+          el("div", { class: "run-sum truncate", text: r.summary || "" })),
+        el("span", { class: "dim tnum", style: "font-size:12px;white-space:nowrap", text: fmtDate(r.finished_at) })));
+    });
+    else runsPanel.append(el("div", { class: "run-row dim", text: "No runs recorded yet." }));
+    body.append(runsPanel);
+
+    // ---- connection & policy (trust signals — real data only)
+    body.append(el("div", { class: "card panel", style: "margin-top:var(--sp-3)" },
+      el("div", { class: "panel-head" }, icon("users", "icon-sm"), "Connection & policy"),
+      el("div", { class: "panel-body" }, el("dl", { class: "conn-grid" },
+        connItem("Account", acc.username || App.account),
+        connItem("Scheduled sync", sy.enabled ? (sy.paused ? "Paused" : "Running") : "Off"),
+        connItem("Change source", sync.change_source || "—"),
+        connItem("Body index", sync.body_index ? "On (full-text)" : "Off"),
+        connItem("OneDrive delta", st.onedrive_cursor ? "Active" : "—"),
+        connItem("Last successful", lastOk ? fmtFullDate(lastOk.finished_at) : "—")))));
+  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
 }
+function connItem(k, v) { return el("div", { class: "conn-item" }, el("dt", { text: k }), el("dd", { text: v == null ? "—" : String(v) })); }
+
+/* shared per-view header: title + live metric line + honest chips (enterprise standard) */
+function viewHeader(title, metrics, chips) {
+  return el("header", { class: "svc-head" },
+    el("div", { class: "grow", style: "min-width:0" },
+      el("h1", { class: "view-title", style: "margin:0", text: title }),
+      el("div", { class: "svc-metrics dim", text: metrics || "" })),
+    chips && chips.length ? el("div", { class: "svc-chips" }, ...chips) : null);
+}
+const readonlyChip = () => el("span", { class: "chip muted" }, icon("shield-check", "icon-sm"), "Read-only");
 
 /* ---------------------------------------------------------------- generic service view (parity; bespoke per PR) */
 const PAGE = 60;
@@ -489,73 +587,119 @@ async function doServiceSearch(service) {
 // `offset` walks the raw /items page (which also contains mailbox folder rows);
 // `folders` accumulates the folder items we skip so the displayed count reflects
 // real messages (folders sort before messages, so the message total is exact).
-const Mail = { offset: 0, msgTotal: 0, folders: 0, selected: null };
-const MAIL_PAGE = 50;
-async function renderMailView(view) {
-  Mail.offset = 0; Mail.msgTotal = 0; Mail.folders = 0; Mail.selected = null;
-  const rail = el("aside", { class: "mail-rail" },
-    el("div", { class: "mail-rail-head" }, icon("mail"), el("b", { text: "Mailbox" })),
-    el("input", { id: "mail-search", class: "input", placeholder: "Search mail…",
-      onkeydown: (e) => { if (e.key === "Enter") mailSearch(); } }),
-    el("nav", { class: "mail-folders" },
-      el("button", { class: "mail-folder active", onclick: () => { $("#mail-search").value = ""; mailReload(); } },
-        icon("mail", "icon-sm"), el("span", { class: "grow", text: "All messages" }),
-        el("span", { id: "mail-total", class: "count tnum", text: App.counts.mail != null ? String(App.counts.mail) : "·" }))),
-    el("div", { class: "spacer" }),
-    el("p", { class: "mail-rail-foot dim", text: "Archived & read-only. Restore re-creates a copy in your mailbox." }),
-  );
-  const list = el("div", { id: "mail-list", class: "mail-list" });
-  const reader = el("div", { id: "mail-reader", class: "mail-reader" });
-  const layout = el("div", { id: "mail-layout", class: "mail-layout" }, rail, list, reader);
-  clear(view).append(layout);
-  renderMailReader(null);
-  await mailLoadPage(true);
+const Mail = { all: [], filter: "all", sort: "newest", q: "", selected: null };
+// auto-categorisation by sender/subject keywords (a labelled heuristic, not metadata)
+const MAIL_CATS = [
+  { key: "security", label: "Security", color: "#f85149", icon: "shield", re: /secur|verif|\bcode\b|login|sign[\s-]?in|password|\b2fa\b|\botp\b|alert|suspicious/i },
+  { key: "billing", label: "Billing", color: "#3fb950", icon: "file-text", re: /invoice|payment|receipt|billing|subscription|renew|paypal|distrokid|\border\b|charged|refund/i },
+  { key: "social", label: "Social", color: "#a371f7", icon: "users", re: /instagram|facebook|twitter|linkedin|tiktok|snapchat|social|follow|friend|tagged|mention/i },
+  { key: "promo", label: "Promotions", color: "#d29922", icon: "mail", re: /spotify|newsletter|offer|\bdeal|\bsale\b|promo|unsubscribe|marketing|discount|\b% off/i },
+];
+function mailCat(it) {
+  const p = it.preview || {};
+  const hay = ((p.from || "") + " " + (p.subject || it.name || "")).toLowerCase();
+  return MAIL_CATS.find(c => c.re.test(hay)) || { key: "other", label: "Other", color: "#768390", icon: "mail" };
 }
-function mailReload() { Mail.offset = 0; Mail.msgTotal = 0; Mail.folders = 0; Mail.selected = null; renderMailReader(null); $("#mail-layout")?.classList.remove("reading"); mailLoadPage(true); }
-async function mailLoadPage(reset) {
-  const list = $("#mail-list"); if (!list) return;
-  const old = list.querySelector(".mail-more"); if (old) old.remove();
-  if (reset) { clear(list); for (let i = 0; i < 8; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:40px" }))); }
+const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || it.remote_mtime) || new Date(0); };
+
+async function renderMailView(view) {
+  Mail.all = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
+  clear(view).append(el("div", { id: "mail-page", class: "mail-page" },
+    // header: title + live metrics + honest trust chips
+    el("header", { class: "mail-head" },
+      el("div", { class: "grow", style: "min-width:0" },
+        el("h1", { class: "view-title", style: "margin:0", text: "Mail archive" }),
+        el("div", { id: "mail-metrics", class: "mail-metrics dim", text: "Loading…" })),
+      el("div", { class: "mail-chips" },
+        el("span", { class: "chip muted" }, icon("shield-check", "icon-sm"), "Read-only"),
+        el("span", { class: "chip muted" }, icon("rotate-ccw", "icon-sm"), "Restore-ready"))),
+    // toolbar
+    el("div", { class: "mail-toolbar" },
+      el("div", { class: "tb-search" }, icon("search", "icon-sm"),
+        el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); } })),
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
+        el("select", { class: "input", onchange: (e) => { Mail.sort = e.target.value; mailRender(); } },
+          el("option", { value: "newest", text: "Newest first" }),
+          el("option", { value: "oldest", text: "Oldest first" }),
+          el("option", { value: "sender", text: "Sender A–Z" }))),
+      el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
+    // 3-pane: filter rail | list | reader
+    el("div", { id: "mail-layout", class: "mail-layout" },
+      el("aside", { id: "mail-rail", class: "mail-rail" }),
+      el("div", { id: "mail-list", class: "mail-list" }),
+      el("div", { id: "mail-reader", class: "mail-reader" }))));
+  renderMailReader(null);
+  const list = $("#mail-list");
+  for (let i = 0; i < 9; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:46px" })));
   try {
-    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: MAIL_PAGE, offset: Mail.offset }));
-    const all = d.items || [];
-    const msgs = all.filter(it => it.item_type === "message");      // hide mailbox folder rows
-    Mail.folders += all.length - msgs.length;
-    Mail.offset += all.length;                                      // advance over the raw page
-    const apiTotal = d.total ?? 0;
-    Mail.msgTotal = Math.max(0, apiTotal - Mail.folders);           // exact: folders sort first
-    if (reset) clear(list);
-    const t = $("#mail-total"); if (t) t.textContent = String(Mail.msgTotal);
-    if (reset && !msgs.length) {
-      if (Mail.offset < apiTotal) return mailLoadPage(false);       // page held only folders → keep going
-      list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." })));
-      return;
-    }
-    const frag = document.createDocumentFragment();
-    msgs.forEach(it => frag.append(mailRow(it)));
-    list.append(frag);
-    if (Mail.offset < apiTotal)
-      list.append(el("div", { class: "mail-more" }, el("button", { class: "btn ghost sm", onclick: () => mailLoadPage(false) }, "Load more")));
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 }));
+    Mail.all = (d.items || []).filter(it => it.item_type === "message");
+    App.counts.mail = Mail.all.length; updateNavCounts();
+    mailRenderRail(); mailRender();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
 }
+function mailFiltered() {
+  let rows = Mail.all;
+  const f = Mail.filter;
+  if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0);
+  else if (f === "restore") rows = rows.filter(it => it.has_body);
+  else if (f !== "all") rows = rows.filter(it => mailCat(it).key === f);
+  if (Mail.q) rows = rows.filter(it => { const p = it.preview || {}; return ((p.subject || it.name || "") + " " + (p.from || "") + " " + (p.snippet || "")).toLowerCase().includes(Mail.q); });
+  const dir = Mail.sort === "oldest" ? 1 : -1;
+  if (Mail.sort === "sender") rows = rows.slice().sort((a, b) => addrLabel((a.preview || {}).from).localeCompare(addrLabel((b.preview || {}).from)));
+  else rows = rows.slice().sort((a, b) => dir * (mailDate(a) - mailDate(b)));
+  return rows;
+}
+function mailRenderRail() {
+  const rail = $("#mail-rail"); if (!rail) return; clear(rail);
+  const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
+  const restore = Mail.all.filter(it => it.has_body).length;
+  const catCounts = {}; Mail.all.forEach(it => { const k = mailCat(it).key; catCounts[k] = (catCounts[k] || 0) + 1; });
+  const folder = (key, label, icn, count, color) => el("button", { class: "mail-folder" + (Mail.filter === key ? " active" : ""), onclick: () => { Mail.filter = key; mailRenderRail(); mailRender(); } },
+    el("span", { class: "mf-ico", style: color ? `color:${color}` : "" }, icon(icn, "icon-sm")),
+    el("span", { class: "grow truncate", text: label }), el("span", { class: "count tnum", text: String(count) }));
+  rail.append(
+    el("div", { class: "mail-rail-sec", text: "Mailbox" }),
+    folder("all", "All messages", "inbox", Mail.all.length),
+    folder("attach", "With attachments", "paperclip", withAtt),
+    folder("restore", "Restore-ready", "rotate-ccw", restore),
+    el("div", { class: "mail-rail-sec", text: "Categories" }),
+    ...MAIL_CATS.map(c => folder(c.key, c.label, c.icon, catCounts[c.key] || 0, c.color)),
+    catCounts.other ? folder("other", "Other", "mail", catCounts.other, "#768390") : null,
+    el("div", { class: "spacer" }),
+    el("p", { class: "mail-rail-foot dim", text: "Read-only archive · restore re-creates a copy in your mailbox. Categories are auto-detected." }));
+}
+function mailRender() {
+  const list = $("#mail-list"); if (!list) return;
+  const rows = mailFiltered();
+  const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
+  const archived = Mail.all.filter(it => it.has_body).length;
+  const m = $("#mail-metrics"); if (m) m.textContent = `${Mail.all.length} messages · ${archived} with content · ${withAtt} with attachments`;
+  clear(list);
+  if (!Mail.all.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." }))); return; }
+  if (!rows.length) { list.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "Adjust the filter or search." }))); return; }
+  const frag = document.createDocumentFragment();
+  rows.forEach(it => frag.append(mailRow(it)));
+  list.append(frag);
+}
 function mailRow(it) {
-  const p = it.preview || {};
-  const from = addrLabel(p.from);
-  const subject = p.subject || it.name || "(no subject)";
-  const when = p.date || it.remote_mtime;
-  return el("button", {
-    class: "mail-item" + (Mail.selected && Mail.selected.remote_id === it.remote_id ? " active" : ""),
-    dataset: { id: it.remote_id }, onclick: () => mailSelect(it),
-  },
-    el("span", { class: "avatar mail-av", text: initials(from || subject) }),
-    el("div", { class: "grow" },
-      el("div", { class: "mi-top" },
-        el("span", { class: "mi-from truncate", text: from || "(unknown sender)" }),
-        el("span", { class: "mi-date dim tnum", text: fmtDate(when) })),
-      el("div", { class: "mi-subject truncate" }, subject,
-        p.has_html ? el("span", { class: "mi-flag", title: "Rich HTML message" }, icon("paperclip", "icon-sm")) : null),
-      el("div", { class: "mi-snippet truncate dim", text: p.snippet || "" })),
-  );
+  const p = it.preview || {}, cat = mailCat(it);
+  const from = addrLabel(p.from), subject = p.subject || it.name || "(no subject)";
+  const sel = Mail.selected && Mail.selected.remote_id === it.remote_id;
+  const badges = el("div", { class: "mi-badges" });
+  if (p.attachments > 0) badges.append(el("span", { class: "mi-chip", title: p.attachments + " attachment(s)" }, icon("paperclip", "icon-sm"), String(p.attachments)));
+  badges.append(el("span", { class: "mi-cat", style: `--c:${cat.color}`, text: cat.label }));
+  return el("button", { class: "mail-item" + (sel ? " active" : ""), dataset: { id: it.remote_id }, onclick: () => mailSelect(it) },
+    el("span", { class: "avatar mail-av", style: `--c:${cat.color}`, text: initials(from || subject) }),
+    el("div", { class: "grow", style: "min-width:0" },
+      el("div", { class: "mi-top" }, el("span", { class: "mi-from truncate", text: from || "(unknown sender)" }),
+        el("span", { class: "mi-date dim tnum", text: fmtDate(p.date || it.remote_mtime) })),
+      el("div", { class: "mi-subject truncate", text: subject }),
+      el("div", { class: "mi-bottom" },
+        el("span", { class: "mi-snippet truncate dim", text: p.snippet || "" }),
+        el("span", { class: "mi-status " + (it.has_body ? "ok" : "muted"), title: it.has_body ? "Full body archived" : "Header only" }, it.has_body ? "Body saved" : "Header only")),
+      badges));
 }
 function mailSelect(it) {
   Mail.selected = it;
@@ -564,51 +708,53 @@ function mailSelect(it) {
   renderMailReader(it);
 }
 function mailBack() { Mail.selected = null; $("#mail-layout")?.classList.remove("reading"); document.querySelectorAll(".mail-item.active").forEach(r => r.classList.remove("active")); renderMailReader(null); }
+// restrained archive-vault illustration for the empty reading pane (trusted in-code SVG)
+const VAULT_SVG = '<svg viewBox="0 0 260 180" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="40" y="34" width="120" height="84" rx="10" opacity="0.35" transform="rotate(-7 100 76)"/><rect x="64" y="44" width="120" height="84" rx="10" opacity="0.6"/><path d="M64 60h120" opacity="0.6"/><circle cx="200" cy="120" r="38" fill="color-mix(in oklab, var(--accent) 10%, transparent)"/><circle cx="200" cy="120" r="38"/><circle cx="200" cy="120" r="14"/><path d="M200 92v10M200 138v10M172 120h10M218 120h10"/></g><path d="M191 119l6 6 12-13" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 function renderMailReader(it) {
-  const box = $("#mail-reader"); if (!box) return;
-  clear(box);
+  const box = $("#mail-reader"); if (!box) return; clear(box);
   if (!it) {
-    box.append(el("div", { class: "empty mail-reader-empty" }, logoGlyph(64),
-      el("h3", { text: "Select a message" }), el("p", { text: "Choose a message from the list to read it here." })));
+    const archived = Mail.all.filter(x => x.has_body).length;
+    const withAtt = Mail.all.filter(x => (x.preview || {}).attachments > 0).length;
+    box.append(el("div", { class: "mail-empty" },
+      el("div", { class: "vault-art", html: VAULT_SVG }),
+      el("h3", { text: "Select a message to inspect it" }),
+      el("p", { class: "dim", text: "Read-only Microsoft 365 mail archive. Choose a message to read its sanitized body and metadata." }),
+      el("div", { class: "mail-empty-metrics" },
+        metricCard("download", archived, "bodies archived"),
+        metricCard("paperclip", withAtt, "with attachments"),
+        metricCard("inbox", Mail.all.length, "messages")),
+      el("div", { class: "mail-empty-actions" },
+        el("button", { class: "btn sm", onclick: () => $("#mail-search")?.focus() }, icon("search", "icon-sm"), "Search archive"),
+        el("button", { class: "btn sm", onclick: () => go("overview") }, icon("clock", "icon-sm"), "View sync log"))));
     return;
   }
-  const p = it.preview || {};
-  const from = parseAddr(p.from);
-  const subject = p.subject || it.name || "(no subject)";
-  const when = p.date || it.remote_mtime;
+  const p = it.preview || {}, from = parseAddr(p.from), cat = mailCat(it);
+  const subject = p.subject || it.name || "(no subject)", when = p.date || it.remote_mtime;
   const q = { account: App.account, service: "mail", id: it.remote_id };
   const actions = el("div", { class: "mr-actions" },
     el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
-  if (CAP.restore)
-    actions.append(el("button", { class: "btn ghost sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
-  const head = el("header", { class: "mail-reader-head" },
-    el("button", { class: "mail-back btn ghost sm", title: "Back to list", onclick: mailBack }, icon("chevron-left", "icon-sm")),
-    el("div", { class: "grow", style: "min-width:0" },
-      el("h2", { class: "mr-subject", text: subject }),
-      el("div", { class: "mr-meta" },
-        el("span", { class: "avatar mail-av", text: initials(from.name || from.email || subject) }),
-        el("div", { class: "grow", style: "min-width:0" },
-          el("div", { class: "mr-from truncate" }, el("b", { text: from.name || from.email || "(unknown sender)" }),
-            from.name && from.email ? el("span", { class: "dim", text: " <" + from.email + ">" }) : null),
-          (p.to && p.to.length) ? el("div", { class: "mr-to dim truncate", text: "To: " + p.to.join(", ") }) : null),
-        el("span", { class: "mr-date dim tnum", text: fmtFullDate(when) }))),
-    actions);
-  // The body is untrusted HTML; it stays isolated in a same-origin iframe that the
-  // server locks down with MAIL_CSP (no scripts, no remote fetch, data: images only).
-  const frame = el("iframe", { class: "mail-frame", src: `/api/v1/view?${qs(q)}`, title: "Message body", loading: "lazy" });
-  box.append(head, frame);
+  if (CAP.restore) actions.append(el("button", { class: "btn sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
+  box.append(
+    el("header", { class: "mail-reader-head" },
+      el("button", { class: "mail-back btn ghost sm", title: "Back", onclick: mailBack }, icon("chevron-left", "icon-sm")),
+      el("div", { class: "grow", style: "min-width:0" },
+        el("div", { class: "mr-tags" }, el("span", { class: "mi-cat", style: `--c:${cat.color}`, text: cat.label }),
+          p.attachments > 0 ? el("span", { class: "mi-chip" }, icon("paperclip", "icon-sm"), p.attachments + (p.attachments === 1 ? " attachment" : " attachments")) : null,
+          el("span", { class: "mi-status " + (it.has_body ? "ok" : "muted") }, it.has_body ? "Body saved" : "Header only")),
+        el("h2", { class: "mr-subject", text: subject }),
+        el("div", { class: "mr-meta" },
+          el("span", { class: "avatar mail-av", style: `--c:${cat.color}`, text: initials(from.name || from.email || subject) }),
+          el("div", { class: "grow", style: "min-width:0" },
+            el("div", { class: "mr-from truncate" }, el("b", { text: from.name || from.email || "(unknown sender)" }),
+              from.name && from.email ? el("span", { class: "dim", text: " <" + from.email + ">" }) : null),
+            (p.to && p.to.length) ? el("div", { class: "mr-to dim truncate", text: "To: " + p.to.join(", ") }) : null),
+          el("span", { class: "mr-date dim tnum", text: fmtFullDate(when) }))),
+      actions),
+    el("iframe", { class: "mail-frame", src: `/api/v1/view?${qs(q)}`, title: "Message body", loading: "lazy" }));
 }
-async function mailSearch() {
-  const q = $("#mail-search").value.trim();
-  if (!q) return mailReload();
-  const list = $("#mail-list"); clear(list);
-  Mail.selected = null; renderMailReader(null); $("#mail-layout")?.classList.remove("reading");
-  try {
-    const d = await api("/api/v1/search?" + qs({ account: App.account, q }));
-    const hits = (d.hits || []).filter(h => h.service === "mail");
-    if (!hits.length) { list.append(el("div", { class: "empty" }, el("h3", { text: "No matches" }), el("p", { text: `Nothing in mail matches “${q}”.` }))); return; }
-    hits.forEach(it => list.append(mailRow(it)));
-  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Search failed" }), el("p", { text: e.message }))); }
+function metricCard(icn, val, label) {
+  return el("div", { class: "metric-card" }, el("span", { class: "mc-ico" }, icon(icn, "icon-sm")),
+    el("div", {}, el("div", { class: "mc-val tnum", text: String(val) }), el("div", { class: "mc-lbl dim", text: label })));
 }
 
 /* ---------------------------------------------------------------- onedrive (file explorer) */
@@ -634,7 +780,7 @@ const fileColor = (ext) => (fileKind(ext) || {}).color || "var(--text-lo)";
 async function renderOnedriveView(view) {
   Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = [];
   clear(view).append(
-    el("h1", { class: "view-title", text: "OneDrive" }),
+    viewHeader("OneDrive", `${App.counts.onedrive != null ? App.counts.onedrive + " items archived · " : ""}file & folder archive`, [readonlyChip()]),
     el("div", { class: "drive-bar" },
       el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
       el("div", { class: "spacer", style: "flex:1" }),
@@ -758,7 +904,7 @@ const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit
 async function renderCalendarView(view) {
   Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda";
   clear(view).append(
-    el("h1", { class: "view-title", text: "Calendar" }),
+    viewHeader("Calendar", `${App.counts.calendar != null ? App.counts.calendar + " events archived" : "event archive"}`, [readonlyChip()]),
     el("div", { class: "cal-bar" },
       el("div", { class: "cal-nav" },
         el("button", { class: "btn ghost sm icon-only", title: "Previous", onclick: () => calNav(-1) }, icon("chevron-left", "icon-sm")),
@@ -928,7 +1074,7 @@ const Contacts = { all: [] };
 async function renderContactsView(view) {
   Contacts.all = [];
   clear(view).append(
-    el("h1", { class: "view-title", text: "Contacts" }),
+    viewHeader("Contacts", `${App.counts.contacts != null ? App.counts.contacts + " contacts archived" : "contact archive"}`, [readonlyChip()]),
     el("div", { class: "view-sub" }, el("input", { id: "con-search", class: "input", style: "max-width:420px", placeholder: "Search contacts…", oninput: contactsFilter })),
   );
   const wrap = el("div", { class: "con-wrap" }, el("div", { id: "con-grid", class: "con-grid" }), el("div", { id: "con-az", class: "con-az" }));
@@ -995,7 +1141,7 @@ async function openContactSheet(it) {
 const Todo = { lists: [], tasks: [] };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
-  clear(view).append(el("h1", { class: "view-title", text: "ToDo" }), el("p", { class: "view-sub", text: "Your archived task lists (read-only)." }));
+  clear(view).append(viewHeader("To Do", `${App.counts.todo != null ? App.counts.todo + " items archived" : "task archive"}`, [readonlyChip()]));
   const board = el("div", { id: "todo-board", class: "todo-board" });
   view.append(board);
   board.append(el("div", { class: "card", style: "min-width:280px" }, el("div", { class: "skel", style: "height:200px" })));
@@ -1065,7 +1211,12 @@ async function renderOnenoteView(view) {
   clear(view);
   const list = el("div", { id: "note-list", class: "note-list" });
   const reader = el("div", { id: "note-reader", class: "note-reader" });
-  view.append(el("div", { class: "note-layout" }, list, reader));
+  view.append(el("div", { class: "note-page" },
+    el("header", { class: "note-page-head" },
+      el("div", { class: "grow", style: "min-width:0" }, el("h1", { class: "view-title", style: "margin:0", text: "OneNote" }),
+        el("div", { class: "svc-metrics dim", text: `${App.counts.onenote != null ? App.counts.onenote + " pages archived" : "notebook archive"}` })),
+      el("div", { class: "svc-chips" }, readonlyChip())),
+    el("div", { class: "note-layout" }, list, reader)));
   renderNoteReader(null);
   for (let i = 0; i < 5; i++) list.append(el("div", { class: "note-item" }, el("div", { class: "skel grow", style: "height:30px" })));
   try {

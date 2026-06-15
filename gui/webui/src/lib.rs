@@ -40,6 +40,9 @@ pub const INDEX_HTML: &str = include_str!("index.html");
 /// capability-token placeholders (injected per request, like the old inline script).
 const APP_CSS: &str = include_str!("app.css");
 const APP_JS: &str = include_str!("app.js");
+/// Embedded Inter variable font (SIL OFL 1.1), served same-origin from `/app.woff2`
+/// so the premium typography needs no web-font request (CSP `font-src 'self'`).
+const APP_FONT: &[u8] = include_bytes!("assets/inter-var.woff2");
 
 /// CSP for the app shell (`/`). `script-src 'self'` (no inline script) is the key
 /// defense; only our own same-origin `/app.js` runs. Allows our stylesheet + inline
@@ -412,6 +415,13 @@ impl Router {
                 content_type: "text/css; charset=utf-8".into(),
                 body: APP_CSS.as_bytes().to_vec(),
                 headers: vec![("Cache-Control".into(), "no-store".into())],
+            },
+            "/app.woff2" => ApiResponse {
+                status: 200,
+                content_type: "font/woff2".into(),
+                body: APP_FONT.to_vec(),
+                // immutable binary asset → cache hard within a version
+                headers: vec![("Cache-Control".into(), "max-age=31536000".into())],
             },
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
@@ -817,6 +827,8 @@ impl Router {
                                                 "snippet": p.body_snippet,
                                                 "date": p.date,
                                                 "has_html": p.has_html,
+                                                "attachments": p.attachment_count,
+                                                "size": p.size_bytes,
                                             });
                                         } else if let Ok(o) =
                                             serde_json::from_slice::<Value>(&bytes)
@@ -1735,7 +1747,7 @@ mod tests {
             "/api/v1/settings",
             "/api/v1/activity",
             "Overview",
-            "Recent activity",
+            "Recent runs",
         ] {
             assert!(
                 APP_JS.contains(needle),
