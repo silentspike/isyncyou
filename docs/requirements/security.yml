@@ -101,10 +101,10 @@ requirements:
       - The restore capability token authorizes restore POSTs only.
       - The scheduled-sync capability token authorizes sync-control POSTs only.
       - A rejected cross-token restore does not write an audit entry.
-      - The served UI receives separate restore and sync-control token constants.
+      - The served app.js receives separate restore and sync-control tokens.
     verified_by:
       - test: destructive_capability_tokens_are_action_scoped
-      - test: index_injects_separate_capability_tokens_when_enabled
+      - test: app_js_injects_separate_capability_tokens_when_enabled
 
   - id: REQ-SEC-007
     title: TCP local API cannot bind outside loopback
