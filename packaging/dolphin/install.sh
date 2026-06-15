@@ -10,12 +10,20 @@
 # icons (KOverlayIconPlugin, packaging/dolphin/overlay-plugin) are an enhancement.
 set -euo pipefail
 
-src="$(cd "$(dirname "$0")" && pwd)/org.silentspike.iSyncYou.desktop"
+here="$(cd "$(dirname "$0")" && pwd)"
+src="$here/org.silentspike.iSyncYou.desktop"
 dest_dir="${XDG_DATA_HOME:-$HOME/.local/share}/kio/servicemenus"
 
 mkdir -p "$dest_dir"
 install -m 0644 "$src" "$dest_dir/org.silentspike.iSyncYou.desktop"
 echo "installed: $dest_dir/org.silentspike.iSyncYou.desktop"
+
+# The "Share with people…" action calls this kdialog wrapper (#504); install it
+# next to the binaries on PATH so the ServiceMenu Exec resolves it.
+bin_dir="$HOME/.local/bin"
+mkdir -p "$bin_dir"
+install -m 0755 "$here/isyncyou-share-invite" "$bin_dir/isyncyou-share-invite"
+echo "installed: $bin_dir/isyncyou-share-invite"
 
 # Refresh KDE's service cache so Dolphin picks it up without a restart.
 if command -v kbuildsycoca6 >/dev/null 2>&1; then

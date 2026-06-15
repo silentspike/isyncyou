@@ -188,6 +188,16 @@ pub trait ShareHandler: Send + Sync {
         link_type: &str,
         scope: &str,
     ) -> Result<String, String>;
+    /// Invite named people to a OneDrive item by email (#504). `role` is `read` or
+    /// `write`. Returns a short human summary (e.g. how many were invited).
+    fn invite(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+        emails: &[String],
+        role: &str,
+    ) -> Result<String, String>;
 }
 
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
@@ -457,6 +467,53 @@ impl Router {
             }
             _ => return ApiResponse::error(400, "account, service and id are required"),
         };
+        // Invite mode (#504): an `email` param (comma/space-separated) invites named
+        // people instead of creating an anonymous link. `role` = read|write.
+        if let Some(emails_raw) = req.q("email").filter(|e| !e.is_empty()) {
+            let emails: Vec<String> = emails_raw
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(String::from)
+                .collect();
+            if emails.is_empty() {
+                return ApiResponse::error(400, "no valid email address");
+            }
+            let role = req.q("role").filter(|r| !r.is_empty()).unwrap_or("read");
+            if let Err(e) = self.audit_account(
+                account,
+                "audit:share",
+                "started",
+                &format!(
+                    "invite requested service={service} id={id} role={role} n={}",
+                    emails.len()
+                ),
+            ) {
+                return ApiResponse::error(500, &format!("audit: {e}"));
+            }
+            return match handler.invite(account, service, id, &emails, role) {
+                Ok(summary) => {
+                    let _ = self.audit_account(
+                        account,
+                        "audit:share",
+                        "ok",
+                        &format!("invite ok service={service} id={id} role={role}"),
+                    );
+                    ApiResponse::ok_json(
+                        &json!({ "invited": emails, "service": service, "role": role, "summary": summary }),
+                    )
+                }
+                Err(e) => {
+                    let _ = self.audit_account(
+                        account,
+                        "audit:share",
+                        "error",
+                        &format!("invite error service={service} id={id}: {e}"),
+                    );
+                    ApiResponse::error(500, &e)
+                }
+            };
+        }
         let link_type = req.q("type").filter(|t| !t.is_empty()).unwrap_or("view");
         let scope = req
             .q("scope")
@@ -1091,6 +1148,16 @@ mod tests {
         ) -> Result<String, String> {
             Ok("https://1drv.ms/x/abc".into())
         }
+        fn invite(
+            &self,
+            _a: &str,
+            _s: &str,
+            _i: &str,
+            emails: &[String],
+            role: &str,
+        ) -> Result<String, String> {
+            Ok(format!("invited {} ({role})", emails.len()))
+        }
     }
 
     #[test]
@@ -1122,6 +1189,25 @@ mod tests {
                 .status,
             404
         );
+    }
+
+    #[test]
+    fn share_post_invite_mode_routes_to_invite_not_link() {
+        let (_d, router) = setup();
+        let router = router.with_share(std::sync::Arc::new(OkShare), "secret".into());
+        // an `email` param switches to invite mode: response has no webUrl, role echoed
+        let q = "/api/v1/share?account=a&service=onedrive&id=x&email=p%40e.com&role=write";
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(ok.status, 200);
+        let body = String::from_utf8_lossy(&ok.body);
+        assert!(
+            body.contains("\"invited\""),
+            "expected invited list: {body}"
+        );
+        assert!(body.contains("p@e.com") && body.contains("write"));
+        assert!(!body.contains("webUrl"), "invite must not create a link");
+        // invite still needs the capability token
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
     }
 
     #[test]
