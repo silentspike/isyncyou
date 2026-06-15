@@ -14,7 +14,10 @@ pub enum ChangeSource {
     Inotify,
     /// periodic reconciler only (no event watcher).
     ReconcileOnly,
-    /// eBPF/fanotify (privileged server mode).
+    /// Privileged mount-wide change source, fanotify-backed (server mode). Needs
+    /// `CAP_SYS_ADMIN`; falls back to inotify when unprivileged or unsupported.
+    /// Accepts `ebpf` or `fanotify` in TOML (both map here; serializes as `ebpf`).
+    #[serde(alias = "fanotify")]
     Ebpf,
 }
 
@@ -282,6 +285,23 @@ mod tests {
         c.save(&path).unwrap();
         let back = Config::load(&path).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn change_source_accepts_fanotify_alias() {
+        // The truthful name `fanotify` deserializes to the `Ebpf` variant (#331),
+        // and so does the canonical `ebpf`.
+        let from_alias: SyncConfig = toml::from_str("change_source = \"fanotify\"").unwrap();
+        assert_eq!(from_alias.change_source, ChangeSource::Ebpf);
+        let from_canonical: SyncConfig = toml::from_str("change_source = \"ebpf\"").unwrap();
+        assert_eq!(from_canonical.change_source, ChangeSource::Ebpf);
+        // Serialization stays `ebpf` (alias affects deserialization only), so
+        // existing configs/tests are unaffected.
+        let dumped = toml::to_string(&from_alias).unwrap();
+        assert!(
+            dumped.contains("change_source = \"ebpf\""),
+            "expected canonical ebpf in output, got: {dumped}"
+        );
     }
 
     #[test]

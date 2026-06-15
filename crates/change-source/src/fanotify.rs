@@ -56,9 +56,10 @@ impl FanotifyWatcher {
         Ok(FanotifyWatcher { fd })
     }
 
-    /// Poll for events up to `timeout`, returning the changed paths as modify
-    /// [`RawEvent`]s. An empty vec means nothing happened in the window.
-    pub fn poll(&self, timeout: Duration) -> Vec<RawEvent> {
+    /// Poll for raw events up to `timeout`. An empty vec means nothing happened in
+    /// the window. The [`crate::source::ChangeSource`] impl wraps this through the
+    /// shared [`crate::watcher::Coalescer`] to produce coalesced `FsChange`s.
+    pub fn poll_raw(&self, timeout: Duration) -> Vec<RawEvent> {
         let mut pfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
             events: libc::POLLIN,
@@ -138,7 +139,7 @@ mod tests {
         };
         let f = dir.path().join("note.txt");
         std::fs::write(&f, b"hello").unwrap(); // open+write+close -> FAN_CLOSE_WRITE
-        let events = w.poll(Duration::from_secs(2));
+        let events = w.poll_raw(Duration::from_secs(2));
         assert!(
             events
                 .iter()
