@@ -64,11 +64,17 @@ const ICONS = {
   film: "M3 3h18v18H3zM7 3v18M17 3v18M3 7h4M3 12h18M3 17h4M17 7h4M17 17h4",
   archive: "M21 8v13H3V8M1 3h22v5H1zM10 12h4",
   code: "M16 18l6-6-6-6M8 6l-6 6 6 6",
+  "map-pin": "M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0zM12 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
-  svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", cls); svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  // always keep the base `.icon` class (stroke:currentColor; fill:none); size
+  // modifiers (icon-sm/icon-lg) only override width/height — without the base
+  // class the browser would fill the stroke-only Lucide paths solid black.
+  svg.setAttribute("class", cls === "icon" ? "icon" : "icon " + cls);
+  svg.setAttribute("aria-hidden", "true");
   const p = document.createElementNS(ns, "path");
   p.setAttribute("d", ICONS[name] || ICONS.file);
   svg.append(p); return svg;
@@ -301,6 +307,7 @@ function onRoute() {
   if (App.route === "overview") renderOverview(view);
   else if (App.route === "mail") renderMailView(view);
   else if (App.route === "onedrive") renderOnedriveView(view);
+  else if (App.route === "calendar") renderCalendarView(view);
   else renderServiceView(view, App.route);
 }
 
@@ -716,6 +723,190 @@ function driveRow(it) {
   return row;
 }
 
+/* ---------------------------------------------------------------- calendar (month / week / agenda) */
+const Cal = { events: [], view: "agenda", cursor: null };
+const DAY_MS = 864e5, HOUR_PX = 44, DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+// Graph datetime ("2026-02-04T09:00:00.0000000" + tz) → JS Date
+function evDate(dt, tz) {
+  if (!dt) return null;
+  let s = String(dt).replace(/(\.\d{3})\d*$/, "$1");            // trim fraction to ms (JS parses ≤3)
+  if (tz === "UTC" && !/[zZ]$|[+\-]\d\d:?\d\d$/.test(s)) s += "Z";
+  const d = new Date(s); return isNaN(d) ? null : d;
+}
+const ymd = (d) => d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate();
+const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+function startOfWeek(d) { const x = startOfDay(d); const dow = (x.getDay() + 6) % 7; x.setDate(x.getDate() - dow); return x; } // Monday
+const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+async function renderCalendarView(view) {
+  Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda";
+  clear(view).append(
+    el("h1", { class: "view-title", text: "Calendar" }),
+    el("div", { class: "cal-bar" },
+      el("div", { class: "cal-nav" },
+        el("button", { class: "btn ghost sm icon-only", title: "Previous", onclick: () => calNav(-1) }, icon("chevron-left", "icon-sm")),
+        el("button", { class: "btn ghost sm", onclick: () => { Cal.cursor = new Date(); calRender(); } }, "Today"),
+        el("button", { class: "btn ghost sm icon-only", title: "Next", onclick: () => calNav(1) }, icon("chevron-right", "icon-sm"))),
+      el("div", { id: "cal-label", class: "cal-label" }),
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("div", { class: "seg" },
+        ["month", "week", "agenda"].map(v => el("button", { class: "seg-btn" + (Cal.view === v ? " active" : ""), dataset: { calview: v }, onclick: () => setCalView(v), text: v[0].toUpperCase() + v.slice(1) }))),
+    ),
+    el("div", { id: "cal-body" }),
+  );
+  await calLoad();
+}
+function setCalView(v) { Cal.view = v; document.querySelectorAll("[data-calview]").forEach(b => b.classList.toggle("active", b.dataset.calview === v)); calRender(); }
+function calNav(dir) {
+  const c = Cal.cursor;
+  if (Cal.view === "week") c.setDate(c.getDate() + dir * 7);
+  else c.setMonth(c.getMonth() + dir);
+  Cal.cursor = new Date(c); calRender();
+}
+async function calLoad() {
+  const body = $("#cal-body"); clear(body).append(el("div", { class: "card" }, el("div", { class: "skel", style: "height:360px" })));
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "calendar", limit: 1000 }));
+    Cal.events = (d.items || []).map(it => {
+      const p = it.preview || {};
+      const start = evDate(p.start, p.start_tz) || (it.remote_mtime ? new Date(it.remote_mtime) : null);
+      return { it, subject: it.name || "(no title)", start, end: evDate(p.end, p.end_tz), allDay: !!p.all_day, location: p.location || "" };
+    }).filter(e => e.start);
+    App.counts.calendar = d.total ?? Cal.events.length; updateNavCounts();
+    calRender();
+  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load calendar" }), el("p", { text: e.message }))); }
+}
+function eventsForDay(day) {
+  const s = startOfDay(day).getTime(), e = s + DAY_MS;
+  return Cal.events.filter(ev => ev.start.getTime() < e && (ev.end ? ev.end.getTime() : ev.start.getTime() + 36e5) > s)
+    .sort((a, b) => a.start - b.start);
+}
+function calRender() {
+  const body = $("#cal-body"); if (!body) return; clear(body);
+  if (!Cal.events.length && Cal.view === "agenda") { body.append(el("div", { class: "empty" }, icon("calendar", "icon-lg"), el("h3", { text: "No events archived" }), el("p", { text: "Run a backup to populate your calendar." }))); return; }
+  if (Cal.view === "month") calRenderMonth(body);
+  else if (Cal.view === "week") calRenderWeek(body);
+  else calRenderAgenda(body);
+}
+function calRenderMonth(body) {
+  const cur = Cal.cursor;
+  $("#cal-label").textContent = MONTHS[cur.getMonth()] + " " + cur.getFullYear();
+  const first = new Date(cur.getFullYear(), cur.getMonth(), 1);
+  const gridStart = startOfWeek(first);
+  const todayKey = ymd(new Date());
+  const grid = el("div", { class: "cal-month" });
+  DAY_NAMES.forEach(n => grid.append(el("div", { class: "cal-dow", text: n })));
+  for (let i = 0; i < 42; i++) {
+    const day = new Date(gridStart.getTime() + i * DAY_MS);
+    const outside = day.getMonth() !== cur.getMonth();
+    const cell = el("div", { class: "cal-cell" + (outside ? " outside" : "") + (ymd(day) === todayKey ? " today" : "") });
+    cell.append(el("div", { class: "cal-daynum", text: String(day.getDate()) }));
+    const evs = eventsForDay(day);
+    evs.slice(0, 3).forEach(ev => cell.append(el("button", { class: "cal-chip", style: "--svc:var(--svc-calendar)", title: ev.subject, onclick: () => openEventSheet(ev) },
+      ev.allDay ? null : el("span", { class: "cal-chip-time", text: hhmm(ev.start) }), el("span", { class: "truncate", text: ev.subject }))));
+    if (evs.length > 3) cell.append(el("div", { class: "cal-more", text: "+" + (evs.length - 3) + " more" }));
+    grid.append(cell);
+  }
+  body.append(grid);
+}
+function calRenderWeek(body) {
+  const ws = startOfWeek(Cal.cursor), days = Array.from({ length: 7 }, (_, i) => new Date(ws.getTime() + i * DAY_MS));
+  $("#cal-label").textContent = days[0].toLocaleDateString([], { month: "short", day: "numeric" }) + " – " + days[6].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+  const todayKey = ymd(new Date());
+  const wrap = el("div", { class: "cal-week card" });
+  // header
+  const head = el("div", { class: "cal-week-head" }, el("div", { class: "cal-gutter" }));
+  days.forEach(d => head.append(el("div", { class: "cal-wday" + (ymd(d) === todayKey ? " today" : "") },
+    el("span", { class: "dim", text: DAY_NAMES[(d.getDay() + 6) % 7] }), el("b", { text: String(d.getDate()) }))));
+  wrap.append(head);
+  // all-day strip
+  const allday = el("div", { class: "cal-allday" }, el("div", { class: "cal-gutter dim", text: "all-day" }));
+  days.forEach(d => {
+    const cell = el("div", { class: "cal-allday-cell" });
+    eventsForDay(d).filter(e => e.allDay).forEach(ev => cell.append(el("button", { class: "cal-chip", title: ev.subject, onclick: () => openEventSheet(ev) }, el("span", { class: "truncate", text: ev.subject }))));
+    allday.append(cell);
+  });
+  wrap.append(allday);
+  // time grid (00–24, scrollable)
+  const grid = el("div", { class: "cal-grid", style: `--hour-px:${HOUR_PX}px` });
+  const gutter = el("div", { class: "cal-gutter-col" });
+  for (let h = 0; h < 24; h++) gutter.append(el("div", { class: "cal-hour", style: `height:${HOUR_PX}px` }, el("span", { text: (h < 10 ? "0" : "") + h + ":00" })));
+  grid.append(gutter);
+  days.forEach(d => {
+    const col = el("div", { class: "cal-daycol" });
+    for (let h = 0; h < 24; h++) col.append(el("div", { class: "cal-slot", style: `height:${HOUR_PX}px` }));
+    eventsForDay(d).filter(e => !e.allDay).forEach(ev => {
+      const dayStart = startOfDay(d).getTime();
+      const top = Math.max(0, (ev.start.getTime() - dayStart) / 36e5) * HOUR_PX;
+      const endT = ev.end ? ev.end.getTime() : ev.start.getTime() + 36e5;
+      const h = Math.max(18, ((endT - ev.start.getTime()) / 36e5) * HOUR_PX - 2);
+      col.append(el("button", { class: "cal-event", style: `top:${top}px;height:${h}px`, onclick: () => openEventSheet(ev) },
+        el("div", { class: "cal-event-time", text: hhmm(ev.start) }), el("div", { class: "cal-event-title truncate", text: ev.subject }),
+        ev.location ? el("div", { class: "cal-event-loc truncate", text: ev.location }) : null));
+    });
+    grid.append(col);
+  });
+  wrap.append(grid);
+  body.append(wrap);
+}
+function calRenderAgenda(body) {
+  const cur = Cal.cursor;
+  $("#cal-label").textContent = MONTHS[cur.getMonth()] + " " + cur.getFullYear();
+  const evs = Cal.events.slice().sort((a, b) => a.start - b.start);
+  if (!evs.length) { body.append(el("div", { class: "empty" }, el("h3", { text: "No events" }))); return; }
+  const box = el("div", { class: "cal-agenda" });
+  let lastKey = null;
+  evs.forEach(ev => {
+    const key = ymd(ev.start);
+    if (key !== lastKey) {
+      lastKey = key;
+      box.append(el("div", { class: "cal-agenda-day" },
+        el("b", { text: ev.start.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" }) }),
+        ymd(ev.start) === ymd(new Date()) ? el("span", { class: "pill info", style: "margin-left:8px" }, "Today") : null));
+    }
+    box.append(el("button", { class: "cal-agenda-row", onclick: () => openEventSheet(ev) },
+      el("span", { class: "cal-agenda-time tnum", text: ev.allDay ? "All day" : hhmm(ev.start) + (ev.end ? "–" + hhmm(ev.end) : "") }),
+      el("span", { class: "cal-dot", style: "background:var(--svc-calendar)" }),
+      el("div", { class: "grow" }, el("div", { class: "truncate", text: ev.subject }),
+        ev.location ? el("div", { class: "dim truncate", style: "font-size:12px" }, icon("map-pin", "icon-sm"), ev.location) : null)));
+  });
+  body.append(box);
+}
+async function openEventSheet(ev) {
+  const q = { account: App.account, service: "calendar", id: ev.it.remote_id };
+  const content = el("div", { class: "body" }, el("div", { class: "spinner" }));
+  const scrim = el("div", { class: "scrim", onclick: closeSheet });
+  const sheet = el("aside", { class: "sheet" },
+    el("header", {}, el("h2", { class: "grow truncate", text: ev.subject }),
+      el("button", { class: "btn ghost sm icon-only", onclick: closeSheet }, icon("x", "icon-sm"))),
+    content);
+  sheetEl = el("div", {}, scrim, sheet); document.body.append(sheetEl);
+  // structured detail rendered via textContent only (never innerHTML on cloud data)
+  const kv = el("dl", { class: "kv" });
+  const add = (k, v, ic) => { if (!v) return; kv.append(el("dt", {}, ic ? icon(ic, "icon-sm") : null, el("span", { text: k })), el("dd", { text: v })); };
+  add("When", ev.allDay ? ev.start.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", year: "numeric" }) + " · all day"
+    : fmtFullDate(ev.start) + (ev.end ? " – " + hhmm(ev.end) : ""), "clock");
+  add("Location", ev.location, "map-pin");
+  try {
+    const full = await api("/api/v1/body?" + qs(q));
+    const org = ((full.organizer || {}).emailAddress || {});
+    add("Organizer", org.name || org.address, "users");
+    const att = (full.attendees || []).map(a => (a.emailAddress || {}).name || (a.emailAddress || {}).address).filter(Boolean);
+    if (att.length) add("Attendees", att.join(", "), "users");
+    // event description is HTML → extract plain text safely (DOMParser runs no scripts, loads nothing)
+    const html = (full.body || {}).content || "";
+    if (html) {
+      const txt = new DOMParser().parseFromString(html, "text/html").body.textContent.trim();
+      if (txt) { clear(content).append(kv, el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: txt.slice(0, 4000) })); }
+      else clear(content).append(kv);
+    } else clear(content).append(kv);
+  } catch { clear(content).append(kv); }
+  content.append(el("a", { class: "btn ghost sm", style: "margin-top:16px", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open full event"));
+}
+let sheetEl = null;
+function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
+
 /* ---------------------------------------------------------------- actions */
 async function doRestore(it, btn) {
   if (!confirm(`Restore this ${it.service} item to the cloud as a new copy?`)) return;
@@ -792,6 +983,7 @@ async function init() {
   window.addEventListener("hashchange", onRoute);
   window.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+    else if (e.key === "Escape" && sheetEl) closeSheet();
   });
   try {
     const d = await api("/api/v1/accounts");
