@@ -93,7 +93,7 @@ function rowsHtml(items) {
       ? `<a href="#" onclick="doRestore('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">restore</a>`
       : "—";
     const shareCell = (SHARE_CAP_TOKEN && SHAREABLE.includes(it.service))
-      ? `<a href="#" onclick="doShare('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">share</a>`
+      ? `<a href="#" onclick="doShare('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">share</a> · <a href="#" onclick="doInvite('${escapeJs(it.service)}','${escapeJs(it.remote_id)}',this);return false">invite</a>`
       : "—";
     return `<tr>
       <td><span class="badge">${it.item_type}</span></td>
@@ -135,6 +135,22 @@ async function doShare(service, id, el) {
       if (el) el.outerHTML = `<a href="${escapeHtml(d.webUrl)}" target="_blank" rel="noopener" title="copied to clipboard">link ✓</a>`;
     } else { if (el) el.textContent = "share"; alert("Share failed: " + (d.error || r.status)); }
   } catch (e) { if (el) el.textContent = "share"; alert("Share failed: " + e); }
+}
+
+// Invite named people by email (#504). Prompts for address(es) + read/write, then
+// POSTs to the share endpoint in invite mode (the daemon sends the invitation).
+async function doInvite(service, id, el) {
+  const emails = prompt("Invite by email — address(es), comma-separated:");
+  if (!emails) return;
+  const role = confirm("Allow editing (read-write)?\nOK = can edit · Cancel = view only") ? "write" : "read";
+  if (el) el.textContent = "…";
+  const q = `account=${encodeURIComponent(account)}&service=${encodeURIComponent(service)}&id=${encodeURIComponent(id)}&email=${encodeURIComponent(emails)}&role=${role}`;
+  try {
+    const r = await fetch(`/api/v1/share?${q}`, { method: "POST", headers: { "X-Capability-Token": SHARE_CAP_TOKEN } });
+    const d = await r.json();
+    if (r.ok) { if (el) { el.textContent = `invited ✓ (${role})`; el.removeAttribute("onclick"); } }
+    else { if (el) el.textContent = "invite"; alert("Invite failed: " + (d.error || r.status)); }
+  } catch (e) { if (el) el.textContent = "invite"; alert("Invite failed: " + e); }
 }
 
 const EMPTY_ROW = '<tr><td colspan="6" class="muted">No items.</td></tr>';
