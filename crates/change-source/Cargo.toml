@@ -9,6 +9,9 @@ authors.workspace = true
 
 [dependencies]
 notify = "8.2.0"
+# `ChangeSource` config enum (backend selection). core has no dep on this crate,
+# so this edge is acyclic.
+isyncyou-core = { path = "../core" }
 
 # fanotify (privileged, mount-wide server backend) uses raw Linux syscalls.
 [target.'cfg(target_os = "linux")'.dependencies]

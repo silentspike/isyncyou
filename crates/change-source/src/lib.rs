@@ -8,11 +8,13 @@
 #[cfg(target_os = "linux")]
 pub mod fanotify;
 pub mod reconcile;
+pub mod source;
 pub mod watch;
 pub mod watcher;
 
 #[cfg(target_os = "linux")]
 pub use fanotify::FanotifyWatcher;
 pub use reconcile::{reconcile, Entry, ReconcileChange};
+pub use source::{decide, select_change_source, ChangeSource, Decision, Watcher};
 pub use watch::FsWatcher;
 pub use watcher::{Coalescer, FsChange, RawEvent};
