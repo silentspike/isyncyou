@@ -373,6 +373,10 @@ a:hover { text-decoration: underline; }
 .donut-seg { transition: stroke-dashoffset var(--t-slow) var(--ease); }
 @keyframes bar-grow { from { transform: scaleY(0); } }
 .bar { transform-origin: bottom; animation: bar-grow var(--t-slow) var(--ease-spring) backwards; }
+@keyframes bar-grow-x { from { width: 0; } }
+.bar-fill { border-radius: var(--r-full); animation: bar-grow-x var(--t-slow) var(--ease-spring) backwards; }
+@keyframes spark-draw { from { opacity: 0; } }
+.spark-line, .spark-area { animation: spark-draw var(--t-slow) var(--ease) backwards; }
 .spark-line { fill: none; stroke: var(--accent); stroke-width: 2; }
 .spark-area { fill: var(--accent-soft); }
 .progress-track { fill: var(--bg-3); }
