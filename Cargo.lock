@@ -1554,6 +1554,7 @@ dependencies = [
 name = "isyncyou-change-source"
 version = "0.1.0"
 dependencies = [
+ "isyncyou-core",
  "libc",
  "notify",
  "tempfile",
