@@ -361,6 +361,36 @@ impl isyncyou_webui::ShareHandler for DaemonShare {
             .create_link(id, link_type, scope, None, None, None)
             .map_err(|e| e.to_string())
     }
+    fn invite(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+        emails: &[String],
+        role: &str,
+    ) -> Result<String, String> {
+        if service != "onedrive" {
+            return Err(format!(
+                "sharing is only supported for OneDrive items, not '{service}'"
+            ));
+        }
+        let roles: &[&str] = if role == "write" {
+            &["write"]
+        } else {
+            &["read"]
+        };
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
+        // Invite named people: require sign-in + send the invitation email.
+        isyncyou_graph::GraphClient::new(token)
+            .invite(id, emails, roles, true, true, "", None, None)
+            .map(|ids| {
+                format!(
+                    "invited {} recipient(s) ({role})",
+                    emails.len().max(ids.len())
+                )
+            })
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn unix_now() -> String {

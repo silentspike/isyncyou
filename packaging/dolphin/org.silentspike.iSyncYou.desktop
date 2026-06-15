@@ -9,7 +9,7 @@ Name=iSyncYou
 Icon=folder-sync
 Exec=isyncyou dolphin-status %f
 MimeType=all/all;
-Actions=Status;MakeAvailable;ShareView;ShareEdit;OpenWindow;
+Actions=Status;MakeAvailable;ShareView;ShareEdit;ShareInvite;OpenWindow;
 X-KDE-Submenu=iSyncYou
 X-KDE-Priority=TopLevel
 NoDisplay=true
@@ -39,6 +39,13 @@ Exec=isyncyou share %F
 Name=Share — copy edit link
 Icon=emblem-shared
 Exec=isyncyou share --type edit %F
+
+[Desktop Action ShareInvite]
+# Invite named people by email (#504): a kdialog wrapper prompts for the
+# address(es) + read/write, then runs `isyncyou share --email …`.
+Name=Share with people…
+Icon=contact-new
+Exec=isyncyou-share-invite %F
 
 [Desktop Action OpenWindow]
 Name=Open iSyncYou status window
