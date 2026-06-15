@@ -52,7 +52,8 @@ const ICONS = {
   "rotate-ccw": "M3 2v6h6M3.5 8a9 9 0 1 0 2.1-3.4L3 8",
   play: "M5 3l14 9-14 9z", pause: "M6 4h4v16H6zM14 4h4v16h-4z",
   "refresh-cw": "M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16",
-  x: "M18 6L6 18M6 6l12 12", "chevron-right": "M9 6l6 6-6 6",
+  x: "M18 6L6 18M6 6l12 12", "chevron-right": "M9 6l6 6-6 6", "chevron-left": "M15 6l-6 6 6 6",
+  paperclip: "M21.4 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48",
   "external-link": "M15 3h6v6M10 14L21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
   clock: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20M12 6v6l4 2",
 };
@@ -169,6 +170,19 @@ function fmtDate(s) {
   if (diff < 6048e5) return d.toLocaleDateString([], { weekday: "short" });
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
+function fmtFullDate(s) {
+  if (!s) return "";
+  const d = new Date(s); if (isNaN(d)) return s;
+  return d.toLocaleString([], { weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+// Parse an RFC 5322 address ("Name <user@host>" or bare "user@host").
+function parseAddr(s) {
+  if (!s) return { name: "", email: "" };
+  const m = String(s).match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/);
+  if (m) return { name: m[1].trim(), email: m[2].trim() };
+  return { name: "", email: String(s).trim() };
+}
+const addrLabel = (s) => { const a = parseAddr(s); return a.name || a.email || ""; };
 
 /* ---------------------------------------------------------------- services */
 const SERVICES = [
@@ -277,6 +291,7 @@ function onRoute() {
   renderShell();
   const view = $("#view");
   if (App.route === "overview") renderOverview(view);
+  else if (App.route === "mail") renderMailView(view);
   else renderServiceView(view, App.route);
 }
 
@@ -435,6 +450,132 @@ async function doServiceSearch(service) {
     if (!hits.length) { list.append(el("div", { class: "empty" }, el("h3", { text: "No matches" }))); }
     else hits.forEach(it => list.append(itemRow(it)));
     $("#svc-more").style.display = "none";
+  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Search failed" }), el("p", { text: e.message }))); }
+}
+
+/* ---------------------------------------------------------------- mail (bespoke 3-pane client) */
+// `offset` walks the raw /items page (which also contains mailbox folder rows);
+// `folders` accumulates the folder items we skip so the displayed count reflects
+// real messages (folders sort before messages, so the message total is exact).
+const Mail = { offset: 0, msgTotal: 0, folders: 0, selected: null };
+const MAIL_PAGE = 50;
+async function renderMailView(view) {
+  Mail.offset = 0; Mail.msgTotal = 0; Mail.folders = 0; Mail.selected = null;
+  const rail = el("aside", { class: "mail-rail" },
+    el("div", { class: "mail-rail-head" }, icon("mail"), el("b", { text: "Mailbox" })),
+    el("input", { id: "mail-search", class: "input", placeholder: "Search mail…",
+      onkeydown: (e) => { if (e.key === "Enter") mailSearch(); } }),
+    el("nav", { class: "mail-folders" },
+      el("button", { class: "mail-folder active", onclick: () => { $("#mail-search").value = ""; mailReload(); } },
+        icon("mail", "icon-sm"), el("span", { class: "grow", text: "All messages" }),
+        el("span", { id: "mail-total", class: "count tnum", text: App.counts.mail != null ? String(App.counts.mail) : "·" }))),
+    el("div", { class: "spacer" }),
+    el("p", { class: "mail-rail-foot dim", text: "Archived & read-only. Restore re-creates a copy in your mailbox." }),
+  );
+  const list = el("div", { id: "mail-list", class: "mail-list" });
+  const reader = el("div", { id: "mail-reader", class: "mail-reader" });
+  const layout = el("div", { id: "mail-layout", class: "mail-layout" }, rail, list, reader);
+  clear(view).append(layout);
+  renderMailReader(null);
+  await mailLoadPage(true);
+}
+function mailReload() { Mail.offset = 0; Mail.msgTotal = 0; Mail.folders = 0; Mail.selected = null; renderMailReader(null); $("#mail-layout")?.classList.remove("reading"); mailLoadPage(true); }
+async function mailLoadPage(reset) {
+  const list = $("#mail-list"); if (!list) return;
+  const old = list.querySelector(".mail-more"); if (old) old.remove();
+  if (reset) { clear(list); for (let i = 0; i < 8; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:40px" }))); }
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: MAIL_PAGE, offset: Mail.offset }));
+    const all = d.items || [];
+    const msgs = all.filter(it => it.item_type === "message");      // hide mailbox folder rows
+    Mail.folders += all.length - msgs.length;
+    Mail.offset += all.length;                                      // advance over the raw page
+    const apiTotal = d.total ?? 0;
+    Mail.msgTotal = Math.max(0, apiTotal - Mail.folders);           // exact: folders sort first
+    if (reset) clear(list);
+    const t = $("#mail-total"); if (t) t.textContent = String(Mail.msgTotal);
+    if (reset && !msgs.length) {
+      if (Mail.offset < apiTotal) return mailLoadPage(false);       // page held only folders → keep going
+      list.append(el("div", { class: "empty" }, icon("mail", "icon-lg"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." })));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    msgs.forEach(it => frag.append(mailRow(it)));
+    list.append(frag);
+    if (Mail.offset < apiTotal)
+      list.append(el("div", { class: "mail-more" }, el("button", { class: "btn ghost sm", onclick: () => mailLoadPage(false) }, "Load more")));
+  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
+}
+function mailRow(it) {
+  const p = it.preview || {};
+  const from = addrLabel(p.from);
+  const subject = p.subject || it.name || "(no subject)";
+  const when = p.date || it.remote_mtime;
+  return el("button", {
+    class: "mail-item" + (Mail.selected && Mail.selected.remote_id === it.remote_id ? " active" : ""),
+    dataset: { id: it.remote_id }, onclick: () => mailSelect(it),
+  },
+    el("span", { class: "avatar mail-av", text: initials(from || subject) }),
+    el("div", { class: "grow" },
+      el("div", { class: "mi-top" },
+        el("span", { class: "mi-from truncate", text: from || "(unknown sender)" }),
+        el("span", { class: "mi-date dim tnum", text: fmtDate(when) })),
+      el("div", { class: "mi-subject truncate" }, subject,
+        p.has_html ? el("span", { class: "mi-flag", title: "Rich HTML message" }, icon("paperclip", "icon-sm")) : null),
+      el("div", { class: "mi-snippet truncate dim", text: p.snippet || "" })),
+  );
+}
+function mailSelect(it) {
+  Mail.selected = it;
+  document.querySelectorAll(".mail-item").forEach(r => r.classList.toggle("active", r.dataset.id === it.remote_id));
+  $("#mail-layout")?.classList.add("reading");
+  renderMailReader(it);
+}
+function mailBack() { Mail.selected = null; $("#mail-layout")?.classList.remove("reading"); document.querySelectorAll(".mail-item.active").forEach(r => r.classList.remove("active")); renderMailReader(null); }
+function renderMailReader(it) {
+  const box = $("#mail-reader"); if (!box) return;
+  clear(box);
+  if (!it) {
+    box.append(el("div", { class: "empty mail-reader-empty" }, logoGlyph(64),
+      el("h3", { text: "Select a message" }), el("p", { text: "Choose a message from the list to read it here." })));
+    return;
+  }
+  const p = it.preview || {};
+  const from = parseAddr(p.from);
+  const subject = p.subject || it.name || "(no subject)";
+  const when = p.date || it.remote_mtime;
+  const q = { account: App.account, service: "mail", id: it.remote_id };
+  const actions = el("div", { class: "mr-actions" },
+    el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
+  if (CAP.restore)
+    actions.append(el("button", { class: "btn ghost sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
+  const head = el("header", { class: "mail-reader-head" },
+    el("button", { class: "mail-back btn ghost sm", title: "Back to list", onclick: mailBack }, icon("chevron-left", "icon-sm")),
+    el("div", { class: "grow", style: "min-width:0" },
+      el("h2", { class: "mr-subject", text: subject }),
+      el("div", { class: "mr-meta" },
+        el("span", { class: "avatar mail-av", text: initials(from.name || from.email || subject) }),
+        el("div", { class: "grow", style: "min-width:0" },
+          el("div", { class: "mr-from truncate" }, el("b", { text: from.name || from.email || "(unknown sender)" }),
+            from.name && from.email ? el("span", { class: "dim", text: " <" + from.email + ">" }) : null),
+          (p.to && p.to.length) ? el("div", { class: "mr-to dim truncate", text: "To: " + p.to.join(", ") }) : null),
+        el("span", { class: "mr-date dim tnum", text: fmtFullDate(when) }))),
+    actions);
+  // The body is untrusted HTML; it stays isolated in a same-origin iframe that the
+  // server locks down with MAIL_CSP (no scripts, no remote fetch, data: images only).
+  const frame = el("iframe", { class: "mail-frame", src: `/api/v1/view?${qs(q)}`, title: "Message body", loading: "lazy" });
+  box.append(head, frame);
+}
+async function mailSearch() {
+  const q = $("#mail-search").value.trim();
+  if (!q) return mailReload();
+  const list = $("#mail-list"); clear(list);
+  Mail.selected = null; renderMailReader(null); $("#mail-layout")?.classList.remove("reading");
+  try {
+    const d = await api("/api/v1/search?" + qs({ account: App.account, q }));
+    const hits = (d.hits || []).filter(h => h.service === "mail");
+    if (!hits.length) { list.append(el("div", { class: "empty" }, el("h3", { text: "No matches" }), el("p", { text: `Nothing in mail matches “${q}”.` }))); return; }
+    hits.forEach(it => list.append(mailRow(it)));
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Search failed" }), el("p", { text: e.message }))); }
 }
 

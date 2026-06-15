@@ -760,7 +760,43 @@ impl Router {
         };
         match store.items_by_service_page(account, service, limit, offset) {
             Ok(items) => {
-                let arr: Vec<Value> = items.iter().map(item_json).collect();
+                // Mail rows are enriched with a read-only preview (sender, snippet,
+                // date, has-html) parsed from the archived `.eml` on disk, so the
+                // 3-pane mail client can render a rich list without an extra request
+                // per message. Additive + best-effort: items without a readable body
+                // simply carry no `preview` object. Bounded by the page size.
+                let arr: Vec<Value> = if service == "mail" {
+                    let archive_root = self
+                        .config
+                        .accounts
+                        .iter()
+                        .find(|a| a.id == account)
+                        .map(|a| a.archive_root.clone());
+                    items
+                        .iter()
+                        .map(|it| {
+                            let mut v = item_json(it);
+                            if let (Some(root), Some(rel)) =
+                                (archive_root.as_ref(), it.local_path.as_ref())
+                            {
+                                if let Some(bytes) = read_under_root(root, rel) {
+                                    let p = isyncyou_connectors::mail_preview(&bytes);
+                                    v["preview"] = json!({
+                                        "from": p.from,
+                                        "to": p.to,
+                                        "subject": p.subject,
+                                        "snippet": p.body_snippet,
+                                        "date": p.date,
+                                        "has_html": p.has_html,
+                                    });
+                                }
+                            }
+                            v
+                        })
+                        .collect()
+                } else {
+                    items.iter().map(item_json).collect()
+                };
                 ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
@@ -1009,6 +1045,19 @@ fn item_json(it: &Item) -> Value {
         "size": it.size,
         "has_body": it.local_path.is_some(),
     })
+}
+
+/// Best-effort read of an archived body file that must stay under `archive_root`
+/// (defends against `..`/symlink traversal, like [`Router::read_archived`]).
+/// Returns `None` on any failure so callers can degrade gracefully. Used to
+/// enrich the mail listing with previews.
+fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>> {
+    let root = archive_root.canonicalize().ok()?;
+    let p = archive_root.join(rel).canonicalize().ok()?;
+    if !p.starts_with(&root) {
+        return None;
+    }
+    std::fs::read(&p).ok()
 }
 
 #[cfg(test)]
@@ -1756,6 +1805,68 @@ mod tests {
             .unwrap();
         assert_eq!(m1["has_body"], true);
         assert_eq!(m1["parent_remote_id"], "F1");
+    }
+
+    #[test]
+    fn items_mail_carries_preview_from_archived_eml() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("mail/aa/bb")).unwrap();
+        // a realistic multipart/alternative message (plain + html)
+        let eml = b"From: Ada Lovelace <ada@example.com>\r\n\
+To: Bob Builder <bob@example.com>\r\n\
+Subject: Quarterly report\r\n\
+Date: Mon, 02 Jun 2025 10:00:00 +0000\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=\"BOUND\"\r\n\
+\r\n\
+--BOUND\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Numbers look great this quarter.\r\n\
+--BOUND\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<html><body><p>Numbers look great this quarter.</p></body></html>\r\n\
+--BOUND--\r\n";
+        std::fs::write(arch.join("mail/aa/bb/m.eml"), eml).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut m = Item::new("a", "mail", "m1", "Quarterly report", "message");
+            m.local_path = Some("mail/aa/bb/m.eml".into());
+            store.upsert_item(&m).unwrap();
+            // an item whose body file is absent → still listed, just without a preview
+            let mut m2 = Item::new("a", "mail", "m2", "No body", "message");
+            m2.local_path = Some("mail/zz/zz/missing.eml".into());
+            store.upsert_item(&m2).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let v = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail")));
+        let items = v["items"].as_array().unwrap();
+        let m1 = items.iter().find(|i| i["remote_id"] == "m1").unwrap();
+        let p = &m1["preview"];
+        assert_eq!(p["from"], "Ada Lovelace <ada@example.com>");
+        assert_eq!(p["subject"], "Quarterly report");
+        assert_eq!(p["has_html"], true);
+        assert_eq!(p["to"][0], "Bob Builder <bob@example.com>");
+        assert_eq!(p["date"], "Mon, 02 Jun 2025 10:00:00 +0000");
+        assert!(p["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Numbers look great this quarter"));
+        // the item with a missing body file is still listed but carries no preview
+        let m2 = items.iter().find(|i| i["remote_id"] == "m2").unwrap();
+        assert!(m2.get("preview").is_none());
     }
 
     #[test]
