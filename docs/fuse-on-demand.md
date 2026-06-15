@@ -92,7 +92,13 @@ isyncyou share --revoke <permission-id> <path>    # un-share
 - In link mode the link is printed to stdout **and** copied to the clipboard
   (`wl-copy`/`xclip`, best-effort) with one desktop notification.
 - The Dolphin ServiceMenu binds `ShareView` (`isyncyou share %F`) and `ShareEdit`
-  (`isyncyou share --type edit %F`).
+  (`isyncyou share --type edit %F`); **"Share with people…"** runs a `kdialog`
+  wrapper (`isyncyou-share-invite`) that prompts for email address(es) + a
+  read/write choice, then invites via `isyncyou share --email`. The web UI offers
+  the same invite per OneDrive item (#504).
+- Run from a GUI launcher, `isyncyou share` finds its config at
+  `~/.config/isyncyou/isyncyou.toml` (the systemd-unit location) when invoked
+  without `--config` from another working directory.
 
 **Personal-account limits (honest):** the OneDrive **root** itself is not shareable
 (select a file/folder inside it); `createLink` is **idempotent** per `(type, scope)`

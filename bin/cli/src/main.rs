@@ -1150,9 +1150,41 @@ fn selected_socket(_tcp: bool, _socket: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
-    let cfg = Config::load(path)?;
+    let cfg = Config::load(resolve_config_path(path))?;
     cfg.validate().map_err(|errs| errs.join("; "))?;
     Ok(cfg)
+}
+
+/// Resolve the config path. If the given path doesn't exist and it's the bare
+/// default name (`isyncyou.toml`, no directory), fall back to the standard
+/// per-user location `$XDG_CONFIG_HOME/isyncyou/isyncyou.toml` (≈ `~/.config/...`,
+/// where the systemd unit + setup docs put it). This lets a GUI launch (the
+/// Dolphin ServiceMenu's `isyncyou share %F`) find the config regardless of the
+/// working directory. An explicit `--config <path>` is always honored as-is.
+fn resolve_config_path(path: &Path) -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    resolve_config_path_in(path, base)
+}
+
+/// [`resolve_config_path`] with the config base directory injected (for tests,
+/// so they need no `$HOME`/`$XDG_CONFIG_HOME` mutation).
+fn resolve_config_path_in(path: &Path, config_base: Option<PathBuf>) -> PathBuf {
+    let is_bare_default = path
+        .parent()
+        .map(|p| p.as_os_str().is_empty())
+        .unwrap_or(true);
+    if path.exists() || !is_bare_default {
+        return path.to_path_buf();
+    }
+    if let Some(base) = config_base {
+        let xdg = base.join("isyncyou").join("isyncyou.toml");
+        if xdg.exists() {
+            return xdg;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Store path for an account: `<archive_root>/.isyncyou-store.db`.
@@ -3068,6 +3100,35 @@ mod tests {
         let outside = dir.join("elsewhere.txt");
         std::fs::write(&outside, b"x").unwrap();
         assert!(owning_account_for_path(&cfg, &outside).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_xdg_for_bare_default() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cfgres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("isyncyou")).unwrap();
+        let xdg_cfg = dir.join("isyncyou").join("isyncyou.toml");
+        std::fs::write(&xdg_cfg, b"").unwrap();
+
+        // bare default name that doesn't exist in CWD → resolves to the XDG copy
+        assert_eq!(
+            resolve_config_path_in(Path::new("isyncyou.toml"), Some(dir.clone())),
+            xdg_cfg
+        );
+        // bare default but no XDG copy present → returns the input unchanged
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            resolve_config_path_in(Path::new("isyncyou.toml"), Some(empty)),
+            Path::new("isyncyou.toml")
+        );
+        // an explicit path with a directory is ALWAYS honored as-is (even if missing)
+        let explicit = dir.join("custom").join("c.toml");
+        assert_eq!(
+            resolve_config_path_in(&explicit, Some(dir.clone())),
+            explicit
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
