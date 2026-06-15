@@ -70,6 +70,7 @@ const ICONS = {
   flag: "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7",
   circle: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
   check: "M20 6L9 17l-5-5",
+  settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -257,10 +258,11 @@ function renderShell() {
     el("div", { id: "sync-widget", class: "sync-widget" }),
   );
   const topbar = el("header", { class: "topbar" },
-    el("div", { class: "crumbs" }, el("b", { text: (SERVICES.find(s => s.id === App.route) || {}).label || "iSyncYou" })),
+    el("div", { class: "crumbs" }, el("b", { text: routeLabel(App.route) })),
     el("div", { class: "spacer" }),
     el("button", { class: "search-trigger", onclick: openPalette },
       icon("search", "icon-sm"), el("span", { class: "label-text", text: "Search everything" }), el("span", { class: "kbd", text: "⌘K" })),
+    el("button", { class: "topbar-btn" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") }, icon("settings", "icon-sm")),
   );
   const main = el("main", { class: "main" }, topbar, el("div", { id: "view", class: "view" }));
   const app = clear($("#app"));
@@ -304,9 +306,13 @@ function updateNavCounts() {
 
 /* ---------------------------------------------------------------- router */
 function go(route) { location.hash = "#/" + route; }
+const EXTRA_ROUTES = { search: "Search", settings: "Settings" };
+const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
-  App.route = (location.hash.replace(/^#\//, "") || "overview").split("?")[0];
-  if (!SERVICES.find(s => s.id === App.route)) App.route = "overview";
+  const raw = location.hash.replace(/^#\//, "") || "overview";
+  App.route = raw.split("?")[0];
+  App.query = (raw.split("?")[1] || "").replace(/^q=/, "");
+  if (!SERVICES.find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
   renderShell();
   const view = $("#view");
   if (App.route === "overview") renderOverview(view);
@@ -316,6 +322,8 @@ function onRoute() {
   else if (App.route === "contacts") renderContactsView(view);
   else if (App.route === "todo") renderTodoView(view);
   else if (App.route === "onenote") renderOnenoteView(view);
+  else if (App.route === "search") renderSearchView(view);
+  else if (App.route === "settings") renderSettingsView(view);
   else renderServiceView(view, App.route);
 }
 
@@ -520,7 +528,7 @@ async function mailLoadPage(reset) {
     const t = $("#mail-total"); if (t) t.textContent = String(Mail.msgTotal);
     if (reset && !msgs.length) {
       if (Mail.offset < apiTotal) return mailLoadPage(false);       // page held only folders → keep going
-      list.append(el("div", { class: "empty" }, icon("mail", "icon-lg"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." })));
+      list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." })));
       return;
     }
     const frag = document.createDocumentFragment();
@@ -672,7 +680,7 @@ function driveSort(items) {
 }
 function driveRender() {
   const body = $("#drive-body"); if (!body) return; clear(body);
-  if (!Drive.items.length) { body.append(el("div", { class: "empty" }, icon("folder", "icon-lg"), el("h3", { text: "Empty folder" }), el("p", { text: "Nothing is archived here." }))); return; }
+  if (!Drive.items.length) { body.append(el("div", { class: "empty" }, emptyArt("empty-files"), el("h3", { text: "Empty folder" }), el("p", { text: "Nothing is archived here." }))); return; }
   const items = driveSort(Drive.items);
   if (Drive.layout === "grid") {
     const grid = el("div", { class: "drive-grid stagger" });
@@ -792,7 +800,7 @@ function eventsForDay(day) {
 }
 function calRender() {
   const body = $("#cal-body"); if (!body) return; clear(body);
-  if (!Cal.events.length && Cal.view === "agenda") { body.append(el("div", { class: "empty" }, icon("calendar", "icon-lg"), el("h3", { text: "No events archived" }), el("p", { text: "Run a backup to populate your calendar." }))); return; }
+  if (!Cal.events.length && Cal.view === "agenda") { body.append(el("div", { class: "empty" }, emptyArt("empty-calendar"), el("h3", { text: "No events archived" }), el("p", { text: "Run a backup to populate your calendar." }))); return; }
   if (Cal.view === "month") calRenderMonth(body);
   else if (Cal.view === "week") calRenderWeek(body);
   else calRenderAgenda(body);
@@ -940,7 +948,7 @@ function contactsFilter() {
 }
 function contactsRender(list) {
   const grid = clear($("#con-grid")), az = clear($("#con-az"));
-  if (!list.length) { grid.append(el("div", { class: "empty" }, icon("users", "icon-lg"), el("h3", { text: "No contacts" }), el("p", { text: "Run a backup to populate your contacts." }))); return; }
+  if (!list.length) { grid.append(el("div", { class: "empty" }, emptyArt("empty-contacts"), el("h3", { text: "No contacts" }), el("p", { text: "Run a backup to populate your contacts." }))); return; }
   const seen = new Set();
   grid.classList.add("stagger");
   list.forEach(it => {
@@ -1002,7 +1010,7 @@ async function renderTodoView(view) {
 }
 function todoRender() {
   const board = clear($("#todo-board"));
-  if (!Todo.lists.length && !Todo.tasks.length) { board.append(el("div", { class: "empty" }, icon("check-square", "icon-lg"), el("h3", { text: "No tasks" }), el("p", { text: "Run a backup to populate your task lists." }))); return; }
+  if (!Todo.lists.length && !Todo.tasks.length) { board.append(el("div", { class: "empty" }, emptyArt("empty-tasks"), el("h3", { text: "No tasks" }), el("p", { text: "Run a backup to populate your task lists." }))); return; }
   // group tasks by their parent list; tasks whose list is unknown go to "Tasks"
   const byList = new Map(Todo.lists.map(l => [l.remote_id, []]));
   const orphan = [];
@@ -1065,7 +1073,7 @@ async function renderOnenoteView(view) {
     const pages = (d.items || []).filter(it => it.item_type === "page");
     App.counts.onenote = d.total ?? pages.length; updateNavCounts();
     clear(list);
-    if (!pages.length) { list.append(el("div", { class: "empty" }, icon("notebook", "icon-lg"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
+    if (!pages.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-notes"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
     pages.forEach((it, i) => {
       const row = el("button", { class: "note-item", dataset: { id: it.remote_id }, onclick: () => noteSelect(it) },
         icon("notebook"), el("div", { class: "grow", style: "min-width:0" },
@@ -1099,6 +1107,90 @@ function openSheet(title, contentEl, leading) {
       el("button", { class: "btn ghost sm icon-only", onclick: closeSheet }, icon("x", "icon-sm"))),
     contentEl);
   sheetEl = el("div", {}, scrim, sheet); document.body.append(sheetEl);
+}
+
+/* ---------------------------------------------------------------- empty-state art (curated in-code line-art SVG) */
+// Hand-authored, cohesive line-art illustrations: stroke=currentColor (tinted by
+// .empty-art) over one soft accent-gradient blob each (unique gradient id). No
+// script/remote refs — embedded as trusted in-code SVG (like logoGlyph).
+const EMPTY_ART = {
+  "empty-mail": '<svg viewBox="0 0 220 160" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ea-m" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><ellipse cx="110" cy="84" rx="72" ry="46" fill="url(#ea-m)" opacity="0.14"/><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="60" y="54" width="100" height="64" rx="9"/><path d="M60 62l50 36 50-36"/></g></svg>',
+  "empty-files": '<svg viewBox="0 0 220 160" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ea-f" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><ellipse cx="110" cy="86" rx="72" ry="44" fill="url(#ea-f)" opacity="0.14"/><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M58 58h30l9 11h65v44a6 6 0 0 1-6 6H64a6 6 0 0 1-6-6z"/><path d="M58 80h104"/></g></svg>',
+  "empty-calendar": '<svg viewBox="0 0 220 160" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ea-c" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><ellipse cx="110" cy="86" rx="70" ry="46" fill="url(#ea-c)" opacity="0.14"/><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="64" y="52" width="92" height="72" rx="9"/><path d="M64 72h92M86 46v12M134 46v12"/></g><g fill="currentColor" opacity="0.5"><circle cx="86" cy="90" r="3"/><circle cx="110" cy="90" r="3"/><circle cx="134" cy="90" r="3"/><circle cx="86" cy="108" r="3"/><circle cx="110" cy="108" r="3"/></g></svg>',
+  "empty-contacts": '<svg viewBox="0 0 220 160" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ea-u" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><ellipse cx="110" cy="86" rx="72" ry="44" fill="url(#ea-u)" opacity="0.14"/><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="58" y="54" width="104" height="64" rx="10"/><circle cx="88" cy="82" r="11"/><path d="M72 106a16 16 0 0 1 32 0"/><path d="M120 78h28M120 92h20"/></g></svg>',
+  "empty-tasks": '<svg viewBox="0 0 220 160" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ea-t" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><ellipse cx="110" cy="86" rx="66" ry="46" fill="url(#ea-t)" opacity="0.14"/><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="72" y="50" width="76" height="74" rx="8"/><rect x="94" y="44" width="32" height="14" rx="4"/><path d="M84 80l7 7 14-15"/><path d="M114 82h22M84 104h44"/></g></svg>',
+  "empty-notes": '<svg viewBox="0 0 220 160" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ea-n" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><ellipse cx="110" cy="86" rx="64" ry="46" fill="url(#ea-n)" opacity="0.14"/><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="74" y="48" width="76" height="76" rx="6"/><path d="M90 48v76"/><path d="M100 70h40M100 86h40M100 102h26"/></g></svg>',
+  "empty-search": '<svg viewBox="0 0 220 160" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ea-s" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><ellipse cx="110" cy="84" rx="68" ry="46" fill="url(#ea-s)" opacity="0.14"/><g fill="currentColor" opacity="0.4"><circle cx="78" cy="58" r="2.5"/><circle cx="142" cy="64" r="2.5"/><circle cx="150" cy="104" r="2.5"/><circle cx="72" cy="106" r="2.5"/></g><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="102" cy="78" r="26"/><path d="M121 97l18 18"/></g></svg>',
+};
+function emptyArt(name, fallbackIcon) {
+  if (EMPTY_ART[name]) return el("div", { class: "empty-art", html: EMPTY_ART[name] }); // trusted in-code SVG only
+  return icon(fallbackIcon || "search", "icon-lg");
+}
+
+/* ---------------------------------------------------------------- search (global results) */
+async function renderSearchView(view) {
+  const q0 = App.query ? decodeURIComponent(App.query) : "";
+  clear(view).append(
+    el("h1", { class: "view-title", text: "Search" }),
+    el("div", { class: "view-sub" }, el("input", {
+      id: "search-input", class: "input", style: "max-width:560px", placeholder: "Search across all services…", value: q0,
+      onkeydown: (e) => { if (e.key === "Enter") go("search?q=" + encodeURIComponent(e.target.value.trim())); },
+    })),
+    el("div", { id: "search-results" }),
+  );
+  const inp = $("#search-input"); inp.focus(); try { inp.setSelectionRange(q0.length, q0.length); } catch {}
+  if (q0) doSearch(q0);
+  else $("#search-results").append(el("div", { class: "empty" }, emptyArt("empty-search"), el("h3", { text: "Search your archive" }), el("p", { text: "Find mail, files, events, contacts, tasks and notes." })));
+}
+async function doSearch(q) {
+  const box = clear($("#search-results")); box.append(el("div", { class: "spinner" }));
+  try {
+    const d = await api("/api/v1/search?" + qs({ account: App.account, q }));
+    const hits = d.hits || [];
+    clear(box);
+    if (!hits.length) { box.append(el("div", { class: "empty" }, emptyArt("empty-search"), el("h3", { text: "No matches" }), el("p", { text: `Nothing matches “${q}”.` }))); return; }
+    const groups = {};
+    hits.forEach(h => (groups[h.service] = groups[h.service] || []).push(h));
+    box.append(el("div", { class: "dim", style: "margin-bottom:12px", text: `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”` }));
+    SERVICES.forEach(s => {
+      const g = groups[s.id]; if (!g || !g.length) return;
+      box.append(el("h3", { class: "sb-section", style: "display:flex;align-items:center;gap:8px" }, icon(s.icon, "icon-sm"), `${s.label} (${g.length})`));
+      const list = el("div", { class: "card", style: "padding:0;overflow:hidden;margin-bottom:16px" });
+      g.forEach(h => list.append(searchRow(h)));
+      box.append(list);
+    });
+  } catch (e) { clear(box).append(el("div", { class: "empty" }, el("h3", { text: "Search failed" }), el("p", { text: e.message }))); }
+}
+function searchRow(h) {
+  const q = { account: App.account, service: h.service, id: h.remote_id };
+  return el("button", { class: "list-row search-row", onclick: () => h.has_body ? window.open(`/api/v1/view?${qs(q)}`, "_blank", "noopener") : go(h.service) },
+    el("span", { class: "avatar", style: `--svc:var(--svc-${h.service});background:color-mix(in oklab,var(--svc-${h.service}) 30%,var(--bg-3));width:30px;height:30px;font-size:11px`, text: initials(h.name) }),
+    el("div", { class: "grow" }, el("div", { class: "truncate", text: h.name || "(no name)" }), el("div", { class: "dim", style: "font-size:12px", text: h.item_type })),
+    el("span", { class: "badge", text: h.service }));
+}
+
+/* ---------------------------------------------------------------- settings */
+function kvList(rows) { const dl = el("dl", { class: "kv" }); rows.forEach(([k, v]) => dl.append(el("dt", { text: k }), el("dd", { text: v == null ? "—" : String(v) }))); return dl; }
+async function renderSettingsView(view) {
+  clear(view).append(el("h1", { class: "view-title", text: "Settings" }), el("p", { class: "view-sub", text: "Configuration and sync controls (read-only)." }));
+  const body = el("div", { class: "grid", style: "max-width:720px" }); view.append(body);
+  body.append(el("div", { class: "card" }, el("div", { class: "spinner" })));
+  try {
+    const [cfg, st] = await Promise.all([api("/api/v1/settings").catch(() => ({})), api("/api/v1/sync/state").catch(() => ({}))]);
+    const sy = cfg.sync || {}, acc = (cfg.accounts || []).find(a => a.id === App.account) || {};
+    clear(body);
+    body.append(el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Account" }),
+      kvList([["User", acc.username || App.account], ["Sync root", acc.sync_root], ["Archive root", acc.archive_root], ["Mount point", acc.mount_point || "—"]])));
+    const syncCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Sync" }),
+      kvList([["Scheduled", st.enabled ? (st.paused ? "paused" : "running") : "off"], ["Trash retention", (sy.trash_retention_days ?? "—") + " days"], ["Body index (FTS)", sy.body_index ? "on" : "off"], ["Change source", sy.change_source || "—"]]));
+    if (st.enabled && CAP.sync) syncCard.append(el("div", { style: "display:flex;gap:8px;margin-top:12px" },
+      el("button", { class: "btn", onclick: () => syncCmd("now") }, icon("refresh-cw", "icon-sm"), "Sync now"),
+      st.paused ? el("button", { class: "btn", onclick: () => syncCmd("resume") }, icon("play", "icon-sm"), "Resume") : el("button", { class: "btn", onclick: () => syncCmd("pause") }, icon("pause", "icon-sm"), "Pause")));
+    body.append(syncCard);
+    body.append(el("div", { class: "card", style: "display:flex;align-items:center;gap:16px" }, logoGlyph(48),
+      el("div", {}, el("div", { style: "font-size:16px;font-weight:700", html: "iSync<span style='background:var(--grad-accent);-webkit-background-clip:text;background-clip:text;color:transparent'>You</span>" }),
+        el("div", { class: "dim", text: "Microsoft 365 personal backup & archive" }))));
+  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load settings" }), el("p", { text: e.message }))); }
 }
 
 /* ---------------------------------------------------------------- actions */
@@ -1146,7 +1238,13 @@ function openPalette() {
       results.append(r);
     });
   };
-  const jumps = SERVICES.map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } }));
+  const jumps = [
+    ...SERVICES.map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } })),
+    { label: "Go to Settings", icon: "settings", run: () => { closePalette(); go("settings"); } },
+    { label: "Sync now", icon: "refresh-cw", run: () => { closePalette(); syncCmd("now"); } },
+    { label: "Pause sync", icon: "pause", run: () => { closePalette(); syncCmd("pause"); } },
+    { label: "Resume sync", icon: "play", run: () => { closePalette(); syncCmd("resume"); } },
+  ];
   renderRes(jumps);
   let timer;
   input.addEventListener("input", () => {
@@ -1154,9 +1252,10 @@ function openPalette() {
     if (!q) { sel = 0; return renderRes(jumps); }
     timer = setTimeout(async () => {
       const local = jumps.filter(j => j.label.toLowerCase().includes(q.toLowerCase()));
+      const full = { label: `Search everywhere for “${q}”`, icon: "search", run: () => { closePalette(); go("search?q=" + encodeURIComponent(q)); } };
       let hits = [];
       try { const d = await api("/api/v1/search?" + qs({ account: App.account, q })); hits = (d.hits || []).slice(0, 8).map(h => ({ label: h.name || "(no name)", icon: (SERVICES.find(s => s.id === h.service) || {}).icon, badge: h.service, run: () => { closePalette(); if (h.has_body) window.open(`/api/v1/view?${qs({ account: App.account, service: h.service, id: h.remote_id })}`, "_blank", "noopener"); else go(h.service); } })); } catch {}
-      sel = 0; renderRes([...local, ...hits]);
+      sel = 0; renderRes([full, ...local, ...hits]);
     }, 180);
   });
   input.addEventListener("keydown", (e) => {
