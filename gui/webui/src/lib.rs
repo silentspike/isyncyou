@@ -786,55 +786,74 @@ impl Router {
         };
         match store.items_by_service_page(account, service, limit, offset) {
             Ok(items) => {
-                // Mail and calendar rows are enriched with a read-only `preview`
-                // parsed from the archived body on disk, so the bespoke views render
-                // richly without an extra request per item. Additive + best-effort:
-                // items without a readable body simply carry no `preview`. Bounded by
-                // the page size. Mail = sender/snippet/date/has-html from the `.eml`;
-                // calendar = start/end/all-day/location from the event JSON.
-                let arr: Vec<Value> = if service == "mail" || service == "calendar" {
-                    let archive_root = self
-                        .config
-                        .accounts
-                        .iter()
-                        .find(|a| a.id == account)
-                        .map(|a| a.archive_root.clone());
-                    items
-                        .iter()
-                        .map(|it| {
-                            let mut v = item_json(it);
-                            if let (Some(root), Some(rel)) =
-                                (archive_root.as_ref(), it.local_path.as_ref())
-                            {
-                                if let Some(bytes) = read_under_root(root, rel) {
-                                    if service == "mail" {
-                                        let p = isyncyou_connectors::mail_preview(&bytes);
-                                        v["preview"] = json!({
-                                            "from": p.from,
-                                            "to": p.to,
-                                            "subject": p.subject,
-                                            "snippet": p.body_snippet,
-                                            "date": p.date,
-                                            "has_html": p.has_html,
-                                        });
-                                    } else if let Ok(ev) = serde_json::from_slice::<Value>(&bytes) {
-                                        v["preview"] = json!({
-                                            "start": ev["start"]["dateTime"],
-                                            "start_tz": ev["start"]["timeZone"],
-                                            "end": ev["end"]["dateTime"],
-                                            "end_tz": ev["end"]["timeZone"],
-                                            "all_day": ev["isAllDay"],
-                                            "location": ev["location"]["displayName"],
-                                        });
+                // Rows are enriched with a read-only `preview` parsed from the
+                // archived body on disk, so the bespoke views render richly without an
+                // extra request per item. Additive + best-effort: items without a
+                // readable body simply carry no `preview`. Bounded by the page size.
+                // mail = sender/snippet/date/has-html (.eml); the rest parse the
+                // archived JSON (calendar/contacts/todo).
+                let arr: Vec<Value> =
+                    if matches!(service, "mail" | "calendar" | "contacts" | "todo") {
+                        let archive_root = self
+                            .config
+                            .accounts
+                            .iter()
+                            .find(|a| a.id == account)
+                            .map(|a| a.archive_root.clone());
+                        items
+                            .iter()
+                            .map(|it| {
+                                let mut v = item_json(it);
+                                if let (Some(root), Some(rel)) =
+                                    (archive_root.as_ref(), it.local_path.as_ref())
+                                {
+                                    if let Some(bytes) = read_under_root(root, rel) {
+                                        if service == "mail" {
+                                            let p = isyncyou_connectors::mail_preview(&bytes);
+                                            v["preview"] = json!({
+                                                "from": p.from,
+                                                "to": p.to,
+                                                "subject": p.subject,
+                                                "snippet": p.body_snippet,
+                                                "date": p.date,
+                                                "has_html": p.has_html,
+                                            });
+                                        } else if let Ok(o) =
+                                            serde_json::from_slice::<Value>(&bytes)
+                                        {
+                                            v["preview"] = match service {
+                                                "calendar" => json!({
+                                                    "start": o["start"]["dateTime"],
+                                                    "start_tz": o["start"]["timeZone"],
+                                                    "end": o["end"]["dateTime"],
+                                                    "end_tz": o["end"]["timeZone"],
+                                                    "all_day": o["isAllDay"],
+                                                    "location": o["location"]["displayName"],
+                                                }),
+                                                "contacts" => json!({
+                                                    "company": o["companyName"],
+                                                    "job": o["jobTitle"],
+                                                    "email": o["emailAddresses"][0]["address"],
+                                                }),
+                                                _ => json!({
+                                                    "status": o["status"],
+                                                    "importance": o["importance"],
+                                                    "due": o["dueDateTime"]["dateTime"],
+                                                    "has_note": o["body"]["content"]
+                                                        .as_str()
+                                                        .map(|s| !s.trim().is_empty())
+                                                        .unwrap_or(false),
+                                                }),
+                                            };
+                                        }
                                     }
                                 }
-                            }
-                            v
-                        })
-                        .collect()
-                } else {
-                    items.iter().map(item_json).collect()
-                };
+                                v
+                            })
+                            .collect()
+                    } else {
+                        items.iter().map(item_json).collect()
+                    };
                 ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
@@ -977,6 +996,15 @@ impl Router {
                     view::MAIL_CSP,
                 );
             }
+        }
+        // A OneNote page is archived raw HTML → render through the same allowlist
+        // sanitizer (scripts removed, remote resources blocked) under MAIL_CSP.
+        if service == "onenote" {
+            let title = if name.is_empty() { "Note" } else { &name };
+            return ApiResponse::html_with_csp(
+                &view::note_page(title, &String::from_utf8_lossy(&bytes)),
+                view::MAIL_CSP,
+            );
         }
         ApiResponse::html_with_csp(
             &view::source_page(service, &String::from_utf8_lossy(&bytes)),
@@ -1969,6 +1997,60 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(p["end"], "2026-02-04T10:00:00.0000000");
         assert_eq!(p["all_day"], false);
         assert_eq!(p["location"], "Room 1");
+    }
+
+    #[test]
+    fn items_contacts_and_todo_carry_preview_from_archived_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("contacts/aa")).unwrap();
+        std::fs::create_dir_all(arch.join("todo/bb")).unwrap();
+        std::fs::write(
+            arch.join("contacts/aa/c.json"),
+            br#"{"displayName":"Ada Lovelace","companyName":"Analytical Engines",
+                 "jobTitle":"Mathematician",
+                 "emailAddresses":[{"address":"ada@example.com","name":"Ada"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            arch.join("todo/bb/t.json"),
+            br#"{"title":"Ship release","status":"inProgress","importance":"high",
+                 "dueDateTime":{"dateTime":"2026-03-01T00:00:00.0000000","timeZone":"UTC"},
+                 "body":{"content":"check the gate","contentType":"text"}}"#,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut c = Item::new("a", "contacts", "c1", "Ada Lovelace", "contact");
+            c.local_path = Some("contacts/aa/c.json".into());
+            store.upsert_item(&c).unwrap();
+            let mut t = Item::new("a", "todo", "t1", "Ship release", "task");
+            t.local_path = Some("todo/bb/t.json".into());
+            store.upsert_item(&t).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let c =
+            body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=contacts")));
+        let cp = &c["items"][0]["preview"];
+        assert_eq!(cp["company"], "Analytical Engines");
+        assert_eq!(cp["job"], "Mathematician");
+        assert_eq!(cp["email"], "ada@example.com");
+        let t = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=todo")));
+        let tp = &t["items"][0]["preview"];
+        assert_eq!(tp["status"], "inProgress");
+        assert_eq!(tp["importance"], "high");
+        assert_eq!(tp["due"], "2026-03-01T00:00:00.0000000");
+        assert_eq!(tp["has_note"], true);
     }
 
     #[test]
