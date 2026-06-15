@@ -454,6 +454,40 @@ a:hover { text-decoration: underline; }
 .mr-actions { display: flex; gap: var(--sp-2); flex: none; align-items: center; }
 .mail-frame { flex: 1; width: 100%; border: 0; background: var(--bg-0); }
 
+/* ============================================================ onedrive (file explorer) */
+.drive-bar { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-5); }
+.drive-crumbs { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; min-width: 0; }
+.drive-crumbs > .icon { color: var(--text-lo); }
+.crumb { display: inline-flex; align-items: center; gap: 6px; padding: 4px var(--sp-2); border: 0;
+  background: transparent; color: var(--text-mid); border-radius: var(--r-sm); font-size: var(--fs-md); }
+.crumb:hover { background: var(--bg-hover); color: var(--text-hi); }
+.crumb.cur { color: var(--text-hi); font-weight: 600; }
+.crumb .icon { color: var(--svc-onedrive); }
+.seg { display: flex; border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; flex: none; }
+.seg-btn { padding: 6px var(--sp-3); border: 0; background: var(--bg-2); color: var(--text-lo); display: grid; place-items: center; }
+.seg-btn:hover { color: var(--text-hi); }
+.seg-btn.active { background: var(--accent-soft); color: var(--text-hi); }
+
+.drive-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: var(--sp-4); }
+.drive-tile { display: flex; flex-direction: column; gap: var(--sp-2); cursor: pointer; position: relative; padding: var(--sp-3);
+  transition: border-color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease); }
+.drive-tile:hover { border-color: var(--line-2); transform: translateY(-2px); box-shadow: var(--sh-2); }
+.drive-thumb { height: 84px; display: grid; place-items: center; background: var(--bg-2); border-radius: var(--r-md); }
+.drive-thumb .icon { width: 38px; height: 38px; }
+.drive-thumb-img { height: 84px; width: 100%; object-fit: cover; border-radius: var(--r-md); background: var(--bg-2); display: block; }
+.drive-tile.is-folder .drive-thumb { background: color-mix(in oklab, var(--svc-onedrive) 18%, var(--bg-2)); color: var(--svc-onedrive); }
+.drive-name { font-size: var(--fs-md); font-weight: 500; }
+.drive-meta { font-size: var(--fs-xs); }
+.drive-actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; opacity: 0; transition: opacity var(--t-fast) var(--ease); }
+.drive-tile:hover .drive-actions { opacity: 1; }
+.drive-actions .act { display: grid; place-items: center; width: 28px; height: 28px; padding: 0;
+  border: 1px solid var(--line); border-radius: var(--r-sm); color: var(--text-mid);
+  background: color-mix(in oklab, var(--bg-1) 80%, transparent); backdrop-filter: blur(6px); }
+.drive-actions .act:hover { color: var(--text-hi); border-color: var(--line-2); }
+.sync-badge { position: absolute; top: 8px; left: 8px; padding: 3px; }
+.drive-row-ico { width: 34px; height: 34px; flex: none; display: grid; place-items: center; background: var(--bg-2); border-radius: var(--r-sm); }
+.drive-row-ico .icon { width: 18px; height: 18px; }
+
 /* ============================================================ responsive: tablet (icon rail) */
 @media (max-width: 1040px) {
   :root { --sidebar-w: 64px; }
