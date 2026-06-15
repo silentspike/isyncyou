@@ -1,0 +1,55 @@
+#!/bin/sh
+# iSyncYou — Dolphin "Share with people…" (#504).
+#
+# Prompts for email address(es) + a read/write choice via kdialog, then invites
+# those people to the selected OneDrive item(s) by calling `isyncyou share --email`
+# (the daemon sends the Microsoft invitation). Dolphin passes the selection as
+# positional arguments (%F). Pure desktop glue: the Rust CLI owns the real work.
+#
+# Headless/test override (no kdialog): set ISYNCYOU_INVITE_EMAILS (and optionally
+# ISYNCYOU_INVITE_ROLE=read|write) in the environment.
+set -eu
+
+if [ "$#" -eq 0 ]; then
+    kdialog --error "iSyncYou: no file selected." 2>/dev/null || echo "no file selected" >&2
+    exit 1
+fi
+
+emails="${ISYNCYOU_INVITE_EMAILS:-}"
+role="${ISYNCYOU_INVITE_ROLE:-}"
+
+if [ -z "$emails" ]; then
+    emails=$(kdialog --title "iSyncYou — Share with people" \
+        --inputbox "Email address(es), comma- or space-separated:") || exit 0
+fi
+[ -z "$emails" ] && exit 0
+
+if [ -z "$role" ]; then
+    if kdialog --title "iSyncYou" \
+        --yesno "Allow editing (read-write)?\n\nYes = can edit · No = view only"; then
+        role="write"
+    else
+        role="read"
+    fi
+fi
+
+# Build the --email flags (email addresses contain no whitespace, so word-splitting
+# is safe); the selected file paths stay quoted in "$@".
+eflags=""
+old_ifs=$IFS
+IFS=", "
+for e in $emails; do
+    [ -n "$e" ] && eflags="$eflags --email $e"
+done
+IFS=$old_ifs
+
+rflag=""
+[ "$role" = "write" ] && rflag="--write"
+
+# shellcheck disable=SC2086
+if out=$(isyncyou share $eflags $rflag "$@" 2>&1); then
+    kdialog --title "iSyncYou" --msgbox "Invited: $emails ($role)" 2>/dev/null || echo "$out"
+else
+    kdialog --title "iSyncYou" --error "Invite failed:\n$out" 2>/dev/null || echo "$out" >&2
+    exit 1
+fi
