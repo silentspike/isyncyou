@@ -603,6 +603,17 @@ a:hover { text-decoration: underline; }
   border-bottom: 1px solid var(--line); background: color-mix(in oklab, var(--bg-1) 70%, transparent); }
 .note-frame { flex: 1; width: 100%; border: 0; background: var(--bg-0); }
 
+/* ============================================================ search / settings / topbar */
+.topbar-btn { display: grid; place-items: center; width: 36px; height: 36px; flex: none;
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-2); color: var(--text-mid);
+  transition: border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.topbar-btn:hover { border-color: var(--line-2); color: var(--text-hi); }
+.topbar-btn.active { background: var(--accent-soft); color: var(--text-hi); border-color: var(--accent-line); }
+.search-row { width: 100%; text-align: left; border: 0; background: transparent; }
+.search-row .badge { text-transform: capitalize; }
+.empty-art { width: 200px; max-width: 62%; color: var(--text-mid); margin-bottom: var(--sp-2); }
+.empty-art svg { width: 100%; height: auto; display: block; }
+
 /* ============================================================ responsive: tablet (icon rail) */
 @media (max-width: 1040px) {
   :root { --sidebar-w: 64px; }
@@ -651,6 +662,16 @@ a:hover { text-decoration: underline; }
   }
   .mail-layout.reading .mail-reader { transform: translateX(0); }
   .mail-back { display: inline-flex; }
+}
+/* onenote: collapse the two-pane to a single column on a narrow content area */
+@container (max-width: 760px) {
+  .note-layout { grid-template-columns: 1fr; }
+  .note-list { max-height: 38vh; border-right: 0; border-bottom: 1px solid var(--line); }
+}
+/* contacts: drop the A–Z rail on a narrow content area */
+@container (max-width: 620px) {
+  .con-az { display: none; }
+  .con-grid { grid-template-columns: 1fr; }
 }
 
 /* ============================================================ reduced motion */
