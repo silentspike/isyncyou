@@ -403,13 +403,15 @@ impl Router {
                         self.share_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
-                headers: Vec::new(),
+                // embedded assets change only on a binary upgrade; never let the
+                // browser serve a stale copy across versions.
+                headers: vec![("Cache-Control".into(), "no-store".into())],
             },
             "/app.css" => ApiResponse {
                 status: 200,
                 content_type: "text/css; charset=utf-8".into(),
                 body: APP_CSS.as_bytes().to_vec(),
-                headers: Vec::new(),
+                headers: vec![("Cache-Control".into(), "no-store".into())],
             },
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
