@@ -365,6 +365,21 @@ pub fn mail_page_with_inline_images(
     page_with_csp(subject, &inner, MAIL_CSP)
 }
 
+/// Render an archived OneNote page's raw HTML as a sanitized, CSP-locked page
+/// (same `ammonia` allowlist as mail: scripts removed, remote resources blocked,
+/// external links routed through the confirmation page). OneNote bodies are plain
+/// HTML — no MIME/cid handling — so this is the mail path minus inline images.
+pub fn note_page(title: &str, raw_html: &str) -> String {
+    let clean = sanitize_mail_html(&rewrite_external_links(raw_html));
+    let inner = format!(
+        "{header}<div class=\"note\">Sanitized view — scripts removed; external images are \
+         blocked. External links open through a confirmation page.</div>\
+<div class=\"mail\">{clean}</div>",
+        header = header("OneNote", title),
+    );
+    page_with_csp(title, &inner, MAIL_CSP)
+}
+
 /// Render the explicit interstitial used before leaving the local viewer for a
 /// URL that came from archived mail. Nothing is fetched or opened automatically.
 pub fn external_link_dialog_page(url: &str) -> Option<String> {
@@ -796,6 +811,21 @@ mod tests {
             clean.contains("data:image/png"),
             "inline data image should survive: {clean}"
         );
+    }
+
+    #[test]
+    fn note_page_sanitizes_and_is_csp_locked() {
+        let p = note_page(
+            "My Note",
+            "<h1>Heading</h1><p>text</p><script>steal()</script>\
+<img src=\"https://tracker.example/p.gif\">",
+        );
+        assert!(p.contains("<h1>Heading</h1>"), "safe markup lost: {p}");
+        assert!(!p.contains("steal"), "script survived: {p}");
+        assert!(!p.contains("https://tracker"), "remote img survived: {p}");
+        assert!(p.contains("My Note"), "title missing: {p}");
+        // carries the strict mail CSP (escaped in the <meta>)
+        assert!(p.contains("default-src &#39;none&#39;"), "no CSP: {p}");
     }
 
     #[test]
