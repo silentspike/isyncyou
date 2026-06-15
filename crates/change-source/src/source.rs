@@ -230,4 +230,50 @@ mod tests {
         assert_eq!(decide(Cs::Ebpf, true, false), Decision::Inotify);
         assert_eq!(decide(Cs::Ebpf, true, true), Decision::Fanotify);
     }
+
+    #[test]
+    fn select_reconcile_only_yields_no_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SyncConfig {
+            change_source: Cs::ReconcileOnly,
+            ..Default::default()
+        };
+        // No live watcher → the consumer relies purely on the periodic reconcile.
+        assert!(select_change_source(&cfg, dir.path()).is_none());
+    }
+
+    #[test]
+    fn select_inotify_yields_an_inotify_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SyncConfig::default(); // default = Inotify
+        assert!(matches!(
+            select_change_source(&cfg, dir.path()),
+            Some(Watcher::Inotify(_))
+        ));
+    }
+
+    #[test]
+    fn select_ebpf_falls_back_to_inotify_when_unprivileged() {
+        // The opt-in `Ebpf` source must never crash and must always yield a usable
+        // watcher: fanotify when privileged + supported, else the inotify fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SyncConfig {
+            change_source: Cs::Ebpf,
+            ..Default::default()
+        };
+        let w = select_change_source(&cfg, dir.path());
+        assert!(
+            w.is_some(),
+            "ebpf must yield a watcher (fanotify or fallback)"
+        );
+        // The test process is unprivileged (and /tmp is unsuitable for fanotify),
+        // so it must downgrade to inotify, never panic or return None.
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                matches!(w, Some(Watcher::Inotify(_))),
+                "unprivileged ebpf must fall back to inotify"
+            );
+        }
+    }
 }
