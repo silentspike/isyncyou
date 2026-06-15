@@ -748,6 +748,32 @@ impl Router {
             Err(e) => return e,
         };
         let account = req.q("account").unwrap_or_default();
+        // Folder navigation for the file explorer: `?parent=<id>` lists that
+        // folder's direct children; `?parent=root` (or empty) lists the top-level
+        // items (those under the untracked drive root). Un-paginated — a single
+        // folder is bounded — and additive: the call without `parent` keeps the
+        // flat paginated behaviour every other view relies on.
+        if let Some(parent) = req.q("parent") {
+            let kids = if parent.is_empty() || parent == "root" {
+                store.roots(account, service)
+            } else {
+                store.children(account, service, Some(parent))
+            };
+            return match kids {
+                Ok(items) => {
+                    let arr: Vec<Value> = items.iter().map(item_json).collect();
+                    ApiResponse::ok_json(&json!({
+                        "items": arr,
+                        "count": arr.len(),
+                        "total": arr.len(),
+                        "limit": arr.len(),
+                        "offset": 0,
+                        "parent": parent,
+                    }))
+                }
+                Err(e) => ApiResponse::error(500, &format!("query: {e}")),
+            };
+        }
         // Page the listing so a large mailbox is never loaded all at once.
         let limit = clamp_limit(req.q("limit"));
         let offset = req
@@ -826,10 +852,12 @@ impl Router {
         }
     }
 
-    /// Read an item's archived body bytes, path-safely. Returns `(relative_path,
-    /// bytes, item_name)` or the `ApiResponse` to send on failure. The resolved
-    /// file must stay under the account's `archive_root` (defense against
-    /// `..`/symlink traversal). Shared by [`Self::body`] and [`Self::view`].
+    /// Read an item's body bytes, path-safely. Returns `(relative_path, bytes,
+    /// item_name)` or the `ApiResponse` to send on failure. The resolved file must
+    /// stay under the item's root (defense against `..`/symlink traversal): an
+    /// archived service (mail/calendar/…) stores its body under `archive_root`,
+    /// whereas a OneDrive file is the materialized file under `sync_root`. Shared
+    /// by [`Self::body`] and [`Self::view`].
     fn read_archived(
         &self,
         account: &str,
@@ -842,7 +870,13 @@ impl Router {
             .iter()
             .find(|a| a.id == account)
             .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
-        let archive_root = acc.archive_root.clone();
+        // OneDrive `local_path` is relative to the synced folder; every archived
+        // service stores its body under the archive root.
+        let body_root = if service == "onedrive" {
+            acc.sync_root.clone()
+        } else {
+            acc.archive_root.clone()
+        };
         let store = self.open(Some(account))?;
         let (rel, name) = match store.get_item(account, service, id) {
             Ok(Some(it)) => {
@@ -854,14 +888,14 @@ impl Router {
             Ok(None) => return Err(ApiResponse::error(404, "item not found")),
             Err(e) => return Err(ApiResponse::error(500, &format!("query: {e}"))),
         };
-        let path = archive_root.join(&rel);
-        match (path.canonicalize(), archive_root.canonicalize()) {
+        let path = body_root.join(&rel);
+        match (path.canonicalize(), body_root.canonicalize()) {
             (Ok(p), Ok(root)) if p.starts_with(&root) => match std::fs::read(&p) {
                 Ok(bytes) => Ok((rel, bytes, name)),
                 Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
             },
-            (Ok(_), Ok(_)) => Err(ApiResponse::error(400, "body path escapes archive root")),
-            _ => Err(ApiResponse::error(404, "archived body file missing")),
+            (Ok(_), Ok(_)) => Err(ApiResponse::error(400, "body path escapes its root")),
+            _ => Err(ApiResponse::error(404, "body file missing")),
         }
     }
 
@@ -1025,8 +1059,24 @@ fn clamp_limit(raw: Option<&str>) -> u32 {
 /// browser renders it inertly without running scripts, loading trackers, or
 /// treating it as a page.
 fn safe_content_type(rel: &str) -> &'static str {
-    if rel.ends_with(".json") {
+    let lower = rel.to_ascii_lowercase();
+    // Raster images get their real type so the explorer can show thumbnails;
+    // `nosniff` (always emitted) keeps them inert. SVG is deliberately excluded —
+    // it can carry scripts — and falls through to inert text/plain.
+    if lower.ends_with(".json") {
         "application/json; charset=utf-8"
+    } else if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".bmp") {
+        "image/bmp"
+    } else if lower.ends_with(".ico") {
+        "image/x-icon"
     } else {
         "text/plain; charset=utf-8"
     }
@@ -1870,6 +1920,73 @@ Content-Type: text/html; charset=utf-8\r\n\
     }
 
     #[test]
+    fn items_parent_navigates_onedrive_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            // "DR" is the untracked drive root; Folder + a.txt hang off it.
+            let mut folder = Item::new("a", "onedrive", "F1", "Folder One", "folder");
+            folder.parent_remote_id = Some("DR".into());
+            let mut top = Item::new("a", "onedrive", "top", "a.txt", "file");
+            top.parent_remote_id = Some("DR".into());
+            let mut nested = Item::new("a", "onedrive", "n1", "nested.txt", "file");
+            nested.parent_remote_id = Some("F1".into());
+            store.upsert_item(&folder).unwrap();
+            store.upsert_item(&top).unwrap();
+            store.upsert_item(&nested).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        // root view → the two items under the untracked drive root
+        let root = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=onedrive&parent=root",
+        )));
+        let root_names: Vec<&str> = root["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(root_names, ["Folder One", "a.txt"]);
+        assert_eq!(root["parent"], "root");
+        // descending into the folder shows only its child
+        let inside = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=onedrive&parent=F1",
+        )));
+        assert_eq!(inside["count"], 1);
+        assert_eq!(inside["items"][0]["name"], "nested.txt");
+        // without `parent` the flat paginated listing is unchanged (all 3 items)
+        let flat =
+            body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=onedrive")));
+        assert_eq!(flat["total"], 3);
+        assert!(flat.get("parent").is_none());
+    }
+
+    #[test]
+    fn safe_content_type_serves_raster_images_but_not_svg() {
+        assert_eq!(safe_content_type("onedrive/aa/bb/photo.PNG"), "image/png");
+        assert_eq!(safe_content_type("x.jpg"), "image/jpeg");
+        assert_eq!(safe_content_type("x.jpeg"), "image/jpeg");
+        assert_eq!(safe_content_type("x.gif"), "image/gif");
+        assert_eq!(safe_content_type("x.webp"), "image/webp");
+        // SVG can carry scripts → kept inert as text/plain
+        assert_eq!(safe_content_type("x.svg"), "text/plain; charset=utf-8");
+        assert!(safe_content_type("x.json").starts_with("application/json"));
+        assert!(safe_content_type("x.eml").starts_with("text/plain"));
+    }
+
+    #[test]
     fn item_returns_one_or_404() {
         let (_d, router) = setup();
         let ok = router.route(&ApiRequest::get(
@@ -1995,6 +2112,51 @@ Content-Type: text/html; charset=utf-8\r\n\
                 .status,
             400
         );
+    }
+
+    #[test]
+    fn body_serves_onedrive_file_from_sync_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        let sync = dir.path().join("od");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(sync.join("Pictures")).unwrap();
+        // a OneDrive file lives under the *sync* root, not the archive root
+        std::fs::write(sync.join("notes.txt"), b"hello onedrive").unwrap();
+        std::fs::write(sync.join("Pictures/logo.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut f = Item::new("a", "onedrive", "f1", "notes.txt", "file");
+            f.local_path = Some("notes.txt".into());
+            store.upsert_item(&f).unwrap();
+            let mut img = Item::new("a", "onedrive", "f2", "logo.png", "file");
+            img.local_path = Some("Pictures/logo.png".into());
+            store.upsert_item(&img).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: sync,
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        // text file → served inertly from the sync root
+        let t = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=onedrive&id=f1",
+        ));
+        assert_eq!(t.status, 200);
+        assert!(t.content_type.starts_with("text/plain"));
+        assert_eq!(t.body, b"hello onedrive");
+        // image → real raster content-type so the explorer can show a thumbnail
+        let i = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=onedrive&id=f2",
+        ));
+        assert_eq!(i.status, 200);
+        assert_eq!(i.content_type, "image/png");
     }
 
     #[test]
