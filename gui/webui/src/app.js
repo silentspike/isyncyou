@@ -80,6 +80,72 @@ function logoGlyph(size = 30) {
   return svg; // trusted, in-code SVG only
 }
 
+/* ---------------------------------------------------------------- charts (pure SVG, no lib) */
+const SVGNS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v);
+  return n;
+}
+const reduceMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+// animate a number node 0 -> target (easeOutCubic)
+function countUp(node, target, dur = 900) {
+  const n = Number(target);
+  if (!isFinite(n) || reduceMotion()) { node.textContent = String(target); return; }
+  const start = performance.now();
+  (function tick(t) {
+    const p = Math.min(1, (t - start) / dur), e = 1 - Math.pow(1 - p, 3);
+    node.textContent = String(Math.round(n * e));
+    if (p < 1) requestAnimationFrame(tick);
+  })(performance.now());
+}
+// donut ring from segments [{value, color}] with a center total
+function donutChart(segments, centerSub) {
+  const total = segments.reduce((s, x) => s + x.value, 0) || 1;
+  const R = 54, C = 2 * Math.PI * R, W = 16;
+  const s = svg("svg", { viewBox: "0 0 140 140", class: "chart", style: "max-width:180px" });
+  s.append(svg("circle", { cx: 70, cy: 70, r: R, fill: "none", stroke: "var(--bg-3)", "stroke-width": W }));
+  let off = 0;
+  segments.filter(x => x.value > 0).forEach(seg => {
+    const len = (seg.value / total) * C;
+    s.append(svg("circle", {
+      cx: 70, cy: 70, r: R, fill: "none", stroke: seg.color, "stroke-width": W,
+      "stroke-dasharray": `${len.toFixed(2)} ${(C - len).toFixed(2)}`,
+      "stroke-dashoffset": (-off).toFixed(2), transform: "rotate(-90 70 70)", class: "donut-seg",
+    }));
+    off += len;
+  });
+  return el("div", { style: "position:relative;display:grid;place-items:center" }, s,
+    el("div", { style: "position:absolute;text-align:center;pointer-events:none" },
+      el("div", { class: "num tnum", style: "font-size:24px", text: String(total) }),
+      el("div", { class: "dim", style: "font-size:11px", text: centerSub || "" })));
+}
+// horizontal bars from rows [{label, value, color}]
+function barChart(rows) {
+  const max = Math.max(1, ...rows.map(r => r.value));
+  const box = el("div", { style: "display:flex;flex-direction:column;gap:10px" });
+  rows.forEach(r => box.append(el("div", { style: "display:flex;align-items:center;gap:10px" },
+    el("span", { class: "dim", style: "width:84px;font-size:12px;text-transform:capitalize;text-align:right" }, r.label),
+    el("div", { style: "flex:1;height:10px;background:var(--bg-3);border-radius:999px;overflow:hidden" },
+      el("div", { class: "bar-fill", style: `height:100%;width:${Math.round((r.value / max) * 100)}%;background:${r.color}` })),
+    el("span", { class: "tnum", style: "width:42px;text-align:right;font-size:12px" }, String(r.value)))));
+  return box;
+}
+// sparkline (area + line) from numeric points
+function sparkline(points, h = 60) {
+  const w = 320;
+  let pts = points.slice();
+  if (pts.length < 2) pts = [0, ...pts, 0];
+  const max = Math.max(1, ...pts), min = Math.min(0, ...pts), span = (max - min) || 1;
+  const step = w / (pts.length - 1);
+  const xy = pts.map((p, i) => [i * step, h - 4 - ((p - min) / span) * (h - 12)]);
+  const line = xy.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const s = svg("svg", { viewBox: `0 0 ${w} ${h}`, preserveAspectRatio: "none", class: "chart", style: `width:100%;height:${h}px` });
+  s.append(svg("polygon", { points: `0,${h} ${line} ${w},${h}`, class: "spark-area" }));
+  s.append(svg("polyline", { points: line, class: "spark-line" }));
+  return s;
+}
+
 /* ---------------------------------------------------------------- api + util */
 const CAP = {
   restore: "__RESTORE_CAP_TOKEN__",
@@ -214,51 +280,87 @@ function onRoute() {
   else renderServiceView(view, App.route);
 }
 
-/* ---------------------------------------------------------------- overview (PR2 makes it the showpiece with animated charts) */
+/* ---------------------------------------------------------------- overview (dashboard showpiece) */
+// concrete hues for SVG charts (SVG presentation attributes don't take CSS vars)
+const SVC_COLOR = {
+  overview: "#6366f1", mail: "#6366f1", onedrive: "#38bdf8", calendar: "#fb7185",
+  contacts: "#34d399", todo: "#fbbf24", onenote: "#a855f7", shared: "#94a3b8",
+};
+// bucket runs into per-day counts for the activity sparkline
+function activityBuckets(runs, days = 14) {
+  const now = Date.now(), b = new Array(days).fill(0);
+  runs.forEach(r => {
+    const t = Date.parse(r.finished_at || r.started_at);
+    if (isNaN(t)) return;
+    const diff = Math.floor((now - t) / 864e5);
+    if (diff >= 0 && diff < days) b[days - 1 - diff]++;
+  });
+  return b;
+}
 async function renderOverview(view) {
-  clear(view).append(el("h1", { class: "view-title", text: "Overview" }), el("p", { class: "view-sub", text: "Your Microsoft 365 archive at a glance." }));
+  const acc0 = App.accounts.find(a => a.id === App.account) || {};
+  clear(view).append(
+    el("h1", { class: "view-title" }, "Welcome back" + (acc0.username ? ", " : ""),
+      acc0.username ? el("span", { style: "background:var(--grad-accent);-webkit-background-clip:text;background-clip:text;color:transparent" }, acc0.username.split("@")[0]) : ""),
+    el("p", { class: "view-sub", text: "Your Microsoft 365 archive at a glance." }),
+  );
   const grid = el("div", { class: "grid cols-auto stagger" });
   view.append(grid);
-  for (let i = 0; i < 3; i++) grid.append(el("div", { class: "card stat-tile" }, el("div", { class: "skel", style: "width:40%;height:40px" })));
+  for (let i = 0; i < 3; i++) grid.append(el("div", { class: "card stat-tile" }, el("div", { class: "skel", style: "width:50%;height:44px" })));
   if (!App.account) { clear(grid).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
   try {
     const [st, cfg, act] = await Promise.all([
       api("/api/v1/status?" + qs({ account: App.account })),
       api("/api/v1/settings").catch(() => ({})),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 10 })).catch(() => ({ runs: [] })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 200 })).catch(() => ({ runs: [] })),
     ]);
-    (st.services || []).forEach(s => { App.counts[s.service] = s.items; });
+    const services = st.services || [];
+    services.forEach(s => { App.counts[s.service] = s.items; });
     updateNavCounts();
+    // stat tiles with animated count-ups
     clear(grid);
-    const tiles = [
-      ["layout-dashboard", st.totals?.items ?? 0, "Total items"],
-      ["download", st.totals?.archived ?? 0, "Archived bodies"],
-      ["hard-drive", st.onedrive_cursor ? "Live" : "—", "OneDrive delta"],
-    ];
-    tiles.forEach(([ic, n, l]) => grid.append(
-      el("div", { class: "card stat-tile rise" }, el("div", { class: "ico" }, icon(ic)),
-        el("div", { class: "num tnum", text: String(n) }), el("div", { class: "lbl", text: l })),
-    ));
-    // per-service mini cards
-    const svc = el("div", { class: "grid cols-auto stagger", style: "margin-top:24px" });
-    view.append(el("h3", { class: "sb-section", text: "Per service" }), svc);
-    (st.services || []).forEach(s => svc.append(
-      el("button", { class: "card stat-tile rise", style: `--svc:var(--svc-${s.service});text-align:left`, onclick: () => go(s.service) },
-        el("div", { class: "ico", style: "background:color-mix(in oklab,var(--svc) 16%,transparent);color:var(--svc)" },
-          icon((SERVICES.find(x => x.id === s.service) || {}).icon || "file")),
-        el("div", { class: "num tnum", style: "font-size:24px", text: String(s.items) }),
-        el("div", { class: "lbl", style: "text-transform:capitalize", text: `${s.service} · ${s.archived} archived` })),
-    ));
+    [
+      ["layout-dashboard", st.totals?.items ?? 0, "Total items", true],
+      ["download", st.totals?.archived ?? 0, "Archived bodies", true],
+      ["hard-drive", st.onedrive_cursor ? "Live" : "—", "OneDrive delta", false],
+    ].forEach(([ic, n, l, anim]) => {
+      const num = el("div", { class: "num tnum", text: anim ? "0" : String(n) });
+      grid.append(el("div", { class: "card stat-tile rise" }, el("div", { class: "ico" }, icon(ic)), num, el("div", { class: "lbl", text: l })));
+      if (anim) countUp(num, n);
+    });
+    // charts
+    if (services.length) {
+      const charts = el("div", { class: "grid stagger", style: "grid-template-columns:repeat(auto-fit,minmax(300px,1fr));margin-top:24px" });
+      view.append(el("h3", { class: "sb-section", text: "Library breakdown" }), charts);
+      // donut + legend (items per service)
+      const legend = el("div", { style: "display:flex;flex-direction:column;gap:7px;min-width:0" });
+      services.forEach(s => legend.append(el("button", {
+        class: "list-row", style: "padding:4px 6px;border:0;background:transparent;gap:8px", onclick: () => go(s.service),
+      },
+        el("span", { style: `width:10px;height:10px;border-radius:3px;flex:none;background:${SVC_COLOR[s.service] || "#888"}` }),
+        el("span", { class: "grow truncate", style: "text-transform:capitalize", text: s.service }),
+        el("span", { class: "tnum dim", text: String(s.items) }))));
+      charts.append(el("div", { class: "card rise", style: "display:flex;gap:20px;align-items:center" },
+        donutChart(services.map(s => ({ value: s.items, color: SVC_COLOR[s.service] || "#888" })), "items"), legend));
+      // bar: items + archived per service
+      charts.append(el("div", { class: "card rise" },
+        el("div", { class: "dim", style: "font-size:12px;margin-bottom:14px" }, "Items per service"),
+        barChart(services.map(s => ({ label: s.service, value: s.items, color: SVC_COLOR[s.service] || "#888" })))));
+      // sparkline: sync activity per day
+      charts.append(el("div", { class: "card rise" },
+        el("div", { class: "dim", style: "font-size:12px;margin-bottom:8px" }, "Sync activity (14 days)"),
+        sparkline(activityBuckets(act.runs || []))));
+    }
     // recent activity timeline
-    const runs = act.runs || [];
-    const actBox = el("div", { class: "card", style: "margin-top:24px" });
+    const runs = (act.runs || []).slice(0, 8);
+    const actBox = el("div", { class: "card", style: "margin-top:24px;padding:6px 4px" });
     if (runs.length) runs.forEach(r => actBox.append(
       el("div", { class: "list-row", style: "cursor:default" },
         el("span", { class: "pill " + (r.status === "ok" ? "ok" : r.status === "error" ? "err" : "info") }, el("span", { class: "dot" })),
         el("div", { class: "grow" }, el("div", { class: "truncate", text: r.summary || r.kind }), el("div", { class: "dim", style: "font-size:12px", text: r.kind })),
         el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(r.finished_at) })),
     ));
-    else actBox.append(el("div", { class: "muted", style: "padding:8px", text: "No runs recorded yet." }));
+    else actBox.append(el("div", { class: "muted", style: "padding:12px", text: "No runs recorded yet." }));
     view.append(el("h3", { class: "sb-section", text: "Recent activity" }), actBox);
     // settings summary
     const sy = cfg.sync || {}, acc = (cfg.accounts || []).find(a => a.id === App.account) || {};
