@@ -22,16 +22,20 @@ use serde_json::Value;
 use std::borrow::Cow;
 
 /// Strict CSP for a viewer page: load nothing, run nothing; only the inline
-/// stylesheet in the page itself is permitted.
+/// stylesheet in the page itself is permitted. `frame-ancestors 'self'` lets the
+/// same-origin app shell embed this page in its reading-pane `<iframe>` (the app
+/// shell's own CSP is `frame-src 'self'`), while cross-origin framing — the
+/// clickjacking vector — stays blocked.
 pub const VIEWER_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; \
-     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+     base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 
 /// CSP for the sanitized mail viewer: like [`VIEWER_CSP`] but allows **inline
 /// `data:` images** (which survive sanitization) while still blocking every
 /// remote fetch — so a tracking pixel can never load even if one slipped past
-/// the sanitizer.
+/// the sanitizer. `frame-ancestors 'self'` allows same-origin embedding in the
+/// mail reading pane while still denying cross-origin framing.
 pub const MAIL_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; \
-     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+     base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 
 /// Cap on rendered raw-source length, so a pathological message can't produce a
 /// multi-megabyte page.
