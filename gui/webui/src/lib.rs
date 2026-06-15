@@ -786,12 +786,13 @@ impl Router {
         };
         match store.items_by_service_page(account, service, limit, offset) {
             Ok(items) => {
-                // Mail rows are enriched with a read-only preview (sender, snippet,
-                // date, has-html) parsed from the archived `.eml` on disk, so the
-                // 3-pane mail client can render a rich list without an extra request
-                // per message. Additive + best-effort: items without a readable body
-                // simply carry no `preview` object. Bounded by the page size.
-                let arr: Vec<Value> = if service == "mail" {
+                // Mail and calendar rows are enriched with a read-only `preview`
+                // parsed from the archived body on disk, so the bespoke views render
+                // richly without an extra request per item. Additive + best-effort:
+                // items without a readable body simply carry no `preview`. Bounded by
+                // the page size. Mail = sender/snippet/date/has-html from the `.eml`;
+                // calendar = start/end/all-day/location from the event JSON.
+                let arr: Vec<Value> = if service == "mail" || service == "calendar" {
                     let archive_root = self
                         .config
                         .accounts
@@ -806,15 +807,26 @@ impl Router {
                                 (archive_root.as_ref(), it.local_path.as_ref())
                             {
                                 if let Some(bytes) = read_under_root(root, rel) {
-                                    let p = isyncyou_connectors::mail_preview(&bytes);
-                                    v["preview"] = json!({
-                                        "from": p.from,
-                                        "to": p.to,
-                                        "subject": p.subject,
-                                        "snippet": p.body_snippet,
-                                        "date": p.date,
-                                        "has_html": p.has_html,
-                                    });
+                                    if service == "mail" {
+                                        let p = isyncyou_connectors::mail_preview(&bytes);
+                                        v["preview"] = json!({
+                                            "from": p.from,
+                                            "to": p.to,
+                                            "subject": p.subject,
+                                            "snippet": p.body_snippet,
+                                            "date": p.date,
+                                            "has_html": p.has_html,
+                                        });
+                                    } else if let Ok(ev) = serde_json::from_slice::<Value>(&bytes) {
+                                        v["preview"] = json!({
+                                            "start": ev["start"]["dateTime"],
+                                            "start_tz": ev["start"]["timeZone"],
+                                            "end": ev["end"]["dateTime"],
+                                            "end_tz": ev["end"]["timeZone"],
+                                            "all_day": ev["isAllDay"],
+                                            "location": ev["location"]["displayName"],
+                                        });
+                                    }
                                 }
                             }
                             v
@@ -1917,6 +1929,46 @@ Content-Type: text/html; charset=utf-8\r\n\
         // the item with a missing body file is still listed but carries no preview
         let m2 = items.iter().find(|i| i["remote_id"] == "m2").unwrap();
         assert!(m2.get("preview").is_none());
+    }
+
+    #[test]
+    fn items_calendar_carries_preview_from_archived_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("calendar/aa/bb")).unwrap();
+        std::fs::write(
+            arch.join("calendar/aa/bb/ev.json"),
+            br#"{"subject":"Team-Standup",
+                 "start":{"dateTime":"2026-02-04T09:00:00.0000000","timeZone":"UTC"},
+                 "end":{"dateTime":"2026-02-04T10:00:00.0000000","timeZone":"UTC"},
+                 "isAllDay":false,"location":{"displayName":"Room 1"}}"#,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut e = Item::new("a", "calendar", "e1", "Team-Standup", "event");
+            e.local_path = Some("calendar/aa/bb/ev.json".into());
+            store.upsert_item(&e).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let v =
+            body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=calendar")));
+        let p = &v["items"][0]["preview"];
+        assert_eq!(p["start"], "2026-02-04T09:00:00.0000000");
+        assert_eq!(p["start_tz"], "UTC");
+        assert_eq!(p["end"], "2026-02-04T10:00:00.0000000");
+        assert_eq!(p["all_day"], false);
+        assert_eq!(p["location"], "Room 1");
     }
 
     #[test]
