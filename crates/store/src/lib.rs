@@ -597,6 +597,24 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Top-level items of a service: those whose `parent_remote_id` is `NULL`
+    /// **or** points at something that is not itself a tracked item (e.g. the
+    /// OneDrive drive root, which is never stored as an item). Lets a file
+    /// explorer show the top of the tree without knowing the drive-root id.
+    /// Excludes tombstones; ordered by name.
+    pub fn roots(&self, account: &str, service: &str) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL
+               AND (parent_remote_id IS NULL OR parent_remote_id NOT IN
+                    (SELECT remote_id FROM items
+                     WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL))
+             ORDER BY name"
+        ))?;
+        let rows = stmt.query_map(params![account, service], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Mark an item as a tombstone (sets `deleted_at`, `sync_state='deleted'`).
     pub fn mark_deleted(
         &self,
@@ -1480,6 +1498,38 @@ mod tests {
         s.mark_deleted("a", "onedrive", "c1", "2026-06-02T00:00:00Z")
             .unwrap();
         assert_eq!(s.children("a", "onedrive", Some("root")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn roots_returns_items_whose_parent_is_not_tracked() {
+        let s = Store::open_in_memory().unwrap();
+        // "DR" is the (untracked) drive root; F1 + top.txt hang off it.
+        let mut f1 = item("a", "F1", "Folder One");
+        f1.item_type = "folder".into();
+        f1.parent_remote_id = Some("DR".into());
+        let mut top = item("a", "top", "top.txt");
+        top.parent_remote_id = Some("DR".into());
+        let mut child = item("a", "child", "nested.txt");
+        child.parent_remote_id = Some("F1".into()); // parent IS a tracked item
+        s.upsert_item(&f1).unwrap();
+        s.upsert_item(&top).unwrap();
+        s.upsert_item(&child).unwrap();
+        // roots = the two items whose parent ("DR") is not itself an item
+        let roots = s.roots("a", "onedrive").unwrap();
+        assert_eq!(
+            roots.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["Folder One", "top.txt"]
+        );
+        // the nested file is reachable only via children of F1
+        let kids = s.children("a", "onedrive", Some("F1")).unwrap();
+        assert_eq!(
+            kids.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["nested.txt"]
+        );
+        // a tombstoned root drops out
+        s.mark_deleted("a", "onedrive", "top", "2026-06-02T00:00:00Z")
+            .unwrap();
+        assert_eq!(s.roots("a", "onedrive").unwrap().len(), 1);
     }
 
     #[test]
