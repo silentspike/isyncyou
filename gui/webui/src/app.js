@@ -56,6 +56,14 @@ const ICONS = {
   paperclip: "M21.4 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48",
   "external-link": "M15 3h6v6M10 14L21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
   clock: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20M12 6v6l4 2",
+  list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+  image: "M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3M21 15l-5-5L5 21",
+  "file-text": "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8",
+  table: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18",
+  music: "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
+  film: "M3 3h18v18H3zM7 3v18M17 3v18M3 7h4M3 12h18M3 17h4M17 7h4M17 17h4",
+  archive: "M21 8v13H3V8M1 3h22v5H1zM10 12h4",
+  code: "M16 18l6-6-6-6M8 6l-6 6 6 6",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -292,6 +300,7 @@ function onRoute() {
   const view = $("#view");
   if (App.route === "overview") renderOverview(view);
   else if (App.route === "mail") renderMailView(view);
+  else if (App.route === "onedrive") renderOnedriveView(view);
   else renderServiceView(view, App.route);
 }
 
@@ -577,6 +586,134 @@ async function mailSearch() {
     if (!hits.length) { list.append(el("div", { class: "empty" }, el("h3", { text: "No matches" }), el("p", { text: `Nothing in mail matches “${q}”.` }))); return; }
     hits.forEach(it => list.append(mailRow(it)));
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Search failed" }), el("p", { text: e.message }))); }
+}
+
+/* ---------------------------------------------------------------- onedrive (file explorer) */
+const Drive = { stack: [], layout: "grid", items: [] };
+// extension → {icon, color} category for file glyphs
+const FILE_KINDS = [
+  { icon: "image", color: "#38bdf8", ext: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "heic", "tiff"] },
+  { icon: "file-text", color: "#f87171", ext: ["pdf"] },
+  { icon: "file-text", color: "#60a5fa", ext: ["doc", "docx", "odt", "rtf", "txt", "md", "one", "onetoc2"] },
+  { icon: "table", color: "#34d399", ext: ["xls", "xlsx", "csv", "ods"] },
+  { icon: "file-text", color: "#fb923c", ext: ["ppt", "pptx", "odp"] },
+  { icon: "music", color: "#a855f7", ext: ["mp3", "wav", "flac", "m4a", "aac", "ogg"] },
+  { icon: "film", color: "#f472b6", ext: ["mp4", "mov", "mkv", "avi", "webm"] },
+  { icon: "archive", color: "#fbbf24", ext: ["zip", "rar", "7z", "tar", "gz", "tgz"] },
+  { icon: "code", color: "#818cf8", ext: ["js", "ts", "rs", "py", "c", "cpp", "h", "java", "go", "json", "html", "css", "sh", "toml", "yaml", "yml", "xml"] },
+];
+const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"]); // raster only (svg served inert)
+const fileExt = (name) => { const m = /\.([a-z0-9]+)$/i.exec(name || ""); return m ? m[1].toLowerCase() : ""; };
+const fileKind = (ext) => FILE_KINDS.find(k => k.ext.includes(ext));
+const fileIcon = (ext) => (fileKind(ext) || {}).icon || "file";
+const fileColor = (ext) => (fileKind(ext) || {}).color || "var(--text-lo)";
+
+async function renderOnedriveView(view) {
+  Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = [];
+  clear(view).append(
+    el("h1", { class: "view-title", text: "OneDrive" }),
+    el("div", { class: "drive-bar" },
+      el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("div", { class: "seg" },
+        el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
+        el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
+    el("div", { id: "drive-body" }),
+  );
+  await driveOpen(null, "OneDrive", true);
+}
+function setDriveLayout(l) { Drive.layout = l; $("#drive-grid")?.classList.toggle("active", l === "grid"); $("#drive-list")?.classList.toggle("active", l === "list"); driveRender(); }
+async function driveOpen(id, name, reset) {
+  if (reset) Drive.stack = [{ id: "root", name: "OneDrive" }];
+  else Drive.stack.push({ id, name });
+  await driveLoad();
+}
+function driveCrumbTo(i) { Drive.stack = Drive.stack.slice(0, i + 1); driveLoad(); }
+function renderCrumbs() {
+  const c = $("#drive-crumbs"); if (!c) return; clear(c);
+  Drive.stack.forEach((s, i) => {
+    if (i) c.append(icon("chevron-right", "icon-sm"));
+    c.append(el("button", { class: "crumb" + (i === Drive.stack.length - 1 ? " cur" : ""), onclick: () => driveCrumbTo(i) },
+      i === 0 ? icon("hard-drive", "icon-sm") : null, el("span", { text: s.name })));
+  });
+}
+async function driveLoad() {
+  renderCrumbs();
+  const body = $("#drive-body"); if (!body) return;
+  clear(body);
+  const sk = el("div", { class: "drive-grid" });
+  for (let i = 0; i < 8; i++) sk.append(el("div", { class: "card drive-tile" }, el("div", { class: "skel", style: "height:84px" }), el("div", { class: "skel", style: "height:14px;width:70%" })));
+  body.append(sk);
+  const cur = Drive.stack[Drive.stack.length - 1].id;
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", parent: cur }));
+    Drive.items = d.items || [];
+    driveRender();
+  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load folder" }), el("p", { text: e.message }))); }
+}
+function driveSort(items) {
+  return items.slice().sort((a, b) =>
+    (a.item_type === "folder" ? 0 : 1) - (b.item_type === "folder" ? 0 : 1) || (a.name || "").localeCompare(b.name || ""));
+}
+function driveRender() {
+  const body = $("#drive-body"); if (!body) return; clear(body);
+  if (!Drive.items.length) { body.append(el("div", { class: "empty" }, icon("folder", "icon-lg"), el("h3", { text: "Empty folder" }), el("p", { text: "Nothing is archived here." }))); return; }
+  const items = driveSort(Drive.items);
+  if (Drive.layout === "grid") {
+    const grid = el("div", { class: "drive-grid stagger" });
+    items.forEach(it => grid.append(driveTile(it)));
+    body.append(grid);
+  } else {
+    const list = el("div", { class: "card", style: "padding:0;overflow:hidden" });
+    items.forEach(it => list.append(driveRow(it)));
+    body.append(list);
+  }
+}
+function syncBadge(it) {
+  if (!it.sync_state || it.sync_state === "clean") return null;
+  const kind = it.sync_state === "deleted" ? "err" : "warn";
+  return el("span", { class: "pill " + kind + " sync-badge", title: "Sync state: " + it.sync_state }, el("span", { class: "dot" }));
+}
+function driveActions(it) {
+  if (it.item_type === "folder") return null;
+  const q = { account: App.account, service: "onedrive", id: it.remote_id };
+  const box = el("div", { class: "drive-actions" });
+  if (it.has_body) box.append(el("a", { class: "act", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
+  if (CAP.share) box.append(el("button", { class: "act", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
+  return box;
+}
+function driveTile(it) {
+  const folder = it.item_type === "folder";
+  const ext = fileExt(it.name);
+  const q = { account: App.account, service: "onedrive", id: it.remote_id };
+  const tile = el("div", { class: "card drive-tile rise" + (folder ? " is-folder" : ""), onclick: () => folder ? driveOpen(it.remote_id, it.name) : window.open(`/api/v1/view?${qs(q)}`, "_blank", "noopener") });
+  let thumb;
+  if (!folder && it.has_body && IMAGE_EXT.has(ext))
+    thumb = el("img", { class: "drive-thumb-img", src: `/api/v1/body?${qs(q)}`, alt: "", loading: "lazy" });
+  else
+    thumb = el("div", { class: "drive-thumb", style: folder ? "" : `color:${fileColor(ext)}` }, icon(folder ? "folder" : fileIcon(ext), "icon-lg"));
+  tile.append(thumb,
+    el("div", { class: "drive-name truncate", text: it.name || "(no name)" }),
+    el("div", { class: "drive-meta dim", text: folder ? "Folder" : [fmtSize(it.size), it.remote_mtime ? fmtDate(it.remote_mtime) : ""].filter(Boolean).join(" · ") }),
+    syncBadge(it), driveActions(it));
+  return tile;
+}
+function driveRow(it) {
+  const folder = it.item_type === "folder";
+  const ext = fileExt(it.name);
+  const q = { account: App.account, service: "onedrive", id: it.remote_id };
+  const row = el("div", { class: "list-row", onclick: () => folder ? driveOpen(it.remote_id, it.name) : window.open(`/api/v1/view?${qs(q)}`, "_blank", "noopener") },
+    el("span", { class: "drive-row-ico", style: folder ? "color:var(--svc-onedrive)" : `color:${fileColor(ext)}` }, icon(folder ? "folder" : fileIcon(ext))),
+    el("div", { class: "grow" },
+      el("div", { class: "truncate", text: it.name || "(no name)" }),
+      el("div", { class: "dim", style: "font-size:12px", text: folder ? "Folder" : (fmtSize(it.size) || "—") })),
+    syncBadge(it),
+    el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(it.remote_mtime) }));
+  const acts = el("div", { style: "display:flex;gap:4px" });
+  if (!folder && it.has_body) acts.append(el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
+  if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
+  row.append(acts);
+  return row;
 }
 
 /* ---------------------------------------------------------------- actions */
