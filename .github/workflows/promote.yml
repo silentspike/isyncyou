@@ -83,6 +83,22 @@ jobs:
           git commit -q -m "chore: promote $HEAD_BRANCH to $BASE (auto)"
           git push -q origin "$pb"
 
+          # Close any older same-direction promotion PR this one supersedes (#432).
+          # With quick successive pushes the previous promote/<head>-to-<base>-* PR
+          # stays open with auto-merge armed, but its content already ships via this
+          # later cascade. The new branch is already pushed above, so closing the
+          # stale PR loses nothing. Match by base + branch prefix; never the new one.
+          prefix="promote/${HEAD_BRANCH}-to-${BASE}-"
+          gh pr list --state open --base "$BASE" --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"${prefix}\")) | select(.headRefName != \"${pb}\") | .number" \
+            | while read -r old; do
+                [ -n "$old" ] || continue
+                echo "::notice::closing superseded promotion PR #${old}"
+                gh pr close "$old" \
+                  --comment "Superseded by a newer promotion of ${HEAD_BRANCH} -> ${BASE} (run ${GITHUB_RUN_NUMBER}); this PR's content ships via the later cascade." \
+                  --delete-branch || true
+              done
+
           gh pr create --base "$BASE" --head "$pb" \
             --title "chore: promote $HEAD_BRANCH to $BASE (auto)" \
             --body "Automated tree-overlay promotion of \`$HEAD_BRANCH\` into \`$BASE\`. Auto-merges once the required checks pass."
