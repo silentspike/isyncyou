@@ -72,6 +72,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   path maps to its cloud item by path, then shares by id. Honest personal-account
   limits: the OneDrive root isn't shareable; `createLink` is idempotent per
   `(type, scope)`; `password`/`expiry`/`embed` are Premium/personal-dependent.
+  **GUI email-invite (#504):** invite named people from the GUI too — a Dolphin
+  "Share with people…" action (a `kdialog` wrapper that prompts for address(es) +
+  read/write, then runs `isyncyou share --email`) and a web-UI "invite" action per
+  OneDrive item. `isyncyou share` now also finds its config at
+  `~/.config/isyncyou/isyncyou.toml` when run without `--config` from another
+  directory (so GUI launches resolve it).
 - **Status-tray app** (#460): tray-first SNI indicator — left-click unfolds a
   frameless live-status flyout at the icon (Nextcloud/Dropbox style) with a link
   into the web UI (mail restore, search); the tray label reflects the live daemon
