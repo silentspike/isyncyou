@@ -35,6 +35,20 @@ pub use serve::{format_http, parse_request_line, serve};
 
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
 pub const INDEX_HTML: &str = include_str!("index.html");
+/// The redesigned UI's stylesheet and script, embedded + served same-origin from
+/// `/app.css` and `/app.js`. Single-binary, no build step. `app.js` carries the
+/// capability-token placeholders (injected per request, like the old inline script).
+const APP_CSS: &str = include_str!("app.css");
+const APP_JS: &str = include_str!("app.js");
+
+/// CSP for the app shell (`/`). `script-src 'self'` (no inline script) is the key
+/// defense; only our own same-origin `/app.js` runs. Allows our stylesheet + inline
+/// `style=` attributes (low-risk), data:-SVG (icons/charts/noise/favicon),
+/// same-origin fetches, and the sandboxed object-viewer iframe (`frame-src 'self'`).
+const APP_SHELL_CSP: &str = "default-src 'none'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
+     font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
 
 /// Services that can hold archived items (mirrors the CLI's `status`).
 const STATUS_SERVICES: &[&str] = &[
@@ -368,10 +382,14 @@ impl Router {
             return ApiResponse::error(405, "method not allowed");
         }
         match req.path.as_str() {
-            // inject the capability token into the page so the (same-origin) UI can
-            // POST restores; empty when restore is disabled, hiding the UI.
-            "/" => ApiResponse::html(
-                &INDEX_HTML
+            // The shell is static; the strict app CSP header locks it to our assets.
+            "/" => ApiResponse::html_with_csp(INDEX_HTML, APP_SHELL_CSP),
+            // app.js carries the (same-origin) capability tokens so the UI can POST
+            // restore/share/sync; empty when an action is disabled, hiding its UI.
+            "/app.js" => ApiResponse {
+                status: 200,
+                content_type: "application/javascript; charset=utf-8".into(),
+                body: APP_JS
                     .replace(
                         "__RESTORE_CAP_TOKEN__",
                         self.restore_cap_token.as_deref().unwrap_or(""),
@@ -383,8 +401,16 @@ impl Router {
                     .replace(
                         "__SHARE_CAP_TOKEN__",
                         self.share_cap_token.as_deref().unwrap_or(""),
-                    ),
-            ),
+                    )
+                    .into_bytes(),
+                headers: Vec::new(),
+            },
+            "/app.css" => ApiResponse {
+                status: 200,
+                content_type: "text/css; charset=utf-8".into(),
+                body: APP_CSS.as_bytes().to_vec(),
+                headers: Vec::new(),
+            },
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
             "/api/v1/activity" => self.activity(req),
@@ -1263,21 +1289,21 @@ mod tests {
     }
 
     #[test]
-    fn index_injects_separate_capability_tokens_when_enabled() {
-        // read-only router: placeholders are blanked, so destructive UI stays hidden
-        let ro = Router::new(Config::default()).route(&ApiRequest::get("/"));
+    fn app_js_injects_separate_capability_tokens_when_enabled() {
+        // the capability tokens are injected into the same-origin /app.js (served as
+        // a script), not the static shell. read-only router: placeholders blanked.
+        let ro = Router::new(Config::default()).route(&ApiRequest::get("/app.js"));
+        assert!(ro.content_type.starts_with("application/javascript"));
         let ro_body = String::from_utf8_lossy(&ro.body);
         assert!(
             !ro_body.contains("__RESTORE_CAP_TOKEN__") && !ro_body.contains("__SYNC_CAP_TOKEN__"),
             "placeholder must be replaced"
         );
         assert!(
-            ro_body.contains("const RESTORE_CAP_TOKEN = \"\"")
-                && ro_body.contains("const SYNC_CAP_TOKEN = \"\""),
+            ro_body.contains("restore: \"\"") && ro_body.contains("sync: \"\""),
             "no tokens when read-only"
         );
-        // restore/sync-enabled router: distinct real tokens are injected for the
-        // same-origin UI.
+        // restore/sync-enabled router: distinct real tokens are injected.
         let sync = std::sync::Arc::new(MockSync {
             paused: false.into(),
             triggered: false.into(),
@@ -1285,10 +1311,32 @@ mod tests {
         let rw = Router::new(Config::default())
             .with_restore(std::sync::Arc::new(OkRestore), "restore123".into())
             .with_sync_control(sync, "sync123".into())
-            .route(&ApiRequest::get("/"));
+            .route(&ApiRequest::get("/app.js"));
         let rw_body = String::from_utf8_lossy(&rw.body);
-        assert!(rw_body.contains("const RESTORE_CAP_TOKEN = \"restore123\""));
-        assert!(rw_body.contains("const SYNC_CAP_TOKEN = \"sync123\""));
+        assert!(rw_body.contains("restore: \"restore123\""));
+        assert!(rw_body.contains("sync: \"sync123\""));
+    }
+
+    #[test]
+    fn app_css_served_with_css_content_type() {
+        let resp = Router::new(Config::default()).route(&ApiRequest::get("/app.css"));
+        assert_eq!(resp.status, 200);
+        assert!(resp.content_type.starts_with("text/css"));
+    }
+
+    #[test]
+    fn app_shell_carries_strict_csp_header() {
+        // the shell `/` must lock script execution to same-origin (no inline script).
+        let resp = Router::new(Config::default()).route(&ApiRequest::get("/"));
+        assert!(resp.content_type.starts_with("text/html"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "Content-Security-Policy"
+                    && v.contains("script-src 'self'")
+                    && v.contains("default-src 'none'")),
+            "app shell must carry a strict CSP header"
+        );
     }
 
     struct MockSync {
@@ -1451,14 +1499,16 @@ mod tests {
     }
 
     #[test]
-    fn index_lists_all_store_services() {
-        // every service that can hold archived items is a browsable tab
+    fn app_js_lists_browsable_services() {
+        // every backed-up service is a browsable view. 'shared' (inbound
+        // shared-with-me) is intentionally omitted — that capability is deprecated
+        // by Microsoft and was closed not-planned (#332), so it never holds data.
         for svc in [
-            "onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared",
+            "onedrive", "mail", "calendar", "contacts", "todo", "onenote",
         ] {
             assert!(
-                INDEX_HTML.contains(&format!("\"{svc}\"")),
-                "web UI is missing the '{svc}' service tab"
+                APP_JS.contains(&format!("\"{svc}\"")),
+                "web UI is missing the '{svc}' service view"
             );
         }
     }
@@ -1526,29 +1576,28 @@ mod tests {
     }
 
     #[test]
-    fn index_wires_pagination() {
-        for needle in ["loadMore", "&offset=", "&limit=", "more-btn"] {
+    fn app_js_wires_pagination() {
+        for needle in ["loadMore", "offset", "limit"] {
             assert!(
-                INDEX_HTML.contains(needle),
+                APP_JS.contains(needle),
                 "web UI is missing '{needle}' (pagination wiring)"
             );
         }
     }
 
     #[test]
-    fn index_wires_overview_dashboard() {
-        // the embedded UI must call the overview endpoints and expose the panel,
-        // so the front-end wiring can't silently regress.
+    fn app_js_wires_overview_dashboard() {
+        // the UI must call the overview endpoints + expose the panels, so the
+        // front-end wiring can't silently regress.
         for needle in [
             "/api/v1/status",
             "/api/v1/settings",
             "/api/v1/activity",
-            "showOverview",
             "Overview",
             "Recent activity",
         ] {
             assert!(
-                INDEX_HTML.contains(needle),
+                APP_JS.contains(needle),
                 "web UI is missing '{needle}' (overview dashboard wiring)"
             );
         }
