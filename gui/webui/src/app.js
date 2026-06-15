@@ -65,6 +65,11 @@ const ICONS = {
   archive: "M21 8v13H3V8M1 3h22v5H1zM10 12h4",
   code: "M16 18l6-6-6-6M8 6l-6 6 6 6",
   "map-pin": "M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0zM12 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6",
+  phone: "M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z",
+  building: "M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18M6 22H2M18 22h4M9 6h.01M15 6h.01M9 10h.01M15 10h.01M9 14h.01M15 14h.01M10 22v-4h4v4",
+  flag: "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7",
+  circle: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
+  check: "M20 6L9 17l-5-5",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -308,6 +313,9 @@ function onRoute() {
   else if (App.route === "mail") renderMailView(view);
   else if (App.route === "onedrive") renderOnedriveView(view);
   else if (App.route === "calendar") renderCalendarView(view);
+  else if (App.route === "contacts") renderContactsView(view);
+  else if (App.route === "todo") renderTodoView(view);
+  else if (App.route === "onenote") renderOnenoteView(view);
   else renderServiceView(view, App.route);
 }
 
@@ -906,6 +914,192 @@ async function openEventSheet(ev) {
 }
 let sheetEl = null;
 function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
+
+/* ---------------------------------------------------------------- contacts (avatar cards) */
+const Contacts = { all: [] };
+async function renderContactsView(view) {
+  Contacts.all = [];
+  clear(view).append(
+    el("h1", { class: "view-title", text: "Contacts" }),
+    el("div", { class: "view-sub" }, el("input", { id: "con-search", class: "input", style: "max-width:420px", placeholder: "Search contacts…", oninput: contactsFilter })),
+  );
+  const wrap = el("div", { class: "con-wrap" }, el("div", { id: "con-grid", class: "con-grid" }), el("div", { id: "con-az", class: "con-az" }));
+  view.append(wrap);
+  const grid = $("#con-grid");
+  for (let i = 0; i < 6; i++) grid.append(el("div", { class: "card con-card" }, el("div", { class: "skel", style: "height:84px" })));
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 }));
+    Contacts.all = (d.items || []).filter(it => it.item_type !== "folder").sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    App.counts.contacts = d.total ?? Contacts.all.length; updateNavCounts();
+    contactsRender(Contacts.all);
+  } catch (e) { clear(grid).append(el("div", { class: "empty" }, el("h3", { text: "Could not load contacts" }), el("p", { text: e.message }))); }
+}
+function contactsFilter() {
+  const q = ($("#con-search").value || "").toLowerCase().trim();
+  contactsRender(!q ? Contacts.all : Contacts.all.filter(it => (it.name || "").toLowerCase().includes(q) || ((it.preview || {}).company || "").toLowerCase().includes(q)));
+}
+function contactsRender(list) {
+  const grid = clear($("#con-grid")), az = clear($("#con-az"));
+  if (!list.length) { grid.append(el("div", { class: "empty" }, icon("users", "icon-lg"), el("h3", { text: "No contacts" }), el("p", { text: "Run a backup to populate your contacts." }))); return; }
+  const seen = new Set();
+  grid.classList.add("stagger");
+  list.forEach(it => {
+    const letter = (it.name || "#").trim()[0].toUpperCase();
+    const card = contactCard(it);
+    if (!seen.has(letter)) { seen.add(letter); card.dataset.letter = letter; }
+    grid.append(card);
+  });
+  // A–Z quick-nav: jump to the first card of each present initial
+  [...seen].sort().forEach(L => az.append(el("button", { class: "az-letter", text: L, onclick: () => { const t = grid.querySelector(`[data-letter="${L}"]`); t && t.scrollIntoView({ block: "start", behavior: "smooth" }); } })));
+}
+function contactCard(it) {
+  const p = it.preview || {};
+  const sub = [p.job, p.company].filter(Boolean).join(" · ");
+  return el("button", { class: "card con-card rise", onclick: () => openContactSheet(it) },
+    el("span", { class: "avatar con-av", text: initials(it.name) }),
+    el("div", { class: "grow", style: "min-width:0" },
+      el("div", { class: "con-name truncate", text: it.name || "(no name)" }),
+      sub ? el("div", { class: "dim truncate", style: "font-size:12px", text: sub }) : null,
+      p.email ? el("div", { class: "con-email truncate", text: p.email }) : null));
+}
+async function openContactSheet(it) {
+  const q = { account: App.account, service: "contacts", id: it.remote_id };
+  const content = el("div", { class: "body" }, el("div", { class: "spinner" }));
+  openSheet(it.name || "Contact", content, el("span", { class: "avatar con-av", style: "width:30px;height:30px", text: initials(it.name) }));
+  try {
+    const c = await api("/api/v1/body?" + qs(q));
+    const kv = el("dl", { class: "kv" });
+    const add = (k, v, ic) => { if (!v || (Array.isArray(v) && !v.length)) return; kv.append(el("dt", {}, ic ? icon(ic, "icon-sm") : null, el("span", { text: k })), el("dd", { text: Array.isArray(v) ? v.join(", ") : v })); };
+    add("Email", (c.emailAddresses || []).map(e => e.address).filter(Boolean), "mail");
+    add("Mobile", c.mobilePhone, "phone");
+    add("Business", c.businessPhones, "phone");
+    add("Home", c.homePhones, "phone");
+    add("Company", [c.companyName, c.department].filter(Boolean).join(" — "), "building");
+    add("Title", c.jobTitle, "users");
+    const addr = c.businessAddress || c.homeAddress || {};
+    add("Address", [addr.street, addr.city, addr.postalCode, addr.countryOrRegion].filter(Boolean).join(", "), "map-pin");
+    clear(content).append(kv);
+    if (c.personalNotes) content.append(el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: c.personalNotes }));
+  } catch (e) { clear(content).append(el("p", { class: "dim", text: "Could not load contact: " + e.message })); }
+}
+
+/* ---------------------------------------------------------------- todo (lists + checklists) */
+const Todo = { lists: [], tasks: [] };
+const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
+async function renderTodoView(view) {
+  clear(view).append(el("h1", { class: "view-title", text: "ToDo" }), el("p", { class: "view-sub", text: "Your archived task lists (read-only)." }));
+  const board = el("div", { id: "todo-board", class: "todo-board" });
+  view.append(board);
+  board.append(el("div", { class: "card", style: "min-width:280px" }, el("div", { class: "skel", style: "height:200px" })));
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "todo", limit: 1000 }));
+    const items = d.items || [];
+    Todo.lists = items.filter(it => it.item_type === "list");
+    Todo.tasks = items.filter(it => it.item_type === "task");
+    App.counts.todo = d.total ?? items.length; updateNavCounts();
+    todoRender();
+  } catch (e) { clear(board).append(el("div", { class: "empty" }, el("h3", { text: "Could not load ToDo" }), el("p", { text: e.message }))); }
+}
+function todoRender() {
+  const board = clear($("#todo-board"));
+  if (!Todo.lists.length && !Todo.tasks.length) { board.append(el("div", { class: "empty" }, icon("check-square", "icon-lg"), el("h3", { text: "No tasks" }), el("p", { text: "Run a backup to populate your task lists." }))); return; }
+  // group tasks by their parent list; tasks whose list is unknown go to "Tasks"
+  const byList = new Map(Todo.lists.map(l => [l.remote_id, []]));
+  const orphan = [];
+  Todo.tasks.forEach(t => (byList.has(t.parent_remote_id) ? byList.get(t.parent_remote_id) : orphan).push(t));
+  const order = ["notStarted", "inProgress", "completed"];
+  const rank = (t) => order.indexOf((t.preview || {}).status || "notStarted");
+  const column = (title, tasks) => {
+    const sorted = tasks.slice().sort((a, b) => rank(a) - rank(b) || (a.name || "").localeCompare(b.name || ""));
+    const col = el("div", { class: "todo-col card" }, el("div", { class: "todo-col-head" }, el("b", { text: title }), el("span", { class: "count tnum", text: String(tasks.length) })));
+    if (!sorted.length) col.append(el("div", { class: "dim", style: "padding:8px", text: "No tasks" }));
+    sorted.forEach(t => col.append(taskRow(t)));
+    return col;
+  };
+  Todo.lists.forEach(l => board.append(column(l.name || "List", byList.get(l.remote_id) || [])));
+  if (orphan.length) board.append(column("Tasks", orphan));
+}
+function taskRow(t) {
+  const p = t.preview || {};
+  const st = TODO_STATUS[p.status] || TODO_STATUS.notStarted;
+  return el("button", { class: "todo-task" + (p.status === "completed" ? " done" : ""), onclick: () => openTaskSheet(t) },
+    el("span", { class: "todo-check " + st.cls }, icon(st.icon, "icon-sm")),
+    el("div", { class: "grow", style: "min-width:0" },
+      el("div", { class: "todo-title truncate", text: t.name || "(untitled)" }),
+      (p.due || p.importance === "high") ? el("div", { class: "todo-meta dim" },
+        p.importance === "high" ? el("span", { class: "todo-flag", title: "High importance" }, icon("flag", "icon-sm")) : null,
+        p.due ? el("span", { text: "Due " + fmtDate(evDate(p.due, "UTC")) }) : null) : null));
+}
+async function openTaskSheet(t) {
+  const q = { account: App.account, service: "todo", id: t.remote_id };
+  const p = t.preview || {};
+  const content = el("div", { class: "body" }, el("div", { class: "spinner" }));
+  openSheet(t.name || "Task", content);
+  try {
+    const full = await api("/api/v1/body?" + qs(q));
+    const kv = el("dl", { class: "kv" });
+    const add = (k, v, ic) => { if (!v) return; kv.append(el("dt", {}, ic ? icon(ic, "icon-sm") : null, el("span", { text: k })), el("dd", { text: v })); };
+    add("Status", (full.status || "").replace(/([A-Z])/g, " $1").replace(/^./, c => c.toUpperCase()), "check-square");
+    add("Importance", full.importance, "flag");
+    if (full.dueDateTime) add("Due", fmtFullDate(evDate(full.dueDateTime.dateTime, full.dueDateTime.timeZone)), "clock");
+    if (full.completedDateTime) add("Completed", fmtFullDate(evDate(full.completedDateTime.dateTime, full.completedDateTime.timeZone)), "check");
+    clear(content).append(kv);
+    const note = (full.body || {}).content || "";
+    if (note.trim()) {
+      const txt = (full.body.contentType === "html") ? new DOMParser().parseFromString(note, "text/html").body.textContent : note;
+      content.append(el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: txt.trim().slice(0, 4000) }));
+    }
+  } catch (e) { clear(content).append(el("p", { class: "dim", text: "Could not load task: " + e.message })); }
+}
+
+/* ---------------------------------------------------------------- onenote (page list + reader) */
+async function renderOnenoteView(view) {
+  clear(view);
+  const list = el("div", { id: "note-list", class: "note-list" });
+  const reader = el("div", { id: "note-reader", class: "note-reader" });
+  view.append(el("div", { class: "note-layout" }, list, reader));
+  renderNoteReader(null);
+  for (let i = 0; i < 5; i++) list.append(el("div", { class: "note-item" }, el("div", { class: "skel grow", style: "height:30px" })));
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onenote", limit: 1000 }));
+    const pages = (d.items || []).filter(it => it.item_type === "page");
+    App.counts.onenote = d.total ?? pages.length; updateNavCounts();
+    clear(list);
+    if (!pages.length) { list.append(el("div", { class: "empty" }, icon("notebook", "icon-lg"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
+    pages.forEach((it, i) => {
+      const row = el("button", { class: "note-item", dataset: { id: it.remote_id }, onclick: () => noteSelect(it) },
+        icon("notebook"), el("div", { class: "grow", style: "min-width:0" },
+          el("div", { class: "truncate", text: it.name || "(untitled)" }),
+          el("div", { class: "dim", style: "font-size:12px", text: fmtDate(it.remote_mtime) })));
+      list.append(row);
+      if (i === 0) setTimeout(() => noteSelect(it), 0);
+    });
+  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load OneNote" }), el("p", { text: e.message }))); }
+}
+function noteSelect(it) {
+  document.querySelectorAll(".note-item").forEach(r => r.classList.toggle("active", r.dataset.id === it.remote_id));
+  renderNoteReader(it);
+}
+function renderNoteReader(it) {
+  const box = $("#note-reader"); if (!box) return; clear(box);
+  if (!it) { box.append(el("div", { class: "empty", style: "margin:auto" }, logoGlyph(64), el("h3", { text: "Select a page" }))); return; }
+  const q = { account: App.account, service: "onenote", id: it.remote_id };
+  box.append(
+    el("header", { class: "note-reader-head" }, el("h2", { class: "grow truncate", text: it.name || "(untitled)" }),
+      el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm"))),
+    el("iframe", { class: "note-frame", src: `/api/v1/view?${qs(q)}`, title: "Note", loading: "lazy" }));
+}
+
+/* shared detail sheet (used by calendar/contacts/todo) */
+function openSheet(title, contentEl, leading) {
+  closeSheet();
+  const scrim = el("div", { class: "scrim", onclick: closeSheet });
+  const sheet = el("aside", { class: "sheet" },
+    el("header", {}, leading || null, el("h2", { class: "grow truncate", text: title }),
+      el("button", { class: "btn ghost sm icon-only", onclick: closeSheet }, icon("x", "icon-sm"))),
+    contentEl);
+  sheetEl = el("div", {}, scrim, sheet); document.body.append(sheetEl);
+}
 
 /* ---------------------------------------------------------------- actions */
 async function doRestore(it, btn) {
