@@ -34,7 +34,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -224,6 +224,20 @@ ALTER TABLE items ADD COLUMN synced_mtime_unix INTEGER;
 ALTER TABLE items ADD COLUMN synced_hash TEXT;
 "#;
 
+/// v9: per-item **archive integrity** state (the real backing for the web UI's
+/// "Integrity verified" / "Verified" signals). `body_sha256` is the SHA-256 of
+/// the archived body file (`local_path`) as recorded at the last verify pass —
+/// the integrity baseline; `verify_status` is the outcome of the last check
+/// (`verified` / `changed` / `failed`) and `verified_at` its RFC3339 timestamp.
+/// Set ONLY by the verify pass (never by the delta ingest), so a re-ingest that
+/// changes a body leaves the old hash in place and the next verify detects the
+/// drift. NULL = never verified.
+const MIGRATION_V9: &str = r#"
+ALTER TABLE items ADD COLUMN body_sha256 TEXT;
+ALTER TABLE items ADD COLUMN verified_at TEXT;
+ALTER TABLE items ADD COLUMN verify_status TEXT;
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -262,6 +276,13 @@ pub struct Item {
     /// For a recurring event's occurrence/exception: the id of its series master
     /// (`NULL` for single-instance events and for the master row itself).
     pub series_master_id: Option<String>,
+    /// SHA-256 of the archived body (`local_path`) recorded at the last verify
+    /// pass — the integrity baseline. `None` = never verified.
+    pub body_sha256: Option<String>,
+    /// RFC3339 timestamp of the last verify pass for this item.
+    pub verified_at: Option<String>,
+    /// Outcome of the last verify pass: `verified` / `changed` / `failed`.
+    pub verify_status: Option<String>,
 }
 
 impl Item {
@@ -292,6 +313,9 @@ impl Item {
             internet_message_id: None,
             ical_uid: None,
             series_master_id: None,
+            body_sha256: None,
+            verified_at: None,
+            verify_status: None,
         }
     }
 }
@@ -758,6 +782,64 @@ impl Store {
             params![account, service, remote_id, local_path],
         )?;
         Ok(n > 0)
+    }
+
+    /// All live items for an account that have an archived body (`local_path`
+    /// set), across every service — the verify pass's work-list. Folders are
+    /// excluded: they have a path but no body to hash.
+    pub fn items_with_body(&self, account: &str) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND deleted_at IS NULL AND local_path IS NOT NULL
+               AND item_type != 'folder'
+             ORDER BY service, remote_id"
+        ))?;
+        let rows = stmt.query_map(params![account], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Record the outcome of a verify pass for one item: the integrity baseline
+    /// hash (`sha`, SHA-256 of the archived body), the `status`
+    /// (`verified`/`changed`/`failed`) and the timestamp `at` (RFC3339). Written
+    /// only by the verify pass — never by the delta ingest. Returns whether a row
+    /// matched.
+    pub fn set_verify(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        sha: Option<&str>,
+        status: &str,
+        at: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE items SET body_sha256=?4, verify_status=?5, verified_at=?6
+             WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, sha, status, at],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Aggregate integrity counts for an account: `(checked, verified)` where
+    /// `checked` is the number of live items that have actually been through a
+    /// verify pass (`verify_status` set — present bodies that were read + hashed;
+    /// cloud-only OneDrive placeholders that the pass skips are excluded) and
+    /// `verified` is how many of those last passed (`verify_status = 'verified'`).
+    /// The web UI derives "Integrity verified N%" as `verified / checked`.
+    pub fn verify_counts(&self, account: &str) -> Result<(i64, i64)> {
+        let checked: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM items
+             WHERE account_id=?1 AND deleted_at IS NULL AND verify_status IS NOT NULL",
+            params![account],
+            |r| r.get(0),
+        )?;
+        let verified: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM items
+             WHERE account_id=?1 AND deleted_at IS NULL AND verify_status='verified'",
+            params![account],
+            |r| r.get(0),
+        )?;
+        Ok((checked, verified))
     }
 
     /// **Every** item of a service, including tombstones (`deleted_at` set). Used
@@ -1254,7 +1336,8 @@ fn is_plaintext_sqlite(path: &Path) -> Result<bool> {
 
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
                     item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
-                    change_key, internet_message_id, ical_uid, series_master_id";
+                    change_key, internet_message_id, ical_uid, series_master_id, \
+                    body_sha256, verified_at, verify_status";
 
 fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     Ok(Item {
@@ -1276,6 +1359,9 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         internet_message_id: r.get(15)?,
         ical_uid: r.get(16)?,
         series_master_id: r.get(17)?,
+        body_sha256: r.get(18)?,
+        verified_at: r.get(19)?,
+        verify_status: r.get(20)?,
     })
 }
 
@@ -1420,6 +1506,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 8 {
         conn.execute_batch(MIGRATION_V8)?;
     }
+    if v < 9 {
+        conn.execute_batch(MIGRATION_V9)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1436,6 +1525,58 @@ mod tests {
     fn migrates_to_current_version() {
         let s = Store::open_in_memory().unwrap();
         assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn set_verify_roundtrip_and_counts() {
+        let s = Store::open_in_memory().unwrap();
+        // two items with an archived body, one without
+        let mut a = item("acc", "id-a", "A.json");
+        a.local_path = Some("ct/aa/id-a.json".into());
+        let mut b = item("acc", "id-b", "B.json");
+        b.local_path = Some("ct/bb/id-b.json".into());
+        let c = item("acc", "id-c", "C"); // no body
+        for it in [&a, &b, &c] {
+            s.upsert_item(it).unwrap();
+        }
+        // fresh items: never verified → nothing checked yet
+        let got = s.get_item("acc", "onedrive", "id-a").unwrap().unwrap();
+        assert_eq!(got.verify_status, None);
+        assert_eq!(got.body_sha256, None);
+        assert_eq!(s.verify_counts("acc").unwrap(), (0, 0)); // nothing verified yet
+
+        // baseline a, fail b
+        assert!(s
+            .set_verify(
+                "acc",
+                "onedrive",
+                "id-a",
+                Some("abc123"),
+                "verified",
+                "2026-06-16T00:00:00Z"
+            )
+            .unwrap());
+        assert!(s
+            .set_verify(
+                "acc",
+                "onedrive",
+                "id-b",
+                None,
+                "failed",
+                "2026-06-16T00:00:00Z"
+            )
+            .unwrap());
+        let ga = s.get_item("acc", "onedrive", "id-a").unwrap().unwrap();
+        assert_eq!(ga.verify_status.as_deref(), Some("verified"));
+        assert_eq!(ga.body_sha256.as_deref(), Some("abc123"));
+        assert_eq!(ga.verified_at.as_deref(), Some("2026-06-16T00:00:00Z"));
+        assert_eq!(s.verify_counts("acc").unwrap(), (2, 1)); // 1 of 2 verified
+
+        // a re-ingest (delta upsert) must NOT clear the verify baseline
+        s.upsert_item(&a).unwrap();
+        let ga2 = s.get_item("acc", "onedrive", "id-a").unwrap().unwrap();
+        assert_eq!(ga2.verify_status.as_deref(), Some("verified"));
+        assert_eq!(ga2.body_sha256.as_deref(), Some("abc123"));
     }
 
     #[test]
