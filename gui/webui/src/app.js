@@ -211,6 +211,7 @@ const CAP = {
   restore: "__RESTORE_CAP_TOKEN__",
   sync: "__SYNC_CAP_TOKEN__",
   share: "__SHARE_CAP_TOKEN__",
+  verify: "__VERIFY_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
@@ -1073,8 +1074,9 @@ function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
 const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null, runs: [], retentionDays: null };
 const conLetter = (it) => ((it.name || "#").trim()[0] || "#").toUpperCase();
 const conPrev = (it) => it.preview || {};
+const CON_FILTERS = [["all", "All"], ["email", "With email"], ["company", "With company"], ["restore", "Restore-ready"]];
 async function renderContactsView(view) {
-  Object.assign(Contacts, { all: [], selected: null, filter: "all", q: "", sort: "name" });
+  Object.assign(Contacts, { all: [], selected: null, filter: "all", q: "", sort: "name", status: null });
   clear(view).append(el("div", { class: "con-page" },
     // header: title + live metrics + honest trust chips (Source / Encryption / Read-only)
     el("header", { class: "con-page-head" },
@@ -1085,38 +1087,60 @@ async function renderContactsView(view) {
         el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"),
         el("span", { class: "chip muted" }, icon("shield", "icon-sm"), "Encrypted at rest"),
         readonlyChip())),
-    // toolbar: search + sort + sync-log shortcut
+    // top metric row (real data: counts + integrity from verify + sync health/activity)
+    el("div", { id: "con-metrics-row", class: "con-metrics-row" }),
+    // toolbar: search + filters + sort + verify + sync-log
     el("div", { class: "con-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
-        el("input", { id: "con-search", placeholder: "Search this directory…", oninput: () => { Contacts.q = ($("#con-search").value || "").trim().toLowerCase(); contactsRenderList(); } })),
+        el("input", { id: "con-search", placeholder: "Search by name, email, or company…", oninput: () => { Contacts.q = ($("#con-search").value || "").trim().toLowerCase(); contactsRenderList(); } })),
+      el("div", { class: "con-filters" }, ...CON_FILTERS.map(([k, l]) =>
+        el("button", { class: "con-filter" + (Contacts.filter === k ? " active" : ""), dataset: { k }, onclick: () => { Contacts.filter = k; document.querySelectorAll(".con-filter").forEach(b => b.classList.toggle("active", b.dataset.k === k)); contactsRenderList(); } }, l))),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
         el("select", { class: "input", onchange: (e) => { Contacts.sort = e.target.value; contactsRenderList(); } },
           el("option", { value: "name", text: "Name A–Z" }),
           el("option", { value: "company", text: "Company A–Z" }),
           el("option", { value: "recent", text: "Recently archived" }))),
+      CAP.verify ? el("button", { class: "btn sm", title: "Re-hash every archived record and check integrity", onclick: (e) => contactsVerify(e.currentTarget) }, icon("shield-check", "icon-sm"), "Verify") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
-    // 3-pane: filter/insights rail | directory | detail
+    // master–detail: directory list | record detail
     el("div", { id: "con-layout", class: "con-layout" },
-      el("aside", { id: "con-rail", class: "con-rail" }),
       el("div", { class: "con-listwrap" }, el("div", { id: "con-list", class: "con-list" }), el("div", { id: "con-az", class: "con-az" })),
       el("div", { id: "con-detail", class: "con-detail" }))));
   renderContactDetail(null);
   const list = $("#con-list");
   for (let i = 0; i < 9; i++) list.append(el("div", { class: "con-row skel-row" }, el("div", { class: "skel grow", style: "height:38px" })));
   try {
-    const [d, act, settings] = await Promise.all([
+    const [d, act, settings, status] = await Promise.all([
       api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 })),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
       api("/api/v1/settings").catch(() => ({})),
+      api("/api/v1/status?" + qs({ account: App.account })).catch(() => ({})),
     ]);
     Contacts.all = (d.items || []).filter(it => it.item_type !== "folder");
     Contacts.runs = act.runs || [];
+    Contacts.status = status;
     Contacts.lastSync = Contacts.runs.filter(r => /sync|backup/i.test(r.kind || "")).map(r => r.finished_at || r.started_at).filter(Boolean).sort().pop() || null;
     Contacts.retentionDays = (settings.sync || {}).trash_retention_days ?? null;
     App.counts.contacts = d.total ?? Contacts.all.length; updateNavCounts();
-    contactsRenderRail(); contactsRenderList();
+    contactsRenderMetrics(); contactsRenderList();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load contacts" }), el("p", { text: e.message }))); }
+}
+// re-hash every archived record (real verify), then refresh the integrity signals
+async function contactsVerify(btn) {
+  btn.disabled = true;
+  try {
+    const r = await post("/api/v1/verify?" + qs({ account: App.account }), CAP.verify);
+    toast(`Integrity: ${r.verified}/${r.checked} records verified`);
+    const [status, d] = await Promise.all([
+      api("/api/v1/status?" + qs({ account: App.account })).catch(() => Contacts.status),
+      api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 })),
+    ]);
+    Contacts.status = status;
+    Contacts.all = (d.items || []).filter(it => it.item_type !== "folder");
+    contactsRenderMetrics(); contactsRenderList();
+    if (Contacts.selected) { const s = Contacts.all.find(x => x.remote_id === Contacts.selected.remote_id); if (s) { Contacts.selected = s; renderContactDetail(s); } }
+  } catch (e) { toast("Verify failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 function contactsFiltered() {
   let rows = Contacts.all;
@@ -1132,27 +1156,34 @@ function contactsFiltered() {
   else rows = rows.slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   return rows;
 }
-function contactsRenderRail() {
-  const rail = $("#con-rail"); if (!rail) return; clear(rail);
-  const withEmail = Contacts.all.filter(it => conPrev(it).email).length;
-  const withCompany = Contacts.all.filter(it => conPrev(it).company).length;
+function conMetric(icn, value, label, sub, tone) {
+  return el("div", { class: "card rise con-metric" },
+    el("span", { class: "cm-ico" + (tone ? " " + tone : "") }, icon(icn, "icon-lg")),
+    el("div", { class: "grow", style: "min-width:0" },
+      el("div", { class: "cm-label dim", text: label }),
+      el("div", { class: "cm-val tnum" + (tone ? " " + tone : ""), text: String(value) }),
+      el("div", { class: "cm-sub dim truncate", text: sub })));
+}
+// top metric row — every value real: counts from items, integrity from /status
+// verify, sync health + last activity from /activity runs.
+function contactsRenderMetrics() {
+  const row = $("#con-metrics-row"); if (!row) return; clear(row);
+  const v = (Contacts.status || {}).verify || {};
   const restore = Contacts.all.filter(it => it.has_body).length;
-  const folder = (key, label, icn, count) => el("button", { class: "con-folder" + (Contacts.filter === key ? " active" : ""), onclick: () => { Contacts.filter = key; contactsRenderRail(); contactsRenderList(); } },
-    el("span", { class: "cf-ico" }, icon(icn, "icon-sm")), el("span", { class: "grow truncate", text: label }), el("span", { class: "count tnum", text: String(count) }));
-  const fact = (icn, label) => el("div", { class: "crc-row" }, icon(icn, "icon-sm"), el("span", { text: label }));
-  rail.append(
-    el("div", { class: "con-rail-sec", text: "Directory" }),
-    folder("all", "All contacts", "users", Contacts.all.length),
-    folder("email", "With email", "mail", withEmail),
-    folder("company", "With company", "building", withCompany),
-    folder("restore", "Restore-ready", "rotate-ccw", restore),
-    el("div", { class: "spacer" }),
-    el("div", { class: "con-rail-sec", text: "Archive" }),
-    el("div", { class: "con-rail-card" },
-      fact("archive", "Source · Microsoft 365"),
-      fact("shield", "Encrypted at rest"),
-      fact("shield-check", "Read-only archive"),
-      Contacts.lastSync ? fact("clock", "Last synced " + fmtDate(Contacts.lastSync)) : fact("clock", "No sync recorded yet")));
+  const total = Contacts.all.length;
+  const pct = v.checked ? Math.round((v.verified / v.checked) * 100) : null;
+  const runs = Contacts.runs || [];
+  // sync health = sync/backup runs only (a verify finding drift is not "sync unhealthy")
+  const failed = runs.filter(r => /sync|backup/i.test(r.kind || "") && /error|fail/i.test(r.status || "")).length;
+  const lastRun = runs[0];
+  row.append(
+    conMetric("users", total, "Total contacts", "Across all directories"),
+    conMetric("rotate-ccw", restore, "Restore-ready", restore === total ? "100% of archive" : `${restore} of ${total} archived`, "ok"),
+    conMetric("shield-check", pct == null ? "—" : pct + "%", "Integrity verified",
+      pct == null ? "Run verify to check" : `${v.verified} of ${v.checked} records`,
+      pct == null ? "" : pct === 100 ? "ok" : "warn"),
+    conMetric("refresh-cw", failed ? "Issues" : "Healthy", "Sync health", failed ? `${failed} failed run(s)` : "All systems operational", failed ? "warn" : "ok"),
+    conMetric("clock", lastRun ? fmtDate(lastRun.finished_at) : "—", "Last archive activity", lastRun ? `${lastRun.kind} · ${fmtFullDate(lastRun.finished_at)}` : "no runs recorded yet"));
 }
 function contactsRenderList() {
   const wrap = clear($("#con-list")), az = clear($("#con-az"));
@@ -1251,6 +1282,34 @@ function archiveMetaCard(it) {
   return el("div", { class: "card con-block" },
     el("div", { class: "con-block-head" }, icon("archive", "icon-sm"), el("span", { text: "Archive details" })), meta);
 }
+// compliance & integrity card — driven entirely by the real verify pass
+function complianceCard(it) {
+  const st = it.verify_status;
+  const ok = st === "verified";
+  const last = ((Contacts.status || {}).verify || {}).last_verified;
+  const tone = ok ? "ok" : st === "changed" ? "warn" : st === "failed" ? "err" : "";
+  const head = ok ? "All integrity checks passed"
+    : st === "changed" ? "Content changed since last check"
+      : st === "failed" ? "Integrity check failed"
+        : "Not verified yet";
+  const note = ok ? "SHA-256 of the archived body matches the recorded baseline."
+    : st === "changed" ? "The archived body differs from the last recorded hash."
+      : st === "failed" ? "The archived body could not be read for hashing."
+        : "Run Verify to hash this record and check its integrity.";
+  const meta = el("dl", { class: "kv meta-kv" });
+  const row = (k, v, ic, cls) => meta.append(el("dt", {}, icon(ic, "icon-sm"), el("span", { text: k })), el("dd", { class: cls || "", text: v }));
+  row("Status", st || "unverified", ok ? "check" : "circle", tone);
+  row("Method", "SHA-256 re-hash", "shield");
+  row("Last verified", last ? fmtFullDate(last) : "—", "clock");
+  return el("div", { class: "card con-block" },
+    el("div", { class: "con-block-head" }, icon("shield-check", "icon-sm"), el("span", { text: "Compliance & integrity" })),
+    el("div", { class: "con-compliance" + (tone ? " " + tone : "") },
+      el("span", { class: "cc-ico" }, icon(ok ? "shield-check" : "shield", "icon-lg")),
+      el("div", { class: "grow", style: "min-width:0" },
+        el("div", { class: "cc-head", text: head }),
+        el("div", { class: "dim", style: "font-size:12px", text: note }))),
+    meta);
+}
 async function renderContactDetail(it) {
   const box = $("#con-detail"); if (!box) return; clear(box);
   if (!it) {
@@ -1289,24 +1348,28 @@ async function renderContactDetail(it) {
   const actions = el("div", { class: "con-detail-actions" },
     el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs({ account: App.account, service: "contacts", id: it.remote_id })}`, target: "_blank", rel: "noopener", title: "View raw archived record" }, icon("external-link", "icon-sm"), "Raw"));
   if (CAP.restore && it.has_body) actions.append(el("button", { class: "btn sm", title: "Restore to cloud as a new copy", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
+  const verified = it.verify_status === "verified";
   box.append(el("header", { class: "con-detail-head" },
     el("button", { class: "con-back btn ghost sm", title: "Back", onclick: contactBack }, icon("chevron-left", "icon-sm")),
     el("span", { class: "avatar con-av lg", text: initials(it.name) }),
     el("div", { class: "grow", style: "min-width:0" },
       el("h2", { class: "con-detail-name truncate", text: it.name || "(no name)" }),
-      sub ? el("div", { class: "con-detail-sub truncate", text: sub }) : null,
+      p.email ? el("button", { class: "con-detail-email truncate", title: "Copy email", onclick: (e) => { navigator.clipboard?.writeText(p.email).then(() => toast("Email copied")).catch(() => {}); } }, el("span", { class: "truncate", text: p.email }), icon("share2", "icon-sm")) : (sub ? el("div", { class: "con-detail-sub truncate", text: sub }) : null),
       el("div", { class: "con-detail-chips" }, readonlyChip(),
-        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"),
         (CAP.restore && it.has_body) ? el("span", { class: "chip ok" }, icon("rotate-ccw", "icon-sm"), "Restore-ready")
           : it.has_body ? el("span", { class: "chip muted" }, icon("check", "icon-sm"), "Body archived")
-            : el("span", { class: "chip muted" }, "Header only"))),
+            : el("span", { class: "chip muted" }, "Header only"),
+        verified ? el("span", { class: "chip ok" }, icon("shield-check", "icon-sm"), "Verified")
+          : it.verify_status === "changed" ? el("span", { class: "chip warn" }, icon("shield", "icon-sm"), "Changed")
+            : it.verify_status === "failed" ? el("span", { class: "chip err" }, icon("shield", "icon-sm"), "Check failed") : null,
+        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"))),
     actions));
   const body = el("div", { class: "con-detail-body" });
   const fieldsBody = el("div", { class: "con-block-body" }, el("div", { class: "spinner" }));
   const fields = el("div", { class: "card con-block" },
     el("div", { class: "con-block-head" }, icon("users", "icon-sm"), el("span", { text: "Contact details" })), fieldsBody);
   const main = el("div", { class: "con-col-main" }, fields);
-  const side = el("div", { class: "con-col-side" }, archiveMetaCard(it));
+  const side = el("div", { class: "con-col-side" }, archiveMetaCard(it), complianceCard(it));
   body.append(main, side);
   box.append(body);
   try {
