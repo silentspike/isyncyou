@@ -305,6 +305,14 @@ function renderShell() {
     nav,
     el("div", { class: "spacer" }),
     el("div", { class: "sb-section", text: "System" }),
+    el("nav", { class: "nav" },
+      el("button", { class: "nav-item", title: "Recent runs (audit log)", onclick: () => go("overview") },
+        icon("clock"), el("span", { class: "label", text: "Audit log" })),
+      el("button", { id: "nav-alerts", class: "nav-item", title: "Failed runs", onclick: () => go("overview") },
+        icon("shield"), el("span", { class: "label", text: "Alerts" }),
+        el("span", { class: "nav-meta" }, el("span", { id: "alerts-badge", class: "count", text: "·" }))),
+      el("button", { class: "nav-item" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") },
+        icon("settings"), el("span", { class: "label", text: "Settings" }))),
     el("div", { id: "sync-widget", class: "sync-widget" }),
   );
   const topbar = el("header", { class: "topbar" },
@@ -320,24 +328,44 @@ function renderShell() {
   renderSyncWidget();
 }
 
-// Sidebar "Archive health" card: real health pill + last-sync + sync controls.
+// Sidebar "System health" card: real health, activity sparkline, last-sync,
+// sync controls — and it back-fills ALL per-service nav counts up-front + the
+// Alerts badge. Every value is real (from /sync/state, /activity, /status).
 async function renderSyncWidget() {
   const box = $("#sync-widget"); if (!box) return;
-  let st = { enabled: false, paused: false }, runs = [];
+  let st = { enabled: false, paused: false }, runs = [], status = null;
   try { st = await api("/api/v1/sync/state"); } catch {}
-  if (App.account) { try { runs = (await api("/api/v1/activity?" + qs({ account: App.account, limit: 30 }))).runs || []; } catch {} }
-  const failed = runs.filter(r => r.status === "error").length, last = runs[0];
+  if (App.account) {
+    try { runs = (await api("/api/v1/activity?" + qs({ account: App.account, limit: 60 }))).runs || []; } catch {}
+    try { status = await api("/api/v1/status?" + qs({ account: App.account })); } catch {}
+  }
+  // back-fill every service's nav count so the sidebar shows them without
+  // visiting each view first (the mockup shows all counts up-front).
+  if (status && Array.isArray(status.services)) {
+    status.services.forEach(s => { App.counts[s.service] = s.items; });
+    updateNavCounts();
+  }
+  // alerts = failed sync/backup runs (real); reflect in the Alerts nav badge.
+  const failed = runs.filter(r => /sync|backup/i.test(r.kind || "") && r.status === "error").length;
+  const ab = $("#alerts-badge"); if (ab) ab.textContent = String(failed);
+  $("#nav-alerts")?.classList.toggle("has-alerts", failed > 0);
+  const last = runs.find(r => /sync|backup/i.test(r.kind || "")) || runs[0];
+  const healthy = !failed;
+  // daily run volume → sparkline (last 14 days)
+  const days = 14, now = Date.now(), buckets = new Array(days).fill(0);
+  runs.forEach(r => { const t = toDate(r.finished_at || r.started_at); if (!t) return; const d = Math.floor((now - t.getTime()) / 864e5); if (d >= 0 && d < days) buckets[days - 1 - d]++; });
   clear(box);
-  const pillCls = !runs.length ? "info" : failed ? "warn" : "ok";
-  const pillTxt = !runs.length ? "Ready" : failed ? `${failed} failed` : "Healthy";
   box.append(
     el("div", { class: "sw-head" },
-      el("span", { class: "pill " + pillCls }, el("span", { class: "dot" }), pillTxt),
+      el("span", { class: "sw-title", text: "System health" }),
       (st.enabled && CAP.sync) ? el("div", { class: "sw-actions" },
         el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
         st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
           : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))) : null),
-    el("div", { class: "sw-meta dim" }, last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet"),
+    el("div", { class: "sw-health " + (runs.length ? (healthy ? "ok" : "warn") : "") },
+      el("span", { class: "dot" }), el("b", { text: !runs.length ? "Ready" : healthy ? "Healthy" : `${failed} alert${failed > 1 ? "s" : ""}` })),
+    runs.length ? el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)) : null,
+    el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }),
   );
 }
 async function syncCmd(cmd) {

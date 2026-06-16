@@ -201,6 +201,16 @@ a:hover { text-decoration: underline; }
 }
 .sw-actions button:hover { color: var(--text-hi); border-color: var(--line-2); }
 .sw-meta { font-size: var(--fs-xs); }
+.sw-title { font-size: var(--fs-sm); font-weight: 600; color: var(--text-mid); }
+.sw-health { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-md); margin-top: var(--sp-1); color: var(--text-mid); }
+.sw-health .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-lo); flex: none; }
+.sw-health.ok { color: var(--ok); } .sw-health.ok .dot { background: var(--ok); }
+.sw-health.warn { color: var(--warn); } .sw-health.warn .dot { background: var(--warn); }
+.sw-spark { margin: var(--sp-1) 0; }
+.sw-spark.ok .spark-line { stroke: var(--ok); } .sw-spark.ok .spark-area { fill: color-mix(in oklab, var(--ok) 16%, transparent); }
+.sw-spark.warn .spark-line { stroke: var(--warn); } .sw-spark.warn .spark-area { fill: color-mix(in oklab, var(--warn) 16%, transparent); }
+.nav-item.has-alerts .count { background: var(--err-soft); color: var(--err); border-radius: var(--r-full); padding: 0 6px; min-width: 0; }
+.nav-item.has-alerts .icon { color: var(--err); }
 
 /* ---- main column */
 .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
