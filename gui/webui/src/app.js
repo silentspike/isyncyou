@@ -640,8 +640,11 @@ async function renderMailView(view) {
         el("h1", { class: "view-title", style: "margin:0", text: "Mail archive" }),
         el("div", { id: "mail-metrics", class: "mail-metrics dim", text: "Loading…" })),
       el("div", { class: "mail-chips" },
-        el("span", { class: "chip muted" }, icon("shield-check", "icon-sm"), "Read-only"),
-        el("span", { class: "chip muted" }, icon("rotate-ccw", "icon-sm"), "Restore-ready"))),
+        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"),
+        el("span", { class: "chip muted" }, icon("shield", "icon-sm"), "Encrypted at rest"),
+        el("span", { class: "chip muted" }, icon("shield-check", "icon-sm"), "Read-only"))),
+    // top metric row (real: counts + integrity from verify + last activity)
+    el("div", { id: "mail-metrics-row", class: "con-metrics-row" }),
     // toolbar
     el("div", { class: "mail-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
@@ -652,6 +655,7 @@ async function renderMailView(view) {
           el("option", { value: "newest", text: "Newest first" }),
           el("option", { value: "oldest", text: "Oldest first" }),
           el("option", { value: "sender", text: "Sender A–Z" }))),
+      verifyButton(() => renderMailView(view)),
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
     // 3-pane: filter rail | list | reader
     el("div", { id: "mail-layout", class: "mail-layout" },
@@ -662,11 +666,32 @@ async function renderMailView(view) {
   const list = $("#mail-list");
   for (let i = 0; i < 9; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:46px" })));
   try {
-    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 }));
+    const [d, act] = await Promise.all([
+      api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
+    ]);
     Mail.all = (d.items || []).filter(it => it.item_type === "message");
+    Mail.runs = act.runs || [];
     App.counts.mail = Mail.all.length; updateNavCounts();
-    mailRenderRail(); mailRender();
+    mailRenderMetrics(); mailRenderRail(); mailRender();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
+}
+// fill an existing .con-metrics-row container in place from card specs
+function fillMetrics(row, cards) {
+  if (!row) return; clear(row);
+  row.style.gridTemplateColumns = `repeat(${cards.length}, 1fr)`;
+  cards.forEach(c => row.append(conMetric(c.icon, c.value, c.label, c.sub, c.tone)));
+}
+function mailRenderMetrics() {
+  const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
+  const restore = Mail.all.filter(it => it.has_body).length;
+  fillMetrics($("#mail-metrics-row"), [
+    { icon: "inbox", value: Mail.all.length, label: "Total messages", sub: "in this mailbox" },
+    { icon: "paperclip", value: withAtt, label: "With attachments", sub: `${withAtt} of ${Mail.all.length}` },
+    { icon: "rotate-ccw", value: restore, label: "Restore-ready", sub: `${restore} with full body`, tone: "ok" },
+    integrityMetric(Mail.all),
+    lastActivityMetric(Mail.runs),
+  ]);
 }
 function mailFiltered() {
   let rows = Mail.all;
@@ -769,7 +794,8 @@ function renderMailReader(it) {
       el("div", { class: "grow", style: "min-width:0" },
         el("div", { class: "mr-tags" }, el("span", { class: "mi-cat", style: `--c:${cat.color}`, text: cat.label }),
           p.attachments > 0 ? el("span", { class: "mi-chip" }, icon("paperclip", "icon-sm"), p.attachments + (p.attachments === 1 ? " attachment" : " attachments")) : null,
-          el("span", { class: "mi-status " + (it.has_body ? "ok" : "muted") }, it.has_body ? "Body saved" : "Header only")),
+          el("span", { class: "mi-status " + (it.has_body ? "ok" : "muted") }, it.has_body ? "Body saved" : "Header only"),
+          verifyChip(it)),
         el("h2", { class: "mr-subject", text: subject }),
         el("div", { class: "mr-meta" },
           el("span", { class: "avatar mail-av", style: `--c:${cat.color}`, text: initials(from.name || from.email || subject) }),
@@ -1191,6 +1217,52 @@ function conMetric(icn, value, label, sub, tone) {
       el("div", { class: "cm-label dim", text: label }),
       el("div", { class: "cm-val tnum" + (tone ? " " + tone : ""), text: String(value) }),
       el("div", { class: "cm-sub dim truncate", text: sub })));
+}
+/* ---- shared archive-mockup primitives (metric row + integrity + verify), reused by every view */
+// a KPI row from [{icon,value,label,sub,tone}] (tone: ok|warn|"")
+function metricsRow(cards) {
+  const row = el("div", { class: "con-metrics-row", style: `grid-template-columns: repeat(${cards.length}, 1fr)` });
+  cards.forEach(c => row.append(conMetric(c.icon, c.value, c.label, c.sub, c.tone)));
+  return row;
+}
+// per-view integrity from each item's real verify_status (no extra backend call)
+function integrityOf(items) {
+  const withBody = items.filter(it => it.has_body).length;
+  const verified = items.filter(it => it.verify_status === "verified").length;
+  return { withBody, verified, pct: withBody ? Math.round((verified / withBody) * 100) : null };
+}
+// integrity KPI card spec from a list of items (honest: "—" until verify has run)
+function integrityMetric(items) {
+  const ig = integrityOf(items);
+  return { icon: "shield-check", value: ig.pct == null ? "—" : ig.pct + "%", label: "Integrity verified",
+    sub: ig.pct == null ? "Run verify to check" : `${ig.verified} of ${ig.withBody} records`,
+    tone: ig.pct == null ? "" : ig.pct === 100 ? "ok" : "warn" };
+}
+// last archive activity KPI from runs (newest)
+function lastActivityMetric(runs) {
+  const r = (runs || [])[0];
+  return { icon: "clock", value: r ? fmtDate(r.finished_at) : "—", label: "Last archive activity",
+    sub: r ? `${r.kind} · ${fmtFullDate(r.finished_at)}` : "no runs recorded yet" };
+}
+// small green "Verified" / amber "Changed" / red "Check failed" chip from verify_status
+function verifyChip(it) {
+  if (it.verify_status === "verified") return el("span", { class: "chip ok" }, icon("shield-check", "icon-sm"), "Verified");
+  if (it.verify_status === "changed") return el("span", { class: "chip warn" }, icon("shield", "icon-sm"), "Changed");
+  if (it.verify_status === "failed") return el("span", { class: "chip err" }, icon("shield", "icon-sm"), "Check failed");
+  return null;
+}
+// cap-gated Verify toolbar button (null when the server is read-only)
+function verifyButton(refreshFn) {
+  if (!CAP.verify) return null;
+  return el("button", { class: "btn sm", title: "Re-hash every archived record and check integrity", onclick: (e) => runVerifyThen(e.currentTarget, refreshFn) }, icon("shield-check", "icon-sm"), "Verify");
+}
+async function runVerifyThen(btn, refreshFn) {
+  btn.disabled = true;
+  try {
+    const r = await post("/api/v1/verify?" + qs({ account: App.account }), CAP.verify);
+    toast(`Integrity: ${r.verified}/${r.checked} records verified`);
+    await refreshFn();
+  } catch (e) { toast("Verify failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 // top metric row — every value real: counts from items, integrity from /status
 // verify, sync health + last activity from /activity runs.
