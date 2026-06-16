@@ -1525,14 +1525,23 @@ fn cmd_verify(config: &Path, account: &str) -> Result<(), String> {
         "  {} item(s), {} with archived body; {} missing, {} empty",
         r.items, r.with_body, r.missing_body, r.empty_body
     );
-    if r.healthy() {
+    // Cryptographic integrity: re-hash every archived body and persist the
+    // per-item verify status (the web UI's "Integrity verified" is backed by this).
+    let ir = isyncyou_engine::verify_account(&cfg, account)?;
+    println!(
+        "  integrity: {} verified, {} changed, {} failed of {} record(s)",
+        ir.verified, ir.changed, ir.failed, ir.total
+    );
+    if r.healthy() && ir.changed == 0 && ir.failed == 0 {
         println!("verify OK");
         Ok(())
     } else {
         Err(format!(
-            "integrity problems: {} missing + {} empty body file(s){}",
+            "integrity problems: {} missing + {} empty body file(s); {} changed, {} failed hash{}",
             r.missing_body,
             r.empty_body,
+            ir.changed,
+            ir.failed,
             if r.schema_ok { "" } else { ", schema outdated" }
         ))
     }
