@@ -1145,6 +1145,7 @@ fn item_json(it: &Item) -> Value {
         "sync_state": it.sync_state,
         "remote_mtime": it.remote_mtime,
         "size": it.size,
+        "etag": it.etag,
         "has_body": it.local_path.is_some(),
     })
 }

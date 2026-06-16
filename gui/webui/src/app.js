@@ -1070,7 +1070,7 @@ let sheetEl = null;
 function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
 
 /* ---------------------------------------------------------------- contacts (avatar cards) */
-const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null };
+const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null, runs: [], retentionDays: null };
 const conLetter = (it) => ((it.name || "#").trim()[0] || "#").toUpperCase();
 const conPrev = (it) => it.preview || {};
 async function renderContactsView(view) {
@@ -1105,12 +1105,15 @@ async function renderContactsView(view) {
   const list = $("#con-list");
   for (let i = 0; i < 9; i++) list.append(el("div", { class: "con-row skel-row" }, el("div", { class: "skel grow", style: "height:38px" })));
   try {
-    const [d, act] = await Promise.all([
+    const [d, act, settings] = await Promise.all([
       api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 })),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 20 })).catch(() => ({ runs: [] })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
+      api("/api/v1/settings").catch(() => ({})),
     ]);
     Contacts.all = (d.items || []).filter(it => it.item_type !== "folder");
-    Contacts.lastSync = (act.runs || []).filter(r => /sync|backup/i.test(r.kind || "")).map(r => r.finished_at || r.started_at).filter(Boolean).sort().pop() || null;
+    Contacts.runs = act.runs || [];
+    Contacts.lastSync = Contacts.runs.filter(r => /sync|backup/i.test(r.kind || "")).map(r => r.finished_at || r.started_at).filter(Boolean).sort().pop() || null;
+    Contacts.retentionDays = (settings.sync || {}).trash_retention_days ?? null;
     App.counts.contacts = d.total ?? Contacts.all.length; updateNavCounts();
     contactsRenderRail(); contactsRenderList();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load contacts" }), el("p", { text: e.message }))); }
@@ -1194,6 +1197,43 @@ function contactBack() {
   document.querySelectorAll(".con-row.active").forEach(r => r.classList.remove("active"));
   renderContactDetail(null);
 }
+// fields that count toward record completeness (each backed by real archived data)
+const CONTACT_FIELDS = [
+  ["Name", (c) => !!(c.displayName || c.givenName || c.surname)],
+  ["Email", (c) => (c.emailAddresses || []).some(e => e.address)],
+  ["Mobile", (c) => !!c.mobilePhone],
+  ["Business phone", (c) => (c.businessPhones || []).length > 0],
+  ["Company", (c) => !!c.companyName],
+  ["Department", (c) => !!c.department],
+  ["Job title", (c) => !!c.jobTitle],
+  ["Address", (c) => { const a = c.businessAddress || c.homeAddress || {}; return !!(a.street || a.city || a.postalCode); }],
+  ["Notes", (c) => !!c.personalNotes],
+];
+const shortEtag = (e) => { const m = String(e).replace(/[^A-Za-z0-9]/g, ""); return m.length > 10 ? "…" + m.slice(-8) : (m || "—"); };
+// completeness ring (real: populated archived fields / known fields)
+function completenessRing(filled, total) {
+  const pct = total ? Math.round((filled / total) * 100) : 0;
+  const R = 34, C = 2 * Math.PI * R, len = (pct / 100) * C;
+  const color = pct >= 70 ? "var(--ok)" : pct >= 40 ? "var(--warn)" : "var(--text-lo)";
+  const s = svg("svg", { viewBox: "0 0 84 84", style: "width:84px;height:84px;flex:none" });
+  s.append(svg("circle", { cx: 42, cy: 42, r: R, fill: "none", stroke: "var(--bg-3)", "stroke-width": 8 }));
+  s.append(svg("circle", { cx: 42, cy: 42, r: R, fill: "none", stroke: color, "stroke-width": 8, "stroke-linecap": "round",
+    "stroke-dasharray": `${len.toFixed(2)} ${(C - len).toFixed(2)}`, transform: "rotate(-90 42 42)" }));
+  return el("div", { style: "position:relative;display:grid;place-items:center;flex:none" }, s,
+    el("div", { class: "con-ring-lbl tnum", text: pct + "%" }));
+}
+function completenessCard(c) {
+  const present = CONTACT_FIELDS.filter(([, f]) => f(c));
+  const list = el("ul", { class: "con-fields" });
+  CONTACT_FIELDS.forEach(([label, f]) => { const on = f(c); list.append(el("li", { class: on ? "on" : "off" }, icon(on ? "check" : "circle", "icon-sm"), el("span", { text: label }))); });
+  return el("div", { class: "card con-block" },
+    el("div", { class: "con-block-head" }, icon("check-square", "icon-sm"), el("span", { text: "Record completeness" })),
+    el("div", { class: "con-complete" },
+      completenessRing(present.length, CONTACT_FIELDS.length),
+      el("div", { class: "grow" },
+        el("div", { class: "con-complete-lead" }, el("b", { class: "tnum", text: `${present.length} of ${CONTACT_FIELDS.length}` }), el("span", { class: "dim", text: " fields archived" })),
+        list)));
+}
 // honest archive-metadata card: every signal is backed by a real feature/datum
 function archiveMetaCard(it) {
   const restoreOk = !!(CAP.restore && it.has_body);
@@ -1203,6 +1243,9 @@ function archiveMetaCard(it) {
   row("Access", "Read-only", "shield-check", "ok");
   row("Storage", "Encrypted at rest (SQLCipher)", "shield");
   row("Content", it.has_body ? "Full record archived" : "Header only", it.has_body ? "check" : "circle", it.has_body ? "ok" : "");
+  if (it.etag) row("Version", shortEtag(it.etag), "file-text");
+  if (it.size) row("Size", fmtSize(it.size), "archive");
+  if (Contacts.retentionDays != null) row("Retention", Contacts.retentionDays + " days (trash)", "clock");
   row("Restore", restoreOk ? "Available" : "Unavailable", "rotate-ccw", restoreOk ? "ok" : "");
   row("Archived", fmtFullDate(it.remote_mtime), "clock");
   return el("div", { class: "card con-block" },
@@ -1214,10 +1257,11 @@ async function renderContactDetail(it) {
     const withEmail = Contacts.all.filter(x => conPrev(x).email).length;
     const withCompany = Contacts.all.filter(x => conPrev(x).company).length;
     const fact = (icn, label) => el("div", { class: "crc-row" }, icon(icn, "icon-sm"), el("span", { text: label }));
+    const runs = Contacts.runs || [];
     box.append(el("div", { class: "con-empty" },
       el("div", { class: "vault-art", html: EMPTY_ART["empty-contacts"] }),
       el("h3", { text: "Select a contact" }),
-      el("p", { class: "dim", text: "Read-only Microsoft 365 contact archive. Choose a person to view their archived record and details." }),
+      el("p", { class: "dim", text: "Read-only Microsoft 365 contact archive. Choose a person to view their archived record, completeness and details." }),
       el("div", { class: "mail-empty-metrics" },
         metricCard("users", Contacts.all.length, "contacts"),
         metricCard("mail", withEmail, "with email"),
@@ -1229,7 +1273,12 @@ async function renderContactDetail(it) {
           fact("shield", "Encrypted at rest (SQLCipher)"),
           fact("shield-check", "Read-only — the archive never writes back"),
           fact("rotate-ccw", "Restore re-creates a copy in your account"),
+          Contacts.retentionDays != null ? fact("clock", `Trash retention · ${Contacts.retentionDays} days`) : null,
           Contacts.lastSync ? fact("clock", "Last synced " + fmtFullDate(Contacts.lastSync)) : fact("clock", "No sync recorded yet"))),
+      runs.length ? el("div", { class: "card con-block con-empty-insights" },
+        el("div", { class: "con-block-head" }, icon("clock", "icon-sm"), el("span", { text: "Archive activity" }),
+          el("span", { class: "spacer", style: "flex:1" }), el("span", { class: "dim", style: "font-size:11px", text: "account-wide" })),
+        el("div", { class: "con-block-body" }, activityChart(runs, 14))) : null,
       el("div", { class: "con-empty-actions" },
         el("button", { class: "btn sm", onclick: () => $("#con-search")?.focus() }, icon("search", "icon-sm"), "Search directory"),
         el("button", { class: "btn sm", onclick: () => go("overview") }, icon("clock", "icon-sm"), "View sync log"))));
@@ -1238,7 +1287,7 @@ async function renderContactDetail(it) {
   const p = conPrev(it);
   const sub = [p.job, p.company].filter(Boolean).join(" · ");
   const actions = el("div", { class: "con-detail-actions" },
-    el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs({ account: App.account, service: "contacts", id: it.remote_id })}`, target: "_blank", rel: "noopener", title: "View raw archived record" }, icon("external-link", "icon-sm")));
+    el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs({ account: App.account, service: "contacts", id: it.remote_id })}`, target: "_blank", rel: "noopener", title: "View raw archived record" }, icon("external-link", "icon-sm"), "Raw"));
   if (CAP.restore && it.has_body) actions.append(el("button", { class: "btn sm", title: "Restore to cloud as a new copy", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
   box.append(el("header", { class: "con-detail-head" },
     el("button", { class: "con-back btn ghost sm", title: "Back", onclick: contactBack }, icon("chevron-left", "icon-sm")),
@@ -1247,15 +1296,18 @@ async function renderContactDetail(it) {
       el("h2", { class: "con-detail-name truncate", text: it.name || "(no name)" }),
       sub ? el("div", { class: "con-detail-sub truncate", text: sub }) : null,
       el("div", { class: "con-detail-chips" }, readonlyChip(),
+        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"),
         (CAP.restore && it.has_body) ? el("span", { class: "chip ok" }, icon("rotate-ccw", "icon-sm"), "Restore-ready")
           : it.has_body ? el("span", { class: "chip muted" }, icon("check", "icon-sm"), "Body archived")
             : el("span", { class: "chip muted" }, "Header only"))),
     actions));
   const body = el("div", { class: "con-detail-body" });
+  const fieldsBody = el("div", { class: "con-block-body" }, el("div", { class: "spinner" }));
   const fields = el("div", { class: "card con-block" },
-    el("div", { class: "con-block-head" }, icon("users", "icon-sm"), el("span", { text: "Contact details" })),
-    el("div", { class: "con-block-body" }, el("div", { class: "spinner" })));
-  body.append(fields, archiveMetaCard(it));
+    el("div", { class: "con-block-head" }, icon("users", "icon-sm"), el("span", { text: "Contact details" })), fieldsBody);
+  const main = el("div", { class: "con-col-main" }, fields);
+  const side = el("div", { class: "con-col-side" }, archiveMetaCard(it));
+  body.append(main, side);
   box.append(body);
   try {
     const c = await api("/api/v1/body?" + qs({ account: App.account, service: "contacts", id: it.remote_id }));
@@ -1269,13 +1321,15 @@ async function renderContactDetail(it) {
     add("Title", c.jobTitle, "users");
     const addr = c.businessAddress || c.homeAddress || {};
     add("Address", [addr.street, addr.city, addr.postalCode, addr.countryOrRegion].filter(Boolean).join(", "), "map-pin");
-    const fb = clear(fields.querySelector(".con-block-body"));
-    if (kv.childElementCount) fb.append(kv);
-    else fb.append(el("p", { class: "dim", style: "padding:2px", text: "No additional fields archived for this contact." }));
-    if (c.personalNotes) body.append(el("div", { class: "card con-block" },
+    clear(fieldsBody);
+    if (kv.childElementCount) fieldsBody.append(kv);
+    else fieldsBody.append(el("p", { class: "dim", style: "padding:2px", text: "No additional fields archived for this contact." }));
+    // record-completeness card at the top of the side column (needs the loaded body)
+    side.insertBefore(completenessCard(c), side.firstChild);
+    if (c.personalNotes) main.append(el("div", { class: "card con-block" },
       el("div", { class: "con-block-head" }, icon("file-text", "icon-sm"), el("span", { text: "Notes" })),
       el("p", { class: "con-notes", style: "white-space:pre-wrap", text: c.personalNotes })));
-  } catch (e) { clear(fields.querySelector(".con-block-body")).append(el("p", { class: "dim", text: "Could not load contact: " + e.message })); }
+  } catch (e) { clear(fieldsBody).append(el("p", { class: "dim", text: "Could not load contact: " + e.message })); }
 }
 
 /* ---------------------------------------------------------------- todo (lists + checklists) */
