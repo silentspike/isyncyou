@@ -1070,58 +1070,195 @@ let sheetEl = null;
 function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
 
 /* ---------------------------------------------------------------- contacts (avatar cards) */
-const Contacts = { all: [] };
+const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null };
+const conLetter = (it) => ((it.name || "#").trim()[0] || "#").toUpperCase();
+const conPrev = (it) => it.preview || {};
 async function renderContactsView(view) {
-  Contacts.all = [];
-  clear(view).append(
-    viewHeader("Contacts", `${App.counts.contacts != null ? App.counts.contacts + " contacts archived" : "contact archive"}`, [readonlyChip()]),
-    el("div", { class: "view-sub" }, el("input", { id: "con-search", class: "input", style: "max-width:420px", placeholder: "Search contacts…", oninput: contactsFilter })),
-  );
-  const wrap = el("div", { class: "con-wrap" }, el("div", { id: "con-grid", class: "con-grid" }), el("div", { id: "con-az", class: "con-az" }));
-  view.append(wrap);
-  const grid = $("#con-grid");
-  for (let i = 0; i < 6; i++) grid.append(el("div", { class: "card con-card" }, el("div", { class: "skel", style: "height:84px" })));
+  Object.assign(Contacts, { all: [], selected: null, filter: "all", q: "", sort: "name" });
+  clear(view).append(el("div", { class: "con-page" },
+    // header: title + live metrics + honest trust chips (Source / Encryption / Read-only)
+    el("header", { class: "con-page-head" },
+      el("div", { class: "grow", style: "min-width:0" },
+        el("h1", { class: "view-title", style: "margin:0", text: "Contacts" }),
+        el("div", { id: "con-metrics", class: "svc-metrics dim", text: "Loading…" })),
+      el("div", { class: "svc-chips" },
+        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"),
+        el("span", { class: "chip muted" }, icon("shield", "icon-sm"), "Encrypted at rest"),
+        readonlyChip())),
+    // toolbar: search + sort + sync-log shortcut
+    el("div", { class: "con-toolbar" },
+      el("div", { class: "tb-search" }, icon("search", "icon-sm"),
+        el("input", { id: "con-search", placeholder: "Search this directory…", oninput: () => { Contacts.q = ($("#con-search").value || "").trim().toLowerCase(); contactsRenderList(); } })),
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
+        el("select", { class: "input", onchange: (e) => { Contacts.sort = e.target.value; contactsRenderList(); } },
+          el("option", { value: "name", text: "Name A–Z" }),
+          el("option", { value: "company", text: "Company A–Z" }),
+          el("option", { value: "recent", text: "Recently archived" }))),
+      el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
+    // 3-pane: filter/insights rail | directory | detail
+    el("div", { id: "con-layout", class: "con-layout" },
+      el("aside", { id: "con-rail", class: "con-rail" }),
+      el("div", { class: "con-listwrap" }, el("div", { id: "con-list", class: "con-list" }), el("div", { id: "con-az", class: "con-az" })),
+      el("div", { id: "con-detail", class: "con-detail" }))));
+  renderContactDetail(null);
+  const list = $("#con-list");
+  for (let i = 0; i < 9; i++) list.append(el("div", { class: "con-row skel-row" }, el("div", { class: "skel grow", style: "height:38px" })));
   try {
-    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 }));
-    Contacts.all = (d.items || []).filter(it => it.item_type !== "folder").sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    const [d, act] = await Promise.all([
+      api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 20 })).catch(() => ({ runs: [] })),
+    ]);
+    Contacts.all = (d.items || []).filter(it => it.item_type !== "folder");
+    Contacts.lastSync = (act.runs || []).filter(r => /sync|backup/i.test(r.kind || "")).map(r => r.finished_at || r.started_at).filter(Boolean).sort().pop() || null;
     App.counts.contacts = d.total ?? Contacts.all.length; updateNavCounts();
-    contactsRender(Contacts.all);
-  } catch (e) { clear(grid).append(el("div", { class: "empty" }, el("h3", { text: "Could not load contacts" }), el("p", { text: e.message }))); }
+    contactsRenderRail(); contactsRenderList();
+  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load contacts" }), el("p", { text: e.message }))); }
 }
-function contactsFilter() {
-  const q = ($("#con-search").value || "").toLowerCase().trim();
-  contactsRender(!q ? Contacts.all : Contacts.all.filter(it => (it.name || "").toLowerCase().includes(q) || ((it.preview || {}).company || "").toLowerCase().includes(q)));
+function contactsFiltered() {
+  let rows = Contacts.all;
+  const f = Contacts.filter;
+  if (f === "email") rows = rows.filter(it => conPrev(it).email);
+  else if (f === "company") rows = rows.filter(it => conPrev(it).company);
+  else if (f === "restore") rows = rows.filter(it => it.has_body);
+  if (Contacts.q) rows = rows.filter(it => ((it.name || "") + " " + (conPrev(it).company || "") + " " + (conPrev(it).email || "") + " " + (conPrev(it).job || "")).toLowerCase().includes(Contacts.q));
+  const s = Contacts.sort;
+  const ts = (it) => { const d = toDate(it.remote_mtime); return d ? d.getTime() : 0; };
+  if (s === "company") rows = rows.slice().sort((a, b) => (conPrev(a).company || "￿").localeCompare(conPrev(b).company || "￿") || (a.name || "").localeCompare(b.name || ""));
+  else if (s === "recent") rows = rows.slice().sort((a, b) => ts(b) - ts(a));
+  else rows = rows.slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  return rows;
 }
-function contactsRender(list) {
-  const grid = clear($("#con-grid")), az = clear($("#con-az"));
-  if (!list.length) { grid.append(el("div", { class: "empty" }, emptyArt("empty-contacts"), el("h3", { text: "No contacts" }), el("p", { text: "Run a backup to populate your contacts." }))); return; }
-  const seen = new Set();
-  grid.classList.add("stagger");
-  list.forEach(it => {
-    const letter = (it.name || "#").trim()[0].toUpperCase();
-    const card = contactCard(it);
-    if (!seen.has(letter)) { seen.add(letter); card.dataset.letter = letter; }
-    grid.append(card);
+function contactsRenderRail() {
+  const rail = $("#con-rail"); if (!rail) return; clear(rail);
+  const withEmail = Contacts.all.filter(it => conPrev(it).email).length;
+  const withCompany = Contacts.all.filter(it => conPrev(it).company).length;
+  const restore = Contacts.all.filter(it => it.has_body).length;
+  const folder = (key, label, icn, count) => el("button", { class: "con-folder" + (Contacts.filter === key ? " active" : ""), onclick: () => { Contacts.filter = key; contactsRenderRail(); contactsRenderList(); } },
+    el("span", { class: "cf-ico" }, icon(icn, "icon-sm")), el("span", { class: "grow truncate", text: label }), el("span", { class: "count tnum", text: String(count) }));
+  const fact = (icn, label) => el("div", { class: "crc-row" }, icon(icn, "icon-sm"), el("span", { text: label }));
+  rail.append(
+    el("div", { class: "con-rail-sec", text: "Directory" }),
+    folder("all", "All contacts", "users", Contacts.all.length),
+    folder("email", "With email", "mail", withEmail),
+    folder("company", "With company", "building", withCompany),
+    folder("restore", "Restore-ready", "rotate-ccw", restore),
+    el("div", { class: "spacer" }),
+    el("div", { class: "con-rail-sec", text: "Archive" }),
+    el("div", { class: "con-rail-card" },
+      fact("archive", "Source · Microsoft 365"),
+      fact("shield", "Encrypted at rest"),
+      fact("shield-check", "Read-only archive"),
+      Contacts.lastSync ? fact("clock", "Last synced " + fmtDate(Contacts.lastSync)) : fact("clock", "No sync recorded yet")));
+}
+function contactsRenderList() {
+  const wrap = clear($("#con-list")), az = clear($("#con-az"));
+  const withEmail = Contacts.all.filter(it => conPrev(it).email).length;
+  const withCompany = Contacts.all.filter(it => conPrev(it).company).length;
+  const m = $("#con-metrics"); if (m) m.textContent = `${Contacts.all.length} contacts archived · ${withEmail} with email · ${withCompany} with company`;
+  if (!Contacts.all.length) { wrap.append(el("div", { class: "empty" }, emptyArt("empty-contacts"), el("h3", { text: "No contacts" }), el("p", { text: "Run a backup to populate your contacts." }))); return; }
+  const rows = contactsFiltered();
+  if (!rows.length) { wrap.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "Adjust the filter or search." }))); return; }
+  const frag = document.createDocumentFragment();
+  const grouped = Contacts.sort === "name";        // letter sections only make sense alphabetically
+  let cur = "";
+  rows.forEach(it => {
+    if (grouped) { const letter = conLetter(it); if (letter !== cur) { cur = letter; frag.append(el("div", { class: "con-sec", dataset: { letter }, text: letter })); } }
+    frag.append(contactRow(it));
   });
-  // A–Z quick-nav: jump to the first card of each present initial
-  [...seen].sort().forEach(L => az.append(el("button", { class: "az-letter", text: L, onclick: () => { const t = grid.querySelector(`[data-letter="${L}"]`); t && t.scrollIntoView({ block: "start", behavior: "smooth" }); } })));
+  wrap.append(frag);
+  if (grouped) [...new Set(rows.map(conLetter))].sort().forEach(L =>
+    az.append(el("button", { class: "az-letter", text: L, onclick: () => { const t = wrap.querySelector(`.con-sec[data-letter="${L}"]`); t && t.scrollIntoView({ block: "start", behavior: "smooth" }); } })));
 }
-function contactCard(it) {
-  const p = it.preview || {};
-  const sub = [p.job, p.company].filter(Boolean).join(" · ");
-  return el("button", { class: "card con-card rise", onclick: () => openContactSheet(it) },
+function contactRow(it) {
+  const p = conPrev(it);
+  const sub = [p.job, p.company].filter(Boolean).join(" · ") || p.email || "";
+  const sel = Contacts.selected && Contacts.selected.remote_id === it.remote_id;
+  return el("button", { class: "con-row" + (sel ? " active" : ""), dataset: { id: it.remote_id }, onclick: () => contactSelect(it) },
     el("span", { class: "avatar con-av", text: initials(it.name) }),
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "con-name truncate", text: it.name || "(no name)" }),
-      sub ? el("div", { class: "dim truncate", style: "font-size:12px", text: sub }) : null,
-      p.email ? el("div", { class: "con-email truncate", text: p.email }) : null));
+      sub ? el("div", { class: "con-sub truncate", text: sub }) : null),
+    el("span", { class: "con-row-meta" },
+      p.email ? el("span", { class: "con-dot", title: "Has email", style: "background:var(--svc-contacts)" }) : null,
+      it.has_body ? el("span", { class: "con-restore", title: "Restore-ready" }, icon("rotate-ccw", "icon-sm")) : null));
 }
-async function openContactSheet(it) {
-  const q = { account: App.account, service: "contacts", id: it.remote_id };
-  const content = el("div", { class: "body" }, el("div", { class: "spinner" }));
-  openSheet(it.name || "Contact", content, el("span", { class: "avatar con-av", style: "width:30px;height:30px", text: initials(it.name) }));
+function contactSelect(it) {
+  Contacts.selected = it;
+  document.querySelectorAll(".con-row").forEach(r => r.classList.toggle("active", r.dataset.id === it.remote_id));
+  $("#con-layout")?.classList.add("reading");
+  renderContactDetail(it);
+}
+function contactBack() {
+  Contacts.selected = null; $("#con-layout")?.classList.remove("reading");
+  document.querySelectorAll(".con-row.active").forEach(r => r.classList.remove("active"));
+  renderContactDetail(null);
+}
+// honest archive-metadata card: every signal is backed by a real feature/datum
+function archiveMetaCard(it) {
+  const restoreOk = !!(CAP.restore && it.has_body);
+  const meta = el("dl", { class: "kv meta-kv" });
+  const row = (k, v, ic, cls) => meta.append(el("dt", {}, icon(ic, "icon-sm"), el("span", { text: k })), el("dd", { class: cls || "", text: v }));
+  row("Source", "Microsoft 365", "archive");
+  row("Access", "Read-only", "shield-check", "ok");
+  row("Storage", "Encrypted at rest (SQLCipher)", "shield");
+  row("Content", it.has_body ? "Full record archived" : "Header only", it.has_body ? "check" : "circle", it.has_body ? "ok" : "");
+  row("Restore", restoreOk ? "Available" : "Unavailable", "rotate-ccw", restoreOk ? "ok" : "");
+  row("Archived", fmtFullDate(it.remote_mtime), "clock");
+  return el("div", { class: "card con-block" },
+    el("div", { class: "con-block-head" }, icon("archive", "icon-sm"), el("span", { text: "Archive details" })), meta);
+}
+async function renderContactDetail(it) {
+  const box = $("#con-detail"); if (!box) return; clear(box);
+  if (!it) {
+    const withEmail = Contacts.all.filter(x => conPrev(x).email).length;
+    const withCompany = Contacts.all.filter(x => conPrev(x).company).length;
+    const fact = (icn, label) => el("div", { class: "crc-row" }, icon(icn, "icon-sm"), el("span", { text: label }));
+    box.append(el("div", { class: "con-empty" },
+      el("div", { class: "vault-art", html: EMPTY_ART["empty-contacts"] }),
+      el("h3", { text: "Select a contact" }),
+      el("p", { class: "dim", text: "Read-only Microsoft 365 contact archive. Choose a person to view their archived record and details." }),
+      el("div", { class: "mail-empty-metrics" },
+        metricCard("users", Contacts.all.length, "contacts"),
+        metricCard("mail", withEmail, "with email"),
+        metricCard("building", withCompany, "with company")),
+      el("div", { class: "card con-block con-empty-insights" },
+        el("div", { class: "con-block-head" }, icon("shield", "icon-sm"), el("span", { text: "Archive insights" })),
+        el("div", { class: "crc-list" },
+          fact("archive", "Source · Microsoft 365"),
+          fact("shield", "Encrypted at rest (SQLCipher)"),
+          fact("shield-check", "Read-only — the archive never writes back"),
+          fact("rotate-ccw", "Restore re-creates a copy in your account"),
+          Contacts.lastSync ? fact("clock", "Last synced " + fmtFullDate(Contacts.lastSync)) : fact("clock", "No sync recorded yet"))),
+      el("div", { class: "con-empty-actions" },
+        el("button", { class: "btn sm", onclick: () => $("#con-search")?.focus() }, icon("search", "icon-sm"), "Search directory"),
+        el("button", { class: "btn sm", onclick: () => go("overview") }, icon("clock", "icon-sm"), "View sync log"))));
+    return;
+  }
+  const p = conPrev(it);
+  const sub = [p.job, p.company].filter(Boolean).join(" · ");
+  const actions = el("div", { class: "con-detail-actions" },
+    el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs({ account: App.account, service: "contacts", id: it.remote_id })}`, target: "_blank", rel: "noopener", title: "View raw archived record" }, icon("external-link", "icon-sm")));
+  if (CAP.restore && it.has_body) actions.append(el("button", { class: "btn sm", title: "Restore to cloud as a new copy", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
+  box.append(el("header", { class: "con-detail-head" },
+    el("button", { class: "con-back btn ghost sm", title: "Back", onclick: contactBack }, icon("chevron-left", "icon-sm")),
+    el("span", { class: "avatar con-av lg", text: initials(it.name) }),
+    el("div", { class: "grow", style: "min-width:0" },
+      el("h2", { class: "con-detail-name truncate", text: it.name || "(no name)" }),
+      sub ? el("div", { class: "con-detail-sub truncate", text: sub }) : null,
+      el("div", { class: "con-detail-chips" }, readonlyChip(),
+        (CAP.restore && it.has_body) ? el("span", { class: "chip ok" }, icon("rotate-ccw", "icon-sm"), "Restore-ready")
+          : it.has_body ? el("span", { class: "chip muted" }, icon("check", "icon-sm"), "Body archived")
+            : el("span", { class: "chip muted" }, "Header only"))),
+    actions));
+  const body = el("div", { class: "con-detail-body" });
+  const fields = el("div", { class: "card con-block" },
+    el("div", { class: "con-block-head" }, icon("users", "icon-sm"), el("span", { text: "Contact details" })),
+    el("div", { class: "con-block-body" }, el("div", { class: "spinner" })));
+  body.append(fields, archiveMetaCard(it));
+  box.append(body);
   try {
-    const c = await api("/api/v1/body?" + qs(q));
+    const c = await api("/api/v1/body?" + qs({ account: App.account, service: "contacts", id: it.remote_id }));
     const kv = el("dl", { class: "kv" });
     const add = (k, v, ic) => { if (!v || (Array.isArray(v) && !v.length)) return; kv.append(el("dt", {}, ic ? icon(ic, "icon-sm") : null, el("span", { text: k })), el("dd", { text: Array.isArray(v) ? v.join(", ") : v })); };
     add("Email", (c.emailAddresses || []).map(e => e.address).filter(Boolean), "mail");
@@ -1132,9 +1269,13 @@ async function openContactSheet(it) {
     add("Title", c.jobTitle, "users");
     const addr = c.businessAddress || c.homeAddress || {};
     add("Address", [addr.street, addr.city, addr.postalCode, addr.countryOrRegion].filter(Boolean).join(", "), "map-pin");
-    clear(content).append(kv);
-    if (c.personalNotes) content.append(el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: c.personalNotes }));
-  } catch (e) { clear(content).append(el("p", { class: "dim", text: "Could not load contact: " + e.message })); }
+    const fb = clear(fields.querySelector(".con-block-body"));
+    if (kv.childElementCount) fb.append(kv);
+    else fb.append(el("p", { class: "dim", style: "padding:2px", text: "No additional fields archived for this contact." }));
+    if (c.personalNotes) body.append(el("div", { class: "card con-block" },
+      el("div", { class: "con-block-head" }, icon("file-text", "icon-sm"), el("span", { text: "Notes" })),
+      el("p", { class: "con-notes", style: "white-space:pre-wrap", text: c.personalNotes })));
+  } catch (e) { clear(fields.querySelector(".con-block-body")).append(el("p", { class: "dim", text: "Could not load contact: " + e.message })); }
 }
 
 /* ---------------------------------------------------------------- todo (lists + checklists) */
