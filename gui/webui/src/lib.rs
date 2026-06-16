@@ -235,6 +235,14 @@ pub trait HydrationStatus: Send + Sync {
     fn active(&self) -> Vec<String>;
 }
 
+/// Runs an archive integrity verify pass for an account on behalf of a POST
+/// (re-hashes every archived body, persists per-item status). Injected by the
+/// daemon (which owns the engine); the read-only CLI `serve` does not set it.
+/// Returns a short human summary.
+pub trait VerifyHandler: Send + Sync {
+    fn verify(&self, account: &str) -> Result<String, String>;
+}
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
@@ -264,6 +272,11 @@ pub struct Router {
     /// Optional FUSE hydration status (the daemon's). Enables the in-flight
     /// download list GET.
     hydrations: Option<std::sync::Arc<dyn HydrationStatus>>,
+    /// Optional integrity-verify handler (the daemon's). `None` => the verify
+    /// POST is refused (the read-only CLI `serve`).
+    verify: Option<std::sync::Arc<dyn VerifyHandler>>,
+    /// Separate capability token for verify POSTs.
+    verify_cap_token: Option<String>,
 }
 
 impl Router {
@@ -278,6 +291,8 @@ impl Router {
             share_cap_token: None,
             sync_control: None,
             hydrations: None,
+            verify: None,
+            verify_cap_token: None,
         }
     }
 
@@ -294,6 +309,8 @@ impl Router {
             share_cap_token: None,
             sync_control: None,
             hydrations: None,
+            verify: None,
+            verify_cap_token: None,
         }
     }
 
@@ -316,6 +333,17 @@ impl Router {
     ) -> Self {
         self.share = Some(handler);
         self.share_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the integrity-verify POST, guarded by `cap_token` (builder style).
+    pub fn with_verify(
+        mut self,
+        handler: std::sync::Arc<dyn VerifyHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.verify = Some(handler);
+        self.verify_cap_token = Some(cap_token);
         self
     }
 
@@ -378,6 +406,7 @@ impl Router {
                 "/api/v1/sync/pause" => self.sync_command(req, |c| c.pause()),
                 "/api/v1/sync/resume" => self.sync_command(req, |c| c.resume()),
                 "/api/v1/sync/now" => self.sync_command(req, |c| c.trigger()),
+                "/api/v1/verify" => self.verify_run(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -404,6 +433,10 @@ impl Router {
                     .replace(
                         "__SHARE_CAP_TOKEN__",
                         self.share_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__VERIFY_CAP_TOKEN__",
+                        self.verify_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -484,6 +517,38 @@ impl Router {
                 );
                 ApiResponse::error(500, &e)
             }
+        }
+    }
+
+    /// `POST /api/v1/verify?account` — re-hash every archived body and persist the
+    /// per-item integrity status. Requires the verify capability token; the work
+    /// is the injected handler (the daemon's engine verify pass, which records its
+    /// own `verify` run). Returns the fresh integrity counts.
+    fn verify_run(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.verify {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "verify is not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.verify_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let account = match req.q("account") {
+            Some(a) if !a.is_empty() => a,
+            _ => return ApiResponse::error(400, "account is required"),
+        };
+        match handler.verify(account) {
+            Ok(summary) => {
+                let (checked, verified) = self
+                    .store_path(account)
+                    .and_then(|p| Store::open(p).ok())
+                    .and_then(|s| s.verify_counts(account).ok())
+                    .unwrap_or((0, 0));
+                ApiResponse::ok_json(&json!({
+                    "account": account, "summary": summary,
+                    "checked": checked, "verified": verified,
+                }))
+            }
+            Err(e) => ApiResponse::error(500, &e),
         }
     }
 
@@ -732,11 +797,20 @@ impl Router {
             .get_delta_cursor(account, "onedrive", "")
             .map(|c| c.is_some())
             .unwrap_or(false);
+        // Real integrity signal: how many archived bodies last passed the verify
+        // hash-check, and when verify last ran (backs "Integrity verified N%").
+        let (checked, verified) = store.verify_counts(account).unwrap_or((0, 0));
+        let last_verified = store.recent_runs(account, 50).ok().and_then(|runs| {
+            runs.into_iter()
+                .find(|r| r.kind == "verify")
+                .map(|r| r.finished_at)
+        });
         ApiResponse::ok_json(&json!({
             "account": account,
             "services": services,
             "totals": { "items": total_items, "archived": total_archived },
             "onedrive_cursor": onedrive_cursor,
+            "verify": { "checked": checked, "verified": verified, "last_verified": last_verified },
         }))
     }
 
@@ -1147,6 +1221,8 @@ fn item_json(it: &Item) -> Value {
         "size": it.size,
         "etag": it.etag,
         "has_body": it.local_path.is_some(),
+        "verify_status": it.verify_status,
+        "verified_at": it.verified_at,
     })
 }
 
@@ -1313,6 +1389,37 @@ mod tests {
         // valid token but missing params -> 400
         let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
             .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+    }
+
+    struct OkVerify;
+    impl VerifyHandler for OkVerify {
+        fn verify(&self, _a: &str) -> Result<String, String> {
+            Ok("224 verified, 0 changed, 0 failed of 224".into())
+        }
+    }
+
+    #[test]
+    fn verify_post_requires_token_and_is_disabled_without_handler() {
+        let (_d, router) = setup();
+        let q = "/api/v1/verify?account=a";
+        // not enabled (read-only serve) -> 404
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 404);
+        let router = router.with_verify(std::sync::Arc::new(OkVerify), "secret".into());
+        // no / wrong token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // correct token -> 200 + summary
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("verified"));
+        // missing account -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/verify").with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&bad).status, 400);
     }
 
