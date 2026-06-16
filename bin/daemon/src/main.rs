@@ -254,7 +254,12 @@ fn run(args: &Args) -> Result<(), String> {
     let share_cap_token = mint_cap_token();
     let share_handler: Arc<dyn isyncyou_webui::ShareHandler> =
         Arc::new(DaemonShare { cfg: cfg.clone() });
-    eprintln!("isyncyoud: restore + sharing enabled; capability token: {cap_token}");
+    // A separate token gates the integrity-verify POST (#528). Local-only (no
+    // cloud mutation), but kept distinct so a leaked token has a small blast radius.
+    let verify_cap_token = mint_cap_token();
+    let verify_handler: Arc<dyn isyncyou_webui::VerifyHandler> =
+        Arc::new(DaemonVerify { cfg: cfg.clone() });
+    eprintln!("isyncyoud: restore + sharing + verify enabled; capability token: {cap_token}");
 
     let mut router = if args.sync_secs > 0 {
         isyncyou_webui::Router::with_gate(cfg.clone(), gate.clone())
@@ -262,7 +267,8 @@ fn run(args: &Args) -> Result<(), String> {
         isyncyou_webui::Router::new(cfg.clone())
     }
     .with_restore(handler, cap_token.clone())
-    .with_share(share_handler, share_cap_token);
+    .with_share(share_handler, share_cap_token)
+    .with_verify(verify_handler, verify_cap_token);
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
     #[cfg(target_os = "linux")]
@@ -343,6 +349,18 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
         }
         let token = isyncyou_engine::auth::resolve_cached_restore_token(&self.cfg, account)?;
         isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)
+    }
+}
+
+/// Web-UI archive integrity verify (#528): re-hash every archived body and
+/// persist per-item status. Local-only (reads on-disk bodies, writes the store),
+/// so it needs no token/network and is always available.
+struct DaemonVerify {
+    cfg: Config,
+}
+impl isyncyou_webui::VerifyHandler for DaemonVerify {
+    fn verify(&self, account: &str) -> Result<String, String> {
+        isyncyou_engine::verify_account(&self.cfg, account).map(|r| r.summary())
     }
 }
 

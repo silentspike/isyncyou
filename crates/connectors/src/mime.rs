@@ -88,6 +88,9 @@ pub struct MailPreview {
     pub size_bytes: usize,
     /// Whether the message carries an HTML alternative.
     pub has_html: bool,
+    /// Number of declared attachments (MIME parts with `Content-Disposition:
+    /// attachment`). A best-effort count over the archived MIME, never panics.
+    pub attachment_count: usize,
     /// A short, whitespace-collapsed snippet of the decoded body text.
     pub body_snippet: String,
 }
@@ -108,8 +111,27 @@ pub fn mail_preview(eml: &[u8]) -> MailPreview {
         message_id: header_value(&headers, "message-id"),
         size_bytes: eml.len(),
         has_html: extract_html(eml).is_some(),
+        attachment_count: count_attachments(eml),
         body_snippet: snippet(&extract_part(&headers, body), 280),
     }
+}
+
+/// Count declared attachments: MIME `Content-Disposition` headers whose value
+/// starts with `attachment`. A cheap, real heuristic over the raw bytes (no full
+/// MIME tree walk needed) — robust to folding and case. Never panics.
+pub fn count_attachments(eml: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(eml);
+    let mut n = 0;
+    for line in text.split('\n') {
+        let l = line.trim_start();
+        if l.len() >= 20 && l[..20.min(l.len())].eq_ignore_ascii_case("content-disposition:") {
+            let v = l[20..].trim_start().to_ascii_lowercase();
+            if v.starts_with("attachment") {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// Return a copy of `eml` whose `Message-ID` header is exactly `message_id`
