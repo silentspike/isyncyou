@@ -861,10 +861,10 @@ function driveTile(it) {
     thumb = el("img", { class: "drive-thumb-img", src: `/api/v1/body?${qs(q)}`, alt: "", loading: "lazy" });
   else
     thumb = el("div", { class: "drive-thumb", style: folder ? "" : `color:${fileColor(ext)}` }, icon(folder ? "folder" : fileIcon(ext), "icon-lg"));
-  tile.append(thumb,
+  tile.append(...[thumb,
     el("div", { class: "drive-name truncate", text: it.name || "(no name)" }),
     el("div", { class: "drive-meta dim", text: folder ? "Folder" : [fmtSize(it.size), it.remote_mtime ? fmtDate(it.remote_mtime) : ""].filter(Boolean).join(" · ") }),
-    syncBadge(it), driveActions(it));
+    syncBadge(it), driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
   return tile;
 }
 function driveRow(it) {
