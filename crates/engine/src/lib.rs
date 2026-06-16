@@ -25,6 +25,7 @@ mod restore_key;
 mod restore_onenote;
 mod restore_recovery;
 mod restore_todo;
+mod verify;
 pub use mail_restore::{
     pending_mail_restore_count, recover_pending_mail_restores, recover_pending_mail_restores_with,
     restore_mail_via_ledger, MailApi, MailSink,
@@ -50,6 +51,7 @@ pub use restore_todo::{
     pending_todo_restore_count, recover_pending_todo_restores, recover_pending_todo_restores_with,
     restore_todo_via_ledger, ToDoApi, ToDoSink,
 };
+pub use verify::{verify_account, VerifyReport};
 
 /// Structured outcome of one [`sync_once`] pass. All counts are best-effort
 /// totals for the pass; `*_blocked` carries the mass-delete-guard reason when a
