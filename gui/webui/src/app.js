@@ -835,16 +835,40 @@ const fileColor = (ext) => (fileKind(ext) || {}).color || "var(--text-lo)";
 async function renderOnedriveView(view) {
   Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = [];
   clear(view).append(
-    viewHeader("OneDrive", `${App.counts.onedrive != null ? App.counts.onedrive + " items archived · " : ""}file & folder archive`, [readonlyChip()]),
+    viewHeader("OneDrive", `${App.counts.onedrive != null ? App.counts.onedrive + " items archived · " : ""}file & folder archive`,
+      [el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip()]),
+    el("div", { id: "drive-metrics-row", class: "con-metrics-row", style: "border-bottom:0;padding-left:0;padding-right:0" }),
     el("div", { class: "drive-bar" },
       el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
       el("div", { class: "spacer", style: "flex:1" }),
+      verifyButton(() => renderOnedriveView(view)),
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
         el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
     el("div", { id: "drive-body" }),
   );
+  driveLoadMetrics();
   await driveOpen(null, "OneDrive", true);
+}
+// account-wide OneDrive KPIs (flat item list, independent of the current folder)
+async function driveLoadMetrics() {
+  try {
+    const [d, act] = await Promise.all([
+      api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", limit: 2000 })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
+    ]);
+    const all = d.items || [];
+    const files = all.filter(it => it.item_type !== "folder");
+    const folders = all.filter(it => it.item_type === "folder").length;
+    const archived = files.filter(it => it.has_body).length;
+    App.counts.onedrive = all.length; updateNavCounts();
+    fillMetrics($("#drive-metrics-row"), [
+      { icon: "file", value: files.length, label: "Files", sub: `${folders} folders` },
+      { icon: "download", value: archived, label: "Archived", sub: "tracked with a copy", tone: archived ? "ok" : "" },
+      integrityMetric(files),
+      lastActivityMetric(act.runs || []),
+    ]);
+  } catch { /* metrics are best-effort; the explorer still loads */ }
 }
 function setDriveLayout(l) { Drive.layout = l; $("#drive-grid")?.classList.toggle("active", l === "grid"); $("#drive-list")?.classList.toggle("active", l === "list"); driveRender(); }
 async function driveOpen(id, name, reset) {
@@ -959,7 +983,9 @@ const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit
 async function renderCalendarView(view) {
   Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda";
   clear(view).append(
-    viewHeader("Calendar", `${App.counts.calendar != null ? App.counts.calendar + " events archived" : "event archive"}`, [readonlyChip()]),
+    viewHeader("Calendar", `${App.counts.calendar != null ? App.counts.calendar + " events archived" : "event archive"}`,
+      [el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip()]),
+    el("div", { id: "cal-metrics-row", class: "con-metrics-row", style: "border-bottom:0;padding-left:0;padding-right:0" }),
     el("div", { class: "cal-bar" },
       el("div", { class: "cal-nav" },
         el("button", { class: "btn ghost sm icon-only", title: "Previous", onclick: () => calNav(-1) }, icon("chevron-left", "icon-sm")),
@@ -967,6 +993,7 @@ async function renderCalendarView(view) {
         el("button", { class: "btn ghost sm icon-only", title: "Next", onclick: () => calNav(1) }, icon("chevron-right", "icon-sm"))),
       el("div", { id: "cal-label", class: "cal-label" }),
       el("div", { class: "spacer", style: "flex:1" }),
+      verifyButton(() => renderCalendarView(view)),
       el("div", { class: "seg" },
         ["month", "week", "agenda"].map(v => el("button", { class: "seg-btn" + (Cal.view === v ? " active" : ""), dataset: { calview: v }, onclick: () => setCalView(v), text: v[0].toUpperCase() + v.slice(1) }))),
     ),
@@ -984,15 +1011,30 @@ function calNav(dir) {
 async function calLoad() {
   const body = $("#cal-body"); clear(body).append(el("div", { class: "card" }, el("div", { class: "skel", style: "height:360px" })));
   try {
-    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "calendar", limit: 1000 }));
+    const [d, act] = await Promise.all([
+      api("/api/v1/items?" + qs({ account: App.account, service: "calendar", limit: 1000 })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
+    ]);
+    Cal.raw = (d.items || []).filter(it => it.item_type !== "folder");
+    Cal.runs = act.runs || [];
     Cal.events = (d.items || []).map(it => {
       const p = it.preview || {};
       const start = evDate(p.start, p.start_tz) || (it.remote_mtime ? new Date(it.remote_mtime) : null);
       return { it, subject: it.name || "(no title)", start, end: evDate(p.end, p.end_tz), allDay: !!p.all_day, location: p.location || "" };
     }).filter(e => e.start);
     App.counts.calendar = d.total ?? Cal.events.length; updateNavCounts();
-    calRender();
+    calRenderMetrics(); calRender();
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load calendar" }), el("p", { text: e.message }))); }
+}
+function calRenderMetrics() {
+  const now = Date.now();
+  const upcoming = Cal.events.filter(e => e.start && e.start.getTime() >= now).length;
+  fillMetrics($("#cal-metrics-row"), [
+    { icon: "calendar", value: Cal.events.length, label: "Total events", sub: "archived" },
+    { icon: "clock", value: upcoming, label: "Upcoming", sub: "start in the future", tone: upcoming ? "ok" : "" },
+    integrityMetric(Cal.raw || []),
+    lastActivityMetric(Cal.runs),
+  ]);
 }
 function eventsForDay(day) {
   const s = startOfDay(day).getTime(), e = s + DAY_MS;
@@ -1225,17 +1267,20 @@ function metricsRow(cards) {
   cards.forEach(c => row.append(conMetric(c.icon, c.value, c.label, c.sub, c.tone)));
   return row;
 }
-// per-view integrity from each item's real verify_status (no extra backend call)
+// per-view integrity from each item's real verify_status (no extra backend call).
+// Denominator = records actually checked (verify_status set), matching the
+// store's verify_counts: cloud-only OneDrive placeholders the pass skips never
+// get a status, so they're correctly excluded (not counted as failures).
 function integrityOf(items) {
-  const withBody = items.filter(it => it.has_body).length;
+  const checked = items.filter(it => it.verify_status).length;
   const verified = items.filter(it => it.verify_status === "verified").length;
-  return { withBody, verified, pct: withBody ? Math.round((verified / withBody) * 100) : null };
+  return { checked, verified, pct: checked ? Math.round((verified / checked) * 100) : null };
 }
 // integrity KPI card spec from a list of items (honest: "—" until verify has run)
 function integrityMetric(items) {
   const ig = integrityOf(items);
   return { icon: "shield-check", value: ig.pct == null ? "—" : ig.pct + "%", label: "Integrity verified",
-    sub: ig.pct == null ? "Run verify to check" : `${ig.verified} of ${ig.withBody} records`,
+    sub: ig.pct == null ? "Run verify to check" : `${ig.verified} of ${ig.checked} records`,
     tone: ig.pct == null ? "" : ig.pct === 100 ? "ok" : "warn" };
 }
 // last archive activity KPI from runs (newest)
@@ -1499,16 +1544,29 @@ async function renderContactDetail(it) {
 const Todo = { lists: [], tasks: [] };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
-  clear(view).append(viewHeader("To Do", `${App.counts.todo != null ? App.counts.todo + " items archived" : "task archive"}`, [readonlyChip()]));
+  clear(view).append(viewHeader("To Do", `${App.counts.todo != null ? App.counts.todo + " items archived" : "task archive"}`,
+    [el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip(),
+      CAP.verify ? verifyButton(() => renderTodoView(view)) : null]));
+  view.append(el("div", { id: "todo-metrics-row", class: "con-metrics-row", style: "border-bottom:0;padding-left:0;padding-right:0" }));
   const board = el("div", { id: "todo-board", class: "todo-board" });
   view.append(board);
   board.append(el("div", { class: "card", style: "min-width:280px" }, el("div", { class: "skel", style: "height:200px" })));
   try {
-    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "todo", limit: 1000 }));
+    const [d, act] = await Promise.all([
+      api("/api/v1/items?" + qs({ account: App.account, service: "todo", limit: 1000 })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
+    ]);
     const items = d.items || [];
     Todo.lists = items.filter(it => it.item_type === "list");
     Todo.tasks = items.filter(it => it.item_type === "task");
     App.counts.todo = d.total ?? items.length; updateNavCounts();
+    const done = Todo.tasks.filter(t => (t.preview || {}).status === "completed").length;
+    fillMetrics($("#todo-metrics-row"), [
+      { icon: "check-square", value: Todo.tasks.length, label: "Tasks", sub: `${Todo.lists.length} lists` },
+      { icon: "check", value: done, label: "Completed", sub: `${Todo.tasks.length - done} open`, tone: "ok" },
+      integrityMetric(Todo.tasks),
+      lastActivityMetric(act.runs || []),
+    ]);
     todoRender();
   } catch (e) { clear(board).append(el("div", { class: "empty" }, el("h3", { text: "Could not load ToDo" }), el("p", { text: e.message }))); }
 }
@@ -1573,14 +1631,25 @@ async function renderOnenoteView(view) {
     el("header", { class: "note-page-head" },
       el("div", { class: "grow", style: "min-width:0" }, el("h1", { class: "view-title", style: "margin:0", text: "OneNote" }),
         el("div", { class: "svc-metrics dim", text: `${App.counts.onenote != null ? App.counts.onenote + " pages archived" : "notebook archive"}` })),
-      el("div", { class: "svc-chips" }, readonlyChip())),
+      el("div", { class: "svc-chips" },
+        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip(),
+        CAP.verify ? verifyButton(() => renderOnenoteView(view)) : null)),
+    el("div", { id: "note-metrics-row", class: "con-metrics-row", style: "padding-bottom:0" }),
     el("div", { class: "note-layout" }, list, reader)));
   renderNoteReader(null);
   for (let i = 0; i < 5; i++) list.append(el("div", { class: "note-item" }, el("div", { class: "skel grow", style: "height:30px" })));
   try {
-    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onenote", limit: 1000 }));
+    const [d, act] = await Promise.all([
+      api("/api/v1/items?" + qs({ account: App.account, service: "onenote", limit: 1000 })),
+      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
+    ]);
     const pages = (d.items || []).filter(it => it.item_type === "page");
     App.counts.onenote = d.total ?? pages.length; updateNavCounts();
+    fillMetrics($("#note-metrics-row"), [
+      { icon: "notebook", value: pages.length, label: "Pages", sub: "archived" },
+      integrityMetric(pages),
+      lastActivityMetric(act.runs || []),
+    ]);
     clear(list);
     if (!pages.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-notes"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
     pages.forEach((it, i) => {
