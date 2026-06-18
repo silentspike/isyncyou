@@ -1068,6 +1068,10 @@ impl Router {
         if service == "mail" {
             if let Some(html) = isyncyou_connectors::extract_html_with_inline_images(&bytes) {
                 let subject = if name.is_empty() { "Message" } else { &name };
+                // external content (remote images + web fonts) is opt-in (the
+                // reader's "Load external content" button adds ?external=1) —
+                // default blocks it (tracking pixels + privacy)
+                let external = req.q("external").as_deref() == Some("1");
                 let inline_images: Vec<_> = html
                     .inline_images
                     .iter()
@@ -1078,8 +1082,13 @@ impl Router {
                     })
                     .collect();
                 return ApiResponse::html_with_csp(
-                    &view::mail_page_with_inline_images(subject, &html.html, &inline_images),
-                    view::MAIL_CSP,
+                    &view::mail_page_with_inline_images(
+                        subject,
+                        &html.html,
+                        &inline_images,
+                        external,
+                    ),
+                    view::mail_csp(external),
                 );
             }
         }

@@ -25,7 +25,7 @@ function el(tag, props, ...kids) {
     else if (k === "dataset") Object.assign(n.dataset, v);
     else n.setAttribute(k, v);
   }
-  for (const kid of kids.flat()) {
+  for (const kid of kids.flat(Infinity)) {
     if (kid == null || kid === false) continue;
     n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
@@ -58,6 +58,7 @@ const ICONS = {
   clock: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20M12 6v6l4 2",
   list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
   image: "M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3M21 15l-5-5L5 21",
+  globe: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z",
   "file-text": "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8",
   table: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18",
   music: "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
@@ -104,6 +105,52 @@ function logoGlyph(size = 30) {
     '<path d="M32 28a9 9 0 0 1-16 3" fill="none" stroke="url(#lg)" stroke-width="3.2" stroke-linecap="round"/>' +
     '<path d="M16 34v-5h5" fill="none" stroke="url(#lg)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>';
   return svg; // trusted, in-code SVG only
+}
+
+/* ---------------------------------------------------------------- ambient graphics (trusted in-code SVG)
+   The approved mockup is a "cosmic archive console": a constellation network
+   behind the whole shell, a flowing particle stream in open space, and line-art
+   vault/shield motifs. All generated deterministically here (no external assets,
+   CSP-safe — same trust as logoGlyph). */
+// tiny deterministic PRNG (mulberry32) so the network is stable across renders
+function rng(seed) { let s = seed >>> 0; return () => { s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+// constellation: nodes (denser toward the top) + near-neighbour links → one SVG
+function netBackdrop(w, h) {
+  const rnd = rng(0x51e3a17), N = Math.round(w * h / 11000);
+  const nodes = [];
+  for (let i = 0; i < N; i++) { const yb = rnd(); nodes.push({ x: rnd() * w, y: yb * yb * h, r: 0.7 + rnd() * 1.9, a: rnd() > 0.7 }); }
+  const maxD = Math.min(w, h) * 0.14, lines = [];
+  for (let i = 0; i < N; i++) { let c = 0; for (let j = i + 1; j < N && c < 3; j++) { const d = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y); if (d < maxD) { lines.push(`<line x1="${nodes[i].x | 0}" y1="${nodes[i].y | 0}" x2="${nodes[j].x | 0}" y2="${nodes[j].y | 0}" opacity="${((1 - d / maxD) * 0.7).toFixed(2)}"/>`); c++; } } }
+  const dots = nodes.map(n => `<circle cx="${n.x | 0}" cy="${n.y | 0}" r="${n.r.toFixed(1)}" fill="${n.a ? "#a78bfa" : "#c7d2fe"}" opacity="${n.a ? .95 : .7}"/>`).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="100%" preserveAspectRatio="xMidYMin slice" xmlns="http://www.w3.org/2000/svg"><g stroke="#9aa2fb" stroke-width="0.9">${lines.join("")}</g>${dots}</svg>`;
+}
+function paintBackdrop() {
+  const host = document.getElementById("bg-net"); if (!host) return;
+  const w = Math.max(window.innerWidth, 320), h = Math.max(window.innerHeight, 760);
+  if (host.dataset.w == w && host.dataset.h == h) return;        // size unchanged → keep
+  host.dataset.w = w; host.dataset.h = h; host.innerHTML = netBackdrop(w, h);
+}
+// flowing particle stream — a wave of dots, brightest mid-span, fading at the ends
+function flowWave(w = 540, h = 300) {
+  const dots = [], rows = 6, n = 74;
+  for (let r = 0; r < rows; r++) {
+    const amp = 26 + r * 7, phase = r * 0.6, yb = h * 0.52 + (r - rows / 2) * 9;
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1), edge = Math.sin(t * Math.PI);
+      const x = t * w, y = yb + Math.sin(t * Math.PI * 2.2 + phase) * amp * edge;
+      dots.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${(0.5 + edge * 1.5).toFixed(2)}" opacity="${((0.05 + edge * 0.5) * (1 - r * 0.11)).toFixed(3)}"/>`);
+    }
+  }
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" fill="#7c8cf8">${dots.join("")}</svg>`;
+}
+// line-art vault door — decorative corner motif for the archive card (matches mockup)
+const VAULT_LINE = '<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="12" y="14" width="104" height="100" rx="12"/><rect x="22" y="24" width="84" height="80" rx="7" opacity="0.5"/><circle cx="64" cy="64" r="30"/><circle cx="64" cy="64" r="19" opacity="0.6"/><circle cx="64" cy="64" r="4.5" fill="currentColor"/><path d="M64 34v-8M64 102v-8M34 64h-8M102 64h-8M44 44l-6-6M84 44l6-6M44 84l-6 6M84 84l6 6" opacity="0.8"/></svg>';
+// line-art shield + keyhole — open-space motif under short lists
+const SHIELD_LINE = '<svg viewBox="0 0 120 132" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M60 10l42 16v30c0 30-19 52-42 60-23-8-42-30-42-60V26z"/><path d="M60 22l30 11v25c0 22-13 38-30 45-17-7-30-23-30-45V33z" opacity="0.45"/><circle cx="60" cy="62" r="9"/><path d="M60 71v14"/></svg>';
+// heartbeat / EKG polyline (a calm baseline with one pulse) — for health signals
+function ekgLine(w = 132, h = 34) {
+  const m = h / 2, p = [[0, m], [w * .2, m], [w * .28, m], [w * .34, h * .26], [w * .4, h * .82], [w * .46, m], [w * .54, m], [w * .62, h * .16], [w * .68, h * .9], [w * .74, m], [w * .82, m], [w, m]];
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="${p.map(([x, y]) => `${x.toFixed(0)},${y.toFixed(0)}`).join(" ")}"/></svg>`;
 }
 
 /* ---------------------------------------------------------------- charts (pure SVG, no lib) */
@@ -263,7 +310,42 @@ const RESTORABLE = new Set(["mail", "calendar", "contacts", "todo", "onenote"]);
 const SHAREABLE = new Set(["onedrive"]);
 
 /* ---------------------------------------------------------------- global state */
-const App = { account: null, accounts: [], route: "overview", counts: {} };
+const App = { account: null, accounts: [], route: "overview", counts: {}, svcFilter: {} };
+// Per-service filter sub-items shown in the LEFT sidebar, indented under the
+// active service (NOT a separate rail). Lazy so MAIL_CATS is defined at call.
+function svcFilters(service) {
+  if (service === "mail") return [
+    { sec: "Mailbox" },
+    { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
+    { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
+    { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
+    { sec: "Categories" },
+    ...MAIL_CATS.map(c => ({ key: c.key, label: c.label, icon: c.icon, color: c.color, count: m => m.filter(it => mailCat(it).key === c.key).length })),
+  ];
+  if (service === "contacts") return [
+    { sec: "Directory" },
+    { key: "all", label: "All contacts", icon: "users", count: c => c.length },
+    { key: "email", label: "With email", icon: "mail", count: c => c.filter(it => (it.preview || {}).email).length },
+    { key: "company", label: "With company", icon: "building", count: c => c.filter(it => (it.preview || {}).company).length },
+    { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: c => c.filter(it => it.has_body).length },
+  ];
+  return null;
+}
+const svcFilter = (service) => App.svcFilter[service] || "all";
+function setSvcFilter(service, key) {
+  App.svcFilter[service] = key;
+  document.querySelectorAll(`#subnav-${service} .nav-subitem`).forEach(b => b.classList.toggle("active", b.dataset.k === key));
+  if (service === "mail") mailRender();
+  else if (service === "contacts") contactsRenderList();
+}
+// fill the sidebar sub-item counts once the active view has loaded its items
+function fillSubnavCounts(service, items) {
+  const specs = svcFilters(service); if (!specs) return;
+  specs.filter(f => f.key).forEach(f => {
+    const c = document.querySelector(`#subnav-${service} [data-cnt="${f.key}"]`);
+    if (c) c.textContent = String(f.count(items));
+  });
+}
 
 /* ---------------------------------------------------------------- toasts */
 function toast(msg, kind = "ok") {
@@ -292,7 +374,17 @@ function renderShell() {
           connected ? el("span", { class: "nav-dot", style: `background:var(--svc-${s.id})`, title: "Connected" }) : null,
           el("span", { class: "count", text: cnt != null ? String(cnt) : "·" })) : null,
       );
-      return item;
+      // active service → its filters expand as indented sub-items right here in
+      // the LEFT sidebar (no separate rail).
+      const specs = App.route === s.id ? svcFilters(s.id) : null;
+      const sub = specs ? el("div", { class: "nav-sub", id: `subnav-${s.id}` },
+        specs.map(f => f.sec
+          ? el("div", { class: "nav-sub-sec", text: f.sec })
+          : el("button", { class: "nav-subitem" + (svcFilter(s.id) === f.key ? " active" : ""), dataset: { k: f.key }, onclick: () => setSvcFilter(s.id, f.key) },
+            f.color ? el("span", { class: "nav-sub-dot", style: `background:${f.color}` }) : icon(f.icon, "icon-sm"),
+            el("span", { class: "grow truncate", text: f.label }),
+            el("span", { class: "count tnum", dataset: { cnt: f.key }, text: "·" })))) : null;
+      return [item, sub];
     }),
   );
   const sidebar = el("aside", { class: "sidebar" },
@@ -305,7 +397,7 @@ function renderShell() {
     nav,
     el("div", { class: "spacer" }),
     el("div", { class: "sb-section", text: "System" }),
-    el("nav", { class: "nav" },
+    el("nav", { class: "nav sys-nav" },
       el("button", { class: "nav-item", title: "Recent runs (audit log)", onclick: () => go("overview") },
         icon("clock"), el("span", { class: "label", text: "Audit log" })),
       el("button", { id: "nav-alerts", class: "nav-item", title: "Failed runs", onclick: () => go("overview") },
@@ -539,9 +631,9 @@ function connItem(k, v) { return el("div", { class: "conn-item" }, el("dt", { te
 /* shared per-view header: title + live metric line + honest chips (enterprise standard) */
 function viewHeader(title, metrics, chips) {
   return el("header", { class: "svc-head" },
-    el("div", { class: "grow", style: "min-width:0" },
-      el("h1", { class: "view-title", style: "margin:0", text: title }),
-      el("div", { class: "svc-metrics dim", text: metrics || "" })),
+    el("h1", { class: "view-title", style: "margin:0", text: title }),
+    metrics ? el("span", { class: "svc-metrics dim", text: metrics }) : null,
+    el("span", { class: "spacer", style: "flex:1" }),
     chips && chips.length ? el("div", { class: "svc-chips" }, ...chips) : null);
 }
 const readonlyChip = () => el("span", { class: "chip muted" }, icon("shield-check", "icon-sm"), "Read-only");
@@ -634,17 +726,9 @@ const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || i
 async function renderMailView(view) {
   Mail.all = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
   clear(view).append(el("div", { id: "mail-page", class: "mail-page" },
-    // header: title + live metrics + honest trust chips
-    el("header", { class: "mail-head" },
-      el("div", { class: "grow", style: "min-width:0" },
-        el("h1", { class: "view-title", style: "margin:0", text: "Mail archive" }),
-        el("div", { id: "mail-metrics", class: "mail-metrics dim", text: "Loading…" })),
-      el("div", { class: "mail-chips" },
-        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"),
-        el("span", { class: "chip muted" }, icon("shield", "icon-sm"), "Encrypted at rest"),
-        el("span", { class: "chip muted" }, icon("shield-check", "icon-sm"), "Read-only"))),
-    // top metric row (real: counts + integrity from verify + last activity)
-    el("div", { id: "mail-metrics-row", class: "con-metrics-row" }),
+    // top metric row leads (title is in the top-bar breadcrumb, counts live in the
+    // cards + sidebar sub-nav) — no separate hero band, matching the mockup
+    el("div", { id: "mail-metrics-row", class: "con-metrics-row top" }),
     // toolbar
     el("div", { class: "mail-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
@@ -657,9 +741,8 @@ async function renderMailView(view) {
           el("option", { value: "sender", text: "Sender A–Z" }))),
       verifyButton(() => renderMailView(view)),
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
-    // 3-pane: filter rail | list | reader
+    // 2-pane: list | reader (filters live in the left sidebar under "Mail")
     el("div", { id: "mail-layout", class: "mail-layout" },
-      el("aside", { id: "mail-rail", class: "mail-rail" }),
       el("div", { id: "mail-list", class: "mail-list" }),
       el("div", { id: "mail-reader", class: "mail-reader" }))));
   renderMailReader(null);
@@ -673,7 +756,8 @@ async function renderMailView(view) {
     Mail.all = (d.items || []).filter(it => it.item_type === "message");
     Mail.runs = act.runs || [];
     App.counts.mail = Mail.all.length; updateNavCounts();
-    mailRenderMetrics(); mailRenderRail(); mailRender();
+    fillSubnavCounts("mail", Mail.all);
+    mailRenderMetrics(); mailRender();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
 }
 // fill an existing .con-metrics-row container in place from card specs
@@ -695,7 +779,7 @@ function mailRenderMetrics() {
 }
 function mailFiltered() {
   let rows = Mail.all;
-  const f = Mail.filter;
+  const f = svcFilter("mail");
   if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
   else if (f !== "all") rows = rows.filter(it => mailCat(it).key === f);
@@ -704,25 +788,6 @@ function mailFiltered() {
   if (Mail.sort === "sender") rows = rows.slice().sort((a, b) => addrLabel((a.preview || {}).from).localeCompare(addrLabel((b.preview || {}).from)));
   else rows = rows.slice().sort((a, b) => dir * (mailDate(a) - mailDate(b)));
   return rows;
-}
-function mailRenderRail() {
-  const rail = $("#mail-rail"); if (!rail) return; clear(rail);
-  const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
-  const restore = Mail.all.filter(it => it.has_body).length;
-  const catCounts = {}; Mail.all.forEach(it => { const k = mailCat(it).key; catCounts[k] = (catCounts[k] || 0) + 1; });
-  const folder = (key, label, icn, count, color) => el("button", { class: "mail-folder" + (Mail.filter === key ? " active" : ""), onclick: () => { Mail.filter = key; mailRenderRail(); mailRender(); } },
-    el("span", { class: "mf-ico", style: color ? `color:${color}` : "" }, icon(icn, "icon-sm")),
-    el("span", { class: "grow truncate", text: label }), el("span", { class: "count tnum", text: String(count) }));
-  rail.append(
-    el("div", { class: "mail-rail-sec", text: "Mailbox" }),
-    folder("all", "All messages", "inbox", Mail.all.length),
-    folder("attach", "With attachments", "paperclip", withAtt),
-    folder("restore", "Restore-ready", "rotate-ccw", restore),
-    el("div", { class: "mail-rail-sec", text: "Categories" }),
-    ...MAIL_CATS.map(c => folder(c.key, c.label, c.icon, catCounts[c.key] || 0, c.color)),
-    catCounts.other ? folder("other", "Other", "mail", catCounts.other, "#768390") : null,
-    el("div", { class: "spacer" }),
-    el("p", { class: "mail-rail-foot dim", text: "Read-only archive · restore re-creates a copy in your mailbox. Categories are auto-detected." }));
 }
 function mailRender() {
   const list = $("#mail-list"); if (!list) return;
@@ -764,11 +829,12 @@ function mailSelect(it) {
 function mailBack() { Mail.selected = null; $("#mail-layout")?.classList.remove("reading"); document.querySelectorAll(".mail-item.active").forEach(r => r.classList.remove("active")); renderMailReader(null); }
 // restrained archive-vault illustration for the empty reading pane (trusted in-code SVG)
 const VAULT_SVG = '<svg viewBox="0 0 260 180" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="40" y="34" width="120" height="84" rx="10" opacity="0.35" transform="rotate(-7 100 76)"/><rect x="64" y="44" width="120" height="84" rx="10" opacity="0.6"/><path d="M64 60h120" opacity="0.6"/><circle cx="200" cy="120" r="38" fill="color-mix(in oklab, var(--accent) 10%, transparent)"/><circle cx="200" cy="120" r="38"/><circle cx="200" cy="120" r="14"/><path d="M200 92v10M200 138v10M172 120h10M218 120h10"/></g><path d="M191 119l6 6 12-13" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-function renderMailReader(it) {
+function renderMailReader(it, remoteImages = false) {
   const box = $("#mail-reader"); if (!box) return; clear(box);
   if (!it) {
     const archived = Mail.all.filter(x => x.has_body).length;
     const withAtt = Mail.all.filter(x => (x.preview || {}).attachments > 0).length;
+    box.append(el("div", { class: "mail-flow", html: `<div class="con-flow-wave">${flowWave(680, 360)}</div>` }));
     box.append(el("div", { class: "mail-empty" },
       el("div", { class: "vault-art", html: VAULT_SVG }),
       el("h3", { text: "Select a message to inspect it" }),
@@ -785,8 +851,12 @@ function renderMailReader(it) {
   const p = it.preview || {}, from = parseAddr(p.from), cat = mailCat(it);
   const subject = p.subject || it.name || "(no subject)", when = p.date || it.remote_mtime;
   const q = { account: App.account, service: "mail", id: it.remote_id };
-  const actions = el("div", { class: "mr-actions" },
-    el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
+  const viewQ = remoteImages ? { ...q, external: "1" } : q;
+  const actions = el("div", { class: "mr-actions" });
+  if (it.has_body) actions.append(remoteImages
+    ? el("button", { class: "btn ghost sm", title: "Block external content again (privacy)", onclick: () => renderMailReader(it, false) }, icon("shield", "icon-sm"), "Hide external content")
+    : el("button", { class: "btn ghost sm", title: "Load external content — images & web fonts (may notify the sender you opened it)", onclick: () => renderMailReader(it, true) }, icon("globe", "icon-sm"), "Load external content"));
+  actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
   if (CAP.restore) actions.append(el("button", { class: "btn sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
   box.append(
     el("header", { class: "mail-reader-head" },
@@ -804,8 +874,33 @@ function renderMailReader(it) {
               from.name && from.email ? el("span", { class: "dim", text: " <" + from.email + ">" }) : null),
             (p.to && p.to.length) ? el("div", { class: "mr-to dim truncate", text: "To: " + p.to.join(", ") }) : null),
           el("span", { class: "mr-date dim tnum", text: fmtFullDate(when) }))),
-      actions),
-    el("iframe", { class: "mail-frame", src: `/api/v1/view?${qs(q)}`, title: "Message body", loading: "lazy" }));
+      actions));
+  // The body is a same-origin sandboxed iframe. Size it to its own content on
+  // load and let the OUTER pane scroll → the whole message scrolls naturally
+  // (an internally-scrolling iframe in a flex column felt like "can't scroll").
+  const frame = el("iframe", { class: "mail-frame", src: `/api/v1/view?${qs(viewQ)}`, title: "Message body" });
+  // Re-measure on EVERY content size change (images decode after load, fonts
+  // reflow, etc.) so the iframe always matches its full content height and the
+  // outer pane can scroll all the way to the end. The >2px guard avoids a
+  // ResizeObserver feedback loop.
+  const fit = () => {
+    try {
+      const d = frame.contentDocument; if (!d || !d.body) return;
+      const h = Math.max(d.documentElement.scrollHeight, d.body.scrollHeight) + 4;
+      const cur = parseInt(frame.style.height, 10) || 0;
+      if (Math.abs(cur - h) > 2) frame.style.height = h + "px";
+    } catch { /* cross-origin: leave default */ }
+  };
+  frame.addEventListener("load", () => {
+    fit();
+    try {
+      const d = frame.contentDocument;
+      if (d && window.ResizeObserver) { const ro = new ResizeObserver(fit); ro.observe(d.documentElement); if (d.body) ro.observe(d.body); }
+      if (d) d.querySelectorAll("img").forEach(img => { if (!img.complete) { img.addEventListener("load", fit, { once: true }); img.addEventListener("error", fit, { once: true }); } });
+    } catch { /* cross-origin */ }
+    [120, 400, 1000, 2500].forEach(t => setTimeout(fit, t));   // fallback for late reflows
+  });
+  box.append(el("div", { class: "mail-frame-scroll" }, frame));
 }
 function metricCard(icn, val, label) {
   return el("div", { class: "metric-card" }, el("span", { class: "mc-ico" }, icon(icn, "icon-sm")),
@@ -835,9 +930,7 @@ const fileColor = (ext) => (fileKind(ext) || {}).color || "var(--text-lo)";
 async function renderOnedriveView(view) {
   Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = [];
   clear(view).append(
-    viewHeader("OneDrive", `${App.counts.onedrive != null ? App.counts.onedrive + " items archived · " : ""}file & folder archive`,
-      [el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip()]),
-    el("div", { id: "drive-metrics-row", class: "con-metrics-row", style: "border-bottom:0;padding-left:0;padding-right:0" }),
+    el("div", { id: "drive-metrics-row", class: "con-metrics-row inset" }),
     el("div", { class: "drive-bar" },
       el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
       el("div", { class: "spacer", style: "flex:1" }),
@@ -983,9 +1076,7 @@ const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit
 async function renderCalendarView(view) {
   Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda";
   clear(view).append(
-    viewHeader("Calendar", `${App.counts.calendar != null ? App.counts.calendar + " events archived" : "event archive"}`,
-      [el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip()]),
-    el("div", { id: "cal-metrics-row", class: "con-metrics-row", style: "border-bottom:0;padding-left:0;padding-right:0" }),
+    el("div", { id: "cal-metrics-row", class: "con-metrics-row inset" }),
     el("div", { class: "cal-bar" },
       el("div", { class: "cal-nav" },
         el("button", { class: "btn ghost sm icon-only", title: "Previous", onclick: () => calNav(-1) }, icon("chevron-left", "icon-sm")),
@@ -1174,23 +1265,14 @@ const CON_FILTERS = [["all", "All"], ["email", "With email"], ["company", "With 
 async function renderContactsView(view) {
   Object.assign(Contacts, { all: [], selected: null, filter: "all", q: "", sort: "name", status: null });
   clear(view).append(el("div", { class: "con-page" },
-    // header: title + live metrics + honest trust chips (Source / Encryption / Read-only)
-    el("header", { class: "con-page-head" },
-      el("div", { class: "grow", style: "min-width:0" },
-        el("h1", { class: "view-title", style: "margin:0", text: "Contacts" }),
-        el("div", { id: "con-metrics", class: "svc-metrics dim", text: "Loading…" })),
-      el("div", { class: "svc-chips" },
-        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"),
-        el("span", { class: "chip muted" }, icon("shield", "icon-sm"), "Encrypted at rest"),
-        readonlyChip())),
-    // top metric row (real data: counts + integrity from verify + sync health/activity)
-    el("div", { id: "con-metrics-row", class: "con-metrics-row" }),
+    // top metric row (real data: counts + integrity from verify + sync health/activity).
+    // The page title lives in the top-bar breadcrumb and the counts live in these
+    // cards + the sidebar sub-nav, so no separate hero band is needed (saves 3 rows).
+    el("div", { id: "con-metrics-row", class: "con-metrics-row top" }),
     // toolbar: search + filters + sort + verify + sync-log
     el("div", { class: "con-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
         el("input", { id: "con-search", placeholder: "Search by name, email, or company…", oninput: () => { Contacts.q = ($("#con-search").value || "").trim().toLowerCase(); contactsRenderList(); } })),
-      el("div", { class: "con-filters" }, ...CON_FILTERS.map(([k, l]) =>
-        el("button", { class: "con-filter" + (Contacts.filter === k ? " active" : ""), dataset: { k }, onclick: () => { Contacts.filter = k; document.querySelectorAll(".con-filter").forEach(b => b.classList.toggle("active", b.dataset.k === k)); contactsRenderList(); } }, l))),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
         el("select", { class: "input", onchange: (e) => { Contacts.sort = e.target.value; contactsRenderList(); } },
@@ -1201,7 +1283,8 @@ async function renderContactsView(view) {
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
     // master–detail: directory list | record detail
     el("div", { id: "con-layout", class: "con-layout" },
-      el("div", { class: "con-listwrap" }, el("div", { id: "con-list", class: "con-list" }), el("div", { id: "con-az", class: "con-az" })),
+      el("div", { class: "con-listwrap" },
+        el("div", { id: "con-list", class: "con-list" }), el("div", { id: "con-az", class: "con-az" })),
       el("div", { id: "con-detail", class: "con-detail" }))));
   renderContactDetail(null);
   const list = $("#con-list");
@@ -1219,7 +1302,7 @@ async function renderContactsView(view) {
     Contacts.lastSync = Contacts.runs.filter(r => /sync|backup/i.test(r.kind || "")).map(r => r.finished_at || r.started_at).filter(Boolean).sort().pop() || null;
     Contacts.retentionDays = (settings.sync || {}).trash_retention_days ?? null;
     App.counts.contacts = d.total ?? Contacts.all.length; updateNavCounts();
-    contactsRenderMetrics(); contactsRenderList();
+    fillSubnavCounts("contacts", Contacts.all); contactsRenderMetrics(); contactsRenderList();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load contacts" }), el("p", { text: e.message }))); }
 }
 // re-hash every archived record (real verify), then refresh the integrity signals
@@ -1234,13 +1317,13 @@ async function contactsVerify(btn) {
     ]);
     Contacts.status = status;
     Contacts.all = (d.items || []).filter(it => it.item_type !== "folder");
-    contactsRenderMetrics(); contactsRenderList();
+    fillSubnavCounts("contacts", Contacts.all); contactsRenderMetrics(); contactsRenderList();
     if (Contacts.selected) { const s = Contacts.all.find(x => x.remote_id === Contacts.selected.remote_id); if (s) { Contacts.selected = s; renderContactDetail(s); } }
   } catch (e) { toast("Verify failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 function contactsFiltered() {
   let rows = Contacts.all;
-  const f = Contacts.filter;
+  const f = svcFilter("contacts");
   if (f === "email") rows = rows.filter(it => conPrev(it).email);
   else if (f === "company") rows = rows.filter(it => conPrev(it).company);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
@@ -1509,14 +1592,16 @@ async function renderContactDetail(it) {
             : it.verify_status === "failed" ? el("span", { class: "chip err" }, icon("shield", "icon-sm"), "Check failed") : null,
         el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"))),
     actions));
+  // cards laid out in a clean 2-column grid, row-aligned to the top (CSS) — fixed
+  // reading order: Contact details | Record completeness / Archive details |
+  // Compliance / Notes (full width)
   const body = el("div", { class: "con-detail-body" });
+  box.append(body);
   const fieldsBody = el("div", { class: "con-block-body" }, el("div", { class: "spinner" }));
   const fields = el("div", { class: "card con-block" },
     el("div", { class: "con-block-head" }, icon("users", "icon-sm"), el("span", { text: "Contact details" })), fieldsBody);
-  const main = el("div", { class: "con-col-main" }, fields);
-  const side = el("div", { class: "con-col-side" }, archiveMetaCard(it), complianceCard(it));
-  body.append(main, side);
-  box.append(body);
+  const completeSlot = el("div", { class: "card con-block" }, el("div", { class: "con-block-body" }, el("div", { class: "spinner" })));
+  body.append(fields, completeSlot, archiveMetaCard(it), complianceCard(it));
   try {
     const c = await api("/api/v1/body?" + qs({ account: App.account, service: "contacts", id: it.remote_id }));
     const kv = el("dl", { class: "kv" });
@@ -1532,22 +1617,34 @@ async function renderContactDetail(it) {
     clear(fieldsBody);
     if (kv.childElementCount) fieldsBody.append(kv);
     else fieldsBody.append(el("p", { class: "dim", style: "padding:2px", text: "No additional fields archived for this contact." }));
-    // record-completeness card at the top of the side column (needs the loaded body)
-    side.insertBefore(completenessCard(c), side.firstChild);
-    if (c.personalNotes) main.append(el("div", { class: "card con-block" },
+    if (!body.isConnected) return;          // contact switched away while loading
+    completeSlot.replaceWith(completenessCard(c));
+    if (c.personalNotes) body.append(el("div", { class: "card con-block con-block-full" },
       el("div", { class: "con-block-head" }, icon("file-text", "icon-sm"), el("span", { text: "Notes" })),
       el("p", { class: "con-notes", style: "white-space:pre-wrap", text: c.personalNotes })));
   } catch (e) { clear(fieldsBody).append(el("p", { class: "dim", text: "Could not load contact: " + e.message })); }
+}
+
+// (removed masonryBalance — replaced by a CSS 2-column grid)
+function _unused_masonryBalance(host, cards) {
+  clear(host);
+  const cols = [el("div", { class: "con-col" }), el("div", { class: "con-col" })];
+  host.append(cols[0], cols[1]);
+  const h = [0, 0];
+  for (const card of cards) {
+    if (!card) continue;
+    const i = h[0] <= h[1] ? 0 : 1;
+    cols[i].append(card);
+    h[i] += card.getBoundingClientRect().height || 1;
+  }
 }
 
 /* ---------------------------------------------------------------- todo (lists + checklists) */
 const Todo = { lists: [], tasks: [] };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
-  clear(view).append(viewHeader("To Do", `${App.counts.todo != null ? App.counts.todo + " items archived" : "task archive"}`,
-    [el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip(),
-      CAP.verify ? verifyButton(() => renderTodoView(view)) : null]));
-  view.append(el("div", { id: "todo-metrics-row", class: "con-metrics-row", style: "border-bottom:0;padding-left:0;padding-right:0" }));
+  clear(view).append(el("div", { id: "todo-metrics-row", class: "con-metrics-row inset" }));
+  if (CAP.verify) view.append(el("div", { class: "view-actions" }, verifyButton(() => renderTodoView(view))));
   const board = el("div", { id: "todo-board", class: "todo-board" });
   view.append(board);
   board.append(el("div", { class: "card", style: "min-width:280px" }, el("div", { class: "skel", style: "height:200px" })));
@@ -1628,13 +1725,8 @@ async function renderOnenoteView(view) {
   const list = el("div", { id: "note-list", class: "note-list" });
   const reader = el("div", { id: "note-reader", class: "note-reader" });
   view.append(el("div", { class: "note-page" },
-    el("header", { class: "note-page-head" },
-      el("div", { class: "grow", style: "min-width:0" }, el("h1", { class: "view-title", style: "margin:0", text: "OneNote" }),
-        el("div", { class: "svc-metrics dim", text: `${App.counts.onenote != null ? App.counts.onenote + " pages archived" : "notebook archive"}` })),
-      el("div", { class: "svc-chips" },
-        el("span", { class: "chip muted" }, icon("archive", "icon-sm"), "Microsoft 365"), readonlyChip(),
-        CAP.verify ? verifyButton(() => renderOnenoteView(view)) : null)),
-    el("div", { id: "note-metrics-row", class: "con-metrics-row", style: "padding-bottom:0" }),
+    el("div", { id: "note-metrics-row", class: "con-metrics-row top" }),
+    CAP.verify ? el("div", { class: "view-actions" }, verifyButton(() => renderOnenoteView(view))) : null,
     el("div", { class: "note-layout" }, list, reader)));
   renderNoteReader(null);
   for (let i = 0; i < 5; i++) list.append(el("div", { class: "note-item" }, el("div", { class: "skel grow", style: "height:30px" })));
@@ -1849,8 +1941,11 @@ function openPalette() {
 function closePalette() { if (palette) { palette.remove(); palette = null; } }
 
 /* ---------------------------------------------------------------- init */
+let _bdT;
 async function init() {
   document.body.append(el("div", { id: "toasts", class: "toasts" }));
+  paintBackdrop();
+  window.addEventListener("resize", () => { clearTimeout(_bdT); _bdT = setTimeout(paintBackdrop, 200); });
   window.addEventListener("hashchange", onRoute);
   window.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }

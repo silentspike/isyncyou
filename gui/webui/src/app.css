@@ -119,13 +119,35 @@ a:hover { text-decoration: underline; }
 *::-webkit-scrollbar { width: 10px; height: 10px; }
 *::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: var(--r-full); border: 3px solid transparent; background-clip: content-box; }
 
-/* ============================================================ ambient background (very subtle, static) */
+/* ============================================================ ambient background — cosmic archive console (constellation + aurora + starfield) */
 .bg-mesh {
-  position: fixed; inset: 0; z-index: -2; pointer-events: none;
-  /* one faint top glow only — depth without "neon". */
-  background: radial-gradient(90% 60% at 50% -20%, color-mix(in oklab, var(--accent) 7%, transparent), transparent 60%);
+  position: fixed; inset: 0; z-index: -3; pointer-events: none;
+  /* accent aurora top + violet glow top-right + deep glow bottom — like the mockup */
+  background:
+    radial-gradient(120% 70% at 50% -25%, color-mix(in oklab, var(--accent) 16%, transparent), transparent 60%),
+    radial-gradient(70% 55% at 100% 0%, color-mix(in oklab, var(--accent-2) 13%, transparent), transparent 65%),
+    radial-gradient(60% 50% at 100% 100%, color-mix(in oklab, var(--svc-onedrive) 7%, transparent), transparent 70%);
 }
-.bg-noise { display: none; } /* removed — the noise read as cheap */
+/* signature constellation network (JS-generated SVG in #bg-net) — strong toward
+   the top, faded into the work area below so it never fights with content */
+.bg-net {
+  position: fixed; inset: 0; z-index: -2; pointer-events: none; opacity: 1;
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 34%, rgba(0,0,0,.4) 66%, transparent 92%);
+          mask-image: linear-gradient(to bottom, #000 0%, #000 34%, rgba(0,0,0,.4) 66%, transparent 92%);
+}
+.bg-net svg { display: block; width: 100%; height: 100%; }
+/* a real (CSP-safe, pure-CSS) starfield: many tiny dots via layered radial-gradients */
+.bg-noise {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .5;
+  background-repeat: repeat;
+  background-size: 260px 260px, 320px 320px, 200px 200px;
+  background-image:
+    radial-gradient(1.4px 1.4px at 40px 60px, rgba(255,255,255,.20), transparent),
+    radial-gradient(1px 1px at 160px 120px, rgba(255,255,255,.14), transparent),
+    radial-gradient(1.6px 1.6px at 220px 30px, color-mix(in oklab, var(--accent) 55%, #fff), transparent),
+    radial-gradient(1px 1px at 90px 200px, rgba(255,255,255,.12), transparent),
+    radial-gradient(1.2px 1.2px at 280px 240px, rgba(255,255,255,.10), transparent);
+}
 
 /* ============================================================ icons / logo */
 .icon { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none;
@@ -144,7 +166,7 @@ a:hover { text-decoration: underline; }
 
 /* ---- sidebar */
 .sidebar {
-  grid-row: 1 / -1;
+  grid-row: 1 / -1; position: relative;
   display: flex; flex-direction: column; gap: var(--sp-2);
   padding: var(--sp-4) var(--sp-3);
   background: color-mix(in oklab, var(--bg-1) 92%, transparent);
@@ -152,6 +174,18 @@ a:hover { text-decoration: underline; }
   border-right: 1px solid var(--line);
   overflow-y: auto;
 }
+/* cosmic accent over the sidebar (top constellation glow + faint stars) */
+.sidebar::before {
+  content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none; opacity: .7;
+  background:
+    radial-gradient(120% 40% at 30% -5%, color-mix(in oklab, var(--accent) 14%, transparent), transparent 60%),
+    radial-gradient(1.4px 1.4px at 30px 70px, rgba(255,255,255,.22), transparent),
+    radial-gradient(1.6px 1.6px at 150px 40px, color-mix(in oklab, var(--accent) 60%, #fff), transparent),
+    radial-gradient(1px 1px at 90px 150px, rgba(255,255,255,.16), transparent),
+    radial-gradient(1px 1px at 190px 110px, rgba(255,255,255,.12), transparent);
+  background-repeat: no-repeat;
+}
+.sidebar > * { position: relative; z-index: 1; }
 .sidebar .brand { padding: var(--sp-2) var(--sp-2) var(--sp-4); }
 .sb-account {
   display: flex; align-items: center; gap: var(--sp-2); width: 100%;
@@ -186,6 +220,19 @@ a:hover { text-decoration: underline; }
 .nav-item .count {
   font-size: var(--fs-xs); color: var(--text-lo); font-variant-numeric: tabular-nums; min-width: 16px; text-align: right;
 }
+/* active service's filter sub-items — indented in the LEFT sidebar (no rail) */
+.nav-sub { display: flex; flex-direction: column; gap: 1px; margin: 2px 0 var(--sp-2) var(--sp-4);
+  padding-left: var(--sp-3); border-left: 1px solid var(--line); }
+.nav-sub-sec { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-lo); padding: var(--sp-2) var(--sp-2) 2px; }
+.nav-subitem { display: flex; align-items: center; gap: var(--sp-2); width: 100%; text-align: left;
+  padding: 5px var(--sp-2); border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-mid); font-size: var(--fs-sm);
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.nav-subitem:hover { background: var(--bg-hover); color: var(--text-hi); }
+.nav-subitem.active { background: var(--accent-soft); color: var(--text-hi); }
+.nav-subitem .icon { width: 14px; height: 14px; color: var(--text-lo); flex: none; }
+.nav-subitem.active .icon { color: var(--accent); }
+.nav-sub-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; margin: 0 3px 0 4px; }
+.nav-subitem .count { font-size: 10px; color: var(--text-lo); font-variant-numeric: tabular-nums; }
 .sidebar .spacer { flex: 1; }
 
 /* ---- archive-health card (sidebar footer) */
@@ -237,9 +284,11 @@ a:hover { text-decoration: underline; }
 .view-title { font-size: var(--fs-2xl); font-weight: 680; letter-spacing: -.02em; margin-bottom: var(--sp-1); }
 .view-sub { color: var(--text-mid); margin-bottom: var(--sp-5); }
 /* shared per-view header band */
-.svc-head { display: flex; align-items: flex-start; gap: var(--sp-4); margin-bottom: var(--sp-5);
-  padding-bottom: var(--sp-4); border-bottom: 1px solid var(--line); }
-.svc-metrics { font-size: var(--fs-md); margin-top: 4px; }
+/* compact single-row service header: title + inline summary + chips on one line */
+.svc-head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4);
+  padding-bottom: var(--sp-3); border-bottom: 1px solid var(--line); }
+.svc-head .view-title { font-size: var(--fs-xl); }
+.svc-metrics { font-size: var(--fs-md); }
 .svc-chips { display: flex; gap: var(--sp-2); flex: none; }
 .svc-chips .chip .icon { width: 13px; height: 13px; }
 
@@ -278,7 +327,8 @@ a:hover { text-decoration: underline; }
 .status-actions { display: flex; gap: var(--sp-2); }
 
 /* KPI row — modest numbers, real context, optional inline trend */
-.kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.kpi-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.kpi { flex: 1 1 170px; min-width: 0; }
 .kpi { padding: var(--sp-4) var(--sp-4); display: flex; flex-direction: column; gap: 5px; }
 .kpi-head { display: flex; align-items: center; gap: var(--sp-2); color: var(--text-lo); font-size: var(--fs-sm); }
 .kpi-head .icon { width: 14px; height: 14px; }
@@ -288,7 +338,10 @@ a:hover { text-decoration: underline; }
 .kpi-ctx { font-size: var(--fs-sm); color: var(--text-mid); }
 
 /* main grid */
-.dash-grid { display: grid; grid-template-columns: 2fr 1fr; gap: var(--sp-3); margin-bottom: var(--sp-4); align-items: start; }
+.dash-grid { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-bottom: var(--sp-4); align-items: flex-start; }
+.dash-grid > * { min-width: 0; }
+.dash-grid > :first-child { flex: 2 1 380px; }
+.dash-grid > :last-child { flex: 1 1 260px; }
 .panel { padding: 0; overflow: hidden; }
 .panel-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4);
   border-bottom: 1px solid var(--line); font-size: var(--fs-sm); font-weight: 600; color: var(--text-mid); }
@@ -482,7 +535,9 @@ a:hover { text-decoration: underline; }
 
 /* ============================================================ mail — premium archive client */
 .view:has(.mail-page) { padding: 0; overflow: hidden; }
-.mail-page { height: 100%; display: flex; flex-direction: column; background: var(--bg-0); min-height: 0; }
+/* transparent so the ambient constellation shows in the metric band + the empty
+   reader; the message list keeps a solid surface for legibility */
+.mail-page { height: 100%; display: flex; flex-direction: column; background: transparent; min-height: 0; }
 
 /* ---- header: title + live metrics + trust chips */
 .mail-head { display: flex; align-items: flex-start; gap: var(--sp-4); padding: var(--sp-4) var(--sp-5); border-bottom: 1px solid var(--line); }
@@ -502,9 +557,9 @@ a:hover { text-decoration: underline; }
 .tb-sort .icon { flex: none; }
 .tb-sort select { width: auto; padding: var(--sp-1) var(--sp-2); }
 
-/* ---- 3-pane */
-.mail-layout { flex: 1; display: grid; min-height: 0; position: relative;
-  grid-template-columns: 224px minmax(330px, 410px) 1fr; }
+/* ---- 2-pane (list | reader); filters live in the left sidebar */
+.mail-layout { flex: 1; display: grid; min-height: 0; position: relative; overflow: hidden;
+  grid-template-columns: minmax(0, 360px) 1fr; }
 .mail-layout > * { min-height: 0; min-width: 0; }
 
 /* rail (filters) */
@@ -551,7 +606,13 @@ a:hover { text-decoration: underline; }
 .skel-row { pointer-events: none; align-items: center; }
 
 /* reader */
-.mail-reader { display: flex; flex-direction: column; overflow: hidden; background: var(--bg-0); }
+.mail-reader { display: flex; flex-direction: column; overflow: hidden; background: transparent; position: relative; }
+/* flowing particle stream behind the empty reader (matches mockup open space) */
+.mail-flow { position: absolute; inset: auto 0 0 0; height: 58%; z-index: 0; pointer-events: none; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 42%); mask-image: linear-gradient(to bottom, transparent, #000 42%); }
+.mail-flow .con-flow-wave { position: absolute; inset: 0; }
+.mail-flow svg { width: 100%; height: 100%; }
+.mail-empty { position: relative; z-index: 1; }
 .mail-reader-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5); flex: none; border-bottom: 1px solid var(--line); background: var(--bg-1); }
 .mail-back { display: none; flex: none; padding: var(--sp-2); }
 .mr-tags { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); flex-wrap: wrap; }
@@ -562,7 +623,9 @@ a:hover { text-decoration: underline; }
 .mr-to { font-size: var(--fs-sm); margin-top: 1px; }
 .mr-date { font-size: var(--fs-sm); flex: none; white-space: nowrap; align-self: center; }
 .mr-actions { display: flex; gap: var(--sp-2); flex: none; align-items: center; }
-.mail-frame { flex: 1; width: 100%; border: 0; background: var(--bg-0); }
+/* the body iframe is auto-sized to its content (JS); this pane does the scrolling */
+.mail-frame-scroll { flex: 1; min-height: 0; overflow-y: auto; background: var(--bg-0); }
+.mail-frame { display: block; width: 100%; border: 0; background: var(--bg-0); min-height: 240px; }
 
 /* rich empty reading pane */
 .mail-empty { margin: auto; max-width: 420px; text-align: center; padding: var(--sp-6); display: flex; flex-direction: column; align-items: center; gap: var(--sp-3); }
@@ -680,18 +743,33 @@ a:hover { text-decoration: underline; }
 
 /* ============================================================ contacts — directory + detail pane */
 .view:has(.con-page) { padding: 0; overflow: hidden; }
-.con-page { height: 100%; display: flex; flex-direction: column; background: var(--bg-0); min-height: 0; }
+/* transparent so the ambient constellation shows through the header/metric band;
+   the working panels (list + detail) below keep their own solid backgrounds */
+.con-page { height: 100%; display: flex; flex-direction: column; background: transparent; min-height: 0; }
 .con-page-head { display: flex; align-items: flex-start; gap: var(--sp-4); padding: var(--sp-4) var(--sp-5); border-bottom: 1px solid var(--line); }
 .con-toolbar { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--line); background: var(--bg-1); flex-wrap: wrap; }
 .con-toolbar .tb-search { max-width: 360px; }
-/* top metric row (5 real KPI cards) */
-.con-metrics-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--sp-3); padding: var(--sp-4) var(--sp-5); border-bottom: 1px solid var(--line); }
-.con-metric { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); }
-.con-metric .cm-ico { width: 40px; height: 40px; flex: none; border-radius: var(--r-md); display: grid; place-items: center;
-  background: var(--accent-soft); color: var(--accent); box-shadow: var(--hl-top); }
-.con-metric .cm-ico.ok { background: var(--ok-soft); color: var(--ok); }
-.con-metric .cm-ico.warn { background: var(--warn-soft); color: var(--warn); }
-.con-metric .cm-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em; }
+/* top metric row (5 real KPI cards). minmax(0,1fr) (not plain 1fr) lets the
+   columns shrink below their content width → the row never overflows the pane
+   on a narrow viewport (plain 1fr = minmax(auto,1fr) refuses to shrink → clip). */
+/* flex-wrap (not grid auto-fit): cards shrink to a 150px basis then wrap to a new
+   row — reflows reliably on resize without any breakpoint and never overflows. */
+.con-metrics-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5); border-bottom: 1px solid var(--line); }
+/* full-bleed band variant = the row leads the page (Mail/Contacts/OneNote) — keeps
+   the default band padding + divider. Inset variant sits inside the already-padded
+   .view (OneDrive/Calendar/ToDo) so it drops its own side padding + divider. */
+.con-metrics-row.inset { padding: 0; border-bottom: 0; margin-bottom: var(--sp-5); }
+/* thin right-aligned action strip for views without a toolbar (ToDo/OneNote) */
+.view-actions { display: flex; justify-content: flex-end; margin-bottom: var(--sp-4); }
+/* KPI cards in the top band are glassy → the constellation shimmers through them */
+.con-metrics-row .con-metric.card { background: color-mix(in oklab, var(--bg-1) 62%, transparent); backdrop-filter: blur(7px); -webkit-backdrop-filter: blur(7px); }
+.con-metric { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); flex: 1 1 150px; min-width: 0; }
+.con-metric .cm-ico { width: 42px; height: 42px; flex: none; border-radius: var(--r-full); display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 35%, transparent), 0 0 0 4px color-mix(in oklab, var(--accent) 8%, transparent); }
+.con-metric .cm-ico.ok { background: var(--ok-soft); color: var(--ok); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--ok) 35%, transparent), 0 0 0 4px color-mix(in oklab, var(--ok) 9%, transparent); }
+.con-metric .cm-ico.warn { background: var(--warn-soft); color: var(--warn); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--warn) 35%, transparent), 0 0 0 4px color-mix(in oklab, var(--warn) 9%, transparent); }
+.con-metric .cm-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .con-metric .cm-val { font-size: var(--fs-2xl); font-weight: 680; line-height: 1.1; letter-spacing: -.02em; color: var(--text-hi); }
 .con-metric .cm-val.ok { color: var(--ok); } .con-metric .cm-val.warn { color: var(--warn); }
 .con-metric .cm-sub { font-size: var(--fs-xs); margin-top: 1px; }
@@ -701,7 +779,7 @@ a:hover { text-decoration: underline; }
 .con-filter:last-child { border-right: 0; }
 .con-filter:hover { background: var(--bg-hover); color: var(--text-hi); }
 .con-filter.active { background: var(--accent-soft); color: var(--text-hi); }
-.con-layout { flex: 1; display: grid; grid-template-columns: minmax(300px, 380px) 1fr; min-height: 0; position: relative; }
+.con-layout { flex: 1; display: grid; grid-template-columns: minmax(0, 380px) 1fr; min-height: 0; position: relative; overflow: hidden; }
 .con-layout > * { min-height: 0; min-width: 0; }
 
 .crc-row { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xs); color: var(--text-mid); }
@@ -709,7 +787,11 @@ a:hover { text-decoration: underline; }
 
 /* directory list (middle) */
 .con-listwrap { position: relative; display: flex; border-right: 1px solid var(--line); background: var(--bg-0); overflow: hidden; }
-.con-list { flex: 1; overflow-y: auto; padding-bottom: var(--sp-4); }
+.con-list { flex: 1; overflow-y: auto; padding-bottom: var(--sp-4); position: relative; z-index: 1; }
+/* .con-flow-wave is the shared particle-stream wrapper (used by the mail empty
+   reader); the contacts-list flow motif was removed (it bled through the rows). */
+.con-flow-wave { position: absolute; inset: 0; }
+.con-flow-wave svg { width: 100%; height: 100%; }
 .con-sec { position: sticky; top: 0; z-index: 1; padding: var(--sp-2) var(--sp-4) 4px; font-size: var(--fs-xs); font-weight: 700;
   letter-spacing: .06em; color: var(--text-lo); background: color-mix(in oklab, var(--bg-0) 88%, transparent); backdrop-filter: blur(6px); }
 .con-row { display: flex; align-items: center; gap: var(--sp-3); width: 100%; text-align: left; color: var(--text-hi);
@@ -757,9 +839,15 @@ a:hover { text-decoration: underline; }
 .con-compliance.ok .cc-head { color: var(--ok); }
 .con-compliance.warn .cc-head { color: var(--warn); }
 .con-compliance.err .cc-head { color: var(--err); }
-.con-detail-body { padding: var(--sp-5); display: flex; gap: var(--sp-4); align-items: flex-start; }
-.con-col-main { flex: 1.5; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-4); }
-.con-col-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-4); }
+/* line-art vault motif in the top-right of the Archive card (matches mockup) */
+/* (removed .con-archive vault-deco — it read as a cut-off box, not a vault) */
+/* balanced masonry: JS packs cards into the shorter of two columns → both
+   columns end at near-even height, no empty-left / cut-off-right regardless of
+   how sparse or rich a contact is (CSS multicol balances poorly with few tall
+   unbreakable cards, so we distribute in JS — see masonryBalance) */
+/* clean 2-column grid, cards row-aligned to the top; Notes spans full width */
+.con-detail-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: var(--sp-4); padding: var(--sp-5); }
+.con-detail-body > .con-block-full { grid-column: 1 / -1; }
 /* structured cards inside the detail pane */
 .con-block { padding: 0; overflow: hidden; }
 .con-block-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4);
@@ -815,7 +903,7 @@ a:hover { text-decoration: underline; }
 .view:has(.note-page) { padding: 0; overflow: hidden; }
 .note-page { height: 100%; display: flex; flex-direction: column; min-height: 0; }
 .note-page-head { display: flex; align-items: flex-start; gap: var(--sp-4); padding: var(--sp-4) var(--sp-5); border-bottom: 1px solid var(--line); }
-.note-layout { flex: 1; display: grid; grid-template-columns: 300px 1fr; min-height: 0; }
+.note-layout { flex: 1; display: grid; grid-template-columns: minmax(0, 300px) 1fr; min-height: 0; overflow: hidden; }
 .note-layout > * { min-height: 0; min-width: 0; }
 .note-list { border-right: 1px solid var(--line); overflow-y: auto; background: color-mix(in oklab, var(--bg-1) 70%, transparent); }
 .note-item { display: flex; align-items: center; gap: var(--sp-3); width: 100%; text-align: left; border: 0;
@@ -856,10 +944,16 @@ a:hover { text-decoration: underline; }
   .sidebar {
     position: fixed; bottom: 0; left: 0; right: 0; top: auto; z-index: 60;
     flex-direction: row; height: 60px; padding: var(--sp-1) var(--sp-2);
-    border-right: 0; border-top: 1px solid var(--line-2); overflow: visible;
+    border-right: 0; border-top: 1px solid var(--line-2);
+    overflow-x: auto; overflow-y: hidden; gap: var(--sp-1);
     justify-content: space-around; align-items: center;
   }
-  .sidebar .brand, .sb-account, .sb-section, .spacer, .sync-widget { display: none; }
+  /* bottom bar shows only the primary service icons — hide the brand/account/
+     footer, the filter sub-nav, and the system nav (Settings is in the top-bar) */
+  .sidebar .brand, .sb-account, .sb-section, .spacer, .sync-widget,
+  .sidebar .nav-sub, .sidebar .sys-nav { display: none; }
+  .sidebar .nav { display: flex; flex-direction: row; gap: var(--sp-1); flex: 1; justify-content: space-around; }
+  .sidebar::before { display: none; }
   .nav-item { flex-direction: column; gap: 2px; padding: var(--sp-1); font-size: var(--fs-xs); }
   .nav-item .label { display: block; font-size: 10px; }
   .nav-item .count { display: none; }
@@ -894,13 +988,12 @@ a:hover { text-decoration: underline; }
   .note-layout { grid-template-columns: 1fr; }
   .note-list { max-height: 38vh; border-right: 0; border-bottom: 1px solid var(--line); }
 }
-/* contacts: drop the filter/insights rail, then the A–Z rail, as space tightens */
-/* metric row reflows as the content area narrows */
-@container (max-width: 1200px) { .con-metrics-row { grid-template-columns: repeat(3, 1fr); } }
-@container (max-width: 760px) { .con-metrics-row { grid-template-columns: repeat(2, 1fr); } }
+/* metric row auto-reflows via repeat(auto-fit, minmax(min(165px,100%),1fr)) — no
+   breakpoints needed, never overflows (min() clamps a lone column to 100%). */
+/* contacts: drop the A–Z rail as space tightens */
 @container (max-width: 900px) { .con-az { display: none; } }
 /* detail cards stack to a single column on a narrow detail pane */
-@container (max-width: 820px) { .con-detail-body { flex-direction: column; } .con-col-main, .con-col-side { width: 100%; } }
+@container (max-width: 820px) { .con-detail-body { grid-template-columns: 1fr; } }
 /* contacts phone-width: single pane; detail slides over the directory list */
 @container (max-width: 640px) {
   .con-layout { grid-template-columns: 1fr; }
