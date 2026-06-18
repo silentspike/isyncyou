@@ -243,9 +243,51 @@ pub trait VerifyHandler: Send + Sync {
     fn verify(&self, account: &str) -> Result<String, String>;
 }
 
+/// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
+/// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
+/// connection waits on a generation counter and streams a frame. Thread-safe and
+/// lock-cheap (one `Mutex<u64>` + `Condvar`), no per-subscriber state.
+#[derive(Default)]
+pub struct EventBus {
+    generation: std::sync::Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a change and wake every waiting SSE connection.
+    pub fn notify(&self) {
+        let mut g = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        *g = g.wrapping_add(1);
+        self.cv.notify_all();
+    }
+
+    /// Current generation — an SSE handler reads this once, then waits for it to move.
+    pub fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Block until the generation differs from `last` or `timeout` elapses; returns
+    /// the current generation. The timeout drives periodic SSE heartbeats.
+    pub fn wait_change(&self, last: u64, timeout: std::time::Duration) -> u64 {
+        let g = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, timeout, |cur| *cur == last)
+            .unwrap_or_else(|e| e.into_inner());
+        *g
+    }
+}
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
+    /// Optional change broadcaster for the SSE `/api/v1/events` stream (the
+    /// daemon's). `None` => the events endpoint reports no live push.
+    events: Option<std::sync::Arc<EventBus>>,
     /// Optional store-access gate, shared with a background syncer (the daemon's
     /// scheduler). When set, the whole request is serialized against the syncer so
     /// the per-request `Store::open` never races the single-instance file lock the
@@ -283,6 +325,7 @@ impl Router {
     pub fn new(config: Config) -> Self {
         Router {
             config,
+            events: None,
             gate: None,
             restore: None,
             restore_cap_token: None,
@@ -301,6 +344,7 @@ impl Router {
     pub fn with_gate(config: Config, gate: std::sync::Arc<std::sync::Mutex<()>>) -> Self {
         Router {
             config,
+            events: None,
             gate: Some(gate),
             restore: None,
             restore_cap_token: None,
@@ -363,6 +407,17 @@ impl Router {
     pub fn with_hydrations(mut self, hydrations: std::sync::Arc<dyn HydrationStatus>) -> Self {
         self.hydrations = Some(hydrations);
         self
+    }
+
+    /// Enable the SSE `/api/v1/events` change stream (builder style).
+    pub fn with_events(mut self, events: std::sync::Arc<EventBus>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// The injected SSE change bus, if any (used by the streaming server).
+    pub(crate) fn events_bus(&self) -> Option<&std::sync::Arc<EventBus>> {
+        self.events.as_ref()
     }
 
     /// Whether the request carries the configured capability token.
@@ -1071,7 +1126,7 @@ impl Router {
                 // external content (remote images + web fonts) is opt-in (the
                 // reader's "Load external content" button adds ?external=1) —
                 // default blocks it (tracking pixels + privacy)
-                let external = req.q("external").as_deref() == Some("1");
+                let external = req.q("external") == Some("1");
                 let inline_images: Vec<_> = html
                     .inline_images
                     .iter()
