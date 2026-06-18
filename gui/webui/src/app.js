@@ -259,6 +259,7 @@ const CAP = {
   sync: "__SYNC_CAP_TOKEN__",
   share: "__SHARE_CAP_TOKEN__",
   verify: "__VERIFY_CAP_TOKEN__",
+  settings: "__SETTINGS_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
@@ -1841,8 +1842,16 @@ function searchRow(h) {
 
 /* ---------------------------------------------------------------- settings */
 function kvList(rows) { const dl = el("dl", { class: "kv" }); rows.forEach(([k, v]) => dl.append(el("dt", { text: k }), el("dd", { text: v == null ? "—" : String(v) }))); return dl; }
+const POLL_STEPS = [1, 5, 10, 30, 60, 300, 900, 1800, 3600];
+const pollLabel = (s) => s < 60 ? s + "s" : (s / 60) + "min";
+function nearestPollStep(secs) {
+  let best = 0;
+  for (let i = 0; i < POLL_STEPS.length; i++)
+    if (Math.abs(POLL_STEPS[i] - secs) < Math.abs(POLL_STEPS[best] - secs)) best = i;
+  return best;
+}
 async function renderSettingsView(view) {
-  clear(view).append(el("h1", { class: "view-title", text: "Settings" }), el("p", { class: "view-sub", text: "Configuration and sync controls (read-only)." }));
+  clear(view).append(el("h1", { class: "view-title", text: "Settings" }), el("p", { class: "view-sub", text: "Configuration, sync controls, and the live-update interval." }));
   const body = el("div", { class: "grid", style: "max-width:720px" }); view.append(body);
   body.append(el("div", { class: "card" }, el("div", { class: "spinner" })));
   try {
@@ -1856,6 +1865,30 @@ async function renderSettingsView(view) {
     if (st.enabled && CAP.sync) syncCard.append(el("div", { style: "display:flex;gap:8px;margin-top:12px" },
       el("button", { class: "btn", onclick: () => syncCmd("now") }, icon("refresh-cw", "icon-sm"), "Sync now"),
       st.paused ? el("button", { class: "btn", onclick: () => syncCmd("resume") }, icon("play", "icon-sm"), "Resume") : el("button", { class: "btn", onclick: () => syncCmd("pause") }, icon("pause", "icon-sm"), "Pause")));
+    // live-update interval slider (log scale) — writable when the daemon enables it
+    if (CAP.settings) {
+      let idx = nearestPollStep(sy.poll_interval_secs || 5);
+      const valLabel = el("span", { class: "tnum", style: "font-weight:700", text: pollLabel(POLL_STEPS[idx]) });
+      const warn = el("div", { class: "dim", style: "font-size:12px;min-height:16px;color:var(--warn)" });
+      const setWarn = (s) => { warn.textContent = s < 5 ? "very frequent — Microsoft may throttle; backoff still applies" : ""; };
+      setWarn(POLL_STEPS[idx]);
+      const slider = el("input", {
+        type: "range", class: "poll-slider", min: "0", max: String(POLL_STEPS.length - 1), step: "1", value: String(idx),
+        oninput: (e) => { const s = POLL_STEPS[+e.target.value]; valLabel.textContent = pollLabel(s); setWarn(s); },
+        onchange: async (e) => {
+          const s = POLL_STEPS[+e.target.value];
+          try { await post("/api/v1/settings?" + qs({ poll_interval_secs: s }), CAP.settings); toast("Live-update interval: " + pollLabel(s)); }
+          catch (err) { toast("Could not save interval: " + err.message, "err"); }
+        },
+      });
+      syncCard.append(el("div", { style: "margin-top:16px" },
+        el("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:6px" },
+          el("span", { class: "dim", style: "font-size:12px", text: "Live-update interval (how often the cloud is polled)" }), valLabel),
+        slider,
+        el("div", { style: "display:flex;justify-content:space-between;font-size:11px", class: "dim" },
+          el("span", { text: "1s" }), el("span", { text: "60min" })),
+        warn));
+    }
     body.append(syncCard);
     body.append(el("div", { class: "card", style: "display:flex;align-items:center;gap:16px" }, logoGlyph(48),
       el("div", {}, el("div", { style: "font-size:16px;font-weight:700", html: "iSync<span style='background:var(--grad-accent);-webkit-background-clip:text;background-clip:text;color:transparent'>You</span>" }),
@@ -1941,7 +1974,14 @@ function openPalette() {
 function closePalette() { if (palette) { palette.remove(); palette = null; } }
 
 /* ---------------------------------------------------------------- init */
-let _bdT;
+let _bdT, _evtT;
+// Subscribe to the daemon's SSE change stream: on a cloud/sync change, refetch the
+// active view (near-real-time). EventSource auto-reconnects if the daemon restarts.
+function subscribeEvents() {
+  if (!window.EventSource) return;
+  const es = new EventSource("/api/v1/events");
+  es.addEventListener("change", () => { clearTimeout(_evtT); _evtT = setTimeout(onRoute, 150); });
+}
 async function init() {
   document.body.append(el("div", { id: "toasts", class: "toasts" }));
   paintBackdrop();
@@ -1957,5 +1997,6 @@ async function init() {
     if (App.accounts.length) App.account = App.accounts[0].id;
   } catch {}
   onRoute();
+  subscribeEvents();
 }
 init();

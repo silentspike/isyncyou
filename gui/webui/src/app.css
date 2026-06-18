@@ -1010,3 +1010,6 @@ a:hover { text-decoration: underline; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
+
+/* poll-interval slider (Settings) — accent-tinted, full width */
+.poll-slider { width: 100%; accent-color: var(--accent); height: 22px; cursor: pointer; }
