@@ -243,6 +243,15 @@ pub trait VerifyHandler: Send + Sync {
     fn verify(&self, account: &str) -> Result<String, String>;
 }
 
+/// Persists mutable sync settings from the UI (currently the cloud-poll interval)
+/// and applies them to the running daemon. Injected by the daemon; the read-only
+/// CLI `serve` does not set it, so the settings POST is refused there.
+pub trait SettingsHandler: Send + Sync {
+    /// Set the active cloud-poll interval (seconds); the impl clamps to a sane
+    /// range, updates the live value, and persists it to the config file.
+    fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -319,6 +328,11 @@ pub struct Router {
     verify: Option<std::sync::Arc<dyn VerifyHandler>>,
     /// Separate capability token for verify POSTs.
     verify_cap_token: Option<String>,
+    /// Optional mutable-settings handler (the daemon's). `None` => the settings
+    /// POST is refused (the read-only CLI `serve`).
+    settings_handler: Option<std::sync::Arc<dyn SettingsHandler>>,
+    /// Separate capability token for settings POSTs.
+    settings_cap_token: Option<String>,
 }
 
 impl Router {
@@ -336,6 +350,8 @@ impl Router {
             hydrations: None,
             verify: None,
             verify_cap_token: None,
+            settings_handler: None,
+            settings_cap_token: None,
         }
     }
 
@@ -355,6 +371,8 @@ impl Router {
             hydrations: None,
             verify: None,
             verify_cap_token: None,
+            settings_handler: None,
+            settings_cap_token: None,
         }
     }
 
@@ -420,6 +438,17 @@ impl Router {
         self.events.as_ref()
     }
 
+    /// Enable the mutable-settings POST, guarded by `cap_token` (builder style).
+    pub fn with_settings(
+        mut self,
+        handler: std::sync::Arc<dyn SettingsHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.settings_handler = Some(handler);
+        self.settings_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token.
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
         matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
@@ -462,6 +491,7 @@ impl Router {
                 "/api/v1/sync/resume" => self.sync_command(req, |c| c.resume()),
                 "/api/v1/sync/now" => self.sync_command(req, |c| c.trigger()),
                 "/api/v1/verify" => self.verify_run(req),
+                "/api/v1/settings" => self.update_settings(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -492,6 +522,10 @@ impl Router {
                     .replace(
                         "__VERIFY_CAP_TOKEN__",
                         self.verify_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__SETTINGS_CAP_TOKEN__",
+                        self.settings_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -524,6 +558,31 @@ impl Router {
             "/api/v1/sync/state" => self.sync_state(),
             "/api/v1/hydrations" => self.hydrations_state(),
             _ => ApiResponse::error(404, "not found"),
+        }
+    }
+
+    /// `POST /api/v1/settings?poll_interval_secs=N` — persist + apply a mutable
+    /// sync setting. Requires the capability token; the work is the injected handler.
+    fn update_settings(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.settings_handler {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "settings are not editable on this server"),
+        };
+        if !Self::cap_ok(&self.settings_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let secs = match req
+            .q("poll_interval_secs")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(s) if (1..=3600).contains(&s) => s,
+            _ => {
+                return ApiResponse::error(400, "poll_interval_secs must be an integer in 1..=3600")
+            }
+        };
+        match handler.set_poll_interval_secs(secs) {
+            Ok(()) => ApiResponse::ok_json(&serde_json::json!({ "poll_interval_secs": secs })),
+            Err(e) => ApiResponse::error(500, &format!("settings: {e}")),
         }
     }
 
@@ -1454,6 +1513,47 @@ mod tests {
         let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
             .with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&bad).status, 400);
+    }
+
+    struct OkSettings(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl SettingsHandler for OkSettings {
+        fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String> {
+            self.0.store(secs, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn settings_post_requires_cap_token_and_validates_interval() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_d, router) = setup();
+        // read-only router (no handler injected) refuses the settings POST
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", "/api/v1/settings?poll_interval_secs=10"))
+                .status,
+            404
+        );
+        let seen = std::sync::Arc::new(AtomicU64::new(0));
+        let router = router.with_settings(std::sync::Arc::new(OkSettings(seen.clone())), "secret".into());
+        let q = "/api/v1/settings?poll_interval_secs=10";
+        // no / wrong token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // valid token but out-of-range value -> 400, handler not called
+        let oob = ApiRequest::new("POST", "/api/v1/settings?poll_interval_secs=99999")
+            .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&oob).status, 400);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        // valid token + valid value -> 200, handler applied
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(ok.status, 200);
+        assert_eq!(seen.load(Ordering::SeqCst), 10);
     }
 
     struct OkVerify;
