@@ -124,13 +124,17 @@ pub mod auth {
     /// Public client app registration for read/backup scopes.
     pub const READ_CLIENT: &str = "cee80dd9-c13e-4dbb-9d4c-73eb4987d447";
     /// Delegated read scopes (User.Read lets `setup` confirm the identity).
+    /// `MailboxSettings.Read` covers mailbox config + inbox rules; `People.Read`
+    /// covers the relevance-ranked people surface (both consumer-available).
     pub const READ_SCOPES: &[&str] = &[
         "Files.Read",
         "Mail.Read",
+        "MailboxSettings.Read",
         "Calendars.Read",
         "Contacts.Read",
         "Tasks.Read",
         "Notes.Read",
+        "People.Read",
         "User.Read",
         "offline_access",
     ];
@@ -197,6 +201,7 @@ pub mod auth {
         "Files.ReadWrite",
         "Mail.ReadWrite",
         "Mail.Send",
+        "MailboxSettings.ReadWrite",
         "Calendars.ReadWrite",
         "Contacts.ReadWrite",
         "Tasks.ReadWrite",
@@ -641,6 +646,32 @@ mod tests {
             !auth::RESTORE_SCOPES.contains(&"Notes.ReadWrite.All"),
             "Personal/Family accounts cannot grant Notes.ReadWrite.All"
         );
+    }
+
+    #[test]
+    fn scopes_cover_mailbox_settings_and_people_without_all_variants() {
+        // #558 live-client foundation: read needs mailbox config + people;
+        // write (restore + live ops) needs MailboxSettings.ReadWrite.
+        assert!(
+            auth::READ_SCOPES.contains(&"MailboxSettings.Read"),
+            "read must cover mailbox settings + inbox rules"
+        );
+        assert!(
+            auth::READ_SCOPES.contains(&"People.Read"),
+            "read must cover the people surface"
+        );
+        assert!(
+            auth::RESTORE_SCOPES.contains(&"MailboxSettings.ReadWrite"),
+            "live write must cover mailbox settings"
+        );
+        // Personal/Family MSA cannot grant any admin-only `.All` scope.
+        for s in auth::READ_SCOPES
+            .iter()
+            .chain(auth::SYNC_SCOPES.iter())
+            .chain(auth::RESTORE_SCOPES.iter())
+        {
+            assert!(!s.ends_with(".All"), "personal/family cannot grant {s}");
+        }
     }
 
     #[test]
