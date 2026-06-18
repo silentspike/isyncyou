@@ -14,6 +14,7 @@ use isyncyou_core::Config;
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::Store;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -259,6 +260,17 @@ fn run(args: &Args) -> Result<(), String> {
     let verify_cap_token = mint_cap_token();
     let verify_handler: Arc<dyn isyncyou_webui::VerifyHandler> =
         Arc::new(DaemonVerify { cfg: cfg.clone() });
+    // Live cloud-poll interval (#559): seeded from config, adjusted live by the
+    // settings POST, read by the sync loop each tick.
+    let live_interval = Arc::new(AtomicU64::new(cfg.sync.poll_interval_secs.max(1)));
+    let settings_cap_token = mint_cap_token();
+    let settings_handler: Arc<dyn isyncyou_webui::SettingsHandler> = Arc::new(DaemonSettings {
+        config_path: args.config.clone(),
+        live_interval: live_interval.clone(),
+    });
+    // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
+    // subscribes at /api/v1/events and refetches the active view.
+    let events = Arc::new(isyncyou_webui::EventBus::new());
     eprintln!("isyncyoud: restore + sharing + verify enabled; capability token: {cap_token}");
 
     let mut router = if args.sync_secs > 0 {
@@ -268,7 +280,9 @@ fn run(args: &Args) -> Result<(), String> {
     }
     .with_restore(handler, cap_token.clone())
     .with_share(share_handler, share_cap_token)
-    .with_verify(verify_handler, verify_cap_token);
+    .with_verify(verify_handler, verify_cap_token)
+    .with_settings(settings_handler, settings_cap_token)
+    .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
     #[cfg(target_os = "linux")]
@@ -279,9 +293,11 @@ fn run(args: &Args) -> Result<(), String> {
 
     // When scheduled sync runs, share a Scheduler so the UI can pause/resume/now.
     if args.sync_secs > 0 {
-        let secs = args.sync_secs;
         let sched = Arc::new(Scheduler::default());
-        eprintln!("isyncyoud: background sync every {secs}s (pausable from the UI)");
+        eprintln!(
+            "isyncyoud: cloud-poll sync enabled, interval {}s (live-adjustable from the UI)",
+            live_interval.load(Ordering::Relaxed)
+        );
         // Event-driven accelerator (#331): one change-source watcher per account
         // wakes this sync loop early on local changes (honoring
         // `cfg.sync.change_source` — inotify by default, the privileged mount-wide
@@ -293,7 +309,8 @@ fn run(args: &Args) -> Result<(), String> {
             move || watch_loop(cfg_w, sched_w)
         });
         let (cfg2, gate2, sched2) = (cfg, gate, sched.clone());
-        std::thread::spawn(move || sync_loop(cfg2, gate2, secs, sched2));
+        let (interval2, events2) = (live_interval.clone(), events.clone());
+        std::thread::spawn(move || sync_loop(cfg2, gate2, interval2, sched2, events2));
         router = router.with_sync_control(sched, cap_token);
     }
 
@@ -361,6 +378,24 @@ struct DaemonVerify {
 impl isyncyou_webui::VerifyHandler for DaemonVerify {
     fn verify(&self, account: &str) -> Result<String, String> {
         isyncyou_engine::verify_account(&self.cfg, account).map(|r| r.summary())
+    }
+}
+
+/// Web-UI mutable settings (#559): persist the cloud-poll interval to the config
+/// file AND update the live value the sync loop reads, so a change takes effect
+/// without a daemon restart.
+struct DaemonSettings {
+    config_path: PathBuf,
+    live_interval: Arc<AtomicU64>,
+}
+impl isyncyou_webui::SettingsHandler for DaemonSettings {
+    fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String> {
+        let secs = secs.clamp(1, 3600);
+        // apply to the running loop immediately, then persist for the next start
+        self.live_interval.store(secs, Ordering::Relaxed);
+        let mut cfg = Config::load(&self.config_path)?;
+        cfg.sync.poll_interval_secs = secs;
+        cfg.save(&self.config_path)
     }
 }
 
@@ -665,12 +700,24 @@ fn recover_pending_restores(cfg: &Config) {
     }
 }
 
-/// Forever: wait up to `secs` (or until the UI triggers/pauses), then run one sync
-/// pass per account unless paused. An explicit `now` trigger always runs. A pass
-/// that errors (no cached token, a network blip) is logged and never kills the loop.
-fn sync_loop(cfg: Config, gate: Arc<Mutex<()>>, secs: u64, sched: Arc<Scheduler>) {
+/// Forever: wait up to the live cloud-poll interval (or until the UI triggers/
+/// pauses), then run one sync pass per account unless paused. The interval is read
+/// from `interval` each tick, so the UI's settings slider takes effect on the next
+/// wait without a restart (`429`/`Retry-After` backoff is handled inside the Graph
+/// client's retry). After a pass that ran, `events` is notified so SSE subscribers
+/// refetch. An explicit `now` trigger always runs. A pass that errors (no cached
+/// token, a network blip) is logged and never kills the loop.
+fn sync_loop(
+    cfg: Config,
+    gate: Arc<Mutex<()>>,
+    interval: Arc<AtomicU64>,
+    sched: Arc<Scheduler>,
+    events: Arc<isyncyou_webui::EventBus>,
+) {
     let host = local_host();
     loop {
+        // read the live interval each tick so a UI slider change applies promptly
+        let secs = interval.load(Ordering::Relaxed).max(1);
         // wait for the interval to elapse OR an explicit trigger to arrive
         let run = {
             let guard = sched.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -692,6 +739,8 @@ fn sync_loop(cfg: Config, gate: Arc<Mutex<()>>, secs: u64, sched: Arc<Scheduler>
                 Err(e) => eprintln!("isyncyoud: sync {} skipped: {e}", acc.id),
             }
         }
+        // wake SSE subscribers so the UI refetches the active view (near-real-time)
+        events.notify();
     }
 }
 
@@ -1397,6 +1446,31 @@ mod tests {
         assert_eq!(c3.matches("<bookmark ").count(), 2);
         assert!(c3.contains("href=\"file:///home/u/OneDrive\""));
         assert!(c3.contains("href=\"file:///home/u/OneDrive-Work\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_settings_persists_and_applies_poll_interval() {
+        use isyncyou_webui::SettingsHandler;
+        let dir = std::env::temp_dir().join(format!("isy-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("isyncyou.toml");
+        Config::default().save(&path).unwrap();
+
+        let live = Arc::new(AtomicU64::new(5));
+        let h = DaemonSettings {
+            config_path: path.clone(),
+            live_interval: live.clone(),
+        };
+        // applies to the live value immediately AND persists to the config file
+        h.set_poll_interval_secs(42).unwrap();
+        assert_eq!(live.load(Ordering::Relaxed), 42);
+        assert_eq!(Config::load(&path).unwrap().sync.poll_interval_secs, 42);
+        // out-of-range is clamped (1..=3600)
+        h.set_poll_interval_secs(99_999).unwrap();
+        assert_eq!(live.load(Ordering::Relaxed), 3600);
+        assert_eq!(Config::load(&path).unwrap().sync.poll_interval_secs, 3600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
