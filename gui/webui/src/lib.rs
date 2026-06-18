@@ -1530,12 +1530,18 @@ mod tests {
         // read-only router (no handler injected) refuses the settings POST
         assert_eq!(
             router
-                .route(&ApiRequest::new("POST", "/api/v1/settings?poll_interval_secs=10"))
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/settings?poll_interval_secs=10"
+                ))
                 .status,
             404
         );
         let seen = std::sync::Arc::new(AtomicU64::new(0));
-        let router = router.with_settings(std::sync::Arc::new(OkSettings(seen.clone())), "secret".into());
+        let router = router.with_settings(
+            std::sync::Arc::new(OkSettings(seen.clone())),
+            "secret".into(),
+        );
         let q = "/api/v1/settings?poll_interval_secs=10";
         // no / wrong token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);

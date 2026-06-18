@@ -867,12 +867,18 @@ mod tests {
 <script>steal()</script>";
         let clean = sanitize_mail_html(dirty);
         assert!(clean.contains("<style>"), "<style> block dropped: {clean}");
-        assert!(clean.contains(".x{color:red}"), "css content dropped: {clean}");
+        assert!(
+            clean.contains(".x{color:red}"),
+            "css content dropped: {clean}"
+        );
         assert!(
             clean.contains("style=\"width:600px;background:#fff\""),
             "inline style dropped: {clean}"
         );
-        assert!(clean.contains("padding:12px"), "inline style dropped: {clean}");
+        assert!(
+            clean.contains("padding:12px"),
+            "inline style dropped: {clean}"
+        );
         assert!(!clean.contains("steal"), "script survived: {clean}");
     }
 
@@ -881,9 +887,15 @@ mod tests {
         let html = "<p><img src=\"https://cdn.example/hero.png\"></p>";
         // default: stripped + strict CSP (no remote images, no remote fonts)
         let off = mail_page_with_inline_images("S", html, &[], false);
-        assert!(!off.contains("https://cdn.example"), "remote img leaked: {off}");
+        assert!(
+            !off.contains("https://cdn.example"),
+            "remote img leaked: {off}"
+        );
         assert!(off.contains("img-src data:;"), "strict CSP missing: {off}");
-        assert!(!off.contains("font-src https:"), "fonts should be blocked by default: {off}");
+        assert!(
+            !off.contains("font-src https:"),
+            "fonts should be blocked by default: {off}"
+        );
         // opted in: src survives + relaxed CSP allows https images AND web fonts
         let on = mail_page_with_inline_images("S", html, &[], true);
         assert!(
@@ -899,12 +911,8 @@ mod tests {
             "relaxed font CSP missing: {on}"
         );
         // links are still routed through the dialog regardless of the image opt-in
-        let links = mail_page_with_inline_images(
-            "S",
-            "<a href=\"https://evil.test/x\">go</a>",
-            &[],
-            true,
-        );
+        let links =
+            mail_page_with_inline_images("S", "<a href=\"https://evil.test/x\">go</a>", &[], true);
         assert!(
             !links.contains("href=\"https://evil.test"),
             "direct external href survived even with images on: {links}"

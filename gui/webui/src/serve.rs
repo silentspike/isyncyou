@@ -17,10 +17,10 @@
 use crate::{ApiRequest, ApiResponse, EventBus, Router};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Hard cap on concurrent connection threads (safety against runaway opens on a
 /// loopback-only server). SSE streams count against this, so it is generous.
@@ -263,7 +263,8 @@ fn handle_sse<S: Conn>(stream: &mut S, bus: &EventBus) -> std::io::Result<()> {
         let g = bus.wait_change(last, std::time::Duration::from_secs(15));
         if g != last {
             last = g;
-            stream.write_all(format!("event: change\ndata: {{\"generation\":{g}}}\n\n").as_bytes())?;
+            stream
+                .write_all(format!("event: change\ndata: {{\"generation\":{g}}}\n\n").as_bytes())?;
         } else {
             stream.write_all(b": keep-alive\n\n")?; // heartbeat
         }
@@ -292,11 +293,7 @@ pub fn serve(addr: &str, router: Router) -> std::io::Result<()> {
 
 /// Handle one accepted connection on its own thread (so a long-lived SSE stream
 /// never blocks other requests), capped at [`MAX_CONNS`] concurrent threads.
-fn spawn_conn<S: Conn + Send + 'static>(
-    mut stream: S,
-    router: Arc<Router>,
-    policy: AccessPolicy,
-) {
+fn spawn_conn<S: Conn + Send + 'static>(mut stream: S, router: Arc<Router>, policy: AccessPolicy) {
     // fetch_add returns the previous count; refuse past the cap.
     if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
         ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
@@ -524,7 +521,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                spawn_conn(stream.unwrap(), Arc::clone(&router), AccessPolicy::TcpLoopback);
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
             }
         });
         // open the long-lived SSE stream
@@ -579,6 +580,9 @@ mod tests {
         // The local-access policy runs before the SSE branch, so /api/v1/events is
         // guarded by the same loopback rule as every other path.
         let resp = one_tcp_response(b"GET /api/v1/events HTTP/1.1\r\nHost: example.com\r\n\r\n");
-        assert!(resp.starts_with("HTTP/1.1 403 Forbidden\r\n"), "got: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "got: {resp}"
+        );
     }
 }
