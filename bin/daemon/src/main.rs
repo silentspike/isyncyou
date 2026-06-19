@@ -268,6 +268,11 @@ fn run(args: &Args) -> Result<(), String> {
         config_path: args.config.clone(),
         live_interval: live_interval.clone(),
     });
+    // A separate token gates the live-mail write POSTs (#561) — these send/modify
+    // real mail, so a distinct token keeps the blast radius small.
+    let mail_write_cap_token = mint_cap_token();
+    let mail_write_handler: Arc<dyn isyncyou_webui::MailWriteHandler> =
+        Arc::new(DaemonMailWrite { cfg: cfg.clone() });
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
@@ -282,6 +287,7 @@ fn run(args: &Args) -> Result<(), String> {
     .with_share(share_handler, share_cap_token)
     .with_verify(verify_handler, verify_cap_token)
     .with_settings(settings_handler, settings_cap_token)
+    .with_mail_write(mail_write_handler, mail_write_cap_token)
     .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
@@ -396,6 +402,89 @@ impl isyncyou_webui::SettingsHandler for DaemonSettings {
         let mut cfg = Config::load(&self.config_path)?;
         cfg.sync.poll_interval_secs = secs;
         cfg.save(&self.config_path)
+    }
+}
+
+/// Web-UI live-mail write (#561): each verb resolves the full write token
+/// (`Mail.ReadWrite` + `Mail.Send`) from the cached `login --write` and pushes the
+/// change to Microsoft 365 via the engine `MailWriter`. Trait calls are fully
+/// qualified so they hit the engine layer, never the inherent `GraphClient`
+/// methods that share their names. The UI for these lands in #563.
+struct DaemonMailWrite {
+    cfg: Config,
+}
+impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
+    fn send(
+        &self,
+        account: &str,
+        subject: &str,
+        body_html: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::send_new(&w, subject, body_html, to, cc, bcc)
+    }
+    fn reply(
+        &self,
+        account: &str,
+        message_id: &str,
+        comment: &str,
+        all: bool,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::reply(&w, message_id, comment, all)
+    }
+    fn forward(
+        &self,
+        account: &str,
+        message_id: &str,
+        comment: &str,
+        to: &[String],
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::forward(&w, message_id, comment, to)
+    }
+    fn move_to(
+        &self,
+        account: &str,
+        message_id: &str,
+        destination_id: &str,
+    ) -> Result<String, String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::move_to(&w, message_id, destination_id)
+    }
+    fn set_read(&self, account: &str, message_id: &str, is_read: bool) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::set_read(&w, message_id, is_read)
+    }
+    fn set_flag(&self, account: &str, message_id: &str, flag_status: &str) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::set_flag(&w, message_id, flag_status)
+    }
+    fn set_categories(
+        &self,
+        account: &str,
+        message_id: &str,
+        categories: &[String],
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::set_categories(&w, message_id, categories)
+    }
+    fn create_draft(
+        &self,
+        account: &str,
+        subject: &str,
+        body_html: &str,
+        to: &[String],
+    ) -> Result<String, String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::create_draft(&w, subject, body_html, to)
+    }
+    fn send_draft(&self, account: &str, message_id: &str) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::send_draft(&w, message_id)
     }
 }
 

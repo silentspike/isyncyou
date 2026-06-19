@@ -260,6 +260,7 @@ const CAP = {
   share: "__SHARE_CAP_TOKEN__",
   verify: "__VERIFY_CAP_TOKEN__",
   settings: "__SETTINGS_CAP_TOKEN__",
+  mailwrite: "__MAILWRITE_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {

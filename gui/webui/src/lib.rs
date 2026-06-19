@@ -252,6 +252,68 @@ pub trait SettingsHandler: Send + Sync {
     fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String>;
 }
 
+/// Performs the live-mail **write** verbs on behalf of a cap-token POST (#561).
+/// Injected by the daemon (which owns the engine + the full write token); the
+/// read-only CLI `serve` does not set it, so every `/api/v1/mail/*` POST is
+/// refused there. The web UI for these verbs lands in #563 — this trait + the
+/// endpoints are the backend they build on.
+pub trait MailWriteHandler: Send + Sync {
+    /// Compose and send a new message (saved to Sent Items).
+    fn send(
+        &self,
+        account: &str,
+        subject: &str,
+        body_html: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+    ) -> Result<(), String>;
+    /// Reply to the sender (`all = false`) or all recipients (`all = true`).
+    fn reply(
+        &self,
+        account: &str,
+        message_id: &str,
+        comment: &str,
+        all: bool,
+    ) -> Result<(), String>;
+    /// Forward a message to new recipients with an optional comment.
+    fn forward(
+        &self,
+        account: &str,
+        message_id: &str,
+        comment: &str,
+        to: &[String],
+    ) -> Result<(), String>;
+    /// Move a message to another folder; returns its new id.
+    fn move_to(
+        &self,
+        account: &str,
+        message_id: &str,
+        destination_id: &str,
+    ) -> Result<String, String>;
+    /// Mark a message read/unread.
+    fn set_read(&self, account: &str, message_id: &str, is_read: bool) -> Result<(), String>;
+    /// Set/clear a follow-up flag (`notFlagged` / `flagged` / `complete`).
+    fn set_flag(&self, account: &str, message_id: &str, flag_status: &str) -> Result<(), String>;
+    /// Replace a message's categories.
+    fn set_categories(
+        &self,
+        account: &str,
+        message_id: &str,
+        categories: &[String],
+    ) -> Result<(), String>;
+    /// Create a draft; returns the new draft's id.
+    fn create_draft(
+        &self,
+        account: &str,
+        subject: &str,
+        body_html: &str,
+        to: &[String],
+    ) -> Result<String, String>;
+    /// Send an existing draft by id.
+    fn send_draft(&self, account: &str, message_id: &str) -> Result<(), String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -333,6 +395,12 @@ pub struct Router {
     settings_handler: Option<std::sync::Arc<dyn SettingsHandler>>,
     /// Separate capability token for settings POSTs.
     settings_cap_token: Option<String>,
+    /// Optional live-mail write handler (the daemon's). `None` => every
+    /// `/api/v1/mail/*` POST is refused (the read-only CLI `serve`).
+    mail_write: Option<std::sync::Arc<dyn MailWriteHandler>>,
+    /// Separate capability token for mail-write POSTs (distinct blast radius —
+    /// these send/modify real mail).
+    mail_write_cap_token: Option<String>,
 }
 
 impl Router {
@@ -352,6 +420,8 @@ impl Router {
             verify_cap_token: None,
             settings_handler: None,
             settings_cap_token: None,
+            mail_write: None,
+            mail_write_cap_token: None,
         }
     }
 
@@ -373,6 +443,8 @@ impl Router {
             verify_cap_token: None,
             settings_handler: None,
             settings_cap_token: None,
+            mail_write: None,
+            mail_write_cap_token: None,
         }
     }
 
@@ -449,6 +521,19 @@ impl Router {
         self
     }
 
+    /// Enable the live-mail write POSTs (`/api/v1/mail/*`), guarded by `cap_token`
+    /// (builder style). Injected by the daemon; the read-only `serve` leaves it
+    /// unset so those POSTs 404.
+    pub fn with_mail_write(
+        mut self,
+        handler: std::sync::Arc<dyn MailWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.mail_write = Some(handler);
+        self.mail_write_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token.
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
         matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
@@ -492,6 +577,14 @@ impl Router {
                 "/api/v1/sync/now" => self.sync_command(req, |c| c.trigger()),
                 "/api/v1/verify" => self.verify_run(req),
                 "/api/v1/settings" => self.update_settings(req),
+                "/api/v1/mail/send" => self.mail_send(req),
+                "/api/v1/mail/reply" => self.mail_reply(req),
+                "/api/v1/mail/forward" => self.mail_forward(req),
+                "/api/v1/mail/move" => self.mail_move(req),
+                "/api/v1/mail/read" => self.mail_read(req),
+                "/api/v1/mail/flag" => self.mail_flag(req),
+                "/api/v1/mail/categories" => self.mail_categories(req),
+                "/api/v1/mail/draft" => self.mail_draft(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -526,6 +619,10 @@ impl Router {
                     .replace(
                         "__SETTINGS_CAP_TOKEN__",
                         self.settings_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__MAILWRITE_CAP_TOKEN__",
+                        self.mail_write_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -583,6 +680,254 @@ impl Router {
         match handler.set_poll_interval_secs(secs) {
             Ok(()) => ApiResponse::ok_json(&serde_json::json!({ "poll_interval_secs": secs })),
             Err(e) => ApiResponse::error(500, &format!("settings: {e}")),
+        }
+    }
+
+    // ---- live-mail write endpoints (#561; UI is #563) -----------------------
+    //
+    // All `/api/v1/mail/*` POSTs share one gate (handler injected + cap token) and
+    // carry their params in the (percent-encoded) query string, like every other
+    // POST here. Each mutation is audited so the intent survives a mid-flight crash.
+
+    /// The shared gate: the handler must be injected (else 404 on the read-only
+    /// server) and the request must carry the mail-write capability token (else 401).
+    fn mail_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn MailWriteHandler>, ApiResponse> {
+        let h = self
+            .mail_write
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "mail write is not enabled on this server"))?;
+        if !Self::cap_ok(&self.mail_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Parse a recipient list param: comma/space/semicolon-separated, trimmed.
+    fn addr_list(raw: Option<&str>) -> Vec<String> {
+        raw.unwrap_or("")
+            .split([',', ' ', ';'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Audit + map a unit mail result to a response.
+    fn mail_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:mail", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(account, "audit:mail", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let to = Self::addr_list(req.q("to"));
+        if to.is_empty() {
+            return ApiResponse::error(400, "at least one recipient (to) is required");
+        }
+        let (cc, bcc) = (Self::addr_list(req.q("cc")), Self::addr_list(req.q("bcc")));
+        let r = h.send(
+            account,
+            req.q("subject").unwrap_or(""),
+            req.q("body").unwrap_or(""),
+            &to,
+            &cc,
+            &bcc,
+        );
+        self.mail_result(account, &format!("send to={}", to.len()), r)
+    }
+
+    fn mail_reply(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let all = req.q("all") == Some("1");
+        let r = h.reply(account, id, req.q("comment").unwrap_or(""), all);
+        self.mail_result(account, &format!("reply id={id} all={all}"), r)
+    }
+
+    fn mail_forward(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let to = Self::addr_list(req.q("to"));
+        if to.is_empty() {
+            return ApiResponse::error(400, "at least one recipient (to) is required");
+        }
+        let r = h.forward(account, id, req.q("comment").unwrap_or(""), &to);
+        self.mail_result(account, &format!("forward id={id} to={}", to.len()), r)
+    }
+
+    fn mail_move(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, dest) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("destination").filter(|d| !d.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(d)) => (a, i, d),
+            _ => return ApiResponse::error(400, "account, id and destination are required"),
+        };
+        match h.move_to(account, id, dest) {
+            Ok(new_id) => {
+                let _ = self.audit_account(account, "audit:mail", "ok", &format!("move id={id}"));
+                ApiResponse::ok_json(&json!({ "moved": id, "new_id": new_id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:mail",
+                    "error",
+                    &format!("move id={id}: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn mail_read(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let is_read = req.q("is_read") != Some("0");
+        let r = h.set_read(account, id, is_read);
+        self.mail_result(account, &format!("set_read id={id} is_read={is_read}"), r)
+    }
+
+    fn mail_flag(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let status = req
+            .q("status")
+            .filter(|s| !s.is_empty())
+            .unwrap_or("flagged");
+        if !["notFlagged", "flagged", "complete"].contains(&status) {
+            return ApiResponse::error(400, "status must be notFlagged|flagged|complete");
+        }
+        let r = h.set_flag(account, id, status);
+        self.mail_result(account, &format!("set_flag id={id} status={status}"), r)
+    }
+
+    fn mail_categories(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        // empty categories param clears the categories (a valid operation)
+        let cats: Vec<String> = req
+            .q("categories")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        let r = h.set_categories(account, id, &cats);
+        self.mail_result(
+            account,
+            &format!("set_categories id={id} n={}", cats.len()),
+            r,
+        )
+    }
+
+    /// `POST /api/v1/mail/draft` — create a draft (no `id`) or send an existing
+    /// draft (`id` present). One endpoint covers both draft verbs.
+    fn mail_draft(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        if let Some(id) = req.q("id").filter(|i| !i.is_empty()) {
+            let r = h.send_draft(account, id);
+            return self.mail_result(account, &format!("send_draft id={id}"), r);
+        }
+        let to = Self::addr_list(req.q("to"));
+        match h.create_draft(
+            account,
+            req.q("subject").unwrap_or(""),
+            req.q("body").unwrap_or(""),
+            &to,
+        ) {
+            Ok(draft_id) => {
+                let _ = self.audit_account(account, "audit:mail", "ok", "create_draft");
+                ApiResponse::ok_json(&json!({ "draft_id": draft_id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:mail",
+                    "error",
+                    &format!("create_draft: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
         }
     }
 
@@ -1616,6 +1961,173 @@ mod tests {
         let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
         assert_eq!(ok.status, 200);
         assert_eq!(seen.load(Ordering::SeqCst), 10);
+    }
+
+    /// Records the last mail-write op so the routing + param parsing is checkable.
+    #[derive(Default)]
+    struct RecordMailWrite(std::sync::Mutex<Vec<String>>);
+    impl RecordMailWrite {
+        fn last(&self) -> String {
+            self.0.lock().unwrap().last().cloned().unwrap_or_default()
+        }
+    }
+    impl MailWriteHandler for RecordMailWrite {
+        fn send(
+            &self,
+            _a: &str,
+            subject: &str,
+            _b: &str,
+            to: &[String],
+            cc: &[String],
+            _bcc: &[String],
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!(
+                "send subj={subject} to={} cc={}",
+                to.join(","),
+                cc.len()
+            ));
+            Ok(())
+        }
+        fn reply(&self, _a: &str, id: &str, _c: &str, all: bool) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("reply id={id} all={all}"));
+            Ok(())
+        }
+        fn forward(&self, _a: &str, id: &str, _c: &str, to: &[String]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("forward id={id} to={}", to.join(",")));
+            Ok(())
+        }
+        fn move_to(&self, _a: &str, id: &str, dest: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("move id={id} dest={dest}"));
+            Ok(format!("{id}-moved"))
+        }
+        fn set_read(&self, _a: &str, id: &str, is_read: bool) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("read id={id} is_read={is_read}"));
+            Ok(())
+        }
+        fn set_flag(&self, _a: &str, id: &str, status: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("flag id={id} status={status}"));
+            Ok(())
+        }
+        fn set_categories(&self, _a: &str, id: &str, cats: &[String]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("cats id={id} n={}", cats.len()));
+            Ok(())
+        }
+        fn create_draft(
+            &self,
+            _a: &str,
+            subject: &str,
+            _b: &str,
+            _to: &[String],
+        ) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("create_draft subj={subject}"));
+            Ok("draft-9".into())
+        }
+        fn send_draft(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("send_draft id={id}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mail_write_endpoints_are_cap_token_gated_and_route_params() {
+        let (_d, router) = setup();
+        // read-only router (no handler) refuses every mail-write POST
+        for p in [
+            "/api/v1/mail/send",
+            "/api/v1/mail/reply",
+            "/api/v1/mail/move",
+            "/api/v1/mail/draft",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router.with_mail_write(rec.clone(), "secret".into());
+
+        // missing / wrong cap token -> 401
+        let send = "/api/v1/mail/send?account=a&to=x@y.com&subject=Hi";
+        assert_eq!(router.route(&ApiRequest::new("POST", send)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", send).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // valid token but no recipient -> 400, handler not called
+        let bad = ApiRequest::new("POST", "/api/v1/mail/send?account=a&subject=Hi")
+            .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        assert!(rec.0.lock().unwrap().is_empty());
+
+        // valid send -> 200, handler called with parsed params
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&tok(send)).status, 200);
+        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0");
+
+        // reply with all=1 carries the id + flag
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/reply?account=a&id=m1&all=1&comment=ok"))
+                .status,
+            200
+        );
+        assert_eq!(rec.last(), "reply id=m1 all=true");
+
+        // move returns the new id
+        let moved = router.route(&tok(
+            "/api/v1/mail/move?account=a&id=m1&destination=Archive",
+        ));
+        assert_eq!(moved.status, 200);
+        assert_eq!(body_json(&moved)["new_id"], "m1-moved");
+
+        // flag validates the status enum
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/flag?account=a&id=m1&status=bogus"))
+                .status,
+            400
+        );
+
+        // draft with no id creates; with id sends
+        let drafted = router.route(&tok("/api/v1/mail/draft?account=a&subject=D&to=x@y.com"));
+        assert_eq!(body_json(&drafted)["draft_id"], "draft-9");
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/draft?account=a&id=d1"))
+                .status,
+            200
+        );
+        assert_eq!(rec.last(), "send_draft id=d1");
+    }
+
+    /// app.js carries the mail-write cap token placeholder so #563's UI can POST.
+    #[test]
+    fn app_js_has_mail_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__MAILWRITE_CAP_TOKEN__"));
     }
 
     struct OkVerify;
