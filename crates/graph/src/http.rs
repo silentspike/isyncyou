@@ -2139,4 +2139,51 @@ mod tests {
         c.send_mail(&message, true).expect("live send-to-self");
         eprintln!("live send-to-self delivered to {to}");
     }
+
+    /// Live exercise of the metadata-PATCH + move verbs against the throwaway
+    /// account: pick a real message, flag/read/categorize it, then move it to the
+    /// Archive (and back). Needs `ISYNCYOU_TEST_TOKEN` (Mail.ReadWrite).
+    #[test]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
+    fn live_flag_read_categories_move() {
+        let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("skipping live_flag_read_categories_move: ISYNCYOU_TEST_TOKEN not set");
+                return;
+            }
+        };
+        let c = GraphClient::new(token);
+        // a real message to act on (newest in the mailbox)
+        let msgs = c
+            .get_json("/me/messages?$top=1&$select=id,parentFolderId")
+            .expect("list messages");
+        let msg = msgs["value"]
+            .get(0)
+            .expect("the test account must have at least one message");
+        let id = msg["id"].as_str().expect("message id").to_string();
+        let origin = msg["parentFolderId"].as_str().unwrap_or("").to_string();
+
+        // metadata PATCHes (each returns the updated message)
+        c.set_flag(&id, "flagged").expect("set_flag");
+        c.set_read(&id, true).expect("set_read");
+        c.set_categories(&id, &["iSyncYou Live Test".to_string()])
+            .expect("set_categories");
+        c.set_importance(&id, "high").expect("set_importance");
+        eprintln!("live flag/read/categories/importance applied to {id}");
+
+        // move to the well-known Archive folder, then back to where it came from
+        let archive = c
+            .get_json("/me/mailFolders/archive?$select=id")
+            .expect("resolve archive folder");
+        let archive_id = archive["id"].as_str().expect("archive id");
+        let moved = c.move_message(&id, archive_id).expect("move to archive");
+        let new_id = moved["id"].as_str().expect("moved message id").to_string();
+        eprintln!("live moved {id} -> archive as {new_id}");
+        if !origin.is_empty() {
+            // restore: move it back so the mailbox is left as we found it
+            c.move_message(&new_id, &origin).expect("move back");
+            eprintln!("live moved back to origin folder");
+        }
+    }
 }
