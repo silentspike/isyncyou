@@ -18,6 +18,7 @@ use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod mail_live;
 mod mail_restore;
 mod restore_calendar;
 mod restore_contacts;
@@ -26,6 +27,7 @@ mod restore_onenote;
 mod restore_recovery;
 mod restore_todo;
 mod verify;
+pub use mail_live::{build_message, mail_writer, MailWriter};
 pub use mail_restore::{
     pending_mail_restore_count, recover_pending_mail_restores, recover_pending_mail_restores_with,
     restore_mail_via_ledger, MailApi, MailSink,
