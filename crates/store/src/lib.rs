@@ -744,8 +744,12 @@ impl Store {
         offset: u32,
     ) -> Result<Vec<Item>> {
         let mut stmt = self.conn.prepare(&format!(
+            // include cloud-deleted items that still have an archived body so the
+            // UI can show the 'backup-only' state (the backup's whole point);
+            // truly-gone items (deleted + never archived) stay hidden.
             "SELECT {COLS} FROM items
-             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL
+             WHERE account_id=?1 AND service=?2
+               AND (deleted_at IS NULL OR local_path IS NOT NULL)
              ORDER BY item_type, name
              LIMIT ?3 OFFSET ?4"
         ))?;
@@ -757,7 +761,8 @@ impl Store {
     pub fn count_by_service(&self, account: &str, service: &str) -> Result<u64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM items
-             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL",
+             WHERE account_id=?1 AND service=?2
+               AND (deleted_at IS NULL OR local_path IS NOT NULL)",
             params![account, service],
             |r| r.get::<_, i64>(0),
         )? as u64)
@@ -1580,7 +1585,10 @@ mod tests {
         // clearing the body resets body_etag
         s.set_local_path("acc", "onedrive", "id-a", None).unwrap();
         assert_eq!(
-            s.get_item("acc", "onedrive", "id-a").unwrap().unwrap().body_etag,
+            s.get_item("acc", "onedrive", "id-a")
+                .unwrap()
+                .unwrap()
+                .body_etag,
             None
         );
     }

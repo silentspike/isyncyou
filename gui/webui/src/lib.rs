@@ -1332,6 +1332,27 @@ fn safe_content_type(rel: &str) -> &'static str {
 }
 
 /// Serialize an item's safe metadata (never the body bytes).
+/// The Live∪Backup status of an element (plan §S-P4.3): the join of the cloud
+/// mirror (the store, refreshed each sync) and the local archive.
+/// - `backup_only` — cloud-deleted but still archived (the backup's value)
+/// - `live_only` — in the cloud, not backed up
+/// - `stale` — backed up, but the cloud changed since (`etag != body_etag`)
+/// - `live_backup` — in the cloud and backed up, up to date
+fn backup_state(it: &Item) -> &'static str {
+    if it.deleted_at.is_some() {
+        // only cloud-deleted items that still have an archived body reach the
+        // listing (see `items_by_service_page`), so this is the archive state.
+        return "backup_only";
+    }
+    if it.local_path.is_none() {
+        return "live_only";
+    }
+    match (it.etag.as_deref(), it.body_etag.as_deref()) {
+        (Some(e), Some(b)) if e != b => "stale",
+        _ => "live_backup",
+    }
+}
+
 fn item_json(it: &Item) -> Value {
     json!({
         "service": it.service,
@@ -1344,6 +1365,8 @@ fn item_json(it: &Item) -> Value {
         "size": it.size,
         "etag": it.etag,
         "has_body": it.local_path.is_some(),
+        "deleted": it.deleted_at.is_some(),
+        "state": backup_state(it),
         "verify_status": it.verify_status,
         "verified_at": it.verified_at,
     })
@@ -1366,6 +1389,39 @@ fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>>
 mod tests {
     use super::*;
     use isyncyou_core::config::AccountConfig;
+
+    // AC1: the 4-state Live∪Backup model is derived correctly per item, and
+    // AC2: a body archived at an older etag than the item's current sync etag
+    // surfaces as `stale`.
+    #[test]
+    fn backup_state_derives_four_states() {
+        // live_only: in the cloud per last sync, no archived body.
+        let mut live = Item::new("a", "mail", "m1", "live", "message");
+        live.etag = Some("E1".into());
+        assert_eq!(backup_state(&live), "live_only");
+
+        // live_backup: archived, and the body matches the current cloud etag.
+        let mut backed = Item::new("a", "mail", "m2", "backed", "message");
+        backed.etag = Some("E1".into());
+        backed.local_path = Some("mail/aa/m2.eml".into());
+        backed.body_etag = Some("E1".into());
+        assert_eq!(backup_state(&backed), "live_backup");
+
+        // stale: archived at E1, but the cloud item moved on to E2.
+        let mut stale = Item::new("a", "mail", "m3", "stale", "message");
+        stale.etag = Some("E2".into());
+        stale.local_path = Some("mail/aa/m3.eml".into());
+        stale.body_etag = Some("E1".into());
+        assert_eq!(backup_state(&stale), "stale");
+
+        // backup_only: cloud-deleted, but we still hold the archived body.
+        let mut gone = Item::new("a", "mail", "m4", "gone", "message");
+        gone.etag = Some("E1".into());
+        gone.local_path = Some("mail/aa/m4.eml".into());
+        gone.body_etag = Some("E1".into());
+        gone.deleted_at = Some("2026-06-18T00:00:00Z".into());
+        assert_eq!(backup_state(&gone), "backup_only");
+    }
 
     fn setup() -> (tempfile::TempDir, Router) {
         let dir = tempfile::tempdir().unwrap();
