@@ -776,6 +776,212 @@ impl GraphClient {
             }),
         }
     }
+
+    // ---- mail write layer (#561): the live client's verbs ---------------------
+    //
+    // Thin wrappers; every request body is built by a pure `*_body`/`send_envelope`
+    // helper below so its exact shape is unit-testable without a network. Graph
+    // *action* endpoints (sendMail/reply/replyAll/forward/send) answer 202 with no
+    // body, so they go through `post_action`; the rest return the affected resource.
+
+    /// POST a JSON body to a Graph **action** that returns no content (202/204 with
+    /// an empty body — e.g. `sendMail`/`reply`). Unlike [`Self::post_json`] this
+    /// never tries to parse a body.
+    pub fn post_action(&self, url: &str, body: &serde_json::Value) -> Result<(), UploadError> {
+        let url = self.abs(url);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 201 | 202 | 204 => Ok(()),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            }),
+        }
+    }
+
+    /// POST with no body to a Graph action (the `send` draft action takes none).
+    pub fn post_empty(&self, url: &str) -> Result<(), UploadError> {
+        let url = self.abs(url);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 201 | 202 | 204 => Ok(()),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            }),
+        }
+    }
+
+    /// Send a mail message (`POST /me/sendMail`). `message` is the Graph `message`
+    /// resource the engine built; `save_to_sent` adds it to Sent Items.
+    pub fn send_mail(
+        &self,
+        message: &serde_json::Value,
+        save_to_sent: bool,
+    ) -> Result<(), UploadError> {
+        self.post_action("/me/sendMail", &send_envelope(message, save_to_sent))
+    }
+
+    /// Reply to the sender (`POST /me/messages/{id}/reply`).
+    pub fn reply(&self, message_id: &str, comment: &str) -> Result<(), UploadError> {
+        self.post_action(
+            &format!("/me/messages/{}/reply", encode_id(message_id)),
+            &comment_body(comment),
+        )
+    }
+
+    /// Reply to all recipients (`POST /me/messages/{id}/replyAll`).
+    pub fn reply_all(&self, message_id: &str, comment: &str) -> Result<(), UploadError> {
+        self.post_action(
+            &format!("/me/messages/{}/replyAll", encode_id(message_id)),
+            &comment_body(comment),
+        )
+    }
+
+    /// Forward a message to new recipients (`POST /me/messages/{id}/forward`).
+    pub fn forward(&self, message_id: &str, comment: &str, to: &[&str]) -> Result<(), UploadError> {
+        self.post_action(
+            &format!("/me/messages/{}/forward", encode_id(message_id)),
+            &forward_body(comment, to),
+        )
+    }
+
+    /// Move a message to another folder (`POST /me/messages/{id}/move`); returns
+    /// the moved message (it gets a new id in the destination folder).
+    pub fn move_message(
+        &self,
+        message_id: &str,
+        destination_id: &str,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_json(
+            &format!("/me/messages/{}/move", encode_id(message_id)),
+            &move_body(destination_id),
+        )
+    }
+
+    /// Mark a message read/unread (`PATCH /me/messages/{id}`).
+    pub fn set_read(
+        &self,
+        message_id: &str,
+        is_read: bool,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(
+            &format!("/me/messages/{}", encode_id(message_id)),
+            &read_body(is_read),
+        )
+    }
+
+    /// Set/clear a follow-up flag (`PATCH /me/messages/{id}`); `status` is one of
+    /// `notFlagged` / `flagged` / `complete`.
+    pub fn set_flag(
+        &self,
+        message_id: &str,
+        flag_status: &str,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(
+            &format!("/me/messages/{}", encode_id(message_id)),
+            &flag_body(flag_status),
+        )
+    }
+
+    /// Replace a message's categories (`PATCH /me/messages/{id}`).
+    pub fn set_categories(
+        &self,
+        message_id: &str,
+        categories: &[String],
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(
+            &format!("/me/messages/{}", encode_id(message_id)),
+            &categories_body(categories),
+        )
+    }
+
+    /// Set a message's importance (`PATCH /me/messages/{id}`): `low`/`normal`/`high`.
+    pub fn set_importance(
+        &self,
+        message_id: &str,
+        importance: &str,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(
+            &format!("/me/messages/{}", encode_id(message_id)),
+            &importance_body(importance),
+        )
+    }
+
+    /// Create a draft message (`POST /me/messages`); returns the created draft.
+    pub fn create_draft(
+        &self,
+        message: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_json("/me/messages", message)
+    }
+
+    /// Update a draft message (`PATCH /me/messages/{id}`); returns the updated draft.
+    pub fn update_draft(
+        &self,
+        message_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(&format!("/me/messages/{}", encode_id(message_id)), patch)
+    }
+
+    /// Send an existing draft (`POST /me/messages/{id}/send`); no request body.
+    pub fn send_draft(&self, message_id: &str) -> Result<(), UploadError> {
+        self.post_empty(&format!("/me/messages/{}/send", encode_id(message_id)))
+    }
+}
+
+// ---- mail-write request-body builders (pure; unit-tested for exact shape) ----
+
+/// `{ "emailAddress": { "address": addr } }` — a Graph recipient.
+fn mail_recipient(addr: &str) -> serde_json::Value {
+    serde_json::json!({ "emailAddress": { "address": addr } })
+}
+/// `sendMail` envelope: `{ "message": <message>, "saveToSentItems": <bool> }`.
+fn send_envelope(message: &serde_json::Value, save_to_sent: bool) -> serde_json::Value {
+    serde_json::json!({ "message": message, "saveToSentItems": save_to_sent })
+}
+/// reply/replyAll body: `{ "comment": <text> }`.
+fn comment_body(comment: &str) -> serde_json::Value {
+    serde_json::json!({ "comment": comment })
+}
+/// forward body: `{ "comment": <text>, "toRecipients": [ … ] }`.
+fn forward_body(comment: &str, to: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "comment": comment,
+        "toRecipients": to.iter().map(|a| mail_recipient(a)).collect::<Vec<_>>(),
+    })
+}
+/// move body: `{ "destinationId": <folder-id> }`.
+fn move_body(destination_id: &str) -> serde_json::Value {
+    serde_json::json!({ "destinationId": destination_id })
+}
+/// read PATCH body: `{ "isRead": <bool> }`.
+fn read_body(is_read: bool) -> serde_json::Value {
+    serde_json::json!({ "isRead": is_read })
+}
+/// flag PATCH body: `{ "flag": { "flagStatus": <status> } }`.
+fn flag_body(flag_status: &str) -> serde_json::Value {
+    serde_json::json!({ "flag": { "flagStatus": flag_status } })
+}
+/// categories PATCH body: `{ "categories": [ … ] }`.
+fn categories_body(categories: &[String]) -> serde_json::Value {
+    serde_json::json!({ "categories": categories })
+}
+/// importance PATCH body: `{ "importance": <level> }`.
+fn importance_body(importance: &str) -> serde_json::Value {
+    serde_json::json!({ "importance": importance })
 }
 
 /// Build the raw multipart/form-data body Graph expects for OneNote page create
@@ -1800,5 +2006,137 @@ mod tests {
         }
         client.delete_item(&id).expect("cleanup delete");
         eprintln!("revoked + cleaned up {id}");
+    }
+
+    // ---- mail write layer (#561) --------------------------------------------
+
+    #[test]
+    fn mail_write_builders_have_exact_shapes() {
+        assert_eq!(
+            mail_recipient("a@b.com"),
+            serde_json::json!({ "emailAddress": { "address": "a@b.com" } })
+        );
+        let msg = serde_json::json!({ "subject": "Hi" });
+        assert_eq!(
+            send_envelope(&msg, true),
+            serde_json::json!({ "message": { "subject": "Hi" }, "saveToSentItems": true })
+        );
+        assert_eq!(comment_body("ok"), serde_json::json!({ "comment": "ok" }));
+        assert_eq!(
+            forward_body("fyi", &["x@y.com", "z@y.com"]),
+            serde_json::json!({
+                "comment": "fyi",
+                "toRecipients": [
+                    { "emailAddress": { "address": "x@y.com" } },
+                    { "emailAddress": { "address": "z@y.com" } }
+                ]
+            })
+        );
+        assert_eq!(
+            move_body("AAMk"),
+            serde_json::json!({ "destinationId": "AAMk" })
+        );
+        assert_eq!(read_body(true), serde_json::json!({ "isRead": true }));
+        assert_eq!(
+            flag_body("flagged"),
+            serde_json::json!({ "flag": { "flagStatus": "flagged" } })
+        );
+        assert_eq!(
+            categories_body(&["Red".to_string(), "Work".to_string()]),
+            serde_json::json!({ "categories": ["Red", "Work"] })
+        );
+        assert_eq!(
+            importance_body("high"),
+            serde_json::json!({ "importance": "high" })
+        );
+    }
+
+    #[test]
+    fn send_mail_posts_to_send_mail_action() {
+        let (base, h) = serve(vec![http_response(202, "Accepted", "", "")]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        c.send_mail(&serde_json::json!({ "subject": "Hi" }), true)
+            .expect("send");
+        let req = &h.join().unwrap()[0];
+        assert!(
+            req.starts_with("POST /me/sendMail HTTP/1.1"),
+            "unexpected request line: {req}"
+        );
+    }
+
+    #[test]
+    fn reply_and_forward_hit_the_right_action_paths() {
+        let (base, h) = serve(vec![
+            http_response(202, "Accepted", "", ""),
+            http_response(202, "Accepted", "", ""),
+        ]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        c.reply("m1", "thanks").expect("reply");
+        c.forward("m1", "fyi", &["x@y.com"]).expect("forward");
+        let seen = h.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/messages/m1/reply HTTP/1.1"));
+        assert!(seen[1].starts_with("POST /me/messages/m1/forward HTTP/1.1"));
+    }
+
+    #[test]
+    fn move_message_posts_to_move_and_returns_resource() {
+        let (base, h) = serve(vec![http_response(201, "Created", "", r#"{"id":"newid"}"#)]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        let moved = c.move_message("m1", "AAMkDest").expect("move");
+        assert_eq!(moved["id"], "newid");
+        assert!(h.join().unwrap()[0].starts_with("POST /me/messages/m1/move HTTP/1.1"));
+    }
+
+    #[test]
+    fn set_read_patches_the_message() {
+        let (base, h) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            r#"{"id":"m1","isRead":true}"#,
+        )]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        let updated = c.set_read("m1", true).expect("set_read");
+        assert_eq!(updated["isRead"], true);
+        assert!(h.join().unwrap()[0].starts_with("PATCH /me/messages/m1 HTTP/1.1"));
+    }
+
+    #[test]
+    fn send_draft_posts_to_send_with_no_body() {
+        let (base, h) = serve(vec![http_response(202, "Accepted", "", "")]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        c.send_draft("m1").expect("send draft");
+        let req = &h.join().unwrap()[0];
+        assert!(req.starts_with("POST /me/messages/m1/send HTTP/1.1"));
+        // no body: Content-Length must be absent or zero
+        assert!(
+            !req.to_ascii_lowercase().contains("content-length: ")
+                || req.to_ascii_lowercase().contains("content-length: 0"),
+            "send draft must carry no body: {req}"
+        );
+    }
+
+    /// Live send-to-self against the throwaway account. Needs `ISYNCYOU_TEST_TOKEN`
+    /// (carrying `Mail.Send`) + `ISYNCYOU_TEST_EMAIL` (the self address).
+    #[test]
+    #[ignore = "live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored"]
+    fn live_send_mail_to_self() {
+        let token = match std::env::var("ISYNCYOU_TEST_TOKEN") {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("skipping live_send_mail_to_self: ISYNCYOU_TEST_TOKEN not set");
+                return;
+            }
+        };
+        let to = std::env::var("ISYNCYOU_TEST_EMAIL")
+            .expect("ISYNCYOU_TEST_EMAIL (self address) required for the live send test");
+        let c = GraphClient::new(token);
+        let message = serde_json::json!({
+            "subject": "iSyncYou live send-to-self test",
+            "body": { "contentType": "Text", "content": "Sent by the #561 live test." },
+            "toRecipients": [ mail_recipient(&to) ],
+        });
+        c.send_mail(&message, true).expect("live send-to-self");
+        eprintln!("live send-to-self delivered to {to}");
     }
 }
