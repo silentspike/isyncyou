@@ -1013,3 +1013,35 @@ a:hover { text-decoration: underline; }
 
 /* poll-interval slider (Settings) — accent-tinted, full width */
 .poll-slider { width: 100%; accent-color: var(--accent); height: 22px; cursor: pointer; }
+
+/* ============================================================ Live∪Backup status (#560) */
+/* shared 4-state badge — reused by every list + detail view */
+.badge { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap;
+  font-size: var(--fs-xs); font-weight: 600; padding: 2px var(--sp-2);
+  border-radius: var(--r-full); border: 1px solid transparent; }
+.badge .icon { width: 13px; height: 13px; }
+.badge.state-live_backup { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in oklab, var(--ok) 30%, transparent); }
+.badge.state-backup_only { color: var(--accent-2); background: var(--accent-soft); border-color: var(--accent-line); }
+.badge.state-stale { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in oklab, var(--warn) 30%, transparent); }
+.badge.state-live_only { color: var(--text-lo); background: var(--bg-2); border-color: var(--line); }
+/* contacts list is dense — show the badge icon-only there */
+.con-row-meta .badge { padding: 3px; border-radius: var(--r-sm); }
+.con-row-meta .badge .badge-label { display: none; }
+
+/* filter chips over a service list */
+.state-chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.state-chip { display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  padding: 5px var(--sp-3); border-radius: var(--r-full); border: 1px solid var(--line);
+  background: var(--bg-2); color: var(--text-mid); font-size: var(--fs-sm); font-weight: 600; }
+.state-chip:hover { border-color: var(--line-2); color: var(--text-hi); }
+.state-chip.active { background: var(--accent-soft); border-color: var(--accent-line); color: var(--text-hi); }
+.state-chip.active .icon { color: var(--accent); }
+.state-chip .icon { width: 14px; height: 14px; }
+.sc-count { font-size: 10px; color: var(--text-lo); font-variant-numeric: tabular-nums; }
+.state-chip.active .sc-count { color: var(--accent-2); }
+
+/* CSS-driven filtering — survives paginated "Load more" without re-render */
+#svc-list[data-filter="live_only"] .list-row:not([data-state="live_only"]),
+#svc-list[data-filter="live_backup"] .list-row:not([data-state="live_backup"]),
+#svc-list[data-filter="backup_only"] .list-row:not([data-state="backup_only"]),
+#svc-list[data-filter="stale"] .list-row:not([data-state="stale"]) { display: none; }

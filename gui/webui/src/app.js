@@ -270,6 +270,38 @@ async function post(path, capToken) {
 }
 const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
 const initials = (s) => (s || "?").trim().split(/[\s@.]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join("") || "?";
+
+/* ---------------------------------------------------------------- shared Live∪Backup status badge (#560) */
+// Mirrors backup_state() in lib.rs: every element is one of four states.
+// Reused by every list + detail view so coverage reads identically everywhere.
+// No emoji — Lucide glyphs only, tinted per state in CSS.
+const STATES = {
+  live_only:   { icon: "globe",        label: "Live only",     title: "In Microsoft 365 — not yet in your backup" },
+  live_backup: { icon: "shield-check", label: "Live + backup", title: "In Microsoft 365 and safely backed up" },
+  backup_only: { icon: "archive",      label: "Backup only",   title: "Deleted from Microsoft 365 — preserved in your backup" },
+  stale:       { icon: "rotate-ccw",   label: "Stale",         title: "Microsoft 365 changed since the last backup — re-run a backup to refresh" },
+};
+const STATE_KEYS = new Set(Object.keys(STATES));
+const stateKey = (it) => (STATES[it.state] ? it.state : "live_only");
+// NB: distinct from the older `syncBadge()` (transient sync_state pill) — this is
+// the persistent Live∪Backup coverage badge. Both axes can show on one row.
+function coverageBadge(it) {
+  const k = stateKey(it), s = STATES[k];
+  return el("span", { class: "badge state-" + k, title: s.title }, icon(s.icon, "icon-sm"), el("span", { class: "badge-label", text: s.label }));
+}
+const stateMatch = (it, f) => f === "all" || stateKey(it) === f;
+// Shared inline filter chips for the bespoke, fully-loaded views (drive/calendar/
+// todo/onenote) — JS re-render over the in-memory item set. (The generic
+// server-paginated fallback uses the CSS-driven `stateChipBar` instead, which
+// hides across pages without re-rendering.) `onPick(key)` re-renders the view.
+function stateFilterBar(items, current, onPick) {
+  const counts = { all: items.length };
+  for (const k of STATE_KEYS) counts[k] = 0;
+  items.forEach(it => { counts[stateKey(it)]++; });
+  const mk = (key, label) => el("button", { class: "state-chip" + (key === current ? " active" : ""), onclick: () => onPick(key) },
+    key === "all" ? null : icon(STATES[key].icon, "icon-sm"), el("span", { text: label }), el("span", { class: "sc-count", text: String(counts[key] || 0) }));
+  return el("div", { class: "state-chips" }, mk("all", "All"), mk("live_only", "Live only"), mk("live_backup", "Live + backup"), mk("backup_only", "Backup only"), mk("stale", "Stale"));
+}
 // Activity timestamps come back as unix seconds (audit_timestamp); everything
 // else is an ISO/RFC string. Normalise both to a JS Date.
 function toDate(s) {
@@ -320,6 +352,7 @@ function svcFilters(service) {
     { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
     { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
     { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
+    ...stateFilterSpecs(),
     { sec: "Categories" },
     ...MAIL_CATS.map(c => ({ key: c.key, label: c.label, icon: c.icon, color: c.color, count: m => m.filter(it => mailCat(it).key === c.key).length })),
   ];
@@ -329,8 +362,17 @@ function svcFilters(service) {
     { key: "email", label: "With email", icon: "mail", count: c => c.filter(it => (it.preview || {}).email).length },
     { key: "company", label: "With company", icon: "building", count: c => c.filter(it => (it.preview || {}).company).length },
     { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: c => c.filter(it => it.has_body).length },
+    ...stateFilterSpecs(),
   ];
   return null;
+}
+// shared "Backup status" sidebar section (#560) for the bespoke views.
+function stateFilterSpecs() {
+  return [
+    { sec: "Backup status" },
+    ...[...STATE_KEYS].map(k => ({ key: k, label: STATES[k].label, icon: STATES[k].icon,
+      count: items => items.filter(it => stateKey(it) === k).length })),
+  ];
 }
 const svcFilter = (service) => App.svcFilter[service] || "all";
 function setSvcFilter(service, key) {
@@ -650,11 +692,38 @@ async function renderServiceView(view, service) {
         onkeydown: (e) => { if (e.key === "Enter") doServiceSearch(service); } })),
   );
   const list = el("div", { id: "svc-list", class: "card", style: "padding:0;overflow:hidden" });
+  list.dataset.filter = "all";
   const more = el("div", { id: "svc-more", style: "display:none;padding:14px;text-align:center" },
     el("button", { class: "btn ghost", onclick: () => loadMore(service) }, "Load more"));
-  view.append(list, more);
+  view.append(stateChipBar(), list, more);
   view._offset = 0; view._total = 0;
   await loadPage(service, true);
+}
+// shared 4-state filter bar (#560): CSS-driven via #svc-list[data-filter] +
+// .list-row[data-state], so it keeps working across paginated "Load more".
+function stateChipBar() {
+  const mk = (key, label) => el("button", { class: "state-chip" + (key === "all" ? " active" : ""), dataset: { k: key }, onclick: () => applyStateFilter(key) },
+    key === "all" ? null : icon(STATES[key].icon, "icon-sm"),
+    el("span", { text: label }), el("span", { class: "sc-count", dataset: { cnt: key }, text: "0" }));
+  return el("div", { id: "svc-statechips", class: "state-chips" },
+    mk("all", "All"), mk("live_only", "Live only"), mk("live_backup", "Live + backup"), mk("backup_only", "Backup only"), mk("stale", "Stale"));
+}
+function applyStateFilter(key) {
+  const list = $("#svc-list"); if (!list) return;
+  list.dataset.filter = key;
+  document.querySelectorAll("#svc-statechips .state-chip").forEach(b => b.classList.toggle("active", b.dataset.k === key));
+  const visible = key === "all" ? list.querySelectorAll(".list-row").length : list.querySelectorAll(`.list-row[data-state="${key}"]`).length;
+  let hint = $("#svc-filter-empty");
+  if (!visible && list.querySelector(".list-row")) {
+    if (!hint) list.append(el("div", { id: "svc-filter-empty", class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "No loaded items have this status." })));
+  } else if (hint) hint.remove();
+}
+function updateStateChipCounts() {
+  const list = $("#svc-list"); if (!list) return;
+  const rows = [...list.querySelectorAll(".list-row[data-state]")];
+  const set = (k, n) => { const c = document.querySelector(`#svc-statechips [data-cnt="${k}"]`); if (c) c.textContent = String(n); };
+  set("all", rows.length);
+  for (const k of STATE_KEYS) set(k, rows.filter(r => r.dataset.state === k).length);
 }
 function itemRow(it) {
   const q = { account: App.account, service: it.service, id: it.remote_id };
@@ -665,7 +734,9 @@ function itemRow(it) {
       el("div", { class: "dim truncate", style: "font-size:12px", text: `${it.item_type}${it.size ? " · " + fmtSize(it.size) : ""}` })),
     el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(it.remote_mtime) }),
   );
-  const actions = el("div", { style: "display:flex;gap:4px;align-items:center" });
+  row.dataset.state = stateKey(it);
+  const actions = el("div", { style: "display:flex;gap:6px;align-items:center" });
+  actions.append(coverageBadge(it));
   if (it.has_body) actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open" }, icon("external-link", "icon-sm")));
   if (CAP.restore && it.has_body && RESTORABLE.has(it.service))
     actions.append(el("button", { class: "btn ghost sm", title: "Restore to cloud", onclick: (e) => { e.stopPropagation(); doRestore(it, e.currentTarget); } }, icon("rotate-ccw", "icon-sm")));
@@ -689,6 +760,7 @@ async function loadPage(service, reset) {
     list.append(frag);
     view._offset += items.length; view._total = d.total ?? view._offset;
     $("#svc-more").style.display = view._offset < view._total ? "block" : "none";
+    updateStateChipCounts(); applyStateFilter(list.dataset.filter || "all");
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load" }), el("p", { text: e.message }))); }
 }
 function loadMore(service) { loadPage(service, false); }
@@ -783,6 +855,7 @@ function mailFiltered() {
   const f = svcFilter("mail");
   if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
+  else if (STATE_KEYS.has(f)) rows = rows.filter(it => stateKey(it) === f);
   else if (f !== "all") rows = rows.filter(it => mailCat(it).key === f);
   if (Mail.q) rows = rows.filter(it => { const p = it.preview || {}; return ((p.subject || it.name || "") + " " + (p.from || "") + " " + (p.snippet || "")).toLowerCase().includes(Mail.q); });
   const dir = Mail.sort === "oldest" ? 1 : -1;
@@ -818,7 +891,7 @@ function mailRow(it) {
       el("div", { class: "mi-subject truncate", text: subject }),
       el("div", { class: "mi-bottom" },
         el("span", { class: "mi-snippet truncate dim", text: p.snippet || "" }),
-        el("span", { class: "mi-status " + (it.has_body ? "ok" : "muted"), title: it.has_body ? "Full body archived" : "Header only" }, it.has_body ? "Body saved" : "Header only")),
+        coverageBadge(it)),
       badges));
 }
 function mailSelect(it) {
@@ -865,7 +938,7 @@ function renderMailReader(it, remoteImages = false) {
       el("div", { class: "grow", style: "min-width:0" },
         el("div", { class: "mr-tags" }, el("span", { class: "mi-cat", style: `--c:${cat.color}`, text: cat.label }),
           p.attachments > 0 ? el("span", { class: "mi-chip" }, icon("paperclip", "icon-sm"), p.attachments + (p.attachments === 1 ? " attachment" : " attachments")) : null,
-          el("span", { class: "mi-status " + (it.has_body ? "ok" : "muted") }, it.has_body ? "Body saved" : "Header only"),
+          coverageBadge(it),
           verifyChip(it)),
         el("h2", { class: "mr-subject", text: subject }),
         el("div", { class: "mr-meta" },
@@ -929,7 +1002,7 @@ const fileIcon = (ext) => (fileKind(ext) || {}).icon || "file";
 const fileColor = (ext) => (fileKind(ext) || {}).color || "var(--text-lo)";
 
 async function renderOnedriveView(view) {
-  Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = [];
+  Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = []; Drive.stateFilter = "all";
   clear(view).append(
     el("div", { id: "drive-metrics-row", class: "con-metrics-row inset" }),
     el("div", { class: "drive-bar" },
@@ -1000,7 +1073,11 @@ function driveSort(items) {
 function driveRender() {
   const body = $("#drive-body"); if (!body) return; clear(body);
   if (!Drive.items.length) { body.append(el("div", { class: "empty" }, emptyArt("empty-files"), el("h3", { text: "Empty folder" }), el("p", { text: "Nothing is archived here." }))); return; }
-  const items = driveSort(Drive.items);
+  // folders always navigate; the 4-state filter applies to files only.
+  const files = Drive.items.filter(it => it.item_type !== "folder");
+  body.append(stateFilterBar(files, Drive.stateFilter, k => { Drive.stateFilter = k; driveRender(); }));
+  const items = driveSort(Drive.items.filter(it => it.item_type === "folder" || stateMatch(it, Drive.stateFilter)));
+  if (!items.length) { body.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "No files here have this backup status." }))); return; }
   if (Drive.layout === "grid") {
     const grid = el("div", { class: "drive-grid stagger" });
     items.forEach(it => grid.append(driveTile(it)));
@@ -1037,6 +1114,7 @@ function driveTile(it) {
   tile.append(...[thumb,
     el("div", { class: "drive-name truncate", text: it.name || "(no name)" }),
     el("div", { class: "drive-meta dim", text: folder ? "Folder" : [fmtSize(it.size), it.remote_mtime ? fmtDate(it.remote_mtime) : ""].filter(Boolean).join(" · ") }),
+    folder ? null : coverageBadge(it),
     syncBadge(it), driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
   return tile;
 }
@@ -1049,6 +1127,7 @@ function driveRow(it) {
     el("div", { class: "grow" },
       el("div", { class: "truncate", text: it.name || "(no name)" }),
       el("div", { class: "dim", style: "font-size:12px", text: folder ? "Folder" : (fmtSize(it.size) || "—") })),
+    folder ? null : coverageBadge(it),
     syncBadge(it),
     el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(it.remote_mtime) }));
   const acts = el("div", { style: "display:flex;gap:4px" });
@@ -1075,7 +1154,7 @@ function startOfWeek(d) { const x = startOfDay(d); const dow = (x.getDay() + 6) 
 const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
 async function renderCalendarView(view) {
-  Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda";
+  Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda"; Cal.stateFilter = "all";
   clear(view).append(
     el("div", { id: "cal-metrics-row", class: "con-metrics-row inset" }),
     el("div", { class: "cal-bar" },
@@ -1130,12 +1209,13 @@ function calRenderMetrics() {
 }
 function eventsForDay(day) {
   const s = startOfDay(day).getTime(), e = s + DAY_MS;
-  return Cal.events.filter(ev => ev.start.getTime() < e && (ev.end ? ev.end.getTime() : ev.start.getTime() + 36e5) > s)
+  return Cal.events.filter(ev => stateMatch(ev.it, Cal.stateFilter) && ev.start.getTime() < e && (ev.end ? ev.end.getTime() : ev.start.getTime() + 36e5) > s)
     .sort((a, b) => a.start - b.start);
 }
 function calRender() {
   const body = $("#cal-body"); if (!body) return; clear(body);
   if (!Cal.events.length && Cal.view === "agenda") { body.append(el("div", { class: "empty" }, emptyArt("empty-calendar"), el("h3", { text: "No events archived" }), el("p", { text: "Run a backup to populate your calendar." }))); return; }
+  if (Cal.events.length) body.append(stateFilterBar(Cal.events.map(e => e.it), Cal.stateFilter, k => { Cal.stateFilter = k; calRender(); }));
   if (Cal.view === "month") calRenderMonth(body);
   else if (Cal.view === "week") calRenderWeek(body);
   else calRenderAgenda(body);
@@ -1204,8 +1284,8 @@ function calRenderWeek(body) {
 function calRenderAgenda(body) {
   const cur = Cal.cursor;
   $("#cal-label").textContent = MONTHS[cur.getMonth()] + " " + cur.getFullYear();
-  const evs = Cal.events.slice().sort((a, b) => a.start - b.start);
-  if (!evs.length) { body.append(el("div", { class: "empty" }, el("h3", { text: "No events" }))); return; }
+  const evs = Cal.events.filter(e => stateMatch(e.it, Cal.stateFilter)).sort((a, b) => a.start - b.start);
+  if (!evs.length) { body.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No events" }), el("p", { text: "No events have this backup status." }))); return; }
   const box = el("div", { class: "cal-agenda" });
   let lastKey = null;
   evs.forEach(ev => {
@@ -1220,7 +1300,8 @@ function calRenderAgenda(body) {
       el("span", { class: "cal-agenda-time tnum", text: ev.allDay ? "All day" : hhmm(ev.start) + (ev.end ? "–" + hhmm(ev.end) : "") }),
       el("span", { class: "cal-dot", style: "background:var(--svc-calendar)" }),
       el("div", { class: "grow" }, el("div", { class: "truncate", text: ev.subject }),
-        ev.location ? el("div", { class: "dim truncate", style: "font-size:12px" }, icon("map-pin", "icon-sm"), ev.location) : null)));
+        ev.location ? el("div", { class: "dim truncate", style: "font-size:12px" }, icon("map-pin", "icon-sm"), ev.location) : null),
+      coverageBadge(ev.it)));
   });
   body.append(box);
 }
@@ -1328,6 +1409,7 @@ function contactsFiltered() {
   if (f === "email") rows = rows.filter(it => conPrev(it).email);
   else if (f === "company") rows = rows.filter(it => conPrev(it).company);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
+  else if (STATE_KEYS.has(f)) rows = rows.filter(it => stateKey(it) === f);
   if (Contacts.q) rows = rows.filter(it => ((it.name || "") + " " + (conPrev(it).company || "") + " " + (conPrev(it).email || "") + " " + (conPrev(it).job || "")).toLowerCase().includes(Contacts.q));
   const s = Contacts.sort;
   const ts = (it) => { const d = toDate(it.remote_mtime); return d ? d.getTime() : 0; };
@@ -1444,7 +1526,7 @@ function contactRow(it) {
       sub ? el("div", { class: "con-sub truncate", text: sub }) : null),
     el("span", { class: "con-row-meta" },
       p.email ? el("span", { class: "con-dot", title: "Has email", style: "background:var(--svc-contacts)" }) : null,
-      it.has_body ? el("span", { class: "con-restore", title: "Restore-ready" }, icon("rotate-ccw", "icon-sm")) : null));
+      coverageBadge(it)));
 }
 function contactSelect(it) {
   Contacts.selected = it;
@@ -1641,7 +1723,7 @@ function _unused_masonryBalance(host, cards) {
 }
 
 /* ---------------------------------------------------------------- todo (lists + checklists) */
-const Todo = { lists: [], tasks: [] };
+const Todo = { lists: [], tasks: [], stateFilter: "all" };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
   clear(view).append(el("div", { id: "todo-metrics-row", class: "con-metrics-row inset" }));
@@ -1670,11 +1752,18 @@ async function renderTodoView(view) {
 }
 function todoRender() {
   const board = clear($("#todo-board"));
+  // refresh the 4-state filter bar as a sibling just above the board
+  const old = $("#todo-statebar"); if (old) old.remove();
+  if (Todo.tasks.length) {
+    const bar = stateFilterBar(Todo.tasks, Todo.stateFilter, k => { Todo.stateFilter = k; todoRender(); });
+    bar.id = "todo-statebar"; board.parentNode.insertBefore(bar, board);
+  }
   if (!Todo.lists.length && !Todo.tasks.length) { board.append(el("div", { class: "empty" }, emptyArt("empty-tasks"), el("h3", { text: "No tasks" }), el("p", { text: "Run a backup to populate your task lists." }))); return; }
   // group tasks by their parent list; tasks whose list is unknown go to "Tasks"
+  const tasks = Todo.tasks.filter(t => stateMatch(t, Todo.stateFilter));
   const byList = new Map(Todo.lists.map(l => [l.remote_id, []]));
   const orphan = [];
-  Todo.tasks.forEach(t => (byList.has(t.parent_remote_id) ? byList.get(t.parent_remote_id) : orphan).push(t));
+  tasks.forEach(t => (byList.has(t.parent_remote_id) ? byList.get(t.parent_remote_id) : orphan).push(t));
   const order = ["notStarted", "inProgress", "completed"];
   const rank = (t) => order.indexOf((t.preview || {}).status || "notStarted");
   const column = (title, tasks) => {
@@ -1696,7 +1785,8 @@ function taskRow(t) {
       el("div", { class: "todo-title truncate", text: t.name || "(untitled)" }),
       (p.due || p.importance === "high") ? el("div", { class: "todo-meta dim" },
         p.importance === "high" ? el("span", { class: "todo-flag", title: "High importance" }, icon("flag", "icon-sm")) : null,
-        p.due ? el("span", { text: "Due " + fmtDate(evDate(p.due, "UTC")) }) : null) : null));
+        p.due ? el("span", { text: "Due " + fmtDate(evDate(p.due, "UTC")) }) : null) : null),
+    coverageBadge(t));
 }
 async function openTaskSheet(t) {
   const q = { account: App.account, service: "todo", id: t.remote_id };
@@ -1721,6 +1811,7 @@ async function openTaskSheet(t) {
 }
 
 /* ---------------------------------------------------------------- onenote (page list + reader) */
+const Note = { pages: [], stateFilter: "all" };
 async function renderOnenoteView(view) {
   clear(view);
   const list = el("div", { id: "note-list", class: "note-list" });
@@ -1743,17 +1834,25 @@ async function renderOnenoteView(view) {
       integrityMetric(pages),
       lastActivityMetric(act.runs || []),
     ]);
-    clear(list);
-    if (!pages.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-notes"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
-    pages.forEach((it, i) => {
-      const row = el("button", { class: "note-item", dataset: { id: it.remote_id }, onclick: () => noteSelect(it) },
-        icon("notebook"), el("div", { class: "grow", style: "min-width:0" },
-          el("div", { class: "truncate", text: it.name || "(untitled)" }),
-          el("div", { class: "dim", style: "font-size:12px", text: fmtDate(it.remote_mtime) })));
-      list.append(row);
-      if (i === 0) setTimeout(() => noteSelect(it), 0);
-    });
+    Note.pages = pages; Note.stateFilter = "all";
+    noteRenderList();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load OneNote" }), el("p", { text: e.message }))); }
+}
+function noteRenderList() {
+  const list = $("#note-list"); if (!list) return; clear(list);
+  if (!Note.pages.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-notes"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
+  list.append(stateFilterBar(Note.pages, Note.stateFilter, k => { Note.stateFilter = k; noteRenderList(); }));
+  const pages = Note.pages.filter(it => stateMatch(it, Note.stateFilter));
+  if (!pages.length) { list.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "No pages have this backup status." }))); return; }
+  pages.forEach((it, i) => {
+    const row = el("button", { class: "note-item", dataset: { id: it.remote_id }, onclick: () => noteSelect(it) },
+      icon("notebook"), el("div", { class: "grow", style: "min-width:0" },
+        el("div", { class: "truncate", text: it.name || "(untitled)" }),
+        el("div", { class: "dim", style: "font-size:12px", text: fmtDate(it.remote_mtime) })),
+      coverageBadge(it));
+    list.append(row);
+    if (i === 0) setTimeout(() => noteSelect(it), 0);
+  });
 }
 function noteSelect(it) {
   document.querySelectorAll(".note-item").forEach(r => r.classList.toggle("active", r.dataset.id === it.remote_id));
