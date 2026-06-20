@@ -259,6 +259,7 @@ pub trait SettingsHandler: Send + Sync {
 /// endpoints are the backend they build on.
 pub trait MailWriteHandler: Send + Sync {
     /// Compose and send a new message (saved to Sent Items).
+    #[allow(clippy::too_many_arguments)] // a compose genuinely has many fields
     fn send(
         &self,
         account: &str,
@@ -267,6 +268,8 @@ pub trait MailWriteHandler: Send + Sync {
         to: &[String],
         cc: &[String],
         bcc: &[String],
+        importance: Option<&str>,
+        request_read_receipt: bool,
     ) -> Result<(), String>;
     /// Reply to the sender (`all = false`) or all recipients (`all = true`).
     fn reply(
@@ -719,11 +722,21 @@ impl Router {
             .collect()
     }
 
-    /// Audit + map a unit mail result to a response.
+    /// Notify the SSE change bus (if any) so every open view reconciles a write
+    /// live — without it, a self-initiated write would only surface on the next
+    /// cloud poll. Best-effort (no bus on the read-only `serve`).
+    fn notify_change(&self) {
+        if let Some(bus) = self.events_bus() {
+            bus.notify();
+        }
+    }
+
+    /// Audit + map a unit mail result to a response; notifies the SSE bus on success.
     fn mail_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
         match r {
             Ok(()) => {
                 let _ = self.audit_account(account, "audit:mail", "ok", what);
+                self.notify_change();
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
             Err(e) => {
@@ -747,6 +760,8 @@ impl Router {
             return ApiResponse::error(400, "at least one recipient (to) is required");
         }
         let (cc, bcc) = (Self::addr_list(req.q("cc")), Self::addr_list(req.q("bcc")));
+        let importance = req.q("importance").filter(|i| !i.is_empty());
+        let request_read_receipt = req.q("read_receipt") == Some("1");
         let r = h.send(
             account,
             req.q("subject").unwrap_or(""),
@@ -754,6 +769,8 @@ impl Router {
             &to,
             &cc,
             &bcc,
+            importance,
+            request_read_receipt,
         );
         self.mail_result(account, &format!("send to={}", to.len()), r)
     }
@@ -811,6 +828,7 @@ impl Router {
         match h.move_to(account, id, dest) {
             Ok(new_id) => {
                 let _ = self.audit_account(account, "audit:mail", "ok", &format!("move id={id}"));
+                self.notify_change();
                 ApiResponse::ok_json(&json!({ "moved": id, "new_id": new_id }))
             }
             Err(e) => {
@@ -918,6 +936,7 @@ impl Router {
         ) {
             Ok(draft_id) => {
                 let _ = self.audit_account(account, "audit:mail", "ok", "create_draft");
+                self.notify_change();
                 ApiResponse::ok_json(&json!({ "draft_id": draft_id }))
             }
             Err(e) => {
@@ -2206,6 +2225,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
+        #[allow(clippy::too_many_arguments)]
         fn send(
             &self,
             _a: &str,
@@ -2214,11 +2234,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             to: &[String],
             cc: &[String],
             _bcc: &[String],
+            importance: Option<&str>,
+            request_read_receipt: bool,
         ) -> Result<(), String> {
             self.0.lock().unwrap().push(format!(
-                "send subj={subject} to={} cc={}",
+                "send subj={subject} to={} cc={} imp={} rr={request_read_receipt}",
                 to.join(","),
-                cc.len()
+                cc.len(),
+                importance.unwrap_or("-"),
             ));
             Ok(())
         }
@@ -2320,7 +2343,18 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // valid send -> 200, handler called with parsed params
         let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&tok(send)).status, 200);
-        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0");
+        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0 imp=- rr=false");
+
+        // importance + read-receipt params are forwarded
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/mail/send?account=a&to=x@y.com&subject=Hi&importance=high&read_receipt=1"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0 imp=high rr=true");
 
         // reply with all=1 carries the id + flag
         assert_eq!(
@@ -2356,6 +2390,43 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             200
         );
         assert_eq!(rec.last(), "send_draft id=d1");
+    }
+
+    #[test]
+    fn mail_write_notifies_the_sse_bus_on_success() {
+        let (_d, router) = setup();
+        let bus = std::sync::Arc::new(EventBus::new());
+        let router = router.with_events(bus.clone()).with_mail_write(
+            std::sync::Arc::new(RecordMailWrite::default()),
+            "secret".into(),
+        );
+        let g0 = bus.generation();
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+
+        // a successful write notifies the SSE bus so open views reconcile live
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/read?account=a&id=m1&is_read=1"))
+                .status,
+            200
+        );
+        assert!(
+            bus.generation() > g0,
+            "successful write must notify the bus"
+        );
+
+        // a rejected write (no cap token) must NOT notify
+        let g1 = bus.generation();
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/mail/read?account=a&id=m1"
+                ))
+                .status,
+            401
+        );
+        assert_eq!(bus.generation(), g1, "a rejected write must not notify");
     }
 
     /// app.js carries the mail-write cap token placeholder so #563's UI can POST.

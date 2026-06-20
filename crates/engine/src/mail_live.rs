@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 /// `&dyn MailWriter` and tests can swap in a fake.
 pub trait MailWriter {
     /// Compose and send a new message; `save_to_sent` is implied true.
+    #[allow(clippy::too_many_arguments)] // a compose genuinely has many fields
     fn send_new(
         &self,
         subject: &str,
@@ -23,6 +24,8 @@ pub trait MailWriter {
         to: &[String],
         cc: &[String],
         bcc: &[String],
+        importance: Option<&str>,
+        request_read_receipt: bool,
     ) -> Result<(), String>;
     /// Reply to the sender (`all = false`) or all recipients (`all = true`).
     fn reply(&self, message_id: &str, comment: &str, all: bool) -> Result<(), String>;
@@ -46,13 +49,16 @@ pub trait MailWriter {
 /// Build the Graph `message` resource from the live client's simple inputs
 /// (mirrors the reference `server.py` shape). Pure + unit-tested for shape; `cc`
 /// and `bcc` are omitted entirely when empty (Graph treats absent and `[]` the
-/// same, and omitting keeps the payload minimal).
+/// same, and omitting keeps the payload minimal). `importance` (`low`/`high`) and
+/// a read-receipt request are added only when set (#563 compose).
 pub fn build_message(
     subject: &str,
     body_html: &str,
     to: &[String],
     cc: &[String],
     bcc: &[String],
+    importance: Option<&str>,
+    request_read_receipt: bool,
 ) -> Value {
     let recips = |addrs: &[String]| -> Vec<Value> {
         addrs
@@ -71,12 +77,19 @@ pub fn build_message(
     if !bcc.is_empty() {
         m["bccRecipients"] = Value::Array(recips(bcc));
     }
+    if let Some(imp) = importance.filter(|i| !i.is_empty()) {
+        m["importance"] = json!(imp);
+    }
+    if request_read_receipt {
+        m["isReadReceiptRequested"] = json!(true);
+    }
     m
 }
 
 // Inherent GraphClient methods share names with several trait methods, so every
 // delegation is fully qualified to call the inherent (HTTP) method, never recurse.
 impl MailWriter for isyncyou_graph::GraphClient {
+    #[allow(clippy::too_many_arguments)]
     fn send_new(
         &self,
         subject: &str,
@@ -84,8 +97,18 @@ impl MailWriter for isyncyou_graph::GraphClient {
         to: &[String],
         cc: &[String],
         bcc: &[String],
+        importance: Option<&str>,
+        request_read_receipt: bool,
     ) -> Result<(), String> {
-        let msg = build_message(subject, body_html, to, cc, bcc);
+        let msg = build_message(
+            subject,
+            body_html,
+            to,
+            cc,
+            bcc,
+            importance,
+            request_read_receipt,
+        );
         isyncyou_graph::GraphClient::send_mail(self, &msg, true).map_err(|e| e.to_string())
     }
     fn reply(&self, message_id: &str, comment: &str, all: bool) -> Result<(), String> {
@@ -130,7 +153,7 @@ impl MailWriter for isyncyou_graph::GraphClient {
         body_html: &str,
         to: &[String],
     ) -> Result<String, String> {
-        let msg = build_message(subject, body_html, to, &[], &[]);
+        let msg = build_message(subject, body_html, to, &[], &[], None, false);
         let v = isyncyou_graph::GraphClient::create_draft(self, &msg).map_err(|e| e.to_string())?;
         v.get("id")
             .and_then(Value::as_str)
@@ -158,7 +181,15 @@ mod tests {
 
     #[test]
     fn build_message_shapes_recipients_and_omits_empty_cc_bcc() {
-        let m = build_message("Hello", "<p>hi</p>", &["a@b.com".into()], &[], &[]);
+        let m = build_message(
+            "Hello",
+            "<p>hi</p>",
+            &["a@b.com".into()],
+            &[],
+            &[],
+            None,
+            false,
+        );
         assert_eq!(m["subject"], "Hello");
         assert_eq!(m["body"]["contentType"], "HTML");
         assert_eq!(m["body"]["content"], "<p>hi</p>");
@@ -168,6 +199,9 @@ mod tests {
             m.get("bccRecipients").is_none(),
             "empty bcc must be omitted"
         );
+        // no importance / read-receipt unless requested
+        assert!(m.get("importance").is_none());
+        assert!(m.get("isReadReceiptRequested").is_none());
 
         let m2 = build_message(
             "Hi",
@@ -175,6 +209,8 @@ mod tests {
             &["t@x.com".into()],
             &["c@x.com".into()],
             &["b1@x.com".into(), "b2@x.com".into()],
+            Some("high"),
+            true,
         );
         assert_eq!(m2["ccRecipients"][0]["emailAddress"]["address"], "c@x.com");
         assert_eq!(m2["bccRecipients"].as_array().unwrap().len(), 2);
@@ -182,6 +218,8 @@ mod tests {
             m2["bccRecipients"][1]["emailAddress"]["address"],
             "b2@x.com"
         );
+        assert_eq!(m2["importance"], "high");
+        assert_eq!(m2["isReadReceiptRequested"], true);
     }
 
     /// Records every op so the trait wiring + id passing is verifiable with no network.
@@ -195,6 +233,7 @@ mod tests {
         }
     }
     impl MailWriter for FakeWriter {
+        #[allow(clippy::too_many_arguments)]
         fn send_new(
             &self,
             subject: &str,
@@ -202,8 +241,14 @@ mod tests {
             to: &[String],
             _cc: &[String],
             _bcc: &[String],
+            importance: Option<&str>,
+            request_read_receipt: bool,
         ) -> Result<(), String> {
-            self.log(format!("send_new subject={subject} to={}", to.join(",")));
+            self.log(format!(
+                "send_new subject={subject} to={} imp={} rr={request_read_receipt}",
+                to.join(","),
+                importance.unwrap_or("-"),
+            ));
             Ok(())
         }
         fn reply(&self, id: &str, comment: &str, all: bool) -> Result<(), String> {
@@ -252,8 +297,16 @@ mod tests {
     fn trait_is_object_safe_and_ops_carry_ids() {
         let f = FakeWriter::default();
         let w: &dyn MailWriter = &f; // object-safety check
-        w.send_new("Hi", "<p>x</p>", &["a@b.com".into()], &[], &[])
-            .unwrap();
+        w.send_new(
+            "Hi",
+            "<p>x</p>",
+            &["a@b.com".into()],
+            &[],
+            &[],
+            Some("high"),
+            true,
+        )
+        .unwrap();
         w.reply("m1", "thanks", false).unwrap();
         w.reply("m1", "all thanks", true).unwrap();
         w.forward("m2", "fyi", &["x@y.com".into()]).unwrap();
@@ -269,7 +322,7 @@ mod tests {
         w.send_draft("m7").unwrap();
 
         let calls = f.calls.borrow();
-        assert_eq!(calls[0], "send_new subject=Hi to=a@b.com");
+        assert_eq!(calls[0], "send_new subject=Hi to=a@b.com imp=high rr=true");
         assert_eq!(calls[1], "reply id=m1 all=false comment=thanks");
         assert_eq!(calls[2], "reply id=m1 all=true comment=all thanks");
         assert_eq!(calls[3], "forward id=m2 to=x@y.com");

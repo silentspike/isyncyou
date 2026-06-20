@@ -414,6 +414,7 @@ struct DaemonMailWrite {
     cfg: Config,
 }
 impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
+    #[allow(clippy::too_many_arguments)]
     fn send(
         &self,
         account: &str,
@@ -422,9 +423,20 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
         to: &[String],
         cc: &[String],
         bcc: &[String],
+        importance: Option<&str>,
+        request_read_receipt: bool,
     ) -> Result<(), String> {
         let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
-        isyncyou_engine::MailWriter::send_new(&w, subject, body_html, to, cc, bcc)
+        isyncyou_engine::MailWriter::send_new(
+            &w,
+            subject,
+            body_html,
+            to,
+            cc,
+            bcc,
+            importance,
+            request_read_receipt,
+        )
     }
     fn reply(
         &self,
