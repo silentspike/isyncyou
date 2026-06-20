@@ -1820,6 +1820,10 @@ fn backup_one_account(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                // Mailbox configuration flanks: settings, inbox rules, categories (#562).
+                let flanks =
+                    connectors::backup_mailbox_flanks(&client, &store, account, &archive_root)
+                        .map_err(|e| e.to_string())?;
                 // Index body text for full-text search when enabled (privacy/space opt-in).
                 let indexed = if cfg.sync.body_index {
                     connectors::index_mail_bodies(&store, account, &archive_root, 0)
@@ -1828,8 +1832,8 @@ fn backup_one_account(
                     0
                 };
                 format!(
-                    "mail: {} folders, {} indexed, {} deleted; {} .eml archived ({} bytes); {} bodies FTS-indexed",
-                    r.folders, r.upserted, r.deleted, b.downloaded, b.bytes, indexed
+                    "mail: {} folders, {} indexed, {} deleted; {} .eml archived ({} bytes); {} flank snapshot(s); {} bodies FTS-indexed",
+                    r.folders, r.upserted, r.deleted, b.downloaded, b.bytes, flanks.archived, indexed
                 )
             }
             "calendar" => {
