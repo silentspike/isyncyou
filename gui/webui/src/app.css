@@ -1045,3 +1045,21 @@ a:hover { text-decoration: underline; }
 #svc-list[data-filter="live_backup"] .list-row:not([data-state="live_backup"]),
 #svc-list[data-filter="backup_only"] .list-row:not([data-state="backup_only"]),
 #svc-list[data-filter="stale"] .list-row:not([data-state="stale"]) { display: none; }
+
+/* ============================================================ compose sheet (#563) */
+.compose { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-5); overflow: auto; }
+.cmp-field { display: grid; gap: 4px; }
+.cmp-label { font-size: var(--fs-xs); font-weight: 600; color: var(--text-lo); text-transform: uppercase; letter-spacing: .06em; }
+.cmp-to-row { display: flex; gap: var(--sp-2); align-items: center; }
+.cmp-to-row .input { flex: 1; }
+.cmp-ccbcc { display: grid; gap: var(--sp-3); }
+.cmp-body {
+  flex: 1; min-height: 220px; overflow: auto; padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-md);
+  color: var(--text-hi); line-height: 1.55; font-size: var(--fs-md);
+}
+.cmp-body:focus { outline: none; border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-soft); }
+.cmp-body:empty::before { content: "Write your message…"; color: var(--text-lo); pointer-events: none; }
+.cmp-footer { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; padding-top: var(--sp-3); border-top: 1px solid var(--line); }
+.cmp-opt { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--text-mid); }
+.cmp-imp { width: auto; padding: 4px var(--sp-2); }

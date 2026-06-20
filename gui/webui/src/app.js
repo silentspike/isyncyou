@@ -77,6 +77,12 @@ const ICONS = {
   inbox: "M22 12h-6l-2 3h-4l-2-3H2M5.5 5h13l3.5 7v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z",
   filter: "M22 3H2l8 9.5V19l4 2v-8.5z",
   "arrow-down-up": "M3 16l4 4 4-4M7 20V4M21 8l-4-4-4 4M17 4v16",
+  send: "M22 2L11 13M22 2l-7 20-4-9-9-4z",
+  "corner-up-left": "M9 14L4 9l5-5M4 9h11a4 4 0 0 1 4 4v7",
+  "corner-up-right": "M15 14l5-5-5-5M20 9H9a4 4 0 0 0-4 4v7",
+  "trash-2": "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6",
+  tag: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82zM7 7h.01",
+  "mail-open": "M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8M3 8l9-6 9 6M3 8l9 6 9-6",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -846,6 +852,7 @@ async function renderMailView(view) {
           el("option", { value: "oldest", text: "Oldest first" }),
           el("option", { value: "sender", text: "Sender A–Z" }))),
       verifyButton(() => renderMailView(view)),
+      CAP.mailwrite ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
     // 2-pane: list | reader (filters live in the left sidebar under "Mail")
     el("div", { id: "mail-layout", class: "mail-layout" },
@@ -938,6 +945,72 @@ function mailSelect(it) {
   renderMailReader(it);
 }
 function mailBack() { Mail.selected = null; $("#mail-layout")?.classList.remove("reading"); document.querySelectorAll(".mail-item.active").forEach(r => r.classList.remove("active")); renderMailReader(null); }
+
+// Compose / reply / forward share this sheet (#563). `opts` { title, to, cc,
+// subject, bodyHtml } pre-fills it (reply/forward, B4). The body is a
+// contenteditable the user authors and which is sent to Graph — it is never
+// rendered as untrusted, so editing HTML here carries no XSS risk.
+function openCompose(opts = {}) {
+  if (!CAP.mailwrite) return;
+  const o = opts || {};
+  const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
+  const toIn = el("input", { class: "input", id: "cmp-to", placeholder: "name@example.com, …", value: (o.to || []).join(", ") });
+  const ccIn = el("input", { class: "input", id: "cmp-cc", placeholder: "Cc", value: (o.cc || []).join(", ") });
+  const bccIn = el("input", { class: "input", id: "cmp-bcc", placeholder: "Bcc" });
+  const subjIn = el("input", { class: "input", id: "cmp-subject", placeholder: "Subject", value: o.subject || "" });
+  const bodyEl = el("div", { class: "cmp-body", id: "cmp-body", contenteditable: "true" });
+  if (o.bodyHtml) bodyEl.innerHTML = o.bodyHtml; // our own quoted-reply markup (trusted)
+  const ccRow = el("div", { class: "cmp-ccbcc", style: "display:none" }, field("Cc", ccIn), field("Bcc", bccIn));
+  const ccToggle = el("button", { class: "btn ghost sm", type: "button", title: "Show Cc/Bcc", onclick: () => { ccRow.style.display = ccRow.style.display === "none" ? "grid" : "none"; } }, "Cc/Bcc");
+  const impSel = el("select", { class: "input cmp-imp", id: "cmp-importance" },
+    el("option", { value: "normal", text: "Normal" }),
+    el("option", { value: "high", text: "High importance" }),
+    el("option", { value: "low", text: "Low importance" }));
+  const rrChk = el("input", { type: "checkbox", id: "cmp-rr" });
+  const content = el("div", { class: "compose" },
+    field("To", el("div", { class: "cmp-to-row" }, toIn, ccToggle)),
+    ccRow,
+    field("Subject", subjIn),
+    bodyEl,
+    el("div", { class: "cmp-footer" },
+      el("label", { class: "cmp-opt", title: "Importance" }, icon("flag", "icon-sm"), impSel),
+      el("label", { class: "cmp-opt" }, rrChk, el("span", { text: "Read receipt" })),
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn ghost", type: "button", onclick: (e) => composeSubmit(e.currentTarget, true) }, icon("archive", "icon-sm"), "Save draft"),
+      el("button", { class: "btn primary", type: "button", onclick: (e) => composeSubmit(e.currentTarget, false) }, icon("send", "icon-sm"), "Send")));
+  openSheet(o.title || "New message", content);
+  setTimeout(() => ((o.to && o.to.length) ? bodyEl : toIn).focus(), 60);
+}
+
+async function composeSubmit(btn, asDraft) {
+  const to = ($("#cmp-to").value || "").trim();
+  const cc = ($("#cmp-cc").value || "").trim();
+  const bcc = ($("#cmp-bcc").value || "").trim();
+  const subject = ($("#cmp-subject").value || "").trim();
+  const body = $("#cmp-body").innerHTML || "";
+  const importance = $("#cmp-importance").value;
+  const rr = $("#cmp-rr").checked;
+  if (!asDraft && !to) { toast("Add at least one recipient", "err"); return; }
+  btn.disabled = true;
+  try {
+    if (asDraft) {
+      await post("/api/v1/mail/draft?" + qs({ account: App.account, to, subject, body }), CAP.mailwrite);
+      toast("Draft saved");
+    } else {
+      const params = { account: App.account, to, cc, bcc, subject, body };
+      if (importance && importance !== "normal") params.importance = importance;
+      if (rr) params.read_receipt = "1";
+      await post("/api/v1/mail/send?" + qs(params), CAP.mailwrite);
+      toast("Message sent");
+    }
+    closeSheet();
+    if (App.route === "mail") renderMailView($("#view"));
+  } catch (e) {
+    toast((asDraft ? "Draft failed: " : "Send failed: ") + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
 // restrained archive-vault illustration for the empty reading pane (trusted in-code SVG)
 const VAULT_SVG = '<svg viewBox="0 0 260 180" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="40" y="34" width="120" height="84" rx="10" opacity="0.35" transform="rotate(-7 100 76)"/><rect x="64" y="44" width="120" height="84" rx="10" opacity="0.6"/><path d="M64 60h120" opacity="0.6"/><circle cx="200" cy="120" r="38" fill="color-mix(in oklab, var(--accent) 10%, transparent)"/><circle cx="200" cy="120" r="38"/><circle cx="200" cy="120" r="14"/><path d="M200 92v10M200 138v10M172 120h10M218 120h10"/></g><path d="M191 119l6 6 12-13" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 function renderMailReader(it, remoteImages = false) {
