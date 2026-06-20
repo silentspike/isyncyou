@@ -722,21 +722,16 @@ impl Router {
             .collect()
     }
 
-    /// Notify the SSE change bus (if any) so every open view reconciles a write
-    /// live — without it, a self-initiated write would only surface on the next
-    /// cloud poll. Best-effort (no bus on the read-only `serve`).
-    fn notify_change(&self) {
-        if let Some(bus) = self.events_bus() {
-            bus.notify();
-        }
-    }
-
-    /// Audit + map a unit mail result to a response; notifies the SSE bus on success.
+    /// Audit + map a unit mail result to a response. NB: we deliberately do NOT
+    /// fire the SSE change bus on a self-write — the daemon doesn't re-sync mail
+    /// into the store on a write, so an SSE-driven re-fetch would read the *stale*
+    /// store and clobber the UI's optimistic update. The frontend's optimistic
+    /// update is the correct immediate feedback; the store reconciles on the next
+    /// backup. (New *incoming* mail live needs daemon mail-sync — a follow-up.)
     fn mail_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
         match r {
             Ok(()) => {
                 let _ = self.audit_account(account, "audit:mail", "ok", what);
-                self.notify_change();
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
             Err(e) => {
@@ -828,7 +823,6 @@ impl Router {
         match h.move_to(account, id, dest) {
             Ok(new_id) => {
                 let _ = self.audit_account(account, "audit:mail", "ok", &format!("move id={id}"));
-                self.notify_change();
                 ApiResponse::ok_json(&json!({ "moved": id, "new_id": new_id }))
             }
             Err(e) => {
@@ -936,7 +930,6 @@ impl Router {
         ) {
             Ok(draft_id) => {
                 let _ = self.audit_account(account, "audit:mail", "ok", "create_draft");
-                self.notify_change();
                 ApiResponse::ok_json(&json!({ "draft_id": draft_id }))
             }
             Err(e) => {
@@ -2393,7 +2386,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn mail_write_notifies_the_sse_bus_on_success() {
+    fn mail_write_does_not_notify_the_sse_bus() {
+        // A self-write must NOT fire the SSE bus: the daemon doesn't re-sync mail
+        // into the store on a write, so an SSE-driven re-fetch would read the stale
+        // store and clobber the frontend's optimistic update (found in #563 live
+        // e2e). The optimistic UI is the correct immediate feedback.
         let (_d, router) = setup();
         let bus = std::sync::Arc::new(EventBus::new());
         let router = router.with_events(bus.clone()).with_mail_write(
@@ -2402,31 +2399,17 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         let g0 = bus.generation();
         let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
-
-        // a successful write notifies the SSE bus so open views reconcile live
         assert_eq!(
             router
                 .route(&tok("/api/v1/mail/read?account=a&id=m1&is_read=1"))
                 .status,
             200
         );
-        assert!(
-            bus.generation() > g0,
-            "successful write must notify the bus"
-        );
-
-        // a rejected write (no cap token) must NOT notify
-        let g1 = bus.generation();
         assert_eq!(
-            router
-                .route(&ApiRequest::new(
-                    "POST",
-                    "/api/v1/mail/read?account=a&id=m1"
-                ))
-                .status,
-            401
+            bus.generation(),
+            g0,
+            "a self-write must not notify (would clobber optimistic UI from a stale re-fetch)"
         );
-        assert_eq!(bus.generation(), g1, "a rejected write must not notify");
     }
 
     /// app.js carries the mail-write cap token placeholder so #563's UI can POST.
