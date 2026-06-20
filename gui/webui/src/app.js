@@ -359,6 +359,10 @@ function svcFilters(service) {
     { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
     { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
     { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
+    { sec: "Status" },
+    { key: "unread", label: "Unread", icon: "mail", count: m => m.filter(it => (it.preview || {}).isRead === false).length },
+    { key: "flagged", label: "Flagged", icon: "flag", count: m => m.filter(it => (it.preview || {}).flag === "flagged").length },
+    { key: "high", label: "High importance", icon: "flag", count: m => m.filter(it => (it.preview || {}).importance === "high").length },
     ...stateFilterSpecs(),
     { sec: "Categories" },
     ...(Mail.cats || []).map(c => ({
@@ -876,6 +880,12 @@ async function renderMailView(view) {
     refreshMailSubnav(); // rebuild the sidebar now that the real categories are known
     fillSubnavCounts("mail", Mail.all);
     mailRenderMetrics(); mailRender();
+    // re-open the message that was selected before a live (SSE) refresh, if it survived
+    if (Mail.pendingSelect) {
+      const keep = Mail.all.find(x => x.remote_id === Mail.pendingSelect);
+      Mail.pendingSelect = null;
+      if (keep) mailSelect(keep);
+    }
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
 }
 // fill an existing .con-metrics-row container in place from card specs
@@ -901,6 +911,9 @@ function mailFiltered() {
   if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
   else if (STATE_KEYS.has(f)) rows = rows.filter(it => stateKey(it) === f);
+  else if (f === "unread") rows = rows.filter(it => (it.preview || {}).isRead === false);
+  else if (f === "flagged") rows = rows.filter(it => (it.preview || {}).flag === "flagged");
+  else if (f === "high") rows = rows.filter(it => (it.preview || {}).importance === "high");
   else if (f !== "all") rows = rows.filter(it => ((it.preview || {}).categories || []).includes(f));
   if (Mail.q) rows = rows.filter(it => { const p = it.preview || {}; return ((p.subject || it.name || "") + " " + (p.from || "") + " " + (p.snippet || "")).toLowerCase().includes(Mail.q); });
   const dir = Mail.sort === "oldest" ? 1 : -1;
@@ -2358,7 +2371,13 @@ let _bdT, _evtT;
 function subscribeEvents() {
   if (!window.EventSource) return;
   const es = new EventSource("/api/v1/events");
-  es.addEventListener("change", () => { clearTimeout(_evtT); _evtT = setTimeout(onRoute, 150); });
+  es.addEventListener("change", () => {
+    clearTimeout(_evtT);
+    // preserve the open message across a live refresh so an SSE tick (new mail /
+    // a reconciled write) doesn't kick the user out of what they're reading.
+    if (App.route === "mail" && Mail.selected) Mail.pendingSelect = Mail.selected.remote_id;
+    _evtT = setTimeout(onRoute, 150);
+  });
 }
 async function init() {
   document.body.append(el("div", { id: "toasts", class: "toasts" }));
