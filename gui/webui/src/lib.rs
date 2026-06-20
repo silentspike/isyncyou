@@ -649,6 +649,7 @@ impl Router {
             "/api/v1/items" => self.items(req),
             "/api/v1/item" => self.item(req),
             "/api/v1/body" => self.body(req),
+            "/api/v1/attachment" => self.attachment(req),
             "/api/v1/view" => self.view(req),
             "/api/v1/open-external" => self.open_external(req),
             "/api/v1/search" => self.search(req),
@@ -1493,6 +1494,54 @@ impl Router {
         }
     }
 
+    /// List (`?account&service&id`) or download (`&index=N`) the attachments of an
+    /// archived mail `.eml` (#562). Listing returns JSON metadata; download serves
+    /// the decoded part bytes with an inert content-type (mapped through the
+    /// attachment filename, `nosniff` always on — never an executable type).
+    fn attachment(&self, req: &ApiRequest) -> ApiResponse {
+        let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
+            (Some(a), Some(s), Some(i)) => (a, s, i),
+            _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
+        };
+        let bytes = match self.read_archived(account, service, id) {
+            Ok((_, b, _)) => b,
+            Err(e) => return e,
+        };
+        match req.q("index") {
+            None => {
+                let list: Vec<Value> = isyncyou_connectors::list_attachments(&bytes)
+                    .into_iter()
+                    .map(|a| {
+                        json!({
+                            "index": a.index,
+                            "filename": a.filename,
+                            "content_type": a.content_type,
+                            "size": a.size,
+                        })
+                    })
+                    .collect();
+                ApiResponse::ok_json(&json!({ "attachments": list }))
+            }
+            Some(idx_s) => {
+                let idx = match idx_s.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return ApiResponse::error(400, "index must be a non-negative integer")
+                    }
+                };
+                match isyncyou_connectors::extract_attachment(&bytes, idx) {
+                    Some((filename, _ct, data)) => ApiResponse {
+                        status: 200,
+                        content_type: safe_content_type(&filename).into(),
+                        body: data,
+                        headers: Vec::new(),
+                    },
+                    None => ApiResponse::error(404, "attachment index out of range"),
+                }
+            }
+        }
+    }
+
     /// Render an archived item as a **safe, self-contained HTML page**: our own
     /// canonical JSON (calendar/contacts/todo/onenote) is escaped into a fixed
     /// skeleton — no untrusted markup, no scripts, no external resources. A mail
@@ -1821,6 +1870,45 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert!(resp.content_type.starts_with("text/html"));
         assert!(String::from_utf8_lossy(&resp.body).contains("iSyncYou"));
+    }
+
+    #[test]
+    fn attachment_lists_and_downloads_with_inert_type() {
+        let (dir, router) = setup();
+        // a real .eml with one PNG attachment at m1's archived path
+        let eml = b"From: a@b.com\r\nSubject: Has attach\r\n\
+Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--B\r\nContent-Type: image/png; name=\"pic.png\"\r\n\
+Content-Disposition: attachment; filename=\"pic.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
+        let p = dir.path().join("arch").join("mail/aa/bb/x.eml");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, eml).unwrap();
+
+        // list
+        let list = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=mail&id=m1",
+        ));
+        assert_eq!(list.status, 200);
+        let v = body_json(&list);
+        assert_eq!(v["attachments"][0]["index"], 0);
+        assert_eq!(v["attachments"][0]["filename"], "pic.png");
+        assert_eq!(v["attachments"][0]["content_type"], "image/png");
+
+        // download index 0 → real PNG bytes, served inert as image/png
+        let dl = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=mail&id=m1&index=0",
+        ));
+        assert_eq!(dl.status, 200);
+        assert_eq!(dl.content_type, "image/png");
+        assert_eq!(&dl.body[..4], b"\x89PNG");
+
+        // out of range → 404
+        let oob = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=mail&id=m1&index=9",
+        ));
+        assert_eq!(oob.status, 404);
     }
 
     #[test]

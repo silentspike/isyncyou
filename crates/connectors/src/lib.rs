@@ -37,8 +37,9 @@ pub use mail::{
     BodyReport, MailReport, MimeFetcher,
 };
 pub use mime::{
-    extract_html, extract_html_with_inline_images, extract_text, mail_preview, set_message_id,
-    HtmlWithInlineImages, InlineImage, MailPreview,
+    extract_attachment, extract_html, extract_html_with_inline_images, extract_text,
+    list_attachments, mail_preview, set_message_id, AttachmentMeta, HtmlWithInlineImages,
+    InlineImage, MailPreview,
 };
 pub use onedrive::{
     apply_local_deletes, apply_local_modifies, incremental_sync, local_rel_path,
