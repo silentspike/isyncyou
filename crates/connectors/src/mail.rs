@@ -60,6 +60,7 @@ pub fn incremental_sync_mail<T: Transport>(
     store: &Store,
     account: &str,
     now: &str,
+    archive_root: &Path,
 ) -> Result<MailReport, SyncError> {
     // Outlook immutable-ID policy (plan §6): make ids stable across folder moves.
     transport.set_prefer_immutable_id(true);
@@ -86,7 +87,7 @@ pub fn incremental_sync_mail<T: Transport>(
             .map(DeltaCursor::new);
         let out = run_delta(transport, &base, cursor.as_ref(), 5)?;
         for msg in &out.items {
-            match ingest_message(store, account, &folder.id, msg, now)? {
+            match ingest_message(store, account, &folder.id, msg, now, archive_root)? {
                 Ingest::Upserted => report.upserted += 1,
                 Ingest::Deleted => report.deleted += 1,
                 Ingest::Skipped => report.skipped += 1,
@@ -200,6 +201,29 @@ pub fn index_mail_bodies(
     Ok(indexed)
 }
 
+/// Archive the full Graph message JSON beside the `.eml` (`mail/<shard>/<id>.json`)
+/// so the backup captures every Outlook property the raw MIME can't carry cleanly
+/// — categories, isRead, flag, importance, cc/bcc, conversationId, webLink,
+/// isDraft, receipt flags (#562). Written at ingest straight from the delta
+/// payload (no extra fetch, no new scope) and rewritten on every change so the
+/// structured fields stay current. Atomic tmp+rename, like the `.eml` path.
+fn write_message_json(archive_root: &Path, id: &str, msg: &Value) -> Result<(), SyncError> {
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(msg).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    Ok(())
+}
+
+/// Drop the archived JSON sidecar when its message is tombstoned.
+fn remove_message_json(archive_root: &Path, id: &str) {
+    let _ = std::fs::remove_file(shard_path(archive_root, SERVICE, id, "json"));
+}
+
 /// Ingest one message-delta entry for a given folder.
 fn ingest_message(
     store: &Store,
@@ -207,6 +231,7 @@ fn ingest_message(
     folder_id: &str,
     msg: &Value,
     now: &str,
+    archive_root: &Path,
 ) -> Result<Ingest, SyncError> {
     let id = msg
         .get("id")
@@ -225,6 +250,7 @@ fn ingest_message(
             .unwrap_or(true);
         if still_here {
             store.mark_deleted(account, SERVICE, id, now)?;
+            remove_message_json(archive_root, id);
             return Ok(Ingest::Deleted);
         }
         return Ok(Ingest::Skipped);
@@ -258,6 +284,8 @@ fn ingest_message(
         .map(String::from);
     it.sync_state = "remote_dirty".into();
     store.upsert_item(&it)?;
+    // Capture the full Graph message JSON beside the .eml (completeness, #562).
+    write_message_json(archive_root, id, msg)?;
     Ok(Ingest::Upserted)
 }
 
@@ -311,6 +339,71 @@ mod tests {
         json!({ "id": id, "@removed": { "reason": "deleted" } })
     }
 
+    /// Run a mail sync against a throwaway archive dir. The JSON sidecar (#562)
+    /// needs a writable root; tests that don't inspect it just discard the dir.
+    fn sync_mail(
+        t: &mut MockTransport,
+        store: &Store,
+        account: &str,
+        now: &str,
+    ) -> Result<MailReport, SyncError> {
+        let arch = tempfile::tempdir().unwrap();
+        incremental_sync_mail(t, store, account, now, arch.path())
+    }
+
+    #[test]
+    fn ingest_writes_full_message_json_sidecar() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let rich = json!({
+            "id": "mr1", "subject": "Rich",
+            "@odata.etag": "W/\"x\"", "changeKey": "x",
+            "receivedDateTime": "2026-01-01T00:00:00Z",
+            "categories": ["Red category", "Work"],
+            "isRead": false,
+            "flag": { "flagStatus": "flagged" },
+            "importance": "high",
+            "ccRecipients": [{ "emailAddress": { "address": "c@x.com" } }],
+            "isDraft": false,
+            "webLink": "https://outlook.live.com/mail/0/x"
+        });
+        let mut t = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA", "Inbox")] })),
+            Response::ok(json!({ "value": [rich], "@odata.deltaLink": "C" })),
+        ]);
+        incremental_sync_mail(&mut t, &store, "acc", "t", arch.path()).unwrap();
+
+        let p = shard_path(arch.path(), SERVICE, "mr1", "json");
+        let v: Value =
+            serde_json::from_slice(&std::fs::read(&p).expect("sidecar json written")).unwrap();
+        assert_eq!(v["categories"][0], "Red category");
+        assert_eq!(v["isRead"], false);
+        assert_eq!(v["flag"]["flagStatus"], "flagged");
+        assert_eq!(v["importance"], "high");
+        assert_eq!(v["ccRecipients"][0]["emailAddress"]["address"], "c@x.com");
+        assert_eq!(v["webLink"], "https://outlook.live.com/mail/0/x");
+    }
+
+    #[test]
+    fn tombstone_removes_the_json_sidecar() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut t1 = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA", "Inbox")] })),
+            Response::ok(json!({ "value": [msg("m9", "Bye")], "@odata.deltaLink": "C1" })),
+        ]);
+        incremental_sync_mail(&mut t1, &store, "acc", "t", arch.path()).unwrap();
+        let p = shard_path(arch.path(), SERVICE, "m9", "json");
+        assert!(p.exists(), "sidecar present after ingest");
+
+        let mut t2 = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA", "Inbox")] })),
+            Response::ok(json!({ "value": [removed("m9")], "@odata.deltaLink": "C2" })),
+        ]);
+        incremental_sync_mail(&mut t2, &store, "acc", "2026-06-02T00:00:00Z", arch.path()).unwrap();
+        assert!(!p.exists(), "sidecar removed after tombstone");
+    }
+
     #[test]
     fn ingests_folders_messages_and_per_folder_cursors() {
         let store = Store::open_in_memory().unwrap();
@@ -321,7 +414,7 @@ mod tests {
             ),
             Response::ok(json!({ "value": [msg("m3","Yo")], "@odata.deltaLink": "CB" })),
         ]);
-        let r = incremental_sync_mail(&mut t, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
+        let r = sync_mail(&mut t, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
         assert_eq!(r.folders, 2);
         assert_eq!(r.upserted, 3);
         assert_eq!(r.deleted, 0);
@@ -377,7 +470,7 @@ mod tests {
             Response::ok(json!({ "value": [msg("m1","Moved")], "@odata.deltaLink": "CB" })),
             Response::ok(json!({ "value": [removed("m1")], "@odata.deltaLink": "CA" })),
         ]);
-        let r = incremental_sync_mail(&mut t, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
+        let r = sync_mail(&mut t, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
         assert_eq!(r.upserted, 1);
         assert_eq!(r.deleted, 0);
         assert_eq!(r.skipped, 1);
@@ -394,13 +487,13 @@ mod tests {
             Response::ok(json!({ "value": [folder("FA","Inbox")] })),
             Response::ok(json!({ "value": [msg("m9","Bye")], "@odata.deltaLink": "C1" })),
         ]);
-        incremental_sync_mail(&mut t1, &store, "acc", "t").unwrap();
+        sync_mail(&mut t1, &store, "acc", "t").unwrap();
         // second sync: FA reports m9 removed -> it still belongs to FA -> tombstone
         let mut t2 = MockTransport::new(vec![
             Response::ok(json!({ "value": [folder("FA","Inbox")] })),
             Response::ok(json!({ "value": [removed("m9")], "@odata.deltaLink": "C2" })),
         ]);
-        let r = incremental_sync_mail(&mut t2, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
+        let r = sync_mail(&mut t2, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
         assert_eq!(r.deleted, 1);
         assert!(store
             .get_item("acc", SERVICE, "m9")
@@ -425,7 +518,7 @@ mod tests {
             Response::ok(json!({ "value": [folder("FA","Inbox")] })),
             Response::ok(json!({ "value": [json!({"id":"mx"})], "@odata.deltaLink": "C" })),
         ]);
-        incremental_sync_mail(&mut t, &store, "acc", "t").unwrap();
+        sync_mail(&mut t, &store, "acc", "t").unwrap();
         assert_eq!(
             store.get_item("acc", SERVICE, "mx").unwrap().unwrap().name,
             "(no subject)"
@@ -541,9 +634,16 @@ mod tests {
             }
         };
         let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let report = incremental_sync_mail(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
-            .expect("live mail sync should succeed");
+        let report = incremental_sync_mail(
+            &mut client,
+            &store,
+            "testuser",
+            "2026-06-02T00:00:00Z",
+            arch.path(),
+        )
+        .expect("live mail sync should succeed");
         assert!(report.folders > 0, "expected at least one mail folder");
         // every well-known folder must have a persisted cursor after the walk
         assert!(store
@@ -572,9 +672,16 @@ mod tests {
             }
         };
         let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let idx = incremental_sync_mail(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
-            .expect("index sync should succeed");
+        let idx = incremental_sync_mail(
+            &mut client,
+            &store,
+            "testuser",
+            "2026-06-02T00:00:00Z",
+            arch.path(),
+        )
+        .expect("index sync should succeed");
         if idx.upserted == 0 {
             eprintln!("no messages to download; skipping body assertions");
             return;

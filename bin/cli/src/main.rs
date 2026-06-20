@@ -1804,8 +1804,14 @@ fn backup_one_account(
         // archive needs `&client`. The mutable borrow ends before the shared one.
         let line = match svc {
             "mail" => {
-                let r = connectors::incremental_sync_mail(&mut client, &store, account, &now)
-                    .map_err(|e| e.to_string())?;
+                let r = connectors::incremental_sync_mail(
+                    &mut client,
+                    &store,
+                    account,
+                    &now,
+                    &archive_root,
+                )
+                .map_err(|e| e.to_string())?;
                 let b = connectors::backup_message_bodies(
                     &client,
                     &store,
