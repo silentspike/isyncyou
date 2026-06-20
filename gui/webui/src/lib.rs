@@ -1353,17 +1353,7 @@ impl Router {
                                 {
                                     if let Some(bytes) = read_under_root(root, rel) {
                                         if service == "mail" {
-                                            let p = isyncyou_connectors::mail_preview(&bytes);
-                                            v["preview"] = json!({
-                                                "from": p.from,
-                                                "to": p.to,
-                                                "subject": p.subject,
-                                                "snippet": p.body_snippet,
-                                                "date": p.date,
-                                                "has_html": p.has_html,
-                                                "attachments": p.attachment_count,
-                                                "size": p.size_bytes,
-                                            });
+                                            mail_preview_enrichment(&mut v, it, root, rel, &bytes);
                                         } else if let Ok(o) =
                                             serde_json::from_slice::<Value>(&bytes)
                                         {
@@ -1779,6 +1769,86 @@ fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>>
     std::fs::read(&p).ok()
 }
 
+/// Build a mail item's `preview` (#562). A `message` carries the `.eml`-parsed
+/// fields (from/to/cc/subject/snippet/date/has_html/size), the attachment list,
+/// and the structured Outlook fields merged from its `<id>.json` sidecar
+/// (categories/isRead/flag/importance/inferenceClassification/bcc/conversationId/
+/// webLink/isDraft/receipt flags). A `category` item exposes its displayName +
+/// colour so the UI can build a colour map. `bytes` is the item's `local_path`
+/// body (`.eml` for a message, `.json` for a category).
+fn mail_preview_enrichment(
+    v: &mut Value,
+    it: &Item,
+    root: &std::path::Path,
+    rel: &str,
+    bytes: &[u8],
+) {
+    match it.item_type.as_str() {
+        "message" => {
+            let p = isyncyou_connectors::mail_preview(bytes);
+            let mut preview = json!({
+                "from": p.from,
+                "to": p.to,
+                "cc": p.cc,
+                "subject": p.subject,
+                "snippet": p.body_snippet,
+                "date": p.date,
+                "has_html": p.has_html,
+                "attachments": p.attachment_count,
+                "size": p.size_bytes,
+            });
+            let atts: Vec<Value> = isyncyou_connectors::list_attachments(bytes)
+                .into_iter()
+                .map(|a| {
+                    json!({
+                        "index": a.index,
+                        "filename": a.filename,
+                        "content_type": a.content_type,
+                        "size": a.size,
+                    })
+                })
+                .collect();
+            preview["attachment_list"] = Value::Array(atts);
+            // Merge the structured Outlook fields from the <id>.json sidecar.
+            if let Some(jrel) = rel.strip_suffix(".eml").map(|s| format!("{s}.json")) {
+                if let Some(jb) = read_under_root(root, &jrel) {
+                    if let Ok(o) = serde_json::from_slice::<Value>(&jb) {
+                        preview["categories"] = o["categories"].clone();
+                        preview["isRead"] = o["isRead"].clone();
+                        preview["flag"] = o["flag"]["flagStatus"].clone();
+                        preview["importance"] = o["importance"].clone();
+                        preview["inferenceClassification"] = o["inferenceClassification"].clone();
+                        preview["conversationId"] = o["conversationId"].clone();
+                        preview["webLink"] = o["webLink"].clone();
+                        preview["isDraft"] = o["isDraft"].clone();
+                        preview["isDeliveryReceiptRequested"] =
+                            o["isDeliveryReceiptRequested"].clone();
+                        preview["isReadReceiptRequested"] = o["isReadReceiptRequested"].clone();
+                        if let Some(bcc) = o["bccRecipients"].as_array() {
+                            preview["bcc"] = Value::Array(
+                                bcc.iter()
+                                    .filter_map(|r| r["emailAddress"]["address"].as_str())
+                                    .map(|s| json!(s))
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+            }
+            v["preview"] = preview;
+        }
+        "category" => {
+            if let Ok(o) = serde_json::from_slice::<Value>(bytes) {
+                v["preview"] = json!({
+                    "displayName": o["displayName"],
+                    "color": o["color"],
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,6 +1979,82 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/attachment?account=a&service=mail&id=m1&index=9",
         ));
         assert_eq!(oob.status, 404);
+    }
+
+    #[test]
+    fn items_mail_preview_exposes_structured_fields_and_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut m = Item::new("a", "mail", "m1", "Hi", "message");
+            m.local_path = Some("mail/aa/bb/msg.eml".into());
+            store.upsert_item(&m).unwrap();
+            let mut c = Item::new("a", "mail", "c1", "Red category", "category");
+            c.local_path = Some("mail/cc/dd/cat.json".into());
+            store.upsert_item(&c).unwrap();
+        }
+        // .eml (cc parsed from headers) + its <id>.json sidecar (structured fields)
+        std::fs::create_dir_all(arch.join("mail/aa/bb")).unwrap();
+        std::fs::write(
+            arch.join("mail/aa/bb/msg.eml"),
+            b"From: a@b.com\r\nTo: t@x.com\r\nCc: c@x.com\r\nSubject: Hi\r\n\r\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            arch.join("mail/aa/bb/msg.json"),
+            serde_json::to_vec(&json!({
+                "categories": ["Red category"],
+                "isRead": false,
+                "flag": { "flagStatus": "flagged" },
+                "importance": "high",
+                "webLink": "https://outlook/x",
+                "isDraft": false,
+                "bccRecipients": [{ "emailAddress": { "address": "b@x.com" } }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // category snapshot
+        std::fs::create_dir_all(arch.join("mail/cc/dd")).unwrap();
+        std::fs::write(
+            arch.join("mail/cc/dd/cat.json"),
+            serde_json::to_vec(&json!({ "displayName": "Red category", "color": "preset0" }))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=mail&limit=100",
+        ));
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        let items = v["items"].as_array().unwrap();
+
+        let msg = items.iter().find(|i| i["remote_id"] == "m1").unwrap();
+        assert_eq!(msg["preview"]["cc"][0], "c@x.com");
+        assert_eq!(msg["preview"]["categories"][0], "Red category");
+        assert_eq!(msg["preview"]["isRead"], false);
+        assert_eq!(msg["preview"]["flag"], "flagged");
+        assert_eq!(msg["preview"]["importance"], "high");
+        assert_eq!(msg["preview"]["webLink"], "https://outlook/x");
+        assert_eq!(msg["preview"]["bcc"][0], "b@x.com");
+
+        let cat = items.iter().find(|i| i["remote_id"] == "c1").unwrap();
+        assert_eq!(cat["preview"]["displayName"], "Red category");
+        assert_eq!(cat["preview"]["color"], "preset0");
     }
 
     #[test]
