@@ -1180,7 +1180,8 @@ function renderMailReader(it, remoteImages = false) {
   if (it.has_body) actions.append(remoteImages
     ? el("button", { class: "btn ghost sm", title: "Block external content again (privacy)", onclick: () => renderMailReader(it, false) }, icon("shield", "icon-sm"), "Hide external content")
     : el("button", { class: "btn ghost sm", title: "Load external content — images & web fonts (may notify the sender you opened it)", onclick: () => renderMailReader(it, true) }, icon("globe", "icon-sm"), "Load external content"));
-  actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
+  actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open the archived copy in a new tab" }, icon("external-link", "icon-sm")));
+  if (p.webLink) actions.append(el("a", { class: "btn ghost sm", href: p.webLink, target: "_blank", rel: "noopener", title: "Open the live message in Outlook on the web" }, icon("globe", "icon-sm"), "Outlook"));
   if (CAP.mailwrite) {
     const read = (it.preview || {}).isRead !== false;
     const flagged = (it.preview || {}).flag === "flagged";
@@ -1199,6 +1200,9 @@ function renderMailReader(it, remoteImages = false) {
       el("div", { class: "grow", style: "min-width:0" },
         el("div", { class: "mr-tags" }, categoryChips(it),
           p.attachments > 0 ? el("span", { class: "mi-chip" }, icon("paperclip", "icon-sm"), p.attachments + (p.attachments === 1 ? " attachment" : " attachments")) : null,
+          (p.importance === "high" || p.importance === "low") ? el("span", { class: "mi-chip imp-" + p.importance, title: "Importance: " + p.importance }, icon("flag", "icon-sm"), p.importance === "high" ? "High" : "Low") : null,
+          p.flag === "flagged" ? el("span", { class: "mi-chip flag-on", title: "Flagged for follow-up" }, icon("flag", "icon-sm"), "Flagged") : null,
+          p.isRead === false ? el("span", { class: "mi-chip unread-chip", title: "Unread" }, "Unread") : null,
           coverageBadge(it),
           verifyChip(it)),
         el("h2", { class: "mr-subject", text: subject }),
@@ -1207,7 +1211,9 @@ function renderMailReader(it, remoteImages = false) {
           el("div", { class: "grow", style: "min-width:0" },
             el("div", { class: "mr-from truncate" }, el("b", { text: from.name || from.email || "(unknown sender)" }),
               from.name && from.email ? el("span", { class: "dim", text: " <" + from.email + ">" }) : null),
-            (p.to && p.to.length) ? el("div", { class: "mr-to dim truncate", text: "To: " + p.to.join(", ") }) : null),
+            (p.to && p.to.length) ? el("div", { class: "mr-to dim truncate", text: "To: " + p.to.join(", ") }) : null,
+            (p.cc && p.cc.length) ? el("div", { class: "mr-to dim truncate", text: "Cc: " + p.cc.join(", ") }) : null,
+            (p.bcc && p.bcc.length) ? el("div", { class: "mr-to dim truncate", text: "Bcc: " + p.bcc.join(", ") }) : null),
           el("span", { class: "mr-date dim tnum", text: fmtFullDate(when) }))),
       actions));
   // The body is a same-origin sandboxed iframe. Size it to its own content on
@@ -1235,6 +1241,18 @@ function renderMailReader(it, remoteImages = false) {
     } catch { /* cross-origin */ }
     [120, 400, 1000, 2500].forEach(t => setTimeout(fit, t));   // fallback for late reflows
   });
+  const atts = p.attachment_list || [];
+  if (atts.length) {
+    box.append(el("div", { class: "mr-attachments" },
+      atts.map(a => el("a", {
+        class: "mr-att", target: "_blank", rel: "noopener",
+        href: `/api/v1/attachment?${qs({ account: App.account, service: "mail", id: it.remote_id, index: a.index })}`,
+        download: a.filename || ("attachment-" + a.index),
+        title: (a.filename || "attachment") + " · " + (a.content_type || ""),
+      }, icon("paperclip", "icon-sm"),
+        el("span", { class: "truncate", text: a.filename || "attachment" }),
+        el("span", { class: "dim mr-att-size", text: fmtSize(a.size) })))));
+  }
   box.append(el("div", { class: "mail-frame-scroll" }, frame));
 }
 function metricCard(icn, val, label) {

@@ -1082,3 +1082,13 @@ a:hover { text-decoration: underline; }
 .mi-flag.on { color: var(--warn); }
 .btn.icon-only.on { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); }
 .btn.danger:hover { color: var(--err); border-color: color-mix(in oklab, var(--err) 40%, transparent); }
+
+/* reader indicators + attachments (#563 B6) */
+.mr-attachments { display: flex; flex-wrap: wrap; gap: var(--sp-2); padding: var(--sp-3) 0; }
+.mr-att { display: inline-flex; align-items: center; gap: 6px; max-width: 280px; padding: 6px var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-2); color: var(--text-hi); font-size: var(--fs-sm); }
+.mr-att:hover { border-color: var(--accent-line); background: var(--bg-3); }
+.mr-att-size { font-size: var(--fs-xs); white-space: nowrap; }
+.mi-chip.imp-high { color: var(--err); border-color: color-mix(in oklab, var(--err) 30%, transparent); }
+.mi-chip.imp-low { color: var(--text-lo); }
+.mi-chip.flag-on { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 30%, transparent); }
+.mi-chip.unread-chip { color: var(--accent-2); border-color: var(--accent-line); }
