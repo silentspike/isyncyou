@@ -8,6 +8,7 @@
 //! identity instead of being lost: we only tombstone a removal if the message
 //! still belongs to the folder reporting it.
 
+use crate::archive::{ArchiveReport, JsonFetcher};
 use crate::common::{fetch_pages, shard_path};
 use crate::mime::extract_text;
 use crate::onedrive::SyncError;
@@ -199,6 +200,99 @@ pub fn index_mail_bodies(
         indexed += 1;
     }
     Ok(indexed)
+}
+
+/// Upsert a JSON-snapshot store item under `service="mail"` and archive its
+/// canonical JSON to `mail/<shard>/<id>.json` (atomic tmp+rename), recording the
+/// relative path as `local_path`. Shared by the mailbox-flank snapshots. Returns
+/// the byte count written.
+fn archive_json_item(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    id: &str,
+    name: &str,
+    item_type: &str,
+    value: &Value,
+) -> Result<u64, SyncError> {
+    let mut it = Item::new(account, SERVICE, id, name, item_type);
+    it.sync_state = "remote_dirty".into();
+    store.upsert_item(&it)?;
+
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+    store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// Back up the mailbox configuration flanks (#562) as JSON snapshots under
+/// `service="mail"`: mailbox settings (`/me/mailboxSettings`, one
+/// `mailbox-setting` item), inbox message rules
+/// (`/me/mailFolders/inbox/messageRules`, one `rule-set` item), and master
+/// categories (`/me/outlook/masterCategories`, one `category` item **per
+/// category** so the UI can read each colour). Re-fetched each pass (the data is
+/// small) so it stays current. Needs `MailboxSettings.Read` (S-P4.1, #558).
+pub fn backup_mailbox_flanks<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<ArchiveReport, SyncError> {
+    let mut report = ArchiveReport::default();
+
+    let settings = fetcher
+        .fetch_json("/me/mailboxSettings")
+        .map_err(SyncError::Remote)?;
+    report.bytes += archive_json_item(
+        store,
+        account,
+        archive_root,
+        "_mailbox_settings",
+        "Mailbox settings",
+        "mailbox-setting",
+        &settings,
+    )?;
+    report.archived += 1;
+
+    let rules = fetcher
+        .fetch_json("/me/mailFolders/inbox/messageRules")
+        .map_err(SyncError::Remote)?;
+    report.bytes += archive_json_item(
+        store,
+        account,
+        archive_root,
+        "_inbox_rules",
+        "Inbox rules",
+        "rule-set",
+        &rules,
+    )?;
+    report.archived += 1;
+
+    let cats = fetcher
+        .fetch_json("/me/outlook/masterCategories")
+        .map_err(SyncError::Remote)?;
+    for cat in cats
+        .get("value")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = cat.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = cat.get("displayName").and_then(Value::as_str).unwrap_or(id);
+        report.bytes += archive_json_item(store, account, archive_root, id, name, "category", cat)?;
+        report.archived += 1;
+    }
+
+    Ok(report)
 }
 
 /// Archive the full Graph message JSON beside the `.eml` (`mail/<shard>/<id>.json`)
@@ -402,6 +496,73 @@ mod tests {
         ]);
         incremental_sync_mail(&mut t2, &store, "acc", "2026-06-02T00:00:00Z", arch.path()).unwrap();
         assert!(!p.exists(), "sidecar removed after tombstone");
+    }
+
+    /// Canned JsonFetcher keyed by url, for the flank-connector test.
+    struct MockJson(std::collections::HashMap<String, Value>);
+    impl JsonFetcher for MockJson {
+        fn fetch_json(&self, url: &str) -> Result<Value, String> {
+            self.0
+                .get(url)
+                .cloned()
+                .ok_or_else(|| format!("no mock for {url}"))
+        }
+    }
+
+    #[test]
+    fn backup_mailbox_flanks_snapshots_settings_rules_and_categories() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "/me/mailboxSettings".to_string(),
+            json!({ "timeZone": "UTC", "language": { "locale": "en-US" } }),
+        );
+        m.insert(
+            "/me/mailFolders/inbox/messageRules".to_string(),
+            json!({ "value": [{ "id": "r1", "displayName": "To Archive" }] }),
+        );
+        m.insert(
+            "/me/outlook/masterCategories".to_string(),
+            json!({ "value": [
+                { "id": "c1", "displayName": "Red category", "color": "preset0" },
+                { "id": "c2", "displayName": "Work", "color": "preset5" }
+            ] }),
+        );
+        let report = backup_mailbox_flanks(&MockJson(m), &store, "acc", arch.path()).unwrap();
+        assert_eq!(report.archived, 4); // settings + rules + 2 categories
+
+        // store items with the right types
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_mailbox_settings")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "mailbox-setting"
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_inbox_rules")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "rule-set"
+        );
+        let c1 = store.get_item("acc", SERVICE, "c1").unwrap().unwrap();
+        assert_eq!(c1.item_type, "category");
+        assert_eq!(c1.name, "Red category");
+
+        // each category archived with displayName + color
+        let pc = shard_path(arch.path(), SERVICE, "c1", "json");
+        let vc: Value = serde_json::from_slice(&std::fs::read(&pc).unwrap()).unwrap();
+        assert_eq!(vc["displayName"], "Red category");
+        assert_eq!(vc["color"], "preset0");
+
+        // settings snapshot archived
+        let ps = shard_path(arch.path(), SERVICE, "_mailbox_settings", "json");
+        let vs: Value = serde_json::from_slice(&std::fs::read(&ps).unwrap()).unwrap();
+        assert_eq!(vs["timeZone"], "UTC");
     }
 
     #[test]

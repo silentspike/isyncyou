@@ -33,8 +33,8 @@ pub use calendar::{incremental_sync_calendar, CalendarReport};
 pub use contacts::{backup_contact_photos, incremental_sync_contacts, ContactsReport, PhotoReport};
 pub use export::{contact_to_vcard, event_to_ics};
 pub use mail::{
-    backup_message_bodies, incremental_sync_mail, index_mail_bodies, BodyReport, MailReport,
-    MimeFetcher,
+    backup_mailbox_flanks, backup_message_bodies, incremental_sync_mail, index_mail_bodies,
+    BodyReport, MailReport, MimeFetcher,
 };
 pub use mime::{
     extract_html, extract_html_with_inline_images, extract_text, mail_preview, set_message_id,
