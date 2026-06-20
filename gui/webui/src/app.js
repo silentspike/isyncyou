@@ -346,7 +346,7 @@ const SHAREABLE = new Set(["onedrive"]);
 /* ---------------------------------------------------------------- global state */
 const App = { account: null, accounts: [], route: "overview", counts: {}, svcFilter: {} };
 // Per-service filter sub-items shown in the LEFT sidebar, indented under the
-// active service (NOT a separate rail). Lazy so MAIL_CATS is defined at call.
+// active service (NOT a separate rail). Lazy so Mail.cats is populated at call.
 function svcFilters(service) {
   if (service === "mail") return [
     { sec: "Mailbox" },
@@ -355,7 +355,12 @@ function svcFilters(service) {
     { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
     ...stateFilterSpecs(),
     { sec: "Categories" },
-    ...MAIL_CATS.map(c => ({ key: c.key, label: c.label, icon: c.icon, color: c.color, count: m => m.filter(it => mailCat(it).key === c.key).length })),
+    ...(Mail.cats || []).map(c => ({
+      key: c.name,
+      label: c.name,
+      color: presetColor((c.preview || {}).color),
+      count: m => m.filter(it => ((it.preview || {}).categories || []).includes(c.name)).length,
+    })),
   ];
   if (service === "contacts") return [
     { sec: "Directory" },
@@ -390,6 +395,23 @@ function fillSubnavCounts(service, items) {
     if (c) c.textContent = String(f.count(items));
   });
 }
+// Rebuild one service's sidebar sub-items in place (without re-rendering the
+// shell, which would wipe the active view). Used after mail loads so the real
+// Outlook categories appear (they're only known once the items are fetched).
+function rebuildSubnav(service) {
+  const host = $(`#subnav-${service}`);
+  const specs = svcFilters(service);
+  if (!host || !specs) return;
+  clear(host);
+  specs.forEach(f => {
+    if (f.sec) { host.append(el("div", { class: "nav-sub-sec", text: f.sec })); return; }
+    host.append(el("button", { class: "nav-subitem" + (svcFilter(service) === f.key ? " active" : ""), dataset: { k: f.key }, onclick: () => setSvcFilter(service, f.key) },
+      f.color ? el("span", { class: "nav-sub-dot", style: `background:${f.color}` }) : icon(f.icon, "icon-sm"),
+      el("span", { class: "grow truncate", text: f.label }),
+      el("span", { class: "count tnum", dataset: { cnt: f.key }, text: "·" })));
+  });
+}
+const refreshMailSubnav = () => rebuildSubnav("mail");
 
 /* ---------------------------------------------------------------- toasts */
 function toast(msg, kind = "ok") {
@@ -783,17 +805,27 @@ async function doServiceSearch(service) {
 // `folders` accumulates the folder items we skip so the displayed count reflects
 // real messages (folders sort before messages, so the message total is exact).
 const Mail = { all: [], filter: "all", sort: "newest", q: "", selected: null };
-// auto-categorisation by sender/subject keywords (a labelled heuristic, not metadata)
-const MAIL_CATS = [
-  { key: "security", label: "Security", color: "#f85149", icon: "shield", re: /secur|verif|\bcode\b|login|sign[\s-]?in|password|\b2fa\b|\botp\b|alert|suspicious/i },
-  { key: "billing", label: "Billing", color: "#3fb950", icon: "file-text", re: /invoice|payment|receipt|billing|subscription|renew|paypal|distrokid|\border\b|charged|refund/i },
-  { key: "social", label: "Social", color: "#a371f7", icon: "users", re: /instagram|facebook|twitter|linkedin|tiktok|snapchat|social|follow|friend|tagged|mention/i },
-  { key: "promo", label: "Promotions", color: "#d29922", icon: "mail", re: /spotify|newsletter|offer|\bdeal|\bsale\b|promo|unsubscribe|marketing|discount|\b% off/i },
-];
-function mailCat(it) {
-  const p = it.preview || {};
-  const hay = ((p.from || "") + " " + (p.subject || it.name || "")).toLowerCase();
-  return MAIL_CATS.find(c => c.re.test(hay)) || { key: "other", label: "Other", color: "#768390", icon: "mail" };
+// Real Outlook categories (#563): the master-category colour map (preset0..24)
+// is built on load from the backed-up `category` items (#562) — no keyword
+// heuristic. Each message carries its real `categories` list in the preview.
+const PRESET_COLORS = {
+  preset0: "#e74c3c", preset1: "#e67e22", preset2: "#8d6e63", preset3: "#f1c40f", preset4: "#2ecc71",
+  preset5: "#1abc9c", preset6: "#9aa700", preset7: "#3498db", preset8: "#9b59b6", preset9: "#e84393",
+  preset10: "#95a5a6", preset11: "#607d8b", preset12: "#b2bec3", preset13: "#7f8c8d", preset14: "#2c3e50",
+  preset15: "#c0392b", preset16: "#d35400", preset17: "#5d4037", preset18: "#f39c12", preset19: "#27ae60",
+  preset20: "#16a085", preset21: "#6b7a00", preset22: "#2980b9", preset23: "#8e44ad", preset24: "#ad1457",
+};
+const presetColor = (preset) => PRESET_COLORS[preset] || "var(--text-lo)";
+const categoryColor = (name) => (Mail.catColor && Mail.catColor.get(name)) || "var(--text-lo)";
+// One chip per real category (colour from the master-category map). Empty → [].
+function categoryChips(it) {
+  return ((it.preview || {}).categories || [])
+    .map(name => el("span", { class: "mi-cat", style: `--c:${categoryColor(name)}`, text: name }));
+}
+// Avatar tint: the first category's colour, else the mail service colour.
+function mailAvatarColor(it) {
+  const cats = (it.preview || {}).categories || [];
+  return cats.length ? categoryColor(cats[0]) : "var(--svc-mail)";
 }
 const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || it.remote_mtime) || new Date(0); };
 
@@ -828,8 +860,12 @@ async function renderMailView(view) {
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
     ]);
     Mail.all = (d.items || []).filter(it => it.item_type === "message");
+    // real Outlook categories (#562): build the displayName → colour map
+    Mail.cats = (d.items || []).filter(it => it.item_type === "category");
+    Mail.catColor = new Map(Mail.cats.map(c => [c.name, presetColor((c.preview || {}).color)]));
     Mail.runs = act.runs || [];
     App.counts.mail = Mail.all.length; updateNavCounts();
+    refreshMailSubnav(); // rebuild the sidebar now that the real categories are known
     fillSubnavCounts("mail", Mail.all);
     mailRenderMetrics(); mailRender();
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
@@ -857,7 +893,7 @@ function mailFiltered() {
   if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
   else if (STATE_KEYS.has(f)) rows = rows.filter(it => stateKey(it) === f);
-  else if (f !== "all") rows = rows.filter(it => mailCat(it).key === f);
+  else if (f !== "all") rows = rows.filter(it => ((it.preview || {}).categories || []).includes(f));
   if (Mail.q) rows = rows.filter(it => { const p = it.preview || {}; return ((p.subject || it.name || "") + " " + (p.from || "") + " " + (p.snippet || "")).toLowerCase().includes(Mail.q); });
   const dir = Mail.sort === "oldest" ? 1 : -1;
   if (Mail.sort === "sender") rows = rows.slice().sort((a, b) => addrLabel((a.preview || {}).from).localeCompare(addrLabel((b.preview || {}).from)));
@@ -878,14 +914,14 @@ function mailRender() {
   list.append(frag);
 }
 function mailRow(it) {
-  const p = it.preview || {}, cat = mailCat(it);
+  const p = it.preview || {};
   const from = addrLabel(p.from), subject = p.subject || it.name || "(no subject)";
   const sel = Mail.selected && Mail.selected.remote_id === it.remote_id;
   const badges = el("div", { class: "mi-badges" });
   if (p.attachments > 0) badges.append(el("span", { class: "mi-chip", title: p.attachments + " attachment(s)" }, icon("paperclip", "icon-sm"), String(p.attachments)));
-  badges.append(el("span", { class: "mi-cat", style: `--c:${cat.color}`, text: cat.label }));
+  categoryChips(it).forEach(c => badges.append(c));
   return el("button", { class: "mail-item" + (sel ? " active" : ""), dataset: { id: it.remote_id }, onclick: () => mailSelect(it) },
-    el("span", { class: "avatar mail-av", style: `--c:${cat.color}`, text: initials(from || subject) }),
+    el("span", { class: "avatar mail-av", style: `--c:${mailAvatarColor(it)}`, text: initials(from || subject) }),
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "mi-top" }, el("span", { class: "mi-from truncate", text: from || "(unknown sender)" }),
         el("span", { class: "mi-date dim tnum", text: fmtDate(p.date || it.remote_mtime) })),
@@ -923,7 +959,7 @@ function renderMailReader(it, remoteImages = false) {
         el("button", { class: "btn sm", onclick: () => go("overview") }, icon("clock", "icon-sm"), "View sync log"))));
     return;
   }
-  const p = it.preview || {}, from = parseAddr(p.from), cat = mailCat(it);
+  const p = it.preview || {}, from = parseAddr(p.from);
   const subject = p.subject || it.name || "(no subject)", when = p.date || it.remote_mtime;
   const q = { account: App.account, service: "mail", id: it.remote_id };
   const viewQ = remoteImages ? { ...q, external: "1" } : q;
@@ -937,13 +973,13 @@ function renderMailReader(it, remoteImages = false) {
     el("header", { class: "mail-reader-head" },
       el("button", { class: "mail-back btn ghost sm", title: "Back", onclick: mailBack }, icon("chevron-left", "icon-sm")),
       el("div", { class: "grow", style: "min-width:0" },
-        el("div", { class: "mr-tags" }, el("span", { class: "mi-cat", style: `--c:${cat.color}`, text: cat.label }),
+        el("div", { class: "mr-tags" }, categoryChips(it),
           p.attachments > 0 ? el("span", { class: "mi-chip" }, icon("paperclip", "icon-sm"), p.attachments + (p.attachments === 1 ? " attachment" : " attachments")) : null,
           coverageBadge(it),
           verifyChip(it)),
         el("h2", { class: "mr-subject", text: subject }),
         el("div", { class: "mr-meta" },
-          el("span", { class: "avatar mail-av", style: `--c:${cat.color}`, text: initials(from.name || from.email || subject) }),
+          el("span", { class: "avatar mail-av", style: `--c:${mailAvatarColor(it)}`, text: initials(from.name || from.email || subject) }),
           el("div", { class: "grow", style: "min-width:0" },
             el("div", { class: "mr-from truncate" }, el("b", { text: from.name || from.email || "(unknown sender)" }),
               from.name && from.email ? el("span", { class: "dim", text: " <" + from.email + ">" }) : null),
