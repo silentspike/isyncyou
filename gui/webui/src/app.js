@@ -870,6 +870,7 @@ async function renderMailView(view) {
     // real Outlook categories (#562): build the displayName → colour map
     Mail.cats = (d.items || []).filter(it => it.item_type === "category");
     Mail.catColor = new Map(Mail.cats.map(c => [c.name, presetColor((c.preview || {}).color)]));
+    Mail.folders = (d.items || []).filter(it => it.item_type === "folder"); // move targets (#563 B5)
     Mail.runs = act.runs || [];
     App.counts.mail = Mail.all.length; updateNavCounts();
     refreshMailSubnav(); // rebuild the sidebar now that the real categories are known
@@ -927,7 +928,12 @@ function mailRow(it) {
   const badges = el("div", { class: "mi-badges" });
   if (p.attachments > 0) badges.append(el("span", { class: "mi-chip", title: p.attachments + " attachment(s)" }, icon("paperclip", "icon-sm"), String(p.attachments)));
   categoryChips(it).forEach(c => badges.append(c));
-  return el("button", { class: "mail-item" + (sel ? " active" : ""), dataset: { id: it.remote_id }, onclick: () => mailSelect(it) },
+  if (CAP.mailwrite) {
+    const flagged = p.flag === "flagged";
+    badges.append(el("button", { class: "mi-flag" + (flagged ? " on" : ""), title: flagged ? "Clear flag" : "Flag",
+      onclick: (e) => { e.stopPropagation(); mailSetFlag(it, flagged ? "notFlagged" : "flagged"); } }, icon("flag", "icon-sm")));
+  }
+  return el("button", { class: "mail-item" + (sel ? " active" : "") + (p.isRead === false ? " unread" : ""), dataset: { id: it.remote_id }, onclick: () => mailSelect(it) },
     el("span", { class: "avatar mail-av", style: `--c:${mailAvatarColor(it)}`, text: initials(from || subject) }),
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "mi-top" }, el("span", { class: "mi-from truncate", text: from || "(unknown sender)" }),
@@ -1065,6 +1071,79 @@ async function replyForwardSubmit(btn, it, mode) {
     if (App.route === "mail") renderMailView($("#view"));
   } catch (e) { toast("Reply failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
+
+/* ---- per-message manage (#563 B5): optimistic local update, reconcile on the
+   server's SSE notify (B1); revert + toast on failure. ---- */
+function mailRerender(it) {
+  mailRender();
+  if (Mail.selected && Mail.selected.remote_id === it.remote_id) renderMailReader(it);
+}
+async function mailManage(it, optimistic, revert, path) {
+  optimistic(it.preview = it.preview || {});
+  mailRerender(it);
+  try {
+    await post(path, CAP.mailwrite);
+  } catch (e) {
+    revert(it.preview);
+    mailRerender(it);
+    toast("Action failed: " + e.message, "err");
+  }
+}
+const mailSetRead = (it, isRead) => mailManage(
+  it, p => { p.isRead = isRead; }, () => { (it.preview || {}).isRead = !isRead; },
+  "/api/v1/mail/read?" + qs({ account: App.account, id: it.remote_id, is_read: isRead ? "1" : "0" }));
+const mailSetFlag = (it, status) => { const prev = (it.preview || {}).flag; return mailManage(
+  it, p => { p.flag = status; }, p => { p.flag = prev; },
+  "/api/v1/mail/flag?" + qs({ account: App.account, id: it.remote_id, status })); };
+const mailSetCategories = (it, cats) => { const prev = (it.preview || {}).categories; return mailManage(
+  it, p => { p.categories = cats; }, p => { p.categories = prev; },
+  "/api/v1/mail/categories?" + qs({ account: App.account, id: it.remote_id, categories: cats.join(",") })); };
+
+// Move changes the message id, so optimistically drop it from the current list;
+// the SSE refresh (B1) brings the authoritative state.
+async function mailMove(it, destination, label) {
+  try {
+    await post("/api/v1/mail/move?" + qs({ account: App.account, id: it.remote_id, destination }), CAP.mailwrite);
+    toast(`Moved to ${label}`);
+    Mail.all = Mail.all.filter(x => x.remote_id !== it.remote_id);
+    if (Mail.selected && Mail.selected.remote_id === it.remote_id) mailBack();
+    mailRender();
+  } catch (e) { toast("Move failed: " + e.message, "err"); }
+}
+function mailDelete(it) {
+  if (!confirm("Move this message to Deleted Items?")) return;
+  mailMove(it, "deleteditems", "Deleted Items");
+}
+
+function openCategoryPicker(it) {
+  if (!CAP.mailwrite) return;
+  const cur = new Set((it.preview || {}).categories || []);
+  const boxes = (Mail.cats || []).map(c => {
+    const cb = el("input", { type: "checkbox", value: c.name });
+    if (cur.has(c.name)) cb.checked = true;
+    return el("label", { class: "pick-row" }, cb,
+      el("span", { class: "nav-sub-dot", style: `background:${presetColor((c.preview || {}).color)}` }),
+      el("span", { class: "grow truncate", text: c.name }));
+  });
+  const content = el("div", { class: "compose" },
+    boxes.length ? el("div", { class: "pick-list" }, boxes) : el("p", { class: "dim", text: "No categories defined in this mailbox." }),
+    el("div", { class: "cmp-footer" }, el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: () => {
+        const sel = boxes.map(b => b.querySelector("input")).filter(i => i.checked).map(i => i.value);
+        closeSheet(); mailSetCategories(it, sel);
+      } }, "Apply")));
+  openSheet("Categories", content);
+}
+
+function openMovePicker(it) {
+  if (!CAP.mailwrite) return;
+  const folders = (Mail.folders || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const rows = folders.map(f => el("button", { class: "pick-row pick-btn", type: "button", onclick: () => { closeSheet(); mailMove(it, f.remote_id, f.name); } },
+    icon("folder", "icon-sm"), el("span", { class: "grow truncate", text: f.name || "(folder)" })));
+  const content = el("div", { class: "compose" },
+    rows.length ? el("div", { class: "pick-list" }, rows) : el("p", { class: "dim", text: "No folders found." }));
+  openSheet("Move to folder", content);
+}
 // restrained archive-vault illustration for the empty reading pane (trusted in-code SVG)
 const VAULT_SVG = '<svg viewBox="0 0 260 180" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="40" y="34" width="120" height="84" rx="10" opacity="0.35" transform="rotate(-7 100 76)"/><rect x="64" y="44" width="120" height="84" rx="10" opacity="0.6"/><path d="M64 60h120" opacity="0.6"/><circle cx="200" cy="120" r="38" fill="color-mix(in oklab, var(--accent) 10%, transparent)"/><circle cx="200" cy="120" r="38"/><circle cx="200" cy="120" r="14"/><path d="M200 92v10M200 138v10M172 120h10M218 120h10"/></g><path d="M191 119l6 6 12-13" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 function renderMailReader(it, remoteImages = false) {
@@ -1102,6 +1181,17 @@ function renderMailReader(it, remoteImages = false) {
     ? el("button", { class: "btn ghost sm", title: "Block external content again (privacy)", onclick: () => renderMailReader(it, false) }, icon("shield", "icon-sm"), "Hide external content")
     : el("button", { class: "btn ghost sm", title: "Load external content — images & web fonts (may notify the sender you opened it)", onclick: () => renderMailReader(it, true) }, icon("globe", "icon-sm"), "Load external content"));
   actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
+  if (CAP.mailwrite) {
+    const read = (it.preview || {}).isRead !== false;
+    const flagged = (it.preview || {}).flag === "flagged";
+    actions.append(
+      el("button", { class: "btn ghost sm icon-only", title: read ? "Mark unread" : "Mark read", onclick: () => mailSetRead(it, !read) }, icon(read ? "mail" : "mail-open", "icon-sm")),
+      el("button", { class: "btn ghost sm icon-only" + (flagged ? " on" : ""), title: flagged ? "Clear flag" : "Flag", onclick: () => mailSetFlag(it, flagged ? "notFlagged" : "flagged") }, icon("flag", "icon-sm")),
+      el("button", { class: "btn ghost sm icon-only", title: "Categories", onclick: () => openCategoryPicker(it) }, icon("tag", "icon-sm")),
+      el("button", { class: "btn ghost sm icon-only", title: "Move to folder", onclick: () => openMovePicker(it) }, icon("folder", "icon-sm")),
+      el("button", { class: "btn ghost sm icon-only danger", title: "Delete (to Deleted Items)", onclick: () => mailDelete(it) }, icon("trash-2", "icon-sm")),
+    );
+  }
   if (CAP.restore) actions.append(el("button", { class: "btn sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
   box.append(
     el("header", { class: "mail-reader-head" },

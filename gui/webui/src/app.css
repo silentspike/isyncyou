@@ -1070,3 +1070,15 @@ a:hover { text-decoration: underline; }
 .cmp-quote { border-left: 3px solid var(--line-2); padding: var(--sp-2) var(--sp-3); background: var(--bg-2); border-radius: 0 var(--r-sm) var(--r-sm) 0; }
 .cmp-quote-h { font-size: var(--fs-xs); margin-bottom: 4px; }
 .cmp-quote-b { font-size: var(--fs-sm); display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* per-message manage: pickers + states (#563 B5) */
+.pick-list { display: flex; flex-direction: column; gap: 2px; max-height: 50vh; overflow: auto; }
+.pick-row { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-radius: var(--r-sm); cursor: pointer; }
+.pick-row:hover { background: var(--bg-hover); }
+.pick-btn { width: 100%; text-align: left; background: transparent; border: 0; color: var(--text-hi); font: inherit; }
+.mail-item.unread .mi-from, .mail-item.unread .mi-subject { font-weight: 700; color: var(--text-hi); }
+.mi-flag { display: inline-flex; padding: 2px; border: 0; background: transparent; color: var(--text-lo); border-radius: var(--r-sm); cursor: pointer; }
+.mi-flag:hover { color: var(--warn); background: var(--bg-2); }
+.mi-flag.on { color: var(--warn); }
+.btn.icon-only.on { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); }
+.btn.danger:hover { color: var(--err); border-color: color-mix(in oklab, var(--err) 40%, transparent); }
