@@ -1063,3 +1063,10 @@ a:hover { text-decoration: underline; }
 .cmp-footer { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; padding-top: var(--sp-3); border-top: 1px solid var(--line); }
 .cmp-opt { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--text-mid); }
 .cmp-imp { width: auto; padding: 4px var(--sp-2); }
+/* reply / forward */
+.cmp-textarea { width: 100%; min-height: 140px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-md); color: var(--text-hi); font: inherit; line-height: 1.55; }
+.cmp-textarea:focus { outline: none; border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-soft); }
+.cmp-replyto, .cmp-subject-ro { font-size: var(--fs-sm); }
+.cmp-quote { border-left: 3px solid var(--line-2); padding: var(--sp-2) var(--sp-3); background: var(--bg-2); border-radius: 0 var(--r-sm) var(--r-sm) 0; }
+.cmp-quote-h { font-size: var(--fs-xs); margin-bottom: 4px; }
+.cmp-quote-b { font-size: var(--fs-sm); display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }

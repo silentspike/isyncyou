@@ -1011,6 +1011,60 @@ async function composeSubmit(btn, asDraft) {
     btn.disabled = false;
   }
 }
+
+// Reply / reply-all / forward (#563). Graph quotes the original server-side, so
+// the sheet only needs the user's comment (+ recipients for forward); the
+// original is shown read-only via textContent (never innerHTML on cloud HTML).
+function openReplyForward(it, mode) {
+  if (!CAP.mailwrite) return;
+  const p = it.preview || {};
+  const title = mode === "forward" ? "Forward" : mode === "replyAll" ? "Reply all" : "Reply";
+  const subjPrefix = mode === "forward" ? "Fwd: " : "Re: ";
+  const toIn = mode === "forward"
+    ? el("input", { class: "input", id: "rf-to", placeholder: "Forward to (comma-separated)" })
+    : null;
+  const commentEl = el("textarea", { class: "cmp-textarea", id: "rf-comment", placeholder: "Add a message…", rows: "6" });
+  const head = mode === "forward"
+    ? el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: "To" }), toIn)
+    : el("div", { class: "cmp-replyto dim" }, `To: ${addrLabel(p.from) || "sender"}${mode === "replyAll" ? " + all recipients" : ""}`);
+  const quote = el("div", { class: "cmp-quote" },
+    el("div", { class: "cmp-quote-h dim", text: `On ${fmtDate(p.date || it.remote_mtime)}, ${addrLabel(p.from) || "unknown"} wrote:` }),
+    el("div", { class: "cmp-quote-b dim", text: p.snippet || p.subject || it.name || "" }));
+  const content = el("div", { class: "compose" },
+    head,
+    el("div", { class: "cmp-subject-ro dim", text: subjPrefix + (p.subject || it.name || "(no subject)") }),
+    commentEl,
+    quote,
+    el("div", { class: "cmp-footer" },
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: (e) => replyForwardSubmit(e.currentTarget, it, mode) },
+        icon(mode === "forward" ? "corner-up-right" : "corner-up-left", "icon-sm"), title)));
+  openSheet(title, content);
+  setTimeout(() => (toIn || commentEl).focus(), 60);
+}
+
+async function replyForwardSubmit(btn, it, mode) {
+  const comment = $("#rf-comment").value || "";
+  if (mode === "forward") {
+    const to = ($("#rf-to").value || "").trim();
+    if (!to) { toast("Add a recipient", "err"); return; }
+    btn.disabled = true;
+    try {
+      await post("/api/v1/mail/forward?" + qs({ account: App.account, id: it.remote_id, to, comment }), CAP.mailwrite);
+      toast("Forwarded");
+      closeSheet();
+      if (App.route === "mail") renderMailView($("#view"));
+    } catch (e) { toast("Forward failed: " + e.message, "err"); } finally { btn.disabled = false; }
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await post("/api/v1/mail/reply?" + qs({ account: App.account, id: it.remote_id, comment, all: mode === "replyAll" ? "1" : "0" }), CAP.mailwrite);
+    toast(mode === "replyAll" ? "Replied to all" : "Replied");
+    closeSheet();
+    if (App.route === "mail") renderMailView($("#view"));
+  } catch (e) { toast("Reply failed: " + e.message, "err"); } finally { btn.disabled = false; }
+}
 // restrained archive-vault illustration for the empty reading pane (trusted in-code SVG)
 const VAULT_SVG = '<svg viewBox="0 0 260 180" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="40" y="34" width="120" height="84" rx="10" opacity="0.35" transform="rotate(-7 100 76)"/><rect x="64" y="44" width="120" height="84" rx="10" opacity="0.6"/><path d="M64 60h120" opacity="0.6"/><circle cx="200" cy="120" r="38" fill="color-mix(in oklab, var(--accent) 10%, transparent)"/><circle cx="200" cy="120" r="38"/><circle cx="200" cy="120" r="14"/><path d="M200 92v10M200 138v10M172 120h10M218 120h10"/></g><path d="M191 119l6 6 12-13" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 function renderMailReader(it, remoteImages = false) {
@@ -1037,6 +1091,13 @@ function renderMailReader(it, remoteImages = false) {
   const q = { account: App.account, service: "mail", id: it.remote_id };
   const viewQ = remoteImages ? { ...q, external: "1" } : q;
   const actions = el("div", { class: "mr-actions" });
+  if (CAP.mailwrite) {
+    actions.append(
+      el("button", { class: "btn primary sm", title: "Reply", onclick: () => openReplyForward(it, "reply") }, icon("corner-up-left", "icon-sm"), "Reply"),
+      el("button", { class: "btn ghost sm icon-only", title: "Reply all", onclick: () => openReplyForward(it, "replyAll") }, icon("users", "icon-sm")),
+      el("button", { class: "btn ghost sm icon-only", title: "Forward", onclick: () => openReplyForward(it, "forward") }, icon("corner-up-right", "icon-sm")),
+    );
+  }
   if (it.has_body) actions.append(remoteImages
     ? el("button", { class: "btn ghost sm", title: "Block external content again (privacy)", onclick: () => renderMailReader(it, false) }, icon("shield", "icon-sm"), "Hide external content")
     : el("button", { class: "btn ghost sm", title: "Load external content — images & web fonts (may notify the sender you opened it)", onclick: () => renderMailReader(it, true) }, icon("globe", "icon-sm"), "Load external content"));
