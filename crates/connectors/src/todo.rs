@@ -6,11 +6,13 @@
 //! persisted across runs. Tasks are stored id-based (service `"todo"`,
 //! `item_type = "task"`). The read app keeps least-privilege `Tasks.Read`.
 
-use crate::common::fetch_pages;
+use crate::archive::{ArchiveReport, JsonFetcher};
+use crate::common::{fetch_pages, shard_path};
 use crate::onedrive::SyncError;
 use isyncyou_graph::{run_delta, DeltaCursor, Transport};
 use isyncyou_store::{Item, Store};
 use serde_json::Value;
+use std::path::Path;
 
 const SERVICE: &str = "todo";
 const LISTS_URL: &str = "https://graph.microsoft.com/v1.0/me/todo/lists?$top=100";
@@ -27,6 +29,11 @@ pub struct TodoReport {
 struct TaskList {
     id: String,
     name: String,
+    /// The full list resource (`isShared`/`isOwner`/`wellknownListName` and the
+    /// rest), archived verbatim as the flank sidecar so the UI can read them
+    /// (#567 B1). Kept whole rather than as typed fields: the webui consumes the
+    /// sidecar JSON, and a whitelist of typed copies would just drift.
+    raw: Value,
 }
 
 fn parse_lists(raw: &[Value]) -> Vec<TaskList> {
@@ -38,7 +45,11 @@ fn parse_lists(raw: &[Value]) -> Vec<TaskList> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Some(TaskList { id, name })
+            Some(TaskList {
+                id,
+                name,
+                raw: l.clone(),
+            })
         })
         .collect()
 }
@@ -80,6 +91,76 @@ pub fn incremental_sync_todo<T: Transport>(
             }
         }
         store.set_delta_cursor(account, SERVICE, &list.id, out.cursor.as_str())?;
+    }
+    Ok(report)
+}
+
+/// Upsert a JSON-snapshot store item under `service="todo"` and archive its
+/// canonical JSON to `todo/<shard>/<id>.json` (atomic tmp+rename), recording the
+/// relative path as `local_path`. Shared by the list flanks (#567 B1) and the
+/// task sub-resource snapshots (#567 B2). Returns the byte count written.
+fn archive_json_item(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    id: &str,
+    name: &str,
+    item_type: &str,
+    value: &Value,
+) -> Result<u64, SyncError> {
+    let mut it = Item::new(account, SERVICE, id, name, item_type);
+    it.sync_state = "remote_dirty".into();
+    store.upsert_item(&it)?;
+
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+    store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// Back up the task-list flanks (#567 B1): one `item_type="list"` JSON sidecar per
+/// list from `/me/todo/lists`, capturing `isShared`/`isOwner`/`wellknownListName`
+/// and the rest so the UI can surface them. Re-fetched each pass (small data). The
+/// delta pass also upserts a bare list row for task grouping; this enriches it
+/// with the archived JSON.
+pub fn backup_todo_list_flanks<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<ArchiveReport, SyncError> {
+    let mut report = ArchiveReport::default();
+    let lists = fetcher
+        .fetch_json("/me/todo/lists?$top=100")
+        .map_err(SyncError::Remote)?;
+    let raw: Vec<Value> = lists
+        .get("value")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for list in parse_lists(&raw) {
+        let name = if list.name.is_empty() {
+            list.id.as_str()
+        } else {
+            list.name.as_str()
+        };
+        report.bytes += archive_json_item(
+            store,
+            account,
+            archive_root,
+            &list.id,
+            name,
+            "list",
+            &list.raw,
+        )?;
+        report.archived += 1;
     }
     Ok(report)
 }
@@ -235,6 +316,70 @@ mod tests {
             .unwrap()
             .deleted_at
             .is_some());
+    }
+
+    struct MockListFetcher;
+    impl JsonFetcher for MockListFetcher {
+        fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+            if url.contains("/me/todo/lists") {
+                Ok(json!({ "value": [
+                    { "id": "L1", "displayName": "Tasks", "isShared": false, "isOwner": true, "wellknownListName": "defaultList" },
+                    { "id": "L2", "displayName": "Shared groceries", "isShared": true, "isOwner": false, "wellknownListName": "none" },
+                ]}))
+            } else {
+                Ok(json!({ "value": [] }))
+            }
+        }
+    }
+
+    #[test]
+    fn backup_todo_list_flanks_writes_sidecars_with_list_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let r = backup_todo_list_flanks(&MockListFetcher, &store, "acc", dir.path()).unwrap();
+        assert_eq!(r.archived, 2);
+
+        // each list is an item_type="list" row with a sidecar path on disk
+        let l2 = store.get_item("acc", SERVICE, "L2").unwrap().unwrap();
+        assert_eq!(l2.item_type, "list");
+        let rel = l2
+            .local_path
+            .expect("list flank must record its sidecar path");
+        let body: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(&rel)).unwrap()).unwrap();
+        // the sidecar carries the list-level fields the UI needs
+        assert_eq!(body.get("isShared").and_then(Value::as_bool), Some(true));
+        assert_eq!(body.get("isOwner").and_then(Value::as_bool), Some(false));
+        let l1: Value = {
+            let l1 = store.get_item("acc", SERVICE, "L1").unwrap().unwrap();
+            serde_json::from_slice(&std::fs::read(dir.path().join(l1.local_path.unwrap())).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            l1.get("wellknownListName").and_then(Value::as_str),
+            Some("defaultList")
+        );
+    }
+
+    #[test]
+    fn parse_lists_keeps_the_full_list_resource() {
+        let raw = vec![json!({
+            "id": "L9", "displayName": "Work", "isShared": true, "wellknownListName": "flaggedEmails"
+        })];
+        let lists = parse_lists(&raw);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].id, "L9");
+        assert_eq!(
+            lists[0].raw.get("isShared").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            lists[0]
+                .raw
+                .get("wellknownListName")
+                .and_then(Value::as_str),
+            Some("flaggedEmails")
+        );
     }
 
     #[test]

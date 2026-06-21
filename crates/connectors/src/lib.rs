@@ -59,7 +59,7 @@ pub use restore::{
     OneNoteResourcePart, PageCreator, Restorer,
 };
 pub use shared::{sync_shared_with_me, SharedReport};
-pub use todo::{incremental_sync_todo, TodoReport};
+pub use todo::{backup_todo_list_flanks, incremental_sync_todo, TodoReport};
 
 /// Serializes the `live_*` integration tests. They all exercise one shared,
 /// rate-limited throwaway account, so running them concurrently self-throttles
