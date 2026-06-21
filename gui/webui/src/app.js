@@ -2467,13 +2467,16 @@ function todoRender() {
 function taskRow(t) {
   const p = t.preview || {};
   const st = TODO_STATUS[p.status] || TODO_STATUS.notStarted;
+  const hasMeta = p.due || p.importance === "high" || p.steps_total > 0 || p.has_attachments;
   return el("button", { class: "todo-task" + (p.status === "completed" ? " done" : ""), onclick: () => openTaskSheet(t) },
     el("span", { class: "todo-check " + st.cls }, icon(st.icon, "icon-sm")),
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "todo-title truncate", text: t.name || "(untitled)" }),
-      (p.due || p.importance === "high") ? el("div", { class: "todo-meta dim" },
+      hasMeta ? el("div", { class: "todo-meta dim" },
         p.importance === "high" ? el("span", { class: "todo-flag", title: "High importance" }, icon("flag", "icon-sm")) : null,
-        p.due ? el("span", { text: "Due " + fmtDate(evDate(p.due, "UTC")) }) : null) : null),
+        p.due ? el("span", { text: "Due " + fmtDate(evDate(p.due, "UTC")) }) : null,
+        p.steps_total > 0 ? el("span", { class: "todo-steps", title: "Checklist progress" }, icon("check-square", "icon-sm"), el("span", { text: `${p.steps_done || 0}/${p.steps_total}` })) : null,
+        p.has_attachments ? el("span", { class: "todo-att-dot", title: "Has attachments" }, icon("paperclip", "icon-sm")) : null) : null),
     coverageBadge(t));
 }
 async function openTaskSheet(t) {
@@ -2481,19 +2484,66 @@ async function openTaskSheet(t) {
   const p = t.preview || {};
   const content = el("div", { class: "body" }, el("div", { class: "spinner" }));
   openSheet(t.name || "Task", content);
+  const httpUrl = (u) => (typeof u === "string" && /^https?:\/\//i.test(u)) ? u : null; // block javascript:/data: from cloud data
+  const dt = (o) => (o && o.dateTime) ? fmtFullDate(evDate(o.dateTime, o.timeZone)) : "";
   try {
     const full = await api("/api/v1/body?" + qs(q));
     const kv = el("dl", { class: "kv" });
     const add = (k, v, ic) => { if (!v) return; kv.append(el("dt", {}, ic ? icon(ic, "icon-sm") : null, el("span", { text: k })), el("dd", { text: v })); };
     add("Status", (full.status || "").replace(/([A-Z])/g, " $1").replace(/^./, c => c.toUpperCase()), "check-square");
     add("Importance", full.importance, "flag");
-    if (full.dueDateTime) add("Due", fmtFullDate(evDate(full.dueDateTime.dateTime, full.dueDateTime.timeZone)), "clock");
-    if (full.completedDateTime) add("Completed", fmtFullDate(evDate(full.completedDateTime.dateTime, full.completedDateTime.timeZone)), "check");
+    add("Start", dt(full.startDateTime), "clock");
+    add("Due", dt(full.dueDateTime), "clock");
+    if (full.isReminderOn) add("Reminder", dt(full.reminderDateTime), "clock");
+    add("Completed", dt(full.completedDateTime), "check");
+    add("Created", full.createdDateTime ? fmtFullDate(full.createdDateTime) : "", "clock");
+    add("Categories", (full.categories || []).join(", "), "tag");
+    if (full.recurrence && full.recurrence.pattern) add("Repeats", (full.recurrence.pattern.type || "").replace(/^./, c => c.toUpperCase()), "refresh-cw");
     clear(content).append(kv);
     const note = (full.body || {}).content || "";
     if (note.trim()) {
       const txt = (full.body.contentType === "html") ? new DOMParser().parseFromString(note, "text/html").body.textContent : note;
       content.append(el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: txt.trim().slice(0, 4000) }));
+    }
+    // Checklist steps (from the _checklist_<id> sub-resource sidecar, #567 B2)
+    const cl = await api("/api/v1/body?" + qs({ account: App.account, service: "todo", id: "_checklist_" + t.remote_id })).catch(() => null);
+    const steps = (cl && cl.value) || [];
+    if (steps.length) {
+      const doneN = steps.filter(s => s.isChecked).length;
+      const box = el("div", { class: "todo-checklist" });
+      steps.forEach(s => box.append(el("div", { class: "todo-step" + (s.isChecked ? " done" : "") },
+        icon(s.isChecked ? "check-square" : "circle", "icon-sm"),
+        el("span", { class: "truncate", text: s.displayName || "(step)" }))));
+      content.append(el("h3", { class: "sb-section" }, el("span", { text: "Checklist" }),
+        el("span", { class: "dim", style: "margin-left:6px;font-size:12px", text: `${doneN}/${steps.length}` })), box);
+    }
+    // Linked resources (from the _linked_<id> sidecar)
+    const lr = await api("/api/v1/body?" + qs({ account: App.account, service: "todo", id: "_linked_" + t.remote_id })).catch(() => null);
+    const links = (lr && lr.value) || [];
+    if (links.length) {
+      const box = el("div", { class: "todo-links" });
+      links.forEach(r => {
+        const url = httpUrl(r.webUrl);
+        const label = r.displayName || r.applicationName || "Linked resource";
+        box.append(url
+          ? el("a", { class: "todo-link", href: url, target: "_blank", rel: "noopener noreferrer" }, icon("external-link", "icon-sm"), el("span", { class: "truncate", text: label }))
+          : el("div", { class: "todo-link" }, icon("external-link", "icon-sm"), el("span", { class: "truncate", text: label })));
+      });
+      content.append(el("h3", { class: "sb-section", text: "Linked resources" }), box);
+    }
+    // Attachments — gated on the preview's has_attachments; download via the route
+    if (p.has_attachments) {
+      const att = await api("/api/v1/attachment?" + qs(q)).catch(() => null);
+      const list = (att && att.attachments) || [];
+      if (list.length) {
+        const box = el("div", { class: "todo-atts" });
+        list.forEach(a => box.append(el("a", { class: "todo-att",
+          href: "/api/v1/attachment?" + qs({ account: App.account, service: "todo", id: t.remote_id, index: a.index }),
+          target: "_blank", rel: "noopener", download: a.filename || "attachment" },
+          icon("paperclip", "icon-sm"), el("span", { class: "grow truncate", text: a.filename || "attachment" }),
+          a.size ? el("span", { class: "dim", text: fmtSize(a.size) }) : null)));
+        content.append(el("h3", { class: "sb-section", text: "Attachments" }), box);
+      }
     }
   } catch (e) { clear(content).append(el("p", { class: "dim", text: "Could not load task: " + e.message })); }
 }

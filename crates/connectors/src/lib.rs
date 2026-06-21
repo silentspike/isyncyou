@@ -60,7 +60,8 @@ pub use restore::{
 };
 pub use shared::{sync_shared_with_me, SharedReport};
 pub use todo::{
-    backup_task_subresources, backup_todo_list_flanks, incremental_sync_todo, TodoReport,
+    backup_task_subresources, backup_todo_list_flanks, extract_task_attachment,
+    incremental_sync_todo, list_task_attachments, TodoReport,
 };
 
 /// Serializes the `live_*` integration tests. They all exercise one shared,

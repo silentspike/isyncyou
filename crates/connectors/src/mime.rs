@@ -471,7 +471,7 @@ fn decode_body(body: &[u8], cte: &str) -> Vec<u8> {
 }
 
 /// Decode standard base64, ignoring whitespace/newlines and stopping at padding.
-fn base64_decode(data: &[u8]) -> Vec<u8> {
+pub(crate) fn base64_decode(data: &[u8]) -> Vec<u8> {
     fn val(b: u8) -> Option<u8> {
         match b {
             b'A'..=b'Z' => Some(b - b'A'),

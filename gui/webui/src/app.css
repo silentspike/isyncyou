@@ -899,6 +899,20 @@ a:hover { text-decoration: underline; }
 .todo-meta { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); margin-top: 2px; }
 .todo-flag { color: var(--err); display: inline-flex; }
 .todo-flag .icon { width: 12px; height: 12px; }
+.todo-steps, .todo-att-dot { display: inline-flex; align-items: center; gap: 3px; }
+.todo-steps .icon, .todo-att-dot .icon { width: 12px; height: 12px; }
+/* task-sheet sub-resources (#567 B4): checklist / linked / attachments */
+.todo-checklist { display: flex; flex-direction: column; gap: 4px; }
+.todo-step { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-mid); }
+.todo-step .icon { flex: none; color: var(--text-lo); }
+.todo-step.done { color: var(--text-lo); }
+.todo-step.done .icon { color: var(--ok); }
+.todo-step.done span { text-decoration: line-through; }
+.todo-links, .todo-atts { display: flex; flex-direction: column; gap: 4px; }
+.todo-link, .todo-att { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm);
+  color: var(--text-mid); text-decoration: none; padding: 4px 6px; border-radius: var(--r-sm); }
+a.todo-link:hover, a.todo-att:hover { background: var(--bg-hover); color: var(--accent); }
+.todo-att .dim { margin-left: auto; flex: none; }
 
 /* ============================================================ onenote (page list + reader) */
 .view:has(.note-page) { padding: 0; overflow: hidden; }

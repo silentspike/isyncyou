@@ -1990,6 +1990,12 @@ impl Router {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
+        // ToDo attachments live in the `_taskatt_<id>` sub-resource sidecar as Graph
+        // taskFileAttachment[] (inline base64 contentBytes), not a MIME `.eml`
+        // (#567 B4): list/decode them from that JSON instead of mail's mime parser.
+        if service == "todo" {
+            return self.todo_attachment(account, id, req.q("index"));
+        }
         let bytes = match self.read_archived(account, service, id) {
             Ok((_, b, _)) => b,
             Err(e) => return e,
@@ -2017,6 +2023,46 @@ impl Router {
                     }
                 };
                 match isyncyou_connectors::extract_attachment(&bytes, idx) {
+                    Some((filename, _ct, data)) => ApiResponse {
+                        status: 200,
+                        content_type: safe_content_type(&filename).into(),
+                        body: data,
+                        headers: Vec::new(),
+                    },
+                    None => ApiResponse::error(404, "attachment index out of range"),
+                }
+            }
+        }
+    }
+
+    /// List/download a task's file attachments from its `_taskatt_<id>` sub-resource
+    /// sidecar (#567 B4). The download decodes the inline base64 `contentBytes` and
+    /// serves it under an inert content-type (the always-on nosniff keeps it
+    /// non-executable, like the mail attachment path).
+    fn todo_attachment(&self, account: &str, task_id: &str, index: Option<&str>) -> ApiResponse {
+        let att_id = format!("_taskatt_{task_id}");
+        let bytes = match self.read_archived(account, "todo", &att_id) {
+            Ok((_, b, _)) => b,
+            Err(_) => return ApiResponse::error(404, "no archived attachments for this task"),
+        };
+        match index {
+            None => {
+                let list: Vec<Value> = isyncyou_connectors::list_task_attachments(&bytes)
+                    .into_iter()
+                    .map(|(i, name, ct, size)| {
+                        json!({ "index": i, "filename": name, "content_type": ct, "size": size })
+                    })
+                    .collect();
+                ApiResponse::ok_json(&json!({ "attachments": list }))
+            }
+            Some(idx_s) => {
+                let idx = match idx_s.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return ApiResponse::error(400, "index must be a non-negative integer")
+                    }
+                };
+                match isyncyou_connectors::extract_task_attachment(&bytes, idx) {
                     Some((filename, _ct, data)) => ApiResponse {
                         status: 200,
                         content_type: safe_content_type(&filename).into(),
@@ -4376,6 +4422,66 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(lp["wellknown_name"], "flaggedEmails");
         assert_eq!(lp["is_shared"], true);
         assert_eq!(lp["is_owner"], false);
+    }
+
+    #[test]
+    fn todo_attachment_lists_and_downloads_from_taskatt_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        // the _taskatt_t1 sub-resource sidecar: one base64 attachment ("QUJD" = "ABC")
+        let rel = isyncyou_connectors::shard_rel("todo", "_taskatt_t1", "json");
+        let p = arch.join(&rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            br#"{"value":[{"name":"spec.pdf","contentType":"application/pdf","size":3,"contentBytes":"QUJD"}]}"#,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut a = Item::new(
+                "a",
+                "todo",
+                "_taskatt_t1",
+                "t1 attachments",
+                "task-attachment",
+            );
+            a.local_path = Some(rel.clone());
+            store.upsert_item(&a).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        // list (the UI passes the TASK id; the route resolves _taskatt_<id>)
+        let list = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=todo&id=t1",
+        )));
+        assert_eq!(list["attachments"][0]["filename"], "spec.pdf");
+        assert_eq!(list["attachments"][0]["index"], 0);
+        // download index 0 -> base64 decoded to "ABC"
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=todo&id=t1&index=0",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ABC");
+        // out of range -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/attachment?account=a&service=todo&id=t1&index=9"
+                ))
+                .status,
+            404
+        );
     }
 
     #[test]

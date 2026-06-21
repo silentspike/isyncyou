@@ -263,6 +263,58 @@ pub fn backup_task_subresources<F: JsonFetcher>(
     Ok(report)
 }
 
+/// List a task's archived attachments from the `_taskatt_<id>` sidecar JSON
+/// (Graph `taskFileAttachment[]`) as `(index, filename, content_type, size)`
+/// (#567 B4). Empty when the bytes aren't a `{ "value": [...] }` collection.
+pub fn list_task_attachments(json_bytes: &[u8]) -> Vec<(usize, String, String, u64)> {
+    let v: Value = match serde_json::from_slice(json_bytes) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v.get("value")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let name = a
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("attachment")
+                        .to_string();
+                    let ct = a
+                        .get("contentType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream")
+                        .to_string();
+                    let size = a.get("size").and_then(Value::as_u64).unwrap_or(0);
+                    (i, name, ct, size)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract one task attachment `(filename, content_type, decoded bytes)` from the
+/// `_taskatt_<id>` sidecar by index (#567 B4); `None` if the index is out of range
+/// or the entry has no inline `contentBytes`.
+pub fn extract_task_attachment(json_bytes: &[u8], idx: usize) -> Option<(String, String, Vec<u8>)> {
+    let v: Value = serde_json::from_slice(json_bytes).ok()?;
+    let a = v.get("value").and_then(Value::as_array)?.get(idx)?;
+    let name = a
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("attachment")
+        .to_string();
+    let ct = a
+        .get("contentType")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let b64 = a.get("contentBytes").and_then(Value::as_str)?;
+    Some((name, ct, crate::mime::base64_decode(b64.as_bytes())))
+}
+
 enum Ingest {
     Upserted,
     Deleted,
