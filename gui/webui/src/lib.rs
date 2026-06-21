@@ -352,6 +352,21 @@ pub trait CalendarWriteHandler: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// Performs the live-contact **write** verbs on behalf of a cap-token POST
+/// (#566 A5). Injected by the daemon (which owns the engine + the full write
+/// token); the read-only CLI `serve` does not set it, so every
+/// `/api/v1/contact/{create,update,delete}` POST is refused there. `contact` is a
+/// Graph contact resource the router builds from the request (sanitized to the
+/// writable fields downstream).
+pub trait ContactWriteHandler: Send + Sync {
+    /// Create a contact; returns the new cloud id.
+    fn create(&self, account: &str, contact: &Value) -> Result<String, String>;
+    /// Update a contact's writable fields from a (partial) contact resource.
+    fn update(&self, account: &str, contact_id: &str, contact: &Value) -> Result<(), String>;
+    /// Delete a contact.
+    fn delete(&self, account: &str, contact_id: &str) -> Result<(), String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -447,6 +462,11 @@ pub struct Router {
     calendar_write: Option<std::sync::Arc<dyn CalendarWriteHandler>>,
     /// Separate capability token for calendar-write POSTs.
     calendar_write_cap_token: Option<String>,
+    /// Optional live-contact write handler (the daemon's). `None` => every
+    /// `/api/v1/contact/{create,update,delete}` POST is refused (read-only `serve`).
+    contact_write: Option<std::sync::Arc<dyn ContactWriteHandler>>,
+    /// Separate capability token for contact-write POSTs.
+    contact_write_cap_token: Option<String>,
 }
 
 impl Router {
@@ -471,6 +491,8 @@ impl Router {
             mail_write_cap_token: None,
             calendar_write: None,
             calendar_write_cap_token: None,
+            contact_write: None,
+            contact_write_cap_token: None,
         }
     }
 
@@ -497,6 +519,8 @@ impl Router {
             mail_write_cap_token: None,
             calendar_write: None,
             calendar_write_cap_token: None,
+            contact_write: None,
+            contact_write_cap_token: None,
         }
     }
 
@@ -603,6 +627,17 @@ impl Router {
         self
     }
 
+    /// Enable the live-contact write POSTs (builder style, #566).
+    pub fn with_contact_write(
+        mut self,
+        handler: std::sync::Arc<dyn ContactWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.contact_write = Some(handler);
+        self.contact_write_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token.
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
         matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
@@ -658,6 +693,9 @@ impl Router {
                 "/api/v1/calendar/update" => self.calendar_update(req),
                 "/api/v1/calendar/delete" => self.calendar_delete(req),
                 "/api/v1/calendar/respond" => self.calendar_respond(req),
+                "/api/v1/contact/create" => self.contact_create(req),
+                "/api/v1/contact/update" => self.contact_update(req),
+                "/api/v1/contact/delete" => self.contact_delete(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -700,6 +738,10 @@ impl Router {
                     .replace(
                         "__CALENDARWRITE_CAP_TOKEN__",
                         self.calendar_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__CONTACTWRITE_CAP_TOKEN__",
+                        self.contact_write_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -965,6 +1007,167 @@ impl Router {
             &format!("respond id={id} {response}"),
             h.respond(account, id, response, comment),
         )
+    }
+
+    fn contact_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn ContactWriteHandler>, ApiResponse> {
+        let h = self.contact_write.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "contact write is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.contact_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit contact result (same no-SSE-on-self-write caveat as
+    /// `cal_result`: the daemon doesn't re-sync contacts on a write, so an SSE
+    /// refresh would read the stale store and clobber the optimistic UI).
+    fn contact_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:contact", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:contact", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a structured Graph physical address from `<prefix>_{street,city,
+    /// state,zip,country}` query params; `None` when none are set.
+    fn addr_from_req(req: &ApiRequest, prefix: &str) -> Option<Value> {
+        let g = |k: &str| {
+            req.q(&format!("{prefix}_{k}"))
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        };
+        let mut a = serde_json::Map::new();
+        for (q, key) in [
+            ("street", "street"),
+            ("city", "city"),
+            ("state", "state"),
+            ("zip", "postalCode"),
+            ("country", "countryOrRegion"),
+        ] {
+            if let Some(v) = g(q) {
+                a.insert(key.into(), json!(v));
+            }
+        }
+        (!a.is_empty()).then_some(Value::Object(a))
+    }
+
+    /// Build a Graph contact resource from the request's query params (name parts,
+    /// email, phones, company/title, notes, birthday, three structured addresses).
+    /// Only provided fields are set; the write layer sanitizes to the whitelist.
+    fn contact_from_req(req: &ApiRequest) -> Value {
+        let mut c = json!({});
+        let obj = c.as_object_mut().unwrap();
+        for (q, key) in [
+            ("given", "givenName"),
+            ("surname", "surname"),
+            ("display_name", "displayName"),
+            ("nickname", "nickName"),
+            ("title", "title"),
+            ("company", "companyName"),
+            ("job", "jobTitle"),
+            ("department", "department"),
+            ("mobile", "mobilePhone"),
+            ("notes", "personalNotes"),
+            ("birthday", "birthday"),
+        ] {
+            if let Some(s) = req.q(q).filter(|s| !s.is_empty()) {
+                obj.insert(key.into(), json!(s));
+            }
+        }
+        if let Some(e) = req.q("email").filter(|s| !s.is_empty()) {
+            obj.insert("emailAddresses".into(), json!([{ "address": e }]));
+        }
+        if let Some(p) = req.q("business_phone").filter(|s| !s.is_empty()) {
+            obj.insert("businessPhones".into(), json!([p]));
+        }
+        if let Some(p) = req.q("home_phone").filter(|s| !s.is_empty()) {
+            obj.insert("homePhones".into(), json!([p]));
+        }
+        if let Some(a) = Self::addr_from_req(req, "business") {
+            obj.insert("businessAddress".into(), a);
+        }
+        if let Some(a) = Self::addr_from_req(req, "home") {
+            obj.insert("homeAddress".into(), a);
+        }
+        if let Some(a) = Self::addr_from_req(req, "other") {
+            obj.insert("otherAddress".into(), a);
+        }
+        c
+    }
+
+    fn contact_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.contact_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let c = Self::contact_from_req(req);
+        if c.as_object().map(serde_json::Map::is_empty).unwrap_or(true) {
+            return ApiResponse::error(400, "at least one contact field is required");
+        }
+        match h.create(account, &c) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:contact", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:contact", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn contact_update(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.contact_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let c = Self::contact_from_req(req);
+        self.contact_result(
+            account,
+            &format!("update id={id}"),
+            h.update(account, id, &c),
+        )
+    }
+
+    fn contact_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.contact_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.contact_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
     fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
@@ -3100,6 +3303,82 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(log[1], "update id=E1");
         assert_eq!(log[2], "delete id=E2");
         assert_eq!(log[3], "respond id=E3 decline");
+    }
+
+    #[test]
+    fn app_js_has_contact_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__CONTACTWRITE_CAP_TOKEN__"));
+    }
+
+    #[derive(Default)]
+    struct RecConWrite(std::sync::Mutex<Vec<String>>);
+    impl ContactWriteHandler for RecConWrite {
+        fn create(&self, _a: &str, contact: &Value) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!(
+                "create name={} other_city={}",
+                contact
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                contact
+                    .pointer("/otherAddress/city")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ));
+            Ok("con-new".into())
+        }
+        fn update(&self, _a: &str, id: &str, _c: &Value) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("update id={id}"));
+            Ok(())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("delete id={id}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn contact_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/contact/create",
+            "/api/v1/contact/update",
+            "/api/v1/contact/delete",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecConWrite::default());
+        let router = router.with_contact_write(rec.clone(), "consecret".into());
+        let create = "/api/v1/contact/create?account=a&display_name=Ada&other_city=London";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token but no fields -> 400 (handler not called)
+        let bad = ApiRequest::new("POST", "/api/v1/contact/create?account=a")
+            .with_cap_token(Some("consecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("consecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/contact/update?account=a&id=C1&job=Analyst"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/contact/delete?account=a&id=C2"))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        // proves contact_from_req maps display_name + the structured other-address param
+        assert_eq!(log[0], "create name=Ada other_city=London");
+        assert_eq!(log[1], "update id=C1");
+        assert_eq!(log[2], "delete id=C2");
     }
 
     struct OkVerify;

@@ -269,6 +269,7 @@ const CAP = {
   settings: "__SETTINGS_CAP_TOKEN__",
   mailwrite: "__MAILWRITE_CAP_TOKEN__",
   calendarwrite: "__CALENDARWRITE_CAP_TOKEN__",
+  contactwrite: "__CONTACTWRITE_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
@@ -1930,6 +1931,7 @@ async function renderContactsView(view) {
           el("option", { value: "name", text: "Name A–Z" }),
           el("option", { value: "company", text: "Company A–Z" }),
           el("option", { value: "recent", text: "Recently archived" }))),
+      CAP.contactwrite ? el("button", { class: "btn sm primary", title: "Create a new contact", onclick: () => openComposeContact() }, icon("users", "icon-sm"), "New contact") : null,
       CAP.verify ? el("button", { class: "btn sm", title: "Re-hash every archived record and check integrity", onclick: (e) => contactsVerify(e.currentTarget) }, icon("shield-check", "icon-sm"), "Verify") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
     // master–detail: directory list | record detail
@@ -1971,6 +1973,89 @@ async function contactsVerify(btn) {
     fillSubnavCounts("contacts", Contacts.all); contactsRenderMetrics(); contactsRenderList();
     if (Contacts.selected) { const s = Contacts.all.find(x => x.remote_id === Contacts.selected.remote_id); if (s) { Contacts.selected = s; renderContactDetail(s); } }
   } catch (e) { toast("Verify failed: " + e.message, "err"); } finally { btn.disabled = false; }
+}
+// #566 A5: live contact write — create / edit (cap-gated). `opts.id` => edit.
+async function openComposeContact(opts = {}) {
+  if (!CAP.contactwrite) return;
+  let o = opts || {};
+  if (o.id) {                                  // editing: pull the full archived record so every field is prefilled
+    try {
+      const c = await api("/api/v1/body?" + qs({ account: App.account, service: "contacts", id: o.id }));
+      o = Object.assign({}, contactFromBody(c), { id: o.id });
+    } catch { toast("Could not load contact for editing", "err"); }
+  }
+  const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
+  const inp = (id, ph, v, type) => el("input", { class: "input", id, placeholder: ph || "", value: v || "", type: type || "text" });
+  const given = inp("ccon-given", "First name", o.given);
+  const surname = inp("ccon-surname", "Last name", o.surname);
+  const email = inp("ccon-email", "name@example.com", o.email);
+  const mobile = inp("ccon-mobile", "Mobile", o.mobile);
+  const bphone = inp("ccon-bphone", "Business phone", o.business_phone);
+  const company = inp("ccon-company", "Company", o.company);
+  const job = inp("ccon-job", "Job title", o.job);
+  const bday = inp("ccon-bday", "", o.birthday, "date");
+  const notes = el("textarea", { class: "input cmp-textarea", id: "ccon-notes", placeholder: "Notes", rows: "4" });
+  if (o.notes) notes.value = o.notes;
+  const content = el("div", { class: "compose" },
+    field("First name", given), field("Last name", surname),
+    field("Email", email), field("Mobile", mobile), field("Business phone", bphone),
+    field("Company", company), field("Job title", job), field("Birthday", bday),
+    field("Notes", notes),
+    el("div", { class: "cmp-footer" },
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: (e) => composeContactSubmit(e.currentTarget, o.id) }, icon("users", "icon-sm"), o.id ? "Save" : "Create")));
+  openSheet(o.id ? "Edit contact" : "New contact", content);
+  setTimeout(() => given.focus(), 60);
+}
+// map an archived contact body JSON -> the compose form's field values
+function contactFromBody(c) {
+  return {
+    given: c.givenName || "", surname: c.surname || "",
+    email: ((c.emailAddresses || [])[0] || {}).address || "",
+    mobile: c.mobilePhone || "", business_phone: (c.businessPhones || [])[0] || "",
+    company: c.companyName || "", job: c.jobTitle || "",
+    birthday: typeof c.birthday === "string" ? c.birthday.slice(0, 10) : "",
+    notes: c.personalNotes || "",
+  };
+}
+async function composeContactSubmit(btn, id) {
+  const v = (s) => ($("#" + s).value || "").trim();
+  const params = {
+    account: App.account, given: v("ccon-given"), surname: v("ccon-surname"),
+    email: v("ccon-email"), mobile: v("ccon-mobile"), business_phone: v("ccon-bphone"),
+    company: v("ccon-company"), job: v("ccon-job"), notes: v("ccon-notes"),
+  };
+  const day = v("ccon-bday");
+  if (day) params.birthday = day + "T00:00:00Z";
+  const dn = [params.given, params.surname].filter(Boolean).join(" ");   // keep it identifiable when only one name set
+  if (dn) params.display_name = dn;
+  if (!params.given && !params.surname && !params.email && !params.company) { toast("Add at least a name, email or company", "err"); return; }
+  if (id) params.id = id;
+  btn.disabled = true;
+  try {
+    await post((id ? "/api/v1/contact/update?" : "/api/v1/contact/create?") + qs(params), CAP.contactwrite);
+    toast(id ? "Contact updated" : "Contact created");
+    closeSheet(); contactsReload();
+  } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
+}
+async function deleteContact(it) {
+  if (!confirm("Delete this contact? This removes it from your Microsoft 365 account.")) return;
+  try {
+    await post("/api/v1/contact/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.contactwrite);
+    toast("Contact deleted");
+    if (Contacts.selected && Contacts.selected.remote_id === it.remote_id) contactBack();
+    contactsReload();
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
+// re-fetch the directory after a live write and re-render list + metrics + detail
+async function contactsReload() {
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 }));
+    Contacts.all = (d.items || []).filter(it => it.item_type !== "folder");
+    App.counts.contacts = d.total ?? Contacts.all.length; updateNavCounts();
+    fillSubnavCounts("contacts", Contacts.all); contactsRenderMetrics(); contactsRenderList();
+    if (Contacts.selected) { const s = Contacts.all.find(x => x.remote_id === Contacts.selected.remote_id); if (s) { Contacts.selected = s; renderContactDetail(s); } else contactBack(); }
+  } catch (e) { toast("Reload failed: " + e.message, "err"); }
 }
 function contactsFiltered() {
   let rows = Contacts.all;
@@ -2244,6 +2329,11 @@ async function renderContactDetail(it) {
   const actions = el("div", { class: "con-detail-actions" },
     el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs({ account: App.account, service: "contacts", id: it.remote_id })}`, target: "_blank", rel: "noopener", title: "View raw archived record" }, icon("external-link", "icon-sm"), "Raw"));
   if (CAP.restore && it.has_body) actions.append(el("button", { class: "btn sm", title: "Restore to cloud as a new copy", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
+  // #566 A5: live write actions (edit / delete), cap-gated
+  if (CAP.contactwrite) {
+    actions.append(el("button", { class: "btn ghost sm", title: "Edit this contact in your account", onclick: () => openComposeContact({ id: it.remote_id }) }, icon("info", "icon-sm"), "Edit"));
+    actions.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", title: "Delete from your account", onclick: () => deleteContact(it) }, icon("trash-2", "icon-sm"), "Delete"));
+  }
   const verified = it.verify_status === "verified";
   box.append(el("header", { class: "con-detail-head" },
     el("button", { class: "con-back btn ghost sm", title: "Back", onclick: contactBack }, icon("chevron-left", "icon-sm")),

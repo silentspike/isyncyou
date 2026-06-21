@@ -280,6 +280,10 @@ fn run(args: &Args) -> Result<(), String> {
     let calendar_write_cap_token = mint_cap_token();
     let calendar_write_handler: Arc<dyn isyncyou_webui::CalendarWriteHandler> =
         Arc::new(DaemonCalendarWrite { cfg: cfg.clone() });
+    // A separate token gates the live-contact write POSTs (#566).
+    let contact_write_cap_token = mint_cap_token();
+    let contact_write_handler: Arc<dyn isyncyou_webui::ContactWriteHandler> =
+        Arc::new(DaemonContactWrite { cfg: cfg.clone() });
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
@@ -297,6 +301,7 @@ fn run(args: &Args) -> Result<(), String> {
     .with_settings(settings_handler, settings_cap_token)
     .with_mail_write(mail_write_handler, mail_write_cap_token)
     .with_calendar_write(calendar_write_handler, calendar_write_cap_token)
+    .with_contact_write(contact_write_handler, contact_write_cap_token)
     .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
@@ -542,6 +547,32 @@ impl isyncyou_webui::CalendarWriteHandler for DaemonCalendarWrite {
     ) -> Result<(), String> {
         let w = isyncyou_engine::calendar_writer(&self.cfg, account)?;
         isyncyou_engine::CalendarWriter::respond(&w, event_id, response, comment)
+    }
+}
+
+/// Web-UI live-contact write (#566 A5): resolves the restore-scope write token
+/// and performs create/update/delete. Fully qualified so the inherent GraphClient
+/// methods that share names aren't shadowed.
+struct DaemonContactWrite {
+    cfg: Config,
+}
+impl isyncyou_webui::ContactWriteHandler for DaemonContactWrite {
+    fn create(&self, account: &str, contact: &serde_json::Value) -> Result<String, String> {
+        let w = isyncyou_engine::contact_writer(&self.cfg, account)?;
+        isyncyou_engine::ContactWriter::create_contact(&w, contact)
+    }
+    fn update(
+        &self,
+        account: &str,
+        contact_id: &str,
+        contact: &serde_json::Value,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::contact_writer(&self.cfg, account)?;
+        isyncyou_engine::ContactWriter::update_contact(&w, contact_id, contact)
+    }
+    fn delete(&self, account: &str, contact_id: &str) -> Result<(), String> {
+        let w = isyncyou_engine::contact_writer(&self.cfg, account)?;
+        isyncyou_engine::ContactWriter::delete_contact(&w, contact_id)
     }
 }
 
@@ -1062,10 +1093,42 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
             .unwrap_or(0);
     let _ =
         isyncyou_connectors::backup_event_attachments(&client, &store, account, &archive_root, 25);
+    // Contacts (#566 A5): keep the per-service archive fresh — folderless + named
+    // folders via the contacts delta, download new contact JSON bodies, and fetch
+    // any newly-seen contact photos (so the photo avatar in the UI stays current).
+    // All best-effort so a contacts hiccup never blocks the mail/calendar passes.
+    // Uses the read token (Contacts.Read).
+    let con =
+        match isyncyou_connectors::incremental_sync_contacts(&mut client, &store, account, &now) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("isyncyoud: contacts sync for {account} skipped: {e}");
+                Default::default()
+            }
+        };
+    let conbodies =
+        isyncyou_connectors::backup_contacts_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let conphotos =
+        isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50)
+            .map(|r| r.downloaded)
+            .unwrap_or(0);
     Ok(format!(
         "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
-         calendar: {} events, {} bodies, {} flanks",
-        r.folders, r.upserted, r.deleted, b.downloaded, flanks, cal.upserted, cbodies, cflanks
+         calendar: {} events, {} bodies, {} flanks | \
+         contacts: {} upserted, {} bodies, {} photos",
+        r.folders,
+        r.upserted,
+        r.deleted,
+        b.downloaded,
+        flanks,
+        cal.upserted,
+        cbodies,
+        cflanks,
+        con.upserted,
+        conbodies,
+        conphotos
     ))
 }
 
