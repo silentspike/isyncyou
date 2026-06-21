@@ -19,6 +19,7 @@ use isyncyou_store::{Item, Store};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod calendar_live;
+mod contacts_live;
 mod mail_live;
 mod mail_restore;
 mod restore_calendar;
@@ -29,6 +30,7 @@ mod restore_recovery;
 mod restore_todo;
 mod verify;
 pub use calendar_live::{calendar_writer, CalendarWriter};
+pub use contacts_live::{contact_writer, ContactWriter};
 pub use mail_live::{build_message, mail_writer, MailWriter};
 pub use mail_restore::{
     pending_mail_restore_count, recover_pending_mail_restores, recover_pending_mail_restores_with,

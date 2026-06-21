@@ -1002,6 +1002,30 @@ impl GraphClient {
             &body,
         )
     }
+
+    /// Create a personal contact (`POST /me/contacts`); returns the created
+    /// contact (#566). The body should already be a sanitized, writable resource.
+    pub fn create_contact(
+        &self,
+        contact: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_json("/me/contacts", contact)
+    }
+
+    /// Update a personal contact (`PATCH /me/contacts/{id}`); returns the updated
+    /// contact.
+    pub fn update_contact(
+        &self,
+        contact_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(&format!("/me/contacts/{}", encode_id(contact_id)), patch)
+    }
+
+    /// Delete a personal contact (`DELETE /me/contacts/{id}`).
+    pub fn delete_contact(&self, contact_id: &str) -> Result<(), UploadError> {
+        self.delete_url(&format!("/me/contacts/{}", encode_id(contact_id)))
+    }
 }
 
 // ---- mail-write request-body builders (pure; unit-tested for exact shape) ----
@@ -1852,6 +1876,29 @@ mod tests {
         let seen = server.join().unwrap();
         assert!(seen[0].starts_with("POST /me/events"));
         assert!(seen[0].contains("content-type: application/json"));
+    }
+
+    #[test]
+    fn contact_verbs_hit_the_right_urls_and_encode_ids() {
+        let (base, server) = serve(vec![
+            http_response(201, "Created", "", "{\"id\":\"c1\"}"),
+            http_response(200, "OK", "", "{\"id\":\"c1\"}"),
+            http_response(204, "No Content", "", ""),
+        ]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        let created = c
+            .create_contact(&serde_json::json!({ "displayName": "Ada" }))
+            .unwrap();
+        assert_eq!(created["id"].as_str(), Some("c1"));
+        c.update_contact("aB+/9==", &serde_json::json!({ "jobTitle": "Analyst" }))
+            .unwrap();
+        c.delete_contact("aB+/9==").unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/contacts"));
+        assert!(seen[0].contains("content-type: application/json"));
+        // Outlook ids carry +//= → must be percent-escaped or Graph 404s the path.
+        assert!(seen[1].starts_with("PATCH /me/contacts/aB%2B%2F9%3D%3D"));
+        assert!(seen[2].starts_with("DELETE /me/contacts/aB%2B%2F9%3D%3D"));
     }
 
     #[test]
