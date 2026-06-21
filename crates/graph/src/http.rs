@@ -950,6 +950,54 @@ impl GraphClient {
     pub fn send_draft(&self, message_id: &str) -> Result<(), UploadError> {
         self.post_empty(&format!("/me/messages/{}/send", encode_id(message_id)))
     }
+
+    /// Create a calendar event (`POST /me/events`); returns the created event
+    /// (#565). The body should already be a sanitized, writable event resource.
+    pub fn create_event(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_json("/me/events", event)
+    }
+
+    /// Update a calendar event (`PATCH /me/events/{id}`); returns the updated event.
+    pub fn update_event(
+        &self,
+        event_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(&format!("/me/events/{}", encode_id(event_id)), patch)
+    }
+
+    /// Delete a calendar event (`DELETE /me/events/{id}`).
+    pub fn delete_event(&self, event_id: &str) -> Result<(), UploadError> {
+        self.delete_url(&format!("/me/events/{}", encode_id(event_id)))
+    }
+
+    /// Respond to an event invitation (#565): `response` is `accept` / `decline`
+    /// / `tentative`, mapped to the Graph action `POST /me/events/{id}/{action}`
+    /// with an optional comment; the response email is always sent.
+    pub fn respond_event(
+        &self,
+        event_id: &str,
+        response: &str,
+        comment: &str,
+    ) -> Result<(), UploadError> {
+        let action = match response {
+            "decline" | "declined" => "decline",
+            "tentative" | "tentativelyAccepted" => "tentativelyAccept",
+            _ => "accept",
+        };
+        let body = if comment.is_empty() {
+            serde_json::json!({ "sendResponse": true })
+        } else {
+            serde_json::json!({ "comment": comment, "sendResponse": true })
+        };
+        self.post_action(
+            &format!("/me/events/{}/{}", encode_id(event_id), action),
+            &body,
+        )
+    }
 }
 
 // ---- mail-write request-body builders (pure; unit-tested for exact shape) ----
