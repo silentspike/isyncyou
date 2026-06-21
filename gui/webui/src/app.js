@@ -1430,8 +1430,9 @@ function openDriveItem(it) {
   const q = { account: App.account, service: "onedrive", id: it.remote_id };
   const folder = it.item_type === "folder";
   const content = el("div");
+  const ext = fileExt(it.name);
   content.append(kvList([
-    ["Type", folder ? "Folder" : (fileKind(fileExt(it.name)) || "File")],
+    ["Type", folder ? "Folder" : (ext ? ext.toUpperCase() + " file" : "File")],
     ["Size", folder ? null : fmtSize(it.size)],
     ["Modified", it.remote_mtime ? fmtFullDate(it.remote_mtime) : null],
   ]));

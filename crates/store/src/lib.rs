@@ -535,9 +535,20 @@ impl Store {
             .write(true)
             .truncate(false)
             .open(&lock_path)?;
-        f.try_lock_exclusive()
-            .map_err(|_| StoreError::AlreadyRunning(lock_path.clone()))?;
-        Ok(f)
+        // The lock is held only for a Store's lifetime (a single request or sync
+        // pass), so concurrent opens within one process — the multi-threaded web
+        // server firing several store reads at once — just need to wait out the
+        // current holder. Retry briefly (~1s); a genuinely long-held lock (a second
+        // daemon instance) still fails after the window, preserving single-writer.
+        for attempt in 0..40 {
+            if f.try_lock_exclusive().is_ok() {
+                return Ok(f);
+            }
+            if attempt < 39 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        Err(StoreError::AlreadyRunning(lock_path))
     }
 
     fn init(conn: &Connection) -> Result<()> {
@@ -1898,6 +1909,28 @@ mod tests {
             Err(StoreError::AlreadyRunning(_)) => {}
             Err(e) => panic!("expected AlreadyRunning, got {e:?}"),
             Ok(_) => panic!("expected AlreadyRunning, got a second store"),
+        }
+    }
+
+    #[test]
+    fn concurrent_opens_from_one_process_all_succeed() {
+        // The multi-threaded web server opens the store per request, so several
+        // short-lived opens can overlap; the brief retry in acquire_lock must let
+        // them all succeed rather than racing the AlreadyRunning lock (#564).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        Store::open(&path).unwrap(); // create the store, then drop (release lock)
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let s = Store::open(&p).expect("concurrent open should succeed");
+                    let _ = s.count_by_service("a", "onedrive");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
         }
     }
 

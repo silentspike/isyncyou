@@ -1616,6 +1616,7 @@ dependencies = [
  "isyncyou-pathmap",
  "isyncyou-store",
  "isyncyou-webui",
+ "serde_json",
 ]
 
 [[package]]
