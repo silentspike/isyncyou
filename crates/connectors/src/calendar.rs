@@ -185,6 +185,64 @@ pub fn incremental_sync_calendar<T: Transport>(
     Ok(report)
 }
 
+/// Sync calendars via `/me/events` (#565 B2, the default model): list each
+/// calendar, then page **all** its events. Recurring series come back as their
+/// MASTER (carrying the recurrence rule), never expanded into occurrences — so a
+/// daily series is one stored row, not tens of thousands (AC-N). There is no
+/// date window, so far-future events are captured (AC-3). Plain `/me/events` has
+/// no Graph delta, so deletions are reconciled by set-difference against the
+/// current id list per calendar.
+pub fn events_sync_calendar<T: Transport>(
+    transport: &mut T,
+    store: &Store,
+    account: &str,
+    now: &str,
+) -> Result<CalendarReport, SyncError> {
+    transport.set_prefer_immutable_id(true);
+    let raw = fetch_pages(transport, CALENDARS_URL)?;
+    let calendars = parse_calendars(&raw);
+    let mut report = CalendarReport {
+        calendars: calendars.len(),
+        ..Default::default()
+    };
+
+    for cal in &calendars {
+        let mut ci = Item::new(account, SERVICE, &cal.id, &cal.name, "calendar");
+        ci.sync_state = "remote_dirty".into();
+        store.upsert_item(&ci)?;
+
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/calendars/{}/events?$top=50",
+            cal.id
+        );
+        let events = fetch_pages(transport, &url)?;
+        let mut seen: Vec<String> = Vec::with_capacity(events.len());
+        for ev in &events {
+            if let Some(id) = ev.get("id").and_then(Value::as_str) {
+                seen.push(id.to_string());
+            }
+            match ingest_event(store, account, &cal.id, ev, now)? {
+                Ingest::Upserted => report.upserted += 1,
+                Ingest::Deleted => report.deleted += 1,
+                Ingest::Skipped => report.skipped += 1,
+            }
+        }
+        // No delta on plain /me/events, so reconcile deletions: a live event under
+        // this calendar that the cloud no longer lists has been removed.
+        for it in store.items_by_service(account, SERVICE)? {
+            if it.item_type == "event"
+                && it.parent_remote_id.as_deref() == Some(cal.id.as_str())
+                && it.deleted_at.is_none()
+                && !seen.iter().any(|s| s == &it.remote_id)
+            {
+                store.mark_deleted(account, SERVICE, &it.remote_id, now)?;
+                report.deleted += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
 enum Ingest {
     Upserted,
     Deleted,
@@ -428,6 +486,79 @@ mod tests {
                 .as_deref(),
             Some("D2")
         );
+    }
+
+    #[test]
+    fn events_mode_stores_master_and_far_future_without_explosion() {
+        let store = Store::open_in_memory().unwrap();
+        // /me/events returns the recurring MASTER (with its rule) + a far-future
+        // single — neither expanded into occurrences.
+        let master = json!({
+            "id": "M1", "subject": "Daily standup", "type": "seriesMaster",
+            "@odata.etag": "W/\"M\"", "lastModifiedDateTime": "2026-01-01T00:00:00Z",
+            "recurrence": { "pattern": { "type": "daily", "interval": 1 }, "range": { "type": "noEnd" } }
+        });
+        let far = json!({
+            "id": "F1", "subject": "2040 plan", "type": "singleInstance",
+            "@odata.etag": "W/\"F\"", "lastModifiedDateTime": "2040-06-01T00:00:00Z"
+        });
+        let mut t = MockTransport(
+            vec![
+                Response::ok(json!({ "value": [cal("C1", "Calendar")] })),
+                Response::ok(json!({ "value": [master, far] })), // one page, no nextLink
+            ],
+            0,
+        );
+        let r = events_sync_calendar(&mut t, &store, "acc", "2026-06-21T00:00:00Z").unwrap();
+        assert_eq!(r.upserted, 2);
+        // the daily series is exactly ONE stored row (the master), not occurrences
+        let m = store.get_item("acc", SERVICE, "M1").unwrap().unwrap();
+        assert_eq!(m.item_type, "event");
+        assert!(m.series_master_id.is_none(), "the master has no master");
+        // the 2040 event is captured despite no date window
+        assert!(store.get_item("acc", SERVICE, "F1").unwrap().is_some());
+        let events = store
+            .items_by_service("acc", SERVICE)
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.item_type == "event")
+            .count();
+        assert_eq!(events, 2, "no occurrence explosion (AC-N)");
+    }
+
+    #[test]
+    fn events_mode_reconciles_deletions() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t1 = MockTransport(
+            vec![
+                Response::ok(json!({ "value": [cal("C1", "Calendar")] })),
+                Response::ok(json!({ "value": [event("e1", "A"), event("e2", "B")] })),
+            ],
+            0,
+        );
+        events_sync_calendar(&mut t1, &store, "acc", "t").unwrap();
+        // second pass: e2 is gone from the listing -> reconciled as deleted
+        let mut t2 = MockTransport(
+            vec![
+                Response::ok(json!({ "value": [cal("C1", "Calendar")] })),
+                Response::ok(json!({ "value": [event("e1", "A")] })),
+            ],
+            0,
+        );
+        let r = events_sync_calendar(&mut t2, &store, "acc", "2026-06-21T00:00:00Z").unwrap();
+        assert_eq!(r.deleted, 1);
+        assert!(store
+            .get_item("acc", SERVICE, "e2")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_some());
+        assert!(store
+            .get_item("acc", SERVICE, "e1")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none());
     }
 
     struct MockJsonFetcher(Value);

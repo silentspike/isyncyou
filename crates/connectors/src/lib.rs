@@ -29,7 +29,9 @@ pub use archive::{
     backup_onenote_bodies, backup_onenote_resources, backup_todo_bodies, ArchiveReport,
     BytesFetcher, JsonFetcher, OneNoteResourceReport,
 };
-pub use calendar::{backup_calendar_flanks, incremental_sync_calendar, CalendarReport};
+pub use calendar::{
+    backup_calendar_flanks, events_sync_calendar, incremental_sync_calendar, CalendarReport,
+};
 pub use common::shard_rel;
 pub use contacts::{backup_contact_photos, incremental_sync_contacts, ContactsReport, PhotoReport};
 pub use export::{contact_to_vcard, event_to_ics};

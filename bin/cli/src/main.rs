@@ -1837,14 +1837,21 @@ fn backup_one_account(
                 )
             }
             "calendar" => {
-                let r = connectors::incremental_sync_calendar(
-                    &mut client,
-                    &store,
-                    account,
-                    cal_start,
-                    cal_end,
-                    &now,
-                )
+                // #565: default to the /me/events model (no window, no occurrence
+                // explosion); the windowed calendarView/delta stays as a flagged
+                // rollback (`calendar_sync_mode = "calendar_view"`).
+                let r = if cfg.sync.calendar_sync_mode == "calendar_view" {
+                    connectors::incremental_sync_calendar(
+                        &mut client,
+                        &store,
+                        account,
+                        cal_start,
+                        cal_end,
+                        &now,
+                    )
+                } else {
+                    connectors::events_sync_calendar(&mut client, &store, account, &now)
+                }
                 .map_err(|e| e.to_string())?;
                 let b = connectors::backup_calendar_bodies(
                     &client,

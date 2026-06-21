@@ -71,6 +71,11 @@ pub struct SyncConfig {
     /// When the UI is idle, the active interval is stretched by this factor to
     /// save battery/network (e.g. 5 s active → 30 s idle at factor 6).
     pub poll_idle_factor: u32,
+    /// Calendar sync model (#565): `"events"` (default) pages `/me/events` —
+    /// recurring series stored as one master + its rule, no date window, no
+    /// occurrence explosion. `"calendar_view"` keeps the legacy windowed
+    /// `calendarView/delta` (incremental but window-bound) as a rollback.
+    pub calendar_sync_mode: String,
 }
 
 impl Default for SyncConfig {
@@ -82,6 +87,7 @@ impl Default for SyncConfig {
             body_index: false,
             poll_interval_secs: 5,
             poll_idle_factor: 6,
+            calendar_sync_mode: "events".into(),
         }
     }
 }
