@@ -1946,9 +1946,12 @@ fn backup_one_account(
                     }
                 };
                 // Task sub-resources (#567 B2): checklistItems/linkedResources +
-                // gated attachments. Best-effort.
+                // gated attachments. Best-effort. Attachments need Tasks.ReadWrite
+                // (the To Do `.../attachments` endpoint denies the read scope), so the
+                // same client doubles as the write-scope att_fetcher here.
                 let sub = match connectors::backup_task_subresources(
                     &client,
+                    Some(&client),
                     &store,
                     account,
                     &archive_root,

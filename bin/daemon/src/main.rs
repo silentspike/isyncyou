@@ -1215,10 +1215,22 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
         isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root)
             .map(|r| r.archived)
             .unwrap_or(0);
-    let tsub =
-        isyncyou_connectors::backup_task_subresources(&client, &store, account, &archive_root, 25)
-            .map(|r| r.archived)
-            .unwrap_or(0);
+    // To Do task attachments need Tasks.ReadWrite — the `.../attachments` endpoint
+    // denies the read scope — so back them up with a write-scope client when one is
+    // cached (best-effort; without it, attachments are simply skipped).
+    let todo_att_client = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account)
+        .ok()
+        .map(isyncyou_graph::GraphClient::new);
+    let tsub = isyncyou_connectors::backup_task_subresources(
+        &client,
+        todo_att_client.as_ref(),
+        &store,
+        account,
+        &archive_root,
+        25,
+    )
+    .map(|r| r.archived)
+    .unwrap_or(0);
     Ok(format!(
         "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
          calendar: {} events, {} bodies, {} flanks | \

@@ -181,8 +181,14 @@ fn has_values(v: &Value) -> bool {
 /// tasks cost no request). Each snapshot is a JSON sidecar under a synthetic id
 /// (`_checklist_<id>` / `_linked_<id>` / `_taskatt_<id>`). Best-effort per task;
 /// a single failing fetch never aborts the pass.
+/// `att_fetcher` is a **separate** fetcher for the attachment list: Microsoft To
+/// Do's `.../attachments` endpoint returns 401 `accessDenied` under the read scope
+/// (`Tasks.Read`) and only works with `Tasks.ReadWrite`, so the daemon passes its
+/// write-scope client here (and `None` when no write token is cached → attachments
+/// are skipped, never an error). checklist/linked use the plain `fetcher`.
 pub fn backup_task_subresources<F: JsonFetcher>(
     fetcher: &F,
+    att_fetcher: Option<&F>,
     store: &Store,
     account: &str,
     archive_root: &Path,
@@ -235,7 +241,8 @@ pub fn backup_task_subresources<F: JsonFetcher>(
             }
         }
 
-        // attachments — gated on the archived task JSON's hasAttachments.
+        // attachments — gated on the archived task JSON's hasAttachments, and only
+        // when a write-scope fetcher is available (the read scope is denied here).
         let has_att = it
             .local_path
             .as_deref()
@@ -243,9 +250,20 @@ pub fn backup_task_subresources<F: JsonFetcher>(
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .and_then(|t| t.get("hasAttachments").and_then(Value::as_bool))
             == Some(true);
-        if has_att {
-            if let Ok(atts) = fetcher.fetch_json(&format!("{base}/attachments")) {
-                if has_values(&atts) {
+        if let (true, Some(af)) = (has_att, att_fetcher) {
+            if let Ok(atts) = af.fetch_json(&format!("{base}/attachments")) {
+                // The attachments *list* omits `contentBytes` (the file bytes); fetch
+                // each attachment in full so the archived snapshot carries the bytes.
+                let full: Vec<Value> = atts
+                    .get("value")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.get("id").and_then(Value::as_str))
+                    .filter_map(|aid| af.fetch_json(&format!("{base}/attachments/{aid}")).ok())
+                    .collect();
+                if !full.is_empty() {
+                    let snap = serde_json::json!({ "value": full });
                     report.bytes += archive_json_item(
                         store,
                         account,
@@ -253,7 +271,7 @@ pub fn backup_task_subresources<F: JsonFetcher>(
                         &format!("_taskatt_{}", it.remote_id),
                         &format!("{} attachments", it.name),
                         "task-attachment",
-                        &atts,
+                        &snap,
                     )?;
                     report.archived += 1;
                 }
@@ -542,9 +560,14 @@ mod tests {
                 } else {
                     Ok(json!({ "value": [] }))
                 }
-            } else if url.contains("/attachments") {
+            } else if url.contains("/attachments/") {
+                // individual GET carries the file bytes (contentBytes), the list does not
+                Ok(json!({ "id": "att1", "name": "spec.pdf",
+                    "contentType": "application/pdf", "contentBytes": "QUJD" }))
+            } else if url.ends_with("/attachments") {
+                // the list omits contentBytes — only metadata + the id
                 Ok(json!({ "value": [{ "id": "att1", "name": "spec.pdf",
-                    "contentType": "application/pdf", "contentBytes": "QUJD" }] }))
+                    "contentType": "application/pdf", "size": 3 }] }))
             } else {
                 Ok(json!({ "value": [] }))
             }
@@ -558,11 +581,33 @@ mod tests {
         seed_task(&store, arch.path(), "t1", "L1", true); // checklist + linked + attachment
         seed_task(&store, arch.path(), "t2", "L1", false); // checklist only (no linked, no attachment gate)
 
-        let r = backup_task_subresources(&SubFetcher, &store, "acc", arch.path(), 0).unwrap();
+        let r = backup_task_subresources(
+            &SubFetcher,
+            Some(&SubFetcher),
+            &store,
+            "acc",
+            arch.path(),
+            0,
+        )
+        .unwrap();
         assert_eq!(
             r.archived, 4,
             "t1: checklist+linked+attachment (3) + t2: checklist (1)"
         );
+
+        // without the write-scope att_fetcher, attachments are skipped (Graph denies
+        // the read scope on .../attachments): t1 -> checklist+linked, t2 -> checklist.
+        let store2 = Store::open_in_memory().unwrap();
+        let arch2 = tempfile::tempdir().unwrap();
+        seed_task(&store2, arch2.path(), "t1", "L1", true);
+        seed_task(&store2, arch2.path(), "t2", "L1", false);
+        let r2 =
+            backup_task_subresources(&SubFetcher, None, &store2, "acc", arch2.path(), 0).unwrap();
+        assert_eq!(r2.archived, 3, "no att_fetcher -> attachments skipped");
+        assert!(store2
+            .get_item("acc", SERVICE, "_taskatt_t1")
+            .unwrap()
+            .is_none());
 
         // checklist sidecar carries the steps with their checked state (#567 core content)
         let cl = store
@@ -586,13 +631,21 @@ mod tests {
                 .item_type,
             "linked-resource"
         );
+        let att = store
+            .get_item("acc", SERVICE, "_taskatt_t1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(att.item_type, "task-attachment");
+        // the attachment snapshot carries the file bytes from the individual GET
+        let att_body: Value = serde_json::from_slice(
+            &std::fs::read(arch.path().join(att.local_path.unwrap())).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            store
-                .get_item("acc", SERVICE, "_taskatt_t1")
-                .unwrap()
-                .unwrap()
-                .item_type,
-            "task-attachment"
+            att_body
+                .pointer("/value/0/contentBytes")
+                .and_then(Value::as_str),
+            Some("QUJD")
         );
         // t2 has no linked resource and hasAttachments=false -> only the checklist
         assert!(store
