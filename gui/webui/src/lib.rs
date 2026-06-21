@@ -330,6 +330,28 @@ pub trait MailWriteHandler: Send + Sync {
     fn send_draft(&self, account: &str, message_id: &str) -> Result<(), String>;
 }
 
+/// Performs the live-calendar **write** verbs on behalf of a cap-token POST
+/// (#565 B7). Injected by the daemon (which owns the engine + the full write
+/// token); the read-only CLI `serve` does not set it, so every
+/// `/api/v1/calendar/*` POST is refused there. `event` is a Graph event resource
+/// the router builds from the request (sanitized to writable fields downstream).
+pub trait CalendarWriteHandler: Send + Sync {
+    /// Create an event; returns the new cloud id.
+    fn create(&self, account: &str, event: &Value) -> Result<String, String>;
+    /// Update an event's writable fields from a (partial) event resource.
+    fn update(&self, account: &str, event_id: &str, event: &Value) -> Result<(), String>;
+    /// Delete an event.
+    fn delete(&self, account: &str, event_id: &str) -> Result<(), String>;
+    /// Respond to an invitation: `accept` / `decline` / `tentative` (+ comment).
+    fn respond(
+        &self,
+        account: &str,
+        event_id: &str,
+        response: &str,
+        comment: &str,
+    ) -> Result<(), String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -420,6 +442,11 @@ pub struct Router {
     /// Separate capability token for mail-write POSTs (distinct blast radius —
     /// these send/modify real mail).
     mail_write_cap_token: Option<String>,
+    /// Optional live-calendar write handler (the daemon's). `None` => every
+    /// `/api/v1/calendar/*` POST is refused (the read-only CLI `serve`).
+    calendar_write: Option<std::sync::Arc<dyn CalendarWriteHandler>>,
+    /// Separate capability token for calendar-write POSTs.
+    calendar_write_cap_token: Option<String>,
 }
 
 impl Router {
@@ -442,6 +469,8 @@ impl Router {
             settings_cap_token: None,
             mail_write: None,
             mail_write_cap_token: None,
+            calendar_write: None,
+            calendar_write_cap_token: None,
         }
     }
 
@@ -466,6 +495,8 @@ impl Router {
             settings_cap_token: None,
             mail_write: None,
             mail_write_cap_token: None,
+            calendar_write: None,
+            calendar_write_cap_token: None,
         }
     }
 
@@ -561,6 +592,17 @@ impl Router {
         self
     }
 
+    /// Enable the live-calendar write POSTs (builder style, #565).
+    pub fn with_calendar_write(
+        mut self,
+        handler: std::sync::Arc<dyn CalendarWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.calendar_write = Some(handler);
+        self.calendar_write_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token.
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
         matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
@@ -612,6 +654,10 @@ impl Router {
                 "/api/v1/mail/flag" => self.mail_flag(req),
                 "/api/v1/mail/categories" => self.mail_categories(req),
                 "/api/v1/mail/draft" => self.mail_draft(req),
+                "/api/v1/calendar/create" => self.calendar_create(req),
+                "/api/v1/calendar/update" => self.calendar_update(req),
+                "/api/v1/calendar/delete" => self.calendar_delete(req),
+                "/api/v1/calendar/respond" => self.calendar_respond(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -650,6 +696,10 @@ impl Router {
                     .replace(
                         "__MAILWRITE_CAP_TOKEN__",
                         self.mail_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__CALENDARWRITE_CAP_TOKEN__",
+                        self.calendar_write_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -765,6 +815,155 @@ impl Router {
                 ApiResponse::error(500, &e)
             }
         }
+    }
+
+    // ---- live-calendar write endpoints (#565 B7) ----------------------------
+    /// Shared gate for `/api/v1/calendar/*` (handler injected + cap token).
+    fn calendar_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn CalendarWriteHandler>, ApiResponse> {
+        let h = self.calendar_write.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "calendar write is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.calendar_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit calendar result (same SSE caveat as mail_result).
+    fn cal_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:calendar", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:calendar", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a Graph event resource from the request's query params (subject,
+    /// start/end with a timezone, location, HTML body, all-day). Only provided
+    /// fields are set; the write layer sanitizes to the writable whitelist.
+    fn event_from_req(req: &ApiRequest) -> Value {
+        let tz = req.q("tz").filter(|s| !s.is_empty()).unwrap_or("UTC");
+        let mut ev = json!({});
+        let obj = ev.as_object_mut().unwrap();
+        if let Some(s) = req.q("subject") {
+            obj.insert("subject".into(), json!(s));
+        }
+        if let Some(s) = req.q("start").filter(|s| !s.is_empty()) {
+            obj.insert("start".into(), json!({ "dateTime": s, "timeZone": tz }));
+        }
+        if let Some(s) = req.q("end").filter(|s| !s.is_empty()) {
+            obj.insert("end".into(), json!({ "dateTime": s, "timeZone": tz }));
+        }
+        if let Some(s) = req.q("location").filter(|s| !s.is_empty()) {
+            obj.insert("location".into(), json!({ "displayName": s }));
+        }
+        if let Some(s) = req.q("body").filter(|s| !s.is_empty()) {
+            obj.insert(
+                "body".into(),
+                json!({ "contentType": "HTML", "content": s }),
+            );
+        }
+        if req.q("all_day") == Some("1") {
+            obj.insert("isAllDay".into(), json!(true));
+        }
+        ev
+    }
+
+    fn calendar_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let ev = Self::event_from_req(req);
+        if ev.get("subject").is_none() || ev.get("start").is_none() {
+            return ApiResponse::error(400, "subject and start are required");
+        }
+        match h.create(account, &ev) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:calendar", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:calendar", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn calendar_update(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let ev = Self::event_from_req(req);
+        self.cal_result(
+            account,
+            &format!("update id={id}"),
+            h.update(account, id, &ev),
+        )
+    }
+
+    fn calendar_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.cal_result(account, &format!("delete id={id}"), h.delete(account, id))
+    }
+
+    fn calendar_respond(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let response = req
+            .q("response")
+            .filter(|r| !r.is_empty())
+            .unwrap_or("accept");
+        let comment = req.q("comment").unwrap_or("");
+        self.cal_result(
+            account,
+            &format!("respond id={id} {response}"),
+            h.respond(account, id, response, comment),
+        )
     }
 
     fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
@@ -2686,6 +2885,88 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn app_js_has_mail_write_cap_token_placeholder() {
         assert!(APP_JS.contains("__MAILWRITE_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_calendar_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__CALENDARWRITE_CAP_TOKEN__"));
+    }
+
+    #[derive(Default)]
+    struct RecCalWrite(std::sync::Mutex<Vec<String>>);
+    impl CalendarWriteHandler for RecCalWrite {
+        fn create(&self, _a: &str, event: &Value) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!(
+                "create subj={}",
+                event.get("subject").and_then(Value::as_str).unwrap_or("")
+            ));
+            Ok("ev-new".into())
+        }
+        fn update(&self, _a: &str, id: &str, _e: &Value) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("update id={id}"));
+            Ok(())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("delete id={id}"));
+            Ok(())
+        }
+        fn respond(&self, _a: &str, id: &str, r: &str, _c: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("respond id={id} {r}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn calendar_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/calendar/create",
+            "/api/v1/calendar/update",
+            "/api/v1/calendar/delete",
+            "/api/v1/calendar/respond",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecCalWrite::default());
+        let router = router.with_calendar_write(rec.clone(), "calsecret".into());
+        let create = "/api/v1/calendar/create?account=a&subject=Plan&start=2026-02-04T09:00:00Z";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token but no subject/start -> 400 (handler not called)
+        let bad = ApiRequest::new("POST", "/api/v1/calendar/create?account=a")
+            .with_cap_token(Some("calsecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("calsecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/calendar/update?account=a&id=E1&subject=X"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/calendar/delete?account=a&id=E2"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/calendar/respond?account=a&id=E3&response=decline"
+                ))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        assert_eq!(log[0], "create subj=Plan");
+        assert_eq!(log[1], "update id=E1");
+        assert_eq!(log[2], "delete id=E2");
+        assert_eq!(log[3], "respond id=E3 decline");
     }
 
     struct OkVerify;

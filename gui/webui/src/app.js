@@ -268,6 +268,7 @@ const CAP = {
   verify: "__VERIFY_CAP_TOKEN__",
   settings: "__SETTINGS_CAP_TOKEN__",
   mailwrite: "__MAILWRITE_CAP_TOKEN__",
+  calendarwrite: "__CALENDARWRITE_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
@@ -1538,6 +1539,7 @@ async function renderCalendarView(view) {
         el("button", { class: "btn ghost sm icon-only", title: "Next", onclick: () => calNav(1) }, icon("chevron-right", "icon-sm"))),
       el("div", { id: "cal-label", class: "cal-label" }),
       el("div", { class: "spacer", style: "flex:1" }),
+      CAP.calendarwrite ? el("button", { class: "btn sm primary", title: "Create a new event", onclick: () => openComposeEvent() }, icon("calendar", "icon-sm"), "New event") : null,
       verifyButton(() => renderCalendarView(view)),
       el("div", { class: "seg" },
         ["month", "week", "agenda"].map(v => el("button", { class: "seg-btn" + (Cal.view === v ? " active" : ""), dataset: { calview: v }, onclick: () => setCalView(v), text: v[0].toUpperCase() + v.slice(1) }))),
@@ -1839,10 +1841,72 @@ async function openEventSheet(ev) {
     }
     clear(content).append(kv, ...notes, ...tail);
   } catch { clear(content).append(kv); }
+  // #565 B7: live write actions (edit / respond / delete), cap-gated
+  if (CAP.calendarwrite) {
+    const acts = el("div", { style: "margin-top:16px;display:flex;gap:8px;flex-wrap:wrap" });
+    acts.append(el("button", { class: "btn ghost sm", onclick: () => { closeSheet(); openComposeEvent({ id: ev.it.remote_id, subject: ev.subject, start: ev.start, end: ev.end, location: ev.location }); } }, icon("info", "icon-sm"), "Edit"));
+    ["accept", "tentative", "decline"].forEach(r => acts.append(el("button", { class: "btn ghost sm", title: "Respond: " + r, onclick: () => respondEvent(ev, r) }, r[0].toUpperCase() + r.slice(1))));
+    acts.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", onclick: () => deleteEvent(ev) }, icon("trash-2", "icon-sm"), "Delete"));
+    content.append(acts);
+  }
   content.append(el("a", { class: "btn ghost sm", style: "margin-top:16px", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open full event"));
 }
 let sheetEl = null;
 function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
+
+// #565 B7: create / edit an event. `opts.id` => edit (PATCH), else create (POST).
+function openComposeEvent(opts = {}) {
+  if (!CAP.calendarwrite) return;
+  const o = opts || {};
+  const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
+  // a JS Date -> the value a <input type=datetime-local> expects (local wall-clock)
+  const toLocal = (d) => { if (!d) return ""; const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000); return z.toISOString().slice(0, 16); };
+  const subjIn = el("input", { class: "input", id: "cev-subject", placeholder: "Title", value: o.subject || "" });
+  const startIn = el("input", { class: "input", type: "datetime-local", id: "cev-start", value: toLocal(o.start) });
+  const endIn = el("input", { class: "input", type: "datetime-local", id: "cev-end", value: toLocal(o.end) });
+  const locIn = el("input", { class: "input", id: "cev-loc", placeholder: "Location", value: o.location || "" });
+  const bodyIn = el("textarea", { class: "input cmp-textarea", id: "cev-body", placeholder: "Notes", rows: "5" });
+  if (o.body) bodyIn.value = o.body;
+  const content = el("div", { class: "compose" },
+    field("Title", subjIn), field("Start", startIn), field("End", endIn),
+    field("Location", locIn), field("Notes", bodyIn),
+    el("div", { class: "cmp-footer" },
+      el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: (e) => composeEventSubmit(e.currentTarget, o.id) }, icon("calendar", "icon-sm"), o.id ? "Save" : "Create")));
+  openSheet(o.id ? "Edit event" : "New event", content);
+  setTimeout(() => subjIn.focus(), 60);
+}
+async function composeEventSubmit(btn, id) {
+  const subject = ($("#cev-subject").value || "").trim();
+  const startV = $("#cev-start").value, endV = $("#cev-end").value;
+  const loc = ($("#cev-loc").value || "").trim(), body = ($("#cev-body").value || "").trim();
+  if (!subject) { toast("Add a title", "err"); return; }
+  if (!id && !startV) { toast("Pick a start time", "err"); return; }
+  const toUtc = (v) => v ? new Date(v).toISOString() : "";  // local wall-clock -> UTC instant
+  const params = { account: App.account, subject, location: loc, body, tz: "UTC" };
+  if (startV) params.start = toUtc(startV);
+  if (endV) params.end = toUtc(endV);
+  if (id) params.id = id;
+  btn.disabled = true;
+  try {
+    await post((id ? "/api/v1/calendar/update?" : "/api/v1/calendar/create?") + qs(params), CAP.calendarwrite);
+    toast(id ? "Event updated" : "Event created");
+    closeSheet(); calLoad();
+  } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
+}
+async function respondEvent(ev, response) {
+  try {
+    await post("/api/v1/calendar/respond?" + qs({ account: App.account, id: ev.it.remote_id, response }), CAP.calendarwrite);
+    toast("Response sent: " + response); closeSheet(); calLoad();
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function deleteEvent(ev) {
+  if (!confirm("Delete this event? This removes it from your calendar.")) return;
+  try {
+    await post("/api/v1/calendar/delete?" + qs({ account: App.account, id: ev.it.remote_id }), CAP.calendarwrite);
+    toast("Event deleted"); closeSheet(); calLoad();
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
 
 /* ---------------------------------------------------------------- contacts (avatar cards) */
 const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null, runs: [], retentionDays: null };

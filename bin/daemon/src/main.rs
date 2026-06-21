@@ -276,6 +276,10 @@ fn run(args: &Args) -> Result<(), String> {
     let mail_write_cap_token = mint_cap_token();
     let mail_write_handler: Arc<dyn isyncyou_webui::MailWriteHandler> =
         Arc::new(DaemonMailWrite { cfg: cfg.clone() });
+    // A separate token gates the live-calendar write POSTs (#565).
+    let calendar_write_cap_token = mint_cap_token();
+    let calendar_write_handler: Arc<dyn isyncyou_webui::CalendarWriteHandler> =
+        Arc::new(DaemonCalendarWrite { cfg: cfg.clone() });
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
@@ -292,6 +296,7 @@ fn run(args: &Args) -> Result<(), String> {
     .with_verify(verify_handler, verify_cap_token)
     .with_settings(settings_handler, settings_cap_token)
     .with_mail_write(mail_write_handler, mail_write_cap_token)
+    .with_calendar_write(calendar_write_handler, calendar_write_cap_token)
     .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
@@ -501,6 +506,42 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
     fn send_draft(&self, account: &str, message_id: &str) -> Result<(), String> {
         let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
         isyncyou_engine::MailWriter::send_draft(&w, message_id)
+    }
+}
+
+/// Web-UI live-calendar write (#565 B7): resolves the restore-scope write token
+/// and performs create/update/delete/respond. Fully qualified so the inherent
+/// GraphClient methods that share names aren't shadowed.
+struct DaemonCalendarWrite {
+    cfg: Config,
+}
+impl isyncyou_webui::CalendarWriteHandler for DaemonCalendarWrite {
+    fn create(&self, account: &str, event: &serde_json::Value) -> Result<String, String> {
+        let w = isyncyou_engine::calendar_writer(&self.cfg, account)?;
+        isyncyou_engine::CalendarWriter::create_event(&w, event)
+    }
+    fn update(
+        &self,
+        account: &str,
+        event_id: &str,
+        event: &serde_json::Value,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::calendar_writer(&self.cfg, account)?;
+        isyncyou_engine::CalendarWriter::update_event(&w, event_id, event)
+    }
+    fn delete(&self, account: &str, event_id: &str) -> Result<(), String> {
+        let w = isyncyou_engine::calendar_writer(&self.cfg, account)?;
+        isyncyou_engine::CalendarWriter::delete_event(&w, event_id)
+    }
+    fn respond(
+        &self,
+        account: &str,
+        event_id: &str,
+        response: &str,
+        comment: &str,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::calendar_writer(&self.cfg, account)?;
+        isyncyou_engine::CalendarWriter::respond(&w, event_id, response, comment)
     }
 }
 
