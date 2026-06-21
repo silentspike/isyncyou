@@ -49,11 +49,11 @@ fn archive_json_item(
     Ok(bytes.len() as u64)
 }
 
-/// Back up the calendar **entity** flanks (#565 B1): one `item_type="calendar"`
-/// snapshot per calendar from `/me/calendars`, archiving the full calendar JSON
-/// (so the UI can colour-code events by each calendar's `hexColor`/`color`).
-/// Re-fetched each pass (small data). #565 B3 extends this with calendar groups,
-/// per-calendar permissions and event attachments.
+/// Back up the calendar flanks (#565 B1 + B3): one `item_type="calendar"`
+/// snapshot per calendar from `/me/calendars` (so the UI can colour-code events
+/// by each calendar's `hexColor`/`color`), a `calendar-group` snapshot of
+/// `/me/calendarGroups`, and a `calendar-permission` snapshot of each calendar's
+/// `/me/calendars/{id}/calendarPermissions`. Re-fetched each pass (small data).
 pub fn backup_calendar_flanks<F: JsonFetcher>(
     fetcher: &F,
     store: &Store,
@@ -77,8 +77,98 @@ pub fn backup_calendar_flanks<F: JsonFetcher>(
         let name = cal.get("name").and_then(Value::as_str).unwrap_or(id);
         report.bytes += archive_json_item(store, account, archive_root, id, name, "calendar", cal)?;
         report.archived += 1;
+
+        // Per-calendar sharing permissions (#565 B3, snapshot-only).
+        if let Ok(perms) = fetcher.fetch_json(&format!("/me/calendars/{id}/calendarPermissions")) {
+            let pid = format!("_calperm_{id}");
+            report.bytes += archive_json_item(
+                store,
+                account,
+                archive_root,
+                &pid,
+                &format!("{name} permissions"),
+                "calendar-permission",
+                &perms,
+            )?;
+            report.archived += 1;
+        }
     }
 
+    // Calendar groups (#565 B3) — one snapshot of the whole list.
+    let groups = fetcher
+        .fetch_json("/me/calendarGroups")
+        .map_err(SyncError::Remote)?;
+    report.bytes += archive_json_item(
+        store,
+        account,
+        archive_root,
+        "_calendar_groups",
+        "Calendar groups",
+        "calendar-group",
+        &groups,
+    )?;
+    report.archived += 1;
+
+    Ok(report)
+}
+
+/// Back up event attachments (#565 B3): for each archived event whose JSON shows
+/// `hasAttachments`, fetch `/me/events/{id}/attachments` and snapshot the list as
+/// an `event-attachment` item (file attachments carry their bytes inline as
+/// base64 `contentBytes`). Gated on the sidecar so non-attachment events cost no
+/// request. Bounded by `limit` (0 = all). Best-effort per event.
+pub fn backup_event_attachments<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    limit: usize,
+) -> Result<ArchiveReport, SyncError> {
+    let mut report = ArchiveReport::default();
+    for it in store.items_by_service(account, SERVICE)? {
+        if it.item_type != "event" || it.deleted_at.is_some() {
+            continue;
+        }
+        if limit != 0 && report.archived >= limit {
+            break;
+        }
+        // Gate on the archived event JSON's hasAttachments (no sidecar => skip).
+        let Some(rel) = it.local_path.as_deref() else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(archive_root.join(rel)) else {
+            continue;
+        };
+        let Ok(ev) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if ev.get("hasAttachments").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Ok(atts) = fetcher.fetch_json(&format!("/me/events/{}/attachments", it.remote_id))
+        else {
+            continue;
+        };
+        let has_any = atts
+            .get("value")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if !has_any {
+            continue;
+        }
+        let aid = format!("_evatt_{}", it.remote_id);
+        report.bytes += archive_json_item(
+            store,
+            account,
+            archive_root,
+            &aid,
+            &format!("{} attachments", it.name),
+            "event-attachment",
+            &atts,
+        )?;
+        report.archived += 1;
+    }
     Ok(report)
 }
 
@@ -561,32 +651,94 @@ mod tests {
             .is_none());
     }
 
-    struct MockJsonFetcher(Value);
+    // URL-aware mock so calendars / permissions / groups get distinct snapshots.
+    struct MockJsonFetcher;
     impl JsonFetcher for MockJsonFetcher {
-        fn fetch_json(&self, _url: &str) -> std::result::Result<Value, String> {
-            Ok(self.0.clone())
+        fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+            if url.contains("calendarPermissions") {
+                Ok(json!({ "value": [{ "id": "perm1", "role": "read" }] }))
+            } else if url.contains("calendarGroups") {
+                Ok(json!({ "value": [{ "id": "g1", "name": "My calendars" }] }))
+            } else if url.contains("/me/calendars") {
+                Ok(json!({ "value": [
+                    { "id": "C1", "name": "Calendar", "hexColor": "#FF0000", "color": "lightRed", "isDefaultCalendar": true },
+                    { "id": "C2", "name": "Work", "hexColor": "#00AA00", "color": "lightGreen" },
+                ]}))
+            } else {
+                Ok(json!({ "value": [] }))
+            }
         }
     }
 
     #[test]
-    fn backup_calendar_flanks_snapshots_calendars_with_colour() {
+    fn backup_calendar_flanks_snapshots_calendars_groups_and_permissions() {
         let store = Store::open_in_memory().unwrap();
         let arch = tempfile::tempdir().unwrap();
-        let fetcher = MockJsonFetcher(json!({ "value": [
-            { "id": "C1", "name": "Calendar", "hexColor": "#FF0000", "color": "lightRed", "isDefaultCalendar": true },
-            { "id": "C2", "name": "Work", "hexColor": "#00AA00", "color": "lightGreen" },
-        ]}));
-        let r = backup_calendar_flanks(&fetcher, &store, "acc", arch.path()).unwrap();
-        assert_eq!(r.archived, 2);
+        // 2 calendars + 2 per-calendar permissions + 1 groups snapshot = 5
+        let r = backup_calendar_flanks(&MockJsonFetcher, &store, "acc", arch.path()).unwrap();
+        assert_eq!(r.archived, 5);
         let c1 = store.get_item("acc", SERVICE, "C1").unwrap().unwrap();
         assert_eq!(c1.item_type, "calendar");
         let rel = c1.local_path.expect("sidecar path recorded");
-        let bytes = std::fs::read(arch.path().join(&rel)).unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let v: Value =
+            serde_json::from_slice(&std::fs::read(arch.path().join(&rel)).unwrap()).unwrap();
         assert_eq!(v.get("hexColor").and_then(Value::as_str), Some("#FF0000"));
         assert_eq!(
             v.get("isDefaultCalendar").and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_calendar_groups")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "calendar-group"
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_calperm_C1")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "calendar-permission"
+        );
+    }
+
+    #[test]
+    fn backup_event_attachments_snapshots_only_events_with_attachments() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        for (id, has) in [("e1", true), ("e2", false)] {
+            let ev =
+                json!({ "id": id, "subject": id, "hasAttachments": has, "type": "singleInstance" });
+            archive_json_item(&store, "acc", arch.path(), id, id, "event", &ev).unwrap();
+        }
+        struct AttFetcher;
+        impl JsonFetcher for AttFetcher {
+            fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+                if url.contains("/events/e1/attachments") {
+                    Ok(json!({ "value": [{ "id": "a1", "name": "agenda.pdf",
+                        "contentType": "application/pdf", "contentBytes": "QUJD" }] }))
+                } else {
+                    Ok(json!({ "value": [] }))
+                }
+            }
+        }
+        let r = backup_event_attachments(&AttFetcher, &store, "acc", arch.path(), 0).unwrap();
+        assert_eq!(r.archived, 1, "only e1 (has attachments) is snapshotted");
+        let att = store
+            .get_item("acc", SERVICE, "_evatt_e1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(att.item_type, "event-attachment");
+        let v: Value = serde_json::from_slice(
+            &std::fs::read(arch.path().join(att.local_path.unwrap())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.pointer("/value/0/name").and_then(Value::as_str),
+            Some("agenda.pdf")
         );
     }
 

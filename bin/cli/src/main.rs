@@ -1875,9 +1875,23 @@ fn backup_one_account(
                         0
                     }
                 };
+                // Event attachments (#565 B3): gated on each event's hasAttachments.
+                let atts = match connectors::backup_event_attachments(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                    body_limit,
+                ) {
+                    Ok(a) => a.archived,
+                    Err(e) => {
+                        eprintln!("event attachments skipped: {e}");
+                        0
+                    }
+                };
                 format!(
-                    "calendar: {} calendars, {} indexed; {} json archived ({} bytes); {} flanks",
-                    r.calendars, r.upserted, b.archived, b.bytes, flanks
+                    "calendar: {} calendars, {} indexed; {} json archived ({} bytes); {} flanks; {} attachment sets",
+                    r.calendars, r.upserted, b.archived, b.bytes, flanks, atts
                 )
             }
             "contacts" => {

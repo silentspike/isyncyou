@@ -30,7 +30,8 @@ pub use archive::{
     BytesFetcher, JsonFetcher, OneNoteResourceReport,
 };
 pub use calendar::{
-    backup_calendar_flanks, events_sync_calendar, incremental_sync_calendar, CalendarReport,
+    backup_calendar_flanks, backup_event_attachments, events_sync_calendar,
+    incremental_sync_calendar, CalendarReport,
 };
 pub use common::shard_rel;
 pub use contacts::{backup_contact_photos, incremental_sync_contacts, ContactsReport, PhotoReport};
