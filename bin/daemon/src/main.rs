@@ -1114,10 +1114,36 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
         isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50)
             .map(|r| r.downloaded)
             .unwrap_or(0);
+    // ToDo (#567 B2): keep the per-service archive fresh — per-list task delta,
+    // task JSON bodies (gate for attachments), list flanks (isShared/wellknown),
+    // and task sub-resources (checklistItems/linkedResources/attachments). All
+    // best-effort so a todo hiccup never blocks the other passes. Read token
+    // (Tasks.Read).
+    let todo = match isyncyou_connectors::incremental_sync_todo(&mut client, &store, account, &now)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("isyncyoud: todo sync for {account} skipped: {e}");
+            Default::default()
+        }
+    };
+    let tbodies =
+        isyncyou_connectors::backup_todo_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let tflanks =
+        isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let tsub =
+        isyncyou_connectors::backup_task_subresources(&client, &store, account, &archive_root, 25)
+            .map(|r| r.archived)
+            .unwrap_or(0);
     Ok(format!(
         "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
          calendar: {} events, {} bodies, {} flanks | \
-         contacts: {} upserted, {} bodies, {} photos",
+         contacts: {} upserted, {} bodies, {} photos | \
+         todo: {} indexed, {} bodies, {} flanks, {} sub",
         r.folders,
         r.upserted,
         r.deleted,
@@ -1128,7 +1154,11 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
         cflanks,
         con.upserted,
         conbodies,
-        conphotos
+        conphotos,
+        todo.upserted,
+        tbodies,
+        tflanks,
+        tsub
     ))
 }
 

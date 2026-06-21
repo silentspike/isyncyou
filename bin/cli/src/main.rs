@@ -1921,6 +1921,8 @@ fn backup_one_account(
             "todo" => {
                 let r = connectors::incremental_sync_todo(&mut client, &store, account, &now)
                     .map_err(|e| e.to_string())?;
+                // task bodies first — the sub-resource pass gates attachments on the
+                // archived task JSON's hasAttachments.
                 let b = connectors::backup_todo_bodies(
                     &client,
                     &store,
@@ -1929,9 +1931,38 @@ fn backup_one_account(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                // List flanks (#567 B1): per-list JSON snapshots (isShared/isOwner/
+                // wellknownListName). Best-effort.
+                let flanks = match connectors::backup_todo_list_flanks(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                ) {
+                    Ok(f) => f.archived,
+                    Err(e) => {
+                        eprintln!("todo list flanks skipped: {e}");
+                        0
+                    }
+                };
+                // Task sub-resources (#567 B2): checklistItems/linkedResources +
+                // gated attachments. Best-effort.
+                let sub = match connectors::backup_task_subresources(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                    body_limit,
+                ) {
+                    Ok(s) => s.archived,
+                    Err(e) => {
+                        eprintln!("todo sub-resources skipped: {e}");
+                        0
+                    }
+                };
                 format!(
-                    "todo: {} lists, {} indexed; {} json archived ({} bytes)",
-                    r.lists, r.upserted, b.archived, b.bytes
+                    "todo: {} lists, {} indexed; {} json archived ({} bytes); {} list flanks; {} sub-resource sets",
+                    r.lists, r.upserted, b.archived, b.bytes, flanks, sub
                 )
             }
             "onenote" => {

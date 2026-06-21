@@ -165,6 +165,104 @@ pub fn backup_todo_list_flanks<F: JsonFetcher>(
     Ok(report)
 }
 
+/// True when a Graph collection response (`{ "value": [...] }`) is non-empty.
+fn has_values(v: &Value) -> bool {
+    v.get("value")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
+/// Back up each task's sub-resources (#567 B2) — the content a plain task GET
+/// drops: `checklistItems` (the core steps), `linkedResources`, and file
+/// `attachments`. For every archived `task` item (bounded by `limit`, 0 = all):
+/// snapshot `checklistItems`/`linkedResources` when non-empty, and `attachments`
+/// only when the archived task JSON shows `hasAttachments` (so non-attachment
+/// tasks cost no request). Each snapshot is a JSON sidecar under a synthetic id
+/// (`_checklist_<id>` / `_linked_<id>` / `_taskatt_<id>`). Best-effort per task;
+/// a single failing fetch never aborts the pass.
+pub fn backup_task_subresources<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    limit: usize,
+) -> Result<ArchiveReport, SyncError> {
+    let mut report = ArchiveReport::default();
+    let mut processed = 0usize;
+    for it in store.items_by_service(account, SERVICE)? {
+        if it.item_type != "task" || it.deleted_at.is_some() {
+            continue;
+        }
+        if limit != 0 && processed >= limit {
+            break;
+        }
+        processed += 1;
+        let Some(list_id) = it.parent_remote_id.as_deref() else {
+            continue;
+        };
+        let base = format!("/me/todo/lists/{}/tasks/{}", list_id, it.remote_id);
+
+        // checklistItems — the core task content (no flag on the task to gate on).
+        if let Ok(cl) = fetcher.fetch_json(&format!("{base}/checklistItems")) {
+            if has_values(&cl) {
+                report.bytes += archive_json_item(
+                    store,
+                    account,
+                    archive_root,
+                    &format!("_checklist_{}", it.remote_id),
+                    &format!("{} checklist", it.name),
+                    "checklist",
+                    &cl,
+                )?;
+                report.archived += 1;
+            }
+        }
+
+        // linkedResources — references back to the app/source that created the task.
+        if let Ok(lr) = fetcher.fetch_json(&format!("{base}/linkedResources")) {
+            if has_values(&lr) {
+                report.bytes += archive_json_item(
+                    store,
+                    account,
+                    archive_root,
+                    &format!("_linked_{}", it.remote_id),
+                    &format!("{} linked", it.name),
+                    "linked-resource",
+                    &lr,
+                )?;
+                report.archived += 1;
+            }
+        }
+
+        // attachments — gated on the archived task JSON's hasAttachments.
+        let has_att = it
+            .local_path
+            .as_deref()
+            .and_then(|rel| std::fs::read(archive_root.join(rel)).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|t| t.get("hasAttachments").and_then(Value::as_bool))
+            == Some(true);
+        if has_att {
+            if let Ok(atts) = fetcher.fetch_json(&format!("{base}/attachments")) {
+                if has_values(&atts) {
+                    report.bytes += archive_json_item(
+                        store,
+                        account,
+                        archive_root,
+                        &format!("_taskatt_{}", it.remote_id),
+                        &format!("{} attachments", it.name),
+                        "task-attachment",
+                        &atts,
+                    )?;
+                    report.archived += 1;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 enum Ingest {
     Upserted,
     Deleted,
@@ -359,6 +457,104 @@ mod tests {
             l1.get("wellknownListName").and_then(Value::as_str),
             Some("defaultList")
         );
+    }
+
+    fn seed_task(store: &Store, arch: &Path, id: &str, list: &str, has_att: bool) {
+        let mut t = Item::new("acc", SERVICE, id, format!("Task {id}"), "task");
+        t.parent_remote_id = Some(list.to_string());
+        store.upsert_item(&t).unwrap();
+        let body = json!({ "id": id, "title": format!("Task {id}"), "hasAttachments": has_att });
+        let abs = shard_path(arch, SERVICE, id, "json");
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, serde_json::to_vec(&body).unwrap()).unwrap();
+        let rel = abs.strip_prefix(arch).unwrap();
+        store
+            .set_local_path("acc", SERVICE, id, Some(&rel.to_string_lossy()))
+            .unwrap();
+    }
+
+    struct SubFetcher;
+    impl JsonFetcher for SubFetcher {
+        fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+            if url.contains("/checklistItems") {
+                Ok(json!({ "value": [
+                    { "id": "c1", "displayName": "step 1", "isChecked": true },
+                    { "id": "c2", "displayName": "step 2", "isChecked": false },
+                ]}))
+            } else if url.contains("/linkedResources") {
+                // only t1 has a linked resource
+                if url.contains("/tasks/t1/") {
+                    Ok(
+                        json!({ "value": [{ "id": "lr1", "webUrl": "https://x", "applicationName": "Outlook" }] }),
+                    )
+                } else {
+                    Ok(json!({ "value": [] }))
+                }
+            } else if url.contains("/attachments") {
+                Ok(json!({ "value": [{ "id": "att1", "name": "spec.pdf",
+                    "contentType": "application/pdf", "contentBytes": "QUJD" }] }))
+            } else {
+                Ok(json!({ "value": [] }))
+            }
+        }
+    }
+
+    #[test]
+    fn backup_task_subresources_snapshots_checklist_linked_and_gated_attachments() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        seed_task(&store, arch.path(), "t1", "L1", true); // checklist + linked + attachment
+        seed_task(&store, arch.path(), "t2", "L1", false); // checklist only (no linked, no attachment gate)
+
+        let r = backup_task_subresources(&SubFetcher, &store, "acc", arch.path(), 0).unwrap();
+        assert_eq!(
+            r.archived, 4,
+            "t1: checklist+linked+attachment (3) + t2: checklist (1)"
+        );
+
+        // checklist sidecar carries the steps with their checked state (#567 core content)
+        let cl = store
+            .get_item("acc", SERVICE, "_checklist_t1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cl.item_type, "checklist");
+        let body: Value = serde_json::from_slice(
+            &std::fs::read(arch.path().join(cl.local_path.unwrap())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body.pointer("/value/0/isChecked").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_linked_t1")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "linked-resource"
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_taskatt_t1")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "task-attachment"
+        );
+        // t2 has no linked resource and hasAttachments=false -> only the checklist
+        assert!(store
+            .get_item("acc", SERVICE, "_linked_t2")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_item("acc", SERVICE, "_taskatt_t2")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_item("acc", SERVICE, "_checklist_t2")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
