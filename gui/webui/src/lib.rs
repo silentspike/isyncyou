@@ -734,6 +734,7 @@ impl Router {
             "/api/v1/hydrations" => self.hydrations_state(),
             "/api/v1/drive" => self.drive_info(req),
             "/api/v1/permissions" => self.item_permissions(req),
+            "/api/v1/contact/photo" => self.contact_photo(req),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -1828,6 +1829,32 @@ impl Router {
         }
     }
 
+    /// Serve a contact's archived photo (#566). `backup_contact_photos` writes
+    /// it to `contacts/<shard>/<id>.jpg` but never records a `local_path`, so it
+    /// is resolved by id via `shard_rel` under the archive root (the same
+    /// id-addressed trick as the OneDrive sidecar). `image/jpeg` + the always-on
+    /// nosniff; 404 when the contact has no archived photo.
+    fn contact_photo(&self, req: &ApiRequest) -> ApiResponse {
+        let (account, id) = match (req.q("account"), req.q("id")) {
+            (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let acc = match self.config.accounts.iter().find(|a| a.id == account) {
+            Some(a) => a,
+            None => return ApiResponse::error(404, "unknown account"),
+        };
+        let rel = isyncyou_connectors::shard_rel("contacts", id, "jpg");
+        match read_under_root(&acc.archive_root, &rel) {
+            Some(bytes) => ApiResponse {
+                status: 200,
+                content_type: "image/jpeg".into(),
+                body: bytes,
+                headers: Vec::new(),
+            },
+            None => ApiResponse::error(404, "no archived photo for this contact"),
+        }
+    }
+
     /// Render an archived item as a **safe, self-contained HTML page**: our own
     /// canonical JSON (calendar/contacts/todo/onenote) is escaped into a fixed
     /// skeleton — no untrusted markup, no scripts, no external resources. A mail
@@ -2765,6 +2792,57 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             p0.pointer("/image/width").and_then(Value::as_i64),
             Some(4032)
+        );
+    }
+
+    #[test]
+    fn contact_photo_serves_archived_jpg_or_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .upsert_item(&Item::new("a", "contacts", "C1", "Ada", "contact"))
+                .unwrap();
+            store
+                .upsert_item(&Item::new("a", "contacts", "C2", "Bob", "contact"))
+                .unwrap();
+        }
+        // write C1's photo at the sharded path, exactly where backup_contact_photos does
+        let rel = isyncyou_connectors::shard_rel("contacts", "C1", "jpg");
+        let p = arch.join(&rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"\xFF\xD8\xFF\xE0JFIF...").unwrap();
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        // C1 has a photo -> 200 image/jpeg + the bytes
+        let resp = router.route(&ApiRequest::get("/api/v1/contact/photo?account=a&id=C1"));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.content_type, "image/jpeg");
+        assert_eq!(&resp.body[..2], b"\xFF\xD8");
+        // C2 has no photo -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/contact/photo?account=a&id=C2"))
+                .status,
+            404
+        );
+        // missing id -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/contact/photo?account=a"))
+                .status,
+            400
         );
     }
 
