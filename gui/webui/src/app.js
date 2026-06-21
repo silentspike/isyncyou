@@ -60,6 +60,7 @@ const ICONS = {
   image: "M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3M21 15l-5-5L5 21",
   globe: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z",
   "file-text": "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8",
+  "info": "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 16v-4M12 8h.01",
   table: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18",
   music: "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
   film: "M3 3h18v18H3zM7 3v18M17 3v18M3 7h4M3 12h18M3 17h4M17 7h4M17 17h4",
@@ -1401,10 +1402,39 @@ function driveActions(it) {
   if (it.item_type === "folder") return null;
   const q = { account: App.account, service: "onedrive", id: it.remote_id };
   const box = el("div", { class: "drive-actions" });
+  box.append(el("button", { class: "act", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
   if (it.has_body) box.append(el("a", { class: "act", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (CAP.share) box.append(el("button", { class: "act", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
   return box;
 }
+// Item detail sheet (#564): facts + lazily-fetched "who has access" (one Graph
+// call per item, only on open). #564 A5 enriches the facts with the rich
+// metadata (mimeType / sha256 / created-by / EXIF / …) from the sidecar preview.
+function openDriveItem(it) {
+  const q = { account: App.account, service: "onedrive", id: it.remote_id };
+  const folder = it.item_type === "folder";
+  const content = el("div");
+  content.append(kvList([
+    ["Type", folder ? "Folder" : (fileKind(fileExt(it.name)) || "File")],
+    ["Size", folder ? null : fmtSize(it.size)],
+    ["Modified", it.remote_mtime ? fmtFullDate(it.remote_mtime) : null],
+  ]));
+  driveItemMeta(content, it); // #564 A5 metadata rows (no-op until enrichment lands)
+  content.append(el("h4", { class: "od-sec dim", text: "Who has access" }));
+  const perm = el("div", { class: "od-perms" }, el("div", { class: "dim", text: "Loading access…" }));
+  content.append(perm);
+  openSheet(it.name || "Item", content);
+  api("/api/v1/permissions?" + qs(q)).then(d => {
+    clear(perm);
+    const list = d.permissions || [];
+    if (!list.length) { perm.append(el("div", { class: "dim", text: "Private — not shared." })); return; }
+    list.forEach(p => perm.append(el("div", { class: "pick-row" },
+      el("span", { class: "grow truncate", text: p.grantee || (p.link ? "Shared link" : "(unknown)") }),
+      el("span", { class: "dim", text: (p.roles || []).join(", ") || "—" }))));
+  }).catch(e => { clear(perm); perm.append(el("div", { class: "dim", text: "Access unavailable (" + e.message + ")" })); });
+}
+// #564 A5 fills this with the sidecar metadata rows; a stub keeps A4 self-contained.
+function driveItemMeta(_content, _it) { }
 function driveTile(it) {
   const folder = it.item_type === "folder";
   const ext = fileExt(it.name);
@@ -1435,6 +1465,7 @@ function driveRow(it) {
     syncBadge(it),
     el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(it.remote_mtime) }));
   const acts = el("div", { style: "display:flex;gap:4px" });
+  if (!folder) acts.append(el("button", { class: "btn ghost sm", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
   if (!folder && it.has_body) acts.append(el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
   row.append(acts);

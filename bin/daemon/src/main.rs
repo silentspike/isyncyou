@@ -574,6 +574,20 @@ impl isyncyou_webui::OneDriveInfoHandler for DaemonOneDriveInfo {
             .drive_quota()
             .map_err(|e| e.to_string())
     }
+    fn permissions(&self, account: &str, id: &str) -> Result<serde_json::Value, String> {
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
+        let perms = isyncyou_graph::GraphClient::new(token)
+            .list_permissions(id)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::Value::Array(
+            perms
+                .into_iter()
+                .map(|(pid, roles, link, grantee)| {
+                    serde_json::json!({ "id": pid, "roles": roles, "link": link, "grantee": grantee })
+                })
+                .collect(),
+        ))
+    }
 }
 
 fn unix_now() -> String {

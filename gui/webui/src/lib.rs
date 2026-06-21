@@ -225,6 +225,9 @@ pub trait ShareHandler: Send + Sync {
 pub trait OneDriveInfoHandler: Send + Sync {
     /// The drive quota object (`total`/`used`/`remaining`/`state`) as JSON.
     fn drive_quota(&self, account: &str) -> Result<serde_json::Value, String>;
+    /// A single item's sharing permissions ("who has access") as a JSON array of
+    /// `{ id, roles, link, grantee }` (#564). Fetched lazily on detail open.
+    fn permissions(&self, account: &str, id: &str) -> Result<serde_json::Value, String>;
 }
 
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
@@ -680,6 +683,7 @@ impl Router {
             "/api/v1/sync/state" => self.sync_state(),
             "/api/v1/hydrations" => self.hydrations_state(),
             "/api/v1/drive" => self.drive_info(req),
+            "/api/v1/permissions" => self.item_permissions(req),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -1194,6 +1198,24 @@ impl Router {
         };
         match handler.drive_quota(account) {
             Ok(q) => ApiResponse::ok_json(&json!({ "quota": q })),
+            Err(e) => ApiResponse::error(502, &e),
+        }
+    }
+
+    /// A OneDrive item's sharing permissions ("who has access") — a live Graph
+    /// call via the daemon's handler (#564). 404 when no handler; 400 without
+    /// account/id. Fetched lazily by the explorer on detail open.
+    fn item_permissions(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_info {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "OneDrive info is not enabled on this server"),
+        };
+        let (account, id) = match (req.q("account"), req.q("id")) {
+            (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        match handler.permissions(account, id) {
+            Ok(p) => ApiResponse::ok_json(&json!({ "permissions": p })),
             Err(e) => ApiResponse::error(502, &e),
         }
     }
@@ -2343,6 +2365,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn drive_quota(&self, _account: &str) -> Result<serde_json::Value, String> {
             Ok(json!({ "total": 1000, "used": 250, "remaining": 750, "state": "normal" }))
         }
+        fn permissions(&self, _account: &str, _id: &str) -> Result<serde_json::Value, String> {
+            Ok(json!([{ "id": "p1", "roles": ["read"], "link": null, "grantee": "Bob" }]))
+        }
     }
 
     #[test]
@@ -2365,6 +2390,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             v.pointer("/quota/remaining").and_then(Value::as_i64),
             Some(750)
+        );
+    }
+
+    #[test]
+    fn permissions_route_returns_handler_json_or_404() {
+        let (_d, router) = setup();
+        // read-only server (no handler) -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/permissions?account=a&id=x"))
+                .status,
+            404
+        );
+        let router = router.with_onedrive_info(std::sync::Arc::new(FakeDriveInfo));
+        // missing id -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/permissions?account=a"))
+                .status,
+            400
+        );
+        // with handler + account + id -> 200 + the permissions array
+        let resp = router.route(&ApiRequest::get("/api/v1/permissions?account=a&id=x"));
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(
+            v.pointer("/permissions/0/grantee").and_then(Value::as_str),
+            Some("Bob")
+        );
+        assert_eq!(
+            v.pointer("/permissions/0/roles/0").and_then(Value::as_str),
+            Some("read")
         );
     }
 
