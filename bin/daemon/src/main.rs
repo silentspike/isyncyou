@@ -839,6 +839,13 @@ fn sync_loop(
                 Ok(summary) => eprintln!("isyncyoud: sync {} -> {summary}", acc.id),
                 Err(e) => eprintln!("isyncyoud: sync {} skipped: {e}", acc.id),
             }
+            // Keep the per-service archive fresh too (live client, #563 AC-5): an
+            // incremental mail pass so new cloud mail lands in the store and the
+            // SSE notify below surfaces it without a manual reload.
+            match backup_account(&cfg, &acc.id, &gate) {
+                Ok(summary) => eprintln!("isyncyoud: backup {} -> {summary}", acc.id),
+                Err(e) => eprintln!("isyncyoud: backup {} skipped: {e}", acc.id),
+            }
         }
         // wake SSE subscribers so the UI refetches the active view (near-real-time)
         events.notify();
@@ -918,6 +925,52 @@ fn sync_account(
         eprintln!("isyncyoud: could not record run for {account}: {e}");
     }
     result.map(|_| summary)
+}
+
+/// One incremental **mail backup** pass for the live client (#563 AC-5). Uses the
+/// cached **read** token (`Mail.Read` + `MailboxSettings.Read`, S-P4.1), runs the
+/// per-folder delta (cheap when idle), downloads bodies for newly-seen messages
+/// (capped per pass so a burst can't stall the loop), and refreshes the mailbox
+/// flank snapshots. Keeps the store/archive current so the SSE notify surfaces new
+/// mail. Read-only; a missing token is a clean skip (logged, never fatal). Mail is
+/// the pilot — other services follow their own rollout stories.
+fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<String, String> {
+    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let token = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)?;
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let archive_root = acc.archive_root.clone();
+    let store = Store::open(archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let mut client = isyncyou_graph::GraphClient::new(token);
+    let now = unix_now();
+    // `&mut client` (Transport delta) must finish before the by-ref archive passes.
+    let r = isyncyou_connectors::incremental_sync_mail(
+        &mut client,
+        &store,
+        account,
+        &now,
+        &archive_root,
+    )
+    .map_err(|e| e.to_string())?;
+    let b = isyncyou_connectors::backup_message_bodies(&client, &store, account, &archive_root, 25)
+        .map_err(|e| e.to_string())?;
+    // Flanks (settings/rules/categories) need MailboxSettings.Read and rarely
+    // change — best-effort, so a flank hiccup never blocks the live-mail pass.
+    let flanks =
+        match isyncyou_connectors::backup_mailbox_flanks(&client, &store, account, &archive_root) {
+            Ok(f) => f.archived,
+            Err(e) => {
+                eprintln!("isyncyoud: mail flanks for {account} skipped: {e}");
+                0
+            }
+        };
+    Ok(format!(
+        "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks",
+        r.folders, r.upserted, r.deleted, b.downloaded, flanks
+    ))
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
