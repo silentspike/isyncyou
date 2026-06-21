@@ -1158,19 +1158,27 @@ impl isyncyou_fuse::Refresher for GraphRefresher {
     fn refresh(&self) -> Result<Vec<isyncyou_store::Item>, String> {
         let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         let token = isyncyou_engine::auth::resolve_cached_read_token(&self.cfg, &self.account)?;
-        let store_path = self
+        let archive_root = self
             .cfg
             .accounts
             .iter()
             .find(|a| a.id == self.account)
-            .map(|a| a.archive_root.join(".isyncyou-store.db"))
+            .map(|a| a.archive_root.clone())
             .ok_or_else(|| format!("no account '{}'", self.account))?;
-        let store = Store::open(store_path).map_err(|e| e.to_string())?;
+        let store =
+            Store::open(archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
         let mut client = isyncyou_graph::GraphClient::new(token);
         let mut map = MappingTable::new();
         let now = unix_now();
-        isyncyou_connectors::incremental_sync(&mut client, &store, &mut map, &self.account, &now)
-            .map_err(|e| e.to_string())?;
+        isyncyou_connectors::incremental_sync(
+            &mut client,
+            &store,
+            &mut map,
+            &self.account,
+            &now,
+            &archive_root,
+        )
+        .map_err(|e| e.to_string())?;
         store
             .all_items_by_service(&self.account, "onedrive")
             .map_err(|e| e.to_string())

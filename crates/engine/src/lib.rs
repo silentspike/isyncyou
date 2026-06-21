@@ -407,18 +407,19 @@ pub fn sync_once(
     let mut out = SyncReport::default();
     let now = unix_now();
 
-    let ingest = connectors::incremental_sync(client, store, map, account, &now)
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+
+    let ingest = connectors::incremental_sync(client, store, map, account, &now, &acc.archive_root)
         .map_err(|e| e.to_string())?;
     out.upserted = ingest.upserted;
     out.deleted = ingest.deleted;
     out.skipped = ingest.skipped;
     out.resynced = ingest.resynced;
 
-    let acc = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
     let sync_root = acc.sync_root.clone();
     let trash_root = acc.archive_root.join(".isyncyou-trash");
     let dg = cfg.sync.delete_guard.clone();

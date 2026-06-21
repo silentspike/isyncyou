@@ -7,6 +7,7 @@
 //! delta cursor. The local → remote upload half (driving uploads from local
 //! changes) layers on top using the same crates.
 
+use crate::common::shard_path;
 use isyncyou_graph::{run_delta, DeltaCursor, DeltaError, Transport};
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store, StoreError};
@@ -55,6 +56,7 @@ pub fn incremental_sync<T: Transport>(
     map: &mut MappingTable,
     account: &str,
     now: &str,
+    archive_root: &Path,
 ) -> Result<SyncReport, SyncError> {
     let cursor = store
         .get_delta_cursor(account, SERVICE, "")?
@@ -66,7 +68,15 @@ pub fn incremental_sync<T: Transport>(
         ..Default::default()
     };
     for item in &out.items {
-        match ingest_item(store, map, account, item, now, "remote_dirty")? {
+        match ingest_item(
+            store,
+            map,
+            account,
+            item,
+            now,
+            "remote_dirty",
+            Some(archive_root),
+        )? {
             Ingest::Upserted => report.upserted += 1,
             Ingest::Deleted => report.deleted += 1,
             Ingest::Skipped => report.skipped += 1,
@@ -90,6 +100,10 @@ fn ingest_item(
     item: &Value,
     now: &str,
     state: &str,
+    // `Some` from the delta pass (writes the full-metadata sidecar); `None` from
+    // the local→remote push paths, whose freshly-uploaded item lacks the
+    // server-enriched facets (EXIF/image dims) — the next delta writes those.
+    archive_root: Option<&Path>,
 ) -> Result<Ingest, SyncError> {
     let id = item
         .get("id")
@@ -99,6 +113,9 @@ fn ingest_item(
     // Tombstone: the `deleted` facet (or the legacy `@removed`) marks removal.
     if item.get("deleted").is_some() || item.get("@removed").is_some() {
         store.mark_deleted(account, SERVICE, id, now)?;
+        if let Some(root) = archive_root {
+            remove_item_json(root, id);
+        }
         return Ok(Ingest::Deleted);
     }
 
@@ -143,7 +160,36 @@ fn ingest_item(
         .map(String::from);
     it.sync_state = state.into();
     store.upsert_item(&it)?;
+    // Archive the full DriveItem JSON so the rich metadata the 9 indexed columns
+    // can't hold is captured straight from the delta payload (#564).
+    if let Some(root) = archive_root {
+        write_item_json(root, id, item)?;
+    }
     Ok(Ingest::Upserted)
+}
+
+/// Archive the full Graph DriveItem JSON (`onedrive/<shard>/<id>.json`) so the
+/// backup captures every rich facet the indexed columns can't hold — `mimeType`,
+/// `sha256Hash` (alongside the indexed quickXor), created/last-modified-by,
+/// `webUrl`, `image`/`photo`/`video`/`audio` + GPS, `shared`, `malware`,
+/// `specialFolder`, `folder.childCount`, `package` (#564). Written at ingest
+/// straight from the delta payload (no extra fetch, no new scope) and rewritten
+/// on every change so the metadata stays current. Atomic tmp+rename.
+fn write_item_json(archive_root: &Path, id: &str, item: &Value) -> Result<(), SyncError> {
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(item).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    Ok(())
+}
+
+/// Drop the archived metadata sidecar when its item is tombstoned.
+fn remove_item_json(archive_root: &Path, id: &str) {
+    let _ = std::fs::remove_file(shard_path(archive_root, SERVICE, id, "json"));
 }
 
 /// Abstraction over the remote write operations, so the local→remote push driver
@@ -267,7 +313,7 @@ pub fn push_upload<W: RemoteWriter>(
         }
         None => item,
     };
-    ingest_item(store, map, account, &to_ingest, "", "clean")?;
+    ingest_item(store, map, account, &to_ingest, "", "clean", None)?;
     Ok(id)
 }
 
@@ -971,7 +1017,7 @@ pub fn apply_local_modifies<R: ContentReplacer>(
                     },
                     None => item,
                 };
-                ingest_item(store, map, account, &to_ingest, "", "clean")?;
+                ingest_item(store, map, account, &to_ingest, "", "clean", None)?;
                 // the uploaded bytes ARE the on-disk state — record the reference
                 let hash = Some(crate::quickxor::quickxor_base64(&data));
                 record_synced_state(store, account, id, &sync_root.join(rel), hash);
@@ -1036,11 +1082,15 @@ mod tests {
     #[test]
     fn ingests_files_folders_and_tombstones() {
         let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
         let mut map = MappingTable::new();
         // an item that already existed and will be tombstoned by the delta
         store
             .upsert_item(&Item::new("acc", SERVICE, "gone1", "old.txt", "file"))
             .unwrap();
+        // seed its metadata sidecar so we can prove the tombstone drops it
+        write_item_json(arch.path(), "gone1", &json!({ "id": "gone1" })).unwrap();
+        assert!(shard_path(arch.path(), SERVICE, "gone1", "json").exists());
         let page = json!({
             "value": [
                 { "id": "root1", "root": {}, "name": "root" },
@@ -1052,8 +1102,15 @@ mod tests {
         });
         let mut t = MockTransport(vec![Response::ok(page)], 0);
 
-        let report =
-            incremental_sync(&mut t, &store, &mut map, "acc", "2026-06-02T00:00:00Z").unwrap();
+        let report = incremental_sync(
+            &mut t,
+            &store,
+            &mut map,
+            "acc",
+            "2026-06-02T00:00:00Z",
+            arch.path(),
+        )
+        .unwrap();
         assert_eq!(report.upserted, 2); // folder + file
         assert_eq!(report.deleted, 1);
         assert_eq!(report.skipped, 1); // root
@@ -1066,6 +1123,19 @@ mod tests {
         assert_eq!(file.remote_mtime.as_deref(), Some("2024-01-02T03:04:05Z"));
         assert_eq!(file.sync_state, "remote_dirty");
 
+        // the metadata sidecar archives the full DriveItem JSON straight from the
+        // delta — the file sidecar round-trips, and the folder sidecar keeps a
+        // facet (folder.childCount) the indexed columns drop (#564 AC-1).
+        let raw = std::fs::read(shard_path(arch.path(), SERVICE, "a1", "json")).unwrap();
+        let v: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v, file_item("a1", "IMG.jpg", "F1"));
+        let fraw = std::fs::read(shard_path(arch.path(), SERVICE, "F1", "json")).unwrap();
+        let fv: Value = serde_json::from_slice(&fraw).unwrap();
+        assert_eq!(
+            fv.pointer("/folder/childCount").and_then(Value::as_i64),
+            Some(1)
+        );
+
         // tombstone recorded
         assert!(store
             .get_item("acc", SERVICE, "gone1")
@@ -1073,6 +1143,8 @@ mod tests {
             .unwrap()
             .deleted_at
             .is_some());
+        // tombstone dropped the metadata sidecar (#564 AC-2)
+        assert!(!shard_path(arch.path(), SERVICE, "gone1", "json").exists());
         // cursor persisted
         assert_eq!(
             store
@@ -1086,16 +1158,17 @@ mod tests {
     #[test]
     fn second_run_uses_persisted_cursor_and_paginates() {
         let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
         let mut map = MappingTable::new();
         // first run sets a cursor
         let p1 = json!({ "value": [file_item("a1","a.txt","root1")], "@odata.deltaLink": "C1" });
         let mut t1 = MockTransport(vec![Response::ok(p1)], 0);
-        incremental_sync(&mut t1, &store, &mut map, "acc", "t").unwrap();
+        incremental_sync(&mut t1, &store, &mut map, "acc", "t", arch.path()).unwrap();
         // second run: two pages, then deltaLink
         let p2a = json!({ "value": [file_item("b1","b.txt","root1")], "@odata.nextLink": "u2" });
         let p2b = json!({ "value": [file_item("c1","c.txt","root1")], "@odata.deltaLink": "C2" });
         let mut t2 = MockTransport(vec![Response::ok(p2a), Response::ok(p2b)], 0);
-        let r = incremental_sync(&mut t2, &store, &mut map, "acc", "t").unwrap();
+        let r = incremental_sync(&mut t2, &store, &mut map, "acc", "t", arch.path()).unwrap();
         assert_eq!(r.upserted, 2);
         assert_eq!(
             store
@@ -2005,6 +2078,7 @@ mod tests {
             }
         };
         let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
         let mut map = MappingTable::new();
         let mut client = isyncyou_graph::GraphClient::new(token);
         let report = incremental_sync(
@@ -2013,6 +2087,7 @@ mod tests {
             &mut map,
             "testuser",
             "2026-06-02T00:00:00Z",
+            arch.path(),
         )
         .expect("live incremental sync should succeed");
         assert!(report.upserted > 0, "expected to ingest some items");
@@ -2041,9 +2116,10 @@ mod tests {
             }
         };
         let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
         let mut map = MappingTable::new();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        incremental_sync(&mut client, &store, &mut map, "testuser", "t")
+        incremental_sync(&mut client, &store, &mut map, "testuser", "t", arch.path())
             .expect("live sync should succeed");
         let dir = tempfile::tempdir().unwrap();
         let report = materialize_downloads(&store, &client, "testuser", dir.path(), "host")
@@ -2109,6 +2185,7 @@ mod tests {
         };
         let mut client = isyncyou_graph::GraphClient::new(token);
         let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
         let mut map = MappingTable::new();
         let dest = "/iSyncYou-deltest/del-me.txt";
 
@@ -2117,7 +2194,8 @@ mod tests {
             .upload(dest, b"delete me")
             .expect("upload should succeed");
         let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
-        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync should succeed");
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1", arch.path())
+            .expect("sync should succeed");
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
         let trash_root = base.path().join("trash");
@@ -2127,7 +2205,7 @@ mod tests {
 
         // delete it on OneDrive, sync again -> tombstone -> local moves to trash
         client.delete(&id).expect("remote delete should succeed");
-        incremental_sync(&mut client, &store, &mut map, "acc", "t2")
+        incremental_sync(&mut client, &store, &mut map, "acc", "t2", arch.path())
             .expect("second sync should succeed");
         let pending = pending_local_deletes(&store, "acc", &sync_root).unwrap();
         assert!(
@@ -2230,7 +2308,8 @@ mod tests {
             .expect("upload");
         let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
 
-        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
+        let arch = tempfile::tempdir().unwrap();
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1", arch.path()).expect("sync");
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
         materialize_downloads(&store, &client, "acc", &sync_root, "host").expect("materialize");
@@ -2288,7 +2367,8 @@ mod tests {
             .expect("upload");
         let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
 
-        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
+        let arch = tempfile::tempdir().unwrap();
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1", arch.path()).expect("sync");
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
         materialize_downloads(&store, &client, "acc", &sync_root, "host").expect("materialize");
@@ -2369,8 +2449,9 @@ mod tests {
             .upload("/iSyncYou-deltest2/d.txt", b"to be deleted")
             .expect("upload");
         let id = item.get("id").and_then(Value::as_str).unwrap().to_string();
+        let arch = tempfile::tempdir().unwrap();
 
-        incremental_sync(&mut client, &store, &mut map, "acc", "t1").expect("sync");
+        incremental_sync(&mut client, &store, &mut map, "acc", "t1", arch.path()).expect("sync");
         let base = tempfile::tempdir().unwrap();
         let sync_root = base.path().join("od");
         materialize_downloads(&store, &client, "acc", &sync_root, "host").expect("materialize");
