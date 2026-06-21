@@ -1294,13 +1294,22 @@ const fileKind = (ext) => FILE_KINDS.find(k => k.ext.includes(ext));
 const fileIcon = (ext) => (fileKind(ext) || {}).icon || "file";
 const fileColor = (ext) => (fileKind(ext) || {}).color || "var(--text-lo)";
 
+function driveSortSelect() {
+  const sel = el("select", { class: "input", title: "Sort", onchange: (e) => { Drive.sort = e.target.value; driveRender(); } },
+    el("option", { value: "name", text: "Name A–Z" }),
+    el("option", { value: "recent", text: "Recently modified" }),
+    el("option", { value: "size", text: "Largest first" }));
+  sel.value = Drive.sort || "name";
+  return sel;
+}
 async function renderOnedriveView(view) {
-  Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = []; Drive.stateFilter = "all";
+  Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = []; Drive.stateFilter = "all"; Drive.sort = Drive.sort || "name";
   clear(view).append(
     el("div", { id: "drive-metrics-row", class: "con-metrics-row inset" }),
     el("div", { class: "drive-bar" },
       el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
       el("div", { class: "spacer", style: "flex:1" }),
+      el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"), driveSortSelect()),
       verifyButton(() => renderOnedriveView(view)),
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
@@ -1371,9 +1380,16 @@ async function driveLoad() {
     driveRender();
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load folder" }), el("p", { text: e.message }))); }
 }
+function mtimeMs(it) { const t = Date.parse(it.remote_mtime || ""); return isNaN(t) ? 0 : t; }
 function driveSort(items) {
-  return items.slice().sort((a, b) =>
-    (a.item_type === "folder" ? 0 : 1) - (b.item_type === "folder" ? 0 : 1) || (a.name || "").localeCompare(b.name || ""));
+  const mode = Drive.sort || "name";
+  return items.slice().sort((a, b) => {
+    const fa = a.item_type === "folder" ? 0 : 1, fb = b.item_type === "folder" ? 0 : 1;
+    if (fa !== fb) return fa - fb; // folders always first
+    if (mode === "recent") return mtimeMs(b) - mtimeMs(a); // newest first (#564)
+    if (mode === "size") return (b.size || 0) - (a.size || 0);
+    return (a.name || "").localeCompare(b.name || "");
+  });
 }
 function driveRender() {
   const body = $("#drive-body"); if (!body) return; clear(body);
@@ -1433,8 +1449,25 @@ function openDriveItem(it) {
       el("span", { class: "dim", text: (p.roles || []).join(", ") || "—" }))));
   }).catch(e => { clear(perm); perm.append(el("div", { class: "dim", text: "Access unavailable (" + e.message + ")" })); });
 }
-// #564 A5 fills this with the sidecar metadata rows; a stub keeps A4 self-contained.
-function driveItemMeta(_content, _it) { }
+// #564 A5: render the rich metadata from the sidecar preview into the detail sheet.
+function driveItemMeta(content, it) {
+  const p = it.preview; if (!p) return;
+  const rows = [];
+  if (p.mime_type) rows.push(["Kind", p.mime_type]);
+  if (p.created_by) rows.push(["Created by", p.created_by]);
+  if (p.last_modified_by) rows.push(["Modified by", p.last_modified_by]);
+  if (p.image && p.image.width) rows.push(["Dimensions", `${p.image.width} × ${p.image.height} px`]);
+  if (p.photo && p.photo.takenDateTime) rows.push(["Taken", fmtFullDate(p.photo.takenDateTime)]);
+  if (p.photo && p.photo.cameraModel) rows.push(["Camera", p.photo.cameraModel]);
+  if (p.child_count != null) rows.push(["Items", String(p.child_count)]);
+  if (p.package_type) rows.push(["Package", p.package_type]);
+  if (p.special_folder) rows.push(["Special folder", p.special_folder]);
+  if (p.shared) rows.push(["Sharing", "Shared with others"]);
+  if (p.malware) rows.push(["Security", "Malware flagged by Microsoft"]);
+  if (p.sha256) rows.push(["SHA-256", p.sha256]);
+  if (rows.length) content.append(kvList(rows));
+  if (p.web_url) content.append(el("a", { class: "btn ghost sm", style: "margin-top:8px", href: p.web_url, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open in OneDrive"));
+}
 function driveTile(it) {
   const folder = it.item_type === "folder";
   const ext = fileExt(it.name);
@@ -1445,9 +1478,12 @@ function driveTile(it) {
     thumb = el("img", { class: "drive-thumb-img", src: `/api/v1/body?${qs(q)}`, alt: "", loading: "lazy" });
   else
     thumb = el("div", { class: "drive-thumb", style: folder ? "" : `color:${fileColor(ext)}` }, icon(folder ? "folder" : fileIcon(ext), "icon-lg"));
+  const pv = it.preview || {};
   tile.append(...[thumb,
     el("div", { class: "drive-name truncate", text: it.name || "(no name)" }),
     el("div", { class: "drive-meta dim", text: folder ? "Folder" : [fmtSize(it.size), it.remote_mtime ? fmtDate(it.remote_mtime) : ""].filter(Boolean).join(" · ") }),
+    (!folder && pv.malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
+    (!folder && pv.shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
     folder ? null : coverageBadge(it),
     syncBadge(it), driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
   return tile;
@@ -1461,6 +1497,8 @@ function driveRow(it) {
     el("div", { class: "grow" },
       el("div", { class: "truncate", text: it.name || "(no name)" }),
       el("div", { class: "dim", style: "font-size:12px", text: folder ? "Folder" : (fmtSize(it.size) || "—") })),
+    (!folder && (it.preview || {}).malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
+    (!folder && (it.preview || {}).shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
     folder ? null : coverageBadge(it),
     syncBadge(it),
     el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(it.remote_mtime) }));

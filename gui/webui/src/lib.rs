@@ -1378,7 +1378,38 @@ impl Router {
             };
             return match kids {
                 Ok(items) => {
-                    let arr: Vec<Value> = items.iter().map(item_json).collect();
+                    // OneDrive rows carry a read-only `preview` parsed from the
+                    // archived DriveItem JSON sidecar (#564): the rich facets the
+                    // indexed columns drop (mimeType/sha256/created-by/EXIF/shared/…).
+                    // Best-effort — an item without a readable sidecar carries none.
+                    let archive_root = (service == "onedrive")
+                        .then(|| {
+                            self.config
+                                .accounts
+                                .iter()
+                                .find(|a| a.id == account)
+                                .map(|a| a.archive_root.clone())
+                        })
+                        .flatten();
+                    let arr: Vec<Value> = items
+                        .iter()
+                        .map(|it| {
+                            let mut v = item_json(it);
+                            if let Some(root) = archive_root.as_ref() {
+                                let rel = isyncyou_connectors::shard_rel(
+                                    "onedrive",
+                                    &it.remote_id,
+                                    "json",
+                                );
+                                if let Some(bytes) = read_under_root(root, &rel) {
+                                    if let Ok(o) = serde_json::from_slice::<Value>(&bytes) {
+                                        v["preview"] = onedrive_preview(&o);
+                                    }
+                                }
+                            }
+                            v
+                        })
+                        .collect();
                     ApiResponse::ok_json(&json!({
                         "items": arr,
                         "count": arr.len(),
@@ -1840,6 +1871,27 @@ fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>>
         return None;
     }
     std::fs::read(&p).ok()
+}
+
+/// Build a OneDrive item's `preview` from its archived DriveItem JSON sidecar
+/// (#564): the rich facets the indexed columns can't hold. All best-effort —
+/// absent fields serialize as null/false.
+fn onedrive_preview(o: &Value) -> Value {
+    json!({
+        "mime_type": o.pointer("/file/mimeType").and_then(Value::as_str),
+        "sha256": o.pointer("/file/hashes/sha256Hash").and_then(Value::as_str),
+        "created_by": o.pointer("/createdBy/user/displayName").and_then(Value::as_str),
+        "last_modified_by": o.pointer("/lastModifiedBy/user/displayName").and_then(Value::as_str),
+        "web_url": o.get("webUrl").and_then(Value::as_str),
+        "image": o.get("image"),
+        "photo": o.get("photo"),
+        "location": o.get("location"),
+        "shared": o.get("shared").is_some(),
+        "malware": o.get("malware").is_some(),
+        "special_folder": o.pointer("/specialFolder/name").and_then(Value::as_str),
+        "child_count": o.pointer("/folder/childCount").and_then(Value::as_i64),
+        "package_type": o.pointer("/package/type").and_then(Value::as_str),
+    })
 }
 
 /// Build a mail item's `preview` (#562). A `message` carries the `.eml`-parsed
@@ -2422,6 +2474,63 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             v.pointer("/permissions/0/roles/0").and_then(Value::as_str),
             Some("read")
+        );
+    }
+
+    #[test]
+    fn onedrive_items_carry_preview_from_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            // a top-level file (no tracked parent => a drive root item)
+            let mut f = Item::new("a", "onedrive", "F1", "photo.jpg", "file");
+            f.remote_mtime = Some("2026-05-01T10:00:00Z".into());
+            store.upsert_item(&f).unwrap();
+        }
+        // its DriveItem JSON sidecar at the sharded archive path (#564 A1 shape)
+        let rel = isyncyou_connectors::shard_rel("onedrive", "F1", "json");
+        let p = arch.join(&rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            serde_json::to_vec(&json!({
+                "id": "F1",
+                "webUrl": "https://1drv.ms/x",
+                "file": { "mimeType": "image/jpeg", "hashes": { "sha256Hash": "ABC123" } },
+                "image": { "width": 4032, "height": 3024 },
+                "shared": { "scope": "users" },
+                "createdBy": { "user": { "displayName": "Jan" } },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=onedrive&parent=root",
+        ));
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        let p0 = &v["items"][0]["preview"];
+        assert_eq!(p0["mime_type"].as_str(), Some("image/jpeg"));
+        assert_eq!(p0["sha256"].as_str(), Some("ABC123"));
+        assert_eq!(p0["created_by"].as_str(), Some("Jan"));
+        assert_eq!(p0["web_url"].as_str(), Some("https://1drv.ms/x"));
+        assert_eq!(p0["shared"].as_bool(), Some(true));
+        assert_eq!(
+            p0.pointer("/image/width").and_then(Value::as_i64),
+            Some(4032)
         );
     }
 
