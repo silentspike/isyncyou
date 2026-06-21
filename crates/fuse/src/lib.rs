@@ -100,6 +100,44 @@ pub struct Node {
     pub is_dir: bool,
     pub size: u64,
     pub remote_id: String,
+    /// Cloud last-modified time as seconds since the Unix epoch, parsed from the
+    /// item's `remote_mtime` (#564). `None` for the root and cloud-less nodes
+    /// (a not-yet-uploaded local create) → `getattr` falls back to the epoch.
+    pub mtime: Option<i64>,
+}
+
+/// Parse a Graph RFC3339 timestamp (e.g. `2024-01-02T03:04:05Z`, fractional
+/// seconds tolerated) into seconds since the Unix epoch, assuming UTC. Returns
+/// `None` on a malformed string — best-effort, never panics. Kept self-contained
+/// (no date dependency) and mirrors the connector's parser.
+fn rfc3339_to_unix(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let num = |a: usize, b: usize| s.get(a..b)?.parse::<i64>().ok();
+    let y = num(0, 4)?;
+    let mo = num(5, 7)?;
+    let d = num(8, 10)?;
+    let h = num(11, 13)?;
+    let mi = num(14, 16)?;
+    let se = num(17, 19)?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Days since the Unix epoch for a civil (y, m, d) date — Howard Hinnant's
+/// `days_from_civil`. Mirrors the connector helper.
+fn days_from_civil(y: i64, month: i64, d: i64) -> i64 {
+    let y = if month <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 /// The read-only directory tree built from the store's OneDrive items.
@@ -189,6 +227,7 @@ impl Tree {
                 is_dir: true,
                 size: 0,
                 remote_id: String::new(),
+                mtime: None,
             },
         );
         let live: Vec<&Item> = items.iter().filter(|i| i.deleted_at.is_none()).collect();
@@ -212,6 +251,7 @@ impl Tree {
                     is_dir: it.item_type == "folder",
                     size: it.size.unwrap_or(0).max(0) as u64,
                     remote_id: it.remote_id.clone(),
+                    mtime: it.remote_mtime.as_deref().and_then(rfc3339_to_unix),
                 },
             );
         }
@@ -270,6 +310,7 @@ impl Tree {
                 is_dir: false,
                 size: 0,
                 remote_id: String::new(),
+                mtime: None,
             },
         );
         self.children.entry(parent).or_default().push(ino);
@@ -311,6 +352,7 @@ impl Tree {
                 is_dir: true,
                 size: 0,
                 remote_id,
+                mtime: None,
             },
         );
         self.children.entry(parent).or_default().push(ino);
@@ -409,6 +451,7 @@ impl Tree {
                     is_dir: it.item_type == "folder",
                     size: it.size.unwrap_or(0).max(0) as u64,
                     remote_id: it.remote_id.clone(),
+                    mtime: it.remote_mtime.as_deref().and_then(rfc3339_to_unix),
                 },
             );
         }
@@ -477,14 +520,21 @@ fn file_attr(node: &Node, uid: u32, gid: u32, writable: bool) -> FileAttr {
             1,
         )
     };
+    // Report the cloud last-modified time so file managers sort by "recent"
+    // correctly (#564); fall back to the epoch for the root / cloud-less nodes.
+    let when = node
+        .mtime
+        .filter(|&s| s >= 0)
+        .map(|s| UNIX_EPOCH + Duration::from_secs(s as u64))
+        .unwrap_or(UNIX_EPOCH);
     FileAttr {
         ino: node.ino,
         size: node.size,
         blocks: node.size.div_ceil(512),
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
-        ctime: UNIX_EPOCH,
-        crtime: UNIX_EPOCH,
+        atime: when,
+        mtime: when,
+        ctime: when,
+        crtime: when,
         kind,
         perm,
         nlink,
@@ -1459,6 +1509,38 @@ mod tests {
         deleted.deleted_at = Some("2026-01-01".into());
         let t2 = Tree::from_items(&[deleted]);
         assert!(t2.children(ROOT_INO).is_empty());
+    }
+
+    #[test]
+    fn from_items_parses_cloud_mtime_onto_nodes() {
+        let mut f = file("f1", None, "note.txt", 7);
+        f.remote_mtime = Some("2024-01-02T03:04:05Z".to_string());
+        let t = Tree::from_items(&[f]);
+        // 2024-01-02T03:04:05Z == 1_704_164_645 seconds since the epoch
+        assert_eq!(
+            t.lookup(ROOT_INO, "note.txt").unwrap().mtime,
+            Some(1_704_164_645)
+        );
+        // a file with no cloud mtime carries None
+        let t2 = Tree::from_items(&[file("f2", None, "no-mtime.txt", 1)]);
+        assert_eq!(t2.lookup(ROOT_INO, "no-mtime.txt").unwrap().mtime, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_attr_reports_cloud_mtime_for_recent_sort() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let mut f = file("f1", None, "note.txt", 7);
+        f.remote_mtime = Some("2024-01-02T03:04:05Z".to_string());
+        let t = Tree::from_items(&[f]);
+        let node = t.lookup(ROOT_INO, "note.txt").unwrap();
+        let attr = file_attr(node, 0, 0, false);
+        assert_eq!(attr.mtime, UNIX_EPOCH + Duration::from_secs(1_704_164_645));
+        assert_ne!(attr.mtime, UNIX_EPOCH); // not the hardcoded epoch anymore
+                                            // a cloud-less node falls back to the epoch
+        let t2 = Tree::from_items(&[file("f2", None, "no-mtime.txt", 1)]);
+        let n2 = t2.lookup(ROOT_INO, "no-mtime.txt").unwrap();
+        assert_eq!(file_attr(n2, 0, 0, false).mtime, UNIX_EPOCH);
     }
 
     #[test]
