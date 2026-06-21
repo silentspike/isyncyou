@@ -1867,6 +1867,7 @@ impl Router {
                                             v["preview"] = match service {
                                                 "calendar" => calendar_preview(it, &o),
                                                 "contacts" => contact_preview(it, &o, root),
+                                                "todo" => todo_preview(it, &o, root),
                                                 _ => json!({
                                                     "status": o["status"],
                                                     "importance": o["importance"],
@@ -2389,6 +2390,63 @@ fn contact_preview(it: &Item, o: &Value, root: &std::path::Path) -> Value {
         "yomi_surname": o.get("yomiSurname").and_then(Value::as_str),
         "yomi_company": o.get("yomiCompanyName").and_then(Value::as_str),
         "has_photo": has_photo,
+    })
+}
+
+/// Build a ToDo item's `preview` from its archived JSON sidecar (#567 B3). A
+/// `list` exposes its list-level fields (`wellknownListName`/`isShared`/
+/// `isOwner`); a `task` exposes status/importance, the date fields, recurrence,
+/// categories, attachment flag, and a checklist summary (`steps_total`/
+/// `steps_done`) read from the `_checklist_<id>` sub-resource sidecar (#567 B2).
+/// All best-effort (absent fields → null).
+fn todo_preview(it: &Item, o: &Value, root: &std::path::Path) -> Value {
+    if it.item_type == "list" {
+        return json!({
+            "wellknown_name": o.get("wellknownListName").and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && *s != "none"),
+            "is_shared": o.get("isShared").and_then(Value::as_bool),
+            "is_owner": o.get("isOwner").and_then(Value::as_bool),
+        });
+    }
+    // Checklist summary from the `_checklist_<id>` sub-resource sidecar (#567 B2):
+    // total steps + how many are checked. The id is hashed by shard_rel, so the
+    // path can't traverse.
+    let (mut steps_total, mut steps_done) = (0usize, 0usize);
+    if let Some(bytes) = read_under_root(
+        root,
+        &isyncyou_connectors::shard_rel("todo", &format!("_checklist_{}", it.remote_id), "json"),
+    ) {
+        if let Ok(cl) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(steps) = cl.get("value").and_then(Value::as_array) {
+                steps_total = steps.len();
+                steps_done = steps
+                    .iter()
+                    .filter(|s| s.get("isChecked").and_then(Value::as_bool) == Some(true))
+                    .count();
+            }
+        }
+    }
+    json!({
+        "status": o.get("status").and_then(Value::as_str),
+        "importance": o.get("importance").and_then(Value::as_str),
+        "due": o.pointer("/dueDateTime/dateTime"),
+        "due_tz": o.pointer("/dueDateTime/timeZone"),
+        "start": o.pointer("/startDateTime/dateTime"),
+        "start_tz": o.pointer("/startDateTime/timeZone"),
+        "reminder": o.pointer("/reminderDateTime/dateTime"),
+        "is_reminder_on": o.get("isReminderOn").and_then(Value::as_bool),
+        "completed": o.pointer("/completedDateTime/dateTime"),
+        "created": o.get("createdDateTime").and_then(Value::as_str),
+        "recurrence": o.get("recurrence"),
+        "categories": o.get("categories"),
+        "body_type": o.pointer("/body/contentType").and_then(Value::as_str),
+        "has_attachments": o.get("hasAttachments").and_then(Value::as_bool),
+        "has_note": o.pointer("/body/content")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        "steps_total": steps_total,
+        "steps_done": steps_done,
     })
 }
 
@@ -4192,7 +4250,23 @@ Content-Type: text/html; charset=utf-8\r\n\
             arch.join("todo/bb/t.json"),
             br#"{"title":"Ship release","status":"inProgress","importance":"high",
                  "dueDateTime":{"dateTime":"2026-03-01T00:00:00.0000000","timeZone":"UTC"},
+                 "startDateTime":{"dateTime":"2026-02-20T00:00:00.0000000","timeZone":"UTC"},
+                 "isReminderOn":true,"reminderDateTime":{"dateTime":"2026-02-28T09:00:00.0000000","timeZone":"UTC"},
+                 "createdDateTime":"2026-02-01T08:00:00Z","hasAttachments":true,
+                 "categories":["Release","Eng"],"recurrence":{"pattern":{"type":"weekly"}},
                  "body":{"content":"check the gate","contentType":"text"}}"#,
+        )
+        .unwrap();
+        // the task's checklist sub-resource sidecar (#567 B2): 3 steps, 2 checked
+        let cl_path = arch.join(isyncyou_connectors::shard_rel(
+            "todo",
+            "_checklist_t1",
+            "json",
+        ));
+        std::fs::create_dir_all(cl_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cl_path,
+            br#"{"value":[{"isChecked":true},{"isChecked":true},{"isChecked":false}]}"#,
         )
         .unwrap();
         {
@@ -4253,6 +4327,55 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(tp["importance"], "high");
         assert_eq!(tp["due"], "2026-03-01T00:00:00.0000000");
         assert_eq!(tp["has_note"], true);
+        // #567 B3 widened task fields
+        assert_eq!(tp["start"], "2026-02-20T00:00:00.0000000");
+        assert_eq!(tp["is_reminder_on"], true);
+        assert_eq!(tp["reminder"], "2026-02-28T09:00:00.0000000");
+        assert_eq!(tp["created"], "2026-02-01T08:00:00Z");
+        assert_eq!(tp["has_attachments"], true);
+        assert_eq!(tp["categories"][0], "Release");
+        assert_eq!(
+            tp.pointer("/recurrence/pattern/type")
+                .and_then(Value::as_str),
+            Some("weekly")
+        );
+        // checklist summary read from the _checklist_t1 sub-resource sidecar
+        assert_eq!(tp["steps_total"], 3);
+        assert_eq!(tp["steps_done"], 2);
+    }
+
+    #[test]
+    fn todo_list_preview_exposes_list_level_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("todo/cc")).unwrap();
+        std::fs::write(
+            arch.join("todo/cc/l.json"),
+            br#"{"displayName":"Flagged","isShared":true,"isOwner":false,"wellknownListName":"flaggedEmails"}"#,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut l = Item::new("a", "todo", "L1", "Flagged", "list");
+            l.local_path = Some("todo/cc/l.json".into());
+            store.upsert_item(&l).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let t = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=todo")));
+        let lp = &t["items"][0]["preview"];
+        assert_eq!(lp["wellknown_name"], "flaggedEmails");
+        assert_eq!(lp["is_shared"], true);
+        assert_eq!(lp["is_owner"], false);
     }
 
     #[test]
