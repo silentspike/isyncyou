@@ -1462,14 +1462,7 @@ impl Router {
                                             serde_json::from_slice::<Value>(&bytes)
                                         {
                                             v["preview"] = match service {
-                                                "calendar" => json!({
-                                                    "start": o["start"]["dateTime"],
-                                                    "start_tz": o["start"]["timeZone"],
-                                                    "end": o["end"]["dateTime"],
-                                                    "end_tz": o["end"]["timeZone"],
-                                                    "all_day": o["isAllDay"],
-                                                    "location": o["location"]["displayName"],
-                                                }),
+                                                "calendar" => calendar_preview(it, &o),
                                                 "contacts" => json!({
                                                     "company": o["companyName"],
                                                     "job": o["jobTitle"],
@@ -1871,6 +1864,48 @@ fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>>
         return None;
     }
     std::fs::read(&p).ok()
+}
+
+/// Build a calendar item's `preview` from its archived JSON sidecar (#565 B4).
+/// A `calendar` entity exposes its colour (so the UI can colour-code events); an
+/// `event` exposes all the detail the UI surfaces — recurrence rule (for
+/// client-side month/week expansion), Teams join link, my response status,
+/// categories, importance, sensitivity, show-as, cancellation, attachments,
+/// webLink, multiple locations. All best-effort (absent fields → null).
+fn calendar_preview(it: &Item, o: &Value) -> Value {
+    if it.item_type == "calendar" {
+        return json!({
+            "hex_color": o.get("hexColor").and_then(Value::as_str),
+            "color": o.get("color").and_then(Value::as_str),
+            "is_default": o.get("isDefaultCalendar").and_then(Value::as_bool),
+            "can_edit": o.get("canEdit").and_then(Value::as_bool),
+        });
+    }
+    json!({
+        "start": o.pointer("/start/dateTime"),
+        "start_tz": o.pointer("/start/timeZone"),
+        "end": o.pointer("/end/dateTime"),
+        "end_tz": o.pointer("/end/timeZone"),
+        "all_day": o.get("isAllDay"),
+        "location": o.pointer("/location/displayName"),
+        "locations": o.get("locations"),
+        "organizer": o.pointer("/organizer/emailAddress"),
+        "recurrence": o.get("recurrence"),
+        "type": o.get("type").and_then(Value::as_str),
+        "series_master_id": o.get("seriesMasterId").and_then(Value::as_str),
+        "response_status": o.pointer("/responseStatus/response").and_then(Value::as_str),
+        "online_meeting_url": o.get("onlineMeetingUrl").and_then(Value::as_str)
+            .or_else(|| o.pointer("/onlineMeeting/joinUrl").and_then(Value::as_str)),
+        "is_online_meeting": o.get("isOnlineMeeting").and_then(Value::as_bool),
+        "show_as": o.get("showAs").and_then(Value::as_str),
+        "sensitivity": o.get("sensitivity").and_then(Value::as_str),
+        "importance": o.get("importance").and_then(Value::as_str),
+        "categories": o.get("categories"),
+        "is_cancelled": o.get("isCancelled").and_then(Value::as_bool),
+        "has_attachments": o.get("hasAttachments").and_then(Value::as_bool),
+        "web_link": o.get("webLink").and_then(Value::as_str),
+        "reminder_minutes": o.get("reminderMinutesBeforeStart"),
+    })
 }
 
 /// Build a OneDrive item's `preview` from its archived DriveItem JSON sidecar
@@ -3350,7 +3385,16 @@ Content-Type: text/html; charset=utf-8\r\n\
             br#"{"subject":"Team-Standup",
                  "start":{"dateTime":"2026-02-04T09:00:00.0000000","timeZone":"UTC"},
                  "end":{"dateTime":"2026-02-04T10:00:00.0000000","timeZone":"UTC"},
-                 "isAllDay":false,"location":{"displayName":"Room 1"}}"#,
+                 "isAllDay":false,"location":{"displayName":"Room 1"},
+                 "type":"seriesMaster",
+                 "recurrence":{"pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday"]},"range":{"type":"noEnd"}},
+                 "onlineMeeting":{"joinUrl":"https://teams.microsoft.com/l/xyz"},
+                 "isOnlineMeeting":true,
+                 "responseStatus":{"response":"accepted"},
+                 "categories":["Work","Blue category"],
+                 "importance":"high","sensitivity":"normal","showAs":"busy",
+                 "isCancelled":false,"hasAttachments":true,
+                 "webLink":"https://outlook.live.com/calendar/x"}"#,
         )
         .unwrap();
         {
@@ -3378,6 +3422,56 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(p["end"], "2026-02-04T10:00:00.0000000");
         assert_eq!(p["all_day"], false);
         assert_eq!(p["location"], "Room 1");
+        // #565 B4 rich fields
+        assert_eq!(p["type"], "seriesMaster");
+        assert_eq!(p["recurrence"]["pattern"]["type"], "weekly");
+        assert_eq!(p["online_meeting_url"], "https://teams.microsoft.com/l/xyz");
+        assert_eq!(p["is_online_meeting"], true);
+        assert_eq!(p["response_status"], "accepted");
+        assert_eq!(p["categories"][1], "Blue category");
+        assert_eq!(p["importance"], "high");
+        assert_eq!(p["show_as"], "busy");
+        assert_eq!(p["has_attachments"], true);
+        assert_eq!(p["web_link"], "https://outlook.live.com/calendar/x");
+    }
+
+    #[test]
+    fn items_calendar_entity_carries_colour_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("calendar/cc/dd")).unwrap();
+        std::fs::write(
+            arch.join("calendar/cc/dd/cal.json"),
+            br##"{"name":"Work","hexColor":"#00AA00","color":"lightGreen","isDefaultCalendar":true}"##,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut c = Item::new("a", "calendar", "C9", "Work", "calendar");
+            c.local_path = Some("calendar/cc/dd/cal.json".into());
+            store.upsert_item(&c).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let v =
+            body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=calendar")));
+        let cal = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["item_type"] == "calendar")
+            .unwrap();
+        assert_eq!(cal["preview"]["hex_color"], "#00AA00");
+        assert_eq!(cal["preview"]["is_default"], true);
     }
 
     #[test]
