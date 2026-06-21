@@ -1560,12 +1560,22 @@ async function calLoad() {
       api("/api/v1/items?" + qs({ account: App.account, service: "calendar", limit: 1000 })),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
     ]);
-    Cal.raw = (d.items || []).filter(it => it.item_type !== "folder");
+    const items = d.items || [];
+    Cal.raw = items.filter(it => it.item_type === "event");
+    // calendar colour map (#565 B5): calendar id -> hexColor, for colour-coding
+    Cal.calColor = new Map(
+      items.filter(it => it.item_type === "calendar")
+        .map(it => [it.remote_id, (it.preview || {}).hex_color])
+        .filter(([, c]) => c));
     Cal.runs = act.runs || [];
-    Cal.events = (d.items || []).map(it => {
+    Cal.events = items.filter(it => it.item_type === "event").map(it => {
       const p = it.preview || {};
       const start = evDate(p.start, p.start_tz) || (it.remote_mtime ? new Date(it.remote_mtime) : null);
-      return { it, subject: it.name || "(no title)", start, end: evDate(p.end, p.end_tz), allDay: !!p.all_day, location: p.location || "" };
+      return {
+        it, calId: it.parent_remote_id, recur: p.recurrence || null,
+        subject: it.name || "(no title)", start, end: evDate(p.end, p.end_tz),
+        allDay: !!p.all_day, location: p.location || "",
+      };
     }).filter(e => e.start);
     App.counts.calendar = d.total ?? Cal.events.length; updateNavCounts();
     calRenderMetrics(); calRender();
@@ -1581,11 +1591,104 @@ function calRenderMetrics() {
     lastActivityMetric(Cal.runs),
   ]);
 }
-function eventsForDay(day) {
-  const s = startOfDay(day).getTime(), e = s + DAY_MS;
-  return Cal.events.filter(ev => stateMatch(ev.it, Cal.stateFilter) && ev.start.getTime() < e && (ev.end ? ev.end.getTime() : ev.start.getTime() + 36e5) > s)
-    .sort((a, b) => a.start - b.start);
+// colour of an event = its calendar's hexColor (#565 B5), else the service tint
+const eventColor = (ev) => (Cal.calColor && Cal.calColor.get(ev.calId)) || "var(--svc-calendar)";
+// human-readable recurrence summary for the detail sheet (#565 B5)
+const DOW_MAP = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+function recurText(rec) {
+  if (!rec) return null;
+  const p = rec.pattern || {}, r = rec.range || {}, iv = p.interval || 1, t = p.type || "";
+  let base;
+  if (t === "daily") base = iv === 1 ? "Daily" : `Every ${iv} days`;
+  else if (t === "weekly") {
+    const ds = (p.daysOfWeek || []).map(d => d[0].toUpperCase() + d.slice(1, 3)).join(", ");
+    base = (iv === 1 ? "Weekly" : `Every ${iv} weeks`) + (ds ? ` on ${ds}` : "");
+  } else if (t.toLowerCase().includes("monthly")) base = iv === 1 ? "Monthly" : `Every ${iv} months`;
+  else if (t.toLowerCase().includes("yearly")) base = iv === 1 ? "Yearly" : `Every ${iv} years`;
+  else base = "Repeats";
+  if (r.type === "endDate" && r.endDate) base += ` until ${r.endDate}`;
+  else if (r.type === "numbered" && r.numberOfOccurrences) base += `, ${r.numberOfOccurrences} times`;
+  return base;
 }
+// One occurrence instance derived from a recurring master (#565 B5).
+function mkOcc(ev, when, dur) {
+  const start = new Date(when);
+  return { it: ev.it, calId: ev.calId, recur: ev.recur, subject: ev.subject, start, end: new Date(start.getTime() + dur), allDay: ev.allDay, location: ev.location, occurrence: true };
+}
+// Expand a recurring master into its occurrences within [rs, re] (best-effort:
+// daily / weekly / absolute-monthly / absolute-yearly; honours count/until).
+// Exceptions aren't captured (the /me/events model holds only the master).
+function expandRecurrence(ev, rs, re) {
+  const rec = ev.recur, start = ev.start;
+  if (!rec || !start) return [];
+  const p = rec.pattern || {}, r = rec.range || {}, iv = Math.max(1, p.interval || 1), t = p.type || "";
+  const dur = ev.end && ev.end > start ? (ev.end - start) : 36e5;
+  const until = r.type === "endDate" && r.endDate ? new Date(r.endDate + "T23:59:59Z") : null;
+  const limit = r.type === "numbered" ? (r.numberOfOccurrences || 0) : 0;
+  const days = (p.daysOfWeek || []).map(d => DOW_MAP[String(d).toLowerCase()]).filter(n => n != null);
+  const out = []; let count = 0;
+  const push = (d) => { // returns false to stop (limit reached)
+    if (limit && count >= limit) return false;
+    count++;
+    if (d >= rs && d <= re && d >= start) out.push(mkOcc(ev, d, dur));
+    return true;
+  };
+  if (t === "daily" || t === "weekly") {
+    const wantDays = days.length ? days : [start.getDay()];
+    for (let d = startOfDay(start), g = 0; g < 20000 && d <= re; g++, d = new Date(d.getTime() + DAY_MS)) {
+      if (until && d > until) break;
+      let emit;
+      if (t === "daily") emit = Math.round((startOfDay(d) - startOfDay(start)) / DAY_MS) % iv === 0;
+      else emit = wantDays.includes(d.getDay()) && Math.floor((startOfWeek(d) - startOfWeek(start)) / (7 * DAY_MS)) % iv === 0;
+      if (!emit) continue;
+      const occ = new Date(d); occ.setHours(start.getHours(), start.getMinutes(), start.getSeconds(), 0);
+      if (!push(occ)) break;
+    }
+  } else if (t.toLowerCase().includes("monthly")) {
+    const dom = p.dayOfMonth || start.getDate();
+    for (let m = new Date(start.getFullYear(), start.getMonth(), 1), g = 0; g < 2400 && m <= re; g++, m.setMonth(m.getMonth() + iv)) {
+      const occ = new Date(m); occ.setDate(dom); occ.setHours(start.getHours(), start.getMinutes(), start.getSeconds(), 0);
+      if (until && occ > until) break;
+      if (!push(occ)) break;
+    }
+  } else if (t.toLowerCase().includes("yearly")) {
+    const mo = (p.month || start.getMonth() + 1) - 1, dom = p.dayOfMonth || start.getDate();
+    for (let y = start.getFullYear(), g = 0; g < 400 && y <= re.getFullYear(); g++, y += iv) {
+      const occ = new Date(start); occ.setFullYear(y, mo, dom);
+      if (until && occ > until) break;
+      if (!push(occ)) break;
+    }
+  }
+  return out;
+}
+// All event instances overlapping [rs, re]: recurring masters expanded, singles
+// passed through. Filtered by the active 4-state filter.
+function expandRange(rs, re) {
+  const out = [];
+  for (const ev of Cal.events) {
+    if (!stateMatch(ev.it, Cal.stateFilter)) continue;
+    if (ev.recur) out.push(...expandRecurrence(ev, rs, re));
+    else {
+      const end = ev.end || new Date(ev.start.getTime() + 36e5);
+      if (ev.start < re && end > rs) out.push(ev);
+    }
+  }
+  return out;
+}
+// Pre-bucket the visible window's occurrences by day (so the per-cell render is
+// cheap); month/week call this once before laying out cells.
+function buildBucket(rs, re) {
+  const map = new Map();
+  for (const occ of expandRange(rs, re)) {
+    const s = startOfDay(occ.start), e = startOfDay(occ.end || occ.start);
+    for (let d = new Date(s), g = 0; d <= e && g < 90; g++, d = new Date(d.getTime() + DAY_MS)) {
+      const k = ymd(d); let a = map.get(k); if (!a) { a = []; map.set(k, a); } a.push(occ);
+    }
+  }
+  for (const a of map.values()) a.sort((x, y) => x.start - y.start);
+  Cal.bucket = map;
+}
+function eventsForDay(day) { return (Cal.bucket && Cal.bucket.get(ymd(day))) || []; }
 function calRender() {
   const body = $("#cal-body"); if (!body) return; clear(body);
   if (!Cal.events.length && Cal.view === "agenda") { body.append(el("div", { class: "empty" }, emptyArt("empty-calendar"), el("h3", { text: "No events archived" }), el("p", { text: "Run a backup to populate your calendar." }))); return; }
@@ -1599,6 +1702,7 @@ function calRenderMonth(body) {
   $("#cal-label").textContent = MONTHS[cur.getMonth()] + " " + cur.getFullYear();
   const first = new Date(cur.getFullYear(), cur.getMonth(), 1);
   const gridStart = startOfWeek(first);
+  buildBucket(gridStart, new Date(gridStart.getTime() + 42 * DAY_MS)); // #565: expand recurrences once
   const todayKey = ymd(new Date());
   const grid = el("div", { class: "cal-month" });
   DAY_NAMES.forEach(n => grid.append(el("div", { class: "cal-dow", text: n })));
@@ -1608,7 +1712,7 @@ function calRenderMonth(body) {
     const cell = el("div", { class: "cal-cell" + (outside ? " outside" : "") + (ymd(day) === todayKey ? " today" : "") });
     cell.append(el("div", { class: "cal-daynum", text: String(day.getDate()) }));
     const evs = eventsForDay(day);
-    evs.slice(0, 3).forEach(ev => cell.append(el("button", { class: "cal-chip", style: "--svc:var(--svc-calendar)", title: ev.subject, onclick: () => openEventSheet(ev) },
+    evs.slice(0, 3).forEach(ev => cell.append(el("button", { class: "cal-chip", style: `--svc:${eventColor(ev)}`, title: ev.subject, onclick: () => openEventSheet(ev) },
       ev.allDay ? null : el("span", { class: "cal-chip-time", text: hhmm(ev.start) }), el("span", { class: "truncate", text: ev.subject }))));
     if (evs.length > 3) cell.append(el("div", { class: "cal-more", text: "+" + (evs.length - 3) + " more" }));
     grid.append(cell);
@@ -1617,6 +1721,7 @@ function calRenderMonth(body) {
 }
 function calRenderWeek(body) {
   const ws = startOfWeek(Cal.cursor), days = Array.from({ length: 7 }, (_, i) => new Date(ws.getTime() + i * DAY_MS));
+  buildBucket(ws, new Date(ws.getTime() + 7 * DAY_MS)); // #565: expand recurrences once
   $("#cal-label").textContent = days[0].toLocaleDateString([], { month: "short", day: "numeric" }) + " – " + days[6].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
   const todayKey = ymd(new Date());
   const wrap = el("div", { class: "cal-week card" });
@@ -1629,7 +1734,7 @@ function calRenderWeek(body) {
   const allday = el("div", { class: "cal-allday" }, el("div", { class: "cal-gutter dim", text: "all-day" }));
   days.forEach(d => {
     const cell = el("div", { class: "cal-allday-cell" });
-    eventsForDay(d).filter(e => e.allDay).forEach(ev => cell.append(el("button", { class: "cal-chip", title: ev.subject, onclick: () => openEventSheet(ev) }, el("span", { class: "truncate", text: ev.subject }))));
+    eventsForDay(d).filter(e => e.allDay).forEach(ev => cell.append(el("button", { class: "cal-chip", style: `--svc:${eventColor(ev)}`, title: ev.subject, onclick: () => openEventSheet(ev) }, el("span", { class: "truncate", text: ev.subject }))));
     allday.append(cell);
   });
   wrap.append(allday);
@@ -1646,7 +1751,7 @@ function calRenderWeek(body) {
       const top = Math.max(0, (ev.start.getTime() - dayStart) / 36e5) * HOUR_PX;
       const endT = ev.end ? ev.end.getTime() : ev.start.getTime() + 36e5;
       const h = Math.max(18, ((endT - ev.start.getTime()) / 36e5) * HOUR_PX - 2);
-      col.append(el("button", { class: "cal-event", style: `top:${top}px;height:${h}px`, onclick: () => openEventSheet(ev) },
+      col.append(el("button", { class: "cal-event", style: `top:${top}px;height:${h}px;--svc:${eventColor(ev)}`, onclick: () => openEventSheet(ev) },
         el("div", { class: "cal-event-time", text: hhmm(ev.start) }), el("div", { class: "cal-event-title truncate", text: ev.subject }),
         ev.location ? el("div", { class: "cal-event-loc truncate", text: ev.location }) : null));
     });
@@ -1672,7 +1777,7 @@ function calRenderAgenda(body) {
     }
     box.append(el("button", { class: "cal-agenda-row", onclick: () => openEventSheet(ev) },
       el("span", { class: "cal-agenda-time tnum", text: ev.allDay ? "All day" : hhmm(ev.start) + (ev.end ? "–" + hhmm(ev.end) : "") }),
-      el("span", { class: "cal-dot", style: "background:var(--svc-calendar)" }),
+      el("span", { class: "cal-dot", style: `background:${eventColor(ev)}` }),
       el("div", { class: "grow" }, el("div", { class: "truncate", text: ev.subject }),
         ev.location ? el("div", { class: "dim truncate", style: "font-size:12px" }, icon("map-pin", "icon-sm"), ev.location) : null),
       coverageBadge(ev.it)));
@@ -1698,15 +1803,41 @@ async function openEventSheet(ev) {
     const full = await api("/api/v1/body?" + qs(q));
     const org = ((full.organizer || {}).emailAddress || {});
     add("Organizer", org.name || org.address, "users");
-    const att = (full.attendees || []).map(a => (a.emailAddress || {}).name || (a.emailAddress || {}).address).filter(Boolean);
+    const att = (full.attendees || []).map(a => {
+      const e = a.emailAddress || {}, r = (a.status || {}).response;
+      const who = e.name || e.address; if (!who) return null;
+      return who + (r && r !== "none" && r !== "notResponded" ? ` (${r})` : "");
+    }).filter(Boolean);
     if (att.length) add("Attendees", att.join(", "), "users");
+    // #565 B5: rich event detail
+    add("Repeats", recurText(full.recurrence || ev.recur), "rotate-ccw");
+    const resp = (full.responseStatus || {}).response;
+    if (resp && resp !== "none" && resp !== "organizer") add("My response", resp[0].toUpperCase() + resp.slice(1), "check-square");
+    if (full.showAs) add("Shown as", full.showAs, "clock");
+    if (full.sensitivity && full.sensitivity !== "normal") add("Sensitivity", full.sensitivity, "shield");
+    if (full.importance && full.importance !== "normal") add("Importance", full.importance, "shield");
+    if (full.isCancelled) add("Status", "Cancelled", "x");
+    if (full.hasAttachments) add("Attachments", "Backed up with the event", "paperclip");
     // event description is HTML → extract plain text safely (DOMParser runs no scripts, loads nothing)
     const html = (full.body || {}).content || "";
+    const tail = [];
+    // Teams / online-meeting join link
+    const joinUrl = (full.onlineMeeting || {}).joinUrl || full.onlineMeetingUrl;
+    if (joinUrl) tail.push(el("a", { class: "btn sm primary", style: "margin-top:12px", href: joinUrl, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Join online meeting"));
+    // real category chips, coloured from the master-category map if present
+    const cats = full.categories || [];
+    if (cats.length) {
+      const row = el("div", { class: "mr-chips", style: "margin-top:12px;display:flex;gap:6px;flex-wrap:wrap" });
+      cats.forEach(c => row.append(el("span", { class: "chip", text: c })));
+      tail.push(row);
+    }
+    if (full.webLink) tail.push(el("a", { class: "btn ghost sm", style: "margin-top:12px", href: full.webLink, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open in Outlook"));
+    const notes = [];
     if (html) {
       const txt = new DOMParser().parseFromString(html, "text/html").body.textContent.trim();
-      if (txt) { clear(content).append(kv, el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: txt.slice(0, 4000) })); }
-      else clear(content).append(kv);
-    } else clear(content).append(kv);
+      if (txt) notes.push(el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: txt.slice(0, 4000) }));
+    }
+    clear(content).append(kv, ...notes, ...tail);
   } catch { clear(content).append(kv); }
   content.append(el("a", { class: "btn ghost sm", style: "margin-top:16px", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open full event"));
 }
