@@ -255,6 +255,9 @@ fn run(args: &Args) -> Result<(), String> {
     let share_cap_token = mint_cap_token();
     let share_handler: Arc<dyn isyncyou_webui::ShareHandler> =
         Arc::new(DaemonShare { cfg: cfg.clone() });
+    // Live OneDrive info (quota/permissions) for the explorer (#564). Read-only.
+    let onedrive_info_handler: Arc<dyn isyncyou_webui::OneDriveInfoHandler> =
+        Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() });
     // A separate token gates the integrity-verify POST (#528). Local-only (no
     // cloud mutation), but kept distinct so a leaked token has a small blast radius.
     let verify_cap_token = mint_cap_token();
@@ -285,6 +288,7 @@ fn run(args: &Args) -> Result<(), String> {
     }
     .with_restore(handler, cap_token.clone())
     .with_share(share_handler, share_cap_token)
+    .with_onedrive_info(onedrive_info_handler)
     .with_verify(verify_handler, verify_cap_token)
     .with_settings(settings_handler, settings_cap_token)
     .with_mail_write(mail_write_handler, mail_write_cap_token)
@@ -553,6 +557,21 @@ impl isyncyou_webui::ShareHandler for DaemonShare {
                     emails.len().max(ids.len())
                 )
             })
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Live OneDrive info for the web UI (#564): the drive quota (and, in #564 A4,
+/// per-item permissions). Resolves the cached sync token (covers the `/me/drive`
+/// read) and calls Graph. Read-only — no capability token.
+struct DaemonOneDriveInfo {
+    cfg: Config,
+}
+impl isyncyou_webui::OneDriveInfoHandler for DaemonOneDriveInfo {
+    fn drive_quota(&self, account: &str) -> Result<serde_json::Value, String> {
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
+        isyncyou_graph::GraphClient::new(token)
+            .drive_quota()
             .map_err(|e| e.to_string())
     }
 }

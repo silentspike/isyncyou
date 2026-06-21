@@ -1312,21 +1312,33 @@ async function renderOnedriveView(view) {
 // account-wide OneDrive KPIs (flat item list, independent of the current folder)
 async function driveLoadMetrics() {
   try {
-    const [d, act] = await Promise.all([
+    const [d, act, drv] = await Promise.all([
       api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", limit: 2000 })),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
+      // live drive quota (#564) — best-effort: 404 on the read-only `serve` server
+      api("/api/v1/drive?" + qs({ account: App.account })).catch(() => null),
     ]);
     const all = d.items || [];
     const files = all.filter(it => it.item_type !== "folder");
     const folders = all.filter(it => it.item_type === "folder").length;
     const archived = files.filter(it => it.has_body).length;
     App.counts.onedrive = all.length; updateNavCounts();
-    fillMetrics($("#drive-metrics-row"), [
+    const cards = [
       { icon: "file", value: files.length, label: "Files", sub: `${folders} folders` },
       { icon: "download", value: archived, label: "Archived", sub: "tracked with a copy", tone: archived ? "ok" : "" },
       integrityMetric(files),
       lastActivityMetric(act.runs || []),
-    ]);
+    ];
+    const q = drv && drv.quota;
+    if (q && typeof q.total === "number" && q.total > 0) {
+      const usedPct = Math.round((q.used || 0) / q.total * 100);
+      cards.push({
+        icon: "hard-drive", value: fmtSize(q.used || 0), label: "Storage used",
+        sub: `${usedPct}% of ${fmtSize(q.total)} · ${fmtSize(q.remaining || 0)} free`,
+        tone: usedPct >= 90 ? "warn" : "",
+      });
+    }
+    fillMetrics($("#drive-metrics-row"), cards);
   } catch { /* metrics are best-effort; the explorer still loads */ }
 }
 function setDriveLayout(l) { Drive.layout = l; $("#drive-grid")?.classList.toggle("active", l === "grid"); $("#drive-list")?.classList.toggle("active", l === "list"); driveRender(); }

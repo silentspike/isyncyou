@@ -217,6 +217,16 @@ pub trait ShareHandler: Send + Sync {
     ) -> Result<String, String>;
 }
 
+/// Reports live OneDrive info that needs a Graph call (not held in the store):
+/// the drive storage quota, and a single item's sharing permissions (#564).
+/// Injected by the daemon (which owns the Graph stack + token); the read-only
+/// CLI `serve` doesn't set it, so the endpoints 404 there. These are reads, so
+/// no capability token is required (the daemon binds to localhost).
+pub trait OneDriveInfoHandler: Send + Sync {
+    /// The drive quota object (`total`/`used`/`remaining`/`state`) as JSON.
+    fn drive_quota(&self, account: &str) -> Result<serde_json::Value, String>;
+}
+
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
 /// scheduler and trigger an immediate pass. Injected by the daemon.
 pub trait SyncControl: Send + Sync {
@@ -388,6 +398,9 @@ pub struct Router {
     /// Optional FUSE hydration status (the daemon's). Enables the in-flight
     /// download list GET.
     hydrations: Option<std::sync::Arc<dyn HydrationStatus>>,
+    /// Optional live OneDrive info handler (the daemon's). Enables the quota /
+    /// permissions GETs; `None` => those 404 (the read-only CLI `serve`).
+    onedrive_info: Option<std::sync::Arc<dyn OneDriveInfoHandler>>,
     /// Optional integrity-verify handler (the daemon's). `None` => the verify
     /// POST is refused (the read-only CLI `serve`).
     verify: Option<std::sync::Arc<dyn VerifyHandler>>,
@@ -419,6 +432,7 @@ impl Router {
             share_cap_token: None,
             sync_control: None,
             hydrations: None,
+            onedrive_info: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -442,6 +456,7 @@ impl Router {
             share_cap_token: None,
             sync_control: None,
             hydrations: None,
+            onedrive_info: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -499,6 +514,12 @@ impl Router {
     /// Enable the read-only FUSE hydration status GET (builder style).
     pub fn with_hydrations(mut self, hydrations: std::sync::Arc<dyn HydrationStatus>) -> Self {
         self.hydrations = Some(hydrations);
+        self
+    }
+
+    /// Enable the live OneDrive info GETs (quota/permissions) (builder style).
+    pub fn with_onedrive_info(mut self, info: std::sync::Arc<dyn OneDriveInfoHandler>) -> Self {
+        self.onedrive_info = Some(info);
         self
     }
 
@@ -658,6 +679,7 @@ impl Router {
             "/api/v1/search" => self.search(req),
             "/api/v1/sync/state" => self.sync_state(),
             "/api/v1/hydrations" => self.hydrations_state(),
+            "/api/v1/drive" => self.drive_info(req),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -1157,6 +1179,23 @@ impl Router {
             .map(|h| h.active())
             .unwrap_or_default();
         ApiResponse::ok_json(&json!({ "count": active.len(), "active": active }))
+    }
+
+    /// The OneDrive storage quota for an account — a live Graph call via the
+    /// daemon's handler (#564). 404 when no handler (read-only CLI `serve`).
+    fn drive_info(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_info {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "OneDrive info is not enabled on this server"),
+        };
+        let account = match req.q("account") {
+            Some(a) if !a.is_empty() => a,
+            _ => return ApiResponse::error(400, "account is required"),
+        };
+        match handler.drive_quota(account) {
+            Ok(q) => ApiResponse::ok_json(&json!({ "quota": q })),
+            Err(e) => ApiResponse::error(502, &e),
+        }
     }
 
     fn store_path(&self, account: &str) -> Option<PathBuf> {
@@ -2297,6 +2336,36 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             self.0.lock().unwrap().push(format!("send_draft id={id}"));
             Ok(())
         }
+    }
+
+    struct FakeDriveInfo;
+    impl OneDriveInfoHandler for FakeDriveInfo {
+        fn drive_quota(&self, _account: &str) -> Result<serde_json::Value, String> {
+            Ok(json!({ "total": 1000, "used": 250, "remaining": 750, "state": "normal" }))
+        }
+    }
+
+    #[test]
+    fn drive_quota_route_returns_handler_json_or_404() {
+        let (_d, router) = setup();
+        // read-only server (no handler) -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/drive?account=a"))
+                .status,
+            404
+        );
+        let router = router.with_onedrive_info(std::sync::Arc::new(FakeDriveInfo));
+        // missing account -> 400
+        assert_eq!(router.route(&ApiRequest::get("/api/v1/drive")).status, 400);
+        // with handler + account -> 200 + the quota object
+        let resp = router.route(&ApiRequest::get("/api/v1/drive?account=a"));
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(
+            v.pointer("/quota/remaining").and_then(Value::as_i64),
+            Some(750)
+        );
     }
 
     #[test]

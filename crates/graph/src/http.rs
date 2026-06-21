@@ -473,6 +473,16 @@ impl GraphClient {
             .ok_or_else(|| UploadError::Parse("drive item response had no id".into()))
     }
 
+    /// The drive's storage quota (`total`/`used`/`remaining`/`state`) from
+    /// `GET /me/drive` (#564). Returns the `quota` object as-is.
+    pub fn drive_quota(&self) -> Result<serde_json::Value, UploadError> {
+        let url = format!("{}/me/drive", self.base);
+        let v = self.get_json(&url)?;
+        v.get("quota")
+            .cloned()
+            .ok_or_else(|| UploadError::Parse("drive response had no quota".into()))
+    }
+
     /// Create (or, idempotently per `(link_type, scope)`, return the existing)
     /// sharing link for an item. `link_type` = `view`/`edit`/`embed`, `scope` =
     /// `anonymous`/`users`. `password`/`expiry` are account/Premium-dependent on
