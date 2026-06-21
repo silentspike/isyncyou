@@ -810,6 +810,7 @@ a:hover { text-decoration: underline; }
   background: linear-gradient(135deg, var(--svc-contacts), color-mix(in oklab, var(--svc-contacts) 45%, var(--accent)));
   box-shadow: inset 0 0 0 1px rgba(255,255,255,.12); }
 .avatar.con-av.lg { width: 56px; height: 56px; font-size: var(--fs-2xl); }
+.avatar.con-av.con-photo { object-fit: cover; padding: 0; background: var(--bg-3); }
 .con-az { display: flex; flex-direction: column; gap: 1px; padding: var(--sp-2) 2px; flex: none; align-self: center; }
 .az-letter { width: 20px; height: 18px; border: 0; background: transparent; color: var(--text-lo);
   font-size: var(--fs-xs); font-weight: 700; border-radius: var(--r-sm); }

@@ -2084,12 +2084,25 @@ function contactsRenderList() {
   if (grouped) [...new Set(rows.map(conLetter))].sort().forEach(L =>
     az.append(el("button", { class: "az-letter", text: L, onclick: () => { const t = wrap.querySelector(`.con-sec[data-letter="${L}"]`); t && t.scrollIntoView({ block: "start", behavior: "smooth" }); } })));
 }
+// avatar that shows the archived contact photo when one exists, falling back to
+// initials (also if the <img> fails to load — never a broken-image glyph).
+function contactAvatar(it, extra) {
+  const cls = "avatar con-av" + (extra ? " " + extra : "");
+  if (conPrev(it).has_photo) {
+    return el("img", {
+      class: cls + " con-photo", alt: "", loading: "lazy",
+      src: "/api/v1/contact/photo?" + qs({ account: App.account, id: it.remote_id }),
+      onerror: (e) => e.currentTarget.replaceWith(el("span", { class: cls, text: initials(it.name) })),
+    });
+  }
+  return el("span", { class: cls, text: initials(it.name) });
+}
 function contactRow(it) {
   const p = conPrev(it);
   const sub = [p.job, p.company].filter(Boolean).join(" · ") || p.email || "";
   const sel = Contacts.selected && Contacts.selected.remote_id === it.remote_id;
   return el("button", { class: "con-row" + (sel ? " active" : ""), dataset: { id: it.remote_id }, onclick: () => contactSelect(it) },
-    el("span", { class: "avatar con-av", text: initials(it.name) }),
+    contactAvatar(it),
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "con-name truncate", text: it.name || "(no name)" }),
       sub ? el("div", { class: "con-sub truncate", text: sub }) : null),
@@ -2117,7 +2130,10 @@ const CONTACT_FIELDS = [
   ["Company", (c) => !!c.companyName],
   ["Department", (c) => !!c.department],
   ["Job title", (c) => !!c.jobTitle],
-  ["Address", (c) => { const a = c.businessAddress || c.homeAddress || {}; return !!(a.street || a.city || a.postalCode); }],
+  ["Address", (c) => { const a = c.businessAddress || c.homeAddress || c.otherAddress || {}; return !!(a.street || a.city || a.postalCode); }],
+  ["Birthday", (c) => !!c.birthday],
+  ["IM", (c) => (c.imAddresses || []).length > 0],
+  ["Categories", (c) => (c.categories || []).length > 0],
   ["Notes", (c) => !!c.personalNotes],
 ];
 const shortEtag = (e) => { const m = String(e).replace(/[^A-Za-z0-9]/g, ""); return m.length > 10 ? "…" + m.slice(-8) : (m || "—"); };
@@ -2231,7 +2247,7 @@ async function renderContactDetail(it) {
   const verified = it.verify_status === "verified";
   box.append(el("header", { class: "con-detail-head" },
     el("button", { class: "con-back btn ghost sm", title: "Back", onclick: contactBack }, icon("chevron-left", "icon-sm")),
-    el("span", { class: "avatar con-av lg", text: initials(it.name) }),
+    contactAvatar(it, "lg"),
     el("div", { class: "grow", style: "min-width:0" },
       el("h2", { class: "con-detail-name truncate", text: it.name || "(no name)" }),
       p.email ? el("button", { class: "con-detail-email truncate", title: "Copy email", onclick: (e) => { navigator.clipboard?.writeText(p.email).then(() => toast("Email copied")).catch(() => {}); } }, el("span", { class: "truncate", text: p.email }), icon("share2", "icon-sm")) : (sub ? el("div", { class: "con-detail-sub truncate", text: sub }) : null),
@@ -2264,8 +2280,21 @@ async function renderContactDetail(it) {
     add("Home", c.homePhones, "phone");
     add("Company", [c.companyName, c.department].filter(Boolean).join(" — "), "building");
     add("Title", c.jobTitle, "users");
-    const addr = c.businessAddress || c.homeAddress || {};
-    add("Address", [addr.street, addr.city, addr.postalCode, addr.countryOrRegion].filter(Boolean).join(", "), "map-pin");
+    add("Nickname", c.nickName, "users");
+    const fmtAddr = (a) => a ? [a.street, a.city, a.state, a.postalCode, a.countryOrRegion].filter(Boolean).join(", ") : "";
+    add("Business address", fmtAddr(c.businessAddress), "map-pin");
+    add("Home address", fmtAddr(c.homeAddress), "map-pin");
+    add("Other address", fmtAddr(c.otherAddress), "map-pin");
+    add("Birthday", typeof c.birthday === "string" ? c.birthday.slice(0, 10) : "", "calendar");
+    add("IM", c.imAddresses, "share2");
+    add("Categories", c.categories, "tag");
+    add("Manager", c.manager, "users");
+    add("Assistant", c.assistantName, "users");
+    add("Spouse / partner", c.spouseName, "users");
+    add("Children", c.children, "users");
+    add("Profession", c.profession, "building");
+    add("Office", c.officeLocation, "map-pin");
+    add("Website", c.businessHomePage, "globe");
     clear(fieldsBody);
     if (kv.childElementCount) fieldsBody.append(kv);
     else fieldsBody.append(el("p", { class: "dim", style: "padding:2px", text: "No additional fields archived for this contact." }));
