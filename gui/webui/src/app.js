@@ -2511,7 +2511,9 @@ async function openTaskSheet(t) {
     if (CAP.todowrite && t.parent_remote_id) {
       const acts = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 8px" });
       acts.append(el("button", { class: "btn ghost sm", onclick: () => { closeSheet(); openComposeTask(t); } }, icon("info", "icon-sm"), "Edit"));
-      if (full.status !== "completed") acts.append(el("button", { class: "btn ghost sm", onclick: () => completeTask(t) }, icon("check", "icon-sm"), "Complete"));
+      acts.append(full.status === "completed"
+        ? el("button", { class: "btn ghost sm", onclick: () => reopenTask(t) }, icon("rotate-ccw", "icon-sm"), "Reopen")
+        : el("button", { class: "btn ghost sm", onclick: () => completeTask(t) }, icon("check", "icon-sm"), "Complete"));
       acts.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", onclick: () => deleteTask(t) }, icon("trash-2", "icon-sm"), "Delete"));
       content.append(acts);
     }
@@ -2643,6 +2645,10 @@ async function newTodoList() {
 }
 async function completeTask(t) {
   try { await post("/api/v1/todo/complete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task completed"); closeSheet(); todoReload(); }
+  catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function reopenTask(t) {
+  try { await post("/api/v1/todo/update?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id, status: "notStarted" }), CAP.todowrite); toast("Task reopened"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function deleteTask(t) {
