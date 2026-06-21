@@ -1026,6 +1026,110 @@ impl GraphClient {
     pub fn delete_contact(&self, contact_id: &str) -> Result<(), UploadError> {
         self.delete_url(&format!("/me/contacts/{}", encode_id(contact_id)))
     }
+
+    // ---- Microsoft To Do write verbs (#567 B5) — ids percent-encoded ----
+
+    /// Create a task in a list (`POST /me/todo/lists/{list}/tasks`); returns it.
+    pub fn create_task(
+        &self,
+        list_id: &str,
+        task: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_json(
+            &format!("/me/todo/lists/{}/tasks", encode_id(list_id)),
+            task,
+        )
+    }
+
+    /// Update a task's writable fields (`PATCH /me/todo/lists/{list}/tasks/{id}`).
+    pub fn update_task(
+        &self,
+        list_id: &str,
+        task_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(
+            &format!(
+                "/me/todo/lists/{}/tasks/{}",
+                encode_id(list_id),
+                encode_id(task_id)
+            ),
+            patch,
+        )
+    }
+
+    /// Delete a task (`DELETE /me/todo/lists/{list}/tasks/{id}`).
+    pub fn delete_task(&self, list_id: &str, task_id: &str) -> Result<(), UploadError> {
+        self.delete_url(&format!(
+            "/me/todo/lists/{}/tasks/{}",
+            encode_id(list_id),
+            encode_id(task_id)
+        ))
+    }
+
+    /// Add a checklist item to a task (`POST .../tasks/{id}/checklistItems`).
+    pub fn create_checklist_item(
+        &self,
+        list_id: &str,
+        task_id: &str,
+        item: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_json(
+            &format!(
+                "/me/todo/lists/{}/tasks/{}/checklistItems",
+                encode_id(list_id),
+                encode_id(task_id)
+            ),
+            item,
+        )
+    }
+
+    /// Update a checklist item (`PATCH .../checklistItems/{cid}`).
+    pub fn update_checklist_item(
+        &self,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.patch_json(
+            &format!(
+                "/me/todo/lists/{}/tasks/{}/checklistItems/{}",
+                encode_id(list_id),
+                encode_id(task_id),
+                encode_id(item_id)
+            ),
+            patch,
+        )
+    }
+
+    /// Delete a checklist item (`DELETE .../checklistItems/{cid}`).
+    pub fn delete_checklist_item(
+        &self,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+    ) -> Result<(), UploadError> {
+        self.delete_url(&format!(
+            "/me/todo/lists/{}/tasks/{}/checklistItems/{}",
+            encode_id(list_id),
+            encode_id(task_id),
+            encode_id(item_id)
+        ))
+    }
+
+    /// Create a task list (`POST /me/todo/lists`); returns the created list.
+    pub fn create_todo_list(
+        &self,
+        list: &serde_json::Value,
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_json("/me/todo/lists", list)
+    }
+
+    /// Delete a task list (`DELETE /me/todo/lists/{id}`).
+    pub fn delete_todo_list(&self, list_id: &str) -> Result<(), UploadError> {
+        self.delete_url(&format!("/me/todo/lists/{}", encode_id(list_id)))
+    }
 }
 
 // ---- mail-write request-body builders (pure; unit-tested for exact shape) ----
@@ -1899,6 +2003,43 @@ mod tests {
         // Outlook ids carry +//= → must be percent-escaped or Graph 404s the path.
         assert!(seen[1].starts_with("PATCH /me/contacts/aB%2B%2F9%3D%3D"));
         assert!(seen[2].starts_with("DELETE /me/contacts/aB%2B%2F9%3D%3D"));
+    }
+
+    #[test]
+    fn todo_write_verbs_hit_the_right_urls() {
+        let (base, server) = serve(vec![
+            http_response(201, "Created", "", "{\"id\":\"t1\"}"),
+            http_response(200, "OK", "", "{\"id\":\"t1\"}"),
+            http_response(201, "Created", "", "{\"id\":\"ci1\"}"),
+            http_response(200, "OK", "", "{\"id\":\"ci1\"}"),
+            http_response(204, "No Content", "", ""),
+            http_response(204, "No Content", "", ""),
+            http_response(201, "Created", "", "{\"id\":\"L9\"}"),
+            http_response(204, "No Content", "", ""),
+        ]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        c.create_task("L1", &serde_json::json!({"title":"x"}))
+            .unwrap();
+        c.update_task("L1", "t1", &serde_json::json!({"status":"completed"}))
+            .unwrap();
+        c.create_checklist_item("L1", "t1", &serde_json::json!({"displayName":"step"}))
+            .unwrap();
+        c.update_checklist_item("L1", "t1", "ci1", &serde_json::json!({"isChecked":true}))
+            .unwrap();
+        c.delete_checklist_item("L1", "t1", "ci1").unwrap();
+        c.delete_task("L1", "t1").unwrap();
+        c.create_todo_list(&serde_json::json!({"displayName":"New"}))
+            .unwrap();
+        c.delete_todo_list("L9").unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/todo/lists/L1/tasks"));
+        assert!(seen[1].starts_with("PATCH /me/todo/lists/L1/tasks/t1"));
+        assert!(seen[2].starts_with("POST /me/todo/lists/L1/tasks/t1/checklistItems"));
+        assert!(seen[3].starts_with("PATCH /me/todo/lists/L1/tasks/t1/checklistItems/ci1"));
+        assert!(seen[4].starts_with("DELETE /me/todo/lists/L1/tasks/t1/checklistItems/ci1"));
+        assert!(seen[5].starts_with("DELETE /me/todo/lists/L1/tasks/t1"));
+        assert!(seen[6].starts_with("POST /me/todo/lists"));
+        assert!(seen[7].starts_with("DELETE /me/todo/lists/L9"));
     }
 
     #[test]
