@@ -1663,11 +1663,7 @@ impl Router {
                                         {
                                             v["preview"] = match service {
                                                 "calendar" => calendar_preview(it, &o),
-                                                "contacts" => json!({
-                                                    "company": o["companyName"],
-                                                    "job": o["jobTitle"],
-                                                    "email": o["emailAddresses"][0]["address"],
-                                                }),
+                                                "contacts" => contact_preview(it, &o, root),
                                                 _ => json!({
                                                     "status": o["status"],
                                                     "importance": o["importance"],
@@ -2131,6 +2127,65 @@ fn calendar_preview(it: &Item, o: &Value) -> Value {
         "has_attachments": o.get("hasAttachments").and_then(Value::as_bool),
         "web_link": o.get("webLink").and_then(Value::as_str),
         "reminder_minutes": o.get("reminderMinutesBeforeStart"),
+    })
+}
+
+/// Build a contact's `preview` from its archived JSON sidecar (#566): every
+/// detail the card surfaces — name parts, the **three** addresses, IM, birthday,
+/// categories, relationships, profession/office — plus `has_photo` (does the
+/// archived `.jpg` exist by id), so the UI knows whether to load the photo
+/// avatar. All best-effort.
+fn contact_preview(it: &Item, o: &Value, root: &std::path::Path) -> Value {
+    let addr = |a: &Value| {
+        json!({
+            "street": a.get("street").and_then(Value::as_str),
+            "city": a.get("city").and_then(Value::as_str),
+            "state": a.get("state").and_then(Value::as_str),
+            "postalCode": a.get("postalCode").and_then(Value::as_str),
+            "countryOrRegion": a.get("countryOrRegion").and_then(Value::as_str),
+        })
+    };
+    // The photo id is hashed by shard_rel, so the path can't traverse — a cheap
+    // existence check is safe.
+    let has_photo = root
+        .join(isyncyou_connectors::shard_rel(
+            "contacts",
+            &it.remote_id,
+            "jpg",
+        ))
+        .exists();
+    json!({
+        "company": o.get("companyName").and_then(Value::as_str),
+        "job": o.get("jobTitle").and_then(Value::as_str),
+        "department": o.get("department").and_then(Value::as_str),
+        "email": o.pointer("/emailAddresses/0/address").and_then(Value::as_str),
+        "emails": o.get("emailAddresses"),
+        "mobile": o.get("mobilePhone").and_then(Value::as_str),
+        "business_phones": o.get("businessPhones"),
+        "home_phones": o.get("homePhones"),
+        "birthday": o.get("birthday").and_then(Value::as_str),
+        "business_address": o.get("businessAddress").map(addr),
+        "home_address": o.get("homeAddress").map(addr),
+        "other_address": o.get("otherAddress").map(addr),
+        "im_addresses": o.get("imAddresses"),
+        "categories": o.get("categories"),
+        "assistant": o.get("assistantName").and_then(Value::as_str),
+        "manager": o.get("manager").and_then(Value::as_str),
+        "spouse": o.get("spouseName").and_then(Value::as_str),
+        "children": o.get("children"),
+        "profession": o.get("profession").and_then(Value::as_str),
+        "office_location": o.get("officeLocation").and_then(Value::as_str),
+        "homepage": o.get("businessHomePage").and_then(Value::as_str),
+        "title": o.get("title").and_then(Value::as_str),
+        "nick_name": o.get("nickName").and_then(Value::as_str),
+        "middle_name": o.get("middleName").and_then(Value::as_str),
+        "initials": o.get("initials").and_then(Value::as_str),
+        "generation": o.get("generation").and_then(Value::as_str),
+        "file_as": o.get("fileAs").and_then(Value::as_str),
+        "yomi_given": o.get("yomiGivenName").and_then(Value::as_str),
+        "yomi_surname": o.get("yomiSurname").and_then(Value::as_str),
+        "yomi_company": o.get("yomiCompanyName").and_then(Value::as_str),
+        "has_photo": has_photo,
     })
 }
 
@@ -3842,8 +3897,16 @@ Content-Type: text/html; charset=utf-8\r\n\
         std::fs::write(
             arch.join("contacts/aa/c.json"),
             br#"{"displayName":"Ada Lovelace","companyName":"Analytical Engines",
-                 "jobTitle":"Mathematician",
-                 "emailAddresses":[{"address":"ada@example.com","name":"Ada"}]}"#,
+                 "jobTitle":"Mathematician","department":"Research","title":"Lady",
+                 "nickName":"Ada","middleName":"Augusta","birthday":"1815-12-10T00:00:00Z",
+                 "emailAddresses":[{"address":"ada@example.com","name":"Ada"}],
+                 "mobilePhone":"+1-555-0100","businessPhones":["+1-555-0101"],
+                 "homeAddress":{"street":"1 Engine Way","city":"London","postalCode":"E1","countryOrRegion":"UK"},
+                 "businessAddress":{"street":"2 Math Rd","city":"Cambridge"},
+                 "otherAddress":{"city":"Paris"},
+                 "imAddresses":["ada@im.example"],"categories":["VIP"],
+                 "spouseName":"William","manager":"Babbage",
+                 "profession":"Mathematician","officeLocation":"Tower"}"#,
         )
         .unwrap();
         std::fs::write(
@@ -3862,6 +3925,11 @@ Content-Type: text/html; charset=utf-8\r\n\
             t.local_path = Some("todo/bb/t.json".into());
             store.upsert_item(&t).unwrap();
         }
+        // c1 has an archived photo at the sharded path -> has_photo must be true
+        let prel = isyncyou_connectors::shard_rel("contacts", "c1", "jpg");
+        let pp = arch.join(&prel);
+        std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+        std::fs::write(&pp, b"\xFF\xD8\xFF").unwrap();
         let cfg = Config {
             accounts: vec![AccountConfig {
                 id: "a".into(),
@@ -3879,6 +3947,27 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(cp["company"], "Analytical Engines");
         assert_eq!(cp["job"], "Mathematician");
         assert_eq!(cp["email"], "ada@example.com");
+        // #566 widened fields
+        assert_eq!(cp["birthday"], "1815-12-10T00:00:00Z");
+        assert_eq!(cp["title"], "Lady");
+        assert_eq!(cp["nick_name"], "Ada");
+        assert_eq!(
+            cp.pointer("/home_address/city").and_then(Value::as_str),
+            Some("London")
+        );
+        assert_eq!(
+            cp.pointer("/business_address/city").and_then(Value::as_str),
+            Some("Cambridge")
+        );
+        assert_eq!(
+            cp.pointer("/other_address/city").and_then(Value::as_str),
+            Some("Paris")
+        );
+        assert_eq!(cp["im_addresses"][0], "ada@im.example");
+        assert_eq!(cp["categories"][0], "VIP");
+        assert_eq!(cp["spouse"], "William");
+        assert_eq!(cp["manager"], "Babbage");
+        assert_eq!(cp["has_photo"], true);
         let t = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=todo")));
         let tp = &t["items"][0]["preview"];
         assert_eq!(tp["status"], "inProgress");
