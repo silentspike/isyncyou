@@ -367,6 +367,48 @@ pub trait ContactWriteHandler: Send + Sync {
     fn delete(&self, account: &str, contact_id: &str) -> Result<(), String>;
 }
 
+/// Performs the live-ToDo **write** verbs on behalf of a cap-token POST (#567 B6):
+/// task create/update/complete/delete, checklist add/toggle/delete, list create/
+/// delete. Injected by the daemon (which owns the engine + the full write token);
+/// the read-only CLI `serve` does not set it, so every `/api/v1/todo/*` POST is
+/// refused there.
+pub trait TaskWriteHandler: Send + Sync {
+    fn create(&self, account: &str, list_id: &str, task: &Value) -> Result<String, String>;
+    fn update(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        task: &Value,
+    ) -> Result<(), String>;
+    fn complete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String>;
+    fn delete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String>;
+    fn checklist_add(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        title: &str,
+    ) -> Result<String, String>;
+    fn checklist_toggle(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+        checked: bool,
+    ) -> Result<(), String>;
+    fn checklist_delete(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+    ) -> Result<(), String>;
+    fn list_create(&self, account: &str, name: &str) -> Result<String, String>;
+    fn list_delete(&self, account: &str, list_id: &str) -> Result<(), String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -467,6 +509,11 @@ pub struct Router {
     contact_write: Option<std::sync::Arc<dyn ContactWriteHandler>>,
     /// Separate capability token for contact-write POSTs.
     contact_write_cap_token: Option<String>,
+    /// Optional live-ToDo write handler (the daemon's). `None` => every
+    /// `/api/v1/todo/*` POST is refused (the read-only CLI `serve`).
+    task_write: Option<std::sync::Arc<dyn TaskWriteHandler>>,
+    /// Separate capability token for ToDo-write POSTs.
+    task_write_cap_token: Option<String>,
 }
 
 impl Router {
@@ -493,6 +540,8 @@ impl Router {
             calendar_write_cap_token: None,
             contact_write: None,
             contact_write_cap_token: None,
+            task_write: None,
+            task_write_cap_token: None,
         }
     }
 
@@ -521,6 +570,8 @@ impl Router {
             calendar_write_cap_token: None,
             contact_write: None,
             contact_write_cap_token: None,
+            task_write: None,
+            task_write_cap_token: None,
         }
     }
 
@@ -638,6 +689,17 @@ impl Router {
         self
     }
 
+    /// Enable the live-ToDo write POSTs (builder style, #567).
+    pub fn with_task_write(
+        mut self,
+        handler: std::sync::Arc<dyn TaskWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.task_write = Some(handler);
+        self.task_write_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token.
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
         matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
@@ -696,6 +758,15 @@ impl Router {
                 "/api/v1/contact/create" => self.contact_create(req),
                 "/api/v1/contact/update" => self.contact_update(req),
                 "/api/v1/contact/delete" => self.contact_delete(req),
+                "/api/v1/todo/create" => self.todo_create(req),
+                "/api/v1/todo/update" => self.todo_update(req),
+                "/api/v1/todo/complete" => self.todo_complete(req),
+                "/api/v1/todo/delete" => self.todo_delete(req),
+                "/api/v1/todo/checklist-add" => self.todo_checklist_add(req),
+                "/api/v1/todo/checklist-toggle" => self.todo_checklist_toggle(req),
+                "/api/v1/todo/checklist-delete" => self.todo_checklist_delete(req),
+                "/api/v1/todo/list-create" => self.todo_list_create(req),
+                "/api/v1/todo/list-delete" => self.todo_list_delete(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -742,6 +813,10 @@ impl Router {
                     .replace(
                         "__CONTACTWRITE_CAP_TOKEN__",
                         self.contact_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__TASKWRITE_CAP_TOKEN__",
+                        self.task_write_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -1168,6 +1243,314 @@ impl Router {
             _ => return ApiResponse::error(400, "account and id are required"),
         };
         self.contact_result(account, &format!("delete id={id}"), h.delete(account, id))
+    }
+
+    fn todo_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn TaskWriteHandler>, ApiResponse> {
+        let h = self
+            .task_write
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "todo write is not enabled on this server"))?;
+        if !Self::cap_ok(&self.task_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit ToDo result (no SSE on self-write, like `cal_result`).
+    fn todo_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(account, "audit:todo", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a Graph todoTask from query params (title/body/importance/status,
+    /// due/start/reminder dates, comma-separated categories). The write layer
+    /// sanitizes to the writable whitelist.
+    fn task_from_req(req: &ApiRequest) -> Value {
+        let tz = req.q("tz").filter(|s| !s.is_empty()).unwrap_or("UTC");
+        let mut t = json!({});
+        let o = t.as_object_mut().unwrap();
+        if let Some(s) = req.q("title") {
+            o.insert("title".into(), json!(s));
+        }
+        if let Some(s) = req.q("body").filter(|s| !s.is_empty()) {
+            o.insert(
+                "body".into(),
+                json!({ "contentType": "text", "content": s }),
+            );
+        }
+        if let Some(s) = req.q("importance").filter(|s| !s.is_empty()) {
+            o.insert("importance".into(), json!(s));
+        }
+        if let Some(s) = req.q("status").filter(|s| !s.is_empty()) {
+            o.insert("status".into(), json!(s));
+        }
+        for (q, key) in [
+            ("due", "dueDateTime"),
+            ("start", "startDateTime"),
+            ("reminder", "reminderDateTime"),
+        ] {
+            if let Some(s) = req.q(q).filter(|s| !s.is_empty()) {
+                o.insert(key.into(), json!({ "dateTime": s, "timeZone": tz }));
+                if q == "reminder" {
+                    o.insert("isReminderOn".into(), json!(true));
+                }
+            }
+        }
+        if let Some(s) = req.q("categories").filter(|s| !s.is_empty()) {
+            let cats: Vec<Value> = s
+                .split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(|c| json!(c))
+                .collect();
+            if !cats.is_empty() {
+                o.insert("categories".into(), Value::Array(cats));
+            }
+        }
+        t
+    }
+
+    /// `(account, list)` from the request, both required.
+    fn todo_acc_list(req: &ApiRequest) -> Result<(&str, &str), ApiResponse> {
+        match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("list").filter(|l| !l.is_empty()),
+        ) {
+            (Some(a), Some(l)) => Ok((a, l)),
+            _ => Err(ApiResponse::error(400, "account and list are required")),
+        }
+    }
+
+    fn todo_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let t = Self::task_from_req(req);
+        if t.get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return ApiResponse::error(400, "title is required");
+        }
+        match h.create(account, list, &t) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(account, "audit:todo", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn todo_update(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let id = match req.q("id").filter(|i| !i.is_empty()) {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "id is required"),
+        };
+        let t = Self::task_from_req(req);
+        self.todo_result(
+            account,
+            &format!("update id={id}"),
+            h.update(account, list, id, &t),
+        )
+    }
+
+    fn todo_complete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let id = match req.q("id").filter(|i| !i.is_empty()) {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "id is required"),
+        };
+        self.todo_result(
+            account,
+            &format!("complete id={id}"),
+            h.complete(account, list, id),
+        )
+    }
+
+    fn todo_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let id = match req.q("id").filter(|i| !i.is_empty()) {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "id is required"),
+        };
+        self.todo_result(
+            account,
+            &format!("delete id={id}"),
+            h.delete(account, list, id),
+        )
+    }
+
+    fn todo_checklist_add(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let (task, title) = match (
+            req.q("task").filter(|t| !t.is_empty()),
+            req.q("title").filter(|t| !t.is_empty()),
+        ) {
+            (Some(t), Some(ti)) => (t, ti),
+            _ => return ApiResponse::error(400, "task and title are required"),
+        };
+        match h.checklist_add(account, list, task, title) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", "checklist-add");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:todo",
+                    "error",
+                    &format!("checklist-add: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn todo_checklist_toggle(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let (task, item) = match (
+            req.q("task").filter(|t| !t.is_empty()),
+            req.q("item").filter(|i| !i.is_empty()),
+        ) {
+            (Some(t), Some(i)) => (t, i),
+            _ => return ApiResponse::error(400, "task and item are required"),
+        };
+        let checked = req.q("checked") == Some("1");
+        self.todo_result(
+            account,
+            &format!("checklist-toggle item={item} checked={checked}"),
+            h.checklist_toggle(account, list, task, item, checked),
+        )
+    }
+
+    fn todo_checklist_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let (task, item) = match (
+            req.q("task").filter(|t| !t.is_empty()),
+            req.q("item").filter(|i| !i.is_empty()),
+        ) {
+            (Some(t), Some(i)) => (t, i),
+            _ => return ApiResponse::error(400, "task and item are required"),
+        };
+        self.todo_result(
+            account,
+            &format!("checklist-delete item={item}"),
+            h.checklist_delete(account, list, task, item),
+        )
+    }
+
+    fn todo_list_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, name) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("name").filter(|n| !n.is_empty()),
+        ) {
+            (Some(a), Some(n)) => (a, n),
+            _ => return ApiResponse::error(400, "account and name are required"),
+        };
+        match h.list_create(account, name) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", "list-create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:todo",
+                    "error",
+                    &format!("list-create: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn todo_list_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.todo_result(
+            account,
+            &format!("list-delete id={id}"),
+            h.list_delete(account, id),
+        )
     }
 
     fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
@@ -3483,6 +3866,186 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(log[0], "create name=Ada other_city=London");
         assert_eq!(log[1], "update id=C1");
         assert_eq!(log[2], "delete id=C2");
+    }
+
+    #[test]
+    fn app_js_has_task_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__TASKWRITE_CAP_TOKEN__"));
+    }
+
+    #[derive(Default)]
+    struct RecTaskWrite(std::sync::Mutex<Vec<String>>);
+    impl TaskWriteHandler for RecTaskWrite {
+        fn create(&self, _a: &str, list: &str, task: &Value) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!(
+                "create list={list} title={}",
+                task.get("title").and_then(Value::as_str).unwrap_or("")
+            ));
+            Ok("task-new".into())
+        }
+        fn update(&self, _a: &str, list: &str, id: &str, _t: &Value) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("update list={list} id={id}"));
+            Ok(())
+        }
+        fn complete(&self, _a: &str, list: &str, id: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete list={list} id={id}"));
+            Ok(())
+        }
+        fn delete(&self, _a: &str, list: &str, id: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("delete list={list} id={id}"));
+            Ok(())
+        }
+        fn checklist_add(
+            &self,
+            _a: &str,
+            _l: &str,
+            task: &str,
+            title: &str,
+        ) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("cl_add task={task} title={title}"));
+            Ok("ci-new".into())
+        }
+        fn checklist_toggle(
+            &self,
+            _a: &str,
+            _l: &str,
+            task: &str,
+            item: &str,
+            checked: bool,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!(
+                "cl_toggle task={task} item={item} checked={checked}"
+            ));
+            Ok(())
+        }
+        fn checklist_delete(
+            &self,
+            _a: &str,
+            _l: &str,
+            task: &str,
+            item: &str,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("cl_del task={task} item={item}"));
+            Ok(())
+        }
+        fn list_create(&self, _a: &str, name: &str) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!("list_create {name}"));
+            Ok("L-new".into())
+        }
+        fn list_delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("list_delete {id}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn todo_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/todo/create",
+            "/api/v1/todo/complete",
+            "/api/v1/todo/checklist-add",
+            "/api/v1/todo/list-create",
+            "/api/v1/todo/list-delete",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecTaskWrite::default());
+        let router = router.with_task_write(rec.clone(), "tasksecret".into());
+        let create = "/api/v1/todo/create?account=a&list=L1&title=Ship&importance=high";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token, no title -> 400 (handler not called)
+        let bad = ApiRequest::new("POST", "/api/v1/todo/create?account=a&list=L1")
+            .with_cap_token(Some("tasksecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("tasksecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/update?account=a&list=L1&id=t1&status=inProgress"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/complete?account=a&list=L1&id=t1"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/checklist-add?account=a&list=L1&task=t1&title=step"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/checklist-toggle?account=a&list=L1&task=t1&item=ci1&checked=1"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/checklist-delete?account=a&list=L1&task=t1&item=ci1"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/list-create?account=a&name=Groceries"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/delete?account=a&list=L1&id=t1"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/list-delete?account=a&id=L1"))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        assert_eq!(log[0], "create list=L1 title=Ship");
+        assert_eq!(log[1], "update list=L1 id=t1");
+        assert_eq!(log[2], "complete list=L1 id=t1");
+        assert_eq!(log[3], "cl_add task=t1 title=step");
+        assert_eq!(log[4], "cl_toggle task=t1 item=ci1 checked=true");
+        assert_eq!(log[5], "cl_del task=t1 item=ci1");
+        assert_eq!(log[6], "list_create Groceries");
+        assert_eq!(log[7], "delete list=L1 id=t1");
+        assert_eq!(log[8], "list_delete L1");
     }
 
     struct OkVerify;

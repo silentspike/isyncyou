@@ -53,6 +53,7 @@ const ICONS = {
   play: "M5 3l14 9-14 9z", pause: "M6 4h4v16H6zM14 4h4v16h-4z",
   "refresh-cw": "M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16",
   x: "M18 6L6 18M6 6l12 12", "chevron-right": "M9 6l6 6-6 6", "chevron-left": "M15 6l-6 6 6 6",
+  plus: "M12 5v14M5 12h14",
   paperclip: "M21.4 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48",
   "external-link": "M15 3h6v6M10 14L21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
   clock: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20M12 6v6l4 2",
@@ -270,6 +271,7 @@ const CAP = {
   mailwrite: "__MAILWRITE_CAP_TOKEN__",
   calendarwrite: "__CALENDARWRITE_CAP_TOKEN__",
   contactwrite: "__CONTACTWRITE_CAP_TOKEN__",
+  todowrite: "__TASKWRITE_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
@@ -2415,7 +2417,12 @@ const Todo = { lists: [], tasks: [], stateFilter: "all" };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
   clear(view).append(el("div", { id: "todo-metrics-row", class: "con-metrics-row inset" }));
-  if (CAP.verify) view.append(el("div", { class: "view-actions" }, verifyButton(() => renderTodoView(view))));
+  const acts = el("div", { class: "view-actions" });
+  if (CAP.todowrite) acts.append(
+    el("button", { class: "btn sm primary", title: "Create a new task", onclick: () => openComposeTask() }, icon("check-square", "icon-sm"), "New task"),
+    el("button", { class: "btn sm", title: "Create a new list", onclick: () => newTodoList() }, icon("notebook", "icon-sm"), "New list"));
+  if (CAP.verify) acts.append(verifyButton(() => renderTodoView(view)));
+  if (acts.childElementCount) view.append(acts);
   const board = el("div", { id: "todo-board", class: "todo-board" });
   view.append(board);
   board.append(el("div", { class: "card", style: "min-width:280px" }, el("div", { class: "skel", style: "height:200px" })));
@@ -2500,22 +2507,48 @@ async function openTaskSheet(t) {
     add("Categories", (full.categories || []).join(", "), "tag");
     if (full.recurrence && full.recurrence.pattern) add("Repeats", (full.recurrence.pattern.type || "").replace(/^./, c => c.toUpperCase()), "refresh-cw");
     clear(content).append(kv);
+    // #567 B6: live write actions (edit / complete / delete), cap-gated
+    if (CAP.todowrite && t.parent_remote_id) {
+      const acts = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 8px" });
+      acts.append(el("button", { class: "btn ghost sm", onclick: () => { closeSheet(); openComposeTask(t); } }, icon("info", "icon-sm"), "Edit"));
+      if (full.status !== "completed") acts.append(el("button", { class: "btn ghost sm", onclick: () => completeTask(t) }, icon("check", "icon-sm"), "Complete"));
+      acts.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", onclick: () => deleteTask(t) }, icon("trash-2", "icon-sm"), "Delete"));
+      content.append(acts);
+    }
     const note = (full.body || {}).content || "";
     if (note.trim()) {
       const txt = (full.body.contentType === "html") ? new DOMParser().parseFromString(note, "text/html").body.textContent : note;
       content.append(el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: txt.trim().slice(0, 4000) }));
     }
-    // Checklist steps (from the _checklist_<id> sub-resource sidecar, #567 B2)
+    // Checklist steps (from the _checklist_<id> sub-resource sidecar, #567 B2);
+    // when CAP.todowrite, each step toggles/deletes live + an inline add (#567 B6).
     const cl = await api("/api/v1/body?" + qs({ account: App.account, service: "todo", id: "_checklist_" + t.remote_id })).catch(() => null);
     const steps = (cl && cl.value) || [];
-    if (steps.length) {
-      const doneN = steps.filter(s => s.isChecked).length;
+    const canWrite = CAP.todowrite && t.parent_remote_id;
+    if (steps.length || canWrite) {
+      const head = el("h3", { class: "sb-section" }, el("span", { text: "Checklist" }), el("span", { id: "todo-cl-count", class: "dim", style: "margin-left:6px;font-size:12px" }));
       const box = el("div", { class: "todo-checklist" });
-      steps.forEach(s => box.append(el("div", { class: "todo-step" + (s.isChecked ? " done" : "") },
-        icon(s.isChecked ? "check-square" : "circle", "icon-sm"),
-        el("span", { class: "truncate", text: s.displayName || "(step)" }))));
-      content.append(el("h3", { class: "sb-section" }, el("span", { text: "Checklist" }),
-        el("span", { class: "dim", style: "margin-left:6px;font-size:12px", text: `${doneN}/${steps.length}` })), box);
+      const updateCount = () => { const c = $("#todo-cl-count"); if (c) c.textContent = steps.length ? `${steps.filter(s => s.isChecked).length}/${steps.length}` : ""; };
+      const renderSteps = () => {
+        clear(box);
+        steps.forEach(s => {
+          const row = el("div", { class: "todo-step" + (s.isChecked ? " done" : "") });
+          if (canWrite && s.id) row.append(el("button", { class: "todo-step-btn", title: s.isChecked ? "Mark not done" : "Mark done", onclick: () => toggleStep(t, s, renderSteps, updateCount) }, icon(s.isChecked ? "check-square" : "circle", "icon-sm")));
+          else row.append(icon(s.isChecked ? "check-square" : "circle", "icon-sm"));
+          row.append(el("span", { class: "grow truncate", text: s.displayName || "(step)" }));
+          if (canWrite && s.id) row.append(el("button", { class: "todo-step-btn del", title: "Delete step", onclick: () => deleteStep(t, s, steps, renderSteps, updateCount) }, icon("x", "icon-sm")));
+          box.append(row);
+        });
+        updateCount();
+      };
+      renderSteps();
+      content.append(head, box);
+      if (canWrite) {
+        const inp = el("input", { class: "input", placeholder: "Add a step…" });
+        const submit = () => addStep(t, inp, steps, renderSteps, updateCount);
+        inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+        content.append(el("div", { class: "todo-cl-add" }, inp, el("button", { class: "btn sm", title: "Add step", onclick: submit }, icon("plus", "icon-sm"))));
+      }
     }
     // Linked resources (from the _linked_<id> sidecar)
     const lr = await api("/api/v1/body?" + qs({ account: App.account, service: "todo", id: "_linked_" + t.remote_id })).catch(() => null);
@@ -2546,6 +2579,107 @@ async function openTaskSheet(t) {
       }
     }
   } catch (e) { clear(content).append(el("p", { class: "dim", text: "Could not load task: " + e.message })); }
+}
+// #567 B6: live ToDo write — task create/edit, list create, complete/delete, checklist ops (cap-gated)
+async function openComposeTask(t) {
+  if (!CAP.todowrite) return;
+  const editing = !!t;
+  const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
+  const title = el("input", { class: "input", id: "ctask-title", placeholder: "Title", value: editing ? (t.name || "") : "" });
+  let listSel = null;
+  if (!editing) {
+    listSel = el("select", { class: "input", id: "ctask-list" });
+    Todo.lists.forEach(l => listSel.append(el("option", { value: l.remote_id, text: l.name || "List" })));
+  }
+  const imp = el("select", { class: "input", id: "ctask-imp" }, el("option", { value: "normal", text: "Normal" }), el("option", { value: "high", text: "High" }), el("option", { value: "low", text: "Low" }));
+  const start = el("input", { class: "input", type: "date", id: "ctask-start" });
+  const due = el("input", { class: "input", type: "date", id: "ctask-due" });
+  const reminder = el("input", { class: "input", type: "datetime-local", id: "ctask-rem" });
+  const cats = el("input", { class: "input", id: "ctask-cats", placeholder: "Comma-separated" });
+  const note = el("textarea", { class: "input cmp-textarea", id: "ctask-note", placeholder: "Notes", rows: "4" });
+  if (editing) {
+    try {
+      const full = await api("/api/v1/body?" + qs({ account: App.account, service: "todo", id: t.remote_id }));
+      imp.value = full.importance || "normal";
+      if (full.startDateTime) start.value = (full.startDateTime.dateTime || "").slice(0, 10);
+      if (full.dueDateTime) due.value = (full.dueDateTime.dateTime || "").slice(0, 10);
+      if (full.isReminderOn && full.reminderDateTime) reminder.value = (full.reminderDateTime.dateTime || "").slice(0, 16);
+      cats.value = (full.categories || []).join(", ");
+      note.value = (full.body || {}).content || "";
+    } catch { toast("Could not load task for editing", "err"); }
+  }
+  const content = el("div", { class: "compose" },
+    field("Title", title),
+    !editing ? field("List", listSel) : null,
+    field("Importance", imp), field("Start", start), field("Due", due), field("Reminder", reminder),
+    field("Categories", cats), field("Notes", note),
+    el("div", { class: "cmp-footer" }, el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: (e) => composeTaskSubmit(e.currentTarget, t) }, icon("check-square", "icon-sm"), editing ? "Save" : "Create")));
+  openSheet(editing ? "Edit task" : "New task", content);
+  setTimeout(() => title.focus(), 60);
+}
+async function composeTaskSubmit(btn, t) {
+  const v = (s) => ($("#" + s).value || "").trim();
+  const title = v("ctask-title");
+  if (!title) { toast("Add a title", "err"); return; }
+  const list = t ? t.parent_remote_id : ($("#ctask-list") && $("#ctask-list").value);
+  if (!list) { toast("No list available — create a list first", "err"); return; }
+  const params = { account: App.account, list, title, importance: v("ctask-imp"), categories: v("ctask-cats"), body: v("ctask-note") };
+  const start = v("ctask-start"); if (start) params.start = start + "T00:00:00";
+  const due = v("ctask-due"); if (due) params.due = due + "T00:00:00";
+  const rem = v("ctask-rem"); if (rem) params.reminder = new Date(rem).toISOString();
+  if (t) params.id = t.remote_id;
+  btn.disabled = true;
+  try {
+    await post((t ? "/api/v1/todo/update?" : "/api/v1/todo/create?") + qs(params), CAP.todowrite);
+    toast(t ? "Task updated" : "Task created"); closeSheet(); todoReload();
+  } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
+}
+async function newTodoList() {
+  const name = prompt("New list name:");
+  if (!name || !name.trim()) return;
+  try { await post("/api/v1/todo/list-create?" + qs({ account: App.account, name: name.trim() }), CAP.todowrite); toast("List created"); todoReload(); }
+  catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function completeTask(t) {
+  try { await post("/api/v1/todo/complete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task completed"); closeSheet(); todoReload(); }
+  catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function deleteTask(t) {
+  if (!confirm("Delete this task from your Microsoft 365 account?")) return;
+  try { await post("/api/v1/todo/delete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task deleted"); closeSheet(); todoReload(); }
+  catch (e) { toast("Failed: " + e.message, "err"); }
+}
+// checklist ops use optimistic UI (the daemon doesn't re-sync on a self-write)
+async function toggleStep(t, s, renderSteps, updateCount) {
+  try {
+    await post("/api/v1/todo/checklist-toggle?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id, checked: s.isChecked ? "0" : "1" }), CAP.todowrite);
+    s.isChecked = !s.isChecked; renderSteps(); updateCount();
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function deleteStep(t, s, steps, renderSteps, updateCount) {
+  try {
+    await post("/api/v1/todo/checklist-delete?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id }), CAP.todowrite);
+    const i = steps.indexOf(s); if (i >= 0) steps.splice(i, 1); renderSteps(); updateCount();
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function addStep(t, inp, steps, renderSteps, updateCount) {
+  const title = (inp.value || "").trim();
+  if (!title) return;
+  try {
+    const r = await post("/api/v1/todo/checklist-add?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, title }), CAP.todowrite);
+    steps.push({ id: r.id, displayName: title, isChecked: false }); inp.value = ""; renderSteps(); updateCount(); inp.focus();
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function todoReload() {
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "todo", limit: 1000 }));
+    const items = d.items || [];
+    Todo.lists = items.filter(it => it.item_type === "list");
+    Todo.tasks = items.filter(it => it.item_type === "task");
+    App.counts.todo = d.total ?? items.length; updateNavCounts();
+    todoRender();
+  } catch (e) { toast("Reload failed: " + e.message, "err"); }
 }
 
 /* ---------------------------------------------------------------- onenote (page list + reader) */

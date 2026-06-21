@@ -284,6 +284,10 @@ fn run(args: &Args) -> Result<(), String> {
     let contact_write_cap_token = mint_cap_token();
     let contact_write_handler: Arc<dyn isyncyou_webui::ContactWriteHandler> =
         Arc::new(DaemonContactWrite { cfg: cfg.clone() });
+    // A separate token gates the live-ToDo write POSTs (#567).
+    let task_write_cap_token = mint_cap_token();
+    let task_write_handler: Arc<dyn isyncyou_webui::TaskWriteHandler> =
+        Arc::new(DaemonTaskWrite { cfg: cfg.clone() });
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
@@ -302,6 +306,7 @@ fn run(args: &Args) -> Result<(), String> {
     .with_mail_write(mail_write_handler, mail_write_cap_token)
     .with_calendar_write(calendar_write_handler, calendar_write_cap_token)
     .with_contact_write(contact_write_handler, contact_write_cap_token)
+    .with_task_write(task_write_handler, task_write_cap_token)
     .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
@@ -573,6 +578,81 @@ impl isyncyou_webui::ContactWriteHandler for DaemonContactWrite {
     fn delete(&self, account: &str, contact_id: &str) -> Result<(), String> {
         let w = isyncyou_engine::contact_writer(&self.cfg, account)?;
         isyncyou_engine::ContactWriter::delete_contact(&w, contact_id)
+    }
+}
+
+/// Web-UI live-ToDo write (#567 B6): resolves the restore-scope write token and
+/// performs the task/checklist/list verbs. Fully qualified so the inherent
+/// GraphClient methods that share names aren't shadowed.
+struct DaemonTaskWrite {
+    cfg: Config,
+}
+impl isyncyou_webui::TaskWriteHandler for DaemonTaskWrite {
+    fn create(
+        &self,
+        account: &str,
+        list_id: &str,
+        task: &serde_json::Value,
+    ) -> Result<String, String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::create(&w, list_id, task)
+    }
+    fn update(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        task: &serde_json::Value,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::update(&w, list_id, task_id, task)
+    }
+    fn complete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::complete(&w, list_id, task_id)
+    }
+    fn delete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::delete(&w, list_id, task_id)
+    }
+    fn checklist_add(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        title: &str,
+    ) -> Result<String, String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::checklist_add(&w, list_id, task_id, title)
+    }
+    fn checklist_toggle(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+        checked: bool,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::checklist_toggle(&w, list_id, task_id, item_id, checked)
+    }
+    fn checklist_delete(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::checklist_delete(&w, list_id, task_id, item_id)
+    }
+    fn list_create(&self, account: &str, name: &str) -> Result<String, String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::list_create(&w, name)
+    }
+    fn list_delete(&self, account: &str, list_id: &str) -> Result<(), String> {
+        let w = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::list_delete(&w, list_id)
     }
 }
 

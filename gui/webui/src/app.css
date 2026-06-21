@@ -908,6 +908,12 @@ a:hover { text-decoration: underline; }
 .todo-step.done { color: var(--text-lo); }
 .todo-step.done .icon { color: var(--ok); }
 .todo-step.done span { text-decoration: line-through; }
+.todo-step-btn { border: 0; background: transparent; color: var(--text-lo); display: inline-flex; padding: 2px; cursor: pointer; border-radius: var(--r-sm); flex: none; }
+.todo-step-btn:hover { background: var(--bg-hover); color: var(--accent); }
+.todo-step-btn.del:hover { color: var(--err); }
+.todo-step.done .todo-step-btn:first-child { color: var(--ok); }
+.todo-cl-add { display: flex; gap: 6px; margin-top: 6px; }
+.todo-cl-add .input { flex: 1; }
 .todo-links, .todo-atts { display: flex; flex-direction: column; gap: 4px; }
 .todo-link, .todo-att { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm);
   color: var(--text-mid); text-decoration: none; padding: 4px 6px; border-radius: var(--r-sm); }
