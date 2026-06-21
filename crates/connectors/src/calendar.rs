@@ -8,14 +8,79 @@
 //! on a delta query (Graph rejects it); the canonical record is the raw JSON,
 //! `.ics` is only an export concern handled elsewhere.
 
-use crate::common::fetch_pages;
+use crate::archive::{ArchiveReport, JsonFetcher};
+use crate::common::{fetch_pages, shard_path};
 use crate::onedrive::SyncError;
 use isyncyou_graph::{run_delta, DeltaCursor, Transport};
 use isyncyou_store::{Item, Store};
 use serde_json::Value;
+use std::path::Path;
 
 const SERVICE: &str = "calendar";
 const CALENDARS_URL: &str = "https://graph.microsoft.com/v1.0/me/calendars?$top=100";
+
+/// Upsert a JSON-snapshot store item under `service="calendar"` and archive its
+/// canonical JSON to `calendar/<shard>/<id>.json` (atomic tmp+rename), recording
+/// the relative path as `local_path`. Shared by the calendar-flank snapshots
+/// (calendars / groups / permissions). Returns the byte count written.
+fn archive_json_item(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    id: &str,
+    name: &str,
+    item_type: &str,
+    value: &Value,
+) -> Result<u64, SyncError> {
+    let mut it = Item::new(account, SERVICE, id, name, item_type);
+    it.sync_state = "remote_dirty".into();
+    store.upsert_item(&it)?;
+
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+    store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// Back up the calendar **entity** flanks (#565 B1): one `item_type="calendar"`
+/// snapshot per calendar from `/me/calendars`, archiving the full calendar JSON
+/// (so the UI can colour-code events by each calendar's `hexColor`/`color`).
+/// Re-fetched each pass (small data). #565 B3 extends this with calendar groups,
+/// per-calendar permissions and event attachments.
+pub fn backup_calendar_flanks<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<ArchiveReport, SyncError> {
+    let mut report = ArchiveReport::default();
+
+    let cals = fetcher
+        .fetch_json("/me/calendars?$top=100")
+        .map_err(SyncError::Remote)?;
+    for cal in cals
+        .get("value")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = cal.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = cal.get("name").and_then(Value::as_str).unwrap_or(id);
+        report.bytes += archive_json_item(store, account, archive_root, id, name, "calendar", cal)?;
+        report.archived += 1;
+    }
+
+    Ok(report)
+}
 
 /// What one calendar sync changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -362,6 +427,35 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("D2")
+        );
+    }
+
+    struct MockJsonFetcher(Value);
+    impl JsonFetcher for MockJsonFetcher {
+        fn fetch_json(&self, _url: &str) -> std::result::Result<Value, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn backup_calendar_flanks_snapshots_calendars_with_colour() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let fetcher = MockJsonFetcher(json!({ "value": [
+            { "id": "C1", "name": "Calendar", "hexColor": "#FF0000", "color": "lightRed", "isDefaultCalendar": true },
+            { "id": "C2", "name": "Work", "hexColor": "#00AA00", "color": "lightGreen" },
+        ]}));
+        let r = backup_calendar_flanks(&fetcher, &store, "acc", arch.path()).unwrap();
+        assert_eq!(r.archived, 2);
+        let c1 = store.get_item("acc", SERVICE, "C1").unwrap().unwrap();
+        assert_eq!(c1.item_type, "calendar");
+        let rel = c1.local_path.expect("sidecar path recorded");
+        let bytes = std::fs::read(arch.path().join(&rel)).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v.get("hexColor").and_then(Value::as_str), Some("#FF0000"));
+        assert_eq!(
+            v.get("isDefaultCalendar").and_then(Value::as_bool),
+            Some(true)
         );
     }
 

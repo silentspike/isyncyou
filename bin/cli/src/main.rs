@@ -1854,9 +1854,23 @@ fn backup_one_account(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                // Calendar entity flanks (#565): per-calendar JSON snapshots
+                // (colour-coding) + groups/permissions. Best-effort.
+                let flanks = match connectors::backup_calendar_flanks(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                ) {
+                    Ok(f) => f.archived,
+                    Err(e) => {
+                        eprintln!("calendar flanks skipped: {e}");
+                        0
+                    }
+                };
                 format!(
-                    "calendar: {} calendars, {} indexed; {} json archived ({} bytes)",
-                    r.calendars, r.upserted, b.archived, b.bytes
+                    "calendar: {} calendars, {} indexed; {} json archived ({} bytes); {} flanks",
+                    r.calendars, r.upserted, b.archived, b.bytes, flanks
                 )
             }
             "contacts" => {
