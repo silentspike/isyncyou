@@ -1041,9 +1041,31 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
                 0
             }
         };
+    // Calendar (#565 B8): keep the per-service archive fresh too — list events via
+    // /me/events (cheap; recurring masters not expanded), download new bodies +
+    // refresh the calendar/group/permission flanks. All best-effort so a calendar
+    // hiccup never blocks the mail pass. Uses the read token (Calendars.Read).
+    let cal = match isyncyou_connectors::events_sync_calendar(&mut client, &store, account, &now) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("isyncyoud: calendar sync for {account} skipped: {e}");
+            Default::default()
+        }
+    };
+    let cbodies =
+        isyncyou_connectors::backup_calendar_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let cflanks =
+        isyncyou_connectors::backup_calendar_flanks(&client, &store, account, &archive_root)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let _ =
+        isyncyou_connectors::backup_event_attachments(&client, &store, account, &archive_root, 25);
     Ok(format!(
-        "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks",
-        r.folders, r.upserted, r.deleted, b.downloaded, flanks
+        "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
+         calendar: {} events, {} bodies, {} flanks",
+        r.folders, r.upserted, r.deleted, b.downloaded, flanks, cal.upserted, cbodies, cflanks
     ))
 }
 

@@ -638,10 +638,14 @@ impl GraphClient {
     /// single item's canonical JSON for the content archive.
     pub fn get_json(&self, url: &str) -> Result<serde_json::Value, UploadError> {
         let url = self.abs(url);
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
+        let mut req = self.client.get(&url).bearer_auth(&self.token);
+        // Honor the immutable-ID policy on JSON GETs too (#565): otherwise a
+        // calendar listed via the delta Transport (immutable ids) and the same
+        // calendar fetched here (default ids) would get two different store rows.
+        if self.prefer_immutable_id {
+            req = req.header("Prefer", PREFER_IMMUTABLE_ID);
+        }
+        let resp = req
             .send()
             .map_err(|e| UploadError::Transport(e.to_string()))?;
         json_or_err(resp)
