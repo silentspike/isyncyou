@@ -82,6 +82,9 @@ secrets.yaml
 # docs/**). Internal planning/session/scratch notes stay local.
 SHOWCASE.md
 /docs/case-study/
+# German-language internal field-coverage worktable (the committed public sibling
+# is the English docs/graph-capability-matrix.md).
+/docs/GRAPH-FIELD-COVERAGE.md
 *.local.md
 *-internal.md
 *.internal.md
