@@ -1830,10 +1830,17 @@ async function openEventSheet(ev) {
       tail.push(row);
     }
     if (full.webLink) tail.push(el("a", { class: "btn ghost sm", style: "margin-top:12px", href: full.webLink, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open in Outlook"));
+    // Show the FULL event inline (sanitised, sandboxed iframe — like the mail
+    // reader) instead of a truncated plain-text note behind an "Open full event"
+    // button. Sized to its own content with an outer scroll.
     const notes = [];
     if (html) {
-      const txt = new DOMParser().parseFromString(html, "text/html").body.textContent.trim();
-      if (txt) notes.push(el("h3", { class: "sb-section", text: "Notes" }), el("p", { class: "muted", style: "white-space:pre-wrap", text: txt.slice(0, 4000) }));
+      const scroll = el("div", { class: "note-frame-scroll", style: "margin-top:12px;max-height:55vh" });
+      const frame = el("iframe", { class: "note-frame", src: `/api/v1/view?${qs(q)}`, title: "Event", sandbox: "allow-same-origin" });
+      const fit = () => { try { const d = frame.contentDocument; if (!d || !d.body) return; const hh = Math.max(d.documentElement.scrollHeight, d.body.scrollHeight) + 4; if (Math.abs((parseInt(frame.style.height, 10) || 0) - hh) > 2) frame.style.height = hh + "px"; } catch { /* x-origin */ } };
+      frame.addEventListener("load", () => { fit(); [120, 400, 1000].forEach(t => setTimeout(fit, t)); });
+      scroll.append(frame);
+      notes.push(el("h3", { class: "sb-section", text: "Event" }), scroll);
     }
     clear(content).append(kv, ...notes, ...tail);
   } catch { clear(content).append(kv); }
@@ -1845,7 +1852,6 @@ async function openEventSheet(ev) {
     acts.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", onclick: () => deleteEvent(ev) }, icon("trash-2", "icon-sm"), "Delete"));
     content.append(acts);
   }
-  content.append(el("a", { class: "btn ghost sm", style: "margin-top:16px", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open full event"));
 }
 let sheetEl = null;
 function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
