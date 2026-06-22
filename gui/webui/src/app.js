@@ -2829,12 +2829,37 @@ function renderNoteReader(it) {
   if (p.web_url && /^https?:\/\//i.test(p.web_url)) meta.append(el("a", { class: "note-meta-chip", href: p.web_url, target: "_blank", rel: "noopener noreferrer" }, icon("external-link", "icon-sm"), el("span", { text: "Open in OneNote" })));
   // has_body=false (live_only) pages have no archived content — show a native dark
   // card instead of pointing the iframe at /view (which would 404 with raw JSON).
-  const bodyEl = it.has_body
-    ? el("iframe", { class: "note-frame", src: `/api/v1/view?${qs(q)}`, title: "Note", loading: "lazy", sandbox: "allow-same-origin" })
-    : el("div", { class: "empty note-empty", style: "margin:auto;text-align:center;padding:48px" },
-        icon("cloud", "icon-lg"),
-        el("h3", { text: "Not backed up yet" }),
-        el("p", { class: "dim", text: "This page is in the cloud but its content isn't archived yet. Run a backup to read it here." }));
+  let bodyEl;
+  if (it.has_body) {
+    // Same pattern as the mail reader: size the iframe to its OWN content and let
+    // the OUTER pane scroll, so the whole page scrolls naturally (an internally-
+    // scrolling iframe in a flex column "can't scroll to the end", esp. on touch).
+    const scroll = el("div", { class: "note-frame-scroll" });
+    const frame = el("iframe", { class: "note-frame", src: `/api/v1/view?${qs(q)}`, title: "Note", loading: "lazy", sandbox: "allow-same-origin" });
+    const fit = () => {
+      try {
+        const d = frame.contentDocument; if (!d || !d.body) return;
+        const h = Math.max(d.documentElement.scrollHeight, d.body.scrollHeight) + 4;
+        if (Math.abs((parseInt(frame.style.height, 10) || 0) - h) > 2) frame.style.height = h + "px";
+      } catch { /* cross-origin */ }
+    };
+    frame.addEventListener("load", () => {
+      fit();
+      try {
+        const d = frame.contentDocument;
+        if (d && window.ResizeObserver) { const ro = new ResizeObserver(fit); ro.observe(d.documentElement); if (d.body) ro.observe(d.body); }
+        if (d) d.querySelectorAll("img").forEach(img => { if (!img.complete) { img.addEventListener("load", fit, { once: true }); img.addEventListener("error", fit, { once: true }); } });
+      } catch { /* cross-origin */ }
+      [120, 400, 1000, 2500].forEach(t => setTimeout(fit, t));
+    });
+    scroll.append(frame);
+    bodyEl = scroll;
+  } else {
+    bodyEl = el("div", { class: "empty note-empty", style: "margin:auto;text-align:center;padding:48px" },
+      icon("cloud", "icon-lg"),
+      el("h3", { text: "Not backed up yet" }),
+      el("p", { class: "dim", text: "This page is in the cloud but its content isn't archived yet. Run a backup to read it here." }));
+  }
   box.append(
     el("header", { class: "note-reader-head" }, el("h2", { class: "grow truncate", text: it.name || "(untitled)" }), actions),
     meta,

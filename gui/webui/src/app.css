@@ -938,7 +938,8 @@ a.todo-link:hover, a.todo-att:hover { background: var(--bg-hover); color: var(--
 .note-reader-head { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-5); flex: none;
   border-bottom: 1px solid var(--line); background: color-mix(in oklab, var(--bg-1) 70%, transparent); }
 .note-reader-actions { display: flex; align-items: center; gap: 6px; flex: none; }
-.note-frame { flex: 1; width: 100%; border: 0; background: var(--bg-0); }
+.note-frame-scroll { flex: 1; min-height: 0; overflow-y: auto; background: var(--bg-0); }
+.note-frame { display: block; width: 100%; border: 0; background: var(--bg-0); min-height: 240px; }
 /* #568: notebook→section→page tree (left pane) */
 .note-tree { border-right: 1px solid var(--line); overflow-y: auto; background: color-mix(in oklab, var(--bg-1) 70%, transparent); display: flex; flex-direction: column; }
 .note-tree-body { display: flex; flex-direction: column; padding: 4px 0; }
