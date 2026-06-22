@@ -772,6 +772,67 @@ impl GraphClient {
         }
     }
 
+    /// Create a OneNote page **in a specific section** (`POST /me/onenote/sections/
+    /// {section}/pages`, `text/html`) — the live-write / restore-to-original-section
+    /// path (#568). Returns the created page JSON. OneNote ids are URL-path-safe and
+    /// used raw, like `delete_onenote_page`.
+    pub fn create_onenote_page_in_section(
+        &self,
+        section_id: &str,
+        html: &[u8],
+    ) -> Result<serde_json::Value, UploadError> {
+        self.post_raw(
+            &format!("/me/onenote/sections/{section_id}/pages"),
+            "text/html",
+            html.to_vec(),
+        )
+    }
+
+    /// Create a OneNote page in a specific section from an HTML part plus binary
+    /// resource parts (multipart; #568).
+    pub fn create_onenote_page_in_section_multipart(
+        &self,
+        section_id: &str,
+        html: &[u8],
+        parts: &[OneNotePagePart],
+    ) -> Result<serde_json::Value, UploadError> {
+        let (content_type, body) = onenote_multipart_body(html, parts)?;
+        self.post_raw(
+            &format!("/me/onenote/sections/{section_id}/pages"),
+            &content_type,
+            body,
+        )
+    }
+
+    /// Append/replace content on an existing OneNote page (`PATCH /me/onenote/pages/
+    /// {id}/content`, #568). `commands` is the Graph OneNote update-command array
+    /// (`[{ "target", "action", "content" }]`); Graph returns 204 on success.
+    /// OneNote's content write is command-based (no full rewrite) — best-effort.
+    pub fn append_onenote_page_content(
+        &self,
+        page_id: &str,
+        commands: &serde_json::Value,
+    ) -> Result<(), UploadError> {
+        let url = format!("{}/me/onenote/pages/{page_id}/content", self.base);
+        let body =
+            serde_json::to_vec(commands).map_err(|e| UploadError::Transport(e.to_string()))?;
+        let resp = self
+            .client
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 202 | 204 => Ok(()),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(200).collect(),
+            }),
+        }
+    }
+
     /// DELETE an arbitrary Graph resource (used for restore-test cleanup on the
     /// throwaway account). `url` may be absolute or a `/me/...` path.
     pub fn delete_url(&self, url: &str) -> Result<(), UploadError> {
@@ -2076,6 +2137,29 @@ mod tests {
         let seen = server.join().unwrap();
         assert!(seen[0].contains("content-type: multipart/form-data; boundary=isyncyou-"));
         assert!(seen[1].starts_with("DELETE /me/onenote/pages/page1"));
+    }
+
+    #[test]
+    fn onenote_section_create_and_content_append_hit_the_right_urls() {
+        let (base, server) = serve(vec![
+            http_response(201, "Created", "", "{\"id\":\"p1\"}"),
+            http_response(204, "No Content", "", ""),
+        ]);
+        let c = GraphClient::new("tok").with_base_url(&base);
+        let out = c
+            .create_onenote_page_in_section("S1", b"<html><body>hi</body></html>")
+            .unwrap();
+        assert_eq!(out["id"].as_str(), Some("p1"));
+        c.append_onenote_page_content(
+            "p1",
+            &serde_json::json!([{ "target": "body", "action": "append", "content": "<p>x</p>" }]),
+        )
+        .unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/onenote/sections/S1/pages"));
+        assert!(seen[0].contains("content-type: text/html"));
+        assert!(seen[1].starts_with("PATCH /me/onenote/pages/p1/content"));
+        assert!(seen[1].contains("content-type: application/json"));
     }
 
     #[test]
