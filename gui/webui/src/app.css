@@ -991,11 +991,13 @@ a.note-meta-chip:hover { color: var(--accent); }
   /* bottom bar shows only the primary service icons — hide the brand/account/
      footer, the filter sub-nav, and the system nav (Settings is in the top-bar) */
   .sidebar .brand, .sb-account, .sb-section, .spacer, .sync-widget,
-  .sidebar .nav-sub, .sidebar .sys-nav { display: none !important; }
-  /* :not(.sys-nav) so this can't re-show the system nav (which is also a .nav);
-     flex:1 items give every icon an EQUAL slot → equal spacing, no overflow. */
-  .sidebar .nav:not(.sys-nav) { display: flex; flex-direction: row; gap: 0; flex: 1; justify-content: space-between; }
-  .sidebar .nav:not(.sys-nav) .nav-item { flex: 1 1 0; min-width: 0; }
+  .sidebar .nav-sub { display: none !important; }
+  /* flatten BOTH navs into the bottom bar (display:contents) so every visible item
+     is an equal flex slot of .sidebar → equal spacing. Show the 7 services +
+     Settings; drop Audit/Alerts (Audit log == Overview anyway). */
+  .sidebar .nav, .sidebar .sys-nav { display: contents; }
+  .sidebar .nav-item { flex: 1 1 0; min-width: 0; }
+  #nav-audit, #nav-alerts { display: none !important; }
   .sidebar::before { display: none; }
   .nav-item { flex-direction: column; gap: 2px; padding: var(--sp-1) 2px; font-size: var(--fs-xs); }
   /* labels never wrap (e.g. "To Do") — one line, ellipsis if too long */
@@ -1005,7 +1007,10 @@ a.note-meta-chip:hover { color: var(--accent); }
   .nav-item.active::before { display: none; }
   .view { padding: var(--sp-4); padding-bottom: 76px; }
   .view-title { font-size: var(--fs-xl); }
-  .topbar { padding: 0 var(--sp-4); }
+  /* the topbar (route name + global-search + settings) duplicates the per-view
+     content + bottom nav on a phone — hide it. Settings is reachable from the
+     Overview tab's Settings button; each view has its own search. */
+  .topbar { display: none; }
   .search-trigger { min-width: 0; }
   .search-trigger .label-text, .search-trigger .kbd { display: none; }
   .sheet { width: 100vw; }
