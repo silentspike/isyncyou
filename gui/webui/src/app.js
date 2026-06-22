@@ -151,15 +151,6 @@ function flowWave(w = 540, h = 300) {
   }
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" fill="#7c8cf8">${dots.join("")}</svg>`;
 }
-// line-art vault door — decorative corner motif for the archive card (matches mockup)
-const VAULT_LINE = '<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="12" y="14" width="104" height="100" rx="12"/><rect x="22" y="24" width="84" height="80" rx="7" opacity="0.5"/><circle cx="64" cy="64" r="30"/><circle cx="64" cy="64" r="19" opacity="0.6"/><circle cx="64" cy="64" r="4.5" fill="currentColor"/><path d="M64 34v-8M64 102v-8M34 64h-8M102 64h-8M44 44l-6-6M84 44l6-6M44 84l-6 6M84 84l6 6" opacity="0.8"/></svg>';
-// line-art shield + keyhole — open-space motif under short lists
-const SHIELD_LINE = '<svg viewBox="0 0 120 132" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M60 10l42 16v30c0 30-19 52-42 60-23-8-42-30-42-60V26z"/><path d="M60 22l30 11v25c0 22-13 38-30 45-17-7-30-23-30-45V33z" opacity="0.45"/><circle cx="60" cy="62" r="9"/><path d="M60 71v14"/></svg>';
-// heartbeat / EKG polyline (a calm baseline with one pulse) — for health signals
-function ekgLine(w = 132, h = 34) {
-  const m = h / 2, p = [[0, m], [w * .2, m], [w * .28, m], [w * .34, h * .26], [w * .4, h * .82], [w * .46, m], [w * .54, m], [w * .62, h * .16], [w * .68, h * .9], [w * .74, m], [w * .82, m], [w, m]];
-  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="${p.map(([x, y]) => `${x.toFixed(0)},${y.toFixed(0)}`).join(" ")}"/></svg>`;
-}
 
 /* ---------------------------------------------------------------- charts (pure SVG, no lib) */
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -167,50 +158,6 @@ function svg(tag, attrs) {
   const n = document.createElementNS(SVGNS, tag);
   for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v);
   return n;
-}
-const reduceMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-// animate a number node 0 -> target (easeOutCubic)
-function countUp(node, target, dur = 900) {
-  const n = Number(target);
-  if (!isFinite(n) || reduceMotion()) { node.textContent = String(target); return; }
-  const start = performance.now();
-  (function tick(t) {
-    const p = Math.min(1, (t - start) / dur), e = 1 - Math.pow(1 - p, 3);
-    node.textContent = String(Math.round(n * e));
-    if (p < 1) requestAnimationFrame(tick);
-  })(performance.now());
-}
-// donut ring from segments [{value, color}] with a center total
-function donutChart(segments, centerSub) {
-  const total = segments.reduce((s, x) => s + x.value, 0) || 1;
-  const R = 54, C = 2 * Math.PI * R, W = 16;
-  const s = svg("svg", { viewBox: "0 0 140 140", class: "chart", style: "max-width:180px" });
-  s.append(svg("circle", { cx: 70, cy: 70, r: R, fill: "none", stroke: "var(--bg-3)", "stroke-width": W }));
-  let off = 0;
-  segments.filter(x => x.value > 0).forEach(seg => {
-    const len = (seg.value / total) * C;
-    s.append(svg("circle", {
-      cx: 70, cy: 70, r: R, fill: "none", stroke: seg.color, "stroke-width": W,
-      "stroke-dasharray": `${len.toFixed(2)} ${(C - len).toFixed(2)}`,
-      "stroke-dashoffset": (-off).toFixed(2), transform: "rotate(-90 70 70)", class: "donut-seg",
-    }));
-    off += len;
-  });
-  return el("div", { style: "position:relative;display:grid;place-items:center" }, s,
-    el("div", { style: "position:absolute;text-align:center;pointer-events:none" },
-      el("div", { class: "num tnum", style: "font-size:24px", text: String(total) }),
-      el("div", { class: "dim", style: "font-size:11px", text: centerSub || "" })));
-}
-// horizontal bars from rows [{label, value, color}]
-function barChart(rows) {
-  const max = Math.max(1, ...rows.map(r => r.value));
-  const box = el("div", { style: "display:flex;flex-direction:column;gap:10px" });
-  rows.forEach(r => box.append(el("div", { style: "display:flex;align-items:center;gap:10px" },
-    el("span", { class: "dim", style: "width:84px;font-size:12px;text-transform:capitalize;text-align:right" }, r.label),
-    el("div", { style: "flex:1;height:10px;background:var(--bg-3);border-radius:999px;overflow:hidden" },
-      el("div", { class: "bar-fill", style: `height:100%;width:${Math.round((r.value / max) * 100)}%;background:${r.color}` })),
-    el("span", { class: "tnum", style: "width:42px;text-align:right;font-size:12px" }, String(r.value)))));
-  return box;
 }
 // sparkline (area + line) from numeric points
 function sparkline(points, h = 60) {
@@ -1056,60 +1003,6 @@ async function composeSubmit(btn, asDraft) {
   } finally {
     btn.disabled = false;
   }
-}
-
-// Reply / reply-all / forward (#563). Graph quotes the original server-side, so
-// the sheet only needs the user's comment (+ recipients for forward); the
-// original is shown read-only via textContent (never innerHTML on cloud HTML).
-function openReplyForward(it, mode) {
-  if (!CAP.mailwrite) return;
-  const p = it.preview || {};
-  const title = mode === "forward" ? "Forward" : mode === "replyAll" ? "Reply all" : "Reply";
-  const subjPrefix = mode === "forward" ? "Fwd: " : "Re: ";
-  const toIn = mode === "forward"
-    ? el("input", { class: "input", id: "rf-to", placeholder: "Forward to (comma-separated)" })
-    : null;
-  const commentEl = el("textarea", { class: "cmp-textarea", id: "rf-comment", placeholder: "Add a message…", rows: "6" });
-  const head = mode === "forward"
-    ? el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: "To" }), toIn)
-    : el("div", { class: "cmp-replyto dim" }, `To: ${addrLabel(p.from) || "sender"}${mode === "replyAll" ? " + all recipients" : ""}`);
-  const quote = el("div", { class: "cmp-quote" },
-    el("div", { class: "cmp-quote-h dim", text: `On ${fmtDate(p.date || it.remote_mtime)}, ${addrLabel(p.from) || "unknown"} wrote:` }),
-    el("div", { class: "cmp-quote-b dim", text: p.snippet || p.subject || it.name || "" }));
-  const content = el("div", { class: "compose" },
-    head,
-    el("div", { class: "cmp-subject-ro dim", text: subjPrefix + (p.subject || it.name || "(no subject)") }),
-    commentEl,
-    quote,
-    el("div", { class: "cmp-footer" },
-      el("div", { class: "spacer", style: "flex:1" }),
-      el("button", { class: "btn primary", type: "button", onclick: (e) => replyForwardSubmit(e.currentTarget, it, mode) },
-        icon(mode === "forward" ? "corner-up-right" : "corner-up-left", "icon-sm"), title)));
-  openSheet(title, content);
-  setTimeout(() => (toIn || commentEl).focus(), 60);
-}
-
-async function replyForwardSubmit(btn, it, mode) {
-  const comment = $("#rf-comment").value || "";
-  if (mode === "forward") {
-    const to = ($("#rf-to").value || "").trim();
-    if (!to) { toast("Add a recipient", "err"); return; }
-    btn.disabled = true;
-    try {
-      await post("/api/v1/mail/forward?" + qs({ account: App.account, id: it.remote_id, to, comment }), CAP.mailwrite);
-      toast("Forwarded");
-      closeSheet();
-      if (App.route === "mail") renderMailView($("#view"));
-    } catch (e) { toast("Forward failed: " + e.message, "err"); } finally { btn.disabled = false; }
-    return;
-  }
-  btn.disabled = true;
-  try {
-    await post("/api/v1/mail/reply?" + qs({ account: App.account, id: it.remote_id, comment, all: mode === "replyAll" ? "1" : "0" }), CAP.mailwrite);
-    toast(mode === "replyAll" ? "Replied to all" : "Replied");
-    closeSheet();
-    if (App.route === "mail") renderMailView($("#view"));
-  } catch (e) { toast("Reply failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 
 // Inline rich reply/forward (#67, live.com-style): the composer takes over the

@@ -2176,7 +2176,10 @@ impl Router {
         };
         match handler.drive_quota(account) {
             Ok(q) => ApiResponse::ok_json(&json!({ "quota": q })),
-            Err(e) => ApiResponse::error(502, &e),
+            // No write token / not connected is an EXPECTED state (e.g. before
+            // login) — return 200 with `available:false` so the UI shows a quiet
+            // "not connected" state instead of a console error from a 5xx fetch.
+            Err(e) => ApiResponse::ok_json(&json!({ "available": false, "reason": e })),
         }
     }
 
