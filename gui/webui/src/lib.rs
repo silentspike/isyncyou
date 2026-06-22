@@ -4767,6 +4767,67 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
     }
 
+    #[test]
+    fn cap_ok_accepts_only_the_exact_token() {
+        // Regression freeze for AUDIT-2 (#73): the capability gate accepts only an
+        // exact, same-length token and rejects everything else. cap_ok compares in
+        // constant time (length check, then XOR-accumulate over all bytes).
+        let expected = Some("s3cr3t-capability-token-0001".to_string());
+        let pass =
+            ApiRequest::get("/x").with_cap_token(Some("s3cr3t-capability-token-0001".into()));
+        assert!(Router::cap_ok(&expected, &pass), "exact token must pass");
+
+        let wrong =
+            ApiRequest::get("/x").with_cap_token(Some("s3cr3t-capability-token-000X".into()));
+        assert!(!Router::cap_ok(&expected, &wrong), "wrong token must fail");
+
+        let short = ApiRequest::get("/x").with_cap_token(Some("s3cr3t".into()));
+        assert!(
+            !Router::cap_ok(&expected, &short),
+            "wrong-length token must fail"
+        );
+
+        let missing = ApiRequest::get("/x"); // no X-Capability-Token header
+        assert!(
+            !Router::cap_ok(&expected, &missing),
+            "missing request token must fail"
+        );
+
+        assert!(
+            !Router::cap_ok(&None, &pass),
+            "an unconfigured gate must reject everything"
+        );
+    }
+
+    #[test]
+    fn static_assets_carry_correct_type_and_no_store() {
+        // Regression freeze: the embedded shell assets keep their exact content-type
+        // and Cache-Control: no-store, so a stale/poisoned copy can never persist
+        // across a binary upgrade (the APK asset-cache bug, #79). Together with
+        // app_shell_carries_strict_csp_header (`/`) and
+        // view_renders_safe_html_with_csp_and_escapes_untrusted_values (`/api/v1/view`)
+        // this freezes the per-layer header posture (W0.1 AC2).
+        let r = Router::new(Config::default());
+        for (path, ctype) in [
+            ("/app.js", "application/javascript"),
+            ("/app.css", "text/css"),
+        ] {
+            let resp = r.route(&ApiRequest::get(path));
+            assert_eq!(resp.status, 200, "{path} must serve 200");
+            assert!(
+                resp.content_type.starts_with(ctype),
+                "{path} wrong content-type: {}",
+                resp.content_type
+            );
+            assert!(
+                resp.headers
+                    .iter()
+                    .any(|(k, v)| k == "Cache-Control" && v.contains("no-store")),
+                "{path} must be Cache-Control: no-store"
+            );
+        }
+    }
+
     struct MockSync {
         paused: std::sync::atomic::AtomicBool,
         triggered: std::sync::atomic::AtomicBool,

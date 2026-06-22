@@ -48,6 +48,16 @@ struct Args {
     token_refresh_secs: u64,
 }
 
+/// The startup line that announces the capability gate. SECURITY (AUDIT-1, #72):
+/// it reports only that protection is enabled and the token's length — NEVER the
+/// token value, which gates every destructive write. Kept as a pure function so a
+/// regression test can pin the format.
+fn cap_status_line(token_len: usize) -> String {
+    format!(
+        "isyncyoud: restore + sharing + verify enabled; capability token: set ({token_len} bytes)"
+    )
+}
+
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(&args) {
@@ -296,11 +306,8 @@ fn run(args: &Args) -> Result<(), String> {
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
     // SECURITY: never log the capability token itself — it gates every destructive
-    // write. Log only that protection is enabled.
-    eprintln!(
-        "isyncyoud: restore + sharing + verify enabled; capability token: set ({} bytes)",
-        cap_token.len()
-    );
+    // write. Log only that protection is enabled (format pinned by cap_status_line).
+    eprintln!("{}", cap_status_line(cap_token.len()));
 
     let mut router = if args.sync_secs > 0 {
         isyncyou_webui::Router::with_gate(cfg.clone(), gate.clone())
@@ -1798,6 +1805,26 @@ impl isyncyou_dbus_status::StatusProvider for DaemonStatusProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_status_line_never_contains_the_token() {
+        // AUDIT-1 (#72) regression freeze: the startup line announces only that the
+        // capability gate is enabled + the token length, never the token itself.
+        let token = "TOPSECRET-do-not-ever-log-this-cap-token";
+        let line = cap_status_line(token.len());
+        assert!(
+            !line.contains(token),
+            "startup line leaked the token: {line}"
+        );
+        assert!(
+            !line.contains("TOPSECRET"),
+            "startup line leaked token bytes: {line}"
+        );
+        assert!(
+            line.contains(&format!("{} bytes", token.len())),
+            "should report the length: {line}"
+        );
+    }
 
     #[test]
     fn parses_defaults() {
