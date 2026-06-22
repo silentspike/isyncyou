@@ -138,6 +138,12 @@ function paintBackdrop() {
   if (host.dataset.w == w && host.dataset.h == h) return;        // size unchanged → keep
   host.dataset.w = w; host.dataset.h = h; host.innerHTML = netBackdrop(w, h);
 }
+// the signature geometric constellation, as a backdrop element for a detail sheet
+// (so sheets carry the same background graphics as the main views, not just a glow)
+function sheetNet() {
+  const w = Math.max(window.innerWidth, 320), h = Math.max(window.innerHeight, 760);
+  return el("div", { class: "sheet-net", html: netBackdrop(w, h) });
+}
 // flowing particle stream — a wave of dots, brightest mid-span, fading at the ends
 function flowWave(w = 540, h = 300) {
   const dots = [], rows = 6, n = 74;
@@ -1189,7 +1195,6 @@ function renderMailReader(it, remoteImages = false) {
     ? el("button", { class: "btn ghost sm", title: "Block external content again (privacy)", onclick: () => renderMailReader(it, false) }, icon("shield", "icon-sm"), "Hide external content")
     : el("button", { class: "btn ghost sm", title: "Load external content — images & web fonts (may notify the sender you opened it)", onclick: () => renderMailReader(it, true) }, icon("globe", "icon-sm"), "Load external content"));
   actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open the archived copy in a new tab" }, icon("external-link", "icon-sm")));
-  if (p.webLink) actions.append(el("a", { class: "btn ghost sm", href: p.webLink, target: "_blank", rel: "noopener", title: "Open the live message in Outlook on the web" }, icon("globe", "icon-sm"), "Outlook"));
   if (CAP.mailwrite) {
     const read = (it.preview || {}).isRead !== false;
     const flagged = (it.preview || {}).flag === "flagged";
@@ -1790,6 +1795,7 @@ async function openEventSheet(ev) {
     el("header", {}, el("h2", { class: "grow truncate", text: ev.subject }),
       el("button", { class: "btn ghost sm icon-only", onclick: closeSheet }, icon("x", "icon-sm"))),
     content);
+  sheet.prepend(sheetNet());
   sheetEl = el("div", {}, scrim, sheet); document.body.append(sheetEl);
   // structured detail rendered via textContent only (never innerHTML on cloud data)
   const kv = el("dl", { class: "kv" });
@@ -1829,7 +1835,6 @@ async function openEventSheet(ev) {
       cats.forEach(c => row.append(el("span", { class: "chip", text: c })));
       tail.push(row);
     }
-    if (full.webLink) tail.push(el("a", { class: "btn ghost sm", style: "margin-top:12px", href: full.webLink, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open in Outlook"));
     // Full event description rendered inline in the APP's own design (dark card,
     // app typography) — not the white archive-styled /view, and no extra button.
     // Cloud HTML → plain text via DOMParser (no innerHTML on cloud data).
@@ -2929,6 +2934,7 @@ function openSheet(title, contentEl, leading) {
     el("header", {}, leading || null, el("h2", { class: "grow truncate", text: title }),
       el("button", { class: "btn ghost sm icon-only", onclick: closeSheet }, icon("x", "icon-sm"))),
     contentEl);
+  sheet.prepend(sheetNet());
   sheetEl = el("div", {}, scrim, sheet); document.body.append(sheetEl);
 }
 
