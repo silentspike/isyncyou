@@ -57,7 +57,8 @@ fn audio_response(bytes: &[u8]) -> ApiResponse {
         status: 200,
         content_type: "audio/mpeg".into(),
         body: bytes.to_vec(),
-        headers: vec![("Cache-Control".into(), "max-age=31536000".into())],
+        // no-store so a regenerated SFX always takes effect (no stale WebView cache)
+        headers: vec![("Cache-Control".into(), "no-store".into())],
     }
 }
 

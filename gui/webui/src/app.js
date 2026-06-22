@@ -680,7 +680,7 @@ function invadersGame(canvas) {
       if (edge) dir *= -1;
       if (low >= H - 16 && n > 0) state = "over";                    // invasion reached the bottom
       foes.forEach(f => { if (f.alive && Math.abs(f.x - player.x) < f.w / 2 + 10 && Math.abs(f.y - player.y) < f.h / 2 + 8) hurt(now); });   // contact damage (HP/armor + i-frames)
-      bullets.forEach(b => { if (b.dead) return; for (const f of foes) { if (f.alive && Math.abs(b.x - f.x) < f.w / 2 && Math.abs(b.y - f.y) < f.h / 2) { f.hp--; boom(f.x, f.y); if (f.hp <= 0) { f.alive = false; score += 10; SFX.play("boom", 0.5); if (Math.random() < 0.17) { pups.push({ x: f.x, y: f.y, t: POW[(Math.random() * POW.length) | 0].k }); SFX.play("drop", 0.4); } } else score += 2; if (b.pierce > 0) b.pierce--; else b.dead = true; break; } } });   // pierce passes through
+      bullets.forEach(b => { if (b.dead) return; for (const f of foes) { if (f.alive && Math.abs(b.x - f.x) < f.w / 2 && Math.abs(b.y - f.y) < f.h / 2) { f.hp--; boom(f.x, f.y); if (f.hp <= 0) { f.alive = false; score += 10; SFX.play("boom", 0.5); if (pups.length < 3 && Math.random() < 0.06) { pups.push({ x: f.x, y: f.y, t: POW[(Math.random() * POW.length) | 0].k }); SFX.play("drop", 0.4); } } else score += 2; if (b.pierce > 0) b.pierce--; else b.dead = true; break; } } });   // pierce passes through
       bullets = bullets.filter(b => !b.dead && b.y > -16 && b.x > -12 && b.x < W + 12);
       pups.forEach(p => { p.y += 1.9; if (Math.abs(p.x - player.x) < 20 && Math.abs(p.y - player.y) < 20) { p.got = true; const d = POW.find(d => d.k === p.t); if (d) d.apply(); SFX.play("pickup", 0.5); } });
       pups = pups.filter(p => !p.got && p.y < H + 14);
