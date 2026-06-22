@@ -936,7 +936,24 @@ a.todo-link:hover, a.todo-att:hover { background: var(--bg-hover); color: var(--
 .note-reader { display: flex; flex-direction: column; overflow: hidden; background: var(--bg-0); }
 .note-reader-head { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-5); flex: none;
   border-bottom: 1px solid var(--line); background: color-mix(in oklab, var(--bg-1) 70%, transparent); }
+.note-reader-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 .note-frame { flex: 1; width: 100%; border: 0; background: var(--bg-0); }
+/* #568: notebook→section→page tree (left pane) */
+.note-tree { border-right: 1px solid var(--line); overflow-y: auto; background: color-mix(in oklab, var(--bg-1) 70%, transparent); display: flex; flex-direction: column; }
+.note-tree-body { display: flex; flex-direction: column; padding: 4px 0; }
+.note-node-head, .note-leaf { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; border: 0;
+  background: transparent; color: var(--text-hi); padding: 5px var(--sp-3); cursor: pointer; border-left: 3px solid transparent; font-size: var(--fs-sm); }
+.note-node-head:hover, .note-leaf:hover { background: var(--bg-hover); }
+.note-leaf.active { background: var(--accent-soft); border-left-color: var(--svc-onenote); }
+.note-node-head .icon, .note-leaf .icon { flex: none; color: var(--svc-onenote); }
+.note-chev { display: inline-flex; flex: none; transition: transform var(--t-fast, .12s) var(--ease, ease); color: var(--text-lo); }
+.note-node-head.open .note-chev { transform: rotate(90deg); }
+.note-node-count { flex: none; font-size: 11px; }
+.note-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 6px var(--sp-5); flex: none;
+  border-bottom: 1px solid var(--line); font-size: 12px; }
+.note-meta-chip { display: inline-flex; align-items: center; gap: 4px; color: var(--text-mid); text-decoration: none; }
+a.note-meta-chip:hover { color: var(--accent); }
+.note-meta-chip .icon { width: 13px; height: 13px; }
 
 /* ============================================================ search / settings / topbar */
 .topbar-btn { display: grid; place-items: center; width: 36px; height: 36px; flex: none;

@@ -2689,62 +2689,177 @@ async function todoReload() {
   } catch (e) { toast("Reload failed: " + e.message, "err"); }
 }
 
-/* ---------------------------------------------------------------- onenote (page list + reader) */
-const Note = { pages: [], stateFilter: "all" };
+/* ---------------------------------------------------------------- onenote (notebook→section→page tree + reader) */
+const Note = { items: [], stateFilter: "all", expanded: new Set(), selected: null };
+const NOTE_ORDER = { notebook: 0, "section-group": 1, section: 2, page: 3 };
+const NOTE_ICON = { notebook: "notebook", "section-group": "folder", section: "folder", page: "file-text" };
 async function renderOnenoteView(view) {
   clear(view);
-  const list = el("div", { id: "note-list", class: "note-list" });
+  const tree = el("div", { id: "note-tree", class: "note-tree" });
   const reader = el("div", { id: "note-reader", class: "note-reader" });
+  const acts = el("div", { class: "view-actions" });
+  if (CAP.onenotewrite) acts.append(el("button", { class: "btn sm primary", title: "Create a new page", onclick: () => openComposePage() }, icon("notebook", "icon-sm"), "New page"));
+  if (CAP.verify) acts.append(verifyButton(() => renderOnenoteView(view)));
   view.append(el("div", { class: "note-page" },
     el("div", { id: "note-metrics-row", class: "con-metrics-row top" }),
-    CAP.verify ? el("div", { class: "view-actions" }, verifyButton(() => renderOnenoteView(view))) : null,
-    el("div", { class: "note-layout" }, list, reader)));
+    acts.childElementCount ? acts : null,
+    el("div", { class: "note-layout" }, tree, reader)));
   renderNoteReader(null);
-  for (let i = 0; i < 5; i++) list.append(el("div", { class: "note-item" }, el("div", { class: "skel grow", style: "height:30px" })));
+  for (let i = 0; i < 5; i++) tree.append(el("div", { class: "note-item" }, el("div", { class: "skel grow", style: "height:30px" })));
   try {
     const [d, act] = await Promise.all([
       api("/api/v1/items?" + qs({ account: App.account, service: "onenote", limit: 1000 })),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
     ]);
-    const pages = (d.items || []).filter(it => it.item_type === "page");
+    Note.items = d.items || [];
+    const pages = Note.items.filter(it => it.item_type === "page");
+    const notebooks = Note.items.filter(it => it.item_type === "notebook");
     App.counts.onenote = d.total ?? pages.length; updateNavCounts();
     fillMetrics($("#note-metrics-row"), [
-      { icon: "notebook", value: pages.length, label: "Pages", sub: "archived" },
+      { icon: "notebook", value: pages.length, label: "Pages", sub: `${notebooks.length} notebooks` },
       integrityMetric(pages),
       lastActivityMetric(act.runs || []),
     ]);
-    Note.pages = pages; Note.stateFilter = "all";
-    noteRenderList();
-  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load OneNote" }), el("p", { text: e.message }))); }
+    // expand notebooks + section groups by default so the structure is visible
+    Note.expanded = new Set(Note.items.filter(it => it.item_type === "notebook" || it.item_type === "section-group" || it.item_type === "section").map(it => it.remote_id));
+    Note.stateFilter = "all";
+    noteRenderTree();
+  } catch (e) { clear(tree).append(el("div", { class: "empty" }, el("h3", { text: "Could not load OneNote" }), el("p", { text: e.message }))); }
 }
-function noteRenderList() {
-  const list = $("#note-list"); if (!list) return; clear(list);
-  if (!Note.pages.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-notes"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
-  list.append(stateFilterBar(Note.pages, Note.stateFilter, k => { Note.stateFilter = k; noteRenderList(); }));
-  const pages = Note.pages.filter(it => stateMatch(it, Note.stateFilter));
-  if (!pages.length) { list.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "No pages have this backup status." }))); return; }
-  pages.forEach((it, i) => {
-    const row = el("button", { class: "note-item", dataset: { id: it.remote_id }, onclick: () => noteSelect(it) },
-      icon("notebook"), el("div", { class: "grow", style: "min-width:0" },
-        el("div", { class: "truncate", text: it.name || "(untitled)" }),
-        el("div", { class: "dim", style: "font-size:12px", text: fmtDate(it.remote_mtime) })),
+// recursively count pages under a node that match the active state filter
+function noteVisiblePages(it, byParent) {
+  if (it.item_type === "page") return stateMatch(it, Note.stateFilter) ? 1 : 0;
+  return (byParent.get(it.remote_id) || []).reduce((n, c) => n + noteVisiblePages(c, byParent), 0);
+}
+function noteSortKids(kids) {
+  return kids.slice().sort((a, b) => (NOTE_ORDER[a.item_type] ?? 9) - (NOTE_ORDER[b.item_type] ?? 9) || (a.name || "").localeCompare(b.name || ""));
+}
+function noteRenderTree() {
+  const host = $("#note-tree"); if (!host) return; clear(host);
+  if (!Note.items.length) { host.append(el("div", { class: "empty" }, emptyArt("empty-notes"), el("h3", { text: "No notes" }), el("p", { text: "Run a backup to populate OneNote." }))); return; }
+  const pages = Note.items.filter(it => it.item_type === "page");
+  host.append(stateFilterBar(pages, Note.stateFilter, k => { Note.stateFilter = k; noteRenderTree(); }));
+  const byParent = new Map();
+  Note.items.forEach(it => { const k = it.parent_remote_id || "__root__"; (byParent.get(k) || byParent.set(k, []).get(k)).push(it); });
+  const ids = new Set(Note.items.map(it => it.remote_id));
+  // roots: notebooks (parent null) + orphans (parent not a tracked item)
+  const roots = noteSortKids(Note.items.filter(it => !it.parent_remote_id || !ids.has(it.parent_remote_id)));
+  const treeBox = el("div", { class: "note-tree-body" });
+  roots.forEach(it => { const node = noteRenderNode(it, byParent, 0); if (node) treeBox.append(node); });
+  if (!treeBox.childElementCount) { treeBox.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "No pages have this backup status." }))); }
+  host.append(treeBox);
+  if (!Note.selected) { const first = pages.find(p => stateMatch(p, Note.stateFilter)); if (first) setTimeout(() => noteSelect(first), 0); }
+}
+function noteRenderNode(it, byParent, depth) {
+  const pad = `padding-left:${8 + depth * 14}px`;
+  if (it.item_type === "page") {
+    if (!stateMatch(it, Note.stateFilter)) return null;
+    const sel = Note.selected && Note.selected.remote_id === it.remote_id;
+    return el("button", { class: "note-leaf" + (sel ? " active" : ""), style: pad, dataset: { id: it.remote_id }, onclick: () => noteSelect(it) },
+      icon("file-text", "icon-sm"),
+      el("span", { class: "grow truncate", text: it.name || "(untitled)" }),
       coverageBadge(it));
-    list.append(row);
-    if (i === 0) setTimeout(() => noteSelect(it), 0);
-  });
+  }
+  // container (notebook / section-group / section)
+  if (Note.stateFilter !== "all" && noteVisiblePages(it, byParent) === 0) return null;
+  const open = Note.expanded.has(it.remote_id);
+  const kids = noteSortKids(byParent.get(it.remote_id) || []);
+  const head = el("button", { class: "note-node-head" + (open ? " open" : ""), style: pad, onclick: () => { if (open) Note.expanded.delete(it.remote_id); else Note.expanded.add(it.remote_id); noteRenderTree(); } },
+    el("span", { class: "note-chev" }, icon("chevron-right", "icon-sm")),
+    icon(NOTE_ICON[it.item_type] || "folder", "icon-sm"),
+    el("span", { class: "grow truncate", text: it.name || "(untitled)" }),
+    el("span", { class: "note-node-count tnum dim", text: String(noteVisiblePages(it, byParent)) }));
+  const node = el("div", { class: "note-node" }, head);
+  if (open) {
+    const body = el("div", { class: "note-node-kids" });
+    kids.forEach(c => { const cn = noteRenderNode(c, byParent, depth + 1); if (cn) body.append(cn); });
+    if (!body.childElementCount) body.append(el("div", { class: "dim", style: `${pad};padding-top:4px;font-size:12px`, text: "(empty)" }));
+    node.append(body);
+  }
+  return node;
 }
 function noteSelect(it) {
-  document.querySelectorAll(".note-item").forEach(r => r.classList.toggle("active", r.dataset.id === it.remote_id));
+  Note.selected = it;
+  document.querySelectorAll(".note-leaf").forEach(r => r.classList.toggle("active", r.dataset.id === it.remote_id));
   renderNoteReader(it);
 }
 function renderNoteReader(it) {
   const box = $("#note-reader"); if (!box) return; clear(box);
   if (!it) { box.append(el("div", { class: "empty", style: "margin:auto" }, logoGlyph(64), el("h3", { text: "Select a page" }))); return; }
   const q = { account: App.account, service: "onenote", id: it.remote_id };
+  const p = it.preview || {};
+  const actions = el("div", { class: "note-reader-actions" },
+    el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
+  if (CAP.onenotewrite) {
+    actions.append(el("button", { class: "btn ghost sm", title: "Append a paragraph (best-effort)", onclick: () => appendPage(it) }, icon("plus", "icon-sm"), "Append"));
+    actions.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", title: "Delete this page", onclick: () => deletePage(it) }, icon("trash-2", "icon-sm"), "Delete"));
+  }
+  // metadata strip from the page preview (created / section / notebook / tags / link)
+  const meta = el("div", { class: "note-meta dim" });
+  const chip = (ic, txt) => txt ? meta.append(el("span", { class: "note-meta-chip" }, icon(ic, "icon-sm"), el("span", { text: txt }))) : null;
+  chip("archive", p.notebook_name ? `${p.notebook_name}${p.section_name ? " / " + p.section_name : ""}` : (p.section_name || ""));
+  chip("clock", p.created ? "Created " + fmtDate(p.created) : "");
+  if (Array.isArray(p.user_tags) && p.user_tags.length) chip("tag", p.user_tags.join(", "));
+  if (p.has_resources) chip("paperclip", "Has embedded resources");
+  meta.append(coverageBadge(it));
+  if (p.web_url && /^https?:\/\//i.test(p.web_url)) meta.append(el("a", { class: "note-meta-chip", href: p.web_url, target: "_blank", rel: "noopener noreferrer" }, icon("external-link", "icon-sm"), el("span", { text: "Open in OneNote" })));
   box.append(
-    el("header", { class: "note-reader-head" }, el("h2", { class: "grow truncate", text: it.name || "(untitled)" }),
-      el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm"))),
+    el("header", { class: "note-reader-head" }, el("h2", { class: "grow truncate", text: it.name || "(untitled)" }), actions),
+    meta,
     el("iframe", { class: "note-frame", src: `/api/v1/view?${qs(q)}`, title: "Note", loading: "lazy" }));
+}
+// #568: live OneNote write — create page (section picker) / delete / best-effort append, cap-gated
+async function openComposePage(presetSection) {
+  if (!CAP.onenotewrite) return;
+  const sections = Note.items.filter(it => it.item_type === "section");
+  if (!sections.length) { toast("No section available — back up a notebook first", "err"); return; }
+  const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
+  const secSel = el("select", { class: "input", id: "cpage-section" });
+  sections.forEach(s => secSel.append(el("option", { value: s.remote_id, text: s.name || "Section", selected: presetSection === s.remote_id })));
+  const title = el("input", { class: "input", id: "cpage-title", placeholder: "Page title" });
+  const body = el("textarea", { class: "input cmp-textarea", id: "cpage-body", placeholder: "Page text", rows: "8" });
+  const content = el("div", { class: "compose" },
+    field("Section", secSel), field("Title", title), field("Body", body),
+    el("div", { class: "cmp-footer" }, el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: (e) => composePageSubmit(e.currentTarget) }, icon("notebook", "icon-sm"), "Create")));
+  openSheet("New page", content);
+  setTimeout(() => title.focus(), 60);
+}
+async function composePageSubmit(btn) {
+  const v = (s) => ($("#" + s).value || "").trim();
+  const section = $("#cpage-section") && $("#cpage-section").value;
+  const title = v("cpage-title");
+  if (!section) { toast("Pick a section", "err"); return; }
+  if (!title) { toast("Add a title", "err"); return; }
+  btn.disabled = true;
+  try {
+    await post("/api/v1/onenote/create?" + qs({ account: App.account, section, title, body: v("cpage-body") }), CAP.onenotewrite);
+    toast("Page created"); closeSheet(); noteReload();
+  } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
+}
+async function deletePage(it) {
+  if (!confirm("Delete this page from your Microsoft 365 account?")) return;
+  try {
+    await post("/api/v1/onenote/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onenotewrite);
+    toast("Page deleted"); Note.selected = null; renderNoteReader(null); noteReload();
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function appendPage(it) {
+  const text = prompt("Append a paragraph to this page:");
+  if (!text || !text.trim()) return;
+  try {
+    await post("/api/v1/onenote/append?" + qs({ account: App.account, id: it.remote_id, text: text.trim() }), CAP.onenotewrite);
+    toast("Appended (OneNote may take a moment to reflect it)");
+  } catch (e) { toast("Failed: " + e.message, "err"); }
+}
+async function noteReload() {
+  try {
+    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onenote", limit: 1000 }));
+    Note.items = d.items || [];
+    App.counts.onenote = d.total ?? Note.items.filter(it => it.item_type === "page").length; updateNavCounts();
+    if (Note.selected) { const s = Note.items.find(x => x.remote_id === Note.selected.remote_id); Note.selected = s || null; renderNoteReader(s || null); }
+    noteRenderTree();
+  } catch (e) { toast("Reload failed: " + e.message, "err"); }
 }
 
 /* shared detail sheet (used by calendar/contacts/todo) */
