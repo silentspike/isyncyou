@@ -510,7 +510,7 @@ const SFX = {
     if (this.ctx) return;
     try {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const src = { shoot: "/sfx/shoot.mp3", boom: "/sfx/boom.mp3", level: "/sfx/level.mp3" };
+      const src = { shoot: "/sfx/shoot.mp3", boom: "/sfx/boom.mp3", level: "/sfx/level.mp3", drop: "/sfx/drop.mp3", pickup: "/sfx/pickup.mp3" };
       for (const k in src) this.buf[k] = await this.ctx.decodeAudioData(await (await fetch(src[k])).arrayBuffer());
       this.ready = true;
     } catch (_) { }
@@ -525,7 +525,7 @@ const SFX = {
     } catch (_) { }
   },
 };
-function speakerGlyph(on, cls = "icon-sm") {
+function speakerGlyph(on, cls = "icon icon-sm") {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", cls);
   svg.innerHTML = '<path d="M4 9v6h4l5 4V5L8 9H4z"/>' + (on
@@ -542,16 +542,18 @@ function invToggleSfx() {
 function renderInvaders(view) {
   clear(view).append(
     el("h1", { class: "view-title", text: "Invaders" }),
-    el("p", { class: "view-sub", text: "drag to move · auto-fire · defend the archive" }),
+    el("p", { class: "view-sub", text: "drag to move · auto-fire · grab power-ups · survive" }),
     el("div", { class: "inv-wrap" },
+      el("canvas", { id: "inv-bg", class: "inv-bg" }),
       el("button", { id: "sfx-toggle", class: "btn ghost sm icon-only inv-sfx", title: SFX.on() ? "Sound on" : "Sound off", onclick: invToggleSfx }, speakerGlyph(SFX.on())),
       el("canvas", { id: "inv-canvas", class: "inv-canvas" })));
+  const ib = document.getElementById("inv-bg"); if (ib) Net.register(ib, { topWeighted: false });   // our animated constellation, full-bleed behind the game
   invadersGame(document.getElementById("inv-canvas"));
 }
 function invadersGame(canvas) {
   if (!canvas) return;
   const ctx = canvas.getContext("2d"), dpr = Math.min(window.devicePixelRatio || 1, 2);
-  let W = 0, H = 0, player, bullets, foes, parts, dir, base, score, state, level, raf = 0, lastShot = 0;
+  let W = 0, H = 0, player, bullets, foes, parts, pups, up, dir, base, score, state, level, raf = 0, lastShot = 0;
   function fit() {
     const r = canvas.getBoundingClientRect();
     W = Math.max(240, r.width); H = Math.max(300, r.height);
@@ -567,7 +569,10 @@ function invadersGame(canvas) {
     for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) foes.push({ x: gx + c * 44, y: 42 + r * 32, w: 26, h: 16, alive: true, hp, maxhp: hp });
   }
   function reset() {
-    player = { x: W / 2, y: H - 24, w: 30, h: 12 }; targetX = W / 2; targetY = H - 24; parts = []; score = 0; level = 1; state = "play";
+    player = { x: W / 2, y: H - 24, w: 30, h: 12, hp: 3, maxhp: 3, armor: 0, inv: 0 };
+    targetX = W / 2; targetY = H - 24; parts = []; pups = [];
+    up = { fire: 320, pierce: 0, bspeed: 7, ease: 0.35, shots: 1 };
+    score = 0; level = 1; state = "play";
     spawnFoes();
   }
   function nextLevel() { level++; spawnFoes(); SFX.play("level", 0.6); }
@@ -608,6 +613,53 @@ function invadersGame(canvas) {
     ctx.fillStyle = "#c7d2fe"; ctx.beginPath(); ctx.ellipse(f.x, f.y - 2, f.w / 4, f.h / 3, 0, 0, 6.2832); ctx.fill();
     ctx.globalAlpha = 1;
   }
+  // power-up types — each killed foe may drop one; pick it up to apply forever
+  const POW = [
+    { k: "atkspeed", col: "#fde68a", apply: () => up.fire = Math.max(70, up.fire - 45) },
+    { k: "pierce", col: "#67e8f9", apply: () => up.pierce += 1 },
+    { k: "hp", col: "#fb7185", apply: () => { player.maxhp += 1; player.hp = Math.min(player.maxhp, player.hp + 1); } },
+    { k: "armor", col: "#60a5fa", apply: () => player.armor += 1 },
+    { k: "bspeed", col: "#fb923c", apply: () => up.bspeed += 2 },
+    { k: "movespeed", col: "#34d399", apply: () => up.ease = Math.min(0.62, up.ease + 0.06) },
+    { k: "morebullets", col: "#c084fc", apply: () => up.shots += 1 },
+  ];
+  function fire(now) {
+    const n = up.shots, spread = 0.5;
+    for (let i = 0; i < n; i++) {
+      const a = n === 1 ? 0 : (i / (n - 1) - 0.5) * spread;
+      bullets.push({ x: player.x, y: player.y - 14, vx: Math.sin(a) * up.bspeed, vy: -Math.cos(a) * up.bspeed, pierce: up.pierce });
+    }
+    lastShot = now; SFX.play("shoot", 0.2);
+  }
+  function hurt(now) {
+    if (player.inv > now) return;
+    if (player.armor > 0) player.armor -= 1; else player.hp -= 1;
+    player.inv = now + 1100; boom(player.x, player.y); SFX.play("boom", 0.45);
+    if (player.hp <= 0) state = "over";
+  }
+  function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+  function drawPowIcon(k, x, y) {
+    ctx.save(); ctx.translate(x, y); ctx.strokeStyle = "#0b0b16"; ctx.fillStyle = "#0b0b16"; ctx.lineWidth = 1.7; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.beginPath();
+    if (k === "atkspeed") { ctx.moveTo(2, -5); ctx.lineTo(-3, 1); ctx.lineTo(0, 1); ctx.lineTo(-2, 5); ctx.lineTo(3, -1); ctx.lineTo(0, -1); ctx.closePath(); ctx.fill(); }
+    else if (k === "pierce") { ctx.moveTo(-4, 2); ctx.lineTo(0, -4); ctx.lineTo(4, 2); ctx.moveTo(0, -4); ctx.lineTo(0, 5); ctx.stroke(); }
+    else if (k === "hp") { ctx.moveTo(0, 5); ctx.bezierCurveTo(-6, 0, -4, -5, 0, -2); ctx.bezierCurveTo(4, -5, 6, 0, 0, 5); ctx.fill(); }
+    else if (k === "armor") { ctx.moveTo(0, -5); ctx.lineTo(5, -3); ctx.lineTo(5, 1); ctx.quadraticCurveTo(5, 5, 0, 6); ctx.quadraticCurveTo(-5, 5, -5, 1); ctx.lineTo(-5, -3); ctx.closePath(); ctx.stroke(); }
+    else if (k === "bspeed") { ctx.moveTo(-4, 1); ctx.lineTo(0, -4); ctx.lineTo(4, 1); ctx.moveTo(-4, 5); ctx.lineTo(0, 0); ctx.lineTo(4, 5); ctx.stroke(); }
+    else if (k === "movespeed") { ctx.moveTo(-4, -4); ctx.lineTo(1, 0); ctx.lineTo(-4, 4); ctx.moveTo(1, -4); ctx.lineTo(6, 0); ctx.lineTo(1, 4); ctx.stroke(); }
+    else { ctx.arc(-4, 0, 1.5, 0, 6.2832); ctx.fill(); ctx.beginPath(); ctx.arc(0, 0, 1.5, 0, 6.2832); ctx.fill(); ctx.beginPath(); ctx.arc(4, 0, 1.5, 0, 6.2832); ctx.fill(); }
+    ctx.restore();
+  }
+  function drawPow(p, now) {
+    const def = POW.find(d => d.k === p.t), bob = Math.sin(now * 0.006 + p.x) * 1.6;
+    ctx.save(); ctx.globalAlpha = 0.95; ctx.fillStyle = def.col; roundRect(p.x - 11, p.y - 11 + bob, 22, 22, 6); ctx.fill(); ctx.restore();
+    drawPowIcon(p.t, p.x, p.y + bob);
+  }
+  function drawHud() {
+    for (let i = 0; i < player.maxhp; i++) {
+      ctx.save(); ctx.translate(W - 16 - i * 17, 16); ctx.fillStyle = i < player.hp ? "#fb7185" : "rgba(148,163,184,.3)";
+      ctx.beginPath(); ctx.moveTo(0, 4); ctx.bezierCurveTo(-6, -1, -4, -6, 0, -3); ctx.bezierCurveTo(4, -6, 6, -1, 0, 4); ctx.fill(); ctx.restore();
+    }
+  }
   function step(now) {
     if (!canvas.isConnected) { cancelAnimationFrame(raf); window.removeEventListener("keydown", kd); window.removeEventListener("keyup", ku); return; }
     if (state === "play") {
@@ -615,31 +667,36 @@ function invadersGame(canvas) {
       if (keys.up) targetY -= 6; if (keys.down) targetY += 6;
       targetX = Math.max(player.w / 2, Math.min(W - player.w / 2, targetX));
       targetY = Math.max(24, Math.min(H - 16, targetY));
-      player.x += (targetX - player.x) * 0.35;                       // ease toward the finger
-      player.y += (targetY - player.y) * 0.35;                       // full 2D follow
-      if (now - lastShot > 320) { bullets.push({ x: player.x, y: player.y - 14 }); lastShot = now; SFX.play("shoot", 0.22); }   // auto-fire
-      bullets.forEach(b => b.y -= 7);
+      player.x += (targetX - player.x) * up.ease;                    // ease toward the finger
+      player.y += (targetY - player.y) * up.ease;                    // full 2D follow
+      if (now - lastShot > up.fire) fire(now);                       // auto-fire (rate + shots from upgrades)
+      bullets.forEach(b => { b.x += b.vx; b.y += b.vy; });
       let lo = W, hi = 0, low = 0, n = 0;
       foes.forEach(f => { if (f.alive) { n++; lo = Math.min(lo, f.x - f.w / 2); hi = Math.max(hi, f.x + f.w / 2); low = Math.max(low, f.y + f.h / 2); } });
-      if (n === 0) nextLevel();   // cleared → next level (faster, more, tougher)
+      if (n === 0) nextLevel();
       const sp = base + (foes.length - n) * 0.05;
-      let drop = (dir > 0 && hi + sp > W - 6) || (dir < 0 && lo - sp < 6);
-      foes.forEach(f => { if (f.alive) { if (drop) f.y += 14; else f.x += dir * sp; } });
-      if (drop) dir *= -1;
-      if (low >= H - 16 && n > 0) state = "over";                    // foes reached the bottom
-      foes.forEach(f => { if (f.alive && Math.abs(f.x - player.x) < f.w / 2 + 10 && Math.abs(f.y - player.y) < f.h / 2 + 8) state = "over"; });   // flew into a foe
-      bullets.forEach(b => foes.forEach(f => { if (f.alive && b.y > -10 && Math.abs(b.x - f.x) < f.w / 2 && Math.abs(b.y - f.y) < f.h / 2) { b.y = -99; f.hp--; boom(f.x, f.y); if (f.hp <= 0) { f.alive = false; score += 10; SFX.play("boom", 0.5); } else { score += 2; } } }));
-      bullets = bullets.filter(b => b.y > -10);
+      const edge = (dir > 0 && hi + sp > W - 6) || (dir < 0 && lo - sp < 6);
+      foes.forEach(f => { if (f.alive) { if (edge) f.y += 14; else f.x += dir * sp; } });
+      if (edge) dir *= -1;
+      if (low >= H - 16 && n > 0) state = "over";                    // invasion reached the bottom
+      foes.forEach(f => { if (f.alive && Math.abs(f.x - player.x) < f.w / 2 + 10 && Math.abs(f.y - player.y) < f.h / 2 + 8) hurt(now); });   // contact damage (HP/armor + i-frames)
+      bullets.forEach(b => { if (b.dead) return; for (const f of foes) { if (f.alive && Math.abs(b.x - f.x) < f.w / 2 && Math.abs(b.y - f.y) < f.h / 2) { f.hp--; boom(f.x, f.y); if (f.hp <= 0) { f.alive = false; score += 10; SFX.play("boom", 0.5); if (Math.random() < 0.17) { pups.push({ x: f.x, y: f.y, t: POW[(Math.random() * POW.length) | 0].k }); SFX.play("drop", 0.4); } } else score += 2; if (b.pierce > 0) b.pierce--; else b.dead = true; break; } } });   // pierce passes through
+      bullets = bullets.filter(b => !b.dead && b.y > -16 && b.x > -12 && b.x < W + 12);
+      pups.forEach(p => { p.y += 1.9; if (Math.abs(p.x - player.x) < 20 && Math.abs(p.y - player.y) < 20) { p.got = true; const d = POW.find(d => d.k === p.t); if (d) d.apply(); SFX.play("pickup", 0.5); } });
+      pups = pups.filter(p => !p.got && p.y < H + 14);
     }
     parts.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 0.045; });
     parts = parts.filter(p => p.life > 0);
     ctx.clearRect(0, 0, W, H);
     foes.forEach(f => { if (f.alive) drawFoe(f); });
-    drawShip(player.x, player.y, now);
-    ctx.fillStyle = "#fde68a"; bullets.forEach(b => ctx.fillRect(b.x - 1.5, b.y - 8, 3, 10));
+    pups.forEach(p => drawPow(p, now));
+    if (player.armor > 0) { ctx.save(); ctx.globalAlpha = 0.35 + 0.2 * Math.sin(now * 0.008); ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 2; for (let i = 0; i < player.armor; i++) { ctx.beginPath(); ctx.arc(player.x, player.y - 3, 20 + i * 4, 0, 6.2832); ctx.stroke(); } ctx.restore(); }   // armor shield rings
+    if (!(player.inv > now && Math.floor(now / 90) % 2)) drawShip(player.x, player.y, now);   // blink while invulnerable
+    ctx.fillStyle = "#fde68a"; bullets.forEach(b => ctx.fillRect(b.x - 1.5, b.y - 7, 3, 9));
     parts.forEach(p => { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, 2.6 * p.life + 0.6, 0, 6.2832); ctx.fill(); });
     ctx.globalAlpha = 1;
     ctx.fillStyle = "#c7d2fe"; ctx.font = "14px system-ui,sans-serif"; ctx.textAlign = "left"; ctx.fillText("Score " + score + "   ·   Level " + level, 52, 22);
+    drawHud();
     if (state !== "play") {
       ctx.fillStyle = "rgba(5,6,20,.55)"; ctx.fillRect(0, 0, W, H);
       ctx.textAlign = "center"; ctx.fillStyle = "#fff"; ctx.font = "700 26px system-ui,sans-serif";
