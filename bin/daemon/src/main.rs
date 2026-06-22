@@ -288,6 +288,10 @@ fn run(args: &Args) -> Result<(), String> {
     let task_write_cap_token = mint_cap_token();
     let task_write_handler: Arc<dyn isyncyou_webui::TaskWriteHandler> =
         Arc::new(DaemonTaskWrite { cfg: cfg.clone() });
+    // A separate token gates the live-OneNote write POSTs (#568).
+    let onenote_write_cap_token = mint_cap_token();
+    let onenote_write_handler: Arc<dyn isyncyou_webui::OneNoteWriteHandler> =
+        Arc::new(DaemonOneNoteWrite { cfg: cfg.clone() });
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
@@ -307,6 +311,7 @@ fn run(args: &Args) -> Result<(), String> {
     .with_calendar_write(calendar_write_handler, calendar_write_cap_token)
     .with_contact_write(contact_write_handler, contact_write_cap_token)
     .with_task_write(task_write_handler, task_write_cap_token)
+    .with_onenote_write(onenote_write_handler, onenote_write_cap_token)
     .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
@@ -653,6 +658,27 @@ impl isyncyou_webui::TaskWriteHandler for DaemonTaskWrite {
     fn list_delete(&self, account: &str, list_id: &str) -> Result<(), String> {
         let w = isyncyou_engine::task_writer(&self.cfg, account)?;
         isyncyou_engine::TaskWriter::list_delete(&w, list_id)
+    }
+}
+
+/// Web-UI live-OneNote write (#568): resolves the restore-scope write token and
+/// performs create-in-section / delete / append. Fully qualified so the inherent
+/// GraphClient methods that share names aren't shadowed.
+struct DaemonOneNoteWrite {
+    cfg: Config,
+}
+impl isyncyou_webui::OneNoteWriteHandler for DaemonOneNoteWrite {
+    fn create(&self, account: &str, section_id: &str, html: &[u8]) -> Result<String, String> {
+        let w = isyncyou_engine::page_writer(&self.cfg, account)?;
+        isyncyou_engine::PageWriter::create(&w, section_id, html)
+    }
+    fn delete(&self, account: &str, page_id: &str) -> Result<(), String> {
+        let w = isyncyou_engine::page_writer(&self.cfg, account)?;
+        isyncyou_engine::PageWriter::delete(&w, page_id)
+    }
+    fn append(&self, account: &str, page_id: &str, text: &str) -> Result<(), String> {
+        let w = isyncyou_engine::page_writer(&self.cfg, account)?;
+        isyncyou_engine::PageWriter::append(&w, page_id, text)
     }
 }
 
@@ -1231,11 +1257,40 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
     )
     .map(|r| r.archived)
     .unwrap_or(0);
+    // OneNote (#568): keep the per-service archive fresh — page index (+ rich
+    // _pagemeta_ sidecars), page HTML bodies + embedded resources, and the
+    // notebook/section hierarchy. All best-effort. Read token (Notes.Read).
+    let note = match isyncyou_connectors::incremental_sync_onenote(
+        &mut client,
+        &store,
+        account,
+        &now,
+        Some(&archive_root),
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("isyncyoud: onenote sync for {account} skipped: {e}");
+            Default::default()
+        }
+    };
+    let nbodies =
+        isyncyou_connectors::backup_onenote_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let nres =
+        isyncyou_connectors::backup_onenote_resources(&client, &store, account, &archive_root, 50)
+            .map(|r| r.resources)
+            .unwrap_or(0);
+    let nhier =
+        isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root)
+            .map(|r| r.notebooks + r.section_groups + r.sections)
+            .unwrap_or(0);
     Ok(format!(
         "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
          calendar: {} events, {} bodies, {} flanks | \
          contacts: {} upserted, {} bodies, {} photos | \
-         todo: {} indexed, {} bodies, {} flanks, {} sub",
+         todo: {} indexed, {} bodies, {} flanks, {} sub | \
+         onenote: {} pages, {} bodies, {} resources, {} containers",
         r.folders,
         r.upserted,
         r.deleted,
@@ -1250,7 +1305,11 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
         todo.upserted,
         tbodies,
         tflanks,
-        tsub
+        tsub,
+        note.upserted,
+        nbodies,
+        nres,
+        nhier
     ))
 }
 

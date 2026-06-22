@@ -272,6 +272,7 @@ const CAP = {
   calendarwrite: "__CALENDARWRITE_CAP_TOKEN__",
   contactwrite: "__CONTACTWRITE_CAP_TOKEN__",
   todowrite: "__TASKWRITE_CAP_TOKEN__",
+  onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {

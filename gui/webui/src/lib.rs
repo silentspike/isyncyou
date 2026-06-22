@@ -409,6 +409,19 @@ pub trait TaskWriteHandler: Send + Sync {
     fn list_delete(&self, account: &str, list_id: &str) -> Result<(), String>;
 }
 
+/// Performs the live-OneNote **write** verbs on behalf of a cap-token POST (#568):
+/// create a page in a section, delete a page, append text to a page. Injected by the
+/// daemon (which owns the engine + the full write token); the read-only CLI `serve`
+/// does not set it, so every `/api/v1/onenote/*` POST is refused there.
+pub trait OneNoteWriteHandler: Send + Sync {
+    /// Create a page in `section_id` from POST-ready HTML; returns the new cloud id.
+    fn create(&self, account: &str, section_id: &str, html: &[u8]) -> Result<String, String>;
+    /// Delete a page.
+    fn delete(&self, account: &str, page_id: &str) -> Result<(), String>;
+    /// Append a plain-text paragraph to a page (best-effort).
+    fn append(&self, account: &str, page_id: &str, text: &str) -> Result<(), String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -514,6 +527,11 @@ pub struct Router {
     task_write: Option<std::sync::Arc<dyn TaskWriteHandler>>,
     /// Separate capability token for ToDo-write POSTs.
     task_write_cap_token: Option<String>,
+    /// Optional live-OneNote write handler (the daemon's). `None` => every
+    /// `/api/v1/onenote/*` POST is refused (the read-only CLI `serve`).
+    onenote_write: Option<std::sync::Arc<dyn OneNoteWriteHandler>>,
+    /// Separate capability token for OneNote-write POSTs.
+    onenote_write_cap_token: Option<String>,
 }
 
 impl Router {
@@ -542,6 +560,8 @@ impl Router {
             contact_write_cap_token: None,
             task_write: None,
             task_write_cap_token: None,
+            onenote_write: None,
+            onenote_write_cap_token: None,
         }
     }
 
@@ -572,6 +592,8 @@ impl Router {
             contact_write_cap_token: None,
             task_write: None,
             task_write_cap_token: None,
+            onenote_write: None,
+            onenote_write_cap_token: None,
         }
     }
 
@@ -700,6 +722,17 @@ impl Router {
         self
     }
 
+    /// Enable the live-OneNote write POSTs (builder style, #568).
+    pub fn with_onenote_write(
+        mut self,
+        handler: std::sync::Arc<dyn OneNoteWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.onenote_write = Some(handler);
+        self.onenote_write_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token.
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
         matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
@@ -767,6 +800,9 @@ impl Router {
                 "/api/v1/todo/checklist-delete" => self.todo_checklist_delete(req),
                 "/api/v1/todo/list-create" => self.todo_list_create(req),
                 "/api/v1/todo/list-delete" => self.todo_list_delete(req),
+                "/api/v1/onenote/create" => self.onenote_create(req),
+                "/api/v1/onenote/delete" => self.onenote_delete(req),
+                "/api/v1/onenote/append" => self.onenote_append(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -817,6 +853,10 @@ impl Router {
                     .replace(
                         "__TASKWRITE_CAP_TOKEN__",
                         self.task_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__ONENOTEWRITE_CAP_TOKEN__",
+                        self.onenote_write_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -1553,6 +1593,120 @@ impl Router {
         )
     }
 
+    fn onenote_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn OneNoteWriteHandler>, ApiResponse> {
+        let h = self.onenote_write.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "onenote write is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.onenote_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit OneNote result (no SSE on self-write, like `cal_result`).
+    fn onenote_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:onenote", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:onenote", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a minimal, well-formed OneNote page HTML from the request's `title` +
+    /// `body` (both HTML-escaped; body newlines become paragraph breaks).
+    fn page_html_from_req(req: &ApiRequest) -> Vec<u8> {
+        let esc = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let title = req
+            .q("title")
+            .filter(|t| !t.is_empty())
+            .unwrap_or("Untitled");
+        let body = req.q("body").unwrap_or("");
+        let body_html = esc(body).replace('\n', "</p><p>");
+        format!(
+            "<!DOCTYPE html><html><head><title>{}</title></head><body><p>{}</p></body></html>",
+            esc(title),
+            body_html
+        )
+        .into_bytes()
+    }
+
+    fn onenote_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onenote_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, section) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("section").filter(|s| !s.is_empty()),
+        ) {
+            (Some(a), Some(s)) => (a, s),
+            _ => return ApiResponse::error(400, "account and section are required"),
+        };
+        let html = Self::page_html_from_req(req);
+        match h.create(account, section, &html) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:onenote", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:onenote", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn onenote_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onenote_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.onenote_result(account, &format!("delete id={id}"), h.delete(account, id))
+    }
+
+    fn onenote_append(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onenote_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, text) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("text").filter(|t| !t.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(t)) => (a, i, t),
+            _ => return ApiResponse::error(400, "account, id and text are required"),
+        };
+        self.onenote_result(
+            account,
+            &format!("append id={id}"),
+            h.append(account, id, text),
+        )
+    }
+
     fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
         let h = match self.mail_gate(req) {
             Ok(h) => h,
@@ -2226,50 +2380,54 @@ impl Router {
                 // readable body simply carry no `preview`. Bounded by the page size.
                 // mail = sender/snippet/date/has-html (.eml); the rest parse the
                 // archived JSON (calendar/contacts/todo).
-                let arr: Vec<Value> =
-                    if matches!(service, "mail" | "calendar" | "contacts" | "todo") {
-                        let archive_root = self
-                            .config
-                            .accounts
-                            .iter()
-                            .find(|a| a.id == account)
-                            .map(|a| a.archive_root.clone());
-                        items
-                            .iter()
-                            .map(|it| {
-                                let mut v = item_json(it);
-                                if let (Some(root), Some(rel)) =
-                                    (archive_root.as_ref(), it.local_path.as_ref())
-                                {
-                                    if let Some(bytes) = read_under_root(root, rel) {
-                                        if service == "mail" {
-                                            mail_preview_enrichment(&mut v, it, root, rel, &bytes);
-                                        } else if let Ok(o) =
-                                            serde_json::from_slice::<Value>(&bytes)
-                                        {
-                                            v["preview"] = match service {
-                                                "calendar" => calendar_preview(it, &o),
-                                                "contacts" => contact_preview(it, &o, root),
-                                                "todo" => todo_preview(it, &o, root),
-                                                _ => json!({
-                                                    "status": o["status"],
-                                                    "importance": o["importance"],
-                                                    "due": o["dueDateTime"]["dateTime"],
-                                                    "has_note": o["body"]["content"]
-                                                        .as_str()
-                                                        .map(|s| !s.trim().is_empty())
-                                                        .unwrap_or(false),
-                                                }),
-                                            };
-                                        }
+                let arr: Vec<Value> = if matches!(
+                    service,
+                    "mail" | "calendar" | "contacts" | "todo" | "onenote"
+                ) {
+                    let archive_root = self
+                        .config
+                        .accounts
+                        .iter()
+                        .find(|a| a.id == account)
+                        .map(|a| a.archive_root.clone());
+                    items
+                        .iter()
+                        .map(|it| {
+                            let mut v = item_json(it);
+                            if let (Some(root), Some(rel)) =
+                                (archive_root.as_ref(), it.local_path.as_ref())
+                            {
+                                if let Some(bytes) = read_under_root(root, rel) {
+                                    if service == "mail" {
+                                        mail_preview_enrichment(&mut v, it, root, rel, &bytes);
+                                    } else if service == "onenote" {
+                                        // a page's local_path is the .html body, not JSON —
+                                        // onenote_preview reads the _pagemeta_ / flank sidecar.
+                                        v["preview"] = onenote_preview(it, root);
+                                    } else if let Ok(o) = serde_json::from_slice::<Value>(&bytes) {
+                                        v["preview"] = match service {
+                                            "calendar" => calendar_preview(it, &o),
+                                            "contacts" => contact_preview(it, &o, root),
+                                            "todo" => todo_preview(it, &o, root),
+                                            _ => json!({
+                                                "status": o["status"],
+                                                "importance": o["importance"],
+                                                "due": o["dueDateTime"]["dateTime"],
+                                                "has_note": o["body"]["content"]
+                                                    .as_str()
+                                                    .map(|s| !s.trim().is_empty())
+                                                    .unwrap_or(false),
+                                            }),
+                                        };
                                     }
                                 }
-                                v
-                            })
-                            .collect()
-                    } else {
-                        items.iter().map(item_json).collect()
-                    };
+                            }
+                            v
+                        })
+                        .collect()
+                } else {
+                    items.iter().map(item_json).collect()
+                };
                 ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
@@ -2876,6 +3034,56 @@ fn todo_preview(it: &Item, o: &Value, root: &std::path::Path) -> Value {
             .unwrap_or(false),
         "steps_total": steps_total,
         "steps_done": steps_done,
+    })
+}
+
+/// Build a OneNote item's `preview` (#568). A page exposes the metadata from its
+/// `_pagemeta_<id>` sidecar (the page's `local_path` is the `.html` body, not JSON) —
+/// createdDateTime, level/order, userTags, the OneNote web/client links, its section
+/// and notebook names, plus `has_resources` (whether a `<page>.resources.json`
+/// manifest exists). A notebook/section/section-group exposes a few fields from its
+/// flank JSON sidecar. All best-effort.
+fn onenote_preview(it: &Item, root: &std::path::Path) -> Value {
+    if it.item_type == "page" {
+        let meta = read_under_root(
+            root,
+            &isyncyou_connectors::shard_rel(
+                "onenote",
+                &format!("_pagemeta_{}", it.remote_id),
+                "json",
+            ),
+        )
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or_else(|| json!({}));
+        let has_resources = it
+            .local_path
+            .as_deref()
+            .map(|rel| root.join(rel).with_extension("resources.json").exists())
+            .unwrap_or(false);
+        return json!({
+            "created": meta.get("createdDateTime").and_then(Value::as_str),
+            "level": meta.get("level"),
+            "order": meta.get("order"),
+            "user_tags": meta.get("userTags"),
+            "web_url": meta.pointer("/links/oneNoteWebUrl/href").and_then(Value::as_str),
+            "client_url": meta.pointer("/links/oneNoteClientUrl/href").and_then(Value::as_str),
+            "section_name": meta.pointer("/parentSection/displayName").and_then(Value::as_str),
+            "notebook_id": meta.pointer("/parentNotebook/id").and_then(Value::as_str),
+            "notebook_name": meta.pointer("/parentNotebook/displayName").and_then(Value::as_str),
+            "has_resources": has_resources,
+        });
+    }
+    // notebook / section / section-group: a few fields from the flank JSON sidecar
+    let o = it
+        .local_path
+        .as_deref()
+        .and_then(|rel| read_under_root(root, rel))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "is_default": o.get("isDefault").and_then(Value::as_bool),
+        "web_url": o.pointer("/links/oneNoteWebUrl/href").and_then(Value::as_str),
+        "created": o.get("createdDateTime").and_then(Value::as_str),
     })
 }
 
@@ -4046,6 +4254,131 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(log[6], "list_create Groceries");
         assert_eq!(log[7], "delete list=L1 id=t1");
         assert_eq!(log[8], "list_delete L1");
+    }
+
+    #[test]
+    fn app_js_has_onenote_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__ONENOTEWRITE_CAP_TOKEN__"));
+    }
+
+    #[derive(Default)]
+    struct RecOneNoteWrite(std::sync::Mutex<Vec<String>>);
+    impl OneNoteWriteHandler for RecOneNoteWrite {
+        fn create(&self, _a: &str, section: &str, html: &[u8]) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("create section={section} bytes={}", html.len()));
+            Ok("page-new".into())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("delete id={id}"));
+            Ok(())
+        }
+        fn append(&self, _a: &str, id: &str, text: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("append id={id} text={text}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn onenote_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/onenote/create",
+            "/api/v1/onenote/delete",
+            "/api/v1/onenote/append",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecOneNoteWrite::default());
+        let router = router.with_onenote_write(rec.clone(), "notesecret".into());
+        let create = "/api/v1/onenote/create?account=a&section=S1&title=Ideas&body=hello";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token but no section -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/onenote/create?account=a&title=x")
+            .with_cap_token(Some("notesecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("notesecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/onenote/append?account=a&id=P1&text=more"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/onenote/delete?account=a&id=P1"))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        // the create built a non-empty page HTML and targeted section S1
+        assert!(log[0].starts_with("create section=S1 bytes="));
+        assert!(!log[0].ends_with("bytes=0"));
+        assert_eq!(log[1], "append id=P1 text=more");
+        assert_eq!(log[2], "delete id=P1");
+    }
+
+    #[test]
+    fn onenote_preview_exposes_page_metadata_from_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        // the page's _pagemeta_<id> sidecar (the page's local_path is the .html body)
+        let meta_rel = isyncyou_connectors::shard_rel("onenote", "_pagemeta_p1", "json");
+        let mp = arch.join(&meta_rel);
+        std::fs::create_dir_all(mp.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mp,
+            br#"{"createdDateTime":"2025-12-01T00:00:00Z","level":1,"order":3,
+                 "userTags":["important"],
+                 "links":{"oneNoteWebUrl":{"href":"https://onenote.com/p1"}},
+                 "parentSection":{"displayName":"Ideas"},
+                 "parentNotebook":{"id":"N1","displayName":"Personal"}}"#,
+        )
+        .unwrap();
+        // the page item: local_path is the .html body
+        std::fs::create_dir_all(arch.join("onenote/aa")).unwrap();
+        std::fs::write(arch.join("onenote/aa/p.html"), b"<html></html>").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut it = Item::new("a", "onenote", "p1", "Ideas page", "page");
+            it.local_path = Some("onenote/aa/p.html".into());
+            it.parent_remote_id = Some("S1".into());
+            store.upsert_item(&it).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let d =
+            body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=onenote")));
+        let p = &d["items"][0]["preview"];
+        assert_eq!(p["created"], "2025-12-01T00:00:00Z");
+        assert_eq!(p["level"], 1);
+        assert_eq!(p["order"], 3);
+        assert_eq!(p["user_tags"][0], "important");
+        assert_eq!(p["web_url"], "https://onenote.com/p1");
+        assert_eq!(p["section_name"], "Ideas");
+        assert_eq!(p["notebook_name"], "Personal");
+        assert_eq!(p["has_resources"], false);
     }
 
     struct OkVerify;
