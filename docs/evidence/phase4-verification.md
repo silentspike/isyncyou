@@ -2,7 +2,13 @@
 
 Per-service confirmation that every Phase-4 decision shipped in the runtime path, with the landed symbol (file) and the live-verification status. Local verification only; the push → cascade → RC → close is gated on explicit GO (S-P4.12 B5).
 
-Gate (all stories): `cargo +1.95.0 fmt --all --check` clean · `clippy --workspace --all-targets -D warnings` clean · `test --workspace` 0 failed (36 suites) · `node --check gui/webui/src/app.js` OK.
+Gate (all stories): `cargo +1.95.0 fmt --all --check` clean · `clippy --workspace --all-targets -D warnings` clean · `test --workspace` 0 failed (36 suites) · `cargo test -p isyncyou-graph --features http` 0 failed (83 passed) · `node --check gui/webui/src/app.js` OK · `tools/check_traceability.py` 40/40 implemented, OK.
+
+Security (S-P4.12 B3, live curl + unit):
+- **Layer 1** app shell `GET /`: `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
+- **Layer 2** static `/app.js`: `application/javascript` + `nosniff` + `no-store`.
+- **Layer 3** sanitized `/api/v1/view` (OneNote page + mail message): `default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'` (MAIL_CSP) + **0 `<script>`** in both bodies (ammonia strips).
+- Write gate: all six write endpoints + settings → 401 without `X-Capability-Token`. XSS inert: `view_renders_safe_html_with_csp_and_escapes_untrusted_values` + `note_page_sanitizes_and_is_csp_locked` pass.
 
 ## S-P4.0 #557 — capability spike (CLOSED)
 Read-only Graph probe; informed the per-service decisions. Closed.
