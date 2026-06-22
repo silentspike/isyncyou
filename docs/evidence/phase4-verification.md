@@ -70,3 +70,24 @@ Read-only Graph probe; informed the per-service decisions. Closed.
 
 ## Findings
 None open. All per-service decisions shipped; 5 live-found bugs across #564/#567/#568 were fixed immediately in their slices. Residuals (documented, not bugs): OneNote `level/order/userTags` are Graph-conditional (captured when present); a full FUSE-mount `stat` and a 2nd-account calendar "accept invite" need external setup (proven via code paths instead); `stale` is transient under fast polling (unit-proven, not live-inducible).
+
+## Story status (close-prep, S-P4.12 B5)
+
+Every Phase-4 story is implemented and locally verified; the whole stack is one linear branch (`feat/p4-verify`) ahead of `origin/dev`. Issues stay open until the gated push → cascade → close.
+
+| Issue | Story | Status | Evidence |
+|---|---|---|---|
+| #557 | S-P4.0 capability spike | closed | informed per-service decisions |
+| #558 | S-P4.1 scope expansion | implemented, verified | `READ_SCOPES`/`RESTORE_SCOPES`; gate green |
+| #559 | S-P4.2 poll engine + SSE + slider | implemented, verified | interval slider 200/400/401 live; SSE wired |
+| #560 | S-P4.3 4-state badge | implemented, verified | live_backup/live_only/backup_only live; stale unit-proven |
+| #561–#563 | S-P4.4/4.5/4.6 Mail | implemented, verified | compose/flag/move Graph-confirmed; daemon SSE AC-5 |
+| #564 | S-P4.7 OneDrive | implemented, verified | quota + permissions live; 2 bugs fixed |
+| #565 | S-P4.8 Calendar | implemented, verified | 9 events agenda; create/update/delete 200 |
+| #566 | S-P4.9 Contacts | implemented, verified | 17 contacts; photo byte-exact; CRUD Graph-confirmed |
+| #567 | S-P4.10 ToDo | implemented, verified | checklist/attachments; CRUD Graph-confirmed |
+| #568 | S-P4.11 OneNote | implemented, verified | tree (not flat); restore-to-section; create/append/delete |
+| #569 | S-P4.12 epic verification | implemented, verified | this document + live matrix above |
+| #556 | Epic | ready to close on GO | all stories implemented + locally verified |
+
+Gate: `fmt`/`clippy`/`test --workspace` (36 suites) 0 failed · graph `--features http` 83/0 · `node --check` OK · traceability 40/40 · release build clean (4 binaries) + smoke green. The push → cascade (dev→staging→main) → RC tag → issue/epic close is the single irreversible step and runs only on explicit GO.
