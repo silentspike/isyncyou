@@ -31,6 +31,13 @@ pub trait MailWriter {
     fn reply(&self, message_id: &str, comment: &str, all: bool) -> Result<(), String>;
     /// Forward a message to new recipients with an optional comment.
     fn forward(&self, message_id: &str, comment: &str, to: &[String]) -> Result<(), String>;
+    /// Rich reply: create a reply(_all) **draft**, set its full HTML body, then
+    /// send — gives the inline composer full control over the body (formatting +
+    /// an edited quote) while keeping the message in the original conversation.
+    fn reply_html(&self, message_id: &str, body_html: &str, all: bool) -> Result<(), String>;
+    /// Rich forward: create a forward **draft** to `to`, set its full HTML body, send.
+    fn forward_html(&self, message_id: &str, body_html: &str, to: &[String])
+        -> Result<(), String>;
     /// Move a message to another folder; returns its new id in the destination.
     fn move_to(&self, message_id: &str, destination_id: &str) -> Result<String, String>;
     /// Mark a message read/unread.
@@ -123,6 +130,40 @@ impl MailWriter for isyncyou_graph::GraphClient {
         let to_refs: Vec<&str> = to.iter().map(String::as_str).collect();
         isyncyou_graph::GraphClient::forward(self, message_id, comment, &to_refs)
             .map_err(|e| e.to_string())
+    }
+    fn reply_html(&self, message_id: &str, body_html: &str, all: bool) -> Result<(), String> {
+        let draft = if all {
+            isyncyou_graph::GraphClient::create_reply_all(self, message_id)
+        } else {
+            isyncyou_graph::GraphClient::create_reply(self, message_id)
+        }
+        .map_err(|e| e.to_string())?;
+        let draft_id = draft
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "createReply response has no id".to_string())?;
+        let patch = json!({ "body": { "contentType": "HTML", "content": body_html } });
+        isyncyou_graph::GraphClient::update_draft(self, draft_id, &patch)
+            .map_err(|e| e.to_string())?;
+        isyncyou_graph::GraphClient::send_draft(self, draft_id).map_err(|e| e.to_string())
+    }
+    fn forward_html(
+        &self,
+        message_id: &str,
+        body_html: &str,
+        to: &[String],
+    ) -> Result<(), String> {
+        let to_refs: Vec<&str> = to.iter().map(String::as_str).collect();
+        let draft = isyncyou_graph::GraphClient::create_forward(self, message_id, &to_refs)
+            .map_err(|e| e.to_string())?;
+        let draft_id = draft
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "createForward response has no id".to_string())?;
+        let patch = json!({ "body": { "contentType": "HTML", "content": body_html } });
+        isyncyou_graph::GraphClient::update_draft(self, draft_id, &patch)
+            .map_err(|e| e.to_string())?;
+        isyncyou_graph::GraphClient::send_draft(self, draft_id).map_err(|e| e.to_string())
     }
     fn move_to(&self, message_id: &str, destination_id: &str) -> Result<String, String> {
         let v = isyncyou_graph::GraphClient::move_message(self, message_id, destination_id)
@@ -257,6 +298,18 @@ mod tests {
         }
         fn forward(&self, id: &str, _comment: &str, to: &[String]) -> Result<(), String> {
             self.log(format!("forward id={id} to={}", to.join(",")));
+            Ok(())
+        }
+        fn reply_html(&self, id: &str, body_html: &str, all: bool) -> Result<(), String> {
+            self.log(format!("reply_html id={id} all={all} body_len={}", body_html.len()));
+            Ok(())
+        }
+        fn forward_html(&self, id: &str, body_html: &str, to: &[String]) -> Result<(), String> {
+            self.log(format!(
+                "forward_html id={id} to={} body_len={}",
+                to.join(","),
+                body_html.len()
+            ));
             Ok(())
         }
         fn move_to(&self, id: &str, dest: &str) -> Result<String, String> {

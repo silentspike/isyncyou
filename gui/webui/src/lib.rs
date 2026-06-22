@@ -300,6 +300,23 @@ pub trait MailWriteHandler: Send + Sync {
         comment: &str,
         to: &[String],
     ) -> Result<(), String>;
+    /// Rich reply: create a reply(_all) draft, set its full HTML body, then send
+    /// (full formatting + an edited quote, kept in the original conversation).
+    fn reply_html(
+        &self,
+        account: &str,
+        message_id: &str,
+        body_html: &str,
+        all: bool,
+    ) -> Result<(), String>;
+    /// Rich forward: create a forward draft to `to`, set its full HTML body, send.
+    fn forward_html(
+        &self,
+        account: &str,
+        message_id: &str,
+        body_html: &str,
+        to: &[String],
+    ) -> Result<(), String>;
     /// Move a message to another folder; returns its new id.
     fn move_to(
         &self,
@@ -1762,7 +1779,12 @@ impl Router {
             _ => return ApiResponse::error(400, "account and id are required"),
         };
         let all = req.q("all") == Some("1");
-        let r = h.reply(account, id, req.q("comment").unwrap_or(""), all);
+        // `body` (full HTML from the inline composer) takes the rich path; the
+        // plain-text `comment` path stays as a fallback.
+        let r = match req.q("body").filter(|b| !b.is_empty()) {
+            Some(body) => h.reply_html(account, id, body, all),
+            None => h.reply(account, id, req.q("comment").unwrap_or(""), all),
+        };
         self.mail_result(account, &format!("reply id={id} all={all}"), r)
     }
 
@@ -1782,7 +1804,10 @@ impl Router {
         if to.is_empty() {
             return ApiResponse::error(400, "at least one recipient (to) is required");
         }
-        let r = h.forward(account, id, req.q("comment").unwrap_or(""), &to);
+        let r = match req.q("body").filter(|b| !b.is_empty()) {
+            Some(body) => h.forward_html(account, id, body, &to),
+            None => h.forward(account, id, req.q("comment").unwrap_or(""), &to),
+        };
         self.mail_result(account, &format!("forward id={id} to={}", to.len()), r)
     }
 
@@ -3590,6 +3615,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .lock()
                 .unwrap()
                 .push(format!("forward id={id} to={}", to.join(",")));
+            Ok(())
+        }
+        fn reply_html(&self, _a: &str, id: &str, body: &str, all: bool) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("reply_html id={id} all={all} body_len={}", body.len()));
+            Ok(())
+        }
+        fn forward_html(&self, _a: &str, id: &str, body: &str, to: &[String]) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!(
+                "forward_html id={id} to={} body_len={}",
+                to.join(","),
+                body.len()
+            ));
             Ok(())
         }
         fn move_to(&self, _a: &str, id: &str, dest: &str) -> Result<String, String> {

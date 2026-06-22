@@ -1016,6 +1016,41 @@ impl GraphClient {
         self.post_empty(&format!("/me/messages/{}/send", encode_id(message_id)))
     }
 
+    /// Create a reply **draft** to the sender (`POST /me/messages/{id}/createReply`);
+    /// returns the new draft message (in the same conversation, pre-quoted). Used by
+    /// the inline rich reply: PATCH the draft body to the user's full HTML, then send.
+    pub fn create_reply(&self, message_id: &str) -> Result<serde_json::Value, UploadError> {
+        self.post_json(
+            &format!("/me/messages/{}/createReply", encode_id(message_id)),
+            &serde_json::json!({}),
+        )
+    }
+
+    /// Create a reply-all **draft** (`POST /me/messages/{id}/createReplyAll`).
+    pub fn create_reply_all(&self, message_id: &str) -> Result<serde_json::Value, UploadError> {
+        self.post_json(
+            &format!("/me/messages/{}/createReplyAll", encode_id(message_id)),
+            &serde_json::json!({}),
+        )
+    }
+
+    /// Create a forward **draft** to new recipients (`POST /me/messages/{id}/createForward`);
+    /// returns the new draft. PATCH the body, then send.
+    pub fn create_forward(
+        &self,
+        message_id: &str,
+        to: &[&str],
+    ) -> Result<serde_json::Value, UploadError> {
+        let recipients: Vec<_> = to
+            .iter()
+            .map(|a| serde_json::json!({ "emailAddress": { "address": a } }))
+            .collect();
+        self.post_json(
+            &format!("/me/messages/{}/createForward", encode_id(message_id)),
+            &serde_json::json!({ "toRecipients": recipients }),
+        )
+    }
+
     /// Create a calendar event (`POST /me/events`); returns the created event
     /// (#565). The body should already be a sanitized, writable event resource.
     pub fn create_event(

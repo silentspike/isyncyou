@@ -509,6 +509,26 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
         let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
         isyncyou_engine::MailWriter::forward(&w, message_id, comment, to)
     }
+    fn reply_html(
+        &self,
+        account: &str,
+        message_id: &str,
+        body_html: &str,
+        all: bool,
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::reply_html(&w, message_id, body_html, all)
+    }
+    fn forward_html(
+        &self,
+        account: &str,
+        message_id: &str,
+        body_html: &str,
+        to: &[String],
+    ) -> Result<(), String> {
+        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        isyncyou_engine::MailWriter::forward_html(&w, message_id, body_html, to)
+    }
     fn move_to(
         &self,
         account: &str,
