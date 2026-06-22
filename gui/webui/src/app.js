@@ -2922,14 +2922,23 @@ function todoRender() {
   tasks.forEach(t => (byList.has(t.parent_remote_id) ? byList.get(t.parent_remote_id) : orphan).push(t));
   const order = ["notStarted", "inProgress", "completed"];
   const rank = (t) => order.indexOf((t.preview || {}).status || "notStarted");
-  const column = (title, tasks) => {
+  const WELLKNOWN = { flaggedEmails: "Flagged email", defaultList: null };
+  const column = (title, tasks, list) => {
     const sorted = tasks.slice().sort((a, b) => rank(a) - rank(b) || (a.name || "").localeCompare(b.name || ""));
-    const col = el("div", { class: "todo-col card" }, el("div", { class: "todo-col-head" }, el("b", { text: title }), el("span", { class: "count tnum", text: String(tasks.length) })));
+    const lp = (list && list.preview) || {};
+    const head = el("div", { class: "todo-col-head" }, el("b", { text: title }));
+    // system-list label (e.g. the flagged-email list) + a shared badge from the
+    // list-level preview fields (wellknownListName / isShared).
+    const wk = lp.wellknown_name ? (WELLKNOWN[lp.wellknown_name] !== undefined ? WELLKNOWN[lp.wellknown_name] : lp.wellknown_name) : null;
+    if (wk) head.append(el("span", { class: "chip muted", style: "font-size:11px", title: "System list" }, wk));
+    if (lp.is_shared) head.append(el("span", { class: "chip muted", style: "font-size:11px", title: "Shared with others" }, icon("share2", "icon-sm"), "Shared"));
+    head.append(el("span", { class: "count tnum", text: String(tasks.length) }));
+    const col = el("div", { class: "todo-col card" }, head);
     if (!sorted.length) col.append(el("div", { class: "dim", style: "padding:8px", text: "No tasks" }));
     sorted.forEach(t => col.append(taskRow(t)));
     return col;
   };
-  Todo.lists.forEach(l => board.append(column(l.name || "List", byList.get(l.remote_id) || [])));
+  Todo.lists.forEach(l => board.append(column(l.name || "List", byList.get(l.remote_id) || [], l)));
   if (orphan.length) board.append(column("Tasks", orphan));
 }
 function taskRow(t) {
