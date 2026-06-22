@@ -990,11 +990,16 @@ a.note-meta-chip:hover { color: var(--accent); }
   /* bottom bar shows only the primary service icons — hide the brand/account/
      footer, the filter sub-nav, and the system nav (Settings is in the top-bar) */
   .sidebar .brand, .sb-account, .sb-section, .spacer, .sync-widget,
-  .sidebar .nav-sub, .sidebar .sys-nav { display: none; }
-  .sidebar .nav { display: flex; flex-direction: row; gap: var(--sp-1); flex: 1; justify-content: space-around; }
+  .sidebar .nav-sub, .sidebar .sys-nav { display: none !important; }
+  /* :not(.sys-nav) so this can't re-show the system nav (which is also a .nav);
+     flex:1 items give every icon an EQUAL slot → equal spacing, no overflow. */
+  .sidebar .nav:not(.sys-nav) { display: flex; flex-direction: row; gap: 0; flex: 1; justify-content: space-between; }
+  .sidebar .nav:not(.sys-nav) .nav-item { flex: 1 1 0; min-width: 0; }
   .sidebar::before { display: none; }
-  .nav-item { flex-direction: column; gap: 2px; padding: var(--sp-1); font-size: var(--fs-xs); }
-  .nav-item .label { display: block; font-size: 10px; }
+  .nav-item { flex-direction: column; gap: 2px; padding: var(--sp-1) 2px; font-size: var(--fs-xs); }
+  /* labels never wrap (e.g. "To Do") — one line, ellipsis if too long */
+  .nav-item .label { display: block; font-size: 10px; max-width: 100%; text-align: center;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .nav-item .count { display: none; }
   .nav-item.active::before { display: none; }
   .view { padding: var(--sp-4); padding-bottom: 76px; }

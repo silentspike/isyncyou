@@ -269,16 +269,16 @@ function toDate(s) {
   if (/^\d{9,11}$/.test(String(s))) return new Date(Number(s) * 1000); // unix seconds
   const d = new Date(s); return isNaN(d) ? null : d;
 }
+// Full absolute timestamp everywhere, e.g. "22.06.2026 14:30:21" (DD.MM.YYYY
+// HH:MM:SS, 24h) — the user wants the exact date + time in every list/row, not a
+// relative "weekday"/"time only" form.
 function fmtDate(s) {
   const d = toDate(s); if (!d) return s ? String(s) : "";
-  const now = Date.now(), diff = now - d.getTime();
-  if (diff < 864e5 && d.getDate() === new Date().getDate()) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-  if (diff < 6048e5) return d.toLocaleDateString([], { weekday: "short" });
-  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 function fmtFullDate(s) {
-  const d = toDate(s); if (!d) return s ? String(s) : "";
-  return d.toLocaleString([], { weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+  return fmtDate(s);
 }
 // Parse an RFC 5322 address ("Name <user@host>" or bare "user@host").
 function parseAddr(s) {
