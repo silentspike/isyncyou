@@ -90,6 +90,8 @@ h1{font-size:20px;margin:0 0 4px}\
 .mail{margin-top:16px;padding:16px;background:#fff;color:#1a1a1a;border-radius:6px;overflow:auto}\
 .mail a{color:#1a56db}\
 .mail img{max-width:100%}\
+.mail *{position:static !important;max-width:100%;overflow-wrap:break-word}\
+.mail table{table-layout:fixed}\
 .actions{margin-top:16px}.actions a{display:inline-block;padding:8px 10px;border:1px solid #58606f;border-radius:6px;color:#e3e3e3;text-decoration:none}\
 .note{margin-top:16px;color:#9aa0a6;font-size:12px}";
 

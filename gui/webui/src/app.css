@@ -223,6 +223,7 @@ a:hover { text-decoration: underline; }
 /* active service's filter sub-items — indented in the LEFT sidebar (no rail) */
 .nav-sub { display: flex; flex-direction: column; gap: 1px; margin: 2px 0 var(--sp-2) var(--sp-4);
   padding-left: var(--sp-3); border-left: 1px solid var(--line); }
+.nav-sub.collapsed { display: none; }
 .nav-sub-sec { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-lo); padding: var(--sp-2) var(--sp-2) 2px; }
 .nav-subitem { display: flex; align-items: center; gap: var(--sp-2); width: 100%; text-align: left;
   padding: 5px var(--sp-2); border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-mid); font-size: var(--fs-sm);
@@ -433,7 +434,7 @@ a:hover { text-decoration: underline; }
 }
 .list-row:hover { background: var(--bg-hover); }
 .list-row.active { background: var(--accent-soft); }
-.list-row .grow { flex: 1; min-width: 0; }
+.grow { flex: 1; min-width: 0; }
 .truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .muted { color: var(--text-mid); }
 .dim { color: var(--text-lo); }
@@ -731,7 +732,7 @@ a:hover { text-decoration: underline; }
   background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4);
   color: var(--text-hi); transition: border-color var(--t-fast) var(--ease); }
 .cal-agenda-row:hover { border-color: var(--line-2); background: var(--bg-hover); }
-.cal-agenda-time { width: 110px; flex: none; color: var(--text-mid); font-size: var(--fs-sm); }
+.cal-agenda-time { width: 104px; flex: none; color: var(--text-mid); font-size: var(--fs-sm); white-space: nowrap; }
 .cal-dot { width: 8px; height: 8px; border-radius: var(--r-full); flex: none; }
 .cal-agenda-row .dim .icon { width: 12px; height: 12px; vertical-align: -2px; margin-right: 3px; }
 

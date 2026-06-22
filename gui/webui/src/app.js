@@ -325,13 +325,13 @@ function toDate(s) {
 function fmtDate(s) {
   const d = toDate(s); if (!d) return s ? String(s) : "";
   const now = Date.now(), diff = now - d.getTime();
-  if (diff < 864e5 && d.getDate() === new Date().getDate()) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (diff < 864e5 && d.getDate() === new Date().getDate()) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
   if (diff < 6048e5) return d.toLocaleDateString([], { weekday: "short" });
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 function fmtFullDate(s) {
   const d = toDate(s); if (!d) return s ? String(s) : "";
-  return d.toLocaleString([], { weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleString([], { weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 // Parse an RFC 5322 address ("Name <user@host>" or bare "user@host").
 function parseAddr(s) {
@@ -448,7 +448,14 @@ function renderShell() {
         class: "nav-item" + (App.route === s.id ? " active" : ""),
         style: `--svc: var(--svc-${s.id})`,
         dataset: { service: s.id },
-        onclick: () => go(s.id),
+        onclick: () => {
+          // Re-click on the already-active service collapses/expands its
+          // sidebar sub-filters (live.com-style); otherwise navigate.
+          if (App.route === s.id) {
+            const sn = document.getElementById("subnav-" + s.id);
+            if (sn) { const c = sn.classList.toggle("collapsed"); item.classList.toggle("nav-collapsed", c); }
+          } else go(s.id);
+        },
       },
         icon(s.icon),
         el("span", { class: "label", text: s.label }),
@@ -1530,7 +1537,7 @@ function evDate(dt, tz) {
 const ymd = (d) => d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate();
 const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
 function startOfWeek(d) { const x = startOfDay(d); const dow = (x.getDay() + 6) % 7; x.setDate(x.getDate() - dow); return x; } // Monday
-const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 
 async function renderCalendarView(view) {
   Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda"; Cal.stateFilter = "all";
