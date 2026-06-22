@@ -2003,6 +2003,14 @@ function calRenderMetrics() {
 const eventColor = (ev) => (Cal.calColor && Cal.calColor.get(ev.calId)) || "var(--svc-calendar)";
 // human-readable recurrence summary for the detail sheet (#565 B5)
 const DOW_MAP = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+// Graph reminderMinutesBeforeStart → human text ("15 minutes before" / "1 hour before").
+function reminderText(m) {
+  if (m == null) return null;
+  if (m <= 0) return "At start";
+  if (m % 1440 === 0) { const d = m / 1440; return `${d} day${d > 1 ? "s" : ""} before`; }
+  if (m % 60 === 0) { const h = m / 60; return `${h} hour${h > 1 ? "s" : ""} before`; }
+  return `${m} minutes before`;
+}
 function recurText(rec) {
   if (!rec) return null;
   const p = rec.pattern || {}, r = rec.range || {}, iv = p.interval || 1, t = p.type || "";
@@ -2227,6 +2235,8 @@ async function openEventSheet(ev) {
     if (full.importance && full.importance !== "normal") add("Importance", full.importance, "shield");
     if (full.isCancelled) add("Status", "Cancelled", "x");
     if (full.hasAttachments) add("Attachments", "Backed up with the event", "paperclip");
+    if (full.isReminderOn && full.reminderMinutesBeforeStart != null) add("Reminder", reminderText(full.reminderMinutesBeforeStart), "clock");
+    if ((full.type === "occurrence" || full.type === "exception") && !full.recurrence) add("Series", "Part of a recurring series", "rotate-ccw");
     // event description is HTML → extract plain text safely (DOMParser runs no scripts, loads nothing)
     const html = (full.body || {}).content || "";
     const tail = [];
