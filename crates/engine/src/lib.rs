@@ -22,6 +22,7 @@ mod calendar_live;
 mod contacts_live;
 mod mail_live;
 mod mail_restore;
+mod onenote_live;
 mod restore_calendar;
 mod restore_contacts;
 mod restore_key;
@@ -37,6 +38,7 @@ pub use mail_restore::{
     pending_mail_restore_count, recover_pending_mail_restores, recover_pending_mail_restores_with,
     restore_mail_via_ledger, MailApi, MailSink,
 };
+pub use onenote_live::{page_writer, PageWriter};
 pub use restore_calendar::{
     pending_calendar_restore_count, recover_pending_calendar_restores,
     recover_pending_calendar_restores_with, restore_calendar_via_ledger, CalendarApi, CalendarSink,
