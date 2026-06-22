@@ -887,6 +887,10 @@ impl GraphClient {
             .client
             .post(&url)
             .bearer_auth(&self.token)
+            // An explicit empty body forces `Content-Length: 0`; without it some
+            // Graph endpoints (e.g. `/messages/{id}/send`) reject the POST with
+            // HTTP 411 Length Required.
+            .body(Vec::<u8>::new())
             .send()
             .map_err(|e| UploadError::Transport(e.to_string()))?;
         match resp.status().as_u16() {
