@@ -1575,6 +1575,7 @@ function renderMailReader(it, remoteImages = false) {
           (p.importance === "high" || p.importance === "low") ? el("span", { class: "mi-chip imp-" + p.importance, title: "Importance: " + p.importance }, icon("flag", "icon-sm"), p.importance === "high" ? "High" : "Low") : null,
           p.flag === "flagged" ? el("span", { class: "mi-chip flag-on", title: "Flagged for follow-up" }, icon("flag", "icon-sm"), "Flagged") : null,
           p.isRead === false ? el("span", { class: "mi-chip unread-chip", title: "Unread" }, "Unread") : null,
+          p.inferenceClassification === "other" ? el("span", { class: "mi-chip", title: "Arrived in Other (not the Focused inbox)" }, icon("inbox", "icon-sm"), "Other") : null,
           coverageBadge(it),
           verifyChip(it)),
         el("h2", { class: "mr-subject", text: subject }),
