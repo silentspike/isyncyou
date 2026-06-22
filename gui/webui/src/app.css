@@ -1197,3 +1197,13 @@ a.note-meta-chip:hover { color: var(--accent); }
 .mi-chip.imp-low { color: var(--text-lo); }
 .mi-chip.flag-on { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 30%, transparent); }
 .mi-chip.unread-chip { color: var(--accent-2); border-color: var(--accent-line); }
+
+/* easter egg — Space Invaders */
+.inv-wrap { display: flex; flex-direction: column; gap: 12px; max-width: 560px; margin: 0 auto; }
+.inv-canvas {
+  display: block; width: 100%; height: calc(100dvh - 188px); min-height: 360px;
+  border-radius: 16px; border: 1px solid var(--border);
+  background: transparent;   /* let the global animated constellation show through */
+  touch-action: none;
+}
+/* movement is touch-drag (mobile) or ← → (desktop); fire is automatic */

@@ -472,6 +472,146 @@ function toast(msg, kind = "ok") {
 }
 
 /* ---------------------------------------------------------------- shell render */
+/* ---------------------------------------------------------------- easter egg 🛸 */
+// 5 taps on the Settings "about" line toggle a hidden UFO nav item that opens a
+// tiny Space Invaders game. State persists in localStorage; 5 more taps hide it.
+const eggOn = () => { try { return localStorage.getItem("isy_egg") === "1"; } catch (_) { return false; } };
+let _eggTaps = 0, _eggTapT = 0;
+function eggTap() {
+  clearTimeout(_eggTapT);
+  _eggTapT = setTimeout(() => { _eggTaps = 0; }, 1500);   // taps must be in quick succession
+  if (++_eggTaps < 5) return;
+  _eggTaps = 0;
+  const on = !eggOn();
+  try { localStorage.setItem("isy_egg", on ? "1" : "0"); } catch (_) { }
+  toast(on ? "UFO unlocked — check the nav" : "UFO hidden");
+  if (!on && App.route === "invaders") { go("overview"); return; }
+  renderShell();
+}
+// custom UFO glyph (mirrors icon(): an <svg class="icon"> with stroke:currentColor)
+function ufoGlyph(cls = "icon") {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", cls);
+  svg.innerHTML = '<ellipse cx="12" cy="13" rx="9" ry="3.4"/>' +
+    '<path d="M7.5 11.3C7.5 9 9.5 7.2 12 7.2s4.5 1.8 4.5 4.1"/>' +
+    '<path d="M6 15.6 4.6 18.6M12 16.5V19.3M18 15.6 19.4 18.6"/>';
+  return svg;
+}
+// a tiny, self-contained Space Invaders on a <canvas>. Keyboard (← → space) on
+// desktop, on-screen buttons + tap on touch. Self-stops when its canvas leaves
+// the DOM (route change), removing its window listeners.
+function renderInvaders(view) {
+  clear(view).append(
+    el("h1", { class: "view-title", text: "Invaders" }),
+    el("p", { class: "view-sub", text: "drag to move · auto-fire · defend the archive" }),
+    el("div", { class: "inv-wrap" },
+      el("canvas", { id: "inv-canvas", class: "inv-canvas" })));
+  invadersGame(document.getElementById("inv-canvas"));
+}
+function invadersGame(canvas) {
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d"), dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let W = 0, H = 0, player, bullets, foes, parts, dir, base, score, state, level, raf = 0, lastShot = 0;
+  function fit() {
+    const r = canvas.getBoundingClientRect();
+    W = Math.max(240, r.width); H = Math.max(300, r.height);
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  function spawnFoes() {
+    foes = []; bullets = []; dir = 1;
+    base = 0.4 + (level - 1) * 0.3;                                  // faster each level
+    const hp = 1 + Math.floor((level - 1) / 2);                      // tougher every 2 levels
+    const cols = Math.max(4, Math.min(9, Math.floor((W - 40) / 44)));
+    const rows = Math.min(3 + level, 6);                            // more rows each level
+    const gx = (W - cols * 44) / 2 + 22;
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) foes.push({ x: gx + c * 44, y: 42 + r * 32, w: 26, h: 16, alive: true, hp, maxhp: hp });
+  }
+  function reset() {
+    player = { x: W / 2, y: H - 24, w: 30, h: 12 }; targetX = W / 2; targetY = H - 24; parts = []; score = 0; level = 1; state = "play";
+    spawnFoes();
+  }
+  function nextLevel() { level++; spawnFoes(); }
+  const keys = { left: false, right: false, up: false, down: false };
+  let dragging = false, targetX = 0, targetY = 0;
+  const onKey = (e, d) => {
+    if (e.key === "ArrowLeft") keys.left = d; else if (e.key === "ArrowRight") keys.right = d;
+    else if (e.key === "ArrowUp") keys.up = d; else if (e.key === "ArrowDown") keys.down = d; else return;
+    e.preventDefault();
+  };
+  const kd = (e) => onKey(e, true), ku = (e) => onKey(e, false);
+  window.addEventListener("keydown", kd); window.addEventListener("keyup", ku);
+  const aim = (e) => { const r = canvas.getBoundingClientRect(); targetX = e.clientX - r.left; targetY = e.clientY - r.top; };
+  canvas.addEventListener("pointerdown", (e) => { if (state !== "play") { reset(); return; } dragging = true; aim(e); });
+  canvas.addEventListener("pointermove", (e) => { if (dragging && state === "play") aim(e); });
+  ["pointerup", "pointerleave", "pointercancel"].forEach(ev => canvas.addEventListener(ev, () => { dragging = false; }));
+  function boom(x, y) {                                               // explosion burst on a hit
+    for (let i = 0; i < 12; i++) {
+      const a = Math.random() * 6.2832, s = 1 + Math.random() * 3;
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1, col: Math.random() > 0.5 ? "#a78bfa" : "#fde68a" });
+    }
+  }
+  function drawShip(x, y, now) {
+    ctx.save(); ctx.translate(x, y);
+    const fl = 7 + 3 * Math.abs(Math.sin(now * 0.02));               // flickering thruster
+    ctx.fillStyle = "#fb923c"; ctx.beginPath(); ctx.moveTo(-3.5, 4); ctx.lineTo(0, 4 + fl); ctx.lineTo(3.5, 4); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#6366f1"; ctx.beginPath();                      // wings
+    ctx.moveTo(-7, 1); ctx.lineTo(-15, 7); ctx.lineTo(-4, 5); ctx.closePath();
+    ctx.moveTo(7, 1); ctx.lineTo(15, 7); ctx.lineTo(4, 5); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#3b9eff"; ctx.beginPath();                      // fuselage
+    ctx.moveTo(0, -15); ctx.quadraticCurveTo(7, -5, 7, 5); ctx.lineTo(-7, 5); ctx.quadraticCurveTo(-7, -5, 0, -15); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#e0f2fe"; ctx.beginPath(); ctx.arc(0, -4, 2.6, 0, 6.2832); ctx.fill();   // cockpit
+    ctx.restore();
+  }
+  function drawFoe(f) {
+    ctx.globalAlpha = 0.45 + 0.55 * (f.hp / f.maxhp);               // damaged foes fade
+    ctx.fillStyle = "#a78bfa"; ctx.beginPath(); ctx.ellipse(f.x, f.y + 2, f.w / 2, f.h / 3, 0, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = "#c7d2fe"; ctx.beginPath(); ctx.ellipse(f.x, f.y - 2, f.w / 4, f.h / 3, 0, 0, 6.2832); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  function step(now) {
+    if (!canvas.isConnected) { cancelAnimationFrame(raf); window.removeEventListener("keydown", kd); window.removeEventListener("keyup", ku); return; }
+    if (state === "play") {
+      if (keys.left) targetX -= 6; if (keys.right) targetX += 6;
+      if (keys.up) targetY -= 6; if (keys.down) targetY += 6;
+      targetX = Math.max(player.w / 2, Math.min(W - player.w / 2, targetX));
+      targetY = Math.max(24, Math.min(H - 16, targetY));
+      player.x += (targetX - player.x) * 0.35;                       // ease toward the finger
+      player.y += (targetY - player.y) * 0.35;                       // full 2D follow
+      if (now - lastShot > 320) { bullets.push({ x: player.x, y: player.y - 14 }); lastShot = now; }   // auto-fire
+      bullets.forEach(b => b.y -= 7);
+      let lo = W, hi = 0, low = 0, n = 0;
+      foes.forEach(f => { if (f.alive) { n++; lo = Math.min(lo, f.x - f.w / 2); hi = Math.max(hi, f.x + f.w / 2); low = Math.max(low, f.y + f.h / 2); } });
+      if (n === 0) nextLevel();   // cleared → next level (faster, more, tougher)
+      const sp = base + (foes.length - n) * 0.05;
+      let drop = (dir > 0 && hi + sp > W - 6) || (dir < 0 && lo - sp < 6);
+      foes.forEach(f => { if (f.alive) { if (drop) f.y += 14; else f.x += dir * sp; } });
+      if (drop) dir *= -1;
+      if (low >= H - 16 && n > 0) state = "over";                    // foes reached the bottom
+      foes.forEach(f => { if (f.alive && Math.abs(f.x - player.x) < f.w / 2 + 10 && Math.abs(f.y - player.y) < f.h / 2 + 8) state = "over"; });   // flew into a foe
+      bullets.forEach(b => foes.forEach(f => { if (f.alive && b.y > -10 && Math.abs(b.x - f.x) < f.w / 2 && Math.abs(b.y - f.y) < f.h / 2) { b.y = -99; f.hp--; boom(f.x, f.y); if (f.hp <= 0) { f.alive = false; score += 10; } else { score += 2; } } }));
+      bullets = bullets.filter(b => b.y > -10);
+    }
+    parts.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 0.045; });
+    parts = parts.filter(p => p.life > 0);
+    ctx.clearRect(0, 0, W, H);
+    foes.forEach(f => { if (f.alive) drawFoe(f); });
+    drawShip(player.x, player.y, now);
+    ctx.fillStyle = "#fde68a"; bullets.forEach(b => ctx.fillRect(b.x - 1.5, b.y - 8, 3, 10));
+    parts.forEach(p => { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, 2.6 * p.life + 0.6, 0, 6.2832); ctx.fill(); });
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#c7d2fe"; ctx.font = "14px system-ui,sans-serif"; ctx.textAlign = "left"; ctx.fillText("Score " + score + "   ·   Level " + level, 12, 22);
+    if (state !== "play") {
+      ctx.fillStyle = "rgba(5,6,20,.55)"; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = "center"; ctx.fillStyle = "#fff"; ctx.font = "700 26px system-ui,sans-serif";
+      ctx.fillText("Game over · Level " + level, W / 2, H / 2 - 6);
+      ctx.font = "14px system-ui,sans-serif"; ctx.fillStyle = "#c7d2fe";
+      ctx.fillText("Score " + score + " · tap or space to replay", W / 2, H / 2 + 20);
+    }
+    raf = requestAnimationFrame(step);
+  }
+  fit(); reset(); raf = requestAnimationFrame(step);
+}
+
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const nav = el("nav", { class: "nav" },
@@ -527,7 +667,9 @@ function renderShell() {
         icon("shield"), el("span", { class: "label", text: "Alerts" }),
         el("span", { class: "nav-meta" }, el("span", { id: "alerts-badge", class: "count", text: "·" }))),
       el("button", { id: "nav-settings", class: "nav-item" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") },
-        icon("settings"), el("span", { class: "label", text: "Settings" }))),
+        icon("settings"), el("span", { class: "label", text: "Settings" })),
+      eggOn() ? el("button", { id: "nav-ufo", class: "nav-item" + (App.route === "invaders" ? " active" : ""), title: "Invaders", onclick: () => go("invaders") },
+        ufoGlyph(), el("span", { class: "label", text: "Invaders" })) : null),
     el("div", { id: "sync-widget", class: "sync-widget" }),
   );
   const topbar = el("header", { class: "topbar" },
@@ -597,7 +739,7 @@ function updateNavCounts() {
 
 /* ---------------------------------------------------------------- router */
 function go(route) { location.hash = "#/" + route; }
-const EXTRA_ROUTES = { search: "Search", settings: "Settings" };
+const EXTRA_ROUTES = { search: "Search", settings: "Settings", invaders: "Invaders" };
 const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
   // Preserve the scroll position across a SAME-route re-render (e.g. an SSE
@@ -610,6 +752,7 @@ function onRoute() {
   App.route = raw.split("?")[0];
   App.query = (raw.split("?")[1] || "").replace(/^q=/, "");
   if (!SERVICES.find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
+  if (App.route === "invaders" && !eggOn()) App.route = "overview";   // egg-gated route
   // Close any open overlay (detail sheet / command palette) on a real navigation
   // so it can't leak across routes; a same-route refresh keeps it open.
   if (App.route !== prevRoute) { closeSheet(); closePalette(); }
@@ -625,6 +768,7 @@ function onRoute() {
   else if (App.route === "onenote") p = renderOnenoteView(view);
   else if (App.route === "search") p = renderSearchView(view);
   else if (App.route === "settings") p = renderSettingsView(view);
+  else if (App.route === "invaders") p = renderInvaders(view);
   else p = renderServiceView(view, App.route);
   if (prevScroll && App.route === prevRoute) {
     const restore = () => { const v = $("#view"); if (v && v.scrollHeight > v.clientHeight) v.scrollTop = prevScroll; };
@@ -3151,7 +3295,7 @@ async function renderSettingsView(view) {
     }
     body.append(syncCard);
     body.append(el("div", { class: "card", style: "display:flex;align-items:center;gap:16px" }, logoGlyph(48),
-      el("div", {}, el("div", { style: "font-size:16px;font-weight:700", html: "iSync<span style='background:var(--grad-accent);-webkit-background-clip:text;background-clip:text;color:transparent'>You</span>" }),
+      el("div", { onclick: eggTap }, el("div", { style: "font-size:16px;font-weight:700", html: "iSync<span style='background:var(--grad-accent);-webkit-background-clip:text;background-clip:text;color:transparent'>You</span>" }),
         el("div", { class: "dim", text: "Microsoft 365 personal backup & archive" }))));
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load settings" }), el("p", { text: e.message }))); }
 }
