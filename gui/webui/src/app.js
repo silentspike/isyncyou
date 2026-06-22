@@ -566,22 +566,33 @@ function go(route) { location.hash = "#/" + route; }
 const EXTRA_ROUTES = { search: "Search", settings: "Settings" };
 const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
+  // Preserve the scroll position across a SAME-route re-render (e.g. an SSE
+  // "change" tick / a live update) so the user isn't bounced back to the top of
+  // a long page mid-scroll. Navigation to a different route starts at the top.
+  const prevView = $("#view");
+  const prevScroll = prevView ? prevView.scrollTop : 0;
+  const prevRoute = App.route;
   const raw = location.hash.replace(/^#\//, "") || "overview";
   App.route = raw.split("?")[0];
   App.query = (raw.split("?")[1] || "").replace(/^q=/, "");
   if (!SERVICES.find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
   renderShell();
   const view = $("#view");
-  if (App.route === "overview") renderOverview(view);
-  else if (App.route === "mail") renderMailView(view);
-  else if (App.route === "onedrive") renderOnedriveView(view);
-  else if (App.route === "calendar") renderCalendarView(view);
-  else if (App.route === "contacts") renderContactsView(view);
-  else if (App.route === "todo") renderTodoView(view);
-  else if (App.route === "onenote") renderOnenoteView(view);
-  else if (App.route === "search") renderSearchView(view);
-  else if (App.route === "settings") renderSettingsView(view);
-  else renderServiceView(view, App.route);
+  let p;
+  if (App.route === "overview") p = renderOverview(view);
+  else if (App.route === "mail") p = renderMailView(view);
+  else if (App.route === "onedrive") p = renderOnedriveView(view);
+  else if (App.route === "calendar") p = renderCalendarView(view);
+  else if (App.route === "contacts") p = renderContactsView(view);
+  else if (App.route === "todo") p = renderTodoView(view);
+  else if (App.route === "onenote") p = renderOnenoteView(view);
+  else if (App.route === "search") p = renderSearchView(view);
+  else if (App.route === "settings") p = renderSettingsView(view);
+  else p = renderServiceView(view, App.route);
+  if (prevScroll && App.route === prevRoute) {
+    const restore = () => { const v = $("#view"); if (v && v.scrollHeight > v.clientHeight) v.scrollTop = prevScroll; };
+    if (p && typeof p.then === "function") p.then(restore); else restore();
+  }
 }
 
 /* ---------------------------------------------------------------- overview (dashboard showpiece) */
