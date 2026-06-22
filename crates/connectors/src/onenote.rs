@@ -23,12 +23,14 @@ use std::collections::HashSet;
 use std::path::Path;
 
 const SERVICE: &str = "onenote";
-// The default OneNote page projection is already rich (title, createdDateTime,
-// lastModifiedDateTime, level, order, userTags, links{oneNoteClientUrl/WebUrl},
-// parentSection{id,displayName}, parentNotebook{id,displayName}) — so no narrowing
-// `$select` (which would have to re-list the parent navigation props and risks
-// dropping them). The full page JSON is archived to the `_pagemeta_<id>` sidecar.
-const PAGES_URL: &str = "https://graph.microsoft.com/v1.0/me/onenote/pages?$top=100";
+// The flat `/me/onenote/pages` list returns title/createdDateTime/links +
+// `parentSection` by default, but NOT `parentNotebook` (live-verified, #568 A8).
+// `$expand` BOTH parents to keep the section (the page's grouping parent) AND get
+// the notebook name for display — expanding only one drops the other. No narrowing
+// `$select` (the default scalar fields are exactly what's needed). `level`/`order`/
+// `userTags` are page-positional/tag-derived and Graph omits them for a plain page;
+// they're captured into the `_pagemeta_<id>` sidecar whenever Graph does return them.
+const PAGES_URL: &str = "https://graph.microsoft.com/v1.0/me/onenote/pages?$top=100&$expand=parentSection($select=id,displayName),parentNotebook($select=id,displayName)";
 
 /// Archive a page's rich Graph metadata JSON to `onenote/<shard>/_pagemeta_<id>.json`
 /// (atomic tmp+rename) so the webui can surface level/order/userTags/createdDateTime/
