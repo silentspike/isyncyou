@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      js: ${{ steps.filter.outputs.js }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
@@ -38,6 +39,11 @@ jobs:
               - 'deny.toml'
               - 'rust-toolchain.toml'
               - '.github/workflows/**'
+              # the web UI (app.js/app.css/index.html) is embedded into the daemon
+              # via include_str!, so a change there must run the Rust build + tests.
+              - 'gui/webui/**'
+            js:
+              - 'gui/webui/**/*.js'
 
   dev-checks:
     name: dev-checks
@@ -69,6 +75,22 @@ jobs:
       - name: Unit tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test --workspace
+
+  # The web UI is hand-written vanilla JS embedded into the daemon via include_str!.
+  # A syntax error still *compiles* (it is just a string to Rust) and only blows up
+  # at runtime in the browser, so parse-check it here on every JS change.
+  js-check:
+    name: js-check
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: No web-UI JS changes — skip
+        if: needs.changes.outputs.js != 'true'
+        run: echo "No gui/webui JS changes in this PR — node --check skipped."
+      - name: Syntax-check the embedded web UI
+        if: needs.changes.outputs.js == 'true'
+        run: node --check gui/webui/src/app.js
 
   # MSRV drift guard (#408): build with the *declared* rust-version so a dependency
   # bump that silently raises the real minimum compiler fails the PR instead of
