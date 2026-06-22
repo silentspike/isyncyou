@@ -542,7 +542,14 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
         let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
         isyncyou_engine::MailWriter::set_read(&w, message_id, is_read)
     }
-    fn set_flag(&self, account: &str, message_id: &str, flag_status: &str, due: Option<&str>, tz: &str) -> Result<(), String> {
+    fn set_flag(
+        &self,
+        account: &str,
+        message_id: &str,
+        flag_status: &str,
+        due: Option<&str>,
+        tz: &str,
+    ) -> Result<(), String> {
         let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
         isyncyou_engine::MailWriter::set_flag(&w, message_id, flag_status, due, tz)
     }

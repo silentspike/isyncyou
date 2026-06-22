@@ -1478,7 +1478,8 @@ mod tests {
         let b = flag_body("flagged", Some("2026-07-01T09:00:00"), "Europe/Vienna");
         let f = &b["flag"];
         assert_eq!(f["flagStatus"], "flagged");
-        let dt = serde_json::json!({ "dateTime": "2026-07-01T09:00:00", "timeZone": "Europe/Vienna" });
+        let dt =
+            serde_json::json!({ "dateTime": "2026-07-01T09:00:00", "timeZone": "Europe/Vienna" });
         assert_eq!(f["dueDateTime"], dt);
         assert_eq!(f["startDateTime"], dt);
     }
