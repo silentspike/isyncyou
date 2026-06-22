@@ -1199,7 +1199,8 @@ a.note-meta-chip:hover { color: var(--accent); }
 .mi-chip.unread-chip { color: var(--accent-2); border-color: var(--accent-line); }
 
 /* easter egg — Space Invaders */
-.inv-wrap { display: flex; flex-direction: column; gap: 12px; max-width: 560px; margin: 0 auto; }
+.inv-wrap { position: relative; display: flex; flex-direction: column; gap: 12px; max-width: 560px; margin: 0 auto; }
+.inv-sfx { position: absolute; top: 10px; left: 10px; z-index: 3; }
 .inv-canvas {
   display: block; width: 100%; height: calc(100dvh - 188px); min-height: 360px;
   border-radius: 16px; border: 1px solid var(--border);

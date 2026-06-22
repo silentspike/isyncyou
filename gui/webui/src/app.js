@@ -500,11 +500,51 @@ function ufoGlyph(cls = "icon") {
 // a tiny, self-contained Space Invaders on a <canvas>. Keyboard (← → space) on
 // desktop, on-screen buttons + tap on touch. Self-stops when its canvas leaves
 // the DOM (route change), removing its window listeners.
+// game sound: ElevenLabs-generated SFX served same-origin from /sfx/*.mp3, fetched
+// once and played via Web Audio (so CSP media-src isn't needed). Toggle persists.
+const SFX = {
+  ctx: null, buf: {}, ready: false,
+  on() { try { return localStorage.getItem("isy_sfx") !== "0"; } catch (_) { return true; } },   // default on
+  toggle() { try { localStorage.setItem("isy_sfx", this.on() ? "0" : "1"); } catch (_) { } return this.on(); },
+  async init() {
+    if (this.ctx) return;
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = { shoot: "/sfx/shoot.mp3", boom: "/sfx/boom.mp3", level: "/sfx/level.mp3" };
+      for (const k in src) this.buf[k] = await this.ctx.decodeAudioData(await (await fetch(src[k])).arrayBuffer());
+      this.ready = true;
+    } catch (_) { }
+  },
+  resume() { try { if (this.ctx && this.ctx.state === "suspended") this.ctx.resume(); } catch (_) { } },
+  play(name, gain = 0.5) {
+    if (!this.ready || !this.on() || !this.ctx || !this.buf[name]) return;
+    try {
+      const s = this.ctx.createBufferSource(); s.buffer = this.buf[name];
+      const g = this.ctx.createGain(); g.gain.value = gain;
+      s.connect(g); g.connect(this.ctx.destination); s.start();
+    } catch (_) { }
+  },
+};
+function speakerGlyph(on, cls = "icon-sm") {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", cls);
+  svg.innerHTML = '<path d="M4 9v6h4l5 4V5L8 9H4z"/>' + (on
+    ? '<path d="M16 8.5a4.5 4.5 0 0 1 0 7M18.5 6a8 8 0 0 1 0 12"/>'
+    : '<path d="M22 9.5l-5 5M17 9.5l5 5"/>');
+  return svg;
+}
+function invToggleSfx() {
+  const on = SFX.toggle();
+  const b = document.getElementById("sfx-toggle");
+  if (b) { b.innerHTML = ""; b.append(speakerGlyph(on)); b.title = on ? "Sound on" : "Sound off"; }
+  if (on) { SFX.resume(); SFX.init().then(() => SFX.resume()); toast("Sound on"); } else toast("Sound off");
+}
 function renderInvaders(view) {
   clear(view).append(
     el("h1", { class: "view-title", text: "Invaders" }),
     el("p", { class: "view-sub", text: "drag to move · auto-fire · defend the archive" }),
     el("div", { class: "inv-wrap" },
+      el("button", { id: "sfx-toggle", class: "btn ghost sm icon-only inv-sfx", title: SFX.on() ? "Sound on" : "Sound off", onclick: invToggleSfx }, speakerGlyph(SFX.on())),
       el("canvas", { id: "inv-canvas", class: "inv-canvas" })));
   invadersGame(document.getElementById("inv-canvas"));
 }
@@ -530,7 +570,7 @@ function invadersGame(canvas) {
     player = { x: W / 2, y: H - 24, w: 30, h: 12 }; targetX = W / 2; targetY = H - 24; parts = []; score = 0; level = 1; state = "play";
     spawnFoes();
   }
-  function nextLevel() { level++; spawnFoes(); }
+  function nextLevel() { level++; spawnFoes(); SFX.play("level", 0.6); }
   const keys = { left: false, right: false, up: false, down: false };
   let dragging = false, targetX = 0, targetY = 0;
   const onKey = (e, d) => {
@@ -538,10 +578,10 @@ function invadersGame(canvas) {
     else if (e.key === "ArrowUp") keys.up = d; else if (e.key === "ArrowDown") keys.down = d; else return;
     e.preventDefault();
   };
-  const kd = (e) => onKey(e, true), ku = (e) => onKey(e, false);
+  const kd = (e) => { SFX.resume(); onKey(e, true); }, ku = (e) => onKey(e, false);
   window.addEventListener("keydown", kd); window.addEventListener("keyup", ku);
   const aim = (e) => { const r = canvas.getBoundingClientRect(); targetX = e.clientX - r.left; targetY = e.clientY - r.top; };
-  canvas.addEventListener("pointerdown", (e) => { if (state !== "play") { reset(); return; } dragging = true; aim(e); });
+  canvas.addEventListener("pointerdown", (e) => { SFX.resume(); if (state !== "play") { reset(); return; } dragging = true; aim(e); });
   canvas.addEventListener("pointermove", (e) => { if (dragging && state === "play") aim(e); });
   ["pointerup", "pointerleave", "pointercancel"].forEach(ev => canvas.addEventListener(ev, () => { dragging = false; }));
   function boom(x, y) {                                               // explosion burst on a hit
@@ -577,7 +617,7 @@ function invadersGame(canvas) {
       targetY = Math.max(24, Math.min(H - 16, targetY));
       player.x += (targetX - player.x) * 0.35;                       // ease toward the finger
       player.y += (targetY - player.y) * 0.35;                       // full 2D follow
-      if (now - lastShot > 320) { bullets.push({ x: player.x, y: player.y - 14 }); lastShot = now; }   // auto-fire
+      if (now - lastShot > 320) { bullets.push({ x: player.x, y: player.y - 14 }); lastShot = now; SFX.play("shoot", 0.22); }   // auto-fire
       bullets.forEach(b => b.y -= 7);
       let lo = W, hi = 0, low = 0, n = 0;
       foes.forEach(f => { if (f.alive) { n++; lo = Math.min(lo, f.x - f.w / 2); hi = Math.max(hi, f.x + f.w / 2); low = Math.max(low, f.y + f.h / 2); } });
@@ -588,7 +628,7 @@ function invadersGame(canvas) {
       if (drop) dir *= -1;
       if (low >= H - 16 && n > 0) state = "over";                    // foes reached the bottom
       foes.forEach(f => { if (f.alive && Math.abs(f.x - player.x) < f.w / 2 + 10 && Math.abs(f.y - player.y) < f.h / 2 + 8) state = "over"; });   // flew into a foe
-      bullets.forEach(b => foes.forEach(f => { if (f.alive && b.y > -10 && Math.abs(b.x - f.x) < f.w / 2 && Math.abs(b.y - f.y) < f.h / 2) { b.y = -99; f.hp--; boom(f.x, f.y); if (f.hp <= 0) { f.alive = false; score += 10; } else { score += 2; } } }));
+      bullets.forEach(b => foes.forEach(f => { if (f.alive && b.y > -10 && Math.abs(b.x - f.x) < f.w / 2 && Math.abs(b.y - f.y) < f.h / 2) { b.y = -99; f.hp--; boom(f.x, f.y); if (f.hp <= 0) { f.alive = false; score += 10; SFX.play("boom", 0.5); } else { score += 2; } } }));
       bullets = bullets.filter(b => b.y > -10);
     }
     parts.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 0.045; });
@@ -599,7 +639,7 @@ function invadersGame(canvas) {
     ctx.fillStyle = "#fde68a"; bullets.forEach(b => ctx.fillRect(b.x - 1.5, b.y - 8, 3, 10));
     parts.forEach(p => { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, 2.6 * p.life + 0.6, 0, 6.2832); ctx.fill(); });
     ctx.globalAlpha = 1;
-    ctx.fillStyle = "#c7d2fe"; ctx.font = "14px system-ui,sans-serif"; ctx.textAlign = "left"; ctx.fillText("Score " + score + "   ·   Level " + level, 12, 22);
+    ctx.fillStyle = "#c7d2fe"; ctx.font = "14px system-ui,sans-serif"; ctx.textAlign = "left"; ctx.fillText("Score " + score + "   ·   Level " + level, 52, 22);
     if (state !== "play") {
       ctx.fillStyle = "rgba(5,6,20,.55)"; ctx.fillRect(0, 0, W, H);
       ctx.textAlign = "center"; ctx.fillStyle = "#fff"; ctx.font = "700 26px system-ui,sans-serif";
@@ -609,7 +649,7 @@ function invadersGame(canvas) {
     }
     raf = requestAnimationFrame(step);
   }
-  fit(); reset(); raf = requestAnimationFrame(step);
+  fit(); reset(); SFX.init(); raf = requestAnimationFrame(step);
 }
 
 function renderShell() {

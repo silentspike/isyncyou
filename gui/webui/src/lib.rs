@@ -43,6 +43,21 @@ const APP_JS: &str = include_str!("app.js");
 /// Embedded Inter variable font (SIL OFL 1.1), served same-origin from `/app.woff2`
 /// so the premium typography needs no web-font request (CSP `font-src 'self'`).
 const APP_FONT: &[u8] = include_bytes!("assets/inter-var.woff2");
+/// Easter-egg game sound effects (generated with ElevenLabs), served same-origin
+/// from `/sfx/*.mp3` and fetched + decoded via Web Audio (`connect-src 'self'`).
+const SFX_SHOOT: &[u8] = include_bytes!("assets/sfx-shoot.mp3");
+const SFX_BOOM: &[u8] = include_bytes!("assets/sfx-boom.mp3");
+const SFX_LEVEL: &[u8] = include_bytes!("assets/sfx-level.mp3");
+
+/// Serve an embedded MP3 sound effect (immutable within a version).
+fn audio_response(bytes: &[u8]) -> ApiResponse {
+    ApiResponse {
+        status: 200,
+        content_type: "audio/mpeg".into(),
+        body: bytes.to_vec(),
+        headers: vec![("Cache-Control".into(), "max-age=31536000".into())],
+    }
+}
 
 /// CSP for the app shell (`/`). `script-src 'self'` (no inline script) is the key
 /// defense; only our own same-origin `/app.js` runs. Allows our stylesheet + inline
@@ -906,6 +921,9 @@ impl Router {
                 // immutable binary asset → cache hard within a version
                 headers: vec![("Cache-Control".into(), "max-age=31536000".into())],
             },
+            "/sfx/shoot.mp3" => audio_response(SFX_SHOOT),
+            "/sfx/boom.mp3" => audio_response(SFX_BOOM),
+            "/sfx/level.mp3" => audio_response(SFX_LEVEL),
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
             "/api/v1/activity" => self.activity(req),
