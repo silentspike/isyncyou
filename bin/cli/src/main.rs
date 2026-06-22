@@ -1969,8 +1969,14 @@ fn backup_one_account(
                 )
             }
             "onenote" => {
-                let r = connectors::incremental_sync_onenote(&mut client, &store, account, &now)
-                    .map_err(|e| e.to_string())?;
+                let r = connectors::incremental_sync_onenote(
+                    &mut client,
+                    &store,
+                    account,
+                    &now,
+                    Some(&archive_root),
+                )
+                .map_err(|e| e.to_string())?;
                 let b = connectors::backup_onenote_bodies(
                     &client,
                     &store,
