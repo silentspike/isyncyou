@@ -1812,23 +1812,67 @@ function openDriveItem(it) {
       el("span", { class: "dim", text: (p.roles || []).join(", ") || "—" }))));
   }).catch(e => { clear(perm); perm.append(el("div", { class: "dim", text: "Access unavailable (" + e.message + ")" })); });
 }
+// format a Graph media duration (milliseconds) → "m:ss" / "h:mm:ss".
+function fmtDur(ms) {
+  if (!ms || ms <= 0) return null;
+  const s = Math.round(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  const mm = String(m).padStart(2, "0"), ss = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
 // #564 A5: render the rich metadata from the sidecar preview into the detail sheet.
+// Every DriveItem facet OneDrive can return is surfaced (no silent drops): core
+// facts, then per-medium sections (Photo/Video/Audio) and GPS, then hashes.
 function driveItemMeta(content, it) {
   const p = it.preview; if (!p) return;
+  const sec = (title) => content.append(el("h4", { class: "od-sec dim", text: title }));
   const rows = [];
   if (p.mime_type) rows.push(["Kind", p.mime_type]);
+  if (p.description) rows.push(["Description", p.description]);
+  if (p.created) rows.push(["Created", fmtFullDate(p.created)]);
   if (p.created_by) rows.push(["Created by", p.created_by]);
   if (p.last_modified_by) rows.push(["Modified by", p.last_modified_by]);
-  if (p.image && p.image.width) rows.push(["Dimensions", `${p.image.width} × ${p.image.height} px`]);
-  if (p.photo && p.photo.takenDateTime) rows.push(["Taken", fmtFullDate(p.photo.takenDateTime)]);
-  if (p.photo && p.photo.cameraModel) rows.push(["Camera", p.photo.cameraModel]);
   if (p.child_count != null) rows.push(["Items", String(p.child_count)]);
   if (p.package_type) rows.push(["Package", p.package_type]);
   if (p.special_folder) rows.push(["Special folder", p.special_folder]);
   if (p.shared) rows.push(["Sharing", "Shared with others"]);
   if (p.malware) rows.push(["Security", "Malware flagged by Microsoft"]);
-  if (p.sha256) rows.push(["SHA-256", p.sha256]);
   if (rows.length) content.append(kvList(rows));
+  // Photo / image — dimensions + EXIF (camera, aperture, focal length, ISO, exposure).
+  const img = p.image || {}, ph = p.photo || {}, photo = [];
+  if (img.width) photo.push(["Dimensions", `${img.width} × ${img.height} px`]);
+  if (ph.takenDateTime) photo.push(["Taken", fmtFullDate(ph.takenDateTime)]);
+  const cam = [ph.cameraMake, ph.cameraModel].filter(Boolean).join(" ");
+  if (cam) photo.push(["Camera", cam]);
+  if (ph.fNumber) photo.push(["Aperture", "ƒ/" + ph.fNumber]);
+  if (ph.focalLength) photo.push(["Focal length", ph.focalLength + " mm"]);
+  if (ph.iso) photo.push(["ISO", String(ph.iso)]);
+  if (ph.exposureDenominator) photo.push(["Exposure", "1/" + Math.round(ph.exposureDenominator) + " s"]);
+  if (photo.length) { sec("Photo"); content.append(kvList(photo)); }
+  // Video — dimensions, duration, bitrate.
+  const vid = p.video || {}, video = [];
+  if (vid.width) video.push(["Dimensions", `${vid.width} × ${vid.height} px`]);
+  if (vid.duration) video.push(["Duration", fmtDur(vid.duration)]);
+  if (vid.bitrate) video.push(["Bitrate", Math.round(vid.bitrate / 1000) + " kbps"]);
+  if (video.length) { sec("Video"); content.append(kvList(video)); }
+  // Audio — track tags.
+  const au = p.audio || {}, audio = [];
+  if (au.title) audio.push(["Title", au.title]);
+  if (au.artist) audio.push(["Artist", au.artist]);
+  if (au.album) audio.push(["Album", au.album]);
+  if (au.duration) audio.push(["Duration", fmtDur(au.duration)]);
+  if (au.year) audio.push(["Year", String(au.year)]);
+  if (audio.length) { sec("Audio"); content.append(kvList(audio)); }
+  // GPS — coordinates + altitude + a map link (external navigation, not a fetch).
+  const loc = p.location || {};
+  if (loc.latitude != null && loc.longitude != null) {
+    const lat = (+loc.latitude).toFixed(5), lon = (+loc.longitude).toFixed(5);
+    sec("Location");
+    const ll = [["Coordinates", `${lat}, ${lon}`]];
+    if (loc.altitude != null) ll.push(["Altitude", Math.round(loc.altitude) + " m"]);
+    content.append(kvList(ll));
+    content.append(el("a", { class: "btn ghost sm", style: "margin-top:8px", href: `https://www.bing.com/maps?cp=${lat}~${lon}&lvl=16`, target: "_blank", rel: "noopener" }, icon("map-pin", "icon-sm"), "View on map"));
+  }
+  if (p.sha256) { sec("Integrity"); content.append(kvList([["SHA-256", p.sha256]])); }
   if (p.web_url) content.append(el("a", { class: "btn ghost sm", style: "margin-top:8px", href: p.web_url, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open in OneDrive"));
 }
 function driveTile(it) {
@@ -1842,9 +1886,10 @@ function driveTile(it) {
   else
     thumb = el("div", { class: "drive-thumb", style: folder ? "" : `color:${fileColor(ext)}` }, icon(folder ? "folder" : fileIcon(ext), "icon-lg"));
   const pv = it.preview || {};
+  const folderMeta = pv.child_count != null ? `${pv.child_count} ${pv.child_count === 1 ? "item" : "items"}` : "Folder";
   tile.append(...[thumb,
     el("div", { class: "drive-name truncate", text: it.name || "(no name)" }),
-    el("div", { class: "drive-meta dim", text: folder ? "Folder" : [fmtSize(it.size), it.remote_mtime ? fmtDate(it.remote_mtime) : ""].filter(Boolean).join(" · ") }),
+    el("div", { class: "drive-meta dim", text: folder ? folderMeta : [fmtSize(it.size), it.remote_mtime ? fmtDate(it.remote_mtime) : ""].filter(Boolean).join(" · ") }),
     (!folder && pv.malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
     (!folder && pv.shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
     folder ? null : coverageBadge(it),
@@ -1859,7 +1904,7 @@ function driveRow(it) {
     el("span", { class: "drive-row-ico", style: folder ? "color:var(--svc-onedrive)" : `color:${fileColor(ext)}` }, icon(folder ? "folder" : fileIcon(ext))),
     el("div", { class: "grow" },
       el("div", { class: "truncate", text: it.name || "(no name)" }),
-      el("div", { class: "dim", style: "font-size:12px", text: folder ? "Folder" : (fmtSize(it.size) || "—") })),
+      el("div", { class: "dim", style: "font-size:12px", text: folder ? ((it.preview || {}).child_count != null ? `${it.preview.child_count} ${it.preview.child_count === 1 ? "item" : "items"}` : "Folder") : (fmtSize(it.size) || "—") })),
     (!folder && (it.preview || {}).malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
     (!folder && (it.preview || {}).shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
     folder ? null : coverageBadge(it),

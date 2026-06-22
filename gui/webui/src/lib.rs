@@ -346,7 +346,14 @@ pub trait MailWriteHandler: Send + Sync {
     /// Mark a message read/unread.
     fn set_read(&self, account: &str, message_id: &str, is_read: bool) -> Result<(), String>;
     /// Set/clear a follow-up flag (`notFlagged` / `flagged` / `complete`).
-    fn set_flag(&self, account: &str, message_id: &str, flag_status: &str, due: Option<&str>, tz: &str) -> Result<(), String>;
+    fn set_flag(
+        &self,
+        account: &str,
+        message_id: &str,
+        flag_status: &str,
+        due: Option<&str>,
+        tz: &str,
+    ) -> Result<(), String>;
     /// Replace a message's categories.
     fn set_categories(
         &self,
@@ -1905,7 +1912,11 @@ impl Router {
         let due = req.q("due").filter(|s| !s.is_empty());
         let tz = req.q("tz").filter(|s| !s.is_empty()).unwrap_or("UTC");
         let r = h.set_flag(account, id, status, due, tz);
-        self.mail_result(account, &format!("set_flag id={id} status={status} due={due:?}"), r)
+        self.mail_result(
+            account,
+            &format!("set_flag id={id} status={status} due={due:?}"),
+            r,
+        )
     }
 
     fn mail_categories(&self, req: &ApiRequest) -> ApiResponse {
@@ -3162,11 +3173,17 @@ fn onedrive_preview(o: &Value) -> Value {
     json!({
         "mime_type": o.pointer("/file/mimeType").and_then(Value::as_str),
         "sha256": o.pointer("/file/hashes/sha256Hash").and_then(Value::as_str),
+        "created": o.get("createdDateTime").and_then(Value::as_str),
         "created_by": o.pointer("/createdBy/user/displayName").and_then(Value::as_str),
         "last_modified_by": o.pointer("/lastModifiedBy/user/displayName").and_then(Value::as_str),
+        "description": o.get("description").and_then(Value::as_str),
         "web_url": o.get("webUrl").and_then(Value::as_str),
+        // Rich media facets passed through verbatim — the UI reads their fields
+        // (dimensions, EXIF, duration, track tags, GPS) so we never lose any.
         "image": o.get("image"),
         "photo": o.get("photo"),
+        "video": o.get("video"),
+        "audio": o.get("audio"),
         "location": o.get("location"),
         "shared": o.get("shared").is_some(),
         "malware": o.get("malware").is_some(),
@@ -3465,6 +3482,71 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn onedrive_preview_captures_all_rich_facets() {
+        // A DriveItem carrying every facet OneDrive can return — the preview must
+        // surface each one so the detail sheet never silently drops metadata (#564).
+        let o = json!({
+            "createdDateTime": "2026-01-02T03:04:05Z",
+            "description": "Sunset over the Alps",
+            "webUrl": "https://onedrive.live.com/x",
+            "createdBy": { "user": { "displayName": "Alice Admin" } },
+            "lastModifiedBy": { "user": { "displayName": "Bob Editor" } },
+            "file": { "mimeType": "image/jpeg", "hashes": { "sha256Hash": "ABC123" } },
+            "image": { "width": 4032, "height": 3024 },
+            "photo": { "takenDateTime": "2026-01-02T03:00:00Z", "cameraMake": "Google",
+                       "cameraModel": "Pixel 9 Pro", "iso": 100, "fNumber": 1.8, "focalLength": 6.9 },
+            "video": { "width": 1920, "height": 1080, "duration": 30000, "bitrate": 8_000_000 },
+            "audio": { "title": "Belgrade Nights", "artist": "DJ Rakija", "album": "Club Mix",
+                       "duration": 215_000 },
+            "location": { "latitude": 47.1, "longitude": 11.4, "altitude": 600.0 },
+            "shared": { "scope": "users" },
+            "malware": { "description": "trojan" },
+            "specialFolder": { "name": "photos" },
+            "folder": { "childCount": 7 },
+            "package": { "type": "oneNote" },
+        });
+        let p = onedrive_preview(&o);
+        assert_eq!(p["mime_type"], "image/jpeg");
+        assert_eq!(p["sha256"], "ABC123");
+        assert_eq!(p["created"], "2026-01-02T03:04:05Z");
+        assert_eq!(p["created_by"], "Alice Admin");
+        assert_eq!(p["last_modified_by"], "Bob Editor");
+        assert_eq!(p["description"], "Sunset over the Alps");
+        assert_eq!(p["web_url"], "https://onedrive.live.com/x");
+        assert_eq!(p["image"]["width"], 4032);
+        assert_eq!(p["photo"]["cameraModel"], "Pixel 9 Pro");
+        assert_eq!(p["photo"]["iso"], 100);
+        assert_eq!(p["video"]["duration"], 30000);
+        assert_eq!(p["video"]["width"], 1920);
+        assert_eq!(p["audio"]["title"], "Belgrade Nights");
+        assert_eq!(p["audio"]["duration"], 215_000);
+        assert_eq!(p["location"]["latitude"], 47.1);
+        assert_eq!(p["shared"], true);
+        assert_eq!(p["malware"], true);
+        assert_eq!(p["special_folder"], "photos");
+        assert_eq!(p["child_count"], 7);
+        assert_eq!(p["package_type"], "oneNote");
+    }
+
+    #[test]
+    fn onedrive_preview_omits_absent_facets() {
+        // A plain file (no media/share/malware) must not fabricate facet fields:
+        // shared/malware are presence-booleans, the rest stay null.
+        let o = json!({
+            "createdDateTime": "2026-01-02T03:04:05Z",
+            "file": { "mimeType": "application/pdf" },
+        });
+        let p = onedrive_preview(&o);
+        assert_eq!(p["mime_type"], "application/pdf");
+        assert_eq!(p["shared"], false);
+        assert_eq!(p["malware"], false);
+        assert!(p["video"].is_null());
+        assert!(p["audio"].is_null());
+        assert!(p["location"].is_null());
+        assert!(p["description"].is_null());
+    }
+
+    #[test]
     fn open_external_confirms_only_safe_http_urls() {
         let router = Router::new(Config::default());
         let ok = router.route(&ApiRequest::get(
@@ -3682,7 +3764,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .push(format!("read id={id} is_read={is_read}"));
             Ok(())
         }
-        fn set_flag(&self, _a: &str, id: &str, status: &str, _due: Option<&str>, _tz: &str) -> Result<(), String> {
+        fn set_flag(
+            &self,
+            _a: &str,
+            id: &str,
+            status: &str,
+            _due: Option<&str>,
+            _tz: &str,
+        ) -> Result<(), String> {
             self.0
                 .lock()
                 .unwrap()
