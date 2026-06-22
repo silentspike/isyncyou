@@ -1852,12 +1852,21 @@ function openComposeEvent(opts = {}) {
   if (o.body) bodyIn.value = o.body;
   const content = el("div", { class: "compose" },
     field("Title", subjIn), field("Start", startIn), field("End", endIn),
-    field("Location", locIn), field("Notes", bodyIn),
-    el("div", { class: "cmp-footer" },
-      el("div", { class: "spacer", style: "flex:1" }),
-      el("button", { class: "btn primary", type: "button", onclick: (e) => composeEventSubmit(e.currentTarget, o.id) }, icon("calendar", "icon-sm"), o.id ? "Save" : "Create")));
-  openSheet(o.id ? "Edit event" : "New event", content);
-  setTimeout(() => subjIn.focus(), 60);
+    field("Location", locIn), field("Notes", bodyIn));
+  // Inline in the calendar body (live.com-style) — the toolbar stays above; not
+  // an overlay sheet. Discard re-renders the calendar.
+  const box = $("#cal-body");
+  const head = el("div", { class: "cmp-inline-head" },
+    el("span", { class: "cmp-inline-title truncate" }, o.id ? "Edit event" : "New event"),
+    el("div", { style: "flex:1" }),
+    el("button", { class: "btn ghost sm", type: "button", onclick: () => calLoad() }, "Discard"),
+    el("button", { class: "btn primary sm", type: "button", onclick: (e) => composeEventSubmit(e.currentTarget, o.id) }, icon("calendar", "icon-sm"), o.id ? "Save" : "Create"));
+  if (box) {
+    clear(box).append(head, content);
+    setTimeout(() => subjIn.focus(), 60);
+  } else {
+    openSheet(o.id ? "Edit event" : "New event", content);
+  }
 }
 async function composeEventSubmit(btn, id) {
   const subject = ($("#cev-subject").value || "").trim();
@@ -2607,11 +2616,21 @@ async function openComposeTask(t) {
     field("Title", title),
     !editing ? field("List", listSel) : null,
     field("Importance", imp), field("Start", start), field("Due", due), field("Reminder", reminder),
-    field("Categories", cats), field("Notes", note),
-    el("div", { class: "cmp-footer" }, el("div", { class: "spacer", style: "flex:1" }),
-      el("button", { class: "btn primary", type: "button", onclick: (e) => composeTaskSubmit(e.currentTarget, t) }, icon("check-square", "icon-sm"), editing ? "Save" : "Create")));
-  openSheet(editing ? "Edit task" : "New task", content);
-  setTimeout(() => title.focus(), 60);
+    field("Categories", cats), field("Notes", note));
+  // Inline in the todo board (live.com-style), not an overlay sheet. Discard
+  // re-renders the board.
+  const box = $("#todo-board");
+  const head = el("div", { class: "cmp-inline-head" },
+    el("span", { class: "cmp-inline-title truncate" }, editing ? "Edit task" : "New task"),
+    el("div", { style: "flex:1" }),
+    el("button", { class: "btn ghost sm", type: "button", onclick: () => todoRender() }, "Discard"),
+    el("button", { class: "btn primary sm", type: "button", onclick: (e) => composeTaskSubmit(e.currentTarget, t) }, icon("check-square", "icon-sm"), editing ? "Save" : "Create"));
+  if (box) {
+    clear(box).append(head, content);
+    setTimeout(() => title.focus(), 60);
+  } else {
+    openSheet(editing ? "Edit task" : "New task", content);
+  }
 }
 async function composeTaskSubmit(btn, t) {
   const v = (s) => ($("#" + s).value || "").trim();
