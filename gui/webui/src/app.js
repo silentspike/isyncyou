@@ -3247,6 +3247,9 @@ function noteRenderNode(it, byParent, depth) {
     el("span", { class: "note-chev" }, icon("chevron-right", "icon-sm")),
     icon(NOTE_ICON[it.item_type] || "folder", "icon-sm"),
     el("span", { class: "grow truncate", text: it.name || "(untitled)" }),
+    // mark the default notebook/section (isDefault from the flank sidecar) — was
+    // captured in the preview but never shown.
+    (it.preview && it.preview.is_default) ? el("span", { class: "note-node-badge dim", title: "Default " + it.item_type, style: "font-size:10px;opacity:.6;text-transform:uppercase;letter-spacing:.04em;margin-right:4px" }, "Default") : null,
     el("span", { class: "note-node-count tnum dim", text: String(noteVisiblePages(it, byParent)) }));
   const node = el("div", { class: "note-node" }, head);
   if (open) {
