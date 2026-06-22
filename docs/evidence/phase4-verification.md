@@ -42,5 +42,25 @@ Read-only Graph probe; informed the per-service decisions. Closed.
 - `backup_onenote_hierarchy` (notebooks/section-groups/sections as items) + `_pagemeta_` sidecars; `onenote_preview`; `OneNoteWriteHandler` (create/delete/append) + `/api/v1/onenote/*` + `onenote_live.rs`; restore-to-original-section (`OneNoteApi::create_page` section + 404 fallback). ✓ live-found PAGES_URL `$expand` both parents.
 - **Live (this epic):** Page→Section→Notebook chain, tree UI (not flat), metadata strip, restore-to-original-section, create/append/delete Graph-confirmed.
 
+## Live matrix (S-P4.12 B2) — daemon @127.0.0.1:8869, all six services backed up vs the backupslave throwaway account
+
+**Live read (playwright headless 1920×1200, every view renders live data + 4-state badges + write UI):**
+| Service | Items rendered | States shown live | Write UI present |
+|---|---|---|---|
+| Mail | 209 messages | live_backup, live_only (8) | Compose / Verify / Unread / per-message manage |
+| OneDrive | 14 files (tiles) | live_backup, live_only, **backup_only** | New / Verify / state filter |
+| Calendar | 9 events (agenda) | live_backup | New event / Verify |
+| Contacts | 17 contacts | live_backup | New contact / Verify |
+| ToDo | 5 tasks (kanban, 2 lists) | live_backup | New task / New list / Verify |
+| OneNote | 3 pages / 3 notebooks (notebook→section→page **tree**, not flat) | live_backup (2), live_only (1), backup_only (filter) | New page / Verify |
+
+**4-state honesty:** `live_backup` shown across all six; `live_only` shown on Mail + OneNote; `backup_only` shown on OneDrive + OneNote. `stale` is **unit-proven** (`backup_state_derives_four_states`, `gui/webui/src/lib.rs`) and **transient** — the backup pass re-archives a changed body in the same pass (sqlite confirmed `etag == body_etag` after a contact `jobTitle` PATCH), so the stale window closes sub-poll and is not live-inducible with fast polling.
+
+**Write gating (fresh curl):** every write endpoint (`mail/flag`, `calendar/create`, `contact/create`, `todo/create`, `onenote/create`) and `settings` → **401** without `X-Capability-Token`. Per-service live writes were Graph-confirmed in the per-story rows above.
+
+**Interval slider:** `POST /api/v1/settings?poll_interval_secs=600` + cap → **200** `{"poll_interval_secs":600}`; `=99999` + cap → **400** (range 1..=3600); no cap → **401**.
+
+**429 / Retry-After:** `crates/graph/src/throttle.rs` honors `Retry-After`, backs off exponentially when absent, and applies hard caps — unit-covered.
+
 ## Findings
-None open. All per-service decisions shipped; 5 live-found bugs across #564/#567/#568 were fixed immediately in their slices. Residuals (documented, not bugs): OneNote `level/order/userTags` are Graph-conditional (captured when present); a full FUSE-mount `stat` and a 2nd-account calendar "accept invite" need external setup (proven via code paths instead).
+None open. All per-service decisions shipped; 5 live-found bugs across #564/#567/#568 were fixed immediately in their slices. Residuals (documented, not bugs): OneNote `level/order/userTags` are Graph-conditional (captured when present); a full FUSE-mount `stat` and a 2nd-account calendar "accept invite" need external setup (proven via code paths instead); `stale` is transient under fast polling (unit-proven, not live-inducible).
