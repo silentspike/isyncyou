@@ -1801,7 +1801,7 @@ async function openEventSheet(ev) {
   const kv = el("dl", { class: "kv" });
   const add = (k, v, ic) => { if (!v) return; kv.append(el("dt", {}, ic ? icon(ic, "icon-sm") : null, el("span", { text: k })), el("dd", { text: v })); };
   add("When", ev.allDay ? ev.start.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", year: "numeric" }) + " · all day"
-    : fmtFullDate(ev.start) + (ev.end ? " – " + hhmm(ev.end) : ""), "clock");
+    : ev.start.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", year: "numeric" }) + " · " + hhmm(ev.start) + (ev.end ? " – " + hhmm(ev.end) : ""), "clock");
   add("Location", ev.location, "map-pin");
   try {
     const full = await api("/api/v1/body?" + qs(q));
