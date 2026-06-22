@@ -191,7 +191,7 @@ jobs:
 
       - name: Publish RC prerelease (on push to main)
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: v0.1.0-rc.${{ github.run_number }}
           name: iSyncYou v0.1.0-rc.${{ github.run_number }}
@@ -221,7 +221,7 @@ jobs:
 
       - name: Publish release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           files: |
             dist/isyncyou-linux-x86_64.tar.gz
