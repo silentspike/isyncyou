@@ -62,7 +62,7 @@ impl MailApi for isyncyou_graph::GraphClient {
             .map_err(|e| e.to_string())
     }
     fn set_flag(&self, id: &str, status: &str) -> Result<(), String> {
-        isyncyou_graph::GraphClient::set_flag(self, id, status)
+        isyncyou_graph::GraphClient::set_flag(self, id, status, None, "UTC")
             .map(|_| ())
             .map_err(|e| e.to_string())
     }

@@ -1446,9 +1446,28 @@ async function mailManage(it, optimistic, revert, path) {
 const mailSetRead = (it, isRead) => mailManage(
   it, p => { p.isRead = isRead; }, () => { (it.preview || {}).isRead = !isRead; },
   "/api/v1/mail/read?" + qs({ account: App.account, id: it.remote_id, is_read: isRead ? "1" : "0" }));
-const mailSetFlag = (it, status) => { const prev = (it.preview || {}).flag; return mailManage(
-  it, p => { p.flag = status; }, p => { p.flag = prev; },
-  "/api/v1/mail/flag?" + qs({ account: App.account, id: it.remote_id, status })); };
+const mailSetFlag = (it, status, due) => {
+  const prev = (it.preview || {}).flag;
+  const q = { account: App.account, id: it.remote_id, status };
+  if (due) { q.due = due; q.tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || "UTC"; }
+  return mailManage(it, p => { p.flag = status; }, p => { p.flag = prev; }, "/api/v1/mail/flag?" + qs(q));
+};
+// inline-animated follow-up menu (no popup): plain flag · due date · complete · clear
+function openFlagMenu(it, btn) {
+  const existing = document.getElementById("flag-menu");
+  if (existing) { existing.remove(); return; }                       // toggle off
+  const cur = (it.preview || {}).flag, di = el("input", { type: "date", class: "flag-due" });
+  const close = () => { const p = document.getElementById("flag-menu"); if (p) p.remove(); };
+  const panel = el("div", { id: "flag-menu", class: "flag-menu" },
+    el("button", { class: "btn ghost sm", onclick: () => { mailSetFlag(it, "flagged"); close(); } }, icon("flag", "icon-sm"), "Flag"),
+    el("span", { class: "flag-due-wrap" }, el("span", { class: "dim", text: "Due" }), di,
+      el("button", { class: "btn sm", onclick: () => { if (di.value) { mailSetFlag(it, "flagged", di.value + "T09:00:00"); close(); } else di.focus(); } }, "Set")),
+    el("button", { class: "btn ghost sm", onclick: () => { mailSetFlag(it, "complete"); close(); } }, "Complete"),
+    (cur && cur !== "notFlagged") ? el("button", { class: "btn ghost sm", onclick: () => { mailSetFlag(it, "notFlagged"); close(); } }, "Clear") : null,
+  );
+  (btn.closest(".mail-reader-head") || btn.parentElement).after(panel);   // full-width block below the header, not squeezed into the action row
+  requestAnimationFrame(() => panel.classList.add("open"));
+}
 const mailSetCategories = (it, cats) => { const prev = (it.preview || {}).categories; return mailManage(
   it, p => { p.categories = cats; }, p => { p.categories = prev; },
   "/api/v1/mail/categories?" + qs({ account: App.account, id: it.remote_id, categories: cats.join(",") })); };
@@ -1540,7 +1559,7 @@ function renderMailReader(it, remoteImages = false) {
     const flagged = (it.preview || {}).flag === "flagged";
     actions.append(
       el("button", { class: "btn ghost sm icon-only", title: read ? "Mark unread" : "Mark read", onclick: () => mailSetRead(it, !read) }, icon(read ? "mail" : "mail-open", "icon-sm")),
-      el("button", { class: "btn ghost sm icon-only" + (flagged ? " on" : ""), title: flagged ? "Clear flag" : "Flag", onclick: () => mailSetFlag(it, flagged ? "notFlagged" : "flagged") }, icon("flag", "icon-sm")),
+      el("button", { class: "btn ghost sm icon-only" + (flagged ? " on" : ""), title: "Follow-up flag (status + due date)", onclick: (e) => openFlagMenu(it, e.currentTarget) }, icon("flag", "icon-sm")),
       el("button", { class: "btn ghost sm icon-only", title: "Categories", onclick: () => openCategoryPicker(it) }, icon("tag", "icon-sm")),
       el("button", { class: "btn ghost sm icon-only", title: "Move to folder", onclick: () => openMovePicker(it) }, icon("folder", "icon-sm")),
       el("button", { class: "btn ghost sm icon-only danger", title: "Delete (to Deleted Items)", onclick: () => mailDelete(it) }, icon("trash-2", "icon-sm")),

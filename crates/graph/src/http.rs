@@ -967,10 +967,12 @@ impl GraphClient {
         &self,
         message_id: &str,
         flag_status: &str,
+        due: Option<&str>,
+        tz: &str,
     ) -> Result<serde_json::Value, UploadError> {
         self.patch_json(
             &format!("/me/messages/{}", encode_id(message_id)),
-            &flag_body(flag_status),
+            &flag_body(flag_status, due, tz),
         )
     }
 
@@ -1262,8 +1264,15 @@ fn read_body(is_read: bool) -> serde_json::Value {
     serde_json::json!({ "isRead": is_read })
 }
 /// flag PATCH body: `{ "flag": { "flagStatus": <status> } }`.
-fn flag_body(flag_status: &str) -> serde_json::Value {
-    serde_json::json!({ "flag": { "flagStatus": flag_status } })
+fn flag_body(flag_status: &str, due: Option<&str>, tz: &str) -> serde_json::Value {
+    let mut flag = serde_json::json!({ "flagStatus": flag_status });
+    if let Some(d) = due {
+        // Graph rejects dueDateTime without startDateTime, so set both.
+        let dt = serde_json::json!({ "dateTime": d, "timeZone": tz });
+        flag["startDateTime"] = dt.clone();
+        flag["dueDateTime"] = dt;
+    }
+    serde_json::json!({ "flag": flag })
 }
 /// categories PATCH body: `{ "categories": [ … ] }`.
 fn categories_body(categories: &[String]) -> serde_json::Value {
@@ -1452,6 +1461,26 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn flag_body_sets_due_with_required_start() {
+        // status-only when no due date is given
+        assert_eq!(
+            flag_body("flagged", None, "UTC"),
+            serde_json::json!({ "flag": { "flagStatus": "flagged" } })
+        );
+        assert_eq!(
+            flag_body("complete", None, "UTC"),
+            serde_json::json!({ "flag": { "flagStatus": "complete" } })
+        );
+        // a due date also sets startDateTime — Graph 400s on dueDateTime alone
+        let b = flag_body("flagged", Some("2026-07-01T09:00:00"), "Europe/Vienna");
+        let f = &b["flag"];
+        assert_eq!(f["flagStatus"], "flagged");
+        let dt = serde_json::json!({ "dateTime": "2026-07-01T09:00:00", "timeZone": "Europe/Vienna" });
+        assert_eq!(f["dueDateTime"], dt);
+        assert_eq!(f["startDateTime"], dt);
     }
 
     #[test]
@@ -2411,7 +2440,7 @@ mod tests {
         );
         assert_eq!(read_body(true), serde_json::json!({ "isRead": true }));
         assert_eq!(
-            flag_body("flagged"),
+            flag_body("flagged", None, "UTC"),
             serde_json::json!({ "flag": { "flagStatus": "flagged" } })
         );
         assert_eq!(
@@ -2538,7 +2567,7 @@ mod tests {
         let origin = msg["parentFolderId"].as_str().unwrap_or("").to_string();
 
         // metadata PATCHes (each returns the updated message)
-        c.set_flag(&id, "flagged").expect("set_flag");
+        c.set_flag(&id, "flagged", None, "UTC").expect("set_flag");
         c.set_read(&id, true).expect("set_read");
         c.set_categories(&id, &["iSyncYou Live Test".to_string()])
             .expect("set_categories");

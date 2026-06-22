@@ -42,7 +42,7 @@ pub trait MailWriter {
     /// Mark a message read/unread.
     fn set_read(&self, message_id: &str, is_read: bool) -> Result<(), String>;
     /// Set/clear a follow-up flag (`notFlagged` / `flagged` / `complete`).
-    fn set_flag(&self, message_id: &str, flag_status: &str) -> Result<(), String>;
+    fn set_flag(&self, message_id: &str, flag_status: &str, due: Option<&str>, tz: &str) -> Result<(), String>;
     /// Replace a message's categories.
     fn set_categories(&self, message_id: &str, categories: &[String]) -> Result<(), String>;
     /// Create a draft; returns the new draft's id.
@@ -190,8 +190,8 @@ impl MailWriter for isyncyou_graph::GraphClient {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-    fn set_flag(&self, message_id: &str, flag_status: &str) -> Result<(), String> {
-        isyncyou_graph::GraphClient::set_flag(self, message_id, flag_status)
+    fn set_flag(&self, message_id: &str, flag_status: &str, due: Option<&str>, tz: &str) -> Result<(), String> {
+        isyncyou_graph::GraphClient::set_flag(self, message_id, flag_status, due, tz)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -335,7 +335,7 @@ mod tests {
             self.log(format!("set_read id={id} is_read={is_read}"));
             Ok(())
         }
-        fn set_flag(&self, id: &str, status: &str) -> Result<(), String> {
+        fn set_flag(&self, id: &str, status: &str, _due: Option<&str>, _tz: &str) -> Result<(), String> {
             self.log(format!("set_flag id={id} status={status}"));
             Ok(())
         }
@@ -380,7 +380,7 @@ mod tests {
         w.forward("m2", "fyi", &["x@y.com".into()]).unwrap();
         assert_eq!(w.move_to("m3", "Archive").unwrap(), "m3-in-Archive");
         w.set_read("m4", true).unwrap();
-        w.set_flag("m5", "flagged").unwrap();
+        w.set_flag("m5", "flagged", None, "UTC").unwrap();
         w.set_categories("m6", &["Red".into()]).unwrap();
         assert_eq!(
             w.create_draft("Draft", "<p>d</p>", &["a@b.com".into()])

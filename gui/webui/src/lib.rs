@@ -346,7 +346,7 @@ pub trait MailWriteHandler: Send + Sync {
     /// Mark a message read/unread.
     fn set_read(&self, account: &str, message_id: &str, is_read: bool) -> Result<(), String>;
     /// Set/clear a follow-up flag (`notFlagged` / `flagged` / `complete`).
-    fn set_flag(&self, account: &str, message_id: &str, flag_status: &str) -> Result<(), String>;
+    fn set_flag(&self, account: &str, message_id: &str, flag_status: &str, due: Option<&str>, tz: &str) -> Result<(), String>;
     /// Replace a message's categories.
     fn set_categories(
         &self,
@@ -1902,8 +1902,10 @@ impl Router {
         if !["notFlagged", "flagged", "complete"].contains(&status) {
             return ApiResponse::error(400, "status must be notFlagged|flagged|complete");
         }
-        let r = h.set_flag(account, id, status);
-        self.mail_result(account, &format!("set_flag id={id} status={status}"), r)
+        let due = req.q("due").filter(|s| !s.is_empty());
+        let tz = req.q("tz").filter(|s| !s.is_empty()).unwrap_or("UTC");
+        let r = h.set_flag(account, id, status, due, tz);
+        self.mail_result(account, &format!("set_flag id={id} status={status} due={due:?}"), r)
     }
 
     fn mail_categories(&self, req: &ApiRequest) -> ApiResponse {
@@ -3680,7 +3682,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .push(format!("read id={id} is_read={is_read}"));
             Ok(())
         }
-        fn set_flag(&self, _a: &str, id: &str, status: &str) -> Result<(), String> {
+        fn set_flag(&self, _a: &str, id: &str, status: &str, _due: Option<&str>, _tz: &str) -> Result<(), String> {
             self.0
                 .lock()
                 .unwrap()
