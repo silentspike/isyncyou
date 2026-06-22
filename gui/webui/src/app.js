@@ -132,17 +132,98 @@ function netBackdrop(w, h) {
   const dots = nodes.map(n => `<circle cx="${n.x | 0}" cy="${n.y | 0}" r="${n.r.toFixed(1)}" fill="${n.a ? "#a78bfa" : "#c7d2fe"}" opacity="${n.a ? .95 : .7}"/>`).join("");
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="100%" preserveAspectRatio="xMidYMin slice" xmlns="http://www.w3.org/2000/svg"><g stroke="#9aa2fb" stroke-width="0.9">${lines.join("")}</g>${dots}</svg>`;
 }
+// living constellation: one shared rAF loop drives every registered <canvas>.
+// Nodes drift on their own slow velocities (parallax-ish, accent stars a touch
+// faster), near-neighbour links are redrawn each frame so the web "breathes",
+// dots gently twinkle. Paused when the document is hidden; honours
+// prefers-reduced-motion (one static frame, no loop); self-heals by dropping
+// layers whose canvas left the DOM (e.g. a closed sheet).
+const Net = (() => {
+  const layers = new Set();
+  let raf = 0, last = 0;
+  const reduce = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  const TWO_PI = Math.PI * 2;
+  function makeNodes(w, h, topWeighted) {
+    const rnd = rng(0x51e3a17), N = Math.max(8, Math.round(w * h / 11000)), nodes = [];
+    for (let i = 0; i < N; i++) {
+      const yb = rnd(), accent = rnd() > 0.7, sp = accent ? 1.5 : 1.0;
+      nodes.push({ x: rnd() * w, y: (topWeighted ? yb * yb : yb) * h, r: 0.7 + rnd() * 1.9, a: accent,
+        vx: (rnd() - 0.5) * sp, vy: (rnd() - 0.5) * sp, tw: rnd() * TWO_PI, ts: 0.6 + rnd() * 0.9 });
+    }
+    return nodes;
+  }
+  function resize(layer) {
+    const r = layer.canvas.getBoundingClientRect();
+    layer.w = Math.max(1, r.width); layer.h = Math.max(1, r.height);
+    layer.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    layer.canvas.width = Math.round(layer.w * layer.dpr); layer.canvas.height = Math.round(layer.h * layer.dpr);
+    layer.ctx.setTransform(layer.dpr, 0, 0, layer.dpr, 0, 0);
+    layer.nodes = makeNodes(layer.w, layer.h, layer.topWeighted);
+  }
+  function draw(layer, now) {
+    const { ctx, w, h, nodes } = layer, maxD = Math.min(w, h) * 0.14;
+    ctx.clearRect(0, 0, w, h);
+    ctx.lineWidth = 0.9; ctx.strokeStyle = "#9aa2fb";
+    for (let i = 0; i < nodes.length; i++) {
+      let c = 0;
+      for (let j = i + 1; j < nodes.length && c < 3; j++) {
+        const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y, d = Math.hypot(dx, dy);
+        if (d < maxD) { ctx.globalAlpha = (1 - d / maxD) * 0.7; ctx.beginPath(); ctx.moveTo(nodes[i].x, nodes[i].y); ctx.lineTo(nodes[j].x, nodes[j].y); ctx.stroke(); c++; }
+      }
+    }
+    for (const n of nodes) {
+      ctx.globalAlpha = (n.a ? 0.95 : 0.7) * (0.68 + 0.32 * Math.sin(now * 0.0016 * n.ts + n.tw));
+      ctx.fillStyle = n.a ? "#a78bfa" : "#c7d2fe";
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, TWO_PI); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function tick(now) {
+    if (!last) last = now;
+    const dt = Math.min(2, (now - last) / 16.67); last = now;
+    if (!document.hidden) {
+      for (const layer of layers) {
+        if (!layer.canvas.isConnected) { layers.delete(layer); continue; }   // self-heal
+        const m = 8;
+        for (const n of layer.nodes) {
+          n.x += n.vx * dt; n.y += n.vy * dt;
+          if (n.x < -m) n.x = layer.w + m; else if (n.x > layer.w + m) n.x = -m;
+          if (n.y < -m) n.y = layer.h + m; else if (n.y > layer.h + m) n.y = -m;
+        }
+        draw(layer, now);
+      }
+    }
+    raf = layers.size ? requestAnimationFrame(tick) : 0;
+  }
+  function register(canvas, opts) {
+    const layer = { canvas, ctx: canvas.getContext("2d"), topWeighted: !opts || opts.topWeighted !== false, w: 1, h: 1, dpr: 1, nodes: [] };
+    resize(layer); layers.add(layer);
+    if (reduce) draw(layer, 0);
+    else if (!raf) { last = 0; raf = requestAnimationFrame(tick); }
+    return layer;
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { if (raf) { cancelAnimationFrame(raf); raf = 0; } }
+    else if (layers.size && !reduce && !raf) { last = 0; raf = requestAnimationFrame(tick); }
+  });
+  return { register, resize, reduce, _layers: layers };
+})();
+let _bgLayer = null;
 function paintBackdrop() {
   const host = document.getElementById("bg-net"); if (!host) return;
-  const w = Math.max(window.innerWidth, 320), h = Math.max(window.innerHeight, 760);
-  if (host.dataset.w == w && host.dataset.h == h) return;        // size unchanged → keep
-  host.dataset.w = w; host.dataset.h = h; host.innerHTML = netBackdrop(w, h);
+  let canvas = host.querySelector("canvas");
+  if (!canvas) { host.innerHTML = ""; canvas = el("canvas", { class: "net-canvas" }); host.append(canvas); }
+  if (!_bgLayer || !_bgLayer.canvas.isConnected) _bgLayer = Net.register(canvas, { topWeighted: true });
+  else Net.resize(_bgLayer);
 }
 // the signature geometric constellation, as a backdrop element for a detail sheet
-// (so sheets carry the same background graphics as the main views, not just a glow)
+// (so sheets carry the same animated background as the main views, not just a glow).
+// Registered after the sheet is in the DOM (next frame) so the canvas has a size.
 function sheetNet() {
-  const w = Math.max(window.innerWidth, 320), h = Math.max(window.innerHeight, 760);
-  return el("div", { class: "sheet-net", html: netBackdrop(w, h) });
+  const wrap = el("div", { class: "sheet-net" }), canvas = el("canvas", { class: "net-canvas" });
+  wrap.append(canvas);
+  requestAnimationFrame(() => { if (canvas.isConnected) Net.register(canvas, { topWeighted: false }); });
+  return wrap;
 }
 // flowing particle stream — a wave of dots, brightest mid-span, fading at the ends
 function flowWave(w = 540, h = 300) {
