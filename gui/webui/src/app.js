@@ -1208,6 +1208,7 @@ const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || i
 
 async function renderMailView(view) {
   Mail.all = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
+  Mail.threaded = Mail.threaded === undefined ? true : Mail.threaded; // group by conversation (#563)
   clear(view).append(el("div", { id: "mail-page", class: "mail-page" },
     // top metric row leads (title is in the top-bar breadcrumb, counts live in the
     // cards + sidebar sub-nav) — no separate hero band, matching the mockup
@@ -1222,6 +1223,7 @@ async function renderMailView(view) {
           el("option", { value: "newest", text: "Newest first" }),
           el("option", { value: "oldest", text: "Oldest first" }),
           el("option", { value: "sender", text: "Sender A–Z" }))),
+      el("button", { id: "mail-thread-toggle", class: "btn sm" + (Mail.threaded ? " active" : ""), title: "Group messages into conversations", onclick: (e) => { Mail.threaded = !Mail.threaded; e.currentTarget.classList.toggle("active", Mail.threaded); mailRender(); } }, icon("mail-open", "icon-sm"), "Conversations"),
       verifyButton(() => renderMailView(view)),
       CAP.mailwrite ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
@@ -1298,15 +1300,30 @@ function mailRender() {
   clear(list);
   if (!Mail.all.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." }))); return; }
   if (!rows.length) { list.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "Adjust the filter or search." }))); return; }
+  // Conversation grouping (#563): collapse messages sharing a conversationId into
+  // one row (the newest, since rows are already sorted) carrying a thread count of
+  // how many of the *currently listed* messages belong to it.
+  let display;
+  if (Mail.threaded) {
+    const seen = new Map(); display = [];
+    rows.forEach(it => {
+      const cid = (it.preview || {}).conversationId;
+      if (cid && seen.has(cid)) { seen.get(cid).n++; return; }
+      const entry = { it, n: 1 }; if (cid) seen.set(cid, entry); display.push(entry);
+    });
+  } else {
+    display = rows.map(it => ({ it, n: 1 }));
+  }
   const frag = document.createDocumentFragment();
-  rows.forEach(it => frag.append(mailRow(it)));
+  display.forEach(e => frag.append(mailRow(e.it, e.n)));
   list.append(frag);
 }
-function mailRow(it) {
+function mailRow(it, threadCount = 1) {
   const p = it.preview || {};
   const from = addrLabel(p.from), subject = p.subject || it.name || "(no subject)";
   const sel = Mail.selected && Mail.selected.remote_id === it.remote_id;
   const badges = el("div", { class: "mi-badges" });
+  if (threadCount > 1) badges.append(el("span", { class: "mi-chip mi-thread", title: threadCount + " messages in this conversation" }, icon("mail-open", "icon-sm"), String(threadCount)));
   if (p.attachments > 0) badges.append(el("span", { class: "mi-chip", title: p.attachments + " attachment(s)" }, icon("paperclip", "icon-sm"), String(p.attachments)));
   categoryChips(it).forEach(c => badges.append(c));
   if (CAP.mailwrite) {
@@ -1625,6 +1642,25 @@ function renderMailReader(it, remoteImages = false) {
             (p.bcc && p.bcc.length) ? el("div", { class: "mr-to dim truncate", text: "Bcc: " + p.bcc.join(", ") }) : null),
           el("span", { class: "mr-date dim tnum", text: fmtFullDate(when) }))),
       actions));
+  // Conversation strip (#563): if this message is part of a multi-message thread,
+  // list every sibling (oldest → newest) so you can step through the conversation.
+  const convId = p.conversationId;
+  if (convId) {
+    const sibs = Mail.all.filter(x => (x.preview || {}).conversationId === convId).sort((a, b) => mailDate(a) - mailDate(b));
+    if (sibs.length > 1) {
+      const strip = el("div", { class: "mr-thread" },
+        el("div", { class: "mr-thread-head" }, icon("mail-open", "icon-sm"), el("span", { text: `Conversation · ${sibs.length} messages` })));
+      sibs.forEach(s => {
+        const sp = s.preview || {}, cur = s.remote_id === it.remote_id;
+        strip.append(el("button", { class: "mr-thread-item" + (cur ? " cur" : ""), title: sp.subject || s.name || "", onclick: () => { if (!cur) mailSelect(s); } },
+          el("span", { class: "mr-thread-dot", style: `background:${mailAvatarColor(s)}` }),
+          el("span", { class: "grow truncate", text: addrLabel(sp.from) || "(unknown sender)" }),
+          (sp.isRead === false) ? el("span", { class: "mr-thread-unread", title: "Unread" }) : null,
+          el("span", { class: "dim tnum", style: "font-size:11px;flex:none", text: fmtDate(sp.date || s.remote_mtime) })));
+      });
+      box.append(strip);
+    }
+  }
   // The body is a same-origin sandboxed iframe. Size it to its own content on
   // load and let the OUTER pane scroll → the whole message scrolls naturally
   // (an internally-scrolling iframe in a flex column felt like "can't scroll").

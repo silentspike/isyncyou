@@ -655,6 +655,16 @@ a:hover { text-decoration: underline; }
 /* the body iframe is auto-sized to its content (JS); this pane does the scrolling */
 .mail-frame-scroll { flex: 1; min-height: 0; overflow-y: auto; background: var(--bg-0); }
 .mail-frame { display: block; width: 100%; border: 0; background: var(--bg-0); min-height: 240px; }
+/* conversation thread strip (#563) */
+.mi-thread { color: var(--accent-2); border-color: var(--accent-line); }
+.mr-thread { margin: var(--sp-3) var(--sp-5) 0; border: 1px solid var(--line); border-radius: var(--r-md, 10px); background: var(--bg-1); overflow: hidden; flex: none; }
+.mr-thread-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); color: var(--text-mid); border-bottom: 1px solid var(--line); background: var(--bg-2); }
+.mr-thread-item { display: flex; align-items: center; gap: var(--sp-2); width: 100%; text-align: left; padding: var(--sp-2) var(--sp-3); background: transparent; border: 0; border-bottom: 1px solid var(--line); color: inherit; cursor: pointer; font-size: var(--fs-sm); }
+.mr-thread-item:last-child { border-bottom: 0; }
+.mr-thread-item:hover { background: var(--bg-2); }
+.mr-thread-item.cur { background: color-mix(in oklab, var(--accent) 12%, transparent); font-weight: 600; cursor: default; }
+.mr-thread-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.mr-thread-unread { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2); flex: none; }
 
 /* rich empty reading pane */
 .mail-empty { margin: auto; max-width: 420px; text-align: center; padding: var(--sp-6); display: flex; flex-direction: column; align-items: center; gap: var(--sp-3); }
