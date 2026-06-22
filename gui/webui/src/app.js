@@ -507,11 +507,11 @@ const SFX = {
   on() { try { return localStorage.getItem("isy_sfx") !== "0"; } catch (_) { return true; } },   // default on
   toggle() { try { localStorage.setItem("isy_sfx", this.on() ? "0" : "1"); } catch (_) { } return this.on(); },
   async init() {
-    if (this.ctx) return;
     try {
-      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const src = { shoot: "/sfx/shoot.mp3", boom: "/sfx/boom.mp3", level: "/sfx/level.mp3", drop: "/sfx/drop.mp3", pickup: "/sfx/pickup.mp3" };
-      for (const k in src) this.buf[k] = await this.ctx.decodeAudioData(await (await fetch(src[k])).arrayBuffer());
+      if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();   // reuse the context, but always (re)load the buffers below so changed SFX take effect on each game open
+      const src = { shoot: "/sfx/shoot.mp3", boom: "/sfx/boom.mp3", level: "/sfx/level.mp3", drop: "/sfx/drop.mp3", pickup: "/sfx/pickup.mp3", hit: "/sfx/hit.mp3" };
+      const cb = "?v=" + Date.now();   // cache-buster: bypass any stale fetch-cache entry from an old max-age response
+      for (const k in src) this.buf[k] = await this.ctx.decodeAudioData(await (await fetch(src[k] + cb)).arrayBuffer());
       this.ready = true;
     } catch (_) { }
   },
@@ -553,20 +553,29 @@ function renderInvaders(view) {
 function invadersGame(canvas) {
   if (!canvas) return;
   const ctx = canvas.getContext("2d"), dpr = Math.min(window.devicePixelRatio || 1, 2);
-  let W = 0, H = 0, player, bullets, foes, parts, pups, up, dir, base, score, state, level, raf = 0, lastShot = 0;
+  let W = 0, H = 0, player, bullets, ebullets, foes, parts, pups, up, dir, base, score, state, level, raf = 0, lastShot = 0;
   function fit() {
     const r = canvas.getBoundingClientRect();
     W = Math.max(240, r.width); H = Math.max(300, r.height);
     canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
+  const FOE = {
+    grunt: { add: 0, col: "#a78bfa", dome: "#c7d2fe", w: 26, h: 16, shoot: false },   // standard
+    tank: { add: 3, col: "#fb7185", dome: "#fecdd3", w: 34, h: 20, shoot: false },    // bigger, more HP
+    shooter: { add: 1, col: "#34d399", dome: "#a7f3d0", w: 26, h: 16, shoot: true },  // fires back
+  };
   function spawnFoes() {
-    foes = []; bullets = []; dir = 1;
+    foes = []; bullets = []; ebullets = []; dir = 1;
     base = 0.4 + (level - 1) * 0.3;                                  // faster each level
-    const hp = 1 + Math.floor((level - 1) / 2);                      // tougher every 2 levels
+    const bhp = 1 + Math.floor((level - 1) / 2);                     // tougher every 2 levels
     const cols = Math.max(4, Math.min(9, Math.floor((W - 40) / 44)));
     const rows = Math.min(3 + level, 6);                            // more rows each level
     const gx = (W - cols * 44) / 2 + 22;
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) foes.push({ x: gx + c * 44, y: 42 + r * 32, w: 26, h: 16, alive: true, hp, maxhp: hp });
+    const sP = level >= 2 ? Math.min(0.05 + level * 0.035, 0.3) : 0, tP = level >= 2 ? Math.min(0.08 + level * 0.025, 0.24) : 0;
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      const rr = Math.random(), t = rr < sP ? "shooter" : rr < sP + tP ? "tank" : "grunt", d = FOE[t], hp = bhp + d.add;
+      foes.push({ x: gx + c * 44, y: 42 + r * 32, w: d.w, h: d.h, alive: true, hp, maxhp: hp, t, shoot: d.shoot, col: d.col, dome: d.dome, cd: 800 + Math.random() * 2200 });
+    }
   }
   function reset() {
     player = { x: W / 2, y: H - 24, w: 30, h: 12, hp: 3, maxhp: 3, armor: 0, inv: 0 };
@@ -608,9 +617,10 @@ function invadersGame(canvas) {
     ctx.restore();
   }
   function drawFoe(f) {
-    ctx.globalAlpha = 0.45 + 0.55 * (f.hp / f.maxhp);               // damaged foes fade
-    ctx.fillStyle = "#a78bfa"; ctx.beginPath(); ctx.ellipse(f.x, f.y + 2, f.w / 2, f.h / 3, 0, 0, 6.2832); ctx.fill();
-    ctx.fillStyle = "#c7d2fe"; ctx.beginPath(); ctx.ellipse(f.x, f.y - 2, f.w / 4, f.h / 3, 0, 0, 6.2832); ctx.fill();
+    ctx.globalAlpha = 0.5 + 0.5 * (f.hp / f.maxhp);                 // damaged foes fade
+    ctx.fillStyle = f.col; ctx.beginPath(); ctx.ellipse(f.x, f.y + 2, f.w / 2, f.h / 3, 0, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = f.dome; ctx.beginPath(); ctx.ellipse(f.x, f.y - 2, f.w / 4, f.h / 3, 0, 0, 6.2832); ctx.fill();
+    if (f.shoot) { ctx.fillStyle = "#064e3b"; ctx.fillRect(f.x - 2, f.y + f.h / 3 - 1, 4, 5); }   // shooter cannon
     ctx.globalAlpha = 1;
   }
   // power-up types — each killed foe may drop one; pick it up to apply forever
@@ -634,7 +644,7 @@ function invadersGame(canvas) {
   function hurt(now) {
     if (player.inv > now) return;
     if (player.armor > 0) player.armor -= 1; else player.hp -= 1;
-    player.inv = now + 1100; boom(player.x, player.y); SFX.play("boom", 0.45);
+    player.inv = now + 1100; boom(player.x, player.y); SFX.play("hit", 0.6);
     if (player.hp <= 0) state = "over";
   }
   function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
@@ -684,6 +694,9 @@ function invadersGame(canvas) {
       bullets = bullets.filter(b => !b.dead && b.y > -16 && b.x > -12 && b.x < W + 12);
       pups.forEach(p => { p.y += 1.9; if (Math.abs(p.x - player.x) < 20 && Math.abs(p.y - player.y) < 20) { p.got = true; const d = POW.find(d => d.k === p.t); if (d) d.apply(); SFX.play("pickup", 0.5); } });
       pups = pups.filter(p => !p.got && p.y < H + 14);
+      foes.forEach(f => { if (f.alive && f.shoot) { f.cd -= 16; if (f.cd <= 0) { f.cd = 1400 + Math.random() * 1800; const dx = player.x - f.x, dy = Math.max(20, player.y - f.y), m = Math.hypot(dx, dy), sp2 = 2.4 + level * 0.15; ebullets.push({ x: f.x, y: f.y + 8, vx: dx / m * sp2, vy: dy / m * sp2 }); } } });   // shooters fire at the player
+      ebullets.forEach(b => { b.x += b.vx; b.y += b.vy; if (Math.abs(b.x - player.x) < player.w / 2 + 2 && Math.abs(b.y - player.y) < player.h) { b.dead = true; hurt(now); } });
+      ebullets = ebullets.filter(b => !b.dead && b.y < H + 12 && b.x > -12 && b.x < W + 12);
     }
     parts.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 0.045; });
     parts = parts.filter(p => p.life > 0);
@@ -693,6 +706,11 @@ function invadersGame(canvas) {
     if (player.armor > 0) { ctx.save(); ctx.globalAlpha = 0.35 + 0.2 * Math.sin(now * 0.008); ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 2; for (let i = 0; i < player.armor; i++) { ctx.beginPath(); ctx.arc(player.x, player.y - 3, 20 + i * 4, 0, 6.2832); ctx.stroke(); } ctx.restore(); }   // armor shield rings
     if (!(player.inv > now && Math.floor(now / 90) % 2)) drawShip(player.x, player.y, now);   // blink while invulnerable
     ctx.fillStyle = "#fde68a"; bullets.forEach(b => ctx.fillRect(b.x - 1.5, b.y - 7, 3, 9));
+    ebullets.forEach(b => {                                          // enemy fire — bright glowing orb, clearly visible
+      ctx.globalAlpha = 0.32; ctx.fillStyle = "#fca5a5"; ctx.beginPath(); ctx.arc(b.x, b.y, 8, 0, 6.2832); ctx.fill();
+      ctx.globalAlpha = 1; ctx.fillStyle = "#ef4444"; ctx.beginPath(); ctx.arc(b.x, b.y, 4.2, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(b.x, b.y, 1.7, 0, 6.2832); ctx.fill();
+    });
     parts.forEach(p => { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, 2.6 * p.life + 0.6, 0, 6.2832); ctx.fill(); });
     ctx.globalAlpha = 1;
     ctx.fillStyle = "#c7d2fe"; ctx.font = "14px system-ui,sans-serif"; ctx.textAlign = "left"; ctx.fillText("Score " + score + "   ·   Level " + level, 52, 22);

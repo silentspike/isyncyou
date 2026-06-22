@@ -50,6 +50,7 @@ const SFX_BOOM: &[u8] = include_bytes!("assets/sfx-boom.mp3");
 const SFX_LEVEL: &[u8] = include_bytes!("assets/sfx-level.mp3");
 const SFX_DROP: &[u8] = include_bytes!("assets/sfx-drop.mp3");
 const SFX_PICKUP: &[u8] = include_bytes!("assets/sfx-pickup.mp3");
+const SFX_HIT: &[u8] = include_bytes!("assets/sfx-hit.mp3");
 
 /// Serve an embedded MP3 sound effect (immutable within a version).
 fn audio_response(bytes: &[u8]) -> ApiResponse {
@@ -929,6 +930,7 @@ impl Router {
             "/sfx/level.mp3" => audio_response(SFX_LEVEL),
             "/sfx/drop.mp3" => audio_response(SFX_DROP),
             "/sfx/pickup.mp3" => audio_response(SFX_PICKUP),
+            "/sfx/hit.mp3" => audio_response(SFX_HIT),
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
             "/api/v1/activity" => self.activity(req),
