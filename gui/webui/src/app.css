@@ -502,6 +502,11 @@ a:hover { text-decoration: underline; }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: var(--sp-2) var(--sp-4); align-items: baseline; }
 .kv dt { color: var(--text-lo); font-size: var(--fs-md); }
 .kv dd { color: var(--text-hi); }
+/* event/detail description — app-native dark card (not the white archive view) */
+.evt-desc { margin-top: 6px; padding: var(--sp-3) var(--sp-4); background: var(--bg-2);
+  border: 1px solid var(--line); border-radius: var(--r-md); color: var(--text-mid);
+  line-height: 1.55; white-space: pre-wrap; word-break: break-word; font-size: var(--fs-sm);
+  max-height: 50vh; overflow-y: auto; }
 
 /* ============================================================ animations utils */
 @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
