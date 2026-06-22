@@ -1003,6 +1003,18 @@ a.note-meta-chip:hover { color: var(--accent); }
   .search-trigger { min-width: 0; }
   .search-trigger .label-text, .search-trigger .kbd { display: none; }
   .sheet { width: 100vw; }
+  /* the mail toolbar (search + sort + order) doesn't fit one phone row — let it
+     wrap: search fills the first row, the sort controls drop below. */
+  .mail-toolbar { flex-wrap: wrap; }
+  .tb-search { max-width: none; }
+  /* content-first on a phone: hide the per-service stat dashboards so the list /
+     files / events lead immediately (like a native mail/files app). The Overview
+     tab keeps its dashboard — that one IS the dashboard. */
+  .con-metrics-row { display: none; }
+  /* touch targets: comfortable row heights + tappable action buttons */
+  .mail-item, .con-row, .list-row, .todo-task, .note-leaf { min-height: 56px; }
+  .btn.sm, .cmp-tb-btn, .seg-btn, .nav-subitem { min-height: 40px; }
+  .svc-head, .cal-head, .con-head, .todo-head { gap: var(--sp-2); flex-wrap: wrap; }
 }
 
 /* ============================================================ mail responsive (container query on .view) */

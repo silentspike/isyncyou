@@ -3100,6 +3100,45 @@ function subscribeEvents() {
     _evtT = setTimeout(onRoute, 150);
   });
 }
+// Mobile touch navigation (#77): a horizontal swipe on the content navigates —
+// a right-swipe with an open detail goes back to the list; otherwise swipe
+// left/right moves to the next/previous service tab (bottom-nav order). Vertical
+// scrolls, slow drags, overlay-open and swipes inside a horizontally-scrollable
+// element (e.g. the ToDo board) are ignored so they keep their native behaviour.
+function mobileBack() {
+  if (App.route === "mail" && Mail.selected) { mailBack(); return true; }
+  if (App.route === "contacts" && Contacts.selected) { contactBack(); return true; }
+  return false;
+}
+function setupSwipe() {
+  const isMobile = () => window.matchMedia("(max-width: 720px)").matches;
+  let x0 = null, y0 = null, t0 = 0, lockH = false;
+  document.addEventListener("touchstart", (e) => {
+    if (!isMobile() || e.touches.length !== 1) { x0 = null; return; }
+    const t = e.touches[0];
+    x0 = t.clientX; y0 = t.clientY; t0 = Date.now(); lockH = false;
+    for (let n = e.target; n && n !== document.body; n = n.parentElement) {
+      if (n.scrollWidth > n.clientWidth + 4) {
+        const ox = getComputedStyle(n).overflowX;
+        if (ox === "auto" || ox === "scroll") { lockH = true; break; }
+      }
+    }
+  }, { passive: true });
+  document.addEventListener("touchend", (e) => {
+    if (x0 == null || lockH) { x0 = null; return; }
+    const t = e.changedTouches[0];
+    const dx = t.clientX - x0, dy = t.clientY - y0, dt = Date.now() - t0;
+    x0 = null;
+    if (dt > 600 || Math.abs(dx) < 64 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
+    if (sheetEl || palette) return;                       // overlay owns the gesture
+    if (dx > 0 && mobileBack()) return;                   // right-swipe → back from detail
+    const order = SERVICES.map((s) => s.id);
+    const i = order.indexOf(App.route);
+    if (i < 0) return;
+    if (dx < 0 && i < order.length - 1) go(order[i + 1]); // left → next tab
+    else if (dx > 0 && i > 0) go(order[i - 1]);           // right → previous tab
+  }, { passive: true });
+}
 async function init() {
   document.body.append(el("div", { id: "toasts", class: "toasts" }));
   paintBackdrop();
@@ -3116,5 +3155,6 @@ async function init() {
   } catch {}
   onRoute();
   subscribeEvents();
+  setupSwipe();
 }
 init();
