@@ -807,9 +807,22 @@ function categoryChips(it) {
     .map(name => el("span", { class: "mi-cat", style: `--c:${categoryColor(name)}`, text: name }));
 }
 // Avatar tint: the first category's colour, else the mail service colour.
+// Deterministic hue (0–359) from a key → a stable colour per identity. The same
+// key always yields the same hue, so identical senders share a colour and distinct
+// senders get distinct ones — no state to track.
+function hashHue(key) {
+  let h = 0;
+  const s = (key || "").toLowerCase();
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
+  return ((h % 360) + 360) % 360;
+}
+// Each sender gets its own colour, derived from its address so it's stable across
+// the list and sessions (identical sender ⇒ identical colour).
 function mailAvatarColor(it) {
-  const cats = (it.preview || {}).categories || [];
-  return cats.length ? categoryColor(cats[0]) : "var(--svc-mail)";
+  const p = it.preview || {};
+  const a = parseAddr(p.from || "");
+  const key = a.email || a.name || it.name || p.subject || "";
+  return `hsl(${hashHue(key)} 58% 56%)`;
 }
 const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || it.remote_mtime) || new Date(0); };
 
