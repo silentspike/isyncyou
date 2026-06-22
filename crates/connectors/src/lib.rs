@@ -51,7 +51,9 @@ pub use onedrive::{
     scan_local_creates, scan_local_deletes, scan_local_modifies, ContentReplacer, Downloader,
     MaterializeReport, ModifyReport, PendingLocalDelete, RemoteWriter, SyncError, SyncReport,
 };
-pub use onenote::{incremental_sync_onenote, OneNoteReport};
+pub use onenote::{
+    backup_onenote_hierarchy, incremental_sync_onenote, OneNoteHierarchyReport, OneNoteReport,
+};
 pub use quickxor::{quickxor, quickxor_base64};
 pub use restore::{
     restore_contact, restore_event, restore_message, restore_page, restore_page_with_resources,

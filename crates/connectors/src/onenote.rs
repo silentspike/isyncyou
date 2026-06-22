@@ -13,6 +13,7 @@
 //! concern handled elsewhere; this connector tracks the page index. Delegated
 //! access only (no app-only); read app keeps `Notes.Read`.
 
+use crate::archive::JsonFetcher;
 use crate::common::{fetch_pages, shard_path};
 use crate::onedrive::SyncError;
 use isyncyou_graph::Transport;
@@ -127,6 +128,146 @@ pub fn incremental_sync_onenote<T: Transport>(
     Ok(report)
 }
 
+/// What one OneNote hierarchy backup did (#568 B-A2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneNoteHierarchyReport {
+    pub notebooks: usize,
+    pub section_groups: usize,
+    pub sections: usize,
+    pub bytes: u64,
+}
+
+/// Upsert a hierarchy container as a store Item (with its `parent_remote_id`) and
+/// archive its full JSON to `onenote/<shard>/<id>.json` (atomic tmp+rename),
+/// recording `local_path`. Mirrors the todo/calendar `archive_json_item` flank
+/// pattern, plus a parent link so the UI can render the tree.
+#[allow(clippy::too_many_arguments)]
+fn archive_hierarchy_item(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    id: &str,
+    name: &str,
+    item_type: &str,
+    parent: Option<&str>,
+    value: &Value,
+) -> Result<u64, SyncError> {
+    let mut it = Item::new(account, SERVICE, id, name, item_type);
+    it.parent_remote_id = parent.map(String::from);
+    it.sync_state = "remote_dirty".into();
+    store.upsert_item(&it)?;
+
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent_dir) = abs.parent() {
+        std::fs::create_dir_all(parent_dir)?;
+    }
+    let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+    store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// A container's parent id: a section / section-group sits under another section
+/// group (`parentSectionGroup`) or directly under a notebook (`parentNotebook`).
+fn container_parent(v: &Value) -> Option<&str> {
+    v.pointer("/parentSectionGroup/id")
+        .and_then(Value::as_str)
+        .or_else(|| v.pointer("/parentNotebook/id").and_then(Value::as_str))
+}
+
+/// Back up the OneNote **structure** (#568): notebooks → section groups → sections
+/// as store items (`item_type` `notebook`/`section-group`/`section`) with their
+/// parent chain + full JSON sidecars, so the UI can render the notebook→section→
+/// page tree (pages already point at their `parentSection`). Re-fetched each pass
+/// (small data). Sections/groups nest via `container_parent`.
+pub fn backup_onenote_hierarchy<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<OneNoteHierarchyReport, SyncError> {
+    let mut report = OneNoteHierarchyReport::default();
+    let values = |v: &Value| -> Vec<Value> {
+        v.get("value")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Notebooks — the roots of the tree.
+    let nbs = fetcher
+        .fetch_json("/me/onenote/notebooks?$top=100")
+        .map_err(SyncError::Remote)?;
+    for nb in values(&nbs) {
+        let Some(id) = nb.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = nb.get("displayName").and_then(Value::as_str).unwrap_or(id);
+        report.bytes += archive_hierarchy_item(
+            store,
+            account,
+            archive_root,
+            id,
+            name,
+            "notebook",
+            None,
+            &nb,
+        )?;
+        report.notebooks += 1;
+    }
+
+    // Section groups (optional intermediate level).
+    let sgs = fetcher
+        .fetch_json("/me/onenote/sectionGroups?$top=100")
+        .map_err(SyncError::Remote)?;
+    for sg in values(&sgs) {
+        let Some(id) = sg.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = sg.get("displayName").and_then(Value::as_str).unwrap_or(id);
+        let parent = container_parent(&sg);
+        report.bytes += archive_hierarchy_item(
+            store,
+            account,
+            archive_root,
+            id,
+            name,
+            "section-group",
+            parent,
+            &sg,
+        )?;
+        report.section_groups += 1;
+    }
+
+    // Sections — pages hang off these (page.parent_remote_id == section.id).
+    let secs = fetcher
+        .fetch_json("/me/onenote/sections?$top=100")
+        .map_err(SyncError::Remote)?;
+    for sec in values(&secs) {
+        let Some(id) = sec.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = sec.get("displayName").and_then(Value::as_str).unwrap_or(id);
+        let parent = container_parent(&sec);
+        report.bytes += archive_hierarchy_item(
+            store,
+            account,
+            archive_root,
+            id,
+            name,
+            "section",
+            parent,
+            &sec,
+        )?;
+        report.sections += 1;
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +351,56 @@ mod tests {
         assert_eq!(
             body.get("createdDateTime").and_then(Value::as_str),
             Some("2025-12-01T00:00:00Z")
+        );
+    }
+
+    struct HierFetcher;
+    impl JsonFetcher for HierFetcher {
+        fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+            if url.contains("/notebooks") {
+                Ok(json!({ "value": [{ "id": "N1", "displayName": "Personal" }] }))
+            } else if url.contains("/sectionGroups") {
+                Ok(
+                    json!({ "value": [{ "id": "G1", "displayName": "Group", "parentNotebook": { "id": "N1" } }] }),
+                )
+            } else if url.contains("/sections") {
+                Ok(json!({ "value": [
+                    { "id": "S1", "displayName": "Ideas", "parentNotebook": { "id": "N1" } },
+                    { "id": "S2", "displayName": "Sub", "parentSectionGroup": { "id": "G1" } },
+                ]}))
+            } else {
+                Ok(json!({ "value": [] }))
+            }
+        }
+    }
+
+    #[test]
+    fn backup_onenote_hierarchy_stores_notebooks_groups_sections_with_parents() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let r = backup_onenote_hierarchy(&HierFetcher, &store, "acc", arch.path()).unwrap();
+        assert_eq!((r.notebooks, r.section_groups, r.sections), (1, 1, 2));
+
+        let nb = store.get_item("acc", SERVICE, "N1").unwrap().unwrap();
+        assert_eq!(nb.item_type, "notebook");
+        assert_eq!(nb.parent_remote_id, None);
+        let g1 = store.get_item("acc", SERVICE, "G1").unwrap().unwrap();
+        assert_eq!(g1.item_type, "section-group");
+        assert_eq!(g1.parent_remote_id.as_deref(), Some("N1"));
+        let s1 = store.get_item("acc", SERVICE, "S1").unwrap().unwrap();
+        assert_eq!(s1.item_type, "section");
+        assert_eq!(s1.parent_remote_id.as_deref(), Some("N1"));
+        // S2 nests under the section group, not the notebook directly
+        let s2 = store.get_item("acc", SERVICE, "S2").unwrap().unwrap();
+        assert_eq!(s2.parent_remote_id.as_deref(), Some("G1"));
+        // the section sidecar carries the full JSON (displayName)
+        let body: Value = serde_json::from_slice(
+            &std::fs::read(arch.path().join(s1.local_path.unwrap())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body.get("displayName").and_then(Value::as_str),
+            Some("Ideas")
         );
     }
 
