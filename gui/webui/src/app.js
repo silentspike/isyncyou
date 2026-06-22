@@ -1982,12 +1982,22 @@ async function openComposeContact(opts = {}) {
     field("First name", given), field("Last name", surname),
     field("Email", email), field("Mobile", mobile), field("Business phone", bphone),
     field("Company", company), field("Job title", job), field("Birthday", bday),
-    field("Notes", notes),
-    el("div", { class: "cmp-footer" },
-      el("div", { class: "spacer", style: "flex:1" }),
-      el("button", { class: "btn primary", type: "button", onclick: (e) => composeContactSubmit(e.currentTarget, o.id) }, icon("users", "icon-sm"), o.id ? "Save" : "Create")));
-  openSheet(o.id ? "Edit contact" : "New contact", content);
-  setTimeout(() => given.focus(), 60);
+    field("Notes", notes));
+  // Render INLINE in the detail pane (live.com-style), like the mail composer —
+  // not an overlay sheet. Header carries the title + Discard/Save.
+  const box = $("#con-detail");
+  const discard = () => renderContactDetail(Contacts.selected || null);
+  const head = el("header", { class: "con-detail-head cmp-inline-head" },
+    el("span", { class: "cmp-inline-title truncate" }, o.id ? "Edit contact" : "New contact"),
+    el("div", { style: "flex:1" }),
+    el("button", { class: "btn ghost sm", type: "button", onclick: discard }, "Discard"),
+    el("button", { class: "btn primary sm", type: "button", onclick: (e) => composeContactSubmit(e.currentTarget, o.id) }, icon("users", "icon-sm"), o.id ? "Save" : "Create"));
+  if (box) {
+    clear(box).append(head, content);
+    setTimeout(() => given.focus(), 60);
+  } else {
+    openSheet(o.id ? "Edit contact" : "New contact", content); // fallback (no detail pane)
+  }
 }
 // map an archived contact body JSON -> the compose form's field values
 function contactFromBody(c) {
@@ -2017,7 +2027,10 @@ async function composeContactSubmit(btn, id) {
   try {
     await post((id ? "/api/v1/contact/update?" : "/api/v1/contact/create?") + qs(params), CAP.contactwrite);
     toast(id ? "Contact updated" : "Contact created");
-    closeSheet(); contactsReload();
+    await contactsReload();
+    // create leaves nothing selected → clear the inline form back to the empty
+    // detail state (edit is already re-rendered by contactsReload).
+    if (!id) renderContactDetail(Contacts.selected || null);
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function deleteContact(it) {
