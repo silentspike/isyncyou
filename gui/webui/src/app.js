@@ -393,12 +393,46 @@ const SHAREABLE = new Set(["onedrive"]);
 const App = { account: null, accounts: [], route: "overview", counts: {}, svcFilter: {} };
 // Per-service filter sub-items shown in the LEFT sidebar, indented under the
 // active service (NOT a separate rail). Lazy so Mail.cats is populated at call.
+// Map a well-known mail folder to an icon; custom folders fall back to "folder".
+function mailFolderIcon(name) {
+  const n = (name || "").toLowerCase();
+  if (n === "inbox") return "inbox";
+  if (n === "sent items" || n === "outbox") return "send";
+  if (n === "drafts") return "file-text";
+  if (n === "deleted items") return "trash-2";
+  if (n === "junk email") return "shield";
+  if (n === "archive") return "archive";
+  return "folder";
+}
+// Resolve a message's parent folder id → folder display name (or null).
+function mailFolderName(id) {
+  if (!id) return null;
+  const f = (Mail.folders || []).find(x => x.remote_id === id);
+  return f ? (f.name || null) : null;
+}
+// Sidebar nav specs for the mailbox folder tree (#563): one entry per archived
+// mailFolder, ordered like Outlook, each counting the messages that live in it
+// (message.parent_remote_id === folder id). Folders are already loaded into
+// Mail.folders; this only navigates them.
+function mailFolderSpecs() {
+  const order = ["inbox", "drafts", "sent items", "archive", "deleted items", "junk email", "outbox", "conversation history"];
+  const rank = n => { const i = order.indexOf((n || "").toLowerCase()); return i < 0 ? 50 : i; };
+  return (Mail.folders || []).slice()
+    .sort((a, b) => rank(a.name) - rank(b.name) || (a.name || "").localeCompare(b.name || ""))
+    .map(f => ({
+      key: "folder:" + f.remote_id,
+      label: f.name || "(folder)",
+      icon: mailFolderIcon(f.name),
+      count: m => m.filter(it => it.parent_remote_id === f.remote_id).length,
+    }));
+}
 function svcFilters(service) {
   if (service === "mail") return [
     { sec: "Mailbox" },
     { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
     { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
     { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
+    ...(Mail.folders && Mail.folders.length ? [{ sec: "Folders" }, ...mailFolderSpecs()] : []),
     { sec: "Status" },
     { key: "unread", label: "Unread", icon: "mail", count: m => m.filter(it => (it.preview || {}).isRead === false).length },
     { key: "flagged", label: "Flagged", icon: "flag", count: m => m.filter(it => (it.preview || {}).flag === "flagged").length },
@@ -1247,6 +1281,7 @@ function mailFiltered() {
   else if (f === "unread") rows = rows.filter(it => (it.preview || {}).isRead === false);
   else if (f === "flagged") rows = rows.filter(it => (it.preview || {}).flag === "flagged");
   else if (f === "high") rows = rows.filter(it => (it.preview || {}).importance === "high");
+  else if (f.startsWith("folder:")) { const fid = f.slice(7); rows = rows.filter(it => it.parent_remote_id === fid); }
   else if (f !== "all") rows = rows.filter(it => ((it.preview || {}).categories || []).includes(f));
   if (Mail.q) rows = rows.filter(it => { const p = it.preview || {}; return ((p.subject || it.name || "") + " " + (p.from || "") + " " + (p.snippet || "")).toLowerCase().includes(Mail.q); });
   const dir = Mail.sort === "oldest" ? 1 : -1;
@@ -1576,6 +1611,7 @@ function renderMailReader(it, remoteImages = false) {
           p.flag === "flagged" ? el("span", { class: "mi-chip flag-on", title: "Flagged for follow-up" }, icon("flag", "icon-sm"), "Flagged") : null,
           p.isRead === false ? el("span", { class: "mi-chip unread-chip", title: "Unread" }, "Unread") : null,
           p.inferenceClassification === "other" ? el("span", { class: "mi-chip", title: "Arrived in Other (not the Focused inbox)" }, icon("inbox", "icon-sm"), "Other") : null,
+          ((fn) => fn ? el("span", { class: "mi-chip", title: "In folder: " + fn + " — click to browse it", style: "cursor:pointer", onclick: () => setSvcFilter("mail", "folder:" + it.parent_remote_id) }, icon(mailFolderIcon(fn), "icon-sm"), fn) : null)(mailFolderName(it.parent_remote_id)),
           coverageBadge(it),
           verifyChip(it)),
         el("h2", { class: "mr-subject", text: subject }),
