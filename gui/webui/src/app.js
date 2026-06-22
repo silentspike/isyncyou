@@ -2824,6 +2824,9 @@ async function renderContactDetail(it) {
     const c = await api("/api/v1/body?" + qs({ account: App.account, service: "contacts", id: it.remote_id }));
     const kv = el("dl", { class: "kv" });
     const add = (k, v, ic) => { if (!v || (Array.isArray(v) && !v.length)) return; kv.append(el("dt", {}, ic ? icon(ic, "icon-sm") : null, el("span", { text: k })), el("dd", { text: Array.isArray(v) ? v.join(", ") : v })); };
+    // Formal name parts (salutation / middle name / generation) the displayName drops.
+    const fullName = [c.title, c.givenName, c.middleName, c.surname, c.generation].filter(Boolean).join(" ").trim();
+    if (fullName && fullName !== (it.name || "").trim()) add("Full name", fullName, "users");
     add("Email", (c.emailAddresses || []).map(e => e.address).filter(Boolean), "mail");
     add("Mobile", c.mobilePhone, "phone");
     add("Business", c.businessPhones, "phone");
