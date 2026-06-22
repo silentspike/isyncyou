@@ -3618,13 +3618,19 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             Ok(())
         }
         fn reply_html(&self, _a: &str, id: &str, body: &str, all: bool) -> Result<(), String> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("reply_html id={id} all={all} body_len={}", body.len()));
+            self.0.lock().unwrap().push(format!(
+                "reply_html id={id} all={all} body_len={}",
+                body.len()
+            ));
             Ok(())
         }
-        fn forward_html(&self, _a: &str, id: &str, body: &str, to: &[String]) -> Result<(), String> {
+        fn forward_html(
+            &self,
+            _a: &str,
+            id: &str,
+            body: &str,
+            to: &[String],
+        ) -> Result<(), String> {
             self.0.lock().unwrap().push(format!(
                 "forward_html id={id} to={} body_len={}",
                 to.join(","),

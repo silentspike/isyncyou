@@ -1112,6 +1112,68 @@ async function replyForwardSubmit(btn, it, mode) {
   } catch (e) { toast("Reply failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 
+// Inline rich reply/forward (#67, live.com-style): the composer takes over the
+// reader pane — a format toolbar + contenteditable for the user's NEW content on
+// top, the original message shown read-only (sandboxed iframe) below. Only the new
+// content is sent; the daemon prepends it above the quoted original (Mail-1), so
+// the URL stays small and the full original is preserved + threaded.
+function openInlineComposer(it, mode) {
+  if (!CAP.mailwrite) return;
+  const box = $("#mail-reader"); if (!box) return;
+  const p = it.preview || {};
+  const isFwd = mode === "forward";
+  const title = isFwd ? "Forward" : mode === "replyAll" ? "Reply all" : "Reply";
+  const editor = el("div", { class: "cmp-editor", id: "cmp-editor", contenteditable: "true" });
+  editor.innerHTML = "<p><br></p>";
+  const toIn = isFwd ? el("input", { class: "input", id: "cmp-fwd-to", placeholder: "To — comma-separated email addresses" }) : null;
+  const tbBtn = (cmd, ic, ttl, arg) => el("button", {
+    class: "cmp-tb-btn", type: "button", title: ttl,
+    onmousedown: (e) => { e.preventDefault(); document.execCommand(cmd, false, arg); editor.focus(); },
+  }, icon(ic, "icon-sm"));
+  const toolbar = el("div", { class: "cmp-toolbar" },
+    tbBtn("bold", "bold", "Bold"), tbBtn("italic", "italic", "Italic"), tbBtn("underline", "underline", "Underline"),
+    el("span", { class: "cmp-tb-sep" }),
+    tbBtn("insertUnorderedList", "list", "Bulleted list"), tbBtn("insertOrderedList", "list-ordered", "Numbered list"),
+    el("button", {
+      class: "cmp-tb-btn", type: "button", title: "Insert link",
+      onmousedown: (e) => { e.preventDefault(); const u = prompt("Link URL:"); if (u) document.execCommand("createLink", false, u); editor.focus(); },
+    }, icon("link", "icon-sm")));
+  const q = { account: App.account, service: "mail", id: it.remote_id };
+  const quoteFrame = el("iframe", { class: "cmp-quote-frame", src: `/api/v1/view?${qs(q)}`, title: "Original message", sandbox: "allow-same-origin", loading: "lazy" });
+  const head = el("div", { class: "cmp-inline-head" },
+    el("span", { class: "cmp-inline-title truncate" }, title + (p.subject ? " · " + p.subject : (it.name ? " · " + it.name : ""))),
+    el("div", { style: "flex:1" }),
+    el("button", { class: "btn ghost sm", type: "button", onclick: () => renderMailReader(it) }, "Discard"),
+    el("button", { class: "btn primary sm", id: "cmp-send", type: "button", onclick: (e) => inlineComposerSend(e.currentTarget, it, mode) },
+      icon(isFwd ? "corner-up-right" : "send", "icon-sm"), isFwd ? "Forward" : "Send"));
+  const scroller = el("div", { class: "cmp-inline-scroll" });
+  if (toIn) scroller.append(el("label", { class: "cmp-inline-to" }, el("span", { class: "cmp-label", text: "To" }), toIn));
+  scroller.append(toolbar, editor,
+    el("div", { class: "cmp-quote-label dim" }, `Original from ${addrLabel(p.from) || "sender"} · included below your ${isFwd ? "forward" : "reply"}`),
+    quoteFrame);
+  clear(box).append(head, scroller);
+  setTimeout(() => editor.focus(), 50);
+}
+async function inlineComposerSend(btn, it, mode) {
+  const editor = $("#cmp-editor"); if (!editor) return;
+  const body = (editor.innerHTML || "").trim();
+  const params = { account: App.account, id: it.remote_id, body };
+  let path = "/api/v1/mail/reply";
+  if (mode === "forward") {
+    const to = ($("#cmp-fwd-to").value || "").trim();
+    if (!to) { toast("Add at least one recipient", "err"); return; }
+    params.to = to; path = "/api/v1/mail/forward";
+  } else {
+    params.all = mode === "replyAll" ? "1" : "0";
+  }
+  btn.disabled = true;
+  try {
+    await post(path + "?" + qs(params), CAP.mailwrite);
+    toast(mode === "forward" ? "Forwarded" : "Reply sent");
+    renderMailReader(it);
+  } catch (e) { toast("Send failed: " + e.message, "err"); btn.disabled = false; }
+}
+
 /* ---- per-message manage (#563 B5): optimistic local update, reconcile on the
    server's SSE notify (B1); revert + toast on failure. ---- */
 function mailRerender(it) {
@@ -1212,9 +1274,9 @@ function renderMailReader(it, remoteImages = false) {
   const actions = el("div", { class: "mr-actions" });
   if (CAP.mailwrite) {
     actions.append(
-      el("button", { class: "btn primary sm", title: "Reply", onclick: () => openReplyForward(it, "reply") }, icon("corner-up-left", "icon-sm"), "Reply"),
-      el("button", { class: "btn ghost sm icon-only", title: "Reply all", onclick: () => openReplyForward(it, "replyAll") }, icon("users", "icon-sm")),
-      el("button", { class: "btn ghost sm icon-only", title: "Forward", onclick: () => openReplyForward(it, "forward") }, icon("corner-up-right", "icon-sm")),
+      el("button", { class: "btn primary sm", title: "Reply", onclick: () => openInlineComposer(it, "reply") }, icon("corner-up-left", "icon-sm"), "Reply"),
+      el("button", { class: "btn ghost sm icon-only", title: "Reply all", onclick: () => openInlineComposer(it, "replyAll") }, icon("users", "icon-sm")),
+      el("button", { class: "btn ghost sm icon-only", title: "Forward", onclick: () => openInlineComposer(it, "forward") }, icon("corner-up-right", "icon-sm")),
     );
   }
   if (it.has_body) actions.append(remoteImages

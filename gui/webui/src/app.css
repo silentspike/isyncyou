@@ -1110,6 +1110,21 @@ a.note-meta-chip:hover { color: var(--accent); }
 .cmp-quote-h { font-size: var(--fs-xs); margin-bottom: 4px; }
 .cmp-quote-b { font-size: var(--fs-sm); display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 
+/* inline rich reply/forward composer (#67) — takes over the reader pane */
+.cmp-inline-head { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-5); flex: none; border-bottom: 1px solid var(--line); background: var(--bg-1); }
+.cmp-inline-title { font-weight: 600; font-size: var(--fs-md); color: var(--text-hi); min-width: 0; }
+.cmp-inline-scroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5); }
+.cmp-inline-to { display: grid; gap: 4px; }
+.cmp-toolbar { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; padding: 4px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-md); }
+.cmp-tb-btn { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-mid); cursor: pointer; transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.cmp-tb-btn:hover { background: var(--bg-hover); color: var(--text-hi); }
+.cmp-tb-sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+.cmp-editor { min-height: 160px; padding: var(--sp-3) var(--sp-4); background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-md); color: var(--text-hi); line-height: 1.55; font-size: var(--fs-md); }
+.cmp-editor:focus { outline: none; border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-soft); }
+.cmp-editor a { color: var(--accent); }
+.cmp-quote-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em; padding-top: var(--sp-2); border-top: 1px solid var(--line); }
+.cmp-quote-frame { width: 100%; min-height: 320px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-0); }
+
 /* per-message manage: pickers + states (#563 B5) */
 .pick-list { display: flex; flex-direction: column; gap: 2px; max-height: 50vh; overflow: auto; }
 .pick-row { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-radius: var(--r-sm); cursor: pointer; }

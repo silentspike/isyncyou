@@ -36,8 +36,7 @@ pub trait MailWriter {
     /// an edited quote) while keeping the message in the original conversation.
     fn reply_html(&self, message_id: &str, body_html: &str, all: bool) -> Result<(), String>;
     /// Rich forward: create a forward **draft** to `to`, set its full HTML body, send.
-    fn forward_html(&self, message_id: &str, body_html: &str, to: &[String])
-        -> Result<(), String>;
+    fn forward_html(&self, message_id: &str, body_html: &str, to: &[String]) -> Result<(), String>;
     /// Move a message to another folder; returns its new id in the destination.
     fn move_to(&self, message_id: &str, destination_id: &str) -> Result<String, String>;
     /// Mark a message read/unread.
@@ -93,6 +92,20 @@ pub fn build_message(
     m
 }
 
+/// Prepend the user's new HTML above the quoted original a reply/forward draft
+/// already contains: Graph's `createReply`/`createForward` pre-fill the draft body
+/// with the quoted original, so the inline composer only sends the user's new
+/// content and we keep the quote below. Falls back to the user's HTML alone if the
+/// draft response carried no body.
+pub fn prepend_to_draft_body(draft: &Value, user_html: &str) -> String {
+    let quote = draft
+        .get("body")
+        .and_then(|b| b.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    format!("{user_html}{quote}")
+}
+
 // Inherent GraphClient methods share names with several trait methods, so every
 // delegation is fully qualified to call the inherent (HTTP) method, never recurse.
 impl MailWriter for isyncyou_graph::GraphClient {
@@ -138,29 +151,28 @@ impl MailWriter for isyncyou_graph::GraphClient {
             isyncyou_graph::GraphClient::create_reply(self, message_id)
         }
         .map_err(|e| e.to_string())?;
+        // `body_html` is only the user's NEW content; prepend it above the quoted
+        // original the draft already carries (Outlook-style "write on top").
+        let combined = prepend_to_draft_body(&draft, body_html);
         let draft_id = draft
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| "createReply response has no id".to_string())?;
-        let patch = json!({ "body": { "contentType": "HTML", "content": body_html } });
+        let patch = json!({ "body": { "contentType": "HTML", "content": combined } });
         isyncyou_graph::GraphClient::update_draft(self, draft_id, &patch)
             .map_err(|e| e.to_string())?;
         isyncyou_graph::GraphClient::send_draft(self, draft_id).map_err(|e| e.to_string())
     }
-    fn forward_html(
-        &self,
-        message_id: &str,
-        body_html: &str,
-        to: &[String],
-    ) -> Result<(), String> {
+    fn forward_html(&self, message_id: &str, body_html: &str, to: &[String]) -> Result<(), String> {
         let to_refs: Vec<&str> = to.iter().map(String::as_str).collect();
         let draft = isyncyou_graph::GraphClient::create_forward(self, message_id, &to_refs)
             .map_err(|e| e.to_string())?;
+        let combined = prepend_to_draft_body(&draft, body_html);
         let draft_id = draft
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| "createForward response has no id".to_string())?;
-        let patch = json!({ "body": { "contentType": "HTML", "content": body_html } });
+        let patch = json!({ "body": { "contentType": "HTML", "content": combined } });
         isyncyou_graph::GraphClient::update_draft(self, draft_id, &patch)
             .map_err(|e| e.to_string())?;
         isyncyou_graph::GraphClient::send_draft(self, draft_id).map_err(|e| e.to_string())
@@ -301,7 +313,10 @@ mod tests {
             Ok(())
         }
         fn reply_html(&self, id: &str, body_html: &str, all: bool) -> Result<(), String> {
-            self.log(format!("reply_html id={id} all={all} body_len={}", body_html.len()));
+            self.log(format!(
+                "reply_html id={id} all={all} body_len={}",
+                body_html.len()
+            ));
             Ok(())
         }
         fn forward_html(&self, id: &str, body_html: &str, to: &[String]) -> Result<(), String> {
