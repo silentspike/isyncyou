@@ -295,7 +295,12 @@ fn run(args: &Args) -> Result<(), String> {
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
-    eprintln!("isyncyoud: restore + sharing + verify enabled; capability token: {cap_token}");
+    // SECURITY: never log the capability token itself — it gates every destructive
+    // write. Log only that protection is enabled.
+    eprintln!(
+        "isyncyoud: restore + sharing + verify enabled; capability token: set ({} bytes)",
+        cap_token.len()
+    );
 
     let mut router = if args.sync_secs > 0 {
         isyncyou_webui::Router::with_gate(cfg.clone(), gate.clone())
@@ -376,7 +381,29 @@ fn mint_cap_token() -> String {
     let mut buf = [0u8; 16];
     match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
         Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
-        Err(_) => format!("isy-{}-fallback", std::process::id()),
+        Err(_) => {
+            // /dev/urandom unavailable — derive a NON-predictable fallback by mixing
+            // several entropy sources (a freshly OS-seeded RandomState, the process
+            // id, a high-resolution timestamp and a stack address) instead of a bare,
+            // guessable pid. Still 32 hex chars like the primary path.
+            use std::hash::{BuildHasher, Hasher};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let seed_addr = std::ptr::addr_of!(buf) as usize;
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut out = String::with_capacity(32);
+            for i in 0..2u64 {
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u64(u64::from(std::process::id()));
+                h.write_u128(nanos);
+                h.write_usize(seed_addr);
+                h.write_u64(i);
+                out.push_str(&format!("{:016x}", h.finish()));
+            }
+            out
+        }
     }
 }
 

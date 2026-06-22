@@ -453,7 +453,7 @@ function renderShell() {
           // sidebar sub-filters (live.com-style); otherwise navigate.
           if (App.route === s.id) {
             const sn = document.getElementById("subnav-" + s.id);
-            if (sn) { const c = sn.classList.toggle("collapsed"); item.classList.toggle("nav-collapsed", c); }
+            if (sn) sn.classList.toggle("collapsed");
           } else go(s.id);
         },
       },
@@ -576,6 +576,9 @@ function onRoute() {
   App.route = raw.split("?")[0];
   App.query = (raw.split("?")[1] || "").replace(/^q=/, "");
   if (!SERVICES.find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
+  // Close any open overlay (detail sheet / command palette) on a real navigation
+  // so it can't leak across routes; a same-route refresh keeps it open.
+  if (App.route !== prevRoute) { closeSheet(); closePalette(); }
   renderShell();
   const view = $("#view");
   let p;
@@ -1256,7 +1259,10 @@ function renderMailReader(it, remoteImages = false) {
   // The body is a same-origin sandboxed iframe. Size it to its own content on
   // load and let the OUTER pane scroll → the whole message scrolls naturally
   // (an internally-scrolling iframe in a flex column felt like "can't scroll").
-  const frame = el("iframe", { class: "mail-frame", src: `/api/v1/view?${qs(viewQ)}`, title: "Message body" });
+  // sandbox: allow-same-origin only — scripts/forms/popups/top-navigation are
+  // blocked by the sandbox (defense-in-depth beside the sanitizer + CSP), while
+  // same-origin access stays open so fit() can measure the content height.
+  const frame = el("iframe", { class: "mail-frame", src: `/api/v1/view?${qs(viewQ)}`, title: "Message body", sandbox: "allow-same-origin" });
   // Re-measure on EVERY content size change (images decode after load, fonts
   // reflow, etc.) so the iframe always matches its full content height and the
   // outer pane can scroll all the way to the end. The >2px guard avoids a
@@ -2821,10 +2827,18 @@ function renderNoteReader(it) {
   if (p.has_resources) chip("paperclip", "Has embedded resources");
   meta.append(coverageBadge(it));
   if (p.web_url && /^https?:\/\//i.test(p.web_url)) meta.append(el("a", { class: "note-meta-chip", href: p.web_url, target: "_blank", rel: "noopener noreferrer" }, icon("external-link", "icon-sm"), el("span", { text: "Open in OneNote" })));
+  // has_body=false (live_only) pages have no archived content — show a native dark
+  // card instead of pointing the iframe at /view (which would 404 with raw JSON).
+  const bodyEl = it.has_body
+    ? el("iframe", { class: "note-frame", src: `/api/v1/view?${qs(q)}`, title: "Note", loading: "lazy", sandbox: "allow-same-origin" })
+    : el("div", { class: "empty note-empty", style: "margin:auto;text-align:center;padding:48px" },
+        icon("cloud", "icon-lg"),
+        el("h3", { text: "Not backed up yet" }),
+        el("p", { class: "dim", text: "This page is in the cloud but its content isn't archived yet. Run a backup to read it here." }));
   box.append(
     el("header", { class: "note-reader-head" }, el("h2", { class: "grow truncate", text: it.name || "(untitled)" }), actions),
     meta,
-    el("iframe", { class: "note-frame", src: `/api/v1/view?${qs(q)}`, title: "Note", loading: "lazy" }));
+    bodyEl);
 }
 // #568: live OneNote write — create page (section picker) / delete / best-effort append, cap-gated
 async function openComposePage(presetSection) {

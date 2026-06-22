@@ -733,9 +733,22 @@ impl Router {
         self
     }
 
-    /// Whether the request carries the configured capability token.
+    /// Whether the request carries the configured capability token. The token is
+    /// compared in **constant time** so a timing side-channel can't reveal it byte
+    /// by byte (the length check only leaks length, which is fixed for our tokens).
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
-        matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
+        let (Some(w), Some(g)) = (expected, &req.cap_token) else {
+            return false;
+        };
+        let (wb, gb) = (w.as_bytes(), g.as_bytes());
+        if wb.len() != gb.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in wb.iter().zip(gb.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
     }
 
     /// Append a durable audit entry to the account activity log. Destructive

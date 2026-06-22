@@ -98,12 +98,22 @@ h1{font-size:20px;margin:0 0 4px}\
 /// Wrap rendered inner HTML in a complete, self-contained, locked-down page,
 /// embedding `csp` as a `<meta>` CSP (a second layer beside the response header).
 pub fn page_with_csp(title: &str, inner: &str, csp: &str) -> String {
+    // `frame-ancestors` is ignored when delivered via <meta> (browsers honor it
+    // only from the response header), so strip it from the meta copy to avoid a
+    // console error. The authoritative CSP — including frame-ancestors — is the
+    // response header set by the caller; this meta is the redundant second layer.
+    let meta_csp: String = csp
+        .split(';')
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.to_ascii_lowercase().starts_with("frame-ancestors"))
+        .collect::<Vec<_>>()
+        .join("; ");
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\
 <title>{title}</title><style>{style}</style></head>\
 <body><div class=\"wrap\">{inner}</div></body></html>",
-        csp = escape(csp),
+        csp = escape(&meta_csp),
         title = escape(title),
         style = STYLE,
         inner = inner,
