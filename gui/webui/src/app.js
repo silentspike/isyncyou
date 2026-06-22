@@ -1849,7 +1849,7 @@ async function openEventSheet(ev) {
   if (CAP.calendarwrite) {
     const acts = el("div", { style: "margin-top:16px;display:flex;gap:8px;flex-wrap:wrap" });
     acts.append(el("button", { class: "btn ghost sm", onclick: () => { closeSheet(); openComposeEvent({ id: ev.it.remote_id, subject: ev.subject, start: ev.start, end: ev.end, location: ev.location }); } }, icon("info", "icon-sm"), "Edit"));
-    ["accept", "tentative", "decline"].forEach(r => acts.append(el("button", { class: "btn ghost sm", title: "Respond: " + r, onclick: () => respondEvent(ev, r) }, r[0].toUpperCase() + r.slice(1))));
+    ["accept", "tentative", "decline"].forEach(r => acts.append(el("button", { class: "btn ghost sm", title: "Respond: " + r, onclick: () => eventRespondInline(ev, r, acts) }, r[0].toUpperCase() + r.slice(1))));
     acts.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", onclick: () => deleteEvent(ev) }, icon("trash-2", "icon-sm"), "Delete"));
     content.append(acts);
   }
@@ -1906,11 +1906,32 @@ async function composeEventSubmit(btn, id) {
     closeSheet(); calLoad();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
-async function respondEvent(ev, response) {
-  try {
-    await post("/api/v1/calendar/respond?" + qs({ account: App.account, id: ev.it.remote_id, response }), CAP.calendarwrite);
-    toast("Response sent: " + response); closeSheet(); calLoad();
-  } catch (e) { toast("Failed: " + e.message, "err"); }
+// Inline, animated response chooser (no popup): Accept/Tentative/Decline opens a
+// smooth expander offering "Send now" or "Add a message" (Outlook-style). The
+// daemon respond endpoint already takes an optional comment.
+function eventRespondInline(ev, response, host) {
+  host.parentNode.querySelectorAll(".evt-respond").forEach(p => p.remove()); // one at a time
+  const cap = response[0].toUpperCase() + response.slice(1);
+  const ta = el("textarea", { class: "input cmp-textarea evt-respond-msg", placeholder: "Add a message…", rows: "3" });
+  const msgWrap = el("div", { class: "evt-respond-msg-wrap" }, ta);
+  const doSend = async (withMsg) => {
+    const comment = withMsg ? (ta.value || "").trim() : "";
+    try {
+      await post("/api/v1/calendar/respond?" + qs({ account: App.account, id: ev.it.remote_id, response, comment }), CAP.calendarwrite);
+      toast(cap + " sent" + (comment ? " with a message" : "")); closeSheet(); calLoad();
+    } catch (e) { toast("Failed: " + e.message, "err"); }
+  };
+  const sendWith = el("button", { class: "btn primary sm", style: "margin-top:8px", onclick: () => doSend(true) }, icon("send", "icon-sm"), "Send with message");
+  const sendWithWrap = el("div", { class: "evt-respond-send2", style: "display:none" }, sendWith);
+  const panel = el("div", { class: "evt-respond" },
+    el("div", { class: "evt-respond-h", text: `${cap} — send your response?` }),
+    el("div", { class: "evt-respond-actions" },
+      el("button", { class: "btn primary sm", onclick: () => doSend(false) }, icon("send", "icon-sm"), "Send now"),
+      el("button", { class: "btn ghost sm", onclick: () => { msgWrap.classList.add("open"); sendWithWrap.style.display = "block"; setTimeout(() => ta.focus(), 60); } }, icon("plus", "icon-sm"), "Add a message"),
+      el("button", { class: "btn ghost sm", onclick: () => { panel.classList.remove("open"); setTimeout(() => panel.remove(), 220); } }, "Cancel")),
+    msgWrap, sendWithWrap);
+  host.after(panel);
+  requestAnimationFrame(() => panel.classList.add("open"));
 }
 async function deleteEvent(ev) {
   if (!confirm("Delete this event? This removes it from your calendar.")) return;

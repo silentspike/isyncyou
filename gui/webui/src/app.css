@@ -520,6 +520,16 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--line); border-radius: var(--r-md); color: var(--text-mid);
   line-height: 1.55; white-space: pre-wrap; word-break: break-word; font-size: var(--fs-sm);
   max-height: 50vh; overflow-y: auto; }
+/* inline animated response chooser (accept/tentative/decline) — not a popup */
+.evt-respond { margin-top: 10px; padding: 0 12px; background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: var(--r-md); max-height: 0; opacity: 0; overflow: hidden;
+  transition: max-height var(--t-mid) var(--ease), opacity var(--t-mid) var(--ease), padding var(--t-mid) var(--ease); }
+.evt-respond.open { max-height: 360px; opacity: 1; padding: 12px; }
+.evt-respond-h { font-size: var(--fs-sm); color: var(--text-mid); margin-bottom: 8px; }
+.evt-respond-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.evt-respond-msg-wrap { max-height: 0; overflow: hidden; transition: max-height var(--t-mid) var(--ease); }
+.evt-respond-msg-wrap.open { max-height: 180px; margin-top: 8px; }
+.evt-respond-msg { width: 100%; }
 
 /* ============================================================ animations utils */
 @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
