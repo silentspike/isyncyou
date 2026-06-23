@@ -681,6 +681,11 @@ a:hover { text-decoration: underline; }
 .acct-dc-title { font-weight: 600; }
 .acct-dc-code { font-family: var(--mono, ui-monospace, monospace); font-size: var(--fs-xl); font-weight: 700; letter-spacing: .12em; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); align-self: stretch; text-align: center; }
 .acct-dc-status { font-size: var(--fs-sm); }
+/* OneNote inline append composer (#65) */
+.note-append { margin: var(--sp-3) var(--sp-4); border: 1px solid var(--line); border-radius: var(--r-md, 10px); background: var(--bg-1); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
+.note-append-head { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); }
+.note-append-ta { width: 100%; resize: vertical; min-height: 64px; }
+.note-append-foot { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 
 /* rich empty reading pane */
 .mail-empty { margin: auto; max-width: 420px; text-align: center; padding: var(--sp-6); display: flex; flex-direction: column; align-items: center; gap: var(--sp-3); }

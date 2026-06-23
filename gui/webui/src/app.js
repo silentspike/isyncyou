@@ -3432,13 +3432,37 @@ async function deletePage(it) {
     toast("Page deleted"); Note.selected = null; renderNoteReader(null); noteReload();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
-async function appendPage(it) {
-  const text = prompt("Append a paragraph to this page:");
-  if (!text || !text.trim()) return;
-  try {
-    await post("/api/v1/onenote/append?" + qs({ account: App.account, id: it.remote_id, text: text.trim() }), CAP.onenotewrite);
-    toast("Appended (OneNote may take a moment to reflect it)");
-  } catch (e) { toast("Failed: " + e.message, "err"); }
+// #65: inline in-reader append composer. Graph's page-content PATCH reliably
+// supports appending a block (`target:body, action:append`); arbitrary in-place
+// replace of existing elements is fragile on a personal MSA, so we scope the UX to
+// append-only and say so. Optimistic toast; cap-gated.
+function appendPage(it) {
+  const box = $("#note-reader"); if (!box) return;
+  const existing = box.querySelector(".note-append");
+  if (existing) { existing.querySelector("textarea")?.focus(); return; }
+  const ta = el("textarea", { class: "input note-append-ta", rows: "3", placeholder: "Type a paragraph to append to this page…" });
+  const status = el("span", { class: "dim", style: "font-size:12px" });
+  const submit = async (btn) => {
+    const text = (ta.value || "").trim();
+    if (!text) { ta.focus(); return; }
+    btn.disabled = true; status.textContent = "Appending…";
+    try {
+      await post("/api/v1/onenote/append?" + qs({ account: App.account, id: it.remote_id, text }), CAP.onenotewrite);
+      toast("Appended — OneNote may take a moment to reflect it");
+      panel.remove();
+    } catch (e) { status.textContent = ""; btn.disabled = false; toast("Append failed: " + e.message, "err"); }
+  };
+  const panel = el("div", { class: "note-append" },
+    el("div", { class: "note-append-head dim" }, icon("plus", "icon-sm"), el("span", { text: "Append a paragraph" })),
+    ta,
+    el("div", { class: "note-append-foot" },
+      el("button", { class: "btn sm primary", onclick: (e) => submit(e.currentTarget) }, icon("plus", "icon-sm"), "Append"),
+      el("button", { class: "btn ghost sm", onclick: () => panel.remove() }, "Cancel"),
+      status,
+      el("span", { class: "dim", style: "font-size:11px;margin-left:auto;text-align:right", text: "Append-only — arbitrary in-place edits aren't reliable on personal OneNote" })));
+  ta.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); submit(panel.querySelector(".btn.primary")); } });
+  box.append(panel);
+  ta.focus();
 }
 async function noteReload() {
   try {
