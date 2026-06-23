@@ -310,6 +310,10 @@ fn run(args: &Args) -> Result<(), String> {
             cfg: cfg.clone(),
             logins: Mutex::new(std::collections::HashMap::new()),
         });
+    // A separate token gates the push register/test POSTs (#576). The notifier is
+    // shared with the sync loop so a completed backup can notify the phone (FCM).
+    let push_cap_token = mint_cap_token();
+    let push_notifier = Arc::new(DaemonPush::new(&cfg));
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
@@ -333,6 +337,10 @@ fn run(args: &Args) -> Result<(), String> {
     .with_task_write(task_write_handler, task_write_cap_token)
     .with_onenote_write(onenote_write_handler, onenote_write_cap_token)
     .with_account_auth(account_auth_handler, account_cap_token)
+    .with_push(
+        push_notifier.clone() as Arc<dyn isyncyou_webui::PushHandler>,
+        push_cap_token,
+    )
     .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
@@ -361,7 +369,8 @@ fn run(args: &Args) -> Result<(), String> {
         });
         let (cfg2, gate2, sched2) = (cfg, gate, sched.clone());
         let (interval2, events2) = (live_interval.clone(), events.clone());
-        std::thread::spawn(move || sync_loop(cfg2, gate2, interval2, sched2, events2));
+        let push2 = push_notifier.clone();
+        std::thread::spawn(move || sync_loop(cfg2, gate2, interval2, sched2, events2, push2));
         router = router.with_sync_control(sched, cap_token);
     }
 
@@ -846,6 +855,78 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
     }
 }
 
+/// Push notifications (#576): stores registered device FCM tokens and sends FCM v1
+/// messages via a Google service-account. The PushProvider abstraction (ADR-006) is
+/// FCM here; a self-hosted ntfy/UnifiedPush provider is the documented alternative.
+/// The service-account path comes from `ISYNCYOU_FCM_SA` (push disabled if unset);
+/// tokens persist as JSON next to the first account's archive.
+#[derive(Clone)]
+struct DaemonPush {
+    tokens_path: PathBuf,
+    sa_path: Option<PathBuf>,
+}
+impl DaemonPush {
+    fn new(cfg: &Config) -> Self {
+        let tokens_path = cfg
+            .accounts
+            .first()
+            .map(|a| a.archive_root.join(".isyncyou-push-tokens.json"))
+            .unwrap_or_else(|| PathBuf::from(".isyncyou-push-tokens.json"));
+        let sa_path = std::env::var_os("ISYNCYOU_FCM_SA").map(PathBuf::from);
+        DaemonPush {
+            tokens_path,
+            sa_path,
+        }
+    }
+    fn load_tokens(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.tokens_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default()
+    }
+    /// Send one notification to every registered device. Returns how many succeeded.
+    /// Best-effort: a missing service-account or a dead token never fails a caller.
+    fn notify(&self, title: &str, body: &str) -> usize {
+        let Some(sa_path) = &self.sa_path else {
+            return 0;
+        };
+        let Ok(sa) = std::fs::read_to_string(sa_path)
+            .map_err(|e| e.to_string())
+            .and_then(|j| isyncyou_graph::push::ServiceAccount::from_json(&j))
+        else {
+            eprintln!("isyncyoud: push disabled — service-account unreadable");
+            return 0;
+        };
+        let now = unix_now().parse::<u64>().unwrap_or(0);
+        let mut sent = 0;
+        for t in self.load_tokens() {
+            match isyncyou_graph::push::fcm_send(&sa, &t, title, body, now) {
+                Ok(_) => sent += 1,
+                Err(e) => eprintln!("isyncyoud: push to a device failed: {e}"),
+            }
+        }
+        sent
+    }
+}
+impl isyncyou_webui::PushHandler for DaemonPush {
+    fn register(&self, token: &str) -> Result<(), String> {
+        let mut toks = self.load_tokens();
+        if !toks.iter().any(|t| t == token) {
+            toks.push(token.to_string());
+            std::fs::write(
+                &self.tokens_path,
+                serde_json::to_vec(&toks).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    fn send_test(&self) -> Result<serde_json::Value, String> {
+        let n = self.notify("iSyncYou", "Test notification");
+        Ok(serde_json::json!({ "sent": n, "registered": self.load_tokens().len() }))
+    }
+}
+
 /// Web-UI outbound sharing (#494): create a sharing link for a OneDrive item by id
 /// using the cached write token (`Files.ReadWrite`). Only OneDrive drive items are
 /// shareable via `createLink`.
@@ -1189,6 +1270,7 @@ fn sync_loop(
     interval: Arc<AtomicU64>,
     sched: Arc<Scheduler>,
     events: Arc<isyncyou_webui::EventBus>,
+    push: Arc<DaemonPush>,
 ) {
     let host = local_host();
     loop {
@@ -1218,7 +1300,17 @@ fn sync_loop(
             // incremental mail pass so new cloud mail lands in the store and the
             // SSE notify below surfaces it without a manual reload.
             match backup_account(&cfg, &acc.id, &gate) {
-                Ok(summary) => eprintln!("isyncyoud: backup {} -> {summary}", acc.id),
+                Ok((summary, delta)) => {
+                    eprintln!("isyncyoud: backup {} -> {summary}", acc.id);
+                    // Push (#576): notify the phone when new content was archived. The
+                    // FCM token must have been registered by the UI; otherwise no-op.
+                    if let Some(body) = delta.notification() {
+                        let n = push.notify("iSyncYou — backup complete", &body);
+                        if n > 0 {
+                            eprintln!("isyncyoud: push '{body}' sent to {n} device(s)");
+                        }
+                    }
+                }
                 Err(e) => eprintln!("isyncyoud: backup {} skipped: {e}", acc.id),
             }
         }
@@ -1309,7 +1401,52 @@ fn sync_account(
 /// flank snapshots. Keeps the store/archive current so the SSE notify surfaces new
 /// mail. Read-only; a missing token is a clean skip (logged, never fatal). Mail is
 /// the pilot — other services follow their own rollout stories.
-fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<String, String> {
+/// What a backup pass newly archived, for the push notification (#576). Only the
+/// counts the user wants to be told about ("3 new emails backed up").
+#[derive(Default)]
+struct BackupDelta {
+    mail: u64,
+    calendar: u64,
+    contacts: u64,
+    todo: u64,
+    onenote: u64,
+}
+impl BackupDelta {
+    fn total(&self) -> u64 {
+        self.mail + self.calendar + self.contacts + self.todo + self.onenote
+    }
+    /// A short human notification body, or `None` when nothing new was archived.
+    fn notification(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        let one_or_many =
+            |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut parts = Vec::new();
+        if self.mail > 0 {
+            parts.push(one_or_many(self.mail, "email", "emails"));
+        }
+        if self.calendar > 0 {
+            parts.push(one_or_many(self.calendar, "event", "events"));
+        }
+        if self.contacts > 0 {
+            parts.push(one_or_many(self.contacts, "contact", "contacts"));
+        }
+        if self.todo > 0 {
+            parts.push(one_or_many(self.todo, "task", "tasks"));
+        }
+        if self.onenote > 0 {
+            parts.push(one_or_many(self.onenote, "note", "notes"));
+        }
+        Some(format!("{} backed up", parts.join(", ")))
+    }
+}
+
+fn backup_account(
+    cfg: &Config,
+    account: &str,
+    gate: &Arc<Mutex<()>>,
+) -> Result<(String, BackupDelta), String> {
     let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
     let token = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)?;
     let acc = cfg
@@ -1449,7 +1586,17 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
         isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root)
             .map(|r| r.notebooks + r.section_groups + r.sections)
             .unwrap_or(0);
-    Ok(format!(
+    // Notification delta (#576): count genuinely new content archived this pass.
+    // New mail bodies (not just delta upserts, which include flag/read changes) is
+    // the user-relevant "new mail" signal; same per service.
+    let delta = BackupDelta {
+        mail: b.downloaded as u64,
+        calendar: cbodies as u64,
+        contacts: conbodies as u64,
+        todo: tbodies as u64,
+        onenote: nbodies as u64,
+    };
+    let summary = format!(
         "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
          calendar: {} events, {} bodies, {} flanks | \
          contacts: {} upserted, {} bodies, {} photos | \
@@ -1474,7 +1621,8 @@ fn backup_account(cfg: &Config, account: &str, gate: &Arc<Mutex<()>>) -> Result<
         nbodies,
         nres,
         nhier
-    ))
+    );
+    Ok((summary, delta))
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
@@ -1908,6 +2056,43 @@ impl isyncyou_dbus_status::StatusProvider for DaemonStatusProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_delta_notification_text() {
+        // Nothing new → no notification (the loop stays silent).
+        assert_eq!(BackupDelta::default().notification(), None);
+        // Singular vs plural per service.
+        assert_eq!(
+            BackupDelta {
+                mail: 1,
+                ..Default::default()
+            }
+            .notification()
+            .as_deref(),
+            Some("1 email backed up")
+        );
+        assert_eq!(
+            BackupDelta {
+                mail: 3,
+                ..Default::default()
+            }
+            .notification()
+            .as_deref(),
+            Some("3 emails backed up")
+        );
+        // Multiple services join in a stable order.
+        assert_eq!(
+            BackupDelta {
+                mail: 2,
+                calendar: 1,
+                onenote: 4,
+                ..Default::default()
+            }
+            .notification()
+            .as_deref(),
+            Some("2 emails, 1 event, 4 notes backed up")
+        );
+    }
 
     #[test]
     fn cap_status_line_never_contains_the_token() {

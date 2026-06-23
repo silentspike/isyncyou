@@ -90,3 +90,58 @@ requirements:
       - No Android-pipeline workflow references an action by a floating tag.
       - Each action reference is a 40-char commit SHA.
     verified_by: []
+
+  # --- Push notifications (#576). The transport + direct-trigger half of ADR-006 is
+  # implemented and device-verified; the public-webhook relay half stays planned (R2).
+  - id: REQ-AND-008
+    title: FCM HTTP v1 sender authenticates with a service-account
+    statement: >
+      The daemon sends device notifications via Firebase Cloud Messaging HTTP v1: it
+      parses a Google service-account, signs an RS256 JWT with the account's RSA key,
+      exchanges it for a short-lived OAuth2 access token, and POSTs the message. The
+      private key and the access token are secrets and are never logged. The sender is
+      the FCM implementation behind the swappable PushProvider boundary (ADR-006).
+    status: implemented
+    design: docs/adr/006-push-relay.md
+    acceptance:
+      - A service-account JSON parses into its client_email/private_key/token_uri/project_id.
+      - A PKCS#8 PEM private key decodes to DER for signing.
+      - The JWT assertion is base64url-unpadded encoded.
+      - A live send returns an FCM message name (ignored test; run with real credentials).
+    verified_by:
+      - test: parses_service_account_fields
+      - test: pem_strips_headers_and_decodes
+      - test: b64url_is_unpadded_urlsafe
+      - test: live_fcm_send
+  - id: REQ-AND-009
+    title: Device push tokens register through a capability-gated endpoint
+    statement: >
+      The native shell reports this device's FCM registration token to the web UI via a
+      JS bridge; the UI registers it at POST /api/v1/push/register, which requires the
+      push capability token, deduplicates, and persists the token next to the account
+      archive. Without a push handler (read-only serve) the route is refused 404.
+    status: implemented
+    design: docs/adr/006-push-relay.md
+    acceptance:
+      - Registration without the capability token is rejected 401 and stores nothing.
+      - Registration with the capability token stores the token; a repeat is deduped.
+      - An empty token is rejected 400.
+      - With no push handler wired, the route 404s before any gate.
+    verified_by:
+      - test: push_register_needs_cap_token_and_records
+      - test: push_register_rejects_empty_token
+      - test: push_routes_refused_without_a_handler
+  - id: REQ-AND-010
+    title: A completed backup notifies the phone when new content was archived
+    statement: >
+      After a backup pass, the daemon sends a native notification summarizing the newly
+      archived content ("N emails, M events backed up"), with correct singular/plural
+      per service and a stable join order. A pass that archived nothing is silent.
+    status: implemented
+    design: docs/adr/006-push-relay.md
+    acceptance:
+      - Zero new items produces no notification.
+      - One vs many items reads singular vs plural per service.
+      - Multiple services join in a stable order in one notification.
+    verified_by:
+      - test: backup_delta_notification_text

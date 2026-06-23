@@ -8,8 +8,11 @@
 //! SECURITY: the service-account private key + the access token are secrets — never
 //! logged or surfaced.
 
+#[cfg(feature = "http")]
 use base64::Engine as _;
-use serde_json::{json, Value};
+#[cfg(feature = "http")]
+use serde_json::json;
+use serde_json::Value;
 
 /// A parsed Google service-account credential (the Firebase Admin SDK JSON).
 #[derive(Clone)]
@@ -39,11 +42,13 @@ impl ServiceAccount {
     }
 }
 
+#[cfg(feature = "http")]
 fn b64url(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
 /// PEM (PKCS#8 `BEGIN PRIVATE KEY`) → DER bytes.
+#[cfg(feature = "http")]
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
     let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
     base64::engine::general_purpose::STANDARD
@@ -52,6 +57,7 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Sign a Google OAuth assertion JWT (RS256) valid for one hour from `now_unix`.
+#[cfg(feature = "http")]
 fn sign_assertion(sa: &ServiceAccount, now_unix: u64) -> Result<String, String> {
     use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
     let header = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
@@ -165,6 +171,7 @@ mod tests {
         assert!(ServiceAccount::from_json(r#"{"project_id":"x"}"#).is_err());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn pem_strips_headers_and_decodes() {
         // "AAAA" base64 = 3 zero bytes.
@@ -173,6 +180,7 @@ mod tests {
         assert_eq!(der, vec![0u8, 0, 0]);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn b64url_is_unpadded_urlsafe() {
         // bytes 0xfb 0xff → url-safe alphabet uses '-'/'_' (std base64 would be "+/8").

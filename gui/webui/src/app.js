@@ -308,7 +308,25 @@ const CAP = {
   todowrite: "__TASKWRITE_CAP_TOKEN__",
   onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
   account: "__ACCOUNT_CAP_TOKEN__",
+  push: "__PUSH_CAP_TOKEN__",
 };
+
+/* ---------------------------------------------------------------- push registration (#576)
+   The native Android shell exposes this device's FCM token via a JS bridge
+   (window.AndroidPush.fcmToken()); register it with the daemon so server-side
+   events (e.g. "backup complete") can notify the phone. No-op in a plain browser
+   (no bridge) or when push is disabled (empty cap token). The token is a device
+   address, not a secret — but we still send it same-origin only. */
+async function registerPushToken() {
+  try {
+    if (!CAP.push) return;                      // push disabled on this daemon
+    const bridge = window.AndroidPush;
+    if (!bridge || typeof bridge.fcmToken !== "function") return; // plain browser
+    const token = bridge.fcmToken();
+    if (!token) return;                         // token not fetched yet
+    await post(`/api/v1/push/register?${qs({ token })}`, CAP.push);
+  } catch (_) { /* best-effort: never block UI load on push */ }
+}
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
   const r = await fetch(path, { method: "POST", headers: capToken ? { "X-Capability-Token": capToken } : {} });
@@ -3808,5 +3826,15 @@ async function init() {
   onRoute();
   subscribeEvents();
   setupSwipe();
+  // Register this device's push token. The native FCM token is fetched async, so
+  // retry a few times before giving up (no-op in a plain browser / when disabled).
+  registerPushToken();
+  let _pushTries = 0;
+  const _pushTimer = setInterval(() => {
+    if (++_pushTries > 5 || (window.AndroidPush && window.AndroidPush.fcmToken())) {
+      clearInterval(_pushTimer);
+    }
+    registerPushToken();
+  }, 2000);
 }
 init();

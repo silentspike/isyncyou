@@ -477,6 +477,16 @@ pub trait AccountAuthHandler: Send + Sync {
     fn sign_out(&self, account: &str) -> Result<serde_json::Value, String>;
 }
 
+/// Push-registration handler (#576): the web UI hands the daemon this device's FCM
+/// registration token so the daemon can send notifications (e.g. "backup complete")
+/// to the phone. `None` => push is unavailable (the read-only CLI `serve`).
+pub trait PushHandler: Send + Sync {
+    /// Register (idempotently) a device push token reported by the native shell.
+    fn register(&self, token: &str) -> Result<(), String>;
+    /// Send a test notification to all registered devices. Returns `{ sent, registered }`.
+    fn send_test(&self) -> Result<serde_json::Value, String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -592,6 +602,11 @@ pub struct Router {
     account_auth: Option<std::sync::Arc<dyn AccountAuthHandler>>,
     /// Separate capability token for account login/sign-out POSTs.
     account_cap_token: Option<String>,
+    /// Optional push-registration handler (#576): stores device FCM tokens + sends
+    /// notifications. `None` => `/api/v1/push/*` POSTs are refused (read-only `serve`).
+    push: Option<std::sync::Arc<dyn PushHandler>>,
+    /// Separate capability token for push register/test POSTs.
+    push_cap_token: Option<String>,
 }
 
 impl Router {
@@ -624,6 +639,8 @@ impl Router {
             onenote_write_cap_token: None,
             account_auth: None,
             account_cap_token: None,
+            push: None,
+            push_cap_token: None,
         }
     }
 
@@ -658,6 +675,8 @@ impl Router {
             onenote_write_cap_token: None,
             account_auth: None,
             account_cap_token: None,
+            push: None,
+            push_cap_token: None,
         }
     }
 
@@ -808,6 +827,17 @@ impl Router {
         self
     }
 
+    /// Wire the push-registration handler (FCM device-token store + sender, #576).
+    pub fn with_push(
+        mut self,
+        handler: std::sync::Arc<dyn PushHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.push = Some(handler);
+        self.push_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token. The token is
     /// compared in **constant time** so a timing side-channel can't reveal it byte
     /// by byte (the length check only leaks length, which is fixed for our tokens).
@@ -894,6 +924,8 @@ impl Router {
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
                 "/api/v1/account/signout" => self.account_signout(req),
+                "/api/v1/push/register" => self.push_register(req),
+                "/api/v1/push/test" => self.push_test(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -952,6 +984,10 @@ impl Router {
                     .replace(
                         "__ACCOUNT_CAP_TOKEN__",
                         self.account_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__PUSH_CAP_TOKEN__",
+                        self.push_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -2353,6 +2389,50 @@ impl Router {
         match h.sign_out(account) {
             Ok(v) => ApiResponse::ok_json(&v),
             Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Push cap check (#576): 404 if push isn't enabled (read-only serve),
+    /// 401 unless the request carries the push capability token.
+    fn push_gate(&self, req: &ApiRequest) -> Result<&std::sync::Arc<dyn PushHandler>, ApiResponse> {
+        let h = self
+            .push
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "push is not enabled on this server"))?;
+        if !Self::cap_ok(&self.push_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Register this device's FCM token (sent by the native shell via the web UI).
+    fn push_register(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.push_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let token = match req.q("token") {
+            Some(t) if !t.is_empty() => t,
+            _ => return ApiResponse::error(400, "missing 'token'"),
+        };
+        match h.register(token) {
+            Ok(()) => ApiResponse::ok_json(&json!({ "registered": true })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Send a test push to every registered device (UI diagnostics).
+    fn push_test(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.push_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        match h.send_test() {
+            Ok(v) => ApiResponse::ok_json(&v),
+            Err(e) => ApiResponse::error(502, &e),
         }
     }
 
@@ -4544,6 +4624,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_has_push_cap_token_placeholder() {
+        assert!(APP_JS.contains("__PUSH_CAP_TOKEN__"));
+    }
+
+    #[test]
     fn account_routes_refused_without_a_handler() {
         // The read-only `serve` wires no account-auth handler → every account
         // login/sign-out POST is refused 404, never reaching the (absent) gate (#68).
@@ -4555,6 +4640,57 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ] {
             assert_eq!(r.route(&ApiRequest::new("POST", p)).status, 404, "{p}");
         }
+    }
+
+    #[derive(Default)]
+    struct RecPush {
+        tokens: std::sync::Mutex<Vec<String>>,
+    }
+    impl PushHandler for RecPush {
+        fn register(&self, token: &str) -> Result<(), String> {
+            self.tokens.lock().unwrap().push(token.to_string());
+            Ok(())
+        }
+        fn send_test(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "sent": self.tokens.lock().unwrap().len() }))
+        }
+    }
+
+    #[test]
+    fn push_routes_refused_without_a_handler() {
+        // The read-only `serve` wires no push handler → register/test POSTs 404 (#576).
+        let r = Router::new(Config::default());
+        for p in ["/api/v1/push/register?token=abc", "/api/v1/push/test"] {
+            assert_eq!(r.route(&ApiRequest::new("POST", p)).status, 404, "{p}");
+        }
+    }
+
+    #[test]
+    fn push_register_needs_cap_token_and_records() {
+        let push = std::sync::Arc::new(RecPush::default());
+        let router = Router::new(Config::default()).with_push(push.clone(), "captok".into());
+        // Wrong/absent cap token → 401, token not recorded.
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", "/api/v1/push/register?token=dev1"))
+                .status,
+            401
+        );
+        assert!(push.tokens.lock().unwrap().is_empty());
+        // With the cap token → 200 and the device token is stored.
+        let mut req = ApiRequest::new("POST", "/api/v1/push/register?token=dev1");
+        req.cap_token = Some("captok".into());
+        assert_eq!(router.route(&req).status, 200);
+        assert_eq!(push.tokens.lock().unwrap().as_slice(), ["dev1"]);
+    }
+
+    #[test]
+    fn push_register_rejects_empty_token() {
+        let push = std::sync::Arc::new(RecPush::default());
+        let router = Router::new(Config::default()).with_push(push, "captok".into());
+        let mut req = ApiRequest::new("POST", "/api/v1/push/register?token=");
+        req.cap_token = Some("captok".into());
+        assert_eq!(router.route(&req).status, 400);
     }
 
     #[derive(Default)]
