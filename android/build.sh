@@ -44,13 +44,35 @@ echo "[5/7] add classes.dex to the apk"
 echo "[6/7] zipalign"
 "$BT/zipalign" -f 4 build/base.apk build/isyncyou-aligned.apk
 
-echo "[7/7] sign (debug key)"
-if [ ! -f build/debug.keystore ]; then
-  keytool -genkeypair -keystore build/debug.keystore -storepass android \
-    -keypass android -alias isy -keyalg RSA -keysize 2048 -validity 10000 \
-    -dname "CN=iSyncYou Debug"
+echo "[7/7] sign"
+SIGNING_PROPS="$HERE/signing.properties"
+if [ -f "$SIGNING_PROPS" ]; then
+  # Release signing from the user-supplied keystore (REQ-AND-003). signing.properties
+  # (gitignored) holds storeFile / keyAlias / storePassword / keyPassword. Passwords
+  # are passed to apksigner via env: (never on the command line → not in `ps`), and
+  # never echoed.
+  # shellcheck disable=SC1090
+  . "$SIGNING_PROPS"
+  : "${storeFile:?signing.properties: storeFile missing}"
+  : "${keyAlias:?signing.properties: keyAlias missing}"
+  : "${storePassword:?signing.properties: storePassword missing}"
+  : "${keyPassword:?signing.properties: keyPassword missing}"
+  [ -f "$storeFile" ] || { echo "release keystore not found: $storeFile" >&2; exit 1; }
+  echo "      release key (alias $keyAlias)"
+  export _ISY_STOREPW="$storePassword" _ISY_KEYPW="$keyPassword"
+  "$BT/apksigner" sign --ks "$storeFile" --ks-pass "env:_ISY_STOREPW" \
+    --key-pass "env:_ISY_KEYPW" --ks-key-alias "$keyAlias" \
+    --out build/iSyncYou.apk build/isyncyou-aligned.apk
+  unset _ISY_STOREPW _ISY_KEYPW
+else
+  echo "      debug key (no android/signing.properties — add one for a release build)"
+  if [ ! -f build/debug.keystore ]; then
+    keytool -genkeypair -keystore build/debug.keystore -storepass android \
+      -keypass android -alias isy -keyalg RSA -keysize 2048 -validity 10000 \
+      -dname "CN=iSyncYou Debug"
+  fi
+  "$BT/apksigner" sign --ks build/debug.keystore --ks-pass pass:android \
+    --key-pass pass:android --ks-key-alias isy \
+    --out build/iSyncYou.apk build/isyncyou-aligned.apk
 fi
-"$BT/apksigner" sign --ks build/debug.keystore --ks-pass pass:android \
-  --key-pass pass:android --ks-key-alias isy \
-  --out build/iSyncYou.apk build/isyncyou-aligned.apk
 "$BT/apksigner" verify build/iSyncYou.apk && echo "OK -> build/iSyncYou.apk"
