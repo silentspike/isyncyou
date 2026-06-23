@@ -1064,6 +1064,10 @@ a.note-meta-chip:hover { color: var(--accent); }
   .mail-item, .con-row, .list-row, .todo-task, .note-leaf { min-height: 56px; }
   .btn.sm, .cmp-tb-btn, .seg-btn, .nav-subitem { min-height: 40px; }
   .svc-head, .cal-head, .con-head, .todo-head { gap: var(--sp-2); flex-wrap: wrap; }
+  /* ToDo board: a horizontal column scroller hides every list past the first on a
+     phone — stack the columns full-width instead. */
+  .todo-board { flex-direction: column; overflow-x: visible; }
+  .todo-col { flex: 1 1 auto; width: 100%; }
 }
 
 /* ============================================================ mail responsive (container query on .view) */
