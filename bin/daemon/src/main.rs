@@ -302,6 +302,14 @@ fn run(args: &Args) -> Result<(), String> {
     let onenote_write_cap_token = mint_cap_token();
     let onenote_write_handler: Arc<dyn isyncyou_webui::OneNoteWriteHandler> =
         Arc::new(DaemonOneNoteWrite { cfg: cfg.clone() });
+    // A separate token gates the account login/sign-out POSTs (#68): device-code
+    // sign-in (writes the token cache in a background thread) + sign-out (clears it).
+    let account_cap_token = mint_cap_token();
+    let account_auth_handler: Arc<dyn isyncyou_webui::AccountAuthHandler> =
+        Arc::new(DaemonAccountAuth {
+            cfg: cfg.clone(),
+            logins: Mutex::new(std::collections::HashMap::new()),
+        });
     // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
     // subscribes at /api/v1/events and refetches the active view.
     let events = Arc::new(isyncyou_webui::EventBus::new());
@@ -324,6 +332,7 @@ fn run(args: &Args) -> Result<(), String> {
     .with_contact_write(contact_write_handler, contact_write_cap_token)
     .with_task_write(task_write_handler, task_write_cap_token)
     .with_onenote_write(onenote_write_handler, onenote_write_cap_token)
+    .with_account_auth(account_auth_handler, account_cap_token)
     .with_events(events.clone());
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
@@ -740,6 +749,100 @@ impl isyncyou_webui::OneNoteWriteHandler for DaemonOneNoteWrite {
     fn append(&self, account: &str, page_id: &str, text: &str) -> Result<(), String> {
         let w = isyncyou_engine::page_writer(&self.cfg, account)?;
         isyncyou_engine::PageWriter::append(&w, page_id, text)
+    }
+}
+
+/// Per-login progress, shared between the HTTP poll handler and the background
+/// device-code thread (#68).
+#[derive(Default)]
+struct LoginState {
+    device: Option<isyncyou_graph::auth::flow::DeviceCode>,
+    done: bool,
+    error: Option<String>,
+}
+
+static LOGIN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Account-auth handler (#68): a device-code sign-in runs to completion in a
+/// background thread (so the HTTP handler returns the code at once and the UI
+/// polls), writing the account's write-token cache on success. Sign-out clears the
+/// cached tokens. Re-authenticates an account already present in the config.
+struct DaemonAccountAuth {
+    cfg: Config,
+    logins: Mutex<std::collections::HashMap<u64, Arc<Mutex<LoginState>>>>,
+}
+impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
+    fn start_login(&self, account: &str) -> Result<serde_json::Value, String> {
+        let cache = isyncyou_engine::auth::write_token_cache_path(&self.cfg, account)
+            .ok_or_else(|| format!("no account '{account}' in config"))?;
+        let id = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
+        let state = Arc::new(Mutex::new(LoginState::default()));
+        self.logins.lock().unwrap().insert(id, state.clone());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let st = state.clone();
+        std::thread::spawn(move || {
+            let present = |dc: &isyncyou_graph::auth::flow::DeviceCode| {
+                st.lock().unwrap().device = Some(dc.clone());
+            };
+            match isyncyou_graph::auth::flow::device_code_login(
+                isyncyou_engine::auth::WRITE_CLIENT,
+                isyncyou_engine::auth::RESTORE_SCOPES,
+                now,
+                present,
+            ) {
+                Ok(tokens) => match tokens.save(&cache) {
+                    Ok(()) => st.lock().unwrap().done = true,
+                    Err(e) => st.lock().unwrap().error = Some(format!("save token: {e}")),
+                },
+                Err(e) => st.lock().unwrap().error = Some(e),
+            }
+        });
+        // Wait briefly for the device code — start_device_code is the first network
+        // call inside device_code_login, so it lands within a second or two.
+        for _ in 0..100 {
+            {
+                let s = state.lock().unwrap();
+                if let Some(dc) = &s.device {
+                    return Ok(serde_json::json!({
+                        "login_id": id.to_string(),
+                        "user_code": dc.user_code,
+                        "verification_uri": dc.verification_uri,
+                        "message": dc.message,
+                    }));
+                }
+                if let Some(e) = &s.error {
+                    return Err(e.clone());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err("device-code did not start in time".into())
+    }
+
+    fn poll_login(&self, login_id: &str) -> serde_json::Value {
+        let Ok(id) = login_id.parse::<u64>() else {
+            return serde_json::json!({ "state": "error", "error": "bad login id" });
+        };
+        let state = self.logins.lock().unwrap().get(&id).cloned();
+        let Some(state) = state else {
+            return serde_json::json!({ "state": "error", "error": "unknown login id" });
+        };
+        let s = state.lock().unwrap();
+        if let Some(e) = &s.error {
+            serde_json::json!({ "state": "error", "error": e })
+        } else if s.done {
+            serde_json::json!({ "state": "done" })
+        } else {
+            serde_json::json!({ "state": "pending" })
+        }
+    }
+
+    fn sign_out(&self, account: &str) -> Result<serde_json::Value, String> {
+        let n = isyncyou_engine::auth::sign_out(&self.cfg, account)?;
+        Ok(serde_json::json!({ "removed": n, "message": format!("Signed out of {account}") }))
     }
 }
 

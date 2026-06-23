@@ -665,6 +665,22 @@ a:hover { text-decoration: underline; }
 .mr-thread-item.cur { background: color-mix(in oklab, var(--accent) 12%, transparent); font-weight: 600; cursor: default; }
 .mr-thread-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .mr-thread-unread { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2); flex: none; }
+/* account menu (#68) */
+.acct-menu-wrap { position: fixed; inset: 0; z-index: 80; }
+.acct-menu { position: fixed; left: var(--sp-3); bottom: 72px; width: 320px; max-width: calc(100vw - 24px); max-height: 70vh; overflow: auto;
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md, 12px); box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+.acct-menu-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3); font-weight: 600; border-bottom: 1px solid var(--line); }
+.acct-menu-body { padding: var(--sp-2); display: flex; flex-direction: column; gap: 2px; }
+.acct-row { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2); border-radius: var(--r-sm); }
+.acct-row.active { background: color-mix(in oklab, var(--accent) 12%, transparent); }
+.acct-row:hover { background: var(--bg-2); }
+.acct-pick { display: flex; flex-direction: column; align-items: flex-start; text-align: left; background: transparent; border: 0; color: inherit; cursor: pointer; min-width: 0; }
+.acct-acts { display: flex; gap: 4px; flex: none; }
+.acct-note { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); line-height: 1.5; border-top: 1px solid var(--line); margin-top: var(--sp-1); }
+.acct-dc { padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-start; }
+.acct-dc-title { font-weight: 600; }
+.acct-dc-code { font-family: var(--mono, ui-monospace, monospace); font-size: var(--fs-xl); font-weight: 700; letter-spacing: .12em; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); align-self: stretch; text-align: center; }
+.acct-dc-status { font-size: var(--fs-sm); }
 
 /* rich empty reading pane */
 .mail-empty { margin: auto; max-width: 420px; text-align: center; padding: var(--sp-6); display: flex; flex-direction: column; align-items: center; gap: var(--sp-3); }

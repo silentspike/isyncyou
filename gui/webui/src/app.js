@@ -307,6 +307,7 @@ const CAP = {
   contactwrite: "__CONTACTWRITE_CAP_TOKEN__",
   todowrite: "__TASKWRITE_CAP_TOKEN__",
   onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
+  account: "__ACCOUNT_CAP_TOKEN__",
 };
 async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
@@ -3593,12 +3594,70 @@ async function doShare(it, btn) {
 }
 
 /* ---------------------------------------------------------------- account switcher */
+// Account menu (#68): switch between configured accounts, sign out (clear the
+// cached token), and sign in / reconnect via the device-code flow (cap-gated).
+let accountMenu = null, accountMenuPoll = null;
+function closeAccountMenu() {
+  if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
+  if (accountMenu) { accountMenu.remove(); accountMenu = null; }
+}
 function openAccountSwitcher() {
-  if (App.accounts.length < 2) return;
-  const i = App.accounts.findIndex(a => a.id === App.account);
-  App.account = App.accounts[(i + 1) % App.accounts.length].id;
-  toast("Switched to " + (App.accounts.find(a => a.id === App.account) || {}).username);
-  onRoute();
+  if (accountMenu) { closeAccountMenu(); return; }
+  const scrim = el("div", { class: "scrim", style: "background:transparent", onclick: closeAccountMenu });
+  const body = el("div", { class: "acct-menu-body" });
+  const panel = el("aside", { class: "acct-menu" }, el("div", { class: "acct-menu-head" }, icon("users", "icon-sm"), el("span", { text: "Accounts" })), body);
+  accountMenu = el("div", { class: "acct-menu-wrap" }, scrim, panel);
+  document.body.append(accountMenu);
+  renderAccountMenu(body);
+}
+function renderAccountMenu(body) {
+  if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
+  clear(body);
+  App.accounts.forEach(a => {
+    const active = a.id === App.account;
+    const row = el("div", { class: "acct-row" + (active ? " active" : "") },
+      el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(a.username || a.id) }),
+      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + (a.username || a.id)); closeAccountMenu(); onRoute(); } } },
+        el("div", { class: "truncate", text: a.username || a.id }),
+        el("div", { class: "dim", style: "font-size:11px", text: active ? "Active" : a.id })),
+      active ? icon("check", "icon-sm") : null);
+    if (CAP.account) {
+      const acts = el("div", { class: "acct-acts" });
+      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Sign in / reconnect (device code)", onclick: () => startDeviceLogin(a, body) }, icon("rotate-ccw", "icon-sm")));
+      acts.append(el("button", { class: "btn ghost sm icon-only", style: "color:var(--danger,#f87171)", title: "Sign out — clear cached token", onclick: () => accountSignOut(a, body) }, icon("trash-2", "icon-sm")));
+      row.append(acts);
+    }
+    body.append(row);
+  });
+  body.append(el("div", { class: "acct-note dim" }, CAP.account
+    ? "Reconnect re-runs device-code sign-in. Adding a brand-new account still needs `isyncyou setup` (live add is the remaining backend work)."
+    : "Read-only server — account switching only."));
+}
+async function accountSignOut(a, body) {
+  try { const d = await post("/api/v1/account/signout?account=" + encodeURIComponent(a.id), CAP.account); toast(d.message || "Signed out"); }
+  catch (e) { toast("Sign-out failed: " + e.message, "err"); }
+  renderAccountMenu(body);
+}
+async function startDeviceLogin(a, body) {
+  clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: "Starting sign-in…" })));
+  let dc;
+  try { dc = await post("/api/v1/account/login/start?account=" + encodeURIComponent(a.id), CAP.account); }
+  catch (e) { toast("Sign-in failed: " + e.message, "err"); renderAccountMenu(body); return; }
+  const status = el("div", { class: "acct-dc-status dim", text: "Waiting for you to sign in…" });
+  clear(body).append(el("div", { class: "acct-dc" },
+    el("div", { class: "acct-dc-title", text: "Sign in to " + (a.username || a.id) }),
+    el("p", { class: "dim", text: "Open the page and enter this code:" }),
+    el("div", { class: "acct-dc-code", text: dc.user_code || "—" }),
+    el("a", { class: "btn sm primary", href: dc.verification_uri || "#", target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open sign-in page"),
+    status,
+    el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: () => renderAccountMenu(body) }, "Cancel")));
+  accountMenuPoll = setInterval(async () => {
+    let r;
+    try { r = await post("/api/v1/account/login/poll?id=" + encodeURIComponent(dc.login_id), CAP.account); }
+    catch (e) { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Poll error: " + e.message; return; }
+    if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
+    else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Sign-in failed: " + (r.error || "unknown"); }
+  }, 3000);
 }
 
 /* ---------------------------------------------------------------- command palette */

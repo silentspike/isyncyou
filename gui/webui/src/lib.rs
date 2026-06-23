@@ -465,6 +465,18 @@ pub trait OneNoteWriteHandler: Send + Sync {
     fn append(&self, account: &str, page_id: &str, text: &str) -> Result<(), String>;
 }
 
+/// Live account-auth handler (#68): the daemon's device-code sign-in + sign-out.
+/// `None` => the account menu offers only switching (the read-only CLI `serve`).
+pub trait AccountAuthHandler: Send + Sync {
+    /// Begin a device-code login for a configured `account`. Returns
+    /// `{ login_id, user_code, verification_uri, message }` to present to the user.
+    fn start_login(&self, account: &str) -> Result<serde_json::Value, String>;
+    /// Poll a started login by its `login_id` → `{ state: "pending"|"done"|"error", error? }`.
+    fn poll_login(&self, login_id: &str) -> serde_json::Value;
+    /// Remove an account's cached tokens (sign out). Returns a short status note.
+    fn sign_out(&self, account: &str) -> Result<serde_json::Value, String>;
+}
+
 /// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
 /// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
 /// connection waits on a generation counter and streams a frame. Thread-safe and
@@ -575,6 +587,11 @@ pub struct Router {
     onenote_write: Option<std::sync::Arc<dyn OneNoteWriteHandler>>,
     /// Separate capability token for OneNote-write POSTs.
     onenote_write_cap_token: Option<String>,
+    /// Optional account-auth handler (#68): device-code sign-in + sign-out. `None`
+    /// => the account menu only switches between already-configured accounts.
+    account_auth: Option<std::sync::Arc<dyn AccountAuthHandler>>,
+    /// Separate capability token for account login/sign-out POSTs.
+    account_cap_token: Option<String>,
 }
 
 impl Router {
@@ -605,6 +622,8 @@ impl Router {
             task_write_cap_token: None,
             onenote_write: None,
             onenote_write_cap_token: None,
+            account_auth: None,
+            account_cap_token: None,
         }
     }
 
@@ -637,6 +656,8 @@ impl Router {
             task_write_cap_token: None,
             onenote_write: None,
             onenote_write_cap_token: None,
+            account_auth: None,
+            account_cap_token: None,
         }
     }
 
@@ -776,6 +797,17 @@ impl Router {
         self
     }
 
+    /// Wire the account-auth handler (device-code sign-in + sign-out, #68).
+    pub fn with_account_auth(
+        mut self,
+        handler: std::sync::Arc<dyn AccountAuthHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.account_auth = Some(handler);
+        self.account_cap_token = Some(cap_token);
+        self
+    }
+
     /// Whether the request carries the configured capability token. The token is
     /// compared in **constant time** so a timing side-channel can't reveal it byte
     /// by byte (the length check only leaks length, which is fixed for our tokens).
@@ -859,6 +891,9 @@ impl Router {
                 "/api/v1/onenote/create" => self.onenote_create(req),
                 "/api/v1/onenote/delete" => self.onenote_delete(req),
                 "/api/v1/onenote/append" => self.onenote_append(req),
+                "/api/v1/account/login/start" => self.account_login_start(req),
+                "/api/v1/account/login/poll" => self.account_login_poll(req),
+                "/api/v1/account/signout" => self.account_signout(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -913,6 +948,10 @@ impl Router {
                     .replace(
                         "__ONENOTEWRITE_CAP_TOKEN__",
                         self.onenote_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__ACCOUNT_CAP_TOKEN__",
+                        self.account_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -2255,6 +2294,66 @@ impl Router {
             .map(|a| json!({ "id": a.id, "username": a.username }))
             .collect();
         ApiResponse::ok_json(&json!({ "accounts": accounts }))
+    }
+
+    /// Account-auth cap check (#68): 404 if sign-in isn't enabled (read-only serve),
+    /// 401 unless the request carries the account capability token.
+    fn account_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn AccountAuthHandler>, ApiResponse> {
+        let h = self.account_auth.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "account sign-in is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.account_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    fn account_login_start(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account") {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "missing 'account'"),
+        };
+        match h.start_login(account) {
+            Ok(v) => ApiResponse::ok_json(&v),
+            Err(e) => ApiResponse::error(502, &e),
+        }
+    }
+
+    fn account_login_poll(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let id = match req.q("id") {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "missing 'id'"),
+        };
+        ApiResponse::ok_json(&h.poll_login(id))
+    }
+
+    fn account_signout(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account") {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "missing 'account'"),
+        };
+        match h.sign_out(account) {
+            Ok(v) => ApiResponse::ok_json(&v),
+            Err(e) => ApiResponse::error(500, &e),
+        }
     }
 
     /// The effective configuration the UI's settings view reads: engine-wide sync
@@ -4437,6 +4536,25 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn app_js_has_onenote_write_cap_token_placeholder() {
         assert!(APP_JS.contains("__ONENOTEWRITE_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_account_cap_token_placeholder() {
+        assert!(APP_JS.contains("__ACCOUNT_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn account_routes_refused_without_a_handler() {
+        // The read-only `serve` wires no account-auth handler → every account
+        // login/sign-out POST is refused 404, never reaching the (absent) gate (#68).
+        let r = Router::new(Config::default());
+        for p in [
+            "/api/v1/account/login/start?account=a",
+            "/api/v1/account/login/poll?id=1",
+            "/api/v1/account/signout?account=a",
+        ] {
+            assert_eq!(r.route(&ApiRequest::new("POST", p)).status, 404, "{p}");
+        }
     }
 
     #[derive(Default)]

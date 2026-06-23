@@ -232,6 +232,31 @@ pub mod auth {
         let now = super::unix_now().parse::<u64>().unwrap_or(0);
         isyncyou_graph::auth::flow::ensure_access_token(&cache, WRITE_CLIENT, RESTORE_SCOPES, now)
     }
+
+    /// Sign an account out by removing its cached read + write tokens (#68). The
+    /// next sync/restore for it then errors "no cached token" until a new login.
+    /// Idempotent: an already-absent cache is success. Returns how many files were
+    /// removed.
+    pub fn sign_out(cfg: &Config, account: &str) -> Result<usize, String> {
+        if !cfg.accounts.iter().any(|a| a.id == account) {
+            return Err(format!("no account '{account}' in config"));
+        }
+        let mut removed = 0;
+        for path in [
+            read_token_cache_path(cfg, account),
+            write_token_cache_path(cfg, account),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {}: {e}", path.display())),
+            }
+        }
+        Ok(removed)
+    }
 }
 
 /// Services with an archived body that can be previewed or restored to a local file.
