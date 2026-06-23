@@ -21,6 +21,10 @@ class MainActivity : Activity() {
 
     private lateinit var web: WebView
 
+    /** The device's FCM registration token (fetched async; read by the JS bridge). */
+    @Volatile
+    private var fcmToken: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -48,12 +52,24 @@ class MainActivity : Activity() {
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+        // Expose this device's FCM token to the web UI (#576), which registers it
+        // with the daemon (the UI holds the daemon's capability token; the native
+        // shell does not). The token is fetched async + cached.
+        web.addJavascriptInterface(PushBridge(), "AndroidPush")
+        com.google.firebase.messaging.FirebaseMessaging.getInstance().token
+            .addOnCompleteListener { t -> if (t.isSuccessful) fcmToken = t.result }
 
         if (savedInstanceState != null) {
             web.restoreState(savedInstanceState)
         } else {
             web.loadUrl(SERVER_URL)
         }
+    }
+
+    /** JS bridge: lets the web UI read the FCM token to register it with the daemon. */
+    private inner class PushBridge {
+        @android.webkit.JavascriptInterface
+        fun fcmToken(): String = fcmToken ?: ""
     }
 
     /** Hardware/gesture back navigates WebView history before leaving the app. */
