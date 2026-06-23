@@ -1,6 +1,9 @@
 package com.silentspike.isyncyou
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
 import android.webkit.WebSettings
@@ -35,6 +38,16 @@ class MainActivity : Activity() {
         // Keep navigation inside the WebView (don't hand off to Chrome).
         web.webViewClient = WebViewClient()
         setContentView(web)
+
+        // FCM (#575): register the notification channel + request POST_NOTIFICATIONS
+        // (Android 13+ needs a runtime grant before notifications can show).
+        IsyncMessagingService.ensureChannel(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
 
         if (savedInstanceState != null) {
             web.restoreState(savedInstanceState)

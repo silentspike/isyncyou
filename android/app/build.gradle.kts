@@ -3,8 +3,8 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    // Firebase google-services plugin is applied in story 2 (#575):
-    // id("com.google.gms.google-services")
+    // Firebase google-services plugin (FCM, #575): processes app/google-services.json.
+    id("com.google.gms.google-services")
 }
 
 // Release signing reads android/signing.properties (user-supplied, gitignored) —
@@ -61,5 +61,7 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.webkit:webkit:1.11.0")
-    // Firebase BoM + messaging are added in story 2 (#575).
+    // Firebase Cloud Messaging via the BoM (#575) — version-aligned, messaging only.
+    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+    implementation("com.google.firebase:firebase-messaging")
 }
