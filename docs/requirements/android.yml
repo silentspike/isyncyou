@@ -1,0 +1,92 @@
+# Android delivery-pipeline requirements (#90, Workstream D).
+# Plan-only: these are PLANNED — the CI/pipeline implementation is gated on an
+# explicit GO and the user's release keystore (a credential the user provides, never
+# generated here). ADR-005 (docs/adr/005-android-build-system.md) fixes the build
+# system; D1 (node --check + path filter, #87) is already shipped. Checked by
+# tools/check_traceability.py.
+requirements:
+  - id: REQ-AND-001
+    title: PR build gate — the APK must build on every relevant PR
+    statement: >
+      A path-gated CI job builds android/ (JDK17 + Android SDK + android/build.sh) on
+      pull requests that touch android/ or gui/webui/, on github-hosted ubuntu-latest
+      (self-hosted runners are forbidden for the public repo). A build failure blocks
+      the PR. Complements the existing js-check (node --check) gate from D1 (#87).
+    status: planned
+    acceptance:
+      - A PR touching android/ runs the APK build job.
+      - A failing android/build.sh fails the required check.
+      - The job runs on ubuntu-latest, never a self-hosted runner.
+    verified_by: []
+  - id: REQ-AND-002
+    title: Version the APK from the RC, not a literal
+    statement: >
+      versionName and versionCode are injected at build time from the workspace
+      version plus the CI run number, replacing the literal "1"/"0.1" in
+      AndroidManifest.xml, so every RC artifact is uniquely identifiable.
+    status: planned
+    acceptance:
+      - versionName matches the workspace version of the built commit.
+      - versionCode is monotonic across RC builds (derived from the run number).
+      - No literal version remains in the manifest at build time.
+    verified_by: []
+  - id: REQ-AND-003
+    title: Release signing uses a user-provided keystore
+    statement: >
+      The release build path signs the APK with a release keystore supplied by the
+      user as GitHub Actions secrets (keystore base64 + passwords). The keystore is
+      NEVER generated or committed in-repo. Debug builds keep the throwaway
+      "pass:android" debug key.
+    status: planned
+    acceptance:
+      - The release build consumes keystore material only from CI secrets.
+      - No keystore or password is committed to the repo.
+      - A missing release secret fails the release build with a clear message.
+    verified_by: []
+  - id: REQ-AND-004
+    title: Emulator smoke E2E — the APK boots and the WebView loads
+    statement: >
+      A CI job runs the signed (or debug) APK on android-emulator-runner with an AVD
+      snapshot and asserts the app launches and its WebView loads the bundled UI.
+      Until the standalone APK (R3, #80/#89) lands, this validates the daemon-WebView
+      shell only.
+    status: planned
+    acceptance:
+      - The emulator job installs and launches the APK without crashing.
+      - The WebView reports the app shell loaded.
+      - The android-emulator-runner action is SHA-pinned (REQ-AND-007).
+    verified_by: []
+  - id: REQ-AND-005
+    title: RC promotion is build-once, promote-many
+    statement: >
+      release.yml builds the signed APK once and attaches it to the
+      v0.1.0-rc.<run> prerelease; the tag release reuses the same artifact rather than
+      rebuilding, so the bytes shipped to users are exactly the bytes tested.
+    status: planned
+    acceptance:
+      - The APK is built once per RC and attached to the prerelease.
+      - The promoted tag release reuses the identical artifact (same checksum).
+    verified_by: []
+  - id: REQ-AND-006
+    title: OTA distribution via GitHub Releases + Obtainium
+    statement: >
+      The APK ships as a GitHub Release asset consumed by Obtainium; the dev,
+      staging and main branches map to nightly, beta and stable tracks. No Play Store
+      and no paid distribution channel.
+    status: planned
+    acceptance:
+      - Each track publishes its APK as a Release asset.
+      - Obtainium can resolve and update from the Release feed.
+      - dev/staging/main map to nightly/beta/stable respectively.
+    verified_by: []
+  - id: REQ-AND-007
+    title: All new CI actions are SHA-pinned
+    statement: >
+      Every third-party GitHub Action added for the Android pipeline is pinned to a
+      full commit SHA (not a moving tag), per REQ-OPS-004, to keep the supply chain
+      reproducible.
+    status: planned
+    acceptance:
+      - No Android-pipeline workflow references an action by a floating tag.
+      - Each action reference is a 40-char commit SHA.
+    verified_by: []
