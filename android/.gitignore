@@ -1,4 +1,9 @@
 build/
 *.apk
 *.keystore
+*.jks
 *.dex
+# credentials the user supplies (never committed): release signing + FCM
+google-services.json
+*-signing.env
+signing.properties
