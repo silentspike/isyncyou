@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import com.google.firebase.messaging.FirebaseMessagingService
@@ -36,7 +37,10 @@ class IsyncMessagingService : FirebaseMessagingService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val notif = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            // Our own brand mark (the sync-loop) as a white status-bar silhouette,
+            // tinted with the brand indigo — not the generic Android default (#576).
+            .setSmallIcon(R.drawable.ic_stat_isyncyou)
+            .setColor(Color.parseColor("#6366F1"))
             .setContentTitle(title)
             .setContentText(body)
             .setAutoCancel(true)
