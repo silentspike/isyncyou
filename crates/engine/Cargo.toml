@@ -9,13 +9,23 @@ authors.workspace = true
 
 [dependencies]
 isyncyou-core = { path = "../core" }
-isyncyou-store = { path = "../store" }
+isyncyou-store = { path = "../store", default-features = false }
 isyncyou-pathmap = { path = "../pathmap" }
 # The orchestration drives the live engine, so the http transport is always on.
-isyncyou-graph = { path = "../graph", features = ["http", "desktop-keyring"] }
-isyncyou-connectors = { path = "../connectors", features = ["http"] }
+# `desktop-keyring` (Linux/D-Bus secret-service) is forwarded as an OPTIONAL,
+# default-on feature so the Android build can drop it (it can't cross-compile).
+isyncyou-graph = { path = "../graph", features = ["http"] }
+isyncyou-connectors = { path = "../connectors", features = ["http"], default-features = false }
 serde_json = { workspace = true }
 # Content-derived idempotency key for crash-safe restore (ADR-001). RustCrypto,
 # permissive (MIT/Apache), no system deps.
 hmac = "0.12"
 sha2 = "0.10"
+
+[features]
+# Desktop/CLI/daemon keep both defaults; the Android mobile crate depends on the
+# engine with `default-features = false` (no D-Bus keyring, plain sqlite store).
+default = ["encrypted-store", "desktop-keyring"]
+desktop-keyring = ["isyncyou-graph/desktop-keyring"]
+encrypted-store = ["isyncyou-store/encrypted-store", "isyncyou-connectors/encrypted-store"]
+plain-store = ["isyncyou-store/plain-store", "isyncyou-connectors/plain-store"]

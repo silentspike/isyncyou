@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- iSyncYou brand palette (#576), mirrored from the web-UI gradient
+     (#6366f1 → #a855f7 on #0d0d14). Used for the notification accent colour and
+     the adaptive launcher icon. -->
+<resources>
+    <color name="brand_indigo">#6366F1</color>
+    <color name="brand_purple">#A855F7</color>
+    <color name="brand_dark">#0D0D14</color>
+</resources>

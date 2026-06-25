@@ -21,7 +21,11 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+# Bundling is selected by the `isyncyou-store` crate's own features
+# (`encrypted-store` = SQLCipher+OpenSSL for desktop; `plain-store` = bundled
+# sqlite for Android, no OpenSSL). Do NOT pin a bundling feature here, or every
+# build (incl. the Android cross-compile) would inherit SQLCipher/OpenSSL.
+rusqlite = { version = "0.40" }
 tiny-skia = "0.11"
 cosmic-text = "0.12"
 taffy = "0.5"

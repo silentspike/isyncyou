@@ -1,0 +1,8 @@
+# Verified false positives.
+#
+# A dummy PKCS#8 PEM used by the pem_to_der unit test in crates/graph/src/push.rs:
+# the "AAAA" body base64-decodes to three zero bytes (asserted by the test itself),
+# so it is a test fixture, not a real private key. gitleaks' `private-key` regex
+# matches the PEM header regardless of content.
+crates/graph/src/push.rs:private-key:160
+crates/graph/src/push.rs:private-key:179
