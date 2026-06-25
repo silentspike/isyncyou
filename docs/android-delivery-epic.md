@@ -22,8 +22,8 @@ not the Play Store and not any paid channel.
 ## Stories
 | Story | What | REQ | State |
 |---|---|---|---|
-| **D1** | `node --check gui/webui/src/app.js` gate + path-filter widened to `gui/webui/**` + `android/**` | — | **shipped (#87, c1e39ac)** |
-| **D1b** | PR build gate: JDK17 + Android SDK + NDK + `./gradlew :app:assembleDebug` must build the APK (path-gated `android/`) | REQ-AND-001 | planned |
+| **D1** | `node --check gui/webui/src/app.js` gate + dev path-filter widened to `gui/webui/**` (the embedded web UI; `android/**` is NOT in the dev filter — the Android build runs on staging, see D1b) | — | **shipped (#87, c1e39ac)** |
+| **D1b** | staging build gate: JDK17 + Android SDK + NDK + `./gradlew :app:assembleDebug` builds the APK on every staging PR (unconditional, the heavy gate dev doesn't have) | REQ-AND-001 | **implemented (staging `android-build`)** |
 | **D2** | Version `versionName`/`versionCode` from the workspace version + run number (literal fallback in `build.gradle.kts` today) | REQ-AND-002 | planned |
 | **D3** | Release signing from a user-provided keystore via CI secrets (debug stays `pass:android`) | REQ-AND-003 | planned |
 | **D4** | Emulator smoke E2E (`android-emulator-runner`, AVD snapshot): APK boots + WebView loads | REQ-AND-004 | planned |
