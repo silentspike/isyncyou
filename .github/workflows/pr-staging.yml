@@ -173,6 +173,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
       - run: cargo build --release --workspace
+      # CycloneDX SBOM of the Rust/Cargo dependency graph (NOT the whole product —
+      # Gradle/Android deps and the CI-only npm tree are not included; a Gradle SBOM is
+      # future work). Surfaced one stage before main + consumed by the main/RC trivy
+      # vuln-scan.
+      - name: Generate the Cargo dependency SBOM
+        run: python3 tools/generate_sbom.py --output isyncyou.sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-cargo-cyclonedx
+          path: isyncyou.sbom.cdx.json
 
   # Android debug APK build gate (REQ-AND-001 / D1b). Token-free: assembleDebug builds
   # without a Firebase config (the google-services plugin is applied only when present)
