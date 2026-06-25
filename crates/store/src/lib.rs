@@ -13,7 +13,10 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// PathBuf is only used by the encrypted-store migrate/credential paths.
+#[cfg(feature = "encrypted-store")]
+use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -351,13 +354,18 @@ impl Store {
     /// closed when the key is absent or wrong; new stores are created encrypted
     /// when the key is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        match configured_store_key()? {
-            Some(secret) => Self::open_encrypted(path, &secret),
-            None => Self::open_plain(path),
+        // With `plain-store` (Android) there is no key path — open plaintext. The
+        // SQLCipher `sqlite3_key` FFI symbol does not exist in the bundled-plain
+        // build, so the encrypted branch must be compiled out entirely.
+        #[cfg(feature = "encrypted-store")]
+        if let Some(secret) = configured_store_key()? {
+            return Self::open_encrypted(path, &secret);
         }
+        Self::open_plain(path)
     }
 
     /// Open (or create) a SQLCipher-encrypted store using `secret`.
+    #[cfg(feature = "encrypted-store")]
     pub fn open_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
         if secret.is_empty() {
             return Err(StoreError::InvalidStoreSecret(
@@ -426,6 +434,7 @@ impl Store {
     /// usable, plus a stale temp file that the next run removes); migrating an
     /// already-encrypted store fails with [`StoreError::AlreadyEncrypted`] so a
     /// re-run after success is a clean, detectable no-op for the caller.
+    #[cfg(feature = "encrypted-store")]
     pub fn migrate_to_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<()> {
         let path = path.as_ref();
         if secret.is_empty() {
@@ -1298,6 +1307,7 @@ impl Store {
     }
 }
 
+#[cfg(feature = "encrypted-store")]
 pub fn configured_store_key() -> Result<Option<Vec<u8>>> {
     if let Some(path) = std::env::var_os(STORE_KEY_FILE_ENV) {
         return read_store_secret_file(Path::new(&path)).map(Some);
@@ -1339,6 +1349,7 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+#[cfg(feature = "encrypted-store")]
 fn apply_sqlcipher_key(conn: &Connection, secret: &[u8]) -> Result<()> {
     let len: i32 = secret
         .len()
@@ -1358,6 +1369,7 @@ fn apply_sqlcipher_key(conn: &Connection, secret: &[u8]) -> Result<()> {
 /// Whether the file at `path` starts with the plaintext SQLite magic. A
 /// SQLCipher-encrypted database encrypts the header too, so this distinguishes a
 /// plaintext store from an encrypted one without a key.
+#[cfg(feature = "encrypted-store")]
 fn is_plaintext_sqlite(path: &Path) -> Result<bool> {
     use std::io::Read;
     let mut f = File::open(path)?;
