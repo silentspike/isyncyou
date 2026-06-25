@@ -122,16 +122,6 @@ function logoGlyph(size = 30) {
    CSP-safe — same trust as logoGlyph). */
 // tiny deterministic PRNG (mulberry32) so the network is stable across renders
 function rng(seed) { let s = seed >>> 0; return () => { s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
-// constellation: nodes (denser toward the top) + near-neighbour links → one SVG
-function netBackdrop(w, h) {
-  const rnd = rng(0x51e3a17), N = Math.round(w * h / 11000);
-  const nodes = [];
-  for (let i = 0; i < N; i++) { const yb = rnd(); nodes.push({ x: rnd() * w, y: yb * yb * h, r: 0.7 + rnd() * 1.9, a: rnd() > 0.7 }); }
-  const maxD = Math.min(w, h) * 0.14, lines = [];
-  for (let i = 0; i < N; i++) { let c = 0; for (let j = i + 1; j < N && c < 3; j++) { const d = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y); if (d < maxD) { lines.push(`<line x1="${nodes[i].x | 0}" y1="${nodes[i].y | 0}" x2="${nodes[j].x | 0}" y2="${nodes[j].y | 0}" opacity="${((1 - d / maxD) * 0.7).toFixed(2)}"/>`); c++; } } }
-  const dots = nodes.map(n => `<circle cx="${n.x | 0}" cy="${n.y | 0}" r="${n.r.toFixed(1)}" fill="${n.a ? "#a78bfa" : "#c7d2fe"}" opacity="${n.a ? .95 : .7}"/>`).join("");
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="100%" preserveAspectRatio="xMidYMin slice" xmlns="http://www.w3.org/2000/svg"><g stroke="#9aa2fb" stroke-width="0.9">${lines.join("")}</g>${dots}</svg>`;
-}
 // living constellation: one shared rAF loop drives every registered <canvas>.
 // Nodes drift on their own slow velocities (parallax-ish, accent stars a touch
 // faster), near-neighbour links are redrawn each frame so the web "breathes",
@@ -991,17 +981,6 @@ const SVC_COLOR = {
 // canonical service display names (consistent everywhere — no "Onedrive"/"Todo")
 const SVC_LABEL = { overview: "Overview", mail: "Mail", onedrive: "OneDrive", calendar: "Calendar", contacts: "Contacts", todo: "To Do", onenote: "OneNote" };
 const svcLabel = (id) => SVC_LABEL[id] || id;
-// bucket runs into per-day counts for the activity sparkline
-function activityBuckets(runs, days = 14) {
-  const now = Date.now(), b = new Array(days).fill(0);
-  runs.forEach(r => {
-    const t = Date.parse(r.finished_at || r.started_at);
-    if (isNaN(t)) return;
-    const diff = Math.floor((now - t) / 864e5);
-    if (diff >= 0 && diff < days) b[days - 1 - diff]++;
-  });
-  return b;
-}
 async function renderOverview(view) {
   clear(view).append(
     el("h1", { class: "view-title", text: MOBILE ? "Microsoft 365 on this device" : "Microsoft 365 archive overview" }),
@@ -1115,14 +1094,6 @@ async function renderOverview(view) {
 }
 function connItem(k, v) { return el("div", { class: "conn-item" }, el("dt", { text: k }), el("dd", { text: v == null ? "—" : String(v) })); }
 
-/* shared per-view header: title + live metric line + honest chips (enterprise standard) */
-function viewHeader(title, metrics, chips) {
-  return el("header", { class: "svc-head" },
-    el("h1", { class: "view-title", style: "margin:0", text: title }),
-    metrics ? el("span", { class: "svc-metrics dim", text: metrics }) : null,
-    el("span", { class: "spacer", style: "flex:1" }),
-    chips && chips.length ? el("div", { class: "svc-chips" }, ...chips) : null);
-}
 const readonlyChip = () => el("span", { class: "chip muted" }, icon("shield-check", "icon-sm"), "Read-only");
 
 /* ---------------------------------------------------------------- generic service view (parity; bespoke per PR) */
@@ -1500,7 +1471,6 @@ function openInlineComposer(it, mode) {
       onmousedown: (e) => { e.preventDefault(); const u = prompt("Link URL:"); if (u) document.execCommand("createLink", false, u); editor.focus(); },
     }, icon("link", "icon-sm")));
   const q = { account: App.account, service: "mail", id: it.remote_id };
-  const quoteFrame = el("iframe", { class: "cmp-quote-frame", src: `/api/v1/view?${qs(q)}`, title: "Original message", sandbox: "allow-same-origin", loading: "lazy" });
   const head = el("div", { class: "cmp-inline-head" },
     el("span", { class: "cmp-inline-title truncate" }, title + (p.subject ? " · " + p.subject : (it.name ? " · " + it.name : ""))),
     el("div", { style: "flex:1" }),
@@ -1758,7 +1728,19 @@ function renderMailReader(it, remoteImages = false) {
         el("span", { class: "truncate", text: a.filename || "attachment" }),
         el("span", { class: "dim mr-att-size", text: fmtSize(a.size) })))));
   }
-  box.append(el("div", { class: "mail-frame-scroll" }, frame));
+  if (it.has_body) {
+    box.append(el("div", { class: "mail-frame-scroll" }, frame));
+  } else {
+    // No archived body (live-only on the mobile cache, or not downloaded yet):
+    // show a graceful card — never the raw /api/v1/view 404 JSON (#89 CC-3).
+    const card = el("div", { class: "empty mail-no-body" }, emptyArt("empty-mail"),
+      el("h3", { text: MOBILE ? "Not cached on this device" : "Body not archived yet" }),
+      el("p", { text: MOBILE
+        ? "This message is in Microsoft 365 — its body isn't cached on this device."
+        : "This message is indexed; its body isn't in your backup yet." }));
+    if (p.webLink) card.append(el("a", { class: "btn sm primary", style: "margin-top:12px", href: p.webLink, target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open in Outlook"));
+    box.append(card);
+  }
 }
 function metricCard(icn, val, label) {
   return el("div", { class: "metric-card" }, el("span", { class: "mc-ico" }, icon(icn, "icon-sm")),
@@ -2489,7 +2471,6 @@ async function deleteEvent(ev) {
 const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null, runs: [], retentionDays: null };
 const conLetter = (it) => ((it.name || "#").trim()[0] || "#").toUpperCase();
 const conPrev = (it) => it.preview || {};
-const CON_FILTERS = [["all", "All"], ["email", "With email"], ["company", "With company"], ["restore", (MOBILE ? "Has content" : "Restore-ready")]];
 async function renderContactsView(view) {
   Object.assign(Contacts, { all: [], selected: null, filter: "all", q: "", sort: "name", status: null });
   clear(view).append(el("div", { class: "con-page" },
@@ -2670,12 +2651,6 @@ function conMetric(icn, value, label, sub, tone) {
       el("div", { class: "cm-sub dim truncate", text: sub })));
 }
 /* ---- shared archive-mockup primitives (metric row + integrity + verify), reused by every view */
-// a KPI row from [{icon,value,label,sub,tone}] (tone: ok|warn|"")
-function metricsRow(cards) {
-  const row = el("div", { class: "con-metrics-row", style: `grid-template-columns: repeat(${cards.length}, 1fr)` });
-  cards.forEach(c => row.append(conMetric(c.icon, c.value, c.label, c.sub, c.tone)));
-  return row;
-}
 // per-view integrity from each item's real verify_status (no extra backend call).
 // Denominator = records actually checked (verify_status set), matching the
 // store's verify_counts: cloud-only OneDrive placeholders the pass skips never
@@ -2988,19 +2963,6 @@ async function renderContactDetail(it) {
   } catch (e) { clear(fieldsBody).append(el("p", { class: "dim", text: "Could not load contact: " + e.message })); }
 }
 
-// (removed masonryBalance — replaced by a CSS 2-column grid)
-function _unused_masonryBalance(host, cards) {
-  clear(host);
-  const cols = [el("div", { class: "con-col" }), el("div", { class: "con-col" })];
-  host.append(cols[0], cols[1]);
-  const h = [0, 0];
-  for (const card of cards) {
-    if (!card) continue;
-    const i = h[0] <= h[1] ? 0 : 1;
-    cols[i].append(card);
-    h[i] += card.getBoundingClientRect().height || 1;
-  }
-}
 
 /* ---------------------------------------------------------------- todo (lists + checklists) */
 const Todo = { lists: [], tasks: [], stateFilter: "all" };
