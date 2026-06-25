@@ -639,6 +639,22 @@ impl Store {
         Ok(())
     }
 
+    /// Set just the `sender` column for one item (CC-1 backfill) without rewriting
+    /// the row or disturbing FTS/sync-state. No-op if the item doesn't exist.
+    pub fn set_sender(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        sender: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET sender=?4 WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, sender],
+        )?;
+        Ok(())
+    }
+
     pub fn get_item(&self, account: &str, service: &str, remote_id: &str) -> Result<Option<Item>> {
         let it = self
             .conn

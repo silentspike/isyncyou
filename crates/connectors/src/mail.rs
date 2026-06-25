@@ -96,6 +96,9 @@ pub fn incremental_sync_mail<T: Transport>(
         }
         store.set_delta_cursor(account, SERVICE, &folder.id, out.cursor.as_str())?;
     }
+    // Backfill senders for any pre-#89 messages still carrying NULL (cheap no-op
+    // once done) so the list never shows "(unknown sender)" on the backlog (CC-1).
+    let _ = backfill_mail_senders(store, account, archive_root);
     Ok(report)
 }
 
@@ -318,6 +321,56 @@ fn remove_message_json(archive_root: &Path, id: &str) {
     let _ = std::fs::remove_file(shard_path(archive_root, SERVICE, id, "json"));
 }
 
+/// Build a mail item's display sender ("Name <addr>" / address / name) from a Graph
+/// message's `from.emailAddress`. Shared by ingest and the backfill so both yield
+/// the same value. `None` only when neither a name nor an address is present.
+pub(crate) fn sender_display(msg: &Value) -> Option<String> {
+    let ea = msg.get("from").and_then(|f| f.get("emailAddress"))?;
+    let name = ea.get("name").and_then(Value::as_str).unwrap_or("").trim();
+    let addr = ea
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match (name.is_empty(), addr.is_empty()) {
+        (false, false) => Some(format!("{name} <{addr}>")),
+        (true, false) => Some(addr.to_string()),
+        (false, true) => Some(name.to_string()),
+        (true, true) => None,
+    }
+}
+
+/// Backfill `sender` for mail items that predate the `sender` column (NULL) by
+/// re-reading the archived Graph JSON sidecar (`<id>.json`, written for every
+/// ingested message). Idempotent and self-limiting: only rows with `sender IS NULL`
+/// are touched, so after the first pass there is nothing to do. Closes the
+/// pre-#89 "(unknown sender)" backlog (the delta never re-delivers unchanged mail,
+/// so without this those rows would stay NULL forever). Returns the count filled.
+pub fn backfill_mail_senders(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<usize, SyncError> {
+    let mut filled = 0;
+    for it in store.items_by_type(account, SERVICE, "message")? {
+        if it.sender.is_some() {
+            continue;
+        }
+        let p = shard_path(archive_root, SERVICE, &it.remote_id, "json");
+        let Ok(bytes) = std::fs::read(&p) else {
+            continue; // no sidecar (e.g. never body-archived) — leave for next sync
+        };
+        let Ok(o) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if let Some(sender) = sender_display(&o) {
+            store.set_sender(account, SERVICE, &it.remote_id, &sender)?;
+            filled += 1;
+        }
+    }
+    Ok(filled)
+}
+
 /// Ingest one message-delta entry for a given folder.
 fn ingest_message(
     store: &Store,
@@ -378,23 +431,7 @@ fn ingest_message(
         .map(String::from);
     // Display sender ("Name <addr>"), captured straight from the delta so the list
     // shows who a message is from even before its .eml body is cached (#89).
-    it.sender = msg
-        .get("from")
-        .and_then(|f| f.get("emailAddress"))
-        .and_then(|ea| {
-            let name = ea.get("name").and_then(Value::as_str).unwrap_or("").trim();
-            let addr = ea
-                .get("address")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            match (name.is_empty(), addr.is_empty()) {
-                (false, false) => Some(format!("{name} <{addr}>")),
-                (true, false) => Some(addr.to_string()),
-                (false, true) => Some(name.to_string()),
-                (true, true) => None,
-            }
-        });
+    it.sender = sender_display(msg);
     it.sync_state = "remote_dirty".into();
     store.upsert_item(&it)?;
     // Capture the full Graph message JSON beside the .eml (completeness, #562).
@@ -533,6 +570,49 @@ mod tests {
                 .sender
                 .as_deref(),
             Some("noname@example.com")
+        );
+    }
+
+    #[test]
+    fn backfill_fills_null_senders_from_json_sidecar() {
+        // CC-1: a pre-#89 message (sender NULL) gets its sender from the archived
+        // Graph JSON sidecar; idempotent; rows without a sidecar are left untouched.
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let msg = json!({
+            "id": "mb1", "subject": "Old mail",
+            "from": { "emailAddress": { "name": "Ada Lovelace", "address": "ada@example.com" } },
+        });
+        write_message_json(arch.path(), "mb1", &msg).unwrap();
+        let it = Item::new("acc", SERVICE, "mb1", "Old mail", "message");
+        assert!(it.sender.is_none());
+        store.upsert_item(&it).unwrap();
+        // a second message with no sidecar on disk — must be left as-is, no crash
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "mb2", "No sidecar", "message"))
+            .unwrap();
+
+        let filled = backfill_mail_senders(&store, "acc", arch.path()).unwrap();
+        assert_eq!(filled, 1);
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "mb1")
+                .unwrap()
+                .unwrap()
+                .sender
+                .as_deref(),
+            Some("Ada Lovelace <ada@example.com>")
+        );
+        assert!(store
+            .get_item("acc", SERVICE, "mb2")
+            .unwrap()
+            .unwrap()
+            .sender
+            .is_none());
+        // idempotent: second pass touches nothing
+        assert_eq!(
+            backfill_mail_senders(&store, "acc", arch.path()).unwrap(),
+            0
         );
     }
 
