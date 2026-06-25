@@ -199,4 +199,54 @@ mod tests {
         let tok = session_token().expect("token present");
         assert!(!tok.is_empty(), "session token must be set");
     }
+
+    #[test]
+    fn standalone_serves_ui_and_gates_the_api_end_to_end() {
+        // #89 P7 (host slice): the embedded engine — the exact code that runs on the
+        // phone — serves the web UI over loopback and fully session-token gates the
+        // data API. The WebView visual + device-code login + over-LTE render are the
+        // genuinely device-bound parts; the engine/serving/gating is proven here.
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let dir = tempfile::tempdir().unwrap();
+        let port = start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let tok = session_token().expect("token");
+
+        let req = |raw: &str| {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(raw.as_bytes()).unwrap();
+            let mut s = String::new();
+            c.read_to_string(&mut s).unwrap();
+            s
+        };
+        // The UI shell is served by the embedded engine (no daemon).
+        let shell = req("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            shell.starts_with("HTTP/1.1 200"),
+            "engine must serve the UI: {shell}"
+        );
+        // Data route without the session token → 401 (the Android-loopback fix).
+        let no_tok =
+            req("GET /api/v1/items?account=me&service=mail HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            no_tok.starts_with("HTTP/1.1 401"),
+            "data API must be gated: {no_tok}"
+        );
+        // With the session token → reaches the handler (not a 401).
+        let with_tok = req(&format!(
+            "GET /api/v1/items?account=me&service=mail HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Session-Token: {tok}\r\n\r\n"
+        ));
+        assert!(
+            !with_tok.starts_with("HTTP/1.1 401"),
+            "valid token must pass: {with_tok}"
+        );
+        // Restore is absent in the mobile profile (cache, not backup-of-record) → 404.
+        let restore = req(&format!(
+            "POST /api/v1/restore?account=me&service=mail&id=x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Session-Token: {tok}\r\n\r\n"
+        ));
+        assert!(
+            restore.starts_with("HTTP/1.1 404"),
+            "restore must be absent on mobile: {restore}"
+        );
+    }
 }
