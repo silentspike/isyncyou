@@ -404,7 +404,7 @@ function stateFilterBar(items, current, onPick) {
   items.forEach(it => { counts[stateKey(it)]++; });
   const mk = (key, label) => el("button", { class: "state-chip" + (key === current ? " active" : ""), onclick: () => onPick(key) },
     key === "all" ? null : icon(STATES[key].icon, "icon-sm"), el("span", { text: label }), el("span", { class: "sc-count", text: String(counts[key] || 0) }));
-  return el("div", { class: "state-chips" }, mk("all", "All"), mk("live_only", "Live only"), mk("live_backup", "Live + backup"), mk("backup_only", "Backup only"), mk("stale", "Stale"));
+  return el("div", { class: "state-chips" }, mk("all", "All"), mk("live_only", STATES.live_only.label), mk("live_backup", STATES.live_backup.label), mk("backup_only", STATES.backup_only.label), mk("stale", STATES.stale.label));
 }
 // Activity timestamps come back as unix seconds (audit_timestamp); everything
 // else is an ISO/RFC string. Normalise both to a JS Date.
@@ -1150,7 +1150,7 @@ function stateChipBar() {
     key === "all" ? null : icon(STATES[key].icon, "icon-sm"),
     el("span", { text: label }), el("span", { class: "sc-count", dataset: { cnt: key }, text: "0" }));
   return el("div", { id: "svc-statechips", class: "state-chips" },
-    mk("all", "All"), mk("live_only", "Live only"), mk("live_backup", "Live + backup"), mk("backup_only", "Backup only"), mk("stale", "Stale"));
+    mk("all", "All"), mk("live_only", STATES.live_only.label), mk("live_backup", STATES.live_backup.label), mk("backup_only", STATES.backup_only.label), mk("stale", STATES.stale.label));
 }
 function applyStateFilter(key) {
   const list = $("#svc-list"); if (!list) return;
@@ -1884,7 +1884,7 @@ function driveSort(items) {
 }
 function driveRender() {
   const body = $("#drive-body"); if (!body) return; clear(body);
-  if (!Drive.items.length) { body.append(el("div", { class: "empty" }, emptyArt("empty-files"), el("h3", { text: "Empty folder" }), el("p", { text: "Nothing is archived here." }))); return; }
+  if (!Drive.items.length) { body.append(el("div", { class: "empty" }, emptyArt("empty-files"), el("h3", { text: "Empty folder" }), el("p", { text: MOBILE ? "OneDrive isn't cached on this device — it stays in your backup on your computer." : "Nothing is archived here." }))); return; }
   // folders always navigate; the 4-state filter applies to files only.
   const files = Drive.items.filter(it => it.item_type !== "folder");
   body.append(stateFilterBar(files, Drive.stateFilter, k => { Drive.stateFilter = k; driveRender(); }));

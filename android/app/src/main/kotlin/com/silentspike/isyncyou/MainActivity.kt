@@ -2,11 +2,13 @@ package com.silentspike.isyncyou
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -45,8 +47,25 @@ class MainActivity : Activity() {
             cacheMode = WebSettings.LOAD_NO_CACHE
         }
         web.clearCache(true)
-        // Keep navigation inside the WebView (don't hand off to Chrome).
-        web.webViewClient = WebViewClient()
+        web.webViewClient = object : WebViewClient() {
+            // The local UI (127.0.0.1) stays in the WebView; hand any external
+            // navigation — e.g. the device-code sign-in at login.live.com — to the
+            // system browser so the auth page never takes over the app's own UI
+            // (#89; aligns with RFC 8252: use the system browser for OAuth).
+            override fun shouldOverrideUrlLoading(
+                view: WebView,
+                request: WebResourceRequest,
+            ): Boolean {
+                val host = request.url.host ?: return false
+                if (host == "127.0.0.1" || host == "localhost") return false
+                return try {
+                    startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+            }
+        }
         setContentView(web)
 
         // FCM (#575): register the notification channel + request POST_NOTIFICATIONS
