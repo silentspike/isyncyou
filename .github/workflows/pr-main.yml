@@ -138,10 +138,28 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
       - run: cargo build --release --workspace
 
+  # Artifact vuln-scan (release-grade): trivy on the Cargo lockfile, a different engine
+  # than cargo-deny (defense-in-depth). Scoped to vuln only — gitleaks owns secrets,
+  # and a local trivy run showed the binary/APK carry no language-specific files (no
+  # useful Rust/Kotlin CVE surface), so those are deliberately not scanned.
+  vuln-scan:
+    name: vuln-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: Trivy vulnerability scan (Cargo lockfile)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
   main-pass:
     name: main-pass
     if: always()
-    needs: [content-check, fmt, clippy, test, deny, docs, release-build]
+    needs: [content-check, fmt, clippy, test, deny, docs, release-build, vuln-scan]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed
