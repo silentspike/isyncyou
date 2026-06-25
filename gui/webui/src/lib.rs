@@ -2733,6 +2733,34 @@ impl Router {
                                     }
                                 }
                             }
+                            // #89: show a mail's sender from the indexed `sender`
+                            // (captured at ingest — read with the item, NO extra
+                            // file I/O) whenever the .eml body isn't cached, so a row
+                            // never reads "(unknown sender)". The .eml enrichment
+                            // above wins when the body is present.
+                            if service == "mail" {
+                                if let Some(sender) = it.sender.as_deref() {
+                                    let has_from = v
+                                        .get("preview")
+                                        .and_then(|p| p.get("from"))
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty());
+                                    if !has_from {
+                                        let mut p =
+                                            v.get("preview").cloned().unwrap_or_else(|| json!({}));
+                                        p["from"] = json!(sender);
+                                        if p.get("subject").and_then(Value::as_str).is_none() {
+                                            p["subject"] = json!(it.name);
+                                        }
+                                        if p.get("date").and_then(Value::as_str).is_none() {
+                                            if let Some(d) = it.remote_mtime.as_deref() {
+                                                p["date"] = json!(d);
+                                            }
+                                        }
+                                        v["preview"] = p;
+                                    }
+                                }
+                            }
                             v
                         })
                         .collect()
@@ -5621,6 +5649,46 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .unwrap();
         assert_eq!(m1["has_body"], true);
         assert_eq!(m1["parent_remote_id"], "F1");
+    }
+
+    #[test]
+    fn items_mail_preview_shows_indexed_sender_without_eml() {
+        // #89: a mail whose .eml body isn't cached (the mobile cache caps bodies)
+        // still shows its sender from the indexed `sender` column (captured at
+        // ingest, read with the item — no per-request file I/O), so the list never
+        // reads "(unknown sender)". Exercises the v11 migration end-to-end.
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut m = Item::new("a", "mail", "m9", "Indexed-sender subject", "message");
+            m.sender = Some("Grace Hopper <grace@example.com>".into());
+            m.remote_mtime = Some("2026-06-25T10:00:00Z".into());
+            // No local_path → the .eml body is NOT cached on this device.
+            store.upsert_item(&m).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let v = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail")));
+        let it = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["remote_id"] == "m9")
+            .expect("m9 listed");
+        assert_eq!(it["preview"]["from"], "Grace Hopper <grace@example.com>");
+        assert_eq!(it["preview"]["subject"], "Indexed-sender subject");
+        assert_eq!(it["preview"]["date"], "2026-06-25T10:00:00Z");
     }
 
     #[test]

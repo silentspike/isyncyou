@@ -37,7 +37,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -250,6 +250,15 @@ const MIGRATION_V10: &str = r#"
 ALTER TABLE items ADD COLUMN body_etag TEXT;
 "#;
 
+/// v11: the display sender of a mail item (`"Name <addr>"`), captured at ingest
+/// straight from the delta payload — so the list shows who a message is from even
+/// when its `.eml` body isn't cached (the mobile cache caps bodies; without this the
+/// row reads "(unknown sender)"). Set by the mail connector's ingest; `NULL` for
+/// every non-mail service. Read with the item — no per-request body/sidecar I/O.
+const MIGRATION_V11: &str = r#"
+ALTER TABLE items ADD COLUMN sender TEXT;
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -299,6 +308,9 @@ pub struct Item {
     /// `etag != body_etag` (with a body present) = the cloud changed since the
     /// backup → the web UI shows a **stale** status. `None` = no body archived.
     pub body_etag: Option<String>,
+    /// Display sender of a mail item (`"Name <addr>"`), captured at ingest so the
+    /// list shows the sender without the `.eml` body. `None` for non-mail / unknown.
+    pub sender: Option<String>,
 }
 
 impl Item {
@@ -333,6 +345,7 @@ impl Item {
             body_etag: None,
             verified_at: None,
             verify_status: None,
+            sender: None,
         }
     }
 }
@@ -582,8 +595,8 @@ impl Store {
             r#"INSERT INTO items
                  (account_id, service, remote_id, parent_remote_id, name, local_path,
                   item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at,
-                  change_key, internet_message_id, ical_uid, series_master_id)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                  change_key, internet_message_id, ical_uid, series_master_id, sender)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
                ON CONFLICT(account_id, service, remote_id) DO UPDATE SET
                  parent_remote_id    = excluded.parent_remote_id,
                  name                = excluded.name,
@@ -599,7 +612,8 @@ impl Store {
                  change_key          = excluded.change_key,
                  internet_message_id = excluded.internet_message_id,
                  ical_uid            = excluded.ical_uid,
-                 series_master_id    = excluded.series_master_id"#,
+                 series_master_id    = excluded.series_master_id,
+                 sender              = COALESCE(excluded.sender, sender)"#,
             params![
                 it.account_id,
                 it.service,
@@ -618,7 +632,8 @@ impl Store {
                 it.change_key,
                 it.internet_message_id,
                 it.ical_uid,
-                it.series_master_id
+                it.series_master_id,
+                it.sender
             ],
         )?;
         Ok(())
@@ -1385,7 +1400,7 @@ fn is_plaintext_sqlite(path: &Path) -> Result<bool> {
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
                     item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
                     change_key, internet_message_id, ical_uid, series_master_id, \
-                    body_sha256, verified_at, verify_status, body_etag";
+                    body_sha256, verified_at, verify_status, body_etag, sender";
 
 fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     Ok(Item {
@@ -1411,6 +1426,7 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         verified_at: r.get(19)?,
         verify_status: r.get(20)?,
         body_etag: r.get(21)?,
+        sender: r.get(22)?,
     })
 }
 
@@ -1560,6 +1576,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 10 {
         conn.execute_batch(MIGRATION_V10)?;
+    }
+    if v < 11 {
+        conn.execute_batch(MIGRATION_V11)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())

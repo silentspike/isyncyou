@@ -376,6 +376,25 @@ fn ingest_message(
         .get("internetMessageId")
         .and_then(Value::as_str)
         .map(String::from);
+    // Display sender ("Name <addr>"), captured straight from the delta so the list
+    // shows who a message is from even before its .eml body is cached (#89).
+    it.sender = msg
+        .get("from")
+        .and_then(|f| f.get("emailAddress"))
+        .and_then(|ea| {
+            let name = ea.get("name").and_then(Value::as_str).unwrap_or("").trim();
+            let addr = ea
+                .get("address")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            match (name.is_empty(), addr.is_empty()) {
+                (false, false) => Some(format!("{name} <{addr}>")),
+                (true, false) => Some(addr.to_string()),
+                (false, true) => Some(name.to_string()),
+                (true, true) => None,
+            }
+        });
     it.sync_state = "remote_dirty".into();
     store.upsert_item(&it)?;
     // Capture the full Graph message JSON beside the .eml (completeness, #562).
@@ -476,6 +495,45 @@ mod tests {
         assert_eq!(v["importance"], "high");
         assert_eq!(v["ccRecipients"][0]["emailAddress"]["address"], "c@x.com");
         assert_eq!(v["webLink"], "https://outlook.live.com/mail/0/x");
+    }
+
+    #[test]
+    fn ingest_captures_display_sender_into_the_item() {
+        // #89: the sender is captured at ingest into the item's `sender` column so
+        // the list shows who a mail is from without its .eml body being cached.
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let with_name = json!({
+            "id": "ms1", "subject": "Hi",
+            "from": { "emailAddress": { "name": "Grace Hopper", "address": "grace@example.com" } },
+        });
+        let addr_only = json!({
+            "id": "ms2", "subject": "No name",
+            "from": { "emailAddress": { "address": "noname@example.com" } },
+        });
+        let mut t = MockTransport::new(vec![
+            Response::ok(json!({ "value": [folder("FA", "Inbox")] })),
+            Response::ok(json!({ "value": [with_name, addr_only], "@odata.deltaLink": "C" })),
+        ]);
+        incremental_sync_mail(&mut t, &store, "acc", "t", arch.path()).unwrap();
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "ms1")
+                .unwrap()
+                .unwrap()
+                .sender
+                .as_deref(),
+            Some("Grace Hopper <grace@example.com>")
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "ms2")
+                .unwrap()
+                .unwrap()
+                .sender
+                .as_deref(),
+            Some("noname@example.com")
+        );
     }
 
     #[test]
