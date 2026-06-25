@@ -101,3 +101,11 @@ packaging/dolphin/overlay-plugin/build/
 
 # user-supplied credentials (never committed)
 .secrets/
+.review/
+/staging.md
+
+# internal review/probe tooling (token-minting + Graph discovery logs — never committed)
+tools/bridge_*.py
+tools/graph_*.py
+tools/mint_write_token.py
+tools/graph-*.log
