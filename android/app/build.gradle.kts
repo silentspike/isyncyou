@@ -3,8 +3,18 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    // Firebase google-services plugin (FCM, #575): processes app/google-services.json.
-    id("com.google.gms.google-services")
+}
+
+// Firebase google-services plugin (FCM, #575): processes app/google-services.json.
+// Applied ONLY when that file is present — it is user-supplied + gitignored
+// (android/.gitignore), so a fresh CI checkout has no Firebase config. Without this
+// guard `:app:processDebugGoogleServices` fails on CI; with it a token-free
+// assembleDebug builds Firebase-less (firebase-messaging still compiles; only the
+// runtime google_app_id resource is absent), while a local checkout that has the file
+// keeps FCM fully wired. (The plugin is on the classpath via the root build's
+// `apply false`; it hooks the Android variants through afterEvaluate.)
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
 }
 
 // Release signing reads android/signing.properties (user-supplied, gitignored) —
