@@ -56,13 +56,23 @@ class MainActivity : Activity() {
                 view: WebView,
                 request: WebResourceRequest,
             ): Boolean {
-                val host = request.url.host ?: return false
+                val url = request.url
+                // Only http/https is ever allowed. Anything else (intent:, javascript:,
+                // file:, data:, tel:, custom schemes) is refused outright — defense in
+                // depth so a hostile link can't drive the WebView into a local scheme.
+                val scheme = url.scheme?.lowercase()
+                if (scheme != "http" && scheme != "https") return true
+                // The local UI stays in the WebView.
+                val host = url.host
                 if (host == "127.0.0.1" || host == "localhost") return false
+                // External http(s) — e.g. the device-code sign-in at login.live.com —
+                // goes to the system browser, never inside the app's own UI.
                 return try {
-                    startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                    startActivity(Intent(Intent.ACTION_VIEW, url))
                     true
                 } catch (_: Exception) {
-                    false
+                    // Can't hand off → refuse rather than load the external URL in-app.
+                    true
                 }
             }
         }
@@ -78,7 +88,14 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
         com.google.firebase.messaging.FirebaseMessaging.getInstance().token
-            .addOnCompleteListener { t -> if (t.isSuccessful) fcmToken = t.result }
+            .addOnCompleteListener { t ->
+                if (t.isSuccessful) {
+                    fcmToken = t.result
+                    // Persist so a later rotation (onNewToken) and the web UI's push
+                    // registration read a single, current source.
+                    IsyncMessagingService.saveToken(this, t.result)
+                }
+            }
 
         // Start the embedded engine off the UI thread (it touches the filesystem and
         // binds a socket), then load the local UI on the UI thread once it's up.
@@ -112,6 +129,10 @@ class MainActivity : Activity() {
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setCookie("$origin/", "isy_session=$token; Path=/")
+            // setCookie is async; flush() persists it synchronously so the very first
+            // subresource requests (iframe/img/EventSource) already carry the session
+            // cookie and don't 401 on the initial load (#89 P1).
+            flush()
         }
         // nativeStart is idempotent, so on Activity recreation the port is the same
         // origin and the UI simply reloads.
@@ -127,7 +148,12 @@ class MainActivity : Activity() {
     /** JS bridge: lets the web UI read the FCM token for push registration (#576). */
     private inner class PushBridge {
         @android.webkit.JavascriptInterface
-        fun fcmToken(): String = fcmToken ?: ""
+        fun fcmToken(): String {
+            // Prefer the persisted token (kept current across rotations by onNewToken),
+            // falling back to the value fetched at startup.
+            val persisted = IsyncMessagingService.currentToken(this@MainActivity)
+            return if (persisted.isNotEmpty()) persisted else (fcmToken ?: "")
+        }
     }
 
     /** Hardware/gesture back navigates WebView history before leaving the app. */

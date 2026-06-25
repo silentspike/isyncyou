@@ -21,8 +21,10 @@ class IsyncMessagingService : FirebaseMessagingService() {
     /** New/rotated FCM registration token — the daemon/relay (#576) targets it. */
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-        // The token is delivered to the daemon by the web UI's push registration
-        // (#576). SECURITY: never log the token value.
+        // Persist the rotated token so the web UI's push registration (#576) always
+        // reads the current value, even if FCM rotates it while the app is running.
+        // SECURITY: never log the token value.
+        saveToken(this, token)
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
@@ -53,6 +55,18 @@ class IsyncMessagingService : FirebaseMessagingService() {
 
     companion object {
         const val CHANNEL_ID = "isyncyou-sync"
+        private const val PREFS = "isyncyou_push"
+        private const val KEY_TOKEN = "fcm_token"
+
+        /** Persist the latest FCM token (process-shared with MainActivity). */
+        fun saveToken(ctx: Context, token: String) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putString(KEY_TOKEN, token).apply()
+        }
+
+        /** The most recent persisted FCM token, or "" if none yet. */
+        fun currentToken(ctx: Context): String =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_TOKEN, "") ?: ""
 
         /** Register the notification channel (Android 8+); a no-op below API 26. */
         fun ensureChannel(ctx: Context) {

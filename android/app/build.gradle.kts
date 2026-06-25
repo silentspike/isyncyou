@@ -18,6 +18,9 @@ val releaseProps = Properties().apply {
 android {
     namespace = "com.silentspike.isyncyou"
     compileSdk = 34
+    // Single source of truth for the NDK; cargoNdkBuild references android.ndkVersion.
+    // AGP fetches/validates this exact NDK, so the cross-compile is reproducible.
+    ndkVersion = System.getenv("ISY_NDK_VERSION") ?: "27.3.13750724"
 
     defaultConfig {
         applicationId = "com.silentspike.isyncyou"
@@ -73,14 +76,17 @@ dependencies {
 
 // #89: build the embedded Rust engine (libisyncyou_mobile.so) with cargo-ndk into
 // app/src/main/jniLibs before assembling the APK. The Rust workspace is the parent
-// of android/. Pins the MSRV toolchain + the installed NDK; uses the rustup cargo
-// proxy so `+1.95.0` resolves.
+// of android/. The cargo binary, MSRV toolchain and NDK are overridable via env for
+// CI reproducibility; defaults match the documented local setup (cargo via rustup so
+// `+1.95.0` resolves, NDK r27d pinned by android.ndkVersion above).
 val cargoNdkBuild by tasks.registering(Exec::class) {
     workingDir = rootProject.projectDir.parentFile
     val home = System.getProperty("user.home")
-    environment("ANDROID_NDK_HOME", "${android.sdkDirectory}/ndk/27.3.13750724")
+    val cargo = System.getenv("CARGO") ?: "$home/.cargo/bin/cargo"
+    val toolchain = System.getenv("ISY_RUST_TOOLCHAIN") ?: "1.95.0"
+    environment("ANDROID_NDK_HOME", "${android.sdkDirectory}/ndk/${android.ndkVersion}")
     commandLine(
-        "$home/.cargo/bin/cargo", "+1.95.0", "ndk",
+        cargo, "+$toolchain", "ndk",
         "-t", "arm64-v8a",
         "-o", "android/app/src/main/jniLibs",
         "build", "-p", "isyncyou-mobile", "--release",
