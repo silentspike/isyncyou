@@ -18,18 +18,27 @@ use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod calendar_live;
+mod contacts_live;
+mod mail_live;
 mod mail_restore;
+mod onenote_live;
 mod restore_calendar;
 mod restore_contacts;
 mod restore_key;
 mod restore_onenote;
 mod restore_recovery;
 mod restore_todo;
+mod task_live;
 mod verify;
+pub use calendar_live::{calendar_writer, CalendarWriter};
+pub use contacts_live::{contact_writer, ContactWriter};
+pub use mail_live::{build_message, mail_writer, MailWriter};
 pub use mail_restore::{
     pending_mail_restore_count, recover_pending_mail_restores, recover_pending_mail_restores_with,
     restore_mail_via_ledger, MailApi, MailSink,
 };
+pub use onenote_live::{page_writer, PageWriter};
 pub use restore_calendar::{
     pending_calendar_restore_count, recover_pending_calendar_restores,
     recover_pending_calendar_restores_with, restore_calendar_via_ledger, CalendarApi, CalendarSink,
@@ -51,6 +60,7 @@ pub use restore_todo::{
     pending_todo_restore_count, recover_pending_todo_restores, recover_pending_todo_restores_with,
     restore_todo_via_ledger, ToDoApi, ToDoSink,
 };
+pub use task_live::{task_writer, TaskWriter};
 pub use verify::{verify_account, VerifyReport};
 
 /// Structured outcome of one [`sync_once`] pass. All counts are best-effort
@@ -124,13 +134,17 @@ pub mod auth {
     /// Public client app registration for read/backup scopes.
     pub const READ_CLIENT: &str = "cee80dd9-c13e-4dbb-9d4c-73eb4987d447";
     /// Delegated read scopes (User.Read lets `setup` confirm the identity).
+    /// `MailboxSettings.Read` covers mailbox config + inbox rules; `People.Read`
+    /// covers the relevance-ranked people surface (both consumer-available).
     pub const READ_SCOPES: &[&str] = &[
         "Files.Read",
         "Mail.Read",
+        "MailboxSettings.Read",
         "Calendars.Read",
         "Contacts.Read",
         "Tasks.Read",
         "Notes.Read",
+        "People.Read",
         "User.Read",
         "offline_access",
     ];
@@ -197,6 +211,7 @@ pub mod auth {
         "Files.ReadWrite",
         "Mail.ReadWrite",
         "Mail.Send",
+        "MailboxSettings.ReadWrite",
         "Calendars.ReadWrite",
         "Contacts.ReadWrite",
         "Tasks.ReadWrite",
@@ -217,6 +232,225 @@ pub mod auth {
         let now = super::unix_now().parse::<u64>().unwrap_or(0);
         isyncyou_graph::auth::flow::ensure_access_token(&cache, WRITE_CLIENT, RESTORE_SCOPES, now)
     }
+
+    /// Resolve a token for the **mobile read-only cache refresh** (#89): prefer the
+    /// cached read token (desktop), else fall back to the write/restore token, whose
+    /// `*.ReadWrite` scopes are read-capable. A standalone phone that did only a
+    /// single device-code (write) login can therefore still fill its live cache.
+    /// Caveat: the restore scopes omit `People.Read`/`User.Read`, so people-relevance
+    /// features are unavailable on a write-token-only refresh (acceptable for the
+    /// live companion; the laptop with a read token remains the backup-of-record).
+    pub fn resolve_cache_refresh_token(cfg: &Config, account: &str) -> Result<String, String> {
+        match resolve_cached_read_token(cfg, account) {
+            Ok(t) => Ok(t),
+            Err(_) => resolve_cached_restore_token(cfg, account),
+        }
+    }
+
+    /// Sign an account out by removing its cached read + write tokens (#68). The
+    /// next sync/restore for it then errors "no cached token" until a new login.
+    /// Idempotent: an already-absent cache is success. Returns how many files were
+    /// removed.
+    pub fn sign_out(cfg: &Config, account: &str) -> Result<usize, String> {
+        if !cfg.accounts.iter().any(|a| a.id == account) {
+            return Err(format!("no account '{account}' in config"));
+        }
+        let mut removed = 0;
+        for path in [
+            read_token_cache_path(cfg, account),
+            write_token_cache_path(cfg, account),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {}: {e}", path.display())),
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Counts from one **read-only cache-refresh** pass over the five non-file services
+/// (#89). Shared by the daemon's `backup_account` (summary + push delta) and the
+/// standalone mobile client (live cache fill). Read-only: it pulls from Graph into
+/// the local store and never pushes local→cloud (no OneDrive bidirectional sync —
+/// that stays a desktop concern via `sync_once`).
+#[derive(Debug, Default, Clone)]
+pub struct RefreshCounts {
+    pub mail_folders: usize,
+    pub mail_upserted: usize,
+    pub mail_deleted: usize,
+    pub mail_bodies: usize,
+    pub mail_flanks: usize,
+    pub calendar_events: usize,
+    pub calendar_bodies: usize,
+    pub calendar_flanks: usize,
+    pub contacts_upserted: usize,
+    pub contacts_bodies: usize,
+    pub contacts_photos: usize,
+    pub todo_indexed: usize,
+    pub todo_bodies: usize,
+    pub todo_flanks: usize,
+    pub todo_sub: usize,
+    pub onenote_pages: usize,
+    pub onenote_bodies: usize,
+    pub onenote_resources: usize,
+    pub onenote_containers: usize,
+}
+
+/// Refresh the local store for `account` from Microsoft Graph across mail, calendar,
+/// contacts, ToDo and OneNote — the read-only pass that both the daemon's scheduled
+/// backup and the standalone mobile client use. `read_access` is the primary token
+/// (read token on desktop, write/restore token on mobile — both read-capable);
+/// `write_access`, when present, is used only for the ToDo `.../attachments` endpoint
+/// (which denies the read scope). Per-service failures are logged and skipped so one
+/// hiccup never blocks the others. **Never mutates the cloud.** The caller holds any
+/// store-access gate; the store's own single-instance lock guards concurrent opens.
+pub fn refresh_cache_account(
+    cfg: &Config,
+    account: &str,
+    read_access: String,
+    write_access: Option<String>,
+) -> Result<RefreshCounts, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let archive_root = acc.archive_root.clone();
+    let store = Store::open(archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let mut client = GraphClient::new(read_access);
+    let now = unix_now();
+    // `&mut client` (Transport delta) must finish before the by-ref archive passes.
+    let r = isyncyou_connectors::incremental_sync_mail(
+        &mut client,
+        &store,
+        account,
+        &now,
+        &archive_root,
+    )
+    .map_err(|e| e.to_string())?;
+    let b = isyncyou_connectors::backup_message_bodies(&client, &store, account, &archive_root, 25)
+        .map_err(|e| e.to_string())?;
+    let flanks =
+        match isyncyou_connectors::backup_mailbox_flanks(&client, &store, account, &archive_root) {
+            Ok(f) => f.archived,
+            Err(e) => {
+                eprintln!("isyncyou: mail flanks for {account} skipped: {e}");
+                0
+            }
+        };
+    let cal = match isyncyou_connectors::events_sync_calendar(&mut client, &store, account, &now) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("isyncyou: calendar sync for {account} skipped: {e}");
+            Default::default()
+        }
+    };
+    let cbodies =
+        isyncyou_connectors::backup_calendar_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let cflanks =
+        isyncyou_connectors::backup_calendar_flanks(&client, &store, account, &archive_root)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let _ =
+        isyncyou_connectors::backup_event_attachments(&client, &store, account, &archive_root, 25);
+    let con =
+        match isyncyou_connectors::incremental_sync_contacts(&mut client, &store, account, &now) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("isyncyou: contacts sync for {account} skipped: {e}");
+                Default::default()
+            }
+        };
+    let conbodies =
+        isyncyou_connectors::backup_contacts_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let conphotos =
+        isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50)
+            .map(|r| r.downloaded)
+            .unwrap_or(0);
+    let todo = match isyncyou_connectors::incremental_sync_todo(&mut client, &store, account, &now)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("isyncyou: todo sync for {account} skipped: {e}");
+            Default::default()
+        }
+    };
+    let tbodies =
+        isyncyou_connectors::backup_todo_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let tflanks =
+        isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    // To Do attachments need Tasks.ReadWrite (the read scope is denied), so use the
+    // write/restore client when available; best-effort, skipped without it.
+    let att_client = write_access.map(GraphClient::new);
+    let tsub = isyncyou_connectors::backup_task_subresources(
+        &client,
+        att_client.as_ref(),
+        &store,
+        account,
+        &archive_root,
+        25,
+    )
+    .map(|r| r.archived)
+    .unwrap_or(0);
+    let note = match isyncyou_connectors::incremental_sync_onenote(
+        &mut client,
+        &store,
+        account,
+        &now,
+        Some(&archive_root),
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("isyncyou: onenote sync for {account} skipped: {e}");
+            Default::default()
+        }
+    };
+    let nbodies =
+        isyncyou_connectors::backup_onenote_bodies(&client, &store, account, &archive_root, 50)
+            .map(|r| r.archived)
+            .unwrap_or(0);
+    let nres =
+        isyncyou_connectors::backup_onenote_resources(&client, &store, account, &archive_root, 50)
+            .map(|r| r.resources)
+            .unwrap_or(0);
+    let nhier =
+        isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root)
+            .map(|r| r.notebooks + r.section_groups + r.sections)
+            .unwrap_or(0);
+    Ok(RefreshCounts {
+        mail_folders: r.folders,
+        mail_upserted: r.upserted,
+        mail_deleted: r.deleted,
+        mail_bodies: b.downloaded,
+        mail_flanks: flanks,
+        calendar_events: cal.upserted,
+        calendar_bodies: cbodies,
+        calendar_flanks: cflanks,
+        contacts_upserted: con.upserted,
+        contacts_bodies: conbodies,
+        contacts_photos: conphotos,
+        todo_indexed: todo.upserted,
+        todo_bodies: tbodies,
+        todo_flanks: tflanks,
+        todo_sub: tsub,
+        onenote_pages: note.upserted,
+        onenote_bodies: nbodies,
+        onenote_resources: nres,
+        onenote_containers: nhier,
+    })
 }
 
 /// Services with an archived body that can be previewed or restored to a local file.
@@ -400,18 +634,19 @@ pub fn sync_once(
     let mut out = SyncReport::default();
     let now = unix_now();
 
-    let ingest = connectors::incremental_sync(client, store, map, account, &now)
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+
+    let ingest = connectors::incremental_sync(client, store, map, account, &now, &acc.archive_root)
         .map_err(|e| e.to_string())?;
     out.upserted = ingest.upserted;
     out.deleted = ingest.deleted;
     out.skipped = ingest.skipped;
     out.resynced = ingest.resynced;
 
-    let acc = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
     let sync_root = acc.sync_root.clone();
     let trash_root = acc.archive_root.join(".isyncyou-trash");
     let dg = cfg.sync.delete_guard.clone();
@@ -644,6 +879,32 @@ mod tests {
     }
 
     #[test]
+    fn scopes_cover_mailbox_settings_and_people_without_all_variants() {
+        // #558 live-client foundation: read needs mailbox config + people;
+        // write (restore + live ops) needs MailboxSettings.ReadWrite.
+        assert!(
+            auth::READ_SCOPES.contains(&"MailboxSettings.Read"),
+            "read must cover mailbox settings + inbox rules"
+        );
+        assert!(
+            auth::READ_SCOPES.contains(&"People.Read"),
+            "read must cover the people surface"
+        );
+        assert!(
+            auth::RESTORE_SCOPES.contains(&"MailboxSettings.ReadWrite"),
+            "live write must cover mailbox settings"
+        );
+        // Personal/Family MSA cannot grant any admin-only `.All` scope.
+        for s in auth::READ_SCOPES
+            .iter()
+            .chain(auth::SYNC_SCOPES.iter())
+            .chain(auth::RESTORE_SCOPES.iter())
+        {
+            assert!(!s.ends_with(".All"), "personal/family cannot grant {s}");
+        }
+    }
+
+    #[test]
     fn restore_preview_reads_mail_without_token_or_gate() {
         let dir = std::env::temp_dir().join(format!("isyncyou-eng-preview-{}", std::process::id()));
         let arch = dir.join("arch");
@@ -677,5 +938,30 @@ mod tests {
         assert_eq!(p.archived_bytes, eml.len());
         assert!(p.summary.contains("Hi"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_refresh_token_prefers_read_then_falls_back_to_write() {
+        // #89: the mobile cache-refresh resolves the read token first, else the
+        // write/restore token (read-capable). With NEITHER cached it surfaces the
+        // WRITE-token error — proof it fell through the read attempt to the write
+        // fallback (the standalone-phone path, which only did a write login).
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a@example.com".into(),
+                sync_root: std::path::PathBuf::from("/nonexistent/sync"),
+                archive_root: std::path::PathBuf::from("/nonexistent/arch"),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let err = auth::resolve_cache_refresh_token(&cfg, "a").unwrap_err();
+        assert!(
+            err.contains("write token"),
+            "must fall through the read attempt to the write fallback: {err}"
+        );
+        // Unknown account → clean error, never a panic.
+        assert!(auth::resolve_cache_refresh_token(&cfg, "ghost").is_err());
     }
 }
