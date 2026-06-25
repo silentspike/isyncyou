@@ -1,8 +1,9 @@
 # ADR-005 — Android build system & on-device auth
 
-- **Status:** Proposed. The build-system choice is finalized when the standalone APK
-  epic (R3) starts; recorded now so R2/R3 do not back into it.
-- **Date:** 2026-06-22
+- **Status:** **Accepted & implemented** (#89, 2026-06-25 — see "Implementation status"
+  below). Originally recorded Proposed on 2026-06-22 so R2/R3 would not back into it; the
+  Context/Decision sections below are the historical pre-Gradle motivation.
+- **Date:** 2026-06-22 (proposed), 2026-06-25 (accepted & implemented)
 - **Related:** ADR-003 (direct-Graph token), ADR-006 (push relay),
   [packaging / daemon model](../packaging-daemon-model.md).
 
@@ -22,8 +23,8 @@ artifacts that the manual chain cannot easily consume:
   asset origin (valid CORS + CSP) instead of `file://` (null origin).
 - the **Firebase Cloud Messaging** SDK (ADR-006).
 
-The current app also has `usesCleartextTraffic="true"` globally, needed only for the
-local-HTTP daemon.
+The pre-Gradle app also had `usesCleartextTraffic="true"` globally, needed only for the
+local-HTTP daemon. (Removed at #89 — see "Implementation status".)
 
 ## Decision (to finalize at R3 start)
 

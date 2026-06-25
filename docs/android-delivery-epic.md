@@ -23,8 +23,8 @@ not the Play Store and not any paid channel.
 | Story | What | REQ | State |
 |---|---|---|---|
 | **D1** | `node --check gui/webui/src/app.js` gate + path-filter widened to `gui/webui/**` + `android/**` | — | **shipped (#87, c1e39ac)** |
-| **D1b** | PR build gate: JDK17 + Android SDK + `android/build.sh` must build the APK (path-gated `android/`) | REQ-AND-001 | planned |
-| **D2** | Version `versionName`/`versionCode` from the workspace version + run number (manifest is literal today) | REQ-AND-002 | planned |
+| **D1b** | PR build gate: JDK17 + Android SDK + NDK + `./gradlew :app:assembleDebug` must build the APK (path-gated `android/`) | REQ-AND-001 | planned |
+| **D2** | Version `versionName`/`versionCode` from the workspace version + run number (literal fallback in `build.gradle.kts` today) | REQ-AND-002 | planned |
 | **D3** | Release signing from a user-provided keystore via CI secrets (debug stays `pass:android`) | REQ-AND-003 | planned |
 | **D4** | Emulator smoke E2E (`android-emulator-runner`, AVD snapshot): APK boots + WebView loads | REQ-AND-004 | planned |
 | **D5** | RC promotion build-once-promote-many: `release.yml` builds the signed APK once, attaches it to the `v0.1.0-rc.<run>` prerelease; the tag release reuses it | REQ-AND-005 | planned |

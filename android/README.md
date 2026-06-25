@@ -47,11 +47,8 @@ applies the `com.google.gms.google-services` plugin. The daemon-side sender live
 ## Notes
 
 - `applicationId = com.silentspike.isyncyou`, `minSdk 24`, `targetSdk 34`.
-- `usesCleartextTraffic="true"` so the WebView can reach the daemon over plain HTTP on
-  loopback / LAN; a TLS-fronted daemon would drop this.
+- **No global cleartext.** `res/xml/network_security_config.xml` permits plain HTTP **only**
+  to `127.0.0.1` (the in-process engine); everything else — including Microsoft Graph — is
+  HTTPS-only. The old global `usesCleartextTraffic="true"` is removed (#89 P5).
 - Hardware/gesture back navigates the WebView history before leaving the app.
 - `build/`, `.gradle/`, `local.properties`, `*.apk`, keystores and credentials are gitignored.
-
-> **Legacy:** the old Gradle-free `build.sh` (`aapt2 → javac → d8 → apksigner`) and the
-> root-level `src/`/`res/`/`AndroidManifest.xml` are superseded by this Gradle project and
-> kept only as a temporary reference — build via `./gradlew`.

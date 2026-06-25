@@ -8,22 +8,23 @@ requirements:
   - id: REQ-AND-001
     title: PR build gate — the APK must build on every relevant PR
     statement: >
-      A path-gated CI job builds android/ (JDK17 + Android SDK + android/build.sh) on
+      A path-gated CI job builds android/ (JDK17 + Android SDK + NDK +
+      `./gradlew :app:assembleDebug`, which also runs the cargoNdkBuild task) on
       pull requests that touch android/ or gui/webui/, on github-hosted ubuntu-latest
       (self-hosted runners are forbidden for the public repo). A build failure blocks
       the PR. Complements the existing js-check (node --check) gate from D1 (#87).
     status: planned
     acceptance:
       - A PR touching android/ runs the APK build job.
-      - A failing android/build.sh fails the required check.
+      - A failing `./gradlew :app:assembleDebug` fails the required check.
       - The job runs on ubuntu-latest, never a self-hosted runner.
     verified_by: []
   - id: REQ-AND-002
     title: Version the APK from the RC, not a literal
     statement: >
       versionName and versionCode are injected at build time from the workspace
-      version plus the CI run number, replacing the literal "1"/"0.1" in
-      AndroidManifest.xml, so every RC artifact is uniquely identifiable.
+      version plus the CI run number, replacing the literal "1"/"0.1" fallback in
+      android/app/build.gradle.kts, so every RC artifact is uniquely identifiable.
     status: planned
     acceptance:
       - versionName matches the workspace version of the built commit.
