@@ -28,7 +28,7 @@ jobs:
       js: ${{ steps.filter.outputs.js }}
       sast: ${{ steps.filter.outputs.sast }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         id: filter
         with:
@@ -58,7 +58,7 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: No code/CI changes — skip compile gate
         if: needs.changes.outputs.code != 'true'
         run: echo "No Rust/Cargo/CI changes in this PR — compile gate skipped."
@@ -92,7 +92,7 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: No web-UI JS changes — skip
         if: needs.changes.outputs.js != 'true'
         run: echo "No gui/webui JS changes in this PR — node --check skipped."
@@ -109,7 +109,7 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: No code/CI changes — skip MSRV gate
         if: needs.changes.outputs.code != 'true'
         run: echo "No Rust/Cargo/CI changes in this PR — MSRV gate skipped."
@@ -136,7 +136,7 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: No dependency/deny changes — skip cargo-deny
         if: needs.changes.outputs.code != 'true'
         run: echo "No Cargo/deny.toml changes in this PR — cargo-deny skipped."
@@ -149,7 +149,7 @@ jobs:
     name: dependency-review
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
@@ -164,7 +164,7 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: No SAST-relevant changes — skip semgrep
         if: needs.changes.outputs.sast != 'true'
         run: echo "No gui/webui, android or workflow changes in this PR — semgrep skipped."
