@@ -89,6 +89,8 @@ const CONTACT_WRITABLE: &[&str] = &[
     "mobilePhone",
     "homeAddress",
     "businessAddress",
+    "otherAddress",
+    "imAddresses",
     "personalNotes",
     "birthday",
     "categories",
@@ -378,13 +380,21 @@ mod tests {
             "photo": { "id": "240X240" },
             "photo@odata.mediaContentType": "image/jpeg",
             "photo@odata.mediaEtag": "etag",
-            "businessPhones": ["+1 555 0100"]
+            "businessPhones": ["+1 555 0100"],
+            "otherAddress": { "city": "London" },
+            "imAddresses": ["ada@im"]
         }));
         assert_eq!(payload.get("displayName").unwrap(), "Ada Lovelace");
         assert_eq!(
             payload.get("businessPhones").unwrap(),
             &json!(["+1 555 0100"])
         );
+        // #566 A4: the multi-address + IM fields surfaced in the UI are also editable.
+        assert_eq!(
+            payload.get("otherAddress").unwrap(),
+            &json!({ "city": "London" })
+        );
+        assert_eq!(payload.get("imAddresses").unwrap(), &json!(["ada@im"]));
         assert!(
             payload.get("photo").is_none(),
             "contact photo metadata must not be posted in the contact create payload"

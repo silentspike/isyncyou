@@ -37,6 +37,26 @@ pub const VIEWER_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img
 pub const MAIL_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; \
      base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 
+/// CSP for the mail viewer **with external content explicitly opted in** (the
+/// user pressed "Load external content"): like [`MAIL_CSP`] but `img-src`,
+/// `font-src` and `media-src` also allow `https:`/`http:` so the message's own
+/// artwork, **web fonts** and media render close to the original. The dangerous
+/// capabilities stay blocked: no scripts (`default-src 'none'`, no `script-src`),
+/// no `connect`/`form`, no cross-origin framing — only passive resources load.
+pub const MAIL_CSP_EXTERNAL: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data: https: http:; \
+     font-src data: https: http:; media-src https: http:; \
+     base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
+
+/// The CSP that matches [`sanitize_mail_html_with`] for a given `external` flag.
+pub fn mail_csp(external: bool) -> &'static str {
+    if external {
+        MAIL_CSP_EXTERNAL
+    } else {
+        MAIL_CSP
+    }
+}
+
 /// Cap on rendered raw-source length, so a pathological message can't produce a
 /// multi-megabyte page.
 const MAX_SOURCE: usize = 512 * 1024;
@@ -67,20 +87,33 @@ h1{font-size:20px;margin:0 0 4px}\
 .v{flex:1;white-space:pre-wrap;word-break:break-word}\
 .body{margin-top:16px;padding:12px;background:#16171a;border-radius:6px;white-space:pre-wrap;word-break:break-word}\
 .src{margin-top:16px;padding:12px;background:#16171a;border-radius:6px;overflow:auto;white-space:pre-wrap;word-break:break-word}\
-.mail{margin-top:16px;padding:12px;background:#16171a;border-radius:6px;overflow:auto}\
+.mail{margin-top:16px;padding:16px;background:#fff;color:#1a1a1a;border-radius:6px;overflow:auto}\
+.mail a{color:#1a56db}\
 .mail img{max-width:100%}\
+.mail *{position:static !important;max-width:100%;overflow-wrap:break-word}\
+.mail table{table-layout:fixed}\
 .actions{margin-top:16px}.actions a{display:inline-block;padding:8px 10px;border:1px solid #58606f;border-radius:6px;color:#e3e3e3;text-decoration:none}\
 .note{margin-top:16px;color:#9aa0a6;font-size:12px}";
 
 /// Wrap rendered inner HTML in a complete, self-contained, locked-down page,
 /// embedding `csp` as a `<meta>` CSP (a second layer beside the response header).
 pub fn page_with_csp(title: &str, inner: &str, csp: &str) -> String {
+    // `frame-ancestors` is ignored when delivered via <meta> (browsers honor it
+    // only from the response header), so strip it from the meta copy to avoid a
+    // console error. The authoritative CSP — including frame-ancestors — is the
+    // response header set by the caller; this meta is the redundant second layer.
+    let meta_csp: String = csp
+        .split(';')
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.to_ascii_lowercase().starts_with("frame-ancestors"))
+        .collect::<Vec<_>>()
+        .join("; ");
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\
 <title>{title}</title><style>{style}</style></head>\
 <body><div class=\"wrap\">{inner}</div></body></html>",
-        csp = escape(csp),
+        csp = escape(&meta_csp),
         title = escape(title),
         style = STYLE,
         inner = inner,
@@ -334,13 +367,32 @@ pub struct InlineImageRef<'a> {
 /// unresolved `cid:` images, `javascript:` links, and remote stylesheets cannot
 /// load. Links keep their text but get `rel=noopener…`.
 pub fn sanitize_mail_html(raw: &str) -> String {
-    let schemes: std::collections::HashSet<&str> = ["data", "mailto"].into_iter().collect();
+    sanitize_mail_html_with(raw, false)
+}
+
+/// Like [`sanitize_mail_html`] but, for fidelity to the original message, **keeps
+/// the message's own CSS** — inline `style="…"` attributes and `<style>` blocks
+/// survive (they are layout, not behaviour). When `external` is set, `http(s)` is
+/// added to the allowed URL schemes so `<img src="https://…">` survives and the
+/// relaxed CSP ([`MAIL_CSP_EXTERNAL`]) also lets the CSS pull web fonts/media;
+/// otherwise only `data:` resources survive, exactly as before. Scripts/event
+/// handlers are always dropped, so even with external content nothing executes.
+pub fn sanitize_mail_html_with(raw: &str, external: bool) -> String {
+    let mut schemes: std::collections::HashSet<&str> = ["data", "mailto"].into_iter().collect();
+    if external {
+        schemes.insert("https");
+        schemes.insert("http");
+    }
     let mut b = ammonia::Builder::default();
     b.url_schemes(schemes)
         .url_relative(ammonia::UrlRelative::Custom(Box::new(
             allow_mail_relative_url,
         )))
-        .link_rel(Some("noopener noreferrer nofollow"));
+        .link_rel(Some("noopener noreferrer nofollow"))
+        // keep the message's styling for a faithful render (inert under the CSP)
+        .add_tags(["style"])
+        .rm_clean_content_tags(["style"])
+        .add_generic_attributes(["style"]);
     b.clean(raw).to_string()
 }
 
@@ -352,17 +404,23 @@ pub fn mail_page_with_inline_images(
     subject: &str,
     raw_html: &str,
     inline_images: &[InlineImageRef<'_>],
+    external: bool,
 ) -> String {
     let rewritten = rewrite_external_links(&inline_cid_images(raw_html, inline_images));
-    let clean = sanitize_mail_html(&rewritten);
+    let clean = sanitize_mail_html_with(&rewritten, external);
+    let note = if external {
+        "Sanitized view — scripts removed; external content (images, fonts) is loaded at your \
+         request. External links open through a confirmation page. Use \u{201c}raw\u{201d} for \
+         the original source."
+    } else {
+        "Sanitized view — scripts removed; external content (images, fonts) is blocked. External \
+         links open through a confirmation page. Use \u{201c}raw\u{201d} for the original source."
+    };
     let inner = format!(
-        "{header}<div class=\"note\">Sanitized view — scripts removed; external images are \
-         blocked. External links open through a confirmation page. Use \u{201c}raw\u{201d} \
-         for the original source.</div>\
-<div class=\"mail\">{clean}</div>",
+        "{header}<div class=\"note\">{note}</div><div class=\"mail\">{clean}</div>",
         header = header("Mail", subject),
     );
-    page_with_csp(subject, &inner, MAIL_CSP)
+    page_with_csp(subject, &inner, mail_csp(external))
 }
 
 /// Render an archived OneNote page's raw HTML as a sanitized, CSP-locked page
@@ -814,6 +872,66 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_keeps_styling_for_fidelity() {
+        // inline style + <style> block survive (layout), but script/event handlers don't
+        let dirty = "<style>.x{color:red}</style>\
+<table style=\"width:600px;background:#fff\"><tr><td style=\"padding:12px\">Hi</td></tr></table>\
+<script>steal()</script>";
+        let clean = sanitize_mail_html(dirty);
+        assert!(clean.contains("<style>"), "<style> block dropped: {clean}");
+        assert!(
+            clean.contains(".x{color:red}"),
+            "css content dropped: {clean}"
+        );
+        assert!(
+            clean.contains("style=\"width:600px;background:#fff\""),
+            "inline style dropped: {clean}"
+        );
+        assert!(
+            clean.contains("padding:12px"),
+            "inline style dropped: {clean}"
+        );
+        assert!(!clean.contains("steal"), "script survived: {clean}");
+    }
+
+    #[test]
+    fn external_content_opt_in_keeps_src_and_uses_relaxed_csp() {
+        let html = "<p><img src=\"https://cdn.example/hero.png\"></p>";
+        // default: stripped + strict CSP (no remote images, no remote fonts)
+        let off = mail_page_with_inline_images("S", html, &[], false);
+        assert!(
+            !off.contains("https://cdn.example"),
+            "remote img leaked: {off}"
+        );
+        assert!(off.contains("img-src data:;"), "strict CSP missing: {off}");
+        assert!(
+            !off.contains("font-src https:"),
+            "fonts should be blocked by default: {off}"
+        );
+        // opted in: src survives + relaxed CSP allows https images AND web fonts
+        let on = mail_page_with_inline_images("S", html, &[], true);
+        assert!(
+            on.contains("https://cdn.example/hero.png"),
+            "remote img should survive when opted in: {on}"
+        );
+        assert!(
+            on.contains("img-src data: https: http:"),
+            "relaxed img CSP missing: {on}"
+        );
+        assert!(
+            on.contains("font-src data: https: http:"),
+            "relaxed font CSP missing: {on}"
+        );
+        // links are still routed through the dialog regardless of the image opt-in
+        let links =
+            mail_page_with_inline_images("S", "<a href=\"https://evil.test/x\">go</a>", &[], true);
+        assert!(
+            !links.contains("href=\"https://evil.test"),
+            "direct external href survived even with images on: {links}"
+        );
+    }
+
+    #[test]
     fn note_page_sanitizes_and_is_csp_locked() {
         let p = note_page(
             "My Note",
@@ -835,6 +953,7 @@ mod tests {
             "<p><a href=\"https://example.test/path?q=1&x=2\" onclick=\"x()\">open</a>\
 <img src=\"https://tracker.example/p.gif\"></p>",
             &[],
+            false,
         );
         assert!(
             p.contains(
@@ -875,7 +994,7 @@ mod tests {
 
     #[test]
     fn mail_page_is_csp_locked_and_shows_escaped_subject() {
-        let p = mail_page_with_inline_images("Hello <there>", "<p>body</p>", &[]);
+        let p = mail_page_with_inline_images("Hello <there>", "<p>body</p>", &[], false);
         assert!(
             p.contains("Hello &lt;there&gt;"),
             "subject not escaped: {p}"
@@ -896,6 +1015,7 @@ mod tests {
             "Inline",
             "<p><img src=\"cid:logo@example.test\"><img src=\"cid:missing@example.test\"></p>",
             &[img],
+            false,
         );
         assert!(
             p.contains("data:image/png;base64,UE5HREFUQQ=="),

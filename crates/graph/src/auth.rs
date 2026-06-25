@@ -629,6 +629,12 @@ pub mod flow {
         Token(TokenResponse),
         Pending,
         SlowDown,
+        /// A transient failure (network/transport blip, server 5xx, or an unknown
+        /// non-terminal error) — the caller should keep polling, not abort. On a
+        /// phone over Wi-Fi/cellular a momentary `send()` failure is routine and must
+        /// not kill an in-progress device-code login (#89, found on-device).
+        Transient(String),
+        /// A terminal OAuth error (declined/expired/denied) — stop polling.
         Error(String),
     }
 
@@ -665,24 +671,41 @@ pub mod flow {
             .send()
         {
             Ok(r) => r,
-            Err(e) => return PollOutcome::Error(e.to_string()),
+            // transport blip (DNS/TLS/connection) — retry, don't abort the login.
+            Err(e) => return PollOutcome::Transient(e.to_string()),
         };
         let status = resp.status();
         let v: serde_json::Value = match resp.json() {
             Ok(v) => v,
-            Err(e) => return PollOutcome::Error(e.to_string()),
+            Err(e) => return PollOutcome::Transient(e.to_string()),
         };
-        if status.is_success() {
-            match serde_json::from_value::<TokenResponse>(v) {
+        classify_poll(status.is_success(), &v)
+    }
+
+    /// Map a token-endpoint response to a [`PollOutcome`]. Pure (no I/O) so the
+    /// transient-vs-terminal classification is unit-tested without the network.
+    pub(crate) fn classify_poll(success: bool, v: &serde_json::Value) -> PollOutcome {
+        if success {
+            return match serde_json::from_value::<TokenResponse>(v.clone()) {
                 Ok(t) => PollOutcome::Token(t),
                 Err(e) => PollOutcome::Error(e.to_string()),
-            }
-        } else {
-            match v.get("error").and_then(|e| e.as_str()) {
-                Some("authorization_pending") => PollOutcome::Pending,
-                Some("slow_down") => PollOutcome::SlowDown,
-                other => PollOutcome::Error(other.unwrap_or("unknown").to_string()),
-            }
+            };
+        }
+        match v.get("error").and_then(|e| e.as_str()) {
+            Some("authorization_pending") => PollOutcome::Pending,
+            Some("slow_down") => PollOutcome::SlowDown,
+            // Terminal per RFC 8628 — the user/code is done, stop polling.
+            Some(
+                e @ ("authorization_declined"
+                | "expired_token"
+                | "access_denied"
+                | "bad_verification_code"
+                | "invalid_grant"
+                | "invalid_client"),
+            ) => PollOutcome::Error(e.to_string()),
+            // 5xx or an unrecognized error: treat as transient and keep polling
+            // until the deadline rather than killing an in-progress sign-in.
+            other => PollOutcome::Transient(other.unwrap_or("unknown").to_string()),
         }
     }
 
@@ -764,6 +787,10 @@ pub mod flow {
                 PollOutcome::Token(t) => return Ok(TokenCache::from_response(&t, now_unix)),
                 PollOutcome::Pending => {}
                 PollOutcome::SlowDown => interval += 5,
+                // Network blip / transient server error: keep polling until the user
+                // authorizes or the code expires — a momentary Wi-Fi/cellular hiccup
+                // must not abort the whole login (#89).
+                PollOutcome::Transient(_) => {}
                 PollOutcome::Error(e) => return Err(e),
             }
         }
@@ -773,6 +800,47 @@ pub mod flow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_code_poll_keeps_going_on_transient_and_stops_on_terminal() {
+        use super::flow::{classify_poll, PollOutcome};
+        use serde_json::json;
+        // Normal in-progress states keep the loop alive.
+        assert!(matches!(
+            classify_poll(false, &json!({"error": "authorization_pending"})),
+            PollOutcome::Pending
+        ));
+        assert!(matches!(
+            classify_poll(false, &json!({"error": "slow_down"})),
+            PollOutcome::SlowDown
+        ));
+        // Terminal errors (user declined / code dead) abort.
+        for e in ["authorization_declined", "expired_token", "access_denied"] {
+            assert!(
+                matches!(
+                    classify_poll(false, &json!({ "error": e })),
+                    PollOutcome::Error(_)
+                ),
+                "{e} must be terminal"
+            );
+        }
+        // The bug this guards (#89): an unknown/5xx error or an empty body is a
+        // transient hiccup, NOT a reason to kill an in-progress device-code login.
+        assert!(matches!(
+            classify_poll(false, &json!({"error": "temporarily_unavailable"})),
+            PollOutcome::Transient(_)
+        ));
+        assert!(matches!(
+            classify_poll(false, &json!({})),
+            PollOutcome::Transient(_)
+        ));
+        // A successful body yields the token.
+        assert!(matches!(
+            classify_poll(true, &json!({"access_token": "x", "expires_in": 3600})),
+            PollOutcome::Token(_)
+        ));
+    }
+
     #[cfg(feature = "desktop-keyring")]
     static KEYRING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
