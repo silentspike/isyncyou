@@ -1,45 +1,88 @@
 name: CodeQL
 
-# Static analysis for Rust. CodeQL on a *private* repo needs GitHub Advanced
-# Security; it is free for public repos. To avoid failing the dev PR gate while the
-# repo is still private, this runs only against `main` and on demand — it activates
-# automatically once the repo is public and the release branch is exercised.
+# Static analysis (SAST) across the three languages this repo ships: Rust (the
+# engine/daemon), JavaScript (the hand-written web UI embedded into the daemon) and
+# Kotlin (the Android app). Runs on `staging` and `main` PRs so the heavy SAST lands
+# on staging — the gate before production — not only once a change reaches `main`.
+# CodeQL is free for public repos (it needs GitHub Advanced Security on a private
+# repo); the three `Analyze (<language>)` checks are wired as required status checks
+# on staging + main via branch protection.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [staging, main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: codeql-${{ github.ref }}
+  group: codeql-${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
   analyze:
-    name: Analyze (rust)
+    name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
-    # Enforced gate (#348): the Rust analyze step runs clean on `main` PRs (verified —
-    # every step succeeds on its own, not masked), so a real finding now fails the
-    # build. `Analyze (rust)` is a required status check on `main` via branch
-    # protection. (CodeQL is free on public repos; it needed GitHub Advanced Security
-    # while the repo was private.)
     permissions:
       contents: read
       security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust: CodeQL autobuilds the workspace (needs the Linux GUI libs + toolchain).
+          - language: rust
+            build-mode: autobuild
+          # JavaScript/TypeScript: the embedded web UI is plain source — no build.
+          - language: javascript-typescript
+            build-mode: none
+          # Kotlin: built manually (same steps as the staging android-build, incl. the
+          # cargo-ndk cross-compile) so CodeQL traces real bytecode. build-mode: none is
+          # not valid for Kotlin.
+          - language: java-kotlin
+            build-mode: manual
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+
+      # --- Rust build prerequisites (for the autobuild) ---
       - name: Install Linux GUI build deps
+        if: matrix.language == 'rust'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: matrix.language == 'rust'
+
+      # --- Kotlin/Android manual-build prerequisites (mirrors pr-staging android-build) ---
+      - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        if: matrix.language == 'java-kotlin'
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: matrix.language == 'java-kotlin'
+        with:
+          toolchain: "1.95.0"
+          targets: aarch64-linux-android
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        if: matrix.language == 'java-kotlin'
+        with:
+          tool: cargo-ndk
+      - name: Install the pinned NDK (matches android.ndkVersion)
+        if: matrix.language == 'java-kotlin'
+        run: yes | sdkmanager --install "ndk;27.3.13750724"
+
       - uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v3.30.5
         with:
-          languages: rust
-      - uses: github/codeql-action/autobuild@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v3.30.5
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Manual build (Kotlin)
+        if: matrix.language == 'java-kotlin'
+        run: cd android && ./gradlew :app:assembleDebug
+
       - uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v3.30.5
         with:
-          category: "/language:rust"
+          category: "/language:${{ matrix.language }}"
