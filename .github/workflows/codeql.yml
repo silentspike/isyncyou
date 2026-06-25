@@ -70,6 +70,9 @@ jobs:
         if: matrix.language == 'java-kotlin'
         with:
           tool: cargo-ndk
+      # sdkmanager onto PATH + licenses (preinstalled SDK isn't on PATH → bare call 127).
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        if: matrix.language == 'java-kotlin'
       - name: Install the pinned NDK (matches android.ndkVersion)
         if: matrix.language == 'java-kotlin'
         run: yes | sdkmanager --install "ndk;27.3.13750724"

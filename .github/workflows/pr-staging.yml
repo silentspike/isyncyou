@@ -206,6 +206,9 @@ jobs:
       - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
           tool: cargo-ndk
+      # Puts sdkmanager on PATH + accepts licenses (the runner's preinstalled SDK is
+      # not on PATH — a bare `sdkmanager` call exits 127).
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
       - name: Install the pinned NDK (matches android.ndkVersion)
         run: yes | sdkmanager --install "ndk;27.3.13750724"
       - name: Build the debug APK

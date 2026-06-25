@@ -152,7 +152,7 @@ fn sanitize_name(s: &str) -> String {
 }
 
 /// The on-disk cache file name for a hydrated item, by its remote id. Kept in sync
-/// with [`PlaceholderFs::cache_path`] so an out-of-process consumer (the daemon's
+/// with `PlaceholderFs::cache_path` so an out-of-process consumer (the daemon's
 /// DBus FileStatus provider, #330 P4) can test "is this placeholder materialized?"
 /// by `cache_dir.join(cache_file_name(remote_id)).exists()`.
 pub fn cache_file_name(remote_id: &str) -> String {
@@ -1153,7 +1153,7 @@ impl Filesystem for MountedFs {
 /// <mountpoint>` or Ctrl-C). Blocks for the mount's lifetime.
 ///
 /// A read-only mount (no uploader — the #330 placeholder use) serves downloads
-/// through a background [`hydration_worker`] so a slow materialization never
+/// through a background `hydration_worker` so a slow materialization never
 /// freezes the whole mount. A read-write mount (write-back, out of #330 scope)
 /// keeps the simpler synchronous [`PlaceholderFs`] dispatch.
 #[cfg(unix)]

@@ -437,7 +437,7 @@ impl Store {
     /// rows are preserved; the FTS indexes are rebuilt from their content tables.
     ///
     /// Key semantics are identical to [`Store::open_encrypted`] by construction:
-    /// only [`apply_sqlcipher_key`] ever touches the key, and the plaintext source
+    /// only `apply_sqlcipher_key` ever touches the key, and the plaintext source
     /// is attached *from the keyed connection* with an empty `KEY ''` (SQLCipher's
     /// documented plaintext attach) — so the migrated store opens with the same
     /// secret later.
