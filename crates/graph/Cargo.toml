@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 ring = "0.17"
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 keyring-core = { version = "1", optional = true }
