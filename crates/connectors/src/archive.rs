@@ -880,8 +880,14 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        crate::incremental_sync_onenote(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
-            .expect("onenote index sync should succeed");
+        crate::incremental_sync_onenote(
+            &mut client,
+            &store,
+            "testuser",
+            "2026-06-02T00:00:00Z",
+            None,
+        )
+        .expect("onenote index sync should succeed");
         let dir = tempfile::tempdir().unwrap();
         let r = backup_onenote_bodies(&client, &store, "testuser", dir.path(), 3)
             .expect("onenote archive should succeed");

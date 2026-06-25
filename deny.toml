@@ -32,7 +32,6 @@ skip = [
     { crate = "bitflags@1.3.2", reason = "transitive split from tiny-skia/png and winit platform deps" },
     { crate = "getrandom@0.2.17", reason = "transitive split from ring/secret-service while ecosystem migrates" },
     { crate = "getrandom@0.3.4", reason = "transitive split from rusqlite/winit/proptest while ecosystem migrates" },
-    { crate = "hashbrown@0.14.5", reason = "transitive split from rusqlite/hashlink versus newer indexmap stack" },
     { crate = "jni-sys@0.3.1", reason = "transitive Android platform split from winit/softbuffer stack" },
     { crate = "linux-raw-sys@0.4.15", reason = "transitive split from older rustix used by winit platform stack" },
     { crate = "linux-raw-sys@0.9.4", reason = "transitive split from drm-sys versus rustix 1.x" },
@@ -44,8 +43,6 @@ skip = [
     { crate = "rustix@0.38.44", reason = "transitive split from winit platform stack versus async/zbus stack" },
     { crate = "thiserror@1.0.69", reason = "transitive split from calloop/smithay while app crates use thiserror 2" },
     { crate = "thiserror-impl@1.0.69", reason = "proc-macro pair for transitive thiserror 1" },
-    { crate = "toml_datetime@0.6.11", reason = "transitive split from toml 0.8 versus proc-macro-crate toml_edit stack" },
-    { crate = "toml_edit@0.22.27", reason = "transitive split from toml 0.8 versus proc-macro-crate toml_edit stack" },
     { crate = "ttf-parser@0.20.0", reason = "transitive split from fontdb/cosmic-text text stack" },
     { crate = "ttf-parser@0.21.1", reason = "transitive split from cosmic-text/rustybuzz text stack" },
     { crate = "windows-sys@0.52.0", reason = "transitive Windows platform split from ring/rustls versus notify" },
@@ -59,7 +56,6 @@ skip = [
     { crate = "windows_x86_64_gnu@0.52.6", reason = "transitive Windows target split from ring/rustls versus notify" },
     { crate = "windows_x86_64_gnullvm@0.52.6", reason = "transitive Windows target split from ring/rustls versus notify" },
     { crate = "windows_x86_64_msvc@0.52.6", reason = "transitive Windows target split from ring/rustls versus notify" },
-    { crate = "winnow@0.7.15", reason = "transitive split from toml 0.8 versus zbus/proc-macro stack" },
     { crate = "wit-bindgen@0.51.0", reason = "transitive split from tempfile WASI dependencies" },
 ]
 

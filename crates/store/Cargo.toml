@@ -12,5 +12,15 @@ rusqlite = { workspace = true }
 thiserror = { workspace = true }
 fs2 = "0.4"
 
+[features]
+# At-rest encryption profile. `encrypted-store` (desktop default) compiles
+# SQLCipher + vendored OpenSSL and enables the `PRAGMA key`/migrate paths.
+# `plain-store` (Android) compiles bundled sqlite only — no OpenSSL, no SQLCipher
+# symbols — relying on the OS app sandbox for at-rest protection. Exactly one must
+# be active so rusqlite gets a bundling backend.
+default = ["encrypted-store"]
+encrypted-store = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+plain-store = ["rusqlite/bundled"]
+
 [dev-dependencies]
 tempfile = "3"

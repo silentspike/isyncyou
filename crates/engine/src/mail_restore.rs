@@ -15,13 +15,22 @@ use crate::restore_recovery::{recover_restore_op, run_restore_op, RestoreSink};
 use isyncyou_core::Config;
 use isyncyou_store::{RestoreState, Store};
 
-/// The two Graph operations a crash-safe mail restore needs, abstracted so the
-/// ledger wiring can be exercised without a network.
+/// The Graph operations a crash-safe mail restore needs, abstracted so the
+/// ledger wiring + the post-create state re-apply (#562) are unit-tested without
+/// a network.
 pub trait MailApi {
     /// Create a message from full MIME; returns the new cloud id.
     fn create_message(&self, mime: &[u8]) -> Result<String, String>;
     /// Find a message by its `internetMessageId`; returns its cloud id if present.
     fn find_by_message_id(&self, message_id: &str) -> Result<Option<String>, String>;
+    /// Mark a restored message read/unread.
+    fn set_read(&self, id: &str, is_read: bool) -> Result<(), String>;
+    /// Set a restored message's follow-up flag (`flagged` / `complete`).
+    fn set_flag(&self, id: &str, status: &str) -> Result<(), String>;
+    /// Restore a message's categories.
+    fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), String>;
+    /// Restore a message's importance (`low` / `high`).
+    fn set_importance(&self, id: &str, importance: &str) -> Result<(), String>;
 }
 
 impl MailApi for isyncyou_graph::GraphClient {
@@ -46,6 +55,79 @@ impl MailApi for isyncyou_graph::GraphClient {
             .and_then(|m| m.get("id"))
             .and_then(|i| i.as_str())
             .map(String::from))
+    }
+    fn set_read(&self, id: &str, is_read: bool) -> Result<(), String> {
+        isyncyou_graph::GraphClient::set_read(self, id, is_read)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    fn set_flag(&self, id: &str, status: &str) -> Result<(), String> {
+        isyncyou_graph::GraphClient::set_flag(self, id, status, None, "UTC")
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), String> {
+        isyncyou_graph::GraphClient::set_categories(self, id, categories)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    fn set_importance(&self, id: &str, importance: &str) -> Result<(), String> {
+        isyncyou_graph::GraphClient::set_importance(self, id, importance)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The archived MAPI state a restore re-applies to the new message (#562), parsed
+/// from the `<id>.json` sidecar. Only non-default values are pushed (matching the
+/// reference `server.py` restore), so a plain message triggers no PATCH.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailRestoreState {
+    pub categories: Vec<String>,
+    pub is_read: Option<bool>,
+    pub flag_status: Option<String>,
+    pub importance: Option<String>,
+}
+
+impl MailRestoreState {
+    /// Parse the structured state from an archived message JSON.
+    pub fn from_json(o: &serde_json::Value) -> Self {
+        MailRestoreState {
+            categories: o["categories"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            is_read: o["isRead"].as_bool(),
+            flag_status: o["flag"]["flagStatus"].as_str().map(String::from),
+            importance: o["importance"].as_str().map(String::from),
+        }
+    }
+
+    /// Re-apply the non-default fields to the freshly-created message via `api`.
+    /// Idempotent (Graph PATCHes), so safe on a committed-restore replay.
+    pub fn apply<A: MailApi>(&self, api: &A, id: &str) -> Result<(), String> {
+        if !self.categories.is_empty() {
+            api.set_categories(id, &self.categories)?;
+        }
+        // A MIME-created message starts unread; only an explicit read needs a PATCH.
+        if self.is_read == Some(true) {
+            api.set_read(id, true)?;
+        }
+        if let Some(s) = self.flag_status.as_deref() {
+            if s != "notFlagged" {
+                api.set_flag(id, s)?;
+            }
+        }
+        if let Some(imp) = self.importance.as_deref() {
+            if imp != "normal" {
+                api.set_importance(id, imp)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -103,7 +185,7 @@ pub fn restore_mail_via_ledger(
         .iter()
         .find(|a| a.id == account)
         .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let (_item, bytes) = crate::read_archived_body(cfg, account, "mail", id)?;
+    let (item, bytes) = crate::read_archived_body(cfg, account, "mail", id)?;
     let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))?;
     let key = idempotency_key(&secret, account, "mail", id, &bytes);
     let op_id = format!("{account}:{key}");
@@ -112,7 +194,7 @@ pub fn restore_mail_via_ledger(
         Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
     let client = isyncyou_graph::GraphClient::new(token);
     let sink = MailSink { api: &client };
-    finish_mail_restore(
+    let new_id = finish_mail_restore(
         &store,
         &op_id,
         account,
@@ -122,7 +204,29 @@ pub fn restore_mail_via_ledger(
         &bytes,
         &sink,
         now_secs(),
-    )
+    )?;
+    // Re-apply the archived MAPI state (#562). The message is already created (in
+    // Drafts — we never send it, so a restored draft stays a draft, AC-N). The
+    // PATCHes are idempotent, so a committed-restore replay self-heals.
+    read_mail_restore_state(acc, &item).apply(&client, &new_id)?;
+    Ok(new_id)
+}
+
+/// Read the archived `<id>.json` sidecar beside the `.eml` and parse the MAPI
+/// state to re-apply. Best-effort: a missing/unreadable sidecar yields the
+/// default (no PATCH), so restore still works against an older archive.
+fn read_mail_restore_state(
+    acc: &isyncyou_core::AccountConfig,
+    item: &isyncyou_store::Item,
+) -> MailRestoreState {
+    item.local_path
+        .as_deref()
+        .and_then(|p| p.strip_suffix(".eml"))
+        .map(|s| format!("{s}.json"))
+        .and_then(|jrel| std::fs::read(acc.archive_root.join(jrel)).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .map(|o| MailRestoreState::from_json(&o))
+        .unwrap_or_default()
 }
 
 /// The idempotent ledger flow, separated so it can be tested with a fake sink.
@@ -261,6 +365,11 @@ mod tests {
         creates: RefCell<u32>,
         crash_after_store: RefCell<bool>, // POST landed, response lost
         fail_before_store: RefCell<bool>, // POST never reached Graph
+        // recorded post-create PATCHes (#562 state re-apply)
+        patched_read: RefCell<Option<bool>>,
+        patched_flag: RefCell<Option<String>>,
+        patched_categories: RefCell<Vec<String>>,
+        patched_importance: RefCell<Option<String>>,
     }
     impl FakeMailApi {
         fn count(&self) -> usize {
@@ -295,6 +404,22 @@ mod tests {
                 .iter()
                 .find(|(m, _)| m == message_id)
                 .map(|(_, id)| id.clone()))
+        }
+        fn set_read(&self, _id: &str, is_read: bool) -> Result<(), String> {
+            *self.patched_read.borrow_mut() = Some(is_read);
+            Ok(())
+        }
+        fn set_flag(&self, _id: &str, status: &str) -> Result<(), String> {
+            *self.patched_flag.borrow_mut() = Some(status.to_string());
+            Ok(())
+        }
+        fn set_categories(&self, _id: &str, categories: &[String]) -> Result<(), String> {
+            *self.patched_categories.borrow_mut() = categories.to_vec();
+            Ok(())
+        }
+        fn set_importance(&self, _id: &str, importance: &str) -> Result<(), String> {
+            *self.patched_importance.borrow_mut() = Some(importance.to_string());
+            Ok(())
         }
     }
 
@@ -434,5 +559,61 @@ mod tests {
         let stamped = isyncyou_connectors::set_message_id(MIME, &marker);
         let parsed = isyncyou_connectors::mail_preview(&stamped).message_id;
         assert_eq!(parsed.as_deref(), Some(marker.as_str()));
+    }
+
+    #[test]
+    fn mail_restore_state_from_json_parses_structured_fields() {
+        let o = serde_json::json!({
+            "categories": ["Red category", "Work"],
+            "isRead": true,
+            "flag": { "flagStatus": "flagged" },
+            "importance": "high",
+        });
+        let s = MailRestoreState::from_json(&o);
+        assert_eq!(
+            s.categories,
+            vec!["Red category".to_string(), "Work".into()]
+        );
+        assert_eq!(s.is_read, Some(true));
+        assert_eq!(s.flag_status.as_deref(), Some("flagged"));
+        assert_eq!(s.importance.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn apply_patches_non_default_state_after_create() {
+        let api = FakeMailApi::default();
+        let s = MailRestoreState {
+            categories: vec!["Red category".into()],
+            is_read: Some(true),
+            flag_status: Some("flagged".into()),
+            importance: Some("high".into()),
+        };
+        s.apply(&api, "new-1").unwrap();
+        assert_eq!(
+            *api.patched_categories.borrow(),
+            vec!["Red category".to_string()]
+        );
+        assert_eq!(*api.patched_read.borrow(), Some(true));
+        assert_eq!(api.patched_flag.borrow().as_deref(), Some("flagged"));
+        assert_eq!(api.patched_importance.borrow().as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn apply_skips_default_state_and_never_sends() {
+        // AC-N: a restored message stays a draft — apply has no send path, and
+        // create-default values (unread / notFlagged / normal / no categories)
+        // trigger no PATCH at all.
+        let api = FakeMailApi::default();
+        let s = MailRestoreState {
+            categories: vec![],
+            is_read: Some(false),
+            flag_status: Some("notFlagged".into()),
+            importance: Some("normal".into()),
+        };
+        s.apply(&api, "new-2").unwrap();
+        assert!(api.patched_categories.borrow().is_empty());
+        assert_eq!(*api.patched_read.borrow(), None);
+        assert!(api.patched_flag.borrow().is_none());
+        assert!(api.patched_importance.borrow().is_none());
     }
 }

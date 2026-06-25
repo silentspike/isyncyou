@@ -1,0 +1,17 @@
+<!-- Status-bar notification icon (#576): the iSyncYou sync-loop mark as a flat white
+     silhouette. Android tints status-bar small icons monochrome, so this is white +
+     transparent only (no gradient/background here — the brand colour is applied via
+     NotificationCompat.setColor / the FCM default_notification_color). Mirrors the
+     web-UI favicon glyph in gui/webui/src/index.html. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M16,20 a9,9 0 0 1 16,-3 M32,14 v5 h-5 M32,28 a9,9 0 0 1 -16,3 M16,34 v-5 h5" />
+</vector>

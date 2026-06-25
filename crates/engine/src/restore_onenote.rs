@@ -28,9 +28,15 @@ use std::path::Path;
 pub trait OneNoteApi {
     /// Create a page from POST-ready HTML (already marker-stamped and rewritten to
     /// `name:<part>` references) plus its binary parts; returns the new cloud id.
-    /// Uses a multipart create when `resources` is non-empty, else a plain HTML create.
-    fn create_page(&self, html: &[u8], resources: &[OneNoteResourcePart])
-        -> Result<String, String>;
+    /// `section_id` places the page into its **original** section (#568); `None` (or
+    /// a section that no longer exists) falls back to the default section. Uses a
+    /// multipart create when `resources` is non-empty, else a plain HTML create.
+    fn create_page(
+        &self,
+        section_id: Option<&str>,
+        html: &[u8],
+        resources: &[OneNoteResourcePart],
+    ) -> Result<String, String>;
     /// Find a page whose content contains `marker` by listing pages (all pages) and
     /// scanning each page's `/content`; returns its cloud id if present.
     fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String>;
@@ -39,22 +45,35 @@ pub trait OneNoteApi {
 impl OneNoteApi for isyncyou_graph::GraphClient {
     fn create_page(
         &self,
+        section_id: Option<&str>,
         html: &[u8],
         resources: &[OneNoteResourcePart],
     ) -> Result<String, String> {
-        let created = if resources.is_empty() {
-            self.create_onenote_page(html).map_err(|e| e.to_string())?
-        } else {
-            let parts: Vec<_> = resources
-                .iter()
-                .map(|r| isyncyou_graph::http::OneNotePagePart {
-                    name: r.part_name.clone(),
-                    content_type: r.content_type.clone(),
-                    bytes: r.bytes.clone(),
-                })
-                .collect();
-            self.create_onenote_page_multipart(html, &parts)
-                .map_err(|e| e.to_string())?
+        let parts: Vec<_> = resources
+            .iter()
+            .map(|r| isyncyou_graph::http::OneNotePagePart {
+                name: r.part_name.clone(),
+                content_type: r.content_type.clone(),
+                bytes: r.bytes.clone(),
+            })
+            .collect();
+        // Create in `sec` (None = default section), JSON-or-error from the graph layer.
+        let do_create = |sec: Option<&str>| match (sec, parts.is_empty()) {
+            (Some(s), true) => self.create_onenote_page_in_section(s, html),
+            (Some(s), false) => self.create_onenote_page_in_section_multipart(s, html, &parts),
+            (None, true) => self.create_onenote_page(html),
+            (None, false) => self.create_onenote_page_multipart(html, &parts),
+        };
+        let created = match section_id {
+            Some(sec) => match do_create(Some(sec)) {
+                Ok(v) => v,
+                // the original section is gone -> restore into the default section
+                Err(isyncyou_graph::http::UploadError::Http { status: 404, .. }) => {
+                    do_create(None).map_err(|e| e.to_string())?
+                }
+                Err(e) => return Err(e.to_string()),
+            },
+            None => do_create(None).map_err(|e| e.to_string())?,
         };
         created
             .get("id")
@@ -98,6 +117,9 @@ pub struct OneNoteSink<'a, A: OneNoteApi> {
     pub rewrites: Vec<(String, String)>,
     /// The binary resource parts to upload alongside the page.
     pub resources: Vec<OneNoteResourcePart>,
+    /// The page's original section id (its `parent_remote_id`); restore targets it,
+    /// falling back to the default section if it's gone (#568). `None` = default.
+    pub section: Option<String>,
 }
 
 /// Rewrite each archived resource URL to its multipart `name:<part>` reference and
@@ -127,7 +149,8 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 impl<A: OneNoteApi> RestoreSink for OneNoteSink<'_, A> {
     fn create(&self, marker: &str, payload: &[u8]) -> Result<String, String> {
         let html = prepare_html(payload, &self.rewrites, marker);
-        self.api.create_page(&html, &self.resources)
+        self.api
+            .create_page(self.section.as_deref(), &html, &self.resources)
     }
     fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String> {
         self.api.find_by_marker(marker)
@@ -210,6 +233,7 @@ pub fn restore_onenote_via_ledger(
         .local_path
         .clone()
         .ok_or_else(|| format!("onenote item '{id}' has no archived body"))?;
+    let section = item.parent_remote_id.clone();
     let (resources, rewrites) = load_resources(&acc.archive_root, &html_local_path)?;
     let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))?;
     let key = idempotency_key(&secret, account, "onenote", id, &bytes);
@@ -222,6 +246,7 @@ pub fn restore_onenote_via_ledger(
         api: &client,
         rewrites,
         resources,
+        section,
     };
     finish_onenote_restore(
         &store,
@@ -317,6 +342,7 @@ pub fn recover_pending_onenote_restores_with<A: OneNoteApi>(
                 .get_item(account, "onenote", &op.source_item_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("no archived onenote item '{}'", op.source_item_id))?;
+            let section = item.parent_remote_id.clone();
             let rel = item
                 .local_path
                 .ok_or_else(|| format!("item '{}' has no archived body", op.source_item_id))?;
@@ -326,6 +352,7 @@ pub fn recover_pending_onenote_restores_with<A: OneNoteApi>(
                 api,
                 rewrites,
                 resources,
+                section,
             };
             recover_restore_op(&store, &op.op_id, &bytes, &sink, now).map(|_| ())
         })();
@@ -359,6 +386,7 @@ mod tests {
     #[derive(Default)]
     struct FakeOneNoteApi {
         pages: RefCell<Vec<(String, String, usize)>>, // (html, id, resource count)
+        sections: RefCell<Vec<Option<String>>>,       // section id each create targeted
         seq: RefCell<u32>,
         creates: RefCell<u32>,
         crash_after_store: RefCell<bool>,
@@ -371,13 +399,20 @@ mod tests {
         fn creates(&self) -> u32 {
             *self.creates.borrow()
         }
+        fn last_section(&self) -> Option<String> {
+            self.sections.borrow().last().cloned().flatten()
+        }
     }
     impl OneNoteApi for FakeOneNoteApi {
         fn create_page(
             &self,
+            section_id: Option<&str>,
             html: &[u8],
             resources: &[OneNoteResourcePart],
         ) -> Result<String, String> {
+            self.sections
+                .borrow_mut()
+                .push(section_id.map(String::from));
             *self.creates.borrow_mut() += 1;
             if *self.fail_before_store.borrow() {
                 return Err("network failed before reaching Graph".into());
@@ -419,7 +454,26 @@ mod tests {
             api,
             rewrites: vec![],
             resources: vec![],
+            section: None,
         }
+    }
+
+    #[test]
+    fn restore_targets_the_pages_original_section() {
+        let api = FakeOneNoteApi::default();
+        let s = OneNoteSink {
+            api: &api,
+            rewrites: vec![],
+            resources: vec![],
+            section: Some("S-orig".into()),
+        };
+        let (_key, marker) = key_marker();
+        s.create(&marker, HTML).unwrap();
+        assert_eq!(
+            api.last_section().as_deref(),
+            Some("S-orig"),
+            "the page is created in its original section, not the default"
+        );
     }
 
     #[test]
