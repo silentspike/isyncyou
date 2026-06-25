@@ -6,19 +6,21 @@
 # tools/check_traceability.py.
 requirements:
   - id: REQ-AND-001
-    title: PR build gate — the APK must build on every relevant PR
+    title: PR build gate — the APK must build before reaching production
     statement: >
-      A path-gated CI job builds android/ (JDK17 + Android SDK + NDK +
-      `./gradlew :app:assembleDebug`, which also runs the cargoNdkBuild task) on
-      pull requests that touch android/ or gui/webui/, on github-hosted ubuntu-latest
-      (self-hosted runners are forbidden for the public repo). A build failure blocks
-      the PR. Complements the existing js-check (node --check) gate from D1 (#87).
-    status: planned
+      The `android-build` job on the staging PR gate builds the debug APK (JDK17 +
+      Android SDK + the pinned NDK + `./gradlew :app:assembleDebug`, which also runs
+      the cargoNdkBuild cross-compile) on every staging PR, unconditionally, on
+      github-hosted ubuntu-latest (self-hosted runners are forbidden for the public
+      repo). It is token-free (assembleDebug needs no Firebase config) and feeds the
+      staging-pass aggregator, so a build failure blocks promotion to main.
+    status: implemented
     acceptance:
-      - A PR touching android/ runs the APK build job.
-      - A failing `./gradlew :app:assembleDebug` fails the required check.
+      - Every staging PR runs the android-build job (unconditional).
+      - A failing `./gradlew :app:assembleDebug` fails staging-pass.
       - The job runs on ubuntu-latest, never a self-hosted runner.
-    verified_by: []
+    verified_by:
+      - file: .github/workflows/pr-staging.yml
   - id: REQ-AND-002
     title: Version the APK from the RC, not a literal
     statement: >
