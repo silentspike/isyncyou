@@ -64,8 +64,18 @@ enum AccessPolicy {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct RequestHeaders {
     cap_token: Option<String>,
+    session_token: Option<String>,
+    cookie: Option<String>,
     host: Option<String>,
     origin: Option<String>,
+}
+
+/// Extract a cookie value by name from a raw `Cookie:` header (`a=1; b=2`).
+fn cookie_value(header: &str, name: &str) -> Option<String> {
+    header.split(';').find_map(|pair| {
+        let (k, v) = pair.trim().split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
 }
 
 /// Parse an HTTP request line (`"GET /path?x=1 HTTP/1.1"`) into `(method, target)`.
@@ -205,6 +215,10 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             let v = v.trim().to_string();
             if k.eq_ignore_ascii_case("x-capability-token") {
                 headers.cap_token = Some(v);
+            } else if k.eq_ignore_ascii_case("x-session-token") {
+                headers.session_token = Some(v);
+            } else if k.eq_ignore_ascii_case("cookie") {
+                headers.cookie = Some(v);
             } else if k.eq_ignore_ascii_case("host") {
                 headers.host = Some(v);
             } else if k.eq_ignore_ascii_case("origin") {
@@ -230,17 +244,42 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
         stream.write_all(&format_http(&resp))?;
         return stream.flush();
     }
+    // Effective session token (#89): an explicit `X-Session-Token` header (used by
+    // the web UI's fetch() calls) OR a loopback `isy_session` cookie set natively by
+    // the Android shell — the cookie auto-rides iframe/img/EventSource subresource
+    // requests, so embedded resources are gated without per-URL `_st` threading.
+    let session_token = headers.session_token.clone().or_else(|| {
+        headers
+            .cookie
+            .as_deref()
+            .and_then(|c| cookie_value(c, "isy_session"))
+    });
+    let req = ApiRequest::new(&method, &target)
+        .with_cap_token(headers.cap_token.clone())
+        .with_session_token(session_token);
     // SSE change stream: a long-lived connection that bypasses the one-shot
     // response model. Reached only after header validation, so the same
     // loopback/origin rules apply; needs the injected EventBus (daemon only).
-    let path = target.split('?').next().unwrap_or(&target);
-    if method == "GET" && path == "/api/v1/events" {
+    if method == "GET" && req.path == "/api/v1/events" {
+        // Mobile profile (#89): SSE is a data route, so it is session-gated too.
+        // EventSource can't send headers, so the token rides the `_st` query param
+        // (the header is honored as well). No-op on the desktop daemon.
+        let st_query = req
+            .query
+            .iter()
+            .find(|(k, _)| k == "_st")
+            .map(|(_, v)| v.as_str());
+        let provided = req.session_token.as_deref().or(st_query);
+        if !router.session_authorized(provided) {
+            let resp = ApiResponse::error(401, "missing or invalid session token");
+            stream.write_all(&format_http(&resp))?;
+            return stream.flush();
+        }
         if let Some(bus) = router.events_bus() {
             return handle_sse(stream, bus);
         }
     }
-    let resp =
-        router.route(&ApiRequest::new(&method, &target).with_cap_token(headers.cap_token.clone()));
+    let resp = router.route(&req);
     stream.write_all(&format_http(&resp))?;
     stream.flush()
 }
@@ -509,6 +548,77 @@ mod tests {
         assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "got: {buf}");
         assert!(buf.contains("\"accounts\""), "body: {buf}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_token_gates_data_routes_over_http() {
+        // #89: real HTTP roundtrip (curl-equivalent) proving the mobile session-token
+        // gate. A native client setting Host: 127.0.0.1 (the desktop loopback policy)
+        // still cannot read the data API without the per-process token.
+        use isyncyou_core::Config;
+        let router =
+            Arc::new(Router::new(Config::default()).with_session_token("sess-http-tok".into()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
+            }
+        });
+        let req = |raw: &str| {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(raw.as_bytes()).unwrap();
+            let mut s = String::new();
+            c.read_to_string(&mut s).unwrap();
+            s
+        };
+        // No session token → 401 (the key Android-loopback exposure fix).
+        let no_tok = req("GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            no_tok.starts_with("HTTP/1.1 401"),
+            "no token must 401: {no_tok}"
+        );
+        // Valid token header → passes the gate (no 401).
+        let with_tok = req(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Session-Token: sess-http-tok\r\n\r\n",
+        );
+        assert!(
+            !with_tok.starts_with("HTTP/1.1 401"),
+            "valid token must pass: {with_tok}"
+        );
+        // Valid token via the `_st` query (iframe/img/EventSource path) → passes.
+        let with_q =
+            req("GET /api/v1/status?_st=sess-http-tok HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            !with_q.starts_with("HTTP/1.1 401"),
+            "valid _st query must pass: {with_q}"
+        );
+        // Valid token via the loopback cookie (auto-rides subresources on Android).
+        let with_cookie = req(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=sess-http-tok\r\n\r\n",
+        );
+        assert!(
+            !with_cookie.starts_with("HTTP/1.1 401"),
+            "valid cookie must pass: {with_cookie}"
+        );
+        // A wrong cookie value is still rejected.
+        let bad_cookie = req(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=nope\r\n\r\n",
+        );
+        assert!(
+            bad_cookie.starts_with("HTTP/1.1 401"),
+            "wrong cookie must 401: {bad_cookie}"
+        );
+        // Static shell stays open without a token (bootstrap).
+        let shell = req("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            shell.starts_with("HTTP/1.1 200"),
+            "/ must stay open: {shell}"
+        );
     }
 
     #[test]

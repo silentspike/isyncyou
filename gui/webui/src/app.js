@@ -327,9 +327,19 @@ async function registerPushToken() {
     await post(`/api/v1/push/register?${qs({ token })}`, CAP.push);
   } catch (_) { /* best-effort: never block UI load on push */ }
 }
-async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
+/* Standalone/mobile (#89): the embedded engine's loopback API is fully gated by a
+   per-process session token. The native shell exposes it via window.AndroidSession;
+   on the desktop daemon the bridge is absent and the gate is off, so this is "". */
+function sessionToken() {
+  try { return (window.AndroidSession && window.AndroidSession.token && window.AndroidSession.token()) || ""; }
+  catch (_) { return ""; }
+}
+function sessionHeaders() { const t = sessionToken(); return t ? { "X-Session-Token": t } : {}; }
+async function api(path) { const r = await fetch(path, { headers: sessionHeaders() }); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
-  const r = await fetch(path, { method: "POST", headers: capToken ? { "X-Capability-Token": capToken } : {} });
+  const headers = sessionHeaders();
+  if (capToken) headers["X-Capability-Token"] = capToken;
+  const r = await fetch(path, { method: "POST", headers });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || r.status);
   return d;

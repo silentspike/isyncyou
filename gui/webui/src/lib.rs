@@ -86,6 +86,9 @@ pub struct ApiRequest {
     pub query: Vec<(String, String)>,
     /// The `X-Capability-Token` header value, required for destructive POSTs.
     pub cap_token: Option<String>,
+    /// The `X-Session-Token` header value (#89 mobile profile): required on every
+    /// `/api/v1/*` route when the Router runs with a session token.
+    pub session_token: Option<String>,
 }
 
 impl ApiRequest {
@@ -108,12 +111,19 @@ impl ApiRequest {
             path: path.to_string(),
             query,
             cap_token: None,
+            session_token: None,
         }
     }
 
     /// Attach a captured capability token (builder style, used by the server).
     pub fn with_cap_token(mut self, token: Option<String>) -> Self {
         self.cap_token = token;
+        self
+    }
+
+    /// Attach the captured `X-Session-Token` header (builder style, #89).
+    pub fn with_session_token(mut self, token: Option<String>) -> Self {
+        self.session_token = token;
         self
     }
 
@@ -607,6 +617,26 @@ pub struct Router {
     push: Option<std::sync::Arc<dyn PushHandler>>,
     /// Separate capability token for push register/test POSTs.
     push_cap_token: Option<String>,
+    /// Mobile/standalone profile (#89): an unguessable per-process token required on
+    /// EVERY `/api/v1/*` route. On Android `127.0.0.1` is reachable by any app on the
+    /// device, so unlike the desktop daemon (GET open, POST cap-gated) the data API
+    /// must be fully gated. `None` => desktop daemon behaviour (no extra gate). The
+    /// token reaches the WebView via the native bridge, never in a static asset.
+    session_token: Option<String>,
+}
+
+/// Constant-time byte-equality (no early return on first mismatch) so token checks
+/// can't be probed byte-by-byte via timing. The length check only leaks length,
+/// which is fixed for our tokens.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl Router {
@@ -641,6 +671,7 @@ impl Router {
             account_cap_token: None,
             push: None,
             push_cap_token: None,
+            session_token: None,
         }
     }
 
@@ -677,6 +708,7 @@ impl Router {
             account_cap_token: None,
             push: None,
             push_cap_token: None,
+            session_token: None,
         }
     }
 
@@ -838,6 +870,23 @@ impl Router {
         self
     }
 
+    /// Enable the mobile session-token gate (#89): every `/api/v1/*` route then
+    /// requires this token. Off (desktop daemon) when never set.
+    pub fn with_session_token(mut self, token: String) -> Self {
+        self.session_token = Some(token);
+        self
+    }
+
+    /// Whether `provided` satisfies the session-token gate. `true` when the gate is
+    /// off (desktop). When on, the token must be present and match in constant time.
+    /// Used by both `route()` (data routes) and the SSE path in `serve.rs`.
+    pub fn session_authorized(&self, provided: Option<&str>) -> bool {
+        match &self.session_token {
+            None => true,
+            Some(expected) => provided.is_some_and(|p| ct_eq(expected.as_bytes(), p.as_bytes())),
+        }
+    }
+
     /// Whether the request carries the configured capability token. The token is
     /// compared in **constant time** so a timing side-channel can't reveal it byte
     /// by byte (the length check only leaks length, which is fixed for our tokens).
@@ -845,15 +894,7 @@ impl Router {
         let (Some(w), Some(g)) = (expected, &req.cap_token) else {
             return false;
         };
-        let (wb, gb) = (w.as_bytes(), g.as_bytes());
-        if wb.len() != gb.len() {
-            return false;
-        }
-        let mut diff = 0u8;
-        for (x, y) in wb.iter().zip(gb.iter()) {
-            diff |= x ^ y;
-        }
-        diff == 0
+        ct_eq(w.as_bytes(), g.as_bytes())
     }
 
     /// Append a durable audit entry to the account activity log. Destructive
@@ -879,6 +920,18 @@ impl Router {
 
     /// Dispatch one request to a response. Never panics; unknown routes → 404.
     pub fn route(&self, req: &ApiRequest) -> ApiResponse {
+        // Mobile/standalone profile (#89): the data API is fully session-token gated
+        // because the loopback server is reachable by any app on the device. The
+        // static shell (`/`, `/app.js`, `/app.css`, fonts, `/sfx/*`) stays open so
+        // the WebView can bootstrap — it carries no user data and no token. The token
+        // rides a header (`X-Session-Token`) or, for iframe/img `src`, the `_st`
+        // query param. No-op on the desktop daemon (session_token = None).
+        if req.path.starts_with("/api/v1/") {
+            let provided = req.session_token.as_deref().or_else(|| req.q("_st"));
+            if !self.session_authorized(provided) {
+                return ApiResponse::error(401, "missing or invalid session token");
+            }
+        }
         // Hold the store-access gate (if any) for the whole request so a concurrent
         // sync pass and this request never both hold the store's single-instance lock.
         let _gate = self
@@ -5051,6 +5104,77 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             !Router::cap_ok(&None, &pass),
             "an unconfigured gate must reject everything"
         );
+    }
+
+    #[test]
+    fn session_gate_off_by_default_desktop() {
+        // #89: the desktop daemon never sets a session token → the gate is off and
+        // GET data routes behave exactly as before (no 401 from the session gate).
+        let r = Router::new(Config::default());
+        assert!(
+            r.session_authorized(None),
+            "gate off must authorize anything"
+        );
+        assert_ne!(
+            r.route(&ApiRequest::get("/api/v1/status")).status,
+            401,
+            "desktop GET must not be session-gated"
+        );
+    }
+
+    #[test]
+    fn session_gate_requires_token_on_data_routes() {
+        // #89 mobile profile: every /api/v1/* route requires the per-process token.
+        let r = Router::new(Config::default()).with_session_token("sess-tok-0001".into());
+        // No token → 401.
+        assert_eq!(
+            r.route(&ApiRequest::get("/api/v1/status")).status,
+            401,
+            "missing session token must 401"
+        );
+        // Wrong token → 401.
+        let wrong = ApiRequest::get("/api/v1/status").with_session_token(Some("nope".into()));
+        assert_eq!(r.route(&wrong).status, 401, "wrong session token must 401");
+        // Correct token via header → passes the gate (not a session-401).
+        let ok = ApiRequest::get("/api/v1/status").with_session_token(Some("sess-tok-0001".into()));
+        assert_ne!(
+            r.route(&ok).status,
+            401,
+            "correct header token must pass the gate"
+        );
+        // Correct token via `_st` query (for iframe/img/EventSource) → passes.
+        let ok_q = ApiRequest::get("/api/v1/status?_st=sess-tok-0001");
+        assert_ne!(
+            r.route(&ok_q).status,
+            401,
+            "correct _st query token must pass the gate"
+        );
+    }
+
+    #[test]
+    fn session_gate_leaves_static_shell_open() {
+        // The bootstrap shell must stay reachable without the token (the WebView has
+        // to load it before the native bridge can hand the token to the JS). It
+        // carries no user data and no token, so this is safe.
+        let r = Router::new(Config::default()).with_session_token("sess-tok-0001".into());
+        assert_eq!(
+            r.route(&ApiRequest::get("/")).status,
+            200,
+            "/ must stay open"
+        );
+        assert_eq!(
+            r.route(&ApiRequest::get("/app.js")).status,
+            200,
+            "/app.js must stay open (bootstrap)"
+        );
+    }
+
+    #[test]
+    fn ct_eq_is_exact_and_length_checked() {
+        assert!(ct_eq(b"abc123", b"abc123"));
+        assert!(!ct_eq(b"abc123", b"abc124"));
+        assert!(!ct_eq(b"abc", b"abc123"));
+        assert!(ct_eq(b"", b""));
     }
 
     #[test]
