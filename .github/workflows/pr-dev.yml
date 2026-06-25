@@ -26,6 +26,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       js: ${{ steps.filter.outputs.js }}
+      sast: ${{ steps.filter.outputs.sast }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
@@ -44,6 +45,13 @@ jobs:
               - 'gui/webui/**'
             js:
               - 'gui/webui/**/*.js'
+            # SAST surface: the hand-written web UI (JS), the Android app (Kotlin) and
+            # the workflows. Drives the `semgrep` job so a Kotlin-only PR still runs
+            # SAST — the `code` filter above intentionally omits android/**.
+            sast:
+              - 'gui/webui/**'
+              - 'android/**'
+              - '.github/workflows/**'
 
   dev-checks:
     name: dev-checks
@@ -145,3 +153,25 @@ jobs:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
+
+  # Fast OSS SAST (shift-left): pattern analysis for the hand-written web UI (JS) and
+  # the Android app (Kotlin), plus a secrets sweep. Rust is covered by clippy +
+  # cargo-deny here and CodeQL on staging/main (semgrep's Rust support is only
+  # experimental). Token-free — the OSS registry rulesets need no Semgrep Cloud login,
+  # and --metrics=off disables telemetry. The image is pinned by digest.
+  semgrep:
+    name: semgrep
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: No SAST-relevant changes — skip semgrep
+        if: needs.changes.outputs.sast != 'true'
+        run: echo "No gui/webui, android or workflow changes in this PR — semgrep skipped."
+      - name: Semgrep (JS / Kotlin / secrets)
+        if: needs.changes.outputs.sast == 'true'
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            semgrep/semgrep@sha256:a265d09a9ca712e6624aca09056304ce4314a695b7028d65c041dd53fd44c700 \
+            semgrep scan --config p/javascript --config p/kotlin --config p/secrets --config p/security-audit \
+            --error --metrics=off gui/webui android
