@@ -13,15 +13,39 @@
 //! concern handled elsewhere; this connector tracks the page index. Delegated
 //! access only (no app-only); read app keeps `Notes.Read`.
 
-use crate::common::fetch_pages;
+use crate::archive::JsonFetcher;
+use crate::common::{fetch_pages, shard_path};
 use crate::onedrive::SyncError;
 use isyncyou_graph::Transport;
 use isyncyou_store::{Item, Store};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::Path;
 
 const SERVICE: &str = "onenote";
-const PAGES_URL: &str = "https://graph.microsoft.com/v1.0/me/onenote/pages?$top=100";
+// The flat `/me/onenote/pages` list returns title/createdDateTime/links +
+// `parentSection` by default, but NOT `parentNotebook` (live-verified, #568 A8).
+// `$expand` BOTH parents to keep the section (the page's grouping parent) AND get
+// the notebook name for display — expanding only one drops the other. No narrowing
+// `$select` (the default scalar fields are exactly what's needed). `level`/`order`/
+// `userTags` are page-positional/tag-derived and Graph omits them for a plain page;
+// they're captured into the `_pagemeta_<id>` sidecar whenever Graph does return them.
+const PAGES_URL: &str = "https://graph.microsoft.com/v1.0/me/onenote/pages?$top=100&$expand=parentSection($select=id,displayName),parentNotebook($select=id,displayName)";
+
+/// Archive a page's rich Graph metadata JSON to `onenote/<shard>/_pagemeta_<id>.json`
+/// (atomic tmp+rename) so the webui can surface level/order/userTags/createdDateTime/
+/// links without parsing the page HTML (the page's `local_path` is the `.html` body).
+fn write_page_meta(archive_root: &Path, id: &str, page: &Value) -> Result<(), SyncError> {
+    let abs = shard_path(archive_root, SERVICE, &format!("_pagemeta_{id}"), "json");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(page).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    Ok(())
+}
 
 /// What one OneNote sync changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,6 +67,7 @@ pub fn incremental_sync_onenote<T: Transport>(
     store: &Store,
     account: &str,
     now: &str,
+    archive_root: Option<&Path>,
 ) -> Result<OneNoteReport, SyncError> {
     let pages = fetch_pages(transport, PAGES_URL)?;
     let prior: HashSet<String> = store
@@ -61,6 +86,12 @@ pub fn incremental_sync_onenote<T: Transport>(
             None => return Err(SyncError::Malformed("page has no id".into())),
         };
         live.insert(id.clone());
+
+        // Archive the page's rich metadata sidecar each pass (cheap, keeps it fresh)
+        // — independent of the unchanged-skip below, so every live page is covered.
+        if let Some(root) = archive_root {
+            write_page_meta(root, &id, page)?;
+        }
 
         let mtime = page
             .get("lastModifiedDateTime")
@@ -99,6 +130,146 @@ pub fn incremental_sync_onenote<T: Transport>(
     Ok(report)
 }
 
+/// What one OneNote hierarchy backup did (#568 B-A2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneNoteHierarchyReport {
+    pub notebooks: usize,
+    pub section_groups: usize,
+    pub sections: usize,
+    pub bytes: u64,
+}
+
+/// Upsert a hierarchy container as a store Item (with its `parent_remote_id`) and
+/// archive its full JSON to `onenote/<shard>/<id>.json` (atomic tmp+rename),
+/// recording `local_path`. Mirrors the todo/calendar `archive_json_item` flank
+/// pattern, plus a parent link so the UI can render the tree.
+#[allow(clippy::too_many_arguments)]
+fn archive_hierarchy_item(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    id: &str,
+    name: &str,
+    item_type: &str,
+    parent: Option<&str>,
+    value: &Value,
+) -> Result<u64, SyncError> {
+    let mut it = Item::new(account, SERVICE, id, name, item_type);
+    it.parent_remote_id = parent.map(String::from);
+    it.sync_state = "remote_dirty".into();
+    store.upsert_item(&it)?;
+
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent_dir) = abs.parent() {
+        std::fs::create_dir_all(parent_dir)?;
+    }
+    let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+    store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// A container's parent id: a section / section-group sits under another section
+/// group (`parentSectionGroup`) or directly under a notebook (`parentNotebook`).
+fn container_parent(v: &Value) -> Option<&str> {
+    v.pointer("/parentSectionGroup/id")
+        .and_then(Value::as_str)
+        .or_else(|| v.pointer("/parentNotebook/id").and_then(Value::as_str))
+}
+
+/// Back up the OneNote **structure** (#568): notebooks → section groups → sections
+/// as store items (`item_type` `notebook`/`section-group`/`section`) with their
+/// parent chain + full JSON sidecars, so the UI can render the notebook→section→
+/// page tree (pages already point at their `parentSection`). Re-fetched each pass
+/// (small data). Sections/groups nest via `container_parent`.
+pub fn backup_onenote_hierarchy<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<OneNoteHierarchyReport, SyncError> {
+    let mut report = OneNoteHierarchyReport::default();
+    let values = |v: &Value| -> Vec<Value> {
+        v.get("value")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Notebooks — the roots of the tree.
+    let nbs = fetcher
+        .fetch_json("/me/onenote/notebooks?$top=100")
+        .map_err(SyncError::Remote)?;
+    for nb in values(&nbs) {
+        let Some(id) = nb.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = nb.get("displayName").and_then(Value::as_str).unwrap_or(id);
+        report.bytes += archive_hierarchy_item(
+            store,
+            account,
+            archive_root,
+            id,
+            name,
+            "notebook",
+            None,
+            &nb,
+        )?;
+        report.notebooks += 1;
+    }
+
+    // Section groups (optional intermediate level).
+    let sgs = fetcher
+        .fetch_json("/me/onenote/sectionGroups?$top=100")
+        .map_err(SyncError::Remote)?;
+    for sg in values(&sgs) {
+        let Some(id) = sg.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = sg.get("displayName").and_then(Value::as_str).unwrap_or(id);
+        let parent = container_parent(&sg);
+        report.bytes += archive_hierarchy_item(
+            store,
+            account,
+            archive_root,
+            id,
+            name,
+            "section-group",
+            parent,
+            &sg,
+        )?;
+        report.section_groups += 1;
+    }
+
+    // Sections — pages hang off these (page.parent_remote_id == section.id).
+    let secs = fetcher
+        .fetch_json("/me/onenote/sections?$top=100")
+        .map_err(SyncError::Remote)?;
+    for sec in values(&secs) {
+        let Some(id) = sec.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = sec.get("displayName").and_then(Value::as_str).unwrap_or(id);
+        let parent = container_parent(&sec);
+        report.bytes += archive_hierarchy_item(
+            store,
+            account,
+            archive_root,
+            id,
+            name,
+            "section",
+            parent,
+            &sec,
+        )?;
+        report.sections += 1;
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,7 +304,8 @@ mod tests {
             ] }))],
             0,
         );
-        let r = incremental_sync_onenote(&mut t, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
+        let r =
+            incremental_sync_onenote(&mut t, &store, "acc", "2026-06-02T00:00:00Z", None).unwrap();
         assert_eq!(r.pages, 2);
         assert_eq!(r.upserted, 2);
         assert_eq!(r.deleted, 0);
@@ -145,15 +317,105 @@ mod tests {
     }
 
     #[test]
+    fn writes_page_metadata_sidecar_with_rich_fields() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let rich = json!({
+            "id": "p1", "title": "Ideas", "lastModifiedDateTime": "2026-01-01T00:00:00Z",
+            "createdDateTime": "2025-12-01T00:00:00Z", "level": 0, "order": 2,
+            "userTags": ["important"],
+            "links": { "oneNoteWebUrl": { "href": "https://onenote.com/p1" } },
+            "parentSection": { "id": "S1", "displayName": "Sec" },
+            "parentNotebook": { "id": "N1", "displayName": "Note" }
+        });
+        let mut t = MockTransport(vec![Response::ok(json!({ "value": [rich] }))], 0);
+        incremental_sync_onenote(&mut t, &store, "acc", "t", Some(arch.path())).unwrap();
+        let p1 = store.get_item("acc", SERVICE, "p1").unwrap().unwrap();
+        assert_eq!(p1.parent_remote_id.as_deref(), Some("S1"));
+        // the _pagemeta_ sidecar carries the rich fields the UI surfaces
+        let abs = shard_path(arch.path(), SERVICE, "_pagemeta_p1", "json");
+        let body: Value = serde_json::from_slice(&std::fs::read(&abs).unwrap()).unwrap();
+        assert_eq!(body.get("level").and_then(Value::as_i64), Some(0));
+        assert_eq!(body.get("order").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            body.pointer("/userTags/0").and_then(Value::as_str),
+            Some("important")
+        );
+        assert_eq!(
+            body.pointer("/links/oneNoteWebUrl/href")
+                .and_then(Value::as_str),
+            Some("https://onenote.com/p1")
+        );
+        assert_eq!(
+            body.pointer("/parentNotebook/id").and_then(Value::as_str),
+            Some("N1")
+        );
+        assert_eq!(
+            body.get("createdDateTime").and_then(Value::as_str),
+            Some("2025-12-01T00:00:00Z")
+        );
+    }
+
+    struct HierFetcher;
+    impl JsonFetcher for HierFetcher {
+        fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+            if url.contains("/notebooks") {
+                Ok(json!({ "value": [{ "id": "N1", "displayName": "Personal" }] }))
+            } else if url.contains("/sectionGroups") {
+                Ok(
+                    json!({ "value": [{ "id": "G1", "displayName": "Group", "parentNotebook": { "id": "N1" } }] }),
+                )
+            } else if url.contains("/sections") {
+                Ok(json!({ "value": [
+                    { "id": "S1", "displayName": "Ideas", "parentNotebook": { "id": "N1" } },
+                    { "id": "S2", "displayName": "Sub", "parentSectionGroup": { "id": "G1" } },
+                ]}))
+            } else {
+                Ok(json!({ "value": [] }))
+            }
+        }
+    }
+
+    #[test]
+    fn backup_onenote_hierarchy_stores_notebooks_groups_sections_with_parents() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let r = backup_onenote_hierarchy(&HierFetcher, &store, "acc", arch.path()).unwrap();
+        assert_eq!((r.notebooks, r.section_groups, r.sections), (1, 1, 2));
+
+        let nb = store.get_item("acc", SERVICE, "N1").unwrap().unwrap();
+        assert_eq!(nb.item_type, "notebook");
+        assert_eq!(nb.parent_remote_id, None);
+        let g1 = store.get_item("acc", SERVICE, "G1").unwrap().unwrap();
+        assert_eq!(g1.item_type, "section-group");
+        assert_eq!(g1.parent_remote_id.as_deref(), Some("N1"));
+        let s1 = store.get_item("acc", SERVICE, "S1").unwrap().unwrap();
+        assert_eq!(s1.item_type, "section");
+        assert_eq!(s1.parent_remote_id.as_deref(), Some("N1"));
+        // S2 nests under the section group, not the notebook directly
+        let s2 = store.get_item("acc", SERVICE, "S2").unwrap().unwrap();
+        assert_eq!(s2.parent_remote_id.as_deref(), Some("G1"));
+        // the section sidecar carries the full JSON (displayName)
+        let body: Value = serde_json::from_slice(
+            &std::fs::read(arch.path().join(s1.local_path.unwrap())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body.get("displayName").and_then(Value::as_str),
+            Some("Ideas")
+        );
+    }
+
+    #[test]
     fn unchanged_pages_are_skipped_on_second_run() {
         let store = Store::open_in_memory().unwrap();
         let pages = json!({ "value": [page("p1","Ideas","2026-01-01T00:00:00Z","S1")] });
         let mut t1 = MockTransport(vec![Response::ok(pages.clone())], 0);
-        let r1 = incremental_sync_onenote(&mut t1, &store, "acc", "t").unwrap();
+        let r1 = incremental_sync_onenote(&mut t1, &store, "acc", "t", None).unwrap();
         assert_eq!(r1.upserted, 1);
         // identical list again -> same mtime -> skipped
         let mut t2 = MockTransport(vec![Response::ok(pages)], 0);
-        let r2 = incremental_sync_onenote(&mut t2, &store, "acc", "t").unwrap();
+        let r2 = incremental_sync_onenote(&mut t2, &store, "acc", "t", None).unwrap();
         assert_eq!(r2.upserted, 0);
         assert_eq!(r2.unchanged, 1);
         // a changed mtime -> re-upserted
@@ -163,7 +425,7 @@ mod tests {
             )],
             0,
         );
-        let r3 = incremental_sync_onenote(&mut t3, &store, "acc", "t").unwrap();
+        let r3 = incremental_sync_onenote(&mut t3, &store, "acc", "t", None).unwrap();
         assert_eq!(r3.upserted, 1);
         assert_eq!(r3.unchanged, 0);
         assert_eq!(
@@ -182,7 +444,7 @@ mod tests {
             ] }))],
             0,
         );
-        incremental_sync_onenote(&mut t1, &store, "acc", "t").unwrap();
+        incremental_sync_onenote(&mut t1, &store, "acc", "t", None).unwrap();
         // second run: p2 gone from the list
         let mut t2 = MockTransport(
             vec![Response::ok(
@@ -190,7 +452,8 @@ mod tests {
             )],
             0,
         );
-        let r = incremental_sync_onenote(&mut t2, &store, "acc", "2026-06-02T00:00:00Z").unwrap();
+        let r =
+            incremental_sync_onenote(&mut t2, &store, "acc", "2026-06-02T00:00:00Z", None).unwrap();
         assert_eq!(r.deleted, 1);
         assert!(store
             .get_item("acc", SERVICE, "p2")
@@ -218,7 +481,7 @@ mod tests {
             ],
             0,
         );
-        let r = incremental_sync_onenote(&mut t, &store, "acc", "t").unwrap();
+        let r = incremental_sync_onenote(&mut t, &store, "acc", "t", None).unwrap();
         assert_eq!(r.pages, 2);
         assert_eq!(r.upserted, 2);
     }
@@ -239,9 +502,14 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let mut client = isyncyou_graph::GraphClient::new(token);
-        let report =
-            incremental_sync_onenote(&mut client, &store, "testuser", "2026-06-02T00:00:00Z")
-                .expect("live onenote sync should succeed");
+        let report = incremental_sync_onenote(
+            &mut client,
+            &store,
+            "testuser",
+            "2026-06-02T00:00:00Z",
+            None,
+        )
+        .expect("live onenote sync should succeed");
         // If the account has any pages, they must be in the store now.
         if report.pages > 0 {
             assert_eq!(report.upserted + report.unchanged, report.pages);

@@ -29,7 +29,7 @@ jobs:
     outputs:
       identical: ${{ steps.t.outputs.identical }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
         with:
           fetch-depth: 0
       - id: t
@@ -49,7 +49,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: Install Linux GUI build deps
         run: |
           sudo apt-get update -qq
@@ -65,7 +65,7 @@ jobs:
     if: needs.content-check.outputs.identical != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: Install Linux GUI build deps
         run: |
           sudo apt-get update -qq
@@ -73,7 +73,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -82,13 +82,13 @@ jobs:
     if: needs.content-check.outputs.identical != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: Install Linux GUI build deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
@@ -96,7 +96,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       # cargo-deny via the official SHA-pinned action (checksum-verified install),
       # consistent with pr-dev.yml — replaces an unverified curl|tar (#358).
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.14
@@ -111,22 +111,154 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
       - name: Install Linux GUI build deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
       - run: cargo doc --no-deps --workspace
 
-  # TODO(staging): integration tests (mock-first Graph fixtures) and headless
-  # UI snapshot tests are added here once those suites exist.
+  # --- staging value-add: jobs that never ran on dev, so they are NOT content-check
+  #     gated — they run on every staging PR and are what makes staging the heavy gate
+  #     before production (deploy/E2E, the release profile, the Android APK). ---
+
+  # Deploy + token-free E2E against a real build: serve the seeded fixture and assert
+  # the served security contract (status/CSP/asset-headers/404) plus the headless-UI
+  # invariants. No Microsoft-365 tokens (the desktop profile is open over loopback;
+  # the mobile 401 gate is covered by the crates/mobile test in `cargo test`).
+  staging-e2e:
+    name: staging-e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+      - name: Install Linux GUI build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - name: Build the daemon
+        run: cargo build -p isyncyou-daemon
+      - name: Seed a token-free fixture
+        run: |
+          cargo run -p isyncyou-connectors --example seed_fixture \
+            --no-default-features --features plain-store -- "$RUNNER_TEMP/fixture"
+      - name: Install the headless-UI-smoke deps
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Serve the fixture and run the serve + UI smokes
+        run: |
+          target/debug/isyncyoud --config "$RUNNER_TEMP/fixture/isyncyou.toml" \
+            --tcp --bind 127.0.0.1:8869 --sync-secs 0 --token-refresh-secs 0 --heartbeat-secs 0 &
+          dpid=$!
+          trap 'kill "$dpid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:8869/ && break; sleep 1; done
+          bash tools/serve-smoke.sh http://127.0.0.1:8869/ fixture
+          node tools/ci-ui-smoke.mjs http://127.0.0.1:8869/
+
+  # Release-profile build, one stage earlier than main (catches release-only breaks
+  # before they reach the release branch).
+  release-build:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+      - name: Install Linux GUI build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - run: cargo build --release --workspace
+      # CycloneDX SBOM of the Rust/Cargo dependency graph (NOT the whole product —
+      # Gradle/Android deps and the CI-only npm tree are not included; a Gradle SBOM is
+      # future work). Surfaced one stage before main + consumed by the main/RC trivy
+      # vuln-scan.
+      - name: Generate the Cargo dependency SBOM
+        run: python3 tools/generate_sbom.py --output isyncyou.sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-cargo-cyclonedx
+          path: isyncyou.sbom.cdx.json
+
+  # Android debug APK build gate (REQ-AND-001 / D1b). Token-free: assembleDebug builds
+  # without a Firebase config (the google-services plugin is applied only when present)
+  # and cross-compiles the embedded Rust engine via cargo-ndk. assembleRelease (the
+  # keystore path) stays out — only the build itself is gated here.
+  android-build:
+    name: android-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+      - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-ndk
+      # Puts sdkmanager on PATH + accepts licenses (the runner's preinstalled SDK is
+      # not on PATH — a bare `sdkmanager` call exits 127).
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - name: Install the pinned NDK (matches android.ndkVersion)
+        run: yes | sdkmanager --install "ndk;27.3.13750724"
+      - name: Build the debug APK
+        run: cd android && ./gradlew :app:assembleDebug
+
+  # DAST: OWASP ZAP baseline against the served fixture UI, on top of the functional
+  # serve-smoke — the active runtime-security pass dev/main don't have. Builds + serves
+  # the same token-free fixture as staging-e2e, then runs the ZAP baseline. `-I` reports
+  # warnings in the artifact but only FAILs block (the hardened static UI yields 0 FAILs
+  # locally; the warnings are intentional, e.g. Cache-Control: no-store). ZAP pinned by
+  # digest; --network host lets it reach the loopback daemon.
+  staging-dast:
+    name: staging-dast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+      - name: Install Linux GUI build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - name: Build the daemon
+        run: cargo build -p isyncyou-daemon
+      - name: Seed a token-free fixture
+        run: |
+          cargo run -p isyncyou-connectors --example seed_fixture \
+            --no-default-features --features plain-store -- "$RUNNER_TEMP/fixture"
+      - name: Serve the fixture and run the ZAP baseline
+        run: |
+          target/debug/isyncyoud --config "$RUNNER_TEMP/fixture/isyncyou.toml" \
+            --tcp --bind 127.0.0.1:8876 --sync-secs 0 --token-refresh-secs 0 --heartbeat-secs 0 &
+          dpid=$!
+          trap 'kill "$dpid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:8876/ && break; sleep 1; done
+          mkdir -p "$RUNNER_TEMP/zap" && chmod 777 "$RUNNER_TEMP/zap"
+          docker run --rm --network host -v "$RUNNER_TEMP/zap":/zap/wrk:rw \
+            ghcr.io/zaproxy/zaproxy@sha256:7c2f8afc893e4e4000be8ad3fd22013fc36e5cce59359349f5a2d45626e2ccb9 \
+            zap-baseline.py -t http://127.0.0.1:8876/ -I -r zap-report.html
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: zap-baseline-report
+          path: ${{ runner.temp }}/zap/zap-report.html
+          if-no-files-found: ignore
 
   staging-pass:
     name: staging-pass
     if: always()
-    needs: [content-check, fmt, clippy, test, deny, docs]
+    needs: [content-check, fmt, clippy, test, deny, docs, staging-e2e, release-build, android-build, staging-dast]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed

@@ -1804,8 +1804,14 @@ fn backup_one_account(
         // archive needs `&client`. The mutable borrow ends before the shared one.
         let line = match svc {
             "mail" => {
-                let r = connectors::incremental_sync_mail(&mut client, &store, account, &now)
-                    .map_err(|e| e.to_string())?;
+                let r = connectors::incremental_sync_mail(
+                    &mut client,
+                    &store,
+                    account,
+                    &now,
+                    &archive_root,
+                )
+                .map_err(|e| e.to_string())?;
                 let b = connectors::backup_message_bodies(
                     &client,
                     &store,
@@ -1814,6 +1820,10 @@ fn backup_one_account(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                // Mailbox configuration flanks: settings, inbox rules, categories (#562).
+                let flanks =
+                    connectors::backup_mailbox_flanks(&client, &store, account, &archive_root)
+                        .map_err(|e| e.to_string())?;
                 // Index body text for full-text search when enabled (privacy/space opt-in).
                 let indexed = if cfg.sync.body_index {
                     connectors::index_mail_bodies(&store, account, &archive_root, 0)
@@ -1822,19 +1832,26 @@ fn backup_one_account(
                     0
                 };
                 format!(
-                    "mail: {} folders, {} indexed, {} deleted; {} .eml archived ({} bytes); {} bodies FTS-indexed",
-                    r.folders, r.upserted, r.deleted, b.downloaded, b.bytes, indexed
+                    "mail: {} folders, {} indexed, {} deleted; {} .eml archived ({} bytes); {} flank snapshot(s); {} bodies FTS-indexed",
+                    r.folders, r.upserted, r.deleted, b.downloaded, b.bytes, flanks.archived, indexed
                 )
             }
             "calendar" => {
-                let r = connectors::incremental_sync_calendar(
-                    &mut client,
-                    &store,
-                    account,
-                    cal_start,
-                    cal_end,
-                    &now,
-                )
+                // #565: default to the /me/events model (no window, no occurrence
+                // explosion); the windowed calendarView/delta stays as a flagged
+                // rollback (`calendar_sync_mode = "calendar_view"`).
+                let r = if cfg.sync.calendar_sync_mode == "calendar_view" {
+                    connectors::incremental_sync_calendar(
+                        &mut client,
+                        &store,
+                        account,
+                        cal_start,
+                        cal_end,
+                        &now,
+                    )
+                } else {
+                    connectors::events_sync_calendar(&mut client, &store, account, &now)
+                }
                 .map_err(|e| e.to_string())?;
                 let b = connectors::backup_calendar_bodies(
                     &client,
@@ -1844,9 +1861,37 @@ fn backup_one_account(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                // Calendar entity flanks (#565): per-calendar JSON snapshots
+                // (colour-coding) + groups/permissions. Best-effort.
+                let flanks = match connectors::backup_calendar_flanks(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                ) {
+                    Ok(f) => f.archived,
+                    Err(e) => {
+                        eprintln!("calendar flanks skipped: {e}");
+                        0
+                    }
+                };
+                // Event attachments (#565 B3): gated on each event's hasAttachments.
+                let atts = match connectors::backup_event_attachments(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                    body_limit,
+                ) {
+                    Ok(a) => a.archived,
+                    Err(e) => {
+                        eprintln!("event attachments skipped: {e}");
+                        0
+                    }
+                };
                 format!(
-                    "calendar: {} calendars, {} indexed; {} json archived ({} bytes)",
-                    r.calendars, r.upserted, b.archived, b.bytes
+                    "calendar: {} calendars, {} indexed; {} json archived ({} bytes); {} flanks; {} attachment sets",
+                    r.calendars, r.upserted, b.archived, b.bytes, flanks, atts
                 )
             }
             "contacts" => {
@@ -1876,6 +1921,8 @@ fn backup_one_account(
             "todo" => {
                 let r = connectors::incremental_sync_todo(&mut client, &store, account, &now)
                     .map_err(|e| e.to_string())?;
+                // task bodies first — the sub-resource pass gates attachments on the
+                // archived task JSON's hasAttachments.
                 let b = connectors::backup_todo_bodies(
                     &client,
                     &store,
@@ -1884,14 +1931,52 @@ fn backup_one_account(
                     body_limit,
                 )
                 .map_err(|e| e.to_string())?;
+                // List flanks (#567 B1): per-list JSON snapshots (isShared/isOwner/
+                // wellknownListName). Best-effort.
+                let flanks = match connectors::backup_todo_list_flanks(
+                    &client,
+                    &store,
+                    account,
+                    &archive_root,
+                ) {
+                    Ok(f) => f.archived,
+                    Err(e) => {
+                        eprintln!("todo list flanks skipped: {e}");
+                        0
+                    }
+                };
+                // Task sub-resources (#567 B2): checklistItems/linkedResources +
+                // gated attachments. Best-effort. Attachments need Tasks.ReadWrite
+                // (the To Do `.../attachments` endpoint denies the read scope), so the
+                // same client doubles as the write-scope att_fetcher here.
+                let sub = match connectors::backup_task_subresources(
+                    &client,
+                    Some(&client),
+                    &store,
+                    account,
+                    &archive_root,
+                    body_limit,
+                ) {
+                    Ok(s) => s.archived,
+                    Err(e) => {
+                        eprintln!("todo sub-resources skipped: {e}");
+                        0
+                    }
+                };
                 format!(
-                    "todo: {} lists, {} indexed; {} json archived ({} bytes)",
-                    r.lists, r.upserted, b.archived, b.bytes
+                    "todo: {} lists, {} indexed; {} json archived ({} bytes); {} list flanks; {} sub-resource sets",
+                    r.lists, r.upserted, b.archived, b.bytes, flanks, sub
                 )
             }
             "onenote" => {
-                let r = connectors::incremental_sync_onenote(&mut client, &store, account, &now)
-                    .map_err(|e| e.to_string())?;
+                let r = connectors::incremental_sync_onenote(
+                    &mut client,
+                    &store,
+                    account,
+                    &now,
+                    Some(&archive_root),
+                )
+                .map_err(|e| e.to_string())?;
                 let b = connectors::backup_onenote_bodies(
                     &client,
                     &store,

@@ -65,6 +65,17 @@ pub struct SyncConfig {
     pub change_source: ChangeSource,
     /// Index mail/file bodies in FTS (off = metadata only; privacy/space).
     pub body_index: bool,
+    /// Cloud-poll cadence (seconds) when the UI is active — the user-tunable
+    /// interval slider (1 s … 3600 s). `429`/`Retry-After` backoff always overrides.
+    pub poll_interval_secs: u64,
+    /// When the UI is idle, the active interval is stretched by this factor to
+    /// save battery/network (e.g. 5 s active → 30 s idle at factor 6).
+    pub poll_idle_factor: u32,
+    /// Calendar sync model (#565): `"events"` (default) pages `/me/events` —
+    /// recurring series stored as one master + its rule, no date window, no
+    /// occurrence explosion. `"calendar_view"` keeps the legacy windowed
+    /// `calendarView/delta` (incremental but window-bound) as a rollback.
+    pub calendar_sync_mode: String,
 }
 
 impl Default for SyncConfig {
@@ -74,6 +85,9 @@ impl Default for SyncConfig {
             delete_guard: DeleteGuardConfig::default(),
             change_source: ChangeSource::default(),
             body_index: false,
+            poll_interval_secs: 5,
+            poll_idle_factor: 6,
+            calendar_sync_mode: "events".into(),
         }
     }
 }
@@ -238,9 +252,37 @@ mod tests {
         assert_eq!(c.sync.trash_retention_days, 30);
         assert_eq!(c.sync.change_source, ChangeSource::Inotify);
         assert!(!c.sync.body_index);
+        assert_eq!(c.sync.poll_interval_secs, 5);
+        assert_eq!(c.sync.poll_idle_factor, 6);
         // Cloud-mutating restore is OFF until the operation ledger is complete.
         assert!(!c.restore.cloud_restore_enabled);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn poll_interval_round_trips_and_defaults_when_omitted() {
+        // AC1: an explicit interval round-trips through toml
+        let mut c = Config::default();
+        c.sync.poll_interval_secs = 1;
+        c.sync.poll_idle_factor = 10;
+        let s = toml::to_string(&c).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.sync.poll_interval_secs, 1);
+        assert_eq!(back.sync.poll_idle_factor, 10);
+        // AC2: a [sync] table that omits the field falls back to the default (5/6)
+        let toml = r#"
+            [[accounts]]
+            id = "p"
+            username = "p@outlook.com"
+            sync_root = "/d/od"
+            archive_root = "/d/a"
+            [sync]
+            trash_retention_days = 14
+        "#;
+        let c2 = Config::from_toml(toml).unwrap();
+        assert_eq!(c2.sync.poll_interval_secs, 5);
+        assert_eq!(c2.sync.poll_idle_factor, 6);
+        assert_eq!(c2.sync.trash_retention_days, 14);
     }
 
     #[test]
