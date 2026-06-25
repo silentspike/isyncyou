@@ -335,6 +335,11 @@ function sessionToken() {
   catch (_) { return ""; }
 }
 function sessionHeaders() { const t = sessionToken(); return t ? { "X-Session-Token": t } : {}; }
+/* Standalone mobile app (#89 P6): the native shell exposes window.AndroidSession,
+   so the UI reads truthfully as a *cache/live companion* ("cached on this device"),
+   not a backup-of-record — the laptop holds the backup. Restore UI is already hidden
+   in this profile (no restore capability token is injected). */
+const MOBILE = typeof window !== "undefined" && !!window.AndroidSession;
 async function api(path) { const r = await fetch(path, { headers: sessionHeaders() }); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
   const headers = sessionHeaders();
@@ -351,7 +356,14 @@ const initials = (s) => (s || "?").trim().split(/[\s@.]+/).filter(Boolean).slice
 // Mirrors backup_state() in lib.rs: every element is one of four states.
 // Reused by every list + detail view so coverage reads identically everywhere.
 // No emoji — Lucide glyphs only, tinted per state in CSS.
-const STATES = {
+// On the standalone phone (#89 P6) the local store is a *cache*, not a
+// backup-of-record, so the four states read in "cached on this device" terms.
+const STATES = MOBILE ? {
+  live_only:   { icon: "globe",        label: "Live only",     title: "In Microsoft 365 — not yet cached on this device" },
+  live_backup: { icon: "shield-check", label: "Live + cached", title: "In Microsoft 365 and cached on this device" },
+  backup_only: { icon: "archive",      label: "Cached only",   title: "Deleted from Microsoft 365 — still cached on this device" },
+  stale:       { icon: "rotate-ccw",   label: "Stale",         title: "Microsoft 365 changed since the last refresh — re-syncing" },
+} : {
   live_only:   { icon: "globe",        label: "Live only",     title: "In Microsoft 365 — not yet in your backup" },
   live_backup: { icon: "shield-check", label: "Live + backup", title: "In Microsoft 365 and safely backed up" },
   backup_only: { icon: "archive",      label: "Backup only",   title: "Deleted from Microsoft 365 — preserved in your backup" },
@@ -460,7 +472,7 @@ function svcFilters(service) {
     { sec: "Mailbox" },
     { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
     { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
-    { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
+    { key: "restore", label: (MOBILE ? "Has content" : "Restore-ready"), icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
     ...(Mail.folders && Mail.folders.length ? [{ sec: "Folders" }, ...mailFolderSpecs()] : []),
     { sec: "Status" },
     { key: "unread", label: "Unread", icon: "mail", count: m => m.filter(it => (it.preview || {}).isRead === false).length },
@@ -480,7 +492,7 @@ function svcFilters(service) {
     { key: "all", label: "All contacts", icon: "users", count: c => c.length },
     { key: "email", label: "With email", icon: "mail", count: c => c.filter(it => (it.preview || {}).email).length },
     { key: "company", label: "With company", icon: "building", count: c => c.filter(it => (it.preview || {}).company).length },
-    { key: "restore", label: "Restore-ready", icon: "rotate-ccw", count: c => c.filter(it => it.has_body).length },
+    { key: "restore", label: (MOBILE ? "Has content" : "Restore-ready"), icon: "rotate-ccw", count: c => c.filter(it => it.has_body).length },
     ...stateFilterSpecs(),
   ];
   return null;
@@ -488,7 +500,7 @@ function svcFilters(service) {
 // shared "Backup status" sidebar section (#560) for the bespoke views.
 function stateFilterSpecs() {
   return [
-    { sec: "Backup status" },
+    { sec: MOBILE ? "Cache status" : "Backup status" },
     ...[...STATE_KEYS].map(k => ({ key: k, label: STATES[k].label, icon: STATES[k].icon,
       count: items => items.filter(it => stateKey(it) === k).length })),
   ];
@@ -976,8 +988,8 @@ function activityBuckets(runs, days = 14) {
 }
 async function renderOverview(view) {
   clear(view).append(
-    el("h1", { class: "view-title", text: "Microsoft 365 archive overview" }),
-    el("p", { class: "view-sub", text: "Backup health, activity and connected services at a glance." }),
+    el("h1", { class: "view-title", text: MOBILE ? "Microsoft 365 on this device" : "Microsoft 365 archive overview" }),
+    el("p", { class: "view-sub", text: MOBILE ? "Your live view, cached on this device. Backups live on your computer." : "Backup health, activity and connected services at a glance." }),
     el("div", { id: "ov-body" }),
   );
   const body = $("#ov-body");
@@ -1004,7 +1016,7 @@ async function renderOverview(view) {
     // ---- status header (the most important line)
     body.append(el("div", { class: "status-bar" },
       el("span", { class: "status-health" },
-        el("span", { class: "chip " + (healthy ? "ok" : "warn") }, el("span", { class: "dot" }), healthy ? "Archive healthy" : "Attention needed")),
+        el("span", { class: "chip " + (healthy ? "ok" : "warn") }, el("span", { class: "dot" }), healthy ? (MOBILE ? "Connected" : "Archive healthy") : "Attention needed")),
       el("div", { class: "status-facts" },
         el("span", {}, el("b", { text: String(services.length) }), " services connected"),
         el("span", { class: "sep", text: "·" }),
@@ -1012,7 +1024,7 @@ async function renderOverview(view) {
         el("span", { class: "sep", text: "·" }),
         el("span", {}, el("b", { text: String(failed) }), failed === 1 ? " failed run" : " failed runs"),
         el("span", { class: "sep", text: "·" }),
-        el("span", {}, el("b", { text: items.toLocaleString() }), " items protected")),
+        el("span", {}, el("b", { text: items.toLocaleString() }), MOBILE ? " items cached" : " items protected")),
       el("div", { class: "spacer" }),
       el("div", { class: "status-actions" },
         CAP.sync ? el("button", { class: "btn primary sm", onclick: () => syncCmd("now") }, icon("refresh-cw", "icon-sm"), "Sync now") : null,
@@ -1025,8 +1037,8 @@ async function renderOverview(view) {
       el("div", { class: "kpi-val" }, String(val), unit ? el("span", { class: "unit", text: unit }) : null),
       ctxEl || null);
     kpi.append(
-      kpiCard("layout-dashboard", "Items protected", items.toLocaleString(), "", el("div", { class: "kpi-ctx", text: `across ${services.length} services` })),
-      kpiCard("download", "Archived bodies", archived.toLocaleString(), "", el("div", { class: "kpi-ctx", text: items ? `${Math.round(archived / items * 100)}% have content` : "—" })),
+      kpiCard("layout-dashboard", MOBILE ? "Items cached" : "Items protected", items.toLocaleString(), "", el("div", { class: "kpi-ctx", text: `across ${services.length} services` })),
+      kpiCard("download", MOBILE ? "Cached bodies" : "Archived bodies", archived.toLocaleString(), "", el("div", { class: "kpi-ctx", text: items ? `${Math.round(archived / items * 100)}% have content` : "—" })),
       kpiCard("rotate-ccw", "Failed runs", failed, "", el("div", { class: "kpi-ctx" }, el("span", { class: "chip " + (failed ? "err" : "ok") }, failed ? "needs review" : "all clear"))),
       kpiCard("clock", "Trash retention", sync.trash_retention_days ?? "—", "days", el("div", { class: "kpi-ctx", text: sync.body_index ? "full-text index on" : "index off" })));
     body.append(kpi);
@@ -1298,7 +1310,7 @@ function mailRenderMetrics() {
   fillMetrics($("#mail-metrics-row"), [
     { icon: "inbox", value: Mail.all.length, label: "Total messages", sub: "in this mailbox" },
     { icon: "paperclip", value: withAtt, label: "With attachments", sub: `${withAtt} of ${Mail.all.length}` },
-    { icon: "rotate-ccw", value: restore, label: "Restore-ready", sub: `${restore} with full body`, tone: "ok" },
+    { icon: "rotate-ccw", value: restore, label: (MOBILE ? "Has content" : "Restore-ready"), sub: `${restore} with full body`, tone: "ok" },
     integrityMetric(Mail.all),
     lastActivityMetric(Mail.runs),
   ]);
@@ -2461,7 +2473,7 @@ async function deleteEvent(ev) {
 const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null, runs: [], retentionDays: null };
 const conLetter = (it) => ((it.name || "#").trim()[0] || "#").toUpperCase();
 const conPrev = (it) => it.preview || {};
-const CON_FILTERS = [["all", "All"], ["email", "With email"], ["company", "With company"], ["restore", "Restore-ready"]];
+const CON_FILTERS = [["all", "All"], ["email", "With email"], ["company", "With company"], ["restore", (MOBILE ? "Has content" : "Restore-ready")]];
 async function renderContactsView(view) {
   Object.assign(Contacts, { all: [], selected: null, filter: "all", q: "", sort: "name", status: null });
   clear(view).append(el("div", { class: "con-page" },
@@ -2704,7 +2716,7 @@ function contactsRenderMetrics() {
   const lastRun = runs[0];
   row.append(
     conMetric("users", total, "Total contacts", "Across all directories"),
-    conMetric("rotate-ccw", restore, "Restore-ready", restore === total ? "100% of archive" : `${restore} of ${total} archived`, "ok"),
+    conMetric("rotate-ccw", restore, (MOBILE ? "Has content" : "Restore-ready"), restore === total ? "100% of archive" : `${restore} of ${total} archived`, "ok"),
     conMetric("shield-check", pct == null ? "—" : pct + "%", "Integrity verified",
       pct == null ? "Run verify to check" : `${v.verified} of ${v.checked} records`,
       pct == null ? "" : pct === 100 ? "ok" : "warn"),
@@ -2903,7 +2915,7 @@ async function renderContactDetail(it) {
       el("h2", { class: "con-detail-name truncate", text: it.name || "(no name)" }),
       p.email ? el("button", { class: "con-detail-email truncate", title: "Copy email", onclick: (e) => { navigator.clipboard?.writeText(p.email).then(() => toast("Email copied")).catch(() => {}); } }, el("span", { class: "truncate", text: p.email }), icon("share2", "icon-sm")) : (sub ? el("div", { class: "con-detail-sub truncate", text: sub }) : null),
       el("div", { class: "con-detail-chips" }, readonlyChip(),
-        (CAP.restore && it.has_body) ? el("span", { class: "chip ok" }, icon("rotate-ccw", "icon-sm"), "Restore-ready")
+        (CAP.restore && it.has_body) ? el("span", { class: "chip ok" }, icon("rotate-ccw", "icon-sm"), (MOBILE ? "Has content" : "Restore-ready"))
           : it.has_body ? el("span", { class: "chip muted" }, icon("check", "icon-sm"), "Body archived")
             : el("span", { class: "chip muted" }, "Header only"),
         verified ? el("span", { class: "chip ok" }, icon("shield-check", "icon-sm"), "Verified")
