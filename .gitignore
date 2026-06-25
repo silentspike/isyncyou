@@ -109,3 +109,6 @@ tools/bridge_*.py
 tools/graph_*.py
 tools/mint_write_token.py
 tools/graph-*.log
+
+# CI UI-smoke deps (package.json/-lock.json are committed; the installed tree is not)
+node_modules/
