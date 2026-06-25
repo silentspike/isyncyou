@@ -1448,153 +1448,21 @@ fn backup_account(
     gate: &Arc<Mutex<()>>,
 ) -> Result<(String, BackupDelta), String> {
     let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-    let token = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)?;
-    let acc = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}'"))?;
-    let archive_root = acc.archive_root.clone();
-    let store = Store::open(archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
-    let mut client = isyncyou_graph::GraphClient::new(token);
-    let now = unix_now();
-    // `&mut client` (Transport delta) must finish before the by-ref archive passes.
-    let r = isyncyou_connectors::incremental_sync_mail(
-        &mut client,
-        &store,
-        account,
-        &now,
-        &archive_root,
-    )
-    .map_err(|e| e.to_string())?;
-    let b = isyncyou_connectors::backup_message_bodies(&client, &store, account, &archive_root, 25)
-        .map_err(|e| e.to_string())?;
-    // Flanks (settings/rules/categories) need MailboxSettings.Read and rarely
-    // change — best-effort, so a flank hiccup never blocks the live-mail pass.
-    let flanks =
-        match isyncyou_connectors::backup_mailbox_flanks(&client, &store, account, &archive_root) {
-            Ok(f) => f.archived,
-            Err(e) => {
-                eprintln!("isyncyoud: mail flanks for {account} skipped: {e}");
-                0
-            }
-        };
-    // Calendar (#565 B8): keep the per-service archive fresh too — list events via
-    // /me/events (cheap; recurring masters not expanded), download new bodies +
-    // refresh the calendar/group/permission flanks. All best-effort so a calendar
-    // hiccup never blocks the mail pass. Uses the read token (Calendars.Read).
-    let cal = match isyncyou_connectors::events_sync_calendar(&mut client, &store, account, &now) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("isyncyoud: calendar sync for {account} skipped: {e}");
-            Default::default()
-        }
-    };
-    let cbodies =
-        isyncyou_connectors::backup_calendar_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let cflanks =
-        isyncyou_connectors::backup_calendar_flanks(&client, &store, account, &archive_root)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let _ =
-        isyncyou_connectors::backup_event_attachments(&client, &store, account, &archive_root, 25);
-    // Contacts (#566 A5): keep the per-service archive fresh — folderless + named
-    // folders via the contacts delta, download new contact JSON bodies, and fetch
-    // any newly-seen contact photos (so the photo avatar in the UI stays current).
-    // All best-effort so a contacts hiccup never blocks the mail/calendar passes.
-    // Uses the read token (Contacts.Read).
-    let con =
-        match isyncyou_connectors::incremental_sync_contacts(&mut client, &store, account, &now) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("isyncyoud: contacts sync for {account} skipped: {e}");
-                Default::default()
-            }
-        };
-    let conbodies =
-        isyncyou_connectors::backup_contacts_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let conphotos =
-        isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50)
-            .map(|r| r.downloaded)
-            .unwrap_or(0);
-    // ToDo (#567 B2): keep the per-service archive fresh — per-list task delta,
-    // task JSON bodies (gate for attachments), list flanks (isShared/wellknown),
-    // and task sub-resources (checklistItems/linkedResources/attachments). All
-    // best-effort so a todo hiccup never blocks the other passes. Read token
-    // (Tasks.Read).
-    let todo = match isyncyou_connectors::incremental_sync_todo(&mut client, &store, account, &now)
-    {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("isyncyoud: todo sync for {account} skipped: {e}");
-            Default::default()
-        }
-    };
-    let tbodies =
-        isyncyou_connectors::backup_todo_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let tflanks =
-        isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    // To Do task attachments need Tasks.ReadWrite — the `.../attachments` endpoint
-    // denies the read scope — so back them up with a write-scope client when one is
-    // cached (best-effort; without it, attachments are simply skipped).
-    let todo_att_client = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account)
-        .ok()
-        .map(isyncyou_graph::GraphClient::new);
-    let tsub = isyncyou_connectors::backup_task_subresources(
-        &client,
-        todo_att_client.as_ref(),
-        &store,
-        account,
-        &archive_root,
-        25,
-    )
-    .map(|r| r.archived)
-    .unwrap_or(0);
-    // OneNote (#568): keep the per-service archive fresh — page index (+ rich
-    // _pagemeta_ sidecars), page HTML bodies + embedded resources, and the
-    // notebook/section hierarchy. All best-effort. Read token (Notes.Read).
-    let note = match isyncyou_connectors::incremental_sync_onenote(
-        &mut client,
-        &store,
-        account,
-        &now,
-        Some(&archive_root),
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("isyncyoud: onenote sync for {account} skipped: {e}");
-            Default::default()
-        }
-    };
-    let nbodies =
-        isyncyou_connectors::backup_onenote_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let nres =
-        isyncyou_connectors::backup_onenote_resources(&client, &store, account, &archive_root, 50)
-            .map(|r| r.resources)
-            .unwrap_or(0);
-    let nhier =
-        isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root)
-            .map(|r| r.notebooks + r.section_groups + r.sections)
-            .unwrap_or(0);
-    // Notification delta (#576): count genuinely new content archived this pass.
-    // New mail bodies (not just delta upserts, which include flag/read changes) is
-    // the user-relevant "new mail" signal; same per service.
+    // Read-only cache fill across the five non-file services. Shared with the
+    // standalone mobile client via `engine::refresh_cache_account` (#89). The read
+    // token drives the pass; the restore token (best-effort) is used only for the
+    // ToDo attachments endpoint, which denies the read scope.
+    let read = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)?;
+    let write = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account).ok();
+    let c = isyncyou_engine::refresh_cache_account(cfg, account, read, write)?;
+    // Notification delta (#576): new mail bodies (not delta upserts, which include
+    // flag/read changes) is the user-relevant "new mail" signal; same per service.
     let delta = BackupDelta {
-        mail: b.downloaded as u64,
-        calendar: cbodies as u64,
-        contacts: conbodies as u64,
-        todo: tbodies as u64,
-        onenote: nbodies as u64,
+        mail: c.mail_bodies as u64,
+        calendar: c.calendar_bodies as u64,
+        contacts: c.contacts_bodies as u64,
+        todo: c.todo_bodies as u64,
+        onenote: c.onenote_bodies as u64,
     };
     let summary = format!(
         "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
@@ -1602,25 +1470,25 @@ fn backup_account(
          contacts: {} upserted, {} bodies, {} photos | \
          todo: {} indexed, {} bodies, {} flanks, {} sub | \
          onenote: {} pages, {} bodies, {} resources, {} containers",
-        r.folders,
-        r.upserted,
-        r.deleted,
-        b.downloaded,
-        flanks,
-        cal.upserted,
-        cbodies,
-        cflanks,
-        con.upserted,
-        conbodies,
-        conphotos,
-        todo.upserted,
-        tbodies,
-        tflanks,
-        tsub,
-        note.upserted,
-        nbodies,
-        nres,
-        nhier
+        c.mail_folders,
+        c.mail_upserted,
+        c.mail_deleted,
+        c.mail_bodies,
+        c.mail_flanks,
+        c.calendar_events,
+        c.calendar_bodies,
+        c.calendar_flanks,
+        c.contacts_upserted,
+        c.contacts_bodies,
+        c.contacts_photos,
+        c.todo_indexed,
+        c.todo_bodies,
+        c.todo_flanks,
+        c.todo_sub,
+        c.onenote_pages,
+        c.onenote_bodies,
+        c.onenote_resources,
+        c.onenote_containers,
     );
     Ok((summary, delta))
 }
