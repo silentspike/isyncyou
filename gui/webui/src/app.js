@@ -328,18 +328,34 @@ async function registerPushToken() {
   } catch (_) { /* best-effort: never block UI load on push */ }
 }
 /* Standalone/mobile (#89): the embedded engine's loopback API is fully gated by a
-   per-process session token. The native shell exposes it via window.AndroidSession;
-   on the desktop daemon the bridge is absent and the gate is off, so this is "". */
+   per-process session token. The native shell delivers it two ways — a JS bridge
+   (window.AndroidSession) and an `isy_session` loopback cookie set *before* the page
+   loads. The cookie is the robust carrier: it is readable synchronously at parse time
+   (the bridge can attach a tick later, racing the first synchronous script run on some
+   WebViews) and auto-rides fetch()/iframe/img subresources. On the desktop daemon
+   neither is present (the gate is off), so both resolve to "". */
+function cookieVal(name) {
+  try {
+    const m = (typeof document !== "undefined" ? document.cookie : "")
+      .match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : "";
+  } catch (_) { return ""; }
+}
 function sessionToken() {
-  try { return (window.AndroidSession && window.AndroidSession.token && window.AndroidSession.token()) || ""; }
-  catch (_) { return ""; }
+  try {
+    const viaBridge = (window.AndroidSession && window.AndroidSession.token && window.AndroidSession.token()) || "";
+    return viaBridge || cookieVal("isy_session");
+  } catch (_) { return cookieVal("isy_session"); }
 }
 function sessionHeaders() { const t = sessionToken(); return t ? { "X-Session-Token": t } : {}; }
-/* Standalone mobile app (#89 P6): the native shell exposes window.AndroidSession,
-   so the UI reads truthfully as a *cache/live companion* ("cached on this device"),
-   not a backup-of-record — the laptop holds the backup. Restore UI is already hidden
-   in this profile (no restore capability token is injected). */
-const MOBILE = typeof window !== "undefined" && !!window.AndroidSession;
+/* Standalone mobile app (#89 P6): detect the phone profile from the session signal
+   (cookie present, or the bridge) so the UI reads truthfully as a *cache/live
+   companion* ("cached on this device"), not a backup-of-record — the laptop holds the
+   backup. The cookie check is parse-time-reliable (the bridge alone races the first
+   synchronous script run on some WebViews). Restore UI is already hidden in this
+   profile (no restore capability token is injected). */
+const MOBILE = typeof window !== "undefined" &&
+  (!!window.AndroidSession || cookieVal("isy_session") !== "");
 async function api(path) { const r = await fetch(path, { headers: sessionHeaders() }); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
 async function post(path, capToken) {
   const headers = sessionHeaders();
@@ -3604,8 +3620,15 @@ async function renderSettingsView(view) {
     const [cfg, st] = await Promise.all([api("/api/v1/settings").catch(() => ({})), api("/api/v1/sync/state").catch(() => ({}))]);
     const sy = cfg.sync || {}, acc = (cfg.accounts || []).find(a => a.id === App.account) || {};
     clear(body);
-    body.append(el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Account" }),
-      kvList([["User", acc.username || App.account], ["Sync root", acc.sync_root], ["Archive root", acc.archive_root], ["Mount point", acc.mount_point || "—"]])));
+    const acctCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Account" }),
+      kvList([["User", acc.username || App.account], ["Sync root", acc.sync_root], ["Archive root", acc.archive_root], ["Mount point", acc.mount_point || "—"]]));
+    // The sidebar account chip (which opens sign-in / reconnect) is hidden in the phone
+    // bottom-nav layout, so surface the same device-code account menu here too —
+    // Settings is reachable on mobile. Without this a standalone phone (#89) would have
+    // no way to sign in. Shown whenever account-auth is wired (mobile live + daemon).
+    if (CAP.account) acctCard.append(el("button", { class: "btn", style: "margin-top:12px", onclick: openAccountSwitcher },
+      icon("rotate-ccw", "icon-sm"), "Sign in / reconnect account"));
+    body.append(acctCard);
     const syncCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Sync" }),
       kvList([["Scheduled", st.enabled ? (st.paused ? "paused" : "running") : "off"], ["Trash retention", (sy.trash_retention_days ?? "—") + " days"], ["Body index (FTS)", sy.body_index ? "on" : "off"], ["Change source", sy.change_source || "—"]]));
     if (st.enabled && CAP.sync) syncCard.append(el("div", { style: "display:flex;gap:8px;margin-top:12px" },

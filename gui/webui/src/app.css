@@ -667,7 +667,12 @@ a:hover { text-decoration: underline; }
 .mr-thread-unread { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2); flex: none; }
 /* account menu (#68) */
 .acct-menu-wrap { position: fixed; inset: 0; z-index: 80; }
-.acct-menu { position: fixed; left: var(--sp-3); bottom: 72px; width: 320px; max-width: calc(100vw - 24px); max-height: 70vh; overflow: auto;
+/* MUST sit above the .scrim (z-index:70) — the scrim is a transparent full-screen
+   click-catcher rendered as a sibling; without an explicit z-index here the panel is
+   z-index:auto and the positioned scrim paints on top of it, swallowing every tap on
+   the menu's buttons (reconnect / sign-out were unclickable; only the curl-driven API
+   path was ever exercised). Found on-device while wiring standalone sign-in (#89). */
+.acct-menu { z-index: 71; position: fixed; left: var(--sp-3); bottom: 72px; width: 320px; max-width: calc(100vw - 24px); max-height: 70vh; overflow: auto;
   background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md, 12px); box-shadow: 0 12px 40px rgba(0,0,0,.5); }
 .acct-menu-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3); font-weight: 600; border-bottom: 1px solid var(--line); }
 .acct-menu-body { padding: var(--sp-2); display: flex; flex-direction: column; gap: 2px; }
