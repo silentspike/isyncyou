@@ -248,6 +248,94 @@ fn content_id(headers: &[u8]) -> Option<String> {
     }
 }
 
+/// Metadata for one `Content-Disposition: attachment` MIME part (#562). `index`
+/// is the part's position in document order, stable for a given `.eml`, and is
+/// what `extract_attachment`/`GET /api/v1/attachment` address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentMeta {
+    pub index: usize,
+    pub filename: String,
+    pub content_type: String,
+    /// Decoded size in bytes.
+    pub size: usize,
+}
+
+struct RawAttachment {
+    filename: String,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+/// Recursively collect every `Content-Disposition: attachment` part in document
+/// order (decoding each per its transfer encoding). Inline images / alternatives
+/// are skipped — only real attachments.
+fn collect_attachments(headers: &[u8], body: &[u8], out: &mut Vec<RawAttachment>) {
+    let ctype = header_value(headers, "content-type").unwrap_or_default();
+    let ctype_l = ctype.to_ascii_lowercase();
+
+    if ctype_l.starts_with("multipart/") {
+        if let Some(boundary) = ct_param(&ctype, "boundary") {
+            for part in split_multipart(body, &boundary) {
+                let (ph, pb) = split_headers(&part);
+                collect_attachments(&ph, pb, out);
+            }
+        }
+        return;
+    }
+
+    let disp = header_value(headers, "content-disposition").unwrap_or_default();
+    if !disp
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("attachment")
+    {
+        return;
+    }
+    let cte = header_value(headers, "content-transfer-encoding")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let filename = ct_param(&disp, "filename")
+        .or_else(|| ct_param(&ctype, "name"))
+        .unwrap_or_else(|| format!("attachment-{}", out.len() + 1));
+    let mut content_type = ctype_l.split(';').next().unwrap_or("").trim().to_string();
+    if content_type.is_empty() {
+        content_type = "application/octet-stream".to_string();
+    }
+    let data = decode_body(body, &cte);
+    out.push(RawAttachment {
+        filename,
+        content_type,
+        data,
+    });
+}
+
+/// List every attachment part of an archived `.eml`, in stable document order.
+pub fn list_attachments(eml: &[u8]) -> Vec<AttachmentMeta> {
+    let mut raw = Vec::new();
+    let (h, b) = split_headers(eml);
+    collect_attachments(&h, b, &mut raw);
+    raw.into_iter()
+        .enumerate()
+        .map(|(index, a)| AttachmentMeta {
+            index,
+            filename: a.filename,
+            content_type: a.content_type,
+            size: a.data.len(),
+        })
+        .collect()
+}
+
+/// Extract the `index`-th attachment of an archived `.eml` as
+/// `(filename, content_type, decoded_bytes)`. `None` if the index is out of range.
+pub fn extract_attachment(eml: &[u8], index: usize) -> Option<(String, String, Vec<u8>)> {
+    let mut raw = Vec::new();
+    let (h, b) = split_headers(eml);
+    collect_attachments(&h, b, &mut raw);
+    raw.into_iter()
+        .nth(index)
+        .map(|a| (a.filename, a.content_type, a.data))
+}
+
 /// Split a MIME entity into its raw header block and body bytes at the first
 /// blank line (CRLF or LF).
 fn split_headers(data: &[u8]) -> (Vec<u8>, &[u8]) {
@@ -383,7 +471,7 @@ fn decode_body(body: &[u8], cte: &str) -> Vec<u8> {
 }
 
 /// Decode standard base64, ignoring whitespace/newlines and stopping at padding.
-fn base64_decode(data: &[u8]) -> Vec<u8> {
+pub(crate) fn base64_decode(data: &[u8]) -> Vec<u8> {
     fn val(b: u8) -> Option<u8> {
         match b {
             b'A'..=b'Z' => Some(b - b'A'),
@@ -732,5 +820,39 @@ mod tests {
         assert!(s.ends_with("\r\n\r\nthe body"));
         // never panics on header-less input
         let _ = set_message_id(b"not an email", "<y@restore.invalid>");
+    }
+
+    #[test]
+    fn lists_and_extracts_attachments_from_multipart_mixed() {
+        // "Hello PDF" base64-encoded
+        let eml = b"From: a@b.com\r\nSubject: Has attach\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\nContent-Type: text/plain\r\n\r\nbody text\r\n\
+--BOUND\r\nContent-Type: application/pdf; name=\"doc.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8gUERG\r\n\
+--BOUND--\r\n";
+
+        let list = list_attachments(eml);
+        assert_eq!(list.len(), 1, "exactly one attachment");
+        assert_eq!(list[0].index, 0);
+        assert_eq!(list[0].filename, "doc.pdf");
+        assert_eq!(list[0].content_type, "application/pdf");
+        assert_eq!(list[0].size, 9); // "Hello PDF"
+
+        let (name, ct, bytes) = extract_attachment(eml, 0).expect("attachment 0");
+        assert_eq!(name, "doc.pdf");
+        assert_eq!(ct, "application/pdf");
+        assert_eq!(bytes, b"Hello PDF");
+
+        // out of range → None
+        assert!(extract_attachment(eml, 1).is_none());
+    }
+
+    #[test]
+    fn no_attachments_for_a_plain_message() {
+        let eml = b"From: a@b.com\r\nSubject: Plain\r\nContent-Type: text/plain\r\n\r\njust text";
+        assert!(list_attachments(eml).is_empty());
+        assert!(extract_attachment(eml, 0).is_none());
     }
 }

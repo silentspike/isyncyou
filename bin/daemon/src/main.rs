@@ -14,6 +14,7 @@ use isyncyou_core::Config;
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::Store;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +46,16 @@ struct Args {
     /// action). 0 = off. Default 6h.
     #[arg(long, default_value_t = 21_600)]
     token_refresh_secs: u64,
+}
+
+/// The startup line that announces the capability gate. SECURITY (AUDIT-1, #72):
+/// it reports only that protection is enabled and the token's length — NEVER the
+/// token value, which gates every destructive write. Kept as a pure function so a
+/// regression test can pin the format.
+fn cap_status_line(token_len: usize) -> String {
+    format!(
+        "isyncyoud: restore + sharing + verify enabled; capability token: set ({token_len} bytes)"
+    )
 }
 
 fn main() {
@@ -246,29 +257,53 @@ fn run(args: &Args) -> Result<(), String> {
         }
     }
 
-    // A per-process capability token gates the destructive restore POST.
-    let cap_token = mint_cap_token();
-    let handler: Arc<dyn isyncyou_webui::RestoreHandler> =
-        Arc::new(DaemonRestore { cfg: cfg.clone() });
-    // A separate token gates the outbound-share POST (#494) — distinct blast radius.
-    let share_cap_token = mint_cap_token();
-    let share_handler: Arc<dyn isyncyou_webui::ShareHandler> =
-        Arc::new(DaemonShare { cfg: cfg.clone() });
-    // A separate token gates the integrity-verify POST (#528). Local-only (no
-    // cloud mutation), but kept distinct so a leaked token has a small blast radius.
-    let verify_cap_token = mint_cap_token();
-    let verify_handler: Arc<dyn isyncyou_webui::VerifyHandler> =
-        Arc::new(DaemonVerify { cfg: cfg.clone() });
-    eprintln!("isyncyoud: restore + sharing + verify enabled; capability token: {cap_token}");
+    // Capability tokens for the daemon-only destructive actions; the live-handler
+    // tokens are minted inside build_live_router (#89).
+    let cap_token = isyncyou_app_host::mint_cap_token();
+    let share_cap_token = isyncyou_app_host::mint_cap_token();
+    let push_cap_token = isyncyou_app_host::mint_cap_token();
+    // Live cloud-poll interval (#559): seeded from config, adjusted live by the
+    // settings POST, read by the sync loop each tick.
+    let live_interval = Arc::new(AtomicU64::new(cfg.sync.poll_interval_secs.max(1)));
+    // Push notifier (#576) — shared with the sync loop so a completed backup notifies
+    // the phone (FCM). Daemon-only: the standalone mobile profile never wires it.
+    let push_notifier = Arc::new(isyncyou_app_host::DaemonPush::new(&cfg));
+    // SSE change bus (#559): the sync loop notifies it after each pass; the web UI
+    // subscribes at /api/v1/events and refetches the active view.
+    let events = Arc::new(isyncyou_webui::EventBus::new());
+    // SECURITY: never log the capability token itself — it gates every destructive
+    // write. Log only that protection is enabled (format pinned by cap_status_line).
+    eprintln!("{}", cap_status_line(cap_token.len()));
 
-    let mut router = if args.sync_secs > 0 {
-        isyncyou_webui::Router::with_gate(cfg.clone(), gate.clone())
+    // The shared "live companion" router (#89): read endpoints + live-write handlers
+    // + account-auth + settings + events. The daemon extends it with the daemon-only
+    // restore/share/push handlers the standalone mobile profile omits.
+    let gate_opt = if args.sync_secs > 0 {
+        Some(gate.clone())
     } else {
-        isyncyou_webui::Router::new(cfg.clone())
-    }
-    .with_restore(handler, cap_token.clone())
-    .with_share(share_handler, share_cap_token)
-    .with_verify(verify_handler, verify_cap_token);
+        None
+    };
+    let mut router = isyncyou_app_host::build_live_router(
+        cfg.clone(),
+        gate_opt,
+        events.clone(),
+        args.config.clone(),
+        live_interval.clone(),
+    )
+    .with_restore(
+        Arc::new(isyncyou_app_host::DaemonRestore::new(cfg.clone()))
+            as Arc<dyn isyncyou_webui::RestoreHandler>,
+        cap_token.clone(),
+    )
+    .with_share(
+        Arc::new(isyncyou_app_host::DaemonShare::new(cfg.clone()))
+            as Arc<dyn isyncyou_webui::ShareHandler>,
+        share_cap_token,
+    )
+    .with_push(
+        push_notifier.clone() as Arc<dyn isyncyou_webui::PushHandler>,
+        push_cap_token,
+    );
 
     // Expose in-flight FUSE hydrations to the status bar (Linux placeholder mounts).
     #[cfg(target_os = "linux")]
@@ -279,9 +314,11 @@ fn run(args: &Args) -> Result<(), String> {
 
     // When scheduled sync runs, share a Scheduler so the UI can pause/resume/now.
     if args.sync_secs > 0 {
-        let secs = args.sync_secs;
         let sched = Arc::new(Scheduler::default());
-        eprintln!("isyncyoud: background sync every {secs}s (pausable from the UI)");
+        eprintln!(
+            "isyncyoud: cloud-poll sync enabled, interval {}s (live-adjustable from the UI)",
+            live_interval.load(Ordering::Relaxed)
+        );
         // Event-driven accelerator (#331): one change-source watcher per account
         // wakes this sync loop early on local changes (honoring
         // `cfg.sync.change_source` — inotify by default, the privileged mount-wide
@@ -293,7 +330,9 @@ fn run(args: &Args) -> Result<(), String> {
             move || watch_loop(cfg_w, sched_w)
         });
         let (cfg2, gate2, sched2) = (cfg, gate, sched.clone());
-        std::thread::spawn(move || sync_loop(cfg2, gate2, secs, sched2));
+        let (interval2, events2) = (live_interval.clone(), events.clone());
+        let push2 = push_notifier.clone();
+        std::thread::spawn(move || sync_loop(cfg2, gate2, interval2, sched2, events2, push2));
         router = router.with_sync_control(sched, cap_token);
     }
 
@@ -320,105 +359,6 @@ fn selected_socket(tcp: bool, socket: Option<PathBuf>) -> Option<PathBuf> {
 #[cfg(not(unix))]
 fn selected_socket(_tcp: bool, _socket: Option<PathBuf>) -> Option<PathBuf> {
     None
-}
-
-/// Mint a per-process capability token from `/dev/urandom` (hex), with a
-/// pid-based fallback. Required on the destructive restore POST.
-fn mint_cap_token() -> String {
-    use std::io::Read;
-    let mut buf = [0u8; 16];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
-        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
-        Err(_) => format!("isy-{}-fallback", std::process::id()),
-    }
-}
-
-/// The daemon's destructive-action handler: re-create an archived item in the
-/// cloud using the cached `login --write` (restore-scoped) token.
-struct DaemonRestore {
-    cfg: Config,
-}
-impl isyncyou_webui::RestoreHandler for DaemonRestore {
-    fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String> {
-        // Refuse a not-yet-ledger-migrated service before resolving a token, so the
-        // web UI gets the clear "not crash-safe yet" message. (Engine re-checks.)
-        if !isyncyou_engine::cloud_restore_service_supported(service) {
-            return Err(isyncyou_engine::unsupported_cloud_restore_service_error(
-                service,
-            ));
-        }
-        let token = isyncyou_engine::auth::resolve_cached_restore_token(&self.cfg, account)?;
-        isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)
-    }
-}
-
-/// Web-UI archive integrity verify (#528): re-hash every archived body and
-/// persist per-item status. Local-only (reads on-disk bodies, writes the store),
-/// so it needs no token/network and is always available.
-struct DaemonVerify {
-    cfg: Config,
-}
-impl isyncyou_webui::VerifyHandler for DaemonVerify {
-    fn verify(&self, account: &str) -> Result<String, String> {
-        isyncyou_engine::verify_account(&self.cfg, account).map(|r| r.summary())
-    }
-}
-
-/// Web-UI outbound sharing (#494): create a sharing link for a OneDrive item by id
-/// using the cached write token (`Files.ReadWrite`). Only OneDrive drive items are
-/// shareable via `createLink`.
-struct DaemonShare {
-    cfg: Config,
-}
-impl isyncyou_webui::ShareHandler for DaemonShare {
-    fn share(
-        &self,
-        account: &str,
-        service: &str,
-        id: &str,
-        link_type: &str,
-        scope: &str,
-    ) -> Result<String, String> {
-        if service != "onedrive" {
-            return Err(format!(
-                "sharing is only supported for OneDrive items, not '{service}'"
-            ));
-        }
-        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
-        isyncyou_graph::GraphClient::new(token)
-            .create_link(id, link_type, scope, None, None, None)
-            .map_err(|e| e.to_string())
-    }
-    fn invite(
-        &self,
-        account: &str,
-        service: &str,
-        id: &str,
-        emails: &[String],
-        role: &str,
-    ) -> Result<String, String> {
-        if service != "onedrive" {
-            return Err(format!(
-                "sharing is only supported for OneDrive items, not '{service}'"
-            ));
-        }
-        let roles: &[&str] = if role == "write" {
-            &["write"]
-        } else {
-            &["read"]
-        };
-        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
-        // Invite named people: require sign-in + send the invitation email.
-        isyncyou_graph::GraphClient::new(token)
-            .invite(id, emails, roles, true, true, "", None, None)
-            .map(|ids| {
-                format!(
-                    "invited {} recipient(s) ({role})",
-                    emails.len().max(ids.len())
-                )
-            })
-            .map_err(|e| e.to_string())
-    }
 }
 
 fn unix_now() -> String {
@@ -665,12 +605,25 @@ fn recover_pending_restores(cfg: &Config) {
     }
 }
 
-/// Forever: wait up to `secs` (or until the UI triggers/pauses), then run one sync
-/// pass per account unless paused. An explicit `now` trigger always runs. A pass
-/// that errors (no cached token, a network blip) is logged and never kills the loop.
-fn sync_loop(cfg: Config, gate: Arc<Mutex<()>>, secs: u64, sched: Arc<Scheduler>) {
+/// Forever: wait up to the live cloud-poll interval (or until the UI triggers/
+/// pauses), then run one sync pass per account unless paused. The interval is read
+/// from `interval` each tick, so the UI's settings slider takes effect on the next
+/// wait without a restart (`429`/`Retry-After` backoff is handled inside the Graph
+/// client's retry). After a pass that ran, `events` is notified so SSE subscribers
+/// refetch. An explicit `now` trigger always runs. A pass that errors (no cached
+/// token, a network blip) is logged and never kills the loop.
+fn sync_loop(
+    cfg: Config,
+    gate: Arc<Mutex<()>>,
+    interval: Arc<AtomicU64>,
+    sched: Arc<Scheduler>,
+    events: Arc<isyncyou_webui::EventBus>,
+    push: Arc<isyncyou_app_host::DaemonPush>,
+) {
     let host = local_host();
     loop {
+        // read the live interval each tick so a UI slider change applies promptly
+        let secs = interval.load(Ordering::Relaxed).max(1);
         // wait for the interval to elapse OR an explicit trigger to arrive
         let run = {
             let guard = sched.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -691,7 +644,26 @@ fn sync_loop(cfg: Config, gate: Arc<Mutex<()>>, secs: u64, sched: Arc<Scheduler>
                 Ok(summary) => eprintln!("isyncyoud: sync {} -> {summary}", acc.id),
                 Err(e) => eprintln!("isyncyoud: sync {} skipped: {e}", acc.id),
             }
+            // Keep the per-service archive fresh too (live client, #563 AC-5): an
+            // incremental mail pass so new cloud mail lands in the store and the
+            // SSE notify below surfaces it without a manual reload.
+            match backup_account(&cfg, &acc.id, &gate) {
+                Ok((summary, delta)) => {
+                    eprintln!("isyncyoud: backup {} -> {summary}", acc.id);
+                    // Push (#576): notify the phone when new content was archived. The
+                    // FCM token must have been registered by the UI; otherwise no-op.
+                    if let Some(body) = delta.notification() {
+                        let n = push.notify("iSyncYou — backup complete", &body);
+                        if n > 0 {
+                            eprintln!("isyncyoud: push '{body}' sent to {n} device(s)");
+                        }
+                    }
+                }
+                Err(e) => eprintln!("isyncyoud: backup {} skipped: {e}", acc.id),
+            }
         }
+        // wake SSE subscribers so the UI refetches the active view (near-real-time)
+        events.notify();
     }
 }
 
@@ -768,6 +740,105 @@ fn sync_account(
         eprintln!("isyncyoud: could not record run for {account}: {e}");
     }
     result.map(|_| summary)
+}
+
+/// One incremental **mail backup** pass for the live client (#563 AC-5). Uses the
+/// cached **read** token (`Mail.Read` + `MailboxSettings.Read`, S-P4.1), runs the
+/// per-folder delta (cheap when idle), downloads bodies for newly-seen messages
+/// (capped per pass so a burst can't stall the loop), and refreshes the mailbox
+/// flank snapshots. Keeps the store/archive current so the SSE notify surfaces new
+/// mail. Read-only; a missing token is a clean skip (logged, never fatal). Mail is
+/// the pilot — other services follow their own rollout stories.
+/// What a backup pass newly archived, for the push notification (#576). Only the
+/// counts the user wants to be told about ("3 new emails backed up").
+#[derive(Default)]
+struct BackupDelta {
+    mail: u64,
+    calendar: u64,
+    contacts: u64,
+    todo: u64,
+    onenote: u64,
+}
+impl BackupDelta {
+    fn total(&self) -> u64 {
+        self.mail + self.calendar + self.contacts + self.todo + self.onenote
+    }
+    /// A short human notification body, or `None` when nothing new was archived.
+    fn notification(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        let one_or_many =
+            |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut parts = Vec::new();
+        if self.mail > 0 {
+            parts.push(one_or_many(self.mail, "email", "emails"));
+        }
+        if self.calendar > 0 {
+            parts.push(one_or_many(self.calendar, "event", "events"));
+        }
+        if self.contacts > 0 {
+            parts.push(one_or_many(self.contacts, "contact", "contacts"));
+        }
+        if self.todo > 0 {
+            parts.push(one_or_many(self.todo, "task", "tasks"));
+        }
+        if self.onenote > 0 {
+            parts.push(one_or_many(self.onenote, "note", "notes"));
+        }
+        Some(format!("{} backed up", parts.join(", ")))
+    }
+}
+
+fn backup_account(
+    cfg: &Config,
+    account: &str,
+    gate: &Arc<Mutex<()>>,
+) -> Result<(String, BackupDelta), String> {
+    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    // Read-only cache fill across the five non-file services. Shared with the
+    // standalone mobile client via `engine::refresh_cache_account` (#89). The read
+    // token drives the pass; the restore token (best-effort) is used only for the
+    // ToDo attachments endpoint, which denies the read scope.
+    let read = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)?;
+    let write = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account).ok();
+    let c = isyncyou_engine::refresh_cache_account(cfg, account, read, write)?;
+    // Notification delta (#576): new mail bodies (not delta upserts, which include
+    // flag/read changes) is the user-relevant "new mail" signal; same per service.
+    let delta = BackupDelta {
+        mail: c.mail_bodies as u64,
+        calendar: c.calendar_bodies as u64,
+        contacts: c.contacts_bodies as u64,
+        todo: c.todo_bodies as u64,
+        onenote: c.onenote_bodies as u64,
+    };
+    let summary = format!(
+        "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
+         calendar: {} events, {} bodies, {} flanks | \
+         contacts: {} upserted, {} bodies, {} photos | \
+         todo: {} indexed, {} bodies, {} flanks, {} sub | \
+         onenote: {} pages, {} bodies, {} resources, {} containers",
+        c.mail_folders,
+        c.mail_upserted,
+        c.mail_deleted,
+        c.mail_bodies,
+        c.mail_flanks,
+        c.calendar_events,
+        c.calendar_bodies,
+        c.calendar_flanks,
+        c.contacts_upserted,
+        c.contacts_bodies,
+        c.contacts_photos,
+        c.todo_indexed,
+        c.todo_bodies,
+        c.todo_flanks,
+        c.todo_sub,
+        c.onenote_pages,
+        c.onenote_bodies,
+        c.onenote_resources,
+        c.onenote_containers,
+    );
+    Ok((summary, delta))
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
@@ -955,19 +1026,27 @@ impl isyncyou_fuse::Refresher for GraphRefresher {
     fn refresh(&self) -> Result<Vec<isyncyou_store::Item>, String> {
         let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         let token = isyncyou_engine::auth::resolve_cached_read_token(&self.cfg, &self.account)?;
-        let store_path = self
+        let archive_root = self
             .cfg
             .accounts
             .iter()
             .find(|a| a.id == self.account)
-            .map(|a| a.archive_root.join(".isyncyou-store.db"))
+            .map(|a| a.archive_root.clone())
             .ok_or_else(|| format!("no account '{}'", self.account))?;
-        let store = Store::open(store_path).map_err(|e| e.to_string())?;
+        let store =
+            Store::open(archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
         let mut client = isyncyou_graph::GraphClient::new(token);
         let mut map = MappingTable::new();
         let now = unix_now();
-        isyncyou_connectors::incremental_sync(&mut client, &store, &mut map, &self.account, &now)
-            .map_err(|e| e.to_string())?;
+        isyncyou_connectors::incremental_sync(
+            &mut client,
+            &store,
+            &mut map,
+            &self.account,
+            &now,
+            &archive_root,
+        )
+        .map_err(|e| e.to_string())?;
         store
             .all_items_by_service(&self.account, "onedrive")
             .map_err(|e| e.to_string())
@@ -1195,6 +1274,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backup_delta_notification_text() {
+        // Nothing new → no notification (the loop stays silent).
+        assert_eq!(BackupDelta::default().notification(), None);
+        // Singular vs plural per service.
+        assert_eq!(
+            BackupDelta {
+                mail: 1,
+                ..Default::default()
+            }
+            .notification()
+            .as_deref(),
+            Some("1 email backed up")
+        );
+        assert_eq!(
+            BackupDelta {
+                mail: 3,
+                ..Default::default()
+            }
+            .notification()
+            .as_deref(),
+            Some("3 emails backed up")
+        );
+        // Multiple services join in a stable order.
+        assert_eq!(
+            BackupDelta {
+                mail: 2,
+                calendar: 1,
+                onenote: 4,
+                ..Default::default()
+            }
+            .notification()
+            .as_deref(),
+            Some("2 emails, 1 event, 4 notes backed up")
+        );
+    }
+
+    #[test]
+    fn cap_status_line_never_contains_the_token() {
+        // AUDIT-1 (#72) regression freeze: the startup line announces only that the
+        // capability gate is enabled + the token length, never the token itself.
+        let token = "TOPSECRET-do-not-ever-log-this-cap-token";
+        let line = cap_status_line(token.len());
+        assert!(
+            !line.contains(token),
+            "startup line leaked the token: {line}"
+        );
+        assert!(
+            !line.contains("TOPSECRET"),
+            "startup line leaked token bytes: {line}"
+        );
+        assert!(
+            line.contains(&format!("{} bytes", token.len())),
+            "should report the length: {line}"
+        );
+    }
+
+    #[test]
     fn parses_defaults() {
         let a = Args::try_parse_from(["isyncyoud"]).unwrap();
         assert_eq!(
@@ -1331,19 +1467,6 @@ mod tests {
             OverlayStatus::Unknown
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn restore_handler_refuses_non_restorable_service_before_token_lookup() {
-        // The web-UI restore handler refuses a service with no crash-safe cloud restore
-        // before any cached-token lookup (so no token is needed to get the clear
-        // message). All five backup services are ledger-backed; a non-backup service
-        // such as onedrive is refused here.
-        let h = DaemonRestore {
-            cfg: Config::default(),
-        };
-        let err = isyncyou_webui::RestoreHandler::restore(&h, "a", "onedrive", "x").unwrap_err();
-        assert!(err.contains("not crash-safe yet"), "onedrive: got: {err}");
     }
 
     #[cfg(target_os = "linux")]

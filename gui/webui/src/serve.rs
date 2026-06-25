@@ -1,22 +1,39 @@
 //! Minimal localhost HTTP/1.1 adapter for [`Router`] (plan §25).
 //!
 //! Hand-rolled over `std::net` — no web framework — because the surface is tiny:
-//! GET requests plus a few capability-token-guarded POSTs, one response per
-//! connection (`Connection: close`).
-//! The loop is **single-threaded**: a personal localhost UI serves one user, and
-//! handling requests sequentially means each per-request [`Store`] open holds the
-//! single-instance lock only momentarily, with no contention. (The production
-//! daemon, which keeps stores open, will front this with an async server.)
+//! GET requests plus a few capability-token-guarded POSTs, mostly one response
+//! per connection (`Connection: close`).
+//! The accept loop is **thread-per-connection** (capped at [`MAX_CONNS`]): a
+//! personal localhost UI serves one user, but the SSE `/api/v1/events` stream
+//! ([`handle_sse`]) holds its connection open, so normal requests must keep being
+//! served concurrently. Each per-request [`Store`] open still holds the
+//! single-instance lock only momentarily; the daemon serializes store access via
+//! the router gate.
 //!
 //! Two transports share one [`handle`]: TCP loopback ([`serve`]) for the browser
 //! UI, and a **Unix-domain socket** ([`serve_unix`]) for owner-only local access
 //! where filesystem permissions (mode 0600) are the access control.
 
-use crate::{ApiRequest, ApiResponse, Router};
+use crate::{ApiRequest, ApiResponse, EventBus, Router};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// Hard cap on concurrent connection threads (safety against runaway opens on a
+/// loopback-only server). SSE streams count against this, so it is generous.
+const MAX_CONNS: usize = 128;
+static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements the live-connection counter when a connection thread ends.
+struct ConnGuard;
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// A connection we can both read the request from and write the response to.
 /// We need a second read handle (for the `BufReader`) while still writing to the
@@ -47,8 +64,18 @@ enum AccessPolicy {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct RequestHeaders {
     cap_token: Option<String>,
+    session_token: Option<String>,
+    cookie: Option<String>,
     host: Option<String>,
     origin: Option<String>,
+}
+
+/// Extract a cookie value by name from a raw `Cookie:` header (`a=1; b=2`).
+fn cookie_value(header: &str, name: &str) -> Option<String> {
+    header.split(';').find_map(|pair| {
+        let (k, v) = pair.trim().split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
 }
 
 /// Parse an HTTP request line (`"GET /path?x=1 HTTP/1.1"`) into `(method, target)`.
@@ -188,6 +215,10 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             let v = v.trim().to_string();
             if k.eq_ignore_ascii_case("x-capability-token") {
                 headers.cap_token = Some(v);
+            } else if k.eq_ignore_ascii_case("x-session-token") {
+                headers.session_token = Some(v);
+            } else if k.eq_ignore_ascii_case("cookie") {
+                headers.cookie = Some(v);
             } else if k.eq_ignore_ascii_case("host") {
                 headers.host = Some(v);
             } else if k.eq_ignore_ascii_case("origin") {
@@ -195,45 +226,138 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             }
         }
     }
-    let resp = match parse_request_line(request_line.trim_end()) {
-        Some((method, target)) => match validate_request_headers(policy, &method, &headers) {
-            Some(resp) => resp,
-            None => router.route(
-                &ApiRequest::new(&method, &target).with_cap_token(headers.cap_token.clone()),
-            ),
-        },
-        None => ApiResponse {
-            status: 400,
-            content_type: "text/plain".into(),
-            body: b"bad request line".to_vec(),
-            headers: Vec::new(),
-        },
+    let (method, target) = match parse_request_line(request_line.trim_end()) {
+        Some(mt) => mt,
+        None => {
+            let resp = ApiResponse {
+                status: 400,
+                content_type: "text/plain".into(),
+                body: b"bad request line".to_vec(),
+                headers: Vec::new(),
+            };
+            stream.write_all(&format_http(&resp))?;
+            return stream.flush();
+        }
     };
+    // Local-access policy (loopback host / local origin) runs first, for every path.
+    if let Some(resp) = validate_request_headers(policy, &method, &headers) {
+        stream.write_all(&format_http(&resp))?;
+        return stream.flush();
+    }
+    // Effective session token (#89): an explicit `X-Session-Token` header (used by
+    // the web UI's fetch() calls) OR a loopback `isy_session` cookie set natively by
+    // the Android shell — the cookie auto-rides iframe/img/EventSource subresource
+    // requests, so embedded resources are gated without per-URL `_st` threading.
+    let session_token = headers.session_token.clone().or_else(|| {
+        headers
+            .cookie
+            .as_deref()
+            .and_then(|c| cookie_value(c, "isy_session"))
+    });
+    let req = ApiRequest::new(&method, &target)
+        .with_cap_token(headers.cap_token.clone())
+        .with_session_token(session_token);
+    // SSE change stream: a long-lived connection that bypasses the one-shot
+    // response model. Reached only after header validation, so the same
+    // loopback/origin rules apply; needs the injected EventBus (daemon only).
+    if method == "GET" && req.path == "/api/v1/events" {
+        // Mobile profile (#89): SSE is a data route, so it is session-gated too.
+        // EventSource can't send headers, so the token rides the `_st` query param
+        // (the header is honored as well). No-op on the desktop daemon.
+        let st_query = req
+            .query
+            .iter()
+            .find(|(k, _)| k == "_st")
+            .map(|(_, v)| v.as_str());
+        let provided = req.session_token.as_deref().or(st_query);
+        if !router.session_authorized(provided) {
+            let resp = ApiResponse::error(401, "missing or invalid session token");
+            stream.write_all(&format_http(&resp))?;
+            return stream.flush();
+        }
+        if let Some(bus) = router.events_bus() {
+            return handle_sse(stream, bus);
+        }
+    }
+    let resp = router.route(&req);
     stream.write_all(&format_http(&resp))?;
     stream.flush()
 }
 
-/// Bind `addr` and serve `router` forever (single-threaded). Returns only on a
-/// fatal bind/accept error.
-pub fn serve(addr: &str, router: Router) -> std::io::Result<()> {
+/// Stream Server-Sent Events until the client disconnects. Writes the event-stream
+/// headers, an initial comment, then a `change` frame whenever [`EventBus`] is
+/// notified, with a heartbeat comment every 15 s so dead peers are detected. The
+/// `flush` error on a closed peer ends the loop (and the connection thread).
+fn handle_sse<S: Conn>(stream: &mut S, bus: &EventBus) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+        Content-Type: text/event-stream\r\n\
+        Cache-Control: no-store\r\n\
+        Connection: keep-alive\r\n\
+        X-Content-Type-Options: nosniff\r\n\r\n";
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(b": connected\n\n")?;
+    stream.flush()?;
+    let mut last = bus.generation();
+    loop {
+        let g = bus.wait_change(last, std::time::Duration::from_secs(15));
+        if g != last {
+            last = g;
+            stream
+                .write_all(format!("event: change\ndata: {{\"generation\":{g}}}\n\n").as_bytes())?;
+        } else {
+            stream.write_all(b": keep-alive\n\n")?; // heartbeat
+        }
+        stream.flush()?; // Err when the peer closed -> end the stream
+    }
+}
+
+/// Bind a **loopback** TCP address, refusing any non-loopback host. Use `:0` for an
+/// OS-assigned free port and read it from `local_addr()` (the standalone mobile
+/// client does this, then hands the port to its WebView, #89).
+pub fn bind_loopback(addr: &str) -> std::io::Result<TcpListener> {
     if !is_loopback_bind_addr(addr) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "refusing non-loopback TCP bind address; use --socket for owner-only local access",
         ));
     }
-    let listener = TcpListener::bind(addr)?;
-    let local = listener.local_addr()?;
-    eprintln!("iSyncYou web UI listening on http://{local}/");
+    TcpListener::bind(addr)
+}
+
+/// Serve `router` forever on an already-bound loopback `listener`. Returns only on a
+/// fatal accept error. Lets a caller read the bound port before serving (mobile).
+pub fn serve_listener(listener: TcpListener, router: Router) -> std::io::Result<()> {
+    let router = Arc::new(router);
     for stream in listener.incoming() {
-        let mut stream = stream?;
-        if let Err(e) = handle(&mut stream, &router, AccessPolicy::TcpLoopback) {
-            eprintln!("connection error: {e}");
-        }
-        // best-effort: drain anything unread so the client sees a clean close
-        let _ = stream.read(&mut [0u8; 0]);
+        spawn_conn(stream?, Arc::clone(&router), AccessPolicy::TcpLoopback);
     }
     Ok(())
+}
+
+/// Bind `addr` and serve `router` forever. Returns only on a fatal bind/accept error.
+pub fn serve(addr: &str, router: Router) -> std::io::Result<()> {
+    let listener = bind_loopback(addr)?;
+    let local = listener.local_addr()?;
+    eprintln!("iSyncYou web UI listening on http://{local}/");
+    serve_listener(listener, router)
+}
+
+/// Handle one accepted connection on its own thread (so a long-lived SSE stream
+/// never blocks other requests), capped at [`MAX_CONNS`] concurrent threads.
+fn spawn_conn<S: Conn + Send + 'static>(mut stream: S, router: Arc<Router>, policy: AccessPolicy) {
+    // fetch_add returns the previous count; refuse past the cap.
+    if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        return; // too many connections; drop this one (the stream closes)
+    }
+    std::thread::spawn(move || {
+        let _guard = ConnGuard; // decrements the live count when this thread ends
+        if let Err(e) = handle(&mut stream, &router, policy) {
+            eprintln!("connection error: {e}");
+        }
+        // dropping `stream` here sends FIN so the client sees a clean EOF; a
+        // zero-length drain read could block and delay that close.
+    });
 }
 
 #[cfg(unix)]
@@ -263,12 +387,9 @@ pub fn serve_unix(path: &std::path::Path, router: Router) -> std::io::Result<()>
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("iSyncYou web UI listening on unix:{}", path.display());
+    let router = Arc::new(router);
     for stream in listener.incoming() {
-        let mut stream = stream?;
-        if let Err(e) = handle(&mut stream, &router, AccessPolicy::UnixSocket) {
-            eprintln!("connection error: {e}");
-        }
-        let _ = stream.read(&mut [0u8; 0]);
+        spawn_conn(stream?, Arc::clone(&router), AccessPolicy::UnixSocket);
     }
     Ok(())
 }
@@ -439,5 +560,151 @@ mod tests {
         assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "got: {buf}");
         assert!(buf.contains("\"accounts\""), "body: {buf}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_token_gates_data_routes_over_http() {
+        // #89: real HTTP roundtrip (curl-equivalent) proving the mobile session-token
+        // gate. A native client setting Host: 127.0.0.1 (the desktop loopback policy)
+        // still cannot read the data API without the per-process token.
+        use isyncyou_core::Config;
+        let router =
+            Arc::new(Router::new(Config::default()).with_session_token("sess-http-tok".into()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
+            }
+        });
+        let req = |raw: &str| {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(raw.as_bytes()).unwrap();
+            let mut s = String::new();
+            c.read_to_string(&mut s).unwrap();
+            s
+        };
+        // No session token → 401 (the key Android-loopback exposure fix).
+        let no_tok = req("GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            no_tok.starts_with("HTTP/1.1 401"),
+            "no token must 401: {no_tok}"
+        );
+        // Valid token header → passes the gate (no 401).
+        let with_tok = req(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Session-Token: sess-http-tok\r\n\r\n",
+        );
+        assert!(
+            !with_tok.starts_with("HTTP/1.1 401"),
+            "valid token must pass: {with_tok}"
+        );
+        // Valid token via the `_st` query (iframe/img/EventSource path) → passes.
+        let with_q =
+            req("GET /api/v1/status?_st=sess-http-tok HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            !with_q.starts_with("HTTP/1.1 401"),
+            "valid _st query must pass: {with_q}"
+        );
+        // Valid token via the loopback cookie (auto-rides subresources on Android).
+        let with_cookie = req(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=sess-http-tok\r\n\r\n",
+        );
+        assert!(
+            !with_cookie.starts_with("HTTP/1.1 401"),
+            "valid cookie must pass: {with_cookie}"
+        );
+        // A wrong cookie value is still rejected.
+        let bad_cookie = req(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=nope\r\n\r\n",
+        );
+        assert!(
+            bad_cookie.starts_with("HTTP/1.1 401"),
+            "wrong cookie must 401: {bad_cookie}"
+        );
+        // Static shell stays open without a token (bootstrap).
+        let shell = req("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            shell.starts_with("HTTP/1.1 200"),
+            "/ must stay open: {shell}"
+        );
+    }
+
+    #[test]
+    fn sse_streams_change_frame_and_serves_concurrently() {
+        use isyncyou_core::Config;
+        use std::time::Duration;
+        let bus = Arc::new(EventBus::new());
+        let router = Arc::new(Router::new(Config::default()).with_events(bus.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
+            }
+        });
+        // open the long-lived SSE stream
+        let mut sse = TcpStream::connect(addr).unwrap();
+        sse.write_all(b"GET /api/v1/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        sse.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 512];
+        let n = sse.read(&mut buf).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("text/event-stream"),
+            "SSE response must be an event stream"
+        );
+        // a normal request is served CONCURRENTLY while the SSE stream stays open
+        let mut c2 = TcpStream::connect(addr).unwrap();
+        c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c2.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut s2 = String::new();
+        c2.read_to_string(&mut s2).unwrap();
+        assert!(
+            s2.starts_with("HTTP/1.1 200 OK\r\n"),
+            "concurrent request blocked by SSE: {s2}"
+        );
+        // a background notifier guarantees the handler sees a change whenever it
+        // reaches wait_change (removes the capture-vs-notify race); read until the
+        // change frame arrives.
+        let notifier = bus.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        std::thread::spawn(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                notifier.notify();
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let mut got_change = false;
+        for _ in 0..50 {
+            if let Ok(m) = sse.read(&mut buf) {
+                if m > 0 && String::from_utf8_lossy(&buf[..m]).contains("event: change") {
+                    got_change = true;
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(got_change, "expected an SSE change frame after notify");
+    }
+
+    #[test]
+    fn sse_path_enforces_loopback_host() {
+        // The local-access policy runs before the SSE branch, so /api/v1/events is
+        // guarded by the same loopback rule as every other path.
+        let resp = one_tcp_response(b"GET /api/v1/events HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "got: {resp}"
+        );
     }
 }

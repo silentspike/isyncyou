@@ -133,6 +133,8 @@ hardening; ⏳ means designed and queued, not built.
 | Upload sessions | ✅ | chunked, persisted session state, survives process kill |
 | Store (SQLite + FTS5) | ✅ | id-based schema, additive migrations, WAL, single-instance lock |
 | M365 backup connectors | ✅ | mail, calendar, contacts, ToDo, OneNote — incremental index |
+| Unified live + backup client | ✅ all six | near-real-time cloud poll + SSE push to the web UI; live-update interval slider (1 s–60 min); four-state coverage badge per item (`live_only` · `live_backup` · `stale` · `backup_only`, store `body_etag` v10) with per-service state filters |
+| Live write (cap-token-gated) | ✅ all six | mail (compose/reply/forward/flag/read/categories/move), calendar (create/update/delete), contacts (create/edit/delete + photo), ToDo (tasks/checklist/lists), OneNote (create-in-section/append/delete + notebook→section→page tree), OneDrive (quota + permissions); restore-to-original-container; writes need `X-Capability-Token` (else `401`), bodies sandboxed under the 3-layer CSP |
 | Content archive | ✅ | `.eml` / canonical JSON / page HTML + OneNote resources / contact photos on disk |
 | Full-text search | ✅ | names **and mail bodies**; per-account and cross-account |
 | Export | ✅ | `.ics` / vCard from the archive |

@@ -29,9 +29,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod serve;
 mod view;
+pub use serve::{bind_loopback, format_http, parse_request_line, serve, serve_listener};
 #[cfg(unix)]
 pub use serve::{default_unix_socket_path, serve_unix};
-pub use serve::{format_http, parse_request_line, serve};
 
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
 pub const INDEX_HTML: &str = include_str!("index.html");
@@ -43,6 +43,25 @@ const APP_JS: &str = include_str!("app.js");
 /// Embedded Inter variable font (SIL OFL 1.1), served same-origin from `/app.woff2`
 /// so the premium typography needs no web-font request (CSP `font-src 'self'`).
 const APP_FONT: &[u8] = include_bytes!("assets/inter-var.woff2");
+/// Easter-egg game sound effects (generated with ElevenLabs), served same-origin
+/// from `/sfx/*.mp3` and fetched + decoded via Web Audio (`connect-src 'self'`).
+const SFX_SHOOT: &[u8] = include_bytes!("assets/sfx-shoot.mp3");
+const SFX_BOOM: &[u8] = include_bytes!("assets/sfx-boom.mp3");
+const SFX_LEVEL: &[u8] = include_bytes!("assets/sfx-level.mp3");
+const SFX_DROP: &[u8] = include_bytes!("assets/sfx-drop.mp3");
+const SFX_PICKUP: &[u8] = include_bytes!("assets/sfx-pickup.mp3");
+const SFX_HIT: &[u8] = include_bytes!("assets/sfx-hit.mp3");
+
+/// Serve an embedded MP3 sound effect (immutable within a version).
+fn audio_response(bytes: &[u8]) -> ApiResponse {
+    ApiResponse {
+        status: 200,
+        content_type: "audio/mpeg".into(),
+        body: bytes.to_vec(),
+        // no-store so a regenerated SFX always takes effect (no stale WebView cache)
+        headers: vec![("Cache-Control".into(), "no-store".into())],
+    }
+}
 
 /// CSP for the app shell (`/`). `script-src 'self'` (no inline script) is the key
 /// defense; only our own same-origin `/app.js` runs. Allows our stylesheet + inline
@@ -67,6 +86,9 @@ pub struct ApiRequest {
     pub query: Vec<(String, String)>,
     /// The `X-Capability-Token` header value, required for destructive POSTs.
     pub cap_token: Option<String>,
+    /// The `X-Session-Token` header value (#89 mobile profile): required on every
+    /// `/api/v1/*` route when the Router runs with a session token.
+    pub session_token: Option<String>,
 }
 
 impl ApiRequest {
@@ -89,12 +111,19 @@ impl ApiRequest {
             path: path.to_string(),
             query,
             cap_token: None,
+            session_token: None,
         }
     }
 
     /// Attach a captured capability token (builder style, used by the server).
     pub fn with_cap_token(mut self, token: Option<String>) -> Self {
         self.cap_token = token;
+        self
+    }
+
+    /// Attach the captured `X-Session-Token` header (builder style, #89).
+    pub fn with_session_token(mut self, token: Option<String>) -> Self {
+        self.session_token = token;
         self
     }
 
@@ -217,6 +246,19 @@ pub trait ShareHandler: Send + Sync {
     ) -> Result<String, String>;
 }
 
+/// Reports live OneDrive info that needs a Graph call (not held in the store):
+/// the drive storage quota, and a single item's sharing permissions (#564).
+/// Injected by the daemon (which owns the Graph stack + token); the read-only
+/// CLI `serve` doesn't set it, so the endpoints 404 there. These are reads, so
+/// no capability token is required (the daemon binds to localhost).
+pub trait OneDriveInfoHandler: Send + Sync {
+    /// The drive quota object (`total`/`used`/`remaining`/`state`) as JSON.
+    fn drive_quota(&self, account: &str) -> Result<serde_json::Value, String>;
+    /// A single item's sharing permissions ("who has access") as a JSON array of
+    /// `{ id, roles, link, grantee }` (#564). Fetched lazily on detail open.
+    fn permissions(&self, account: &str, id: &str) -> Result<serde_json::Value, String>;
+}
+
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
 /// scheduler and trigger an immediate pass. Injected by the daemon.
 pub trait SyncControl: Send + Sync {
@@ -243,9 +285,263 @@ pub trait VerifyHandler: Send + Sync {
     fn verify(&self, account: &str) -> Result<String, String>;
 }
 
+/// Persists mutable sync settings from the UI (currently the cloud-poll interval)
+/// and applies them to the running daemon. Injected by the daemon; the read-only
+/// CLI `serve` does not set it, so the settings POST is refused there.
+pub trait SettingsHandler: Send + Sync {
+    /// Set the active cloud-poll interval (seconds); the impl clamps to a sane
+    /// range, updates the live value, and persists it to the config file.
+    fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String>;
+}
+
+/// Performs the live-mail **write** verbs on behalf of a cap-token POST (#561).
+/// Injected by the daemon (which owns the engine + the full write token); the
+/// read-only CLI `serve` does not set it, so every `/api/v1/mail/*` POST is
+/// refused there. The web UI for these verbs lands in #563 — this trait + the
+/// endpoints are the backend they build on.
+pub trait MailWriteHandler: Send + Sync {
+    /// Compose and send a new message (saved to Sent Items).
+    #[allow(clippy::too_many_arguments)] // a compose genuinely has many fields
+    fn send(
+        &self,
+        account: &str,
+        subject: &str,
+        body_html: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        importance: Option<&str>,
+        request_read_receipt: bool,
+    ) -> Result<(), String>;
+    /// Reply to the sender (`all = false`) or all recipients (`all = true`).
+    fn reply(
+        &self,
+        account: &str,
+        message_id: &str,
+        comment: &str,
+        all: bool,
+    ) -> Result<(), String>;
+    /// Forward a message to new recipients with an optional comment.
+    fn forward(
+        &self,
+        account: &str,
+        message_id: &str,
+        comment: &str,
+        to: &[String],
+    ) -> Result<(), String>;
+    /// Rich reply: create a reply(_all) draft, set its full HTML body, then send
+    /// (full formatting + an edited quote, kept in the original conversation).
+    fn reply_html(
+        &self,
+        account: &str,
+        message_id: &str,
+        body_html: &str,
+        all: bool,
+    ) -> Result<(), String>;
+    /// Rich forward: create a forward draft to `to`, set its full HTML body, send.
+    fn forward_html(
+        &self,
+        account: &str,
+        message_id: &str,
+        body_html: &str,
+        to: &[String],
+    ) -> Result<(), String>;
+    /// Move a message to another folder; returns its new id.
+    fn move_to(
+        &self,
+        account: &str,
+        message_id: &str,
+        destination_id: &str,
+    ) -> Result<String, String>;
+    /// Mark a message read/unread.
+    fn set_read(&self, account: &str, message_id: &str, is_read: bool) -> Result<(), String>;
+    /// Set/clear a follow-up flag (`notFlagged` / `flagged` / `complete`).
+    fn set_flag(
+        &self,
+        account: &str,
+        message_id: &str,
+        flag_status: &str,
+        due: Option<&str>,
+        tz: &str,
+    ) -> Result<(), String>;
+    /// Replace a message's categories.
+    fn set_categories(
+        &self,
+        account: &str,
+        message_id: &str,
+        categories: &[String],
+    ) -> Result<(), String>;
+    /// Create a draft; returns the new draft's id.
+    fn create_draft(
+        &self,
+        account: &str,
+        subject: &str,
+        body_html: &str,
+        to: &[String],
+    ) -> Result<String, String>;
+    /// Send an existing draft by id.
+    fn send_draft(&self, account: &str, message_id: &str) -> Result<(), String>;
+}
+
+/// Performs the live-calendar **write** verbs on behalf of a cap-token POST
+/// (#565 B7). Injected by the daemon (which owns the engine + the full write
+/// token); the read-only CLI `serve` does not set it, so every
+/// `/api/v1/calendar/*` POST is refused there. `event` is a Graph event resource
+/// the router builds from the request (sanitized to writable fields downstream).
+pub trait CalendarWriteHandler: Send + Sync {
+    /// Create an event; returns the new cloud id.
+    fn create(&self, account: &str, event: &Value) -> Result<String, String>;
+    /// Update an event's writable fields from a (partial) event resource.
+    fn update(&self, account: &str, event_id: &str, event: &Value) -> Result<(), String>;
+    /// Delete an event.
+    fn delete(&self, account: &str, event_id: &str) -> Result<(), String>;
+    /// Respond to an invitation: `accept` / `decline` / `tentative` (+ comment).
+    fn respond(
+        &self,
+        account: &str,
+        event_id: &str,
+        response: &str,
+        comment: &str,
+    ) -> Result<(), String>;
+}
+
+/// Performs the live-contact **write** verbs on behalf of a cap-token POST
+/// (#566 A5). Injected by the daemon (which owns the engine + the full write
+/// token); the read-only CLI `serve` does not set it, so every
+/// `/api/v1/contact/{create,update,delete}` POST is refused there. `contact` is a
+/// Graph contact resource the router builds from the request (sanitized to the
+/// writable fields downstream).
+pub trait ContactWriteHandler: Send + Sync {
+    /// Create a contact; returns the new cloud id.
+    fn create(&self, account: &str, contact: &Value) -> Result<String, String>;
+    /// Update a contact's writable fields from a (partial) contact resource.
+    fn update(&self, account: &str, contact_id: &str, contact: &Value) -> Result<(), String>;
+    /// Delete a contact.
+    fn delete(&self, account: &str, contact_id: &str) -> Result<(), String>;
+}
+
+/// Performs the live-ToDo **write** verbs on behalf of a cap-token POST (#567 B6):
+/// task create/update/complete/delete, checklist add/toggle/delete, list create/
+/// delete. Injected by the daemon (which owns the engine + the full write token);
+/// the read-only CLI `serve` does not set it, so every `/api/v1/todo/*` POST is
+/// refused there.
+pub trait TaskWriteHandler: Send + Sync {
+    fn create(&self, account: &str, list_id: &str, task: &Value) -> Result<String, String>;
+    fn update(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        task: &Value,
+    ) -> Result<(), String>;
+    fn complete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String>;
+    fn delete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String>;
+    fn checklist_add(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        title: &str,
+    ) -> Result<String, String>;
+    fn checklist_toggle(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+        checked: bool,
+    ) -> Result<(), String>;
+    fn checklist_delete(
+        &self,
+        account: &str,
+        list_id: &str,
+        task_id: &str,
+        item_id: &str,
+    ) -> Result<(), String>;
+    fn list_create(&self, account: &str, name: &str) -> Result<String, String>;
+    fn list_delete(&self, account: &str, list_id: &str) -> Result<(), String>;
+}
+
+/// Performs the live-OneNote **write** verbs on behalf of a cap-token POST (#568):
+/// create a page in a section, delete a page, append text to a page. Injected by the
+/// daemon (which owns the engine + the full write token); the read-only CLI `serve`
+/// does not set it, so every `/api/v1/onenote/*` POST is refused there.
+pub trait OneNoteWriteHandler: Send + Sync {
+    /// Create a page in `section_id` from POST-ready HTML; returns the new cloud id.
+    fn create(&self, account: &str, section_id: &str, html: &[u8]) -> Result<String, String>;
+    /// Delete a page.
+    fn delete(&self, account: &str, page_id: &str) -> Result<(), String>;
+    /// Append a plain-text paragraph to a page (best-effort).
+    fn append(&self, account: &str, page_id: &str, text: &str) -> Result<(), String>;
+}
+
+/// Live account-auth handler (#68): the daemon's device-code sign-in + sign-out.
+/// `None` => the account menu offers only switching (the read-only CLI `serve`).
+pub trait AccountAuthHandler: Send + Sync {
+    /// Begin a device-code login for a configured `account`. Returns
+    /// `{ login_id, user_code, verification_uri, message }` to present to the user.
+    fn start_login(&self, account: &str) -> Result<serde_json::Value, String>;
+    /// Poll a started login by its `login_id` → `{ state: "pending"|"done"|"error", error? }`.
+    fn poll_login(&self, login_id: &str) -> serde_json::Value;
+    /// Remove an account's cached tokens (sign out). Returns a short status note.
+    fn sign_out(&self, account: &str) -> Result<serde_json::Value, String>;
+}
+
+/// Push-registration handler (#576): the web UI hands the daemon this device's FCM
+/// registration token so the daemon can send notifications (e.g. "backup complete")
+/// to the phone. `None` => push is unavailable (the read-only CLI `serve`).
+pub trait PushHandler: Send + Sync {
+    /// Register (idempotently) a device push token reported by the native shell.
+    fn register(&self, token: &str) -> Result<(), String>;
+    /// Send a test notification to all registered devices. Returns `{ sent, registered }`.
+    fn send_test(&self) -> Result<serde_json::Value, String>;
+}
+
+/// A tiny change broadcaster for Server-Sent Events: the daemon's cloud-poll loop
+/// calls [`EventBus::notify`] when it detects cloud changes; each open SSE
+/// connection waits on a generation counter and streams a frame. Thread-safe and
+/// lock-cheap (one `Mutex<u64>` + `Condvar`), no per-subscriber state.
+#[derive(Default)]
+pub struct EventBus {
+    generation: std::sync::Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a change and wake every waiting SSE connection.
+    pub fn notify(&self) {
+        let mut g = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        *g = g.wrapping_add(1);
+        self.cv.notify_all();
+    }
+
+    /// Current generation — an SSE handler reads this once, then waits for it to move.
+    pub fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Block until the generation differs from `last` or `timeout` elapses; returns
+    /// the current generation. The timeout drives periodic SSE heartbeats.
+    pub fn wait_change(&self, last: u64, timeout: std::time::Duration) -> u64 {
+        let g = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, timeout, |cur| *cur == last)
+            .unwrap_or_else(|e| e.into_inner());
+        *g
+    }
+}
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
+    /// Optional change broadcaster for the SSE `/api/v1/events` stream (the
+    /// daemon's). `None` => the events endpoint reports no live push.
+    events: Option<std::sync::Arc<EventBus>>,
     /// Optional store-access gate, shared with a background syncer (the daemon's
     /// scheduler). When set, the whole request is serialized against the syncer so
     /// the per-request `Store::open` never races the single-instance file lock the
@@ -272,17 +568,82 @@ pub struct Router {
     /// Optional FUSE hydration status (the daemon's). Enables the in-flight
     /// download list GET.
     hydrations: Option<std::sync::Arc<dyn HydrationStatus>>,
+    /// Optional live OneDrive info handler (the daemon's). Enables the quota /
+    /// permissions GETs; `None` => those 404 (the read-only CLI `serve`).
+    onedrive_info: Option<std::sync::Arc<dyn OneDriveInfoHandler>>,
     /// Optional integrity-verify handler (the daemon's). `None` => the verify
     /// POST is refused (the read-only CLI `serve`).
     verify: Option<std::sync::Arc<dyn VerifyHandler>>,
     /// Separate capability token for verify POSTs.
     verify_cap_token: Option<String>,
+    /// Optional mutable-settings handler (the daemon's). `None` => the settings
+    /// POST is refused (the read-only CLI `serve`).
+    settings_handler: Option<std::sync::Arc<dyn SettingsHandler>>,
+    /// Separate capability token for settings POSTs.
+    settings_cap_token: Option<String>,
+    /// Optional live-mail write handler (the daemon's). `None` => every
+    /// `/api/v1/mail/*` POST is refused (the read-only CLI `serve`).
+    mail_write: Option<std::sync::Arc<dyn MailWriteHandler>>,
+    /// Separate capability token for mail-write POSTs (distinct blast radius —
+    /// these send/modify real mail).
+    mail_write_cap_token: Option<String>,
+    /// Optional live-calendar write handler (the daemon's). `None` => every
+    /// `/api/v1/calendar/*` POST is refused (the read-only CLI `serve`).
+    calendar_write: Option<std::sync::Arc<dyn CalendarWriteHandler>>,
+    /// Separate capability token for calendar-write POSTs.
+    calendar_write_cap_token: Option<String>,
+    /// Optional live-contact write handler (the daemon's). `None` => every
+    /// `/api/v1/contact/{create,update,delete}` POST is refused (read-only `serve`).
+    contact_write: Option<std::sync::Arc<dyn ContactWriteHandler>>,
+    /// Separate capability token for contact-write POSTs.
+    contact_write_cap_token: Option<String>,
+    /// Optional live-ToDo write handler (the daemon's). `None` => every
+    /// `/api/v1/todo/*` POST is refused (the read-only CLI `serve`).
+    task_write: Option<std::sync::Arc<dyn TaskWriteHandler>>,
+    /// Separate capability token for ToDo-write POSTs.
+    task_write_cap_token: Option<String>,
+    /// Optional live-OneNote write handler (the daemon's). `None` => every
+    /// `/api/v1/onenote/*` POST is refused (the read-only CLI `serve`).
+    onenote_write: Option<std::sync::Arc<dyn OneNoteWriteHandler>>,
+    /// Separate capability token for OneNote-write POSTs.
+    onenote_write_cap_token: Option<String>,
+    /// Optional account-auth handler (#68): device-code sign-in + sign-out. `None`
+    /// => the account menu only switches between already-configured accounts.
+    account_auth: Option<std::sync::Arc<dyn AccountAuthHandler>>,
+    /// Separate capability token for account login/sign-out POSTs.
+    account_cap_token: Option<String>,
+    /// Optional push-registration handler (#576): stores device FCM tokens + sends
+    /// notifications. `None` => `/api/v1/push/*` POSTs are refused (read-only `serve`).
+    push: Option<std::sync::Arc<dyn PushHandler>>,
+    /// Separate capability token for push register/test POSTs.
+    push_cap_token: Option<String>,
+    /// Mobile/standalone profile (#89): an unguessable per-process token required on
+    /// EVERY `/api/v1/*` route. On Android `127.0.0.1` is reachable by any app on the
+    /// device, so unlike the desktop daemon (GET open, POST cap-gated) the data API
+    /// must be fully gated. `None` => desktop daemon behaviour (no extra gate). The
+    /// token reaches the WebView via the native bridge, never in a static asset.
+    session_token: Option<String>,
+}
+
+/// Constant-time byte-equality (no early return on first mismatch) so token checks
+/// can't be probed byte-by-byte via timing. The length check only leaks length,
+/// which is fixed for our tokens.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl Router {
     pub fn new(config: Config) -> Self {
         Router {
             config,
+            events: None,
             gate: None,
             restore: None,
             restore_cap_token: None,
@@ -291,8 +652,26 @@ impl Router {
             share_cap_token: None,
             sync_control: None,
             hydrations: None,
+            onedrive_info: None,
             verify: None,
             verify_cap_token: None,
+            settings_handler: None,
+            settings_cap_token: None,
+            mail_write: None,
+            mail_write_cap_token: None,
+            calendar_write: None,
+            calendar_write_cap_token: None,
+            contact_write: None,
+            contact_write_cap_token: None,
+            task_write: None,
+            task_write_cap_token: None,
+            onenote_write: None,
+            onenote_write_cap_token: None,
+            account_auth: None,
+            account_cap_token: None,
+            push: None,
+            push_cap_token: None,
+            session_token: None,
         }
     }
 
@@ -301,6 +680,7 @@ impl Router {
     pub fn with_gate(config: Config, gate: std::sync::Arc<std::sync::Mutex<()>>) -> Self {
         Router {
             config,
+            events: None,
             gate: Some(gate),
             restore: None,
             restore_cap_token: None,
@@ -309,8 +689,26 @@ impl Router {
             share_cap_token: None,
             sync_control: None,
             hydrations: None,
+            onedrive_info: None,
             verify: None,
             verify_cap_token: None,
+            settings_handler: None,
+            settings_cap_token: None,
+            mail_write: None,
+            mail_write_cap_token: None,
+            calendar_write: None,
+            calendar_write_cap_token: None,
+            contact_write: None,
+            contact_write_cap_token: None,
+            task_write: None,
+            task_write_cap_token: None,
+            onenote_write: None,
+            onenote_write_cap_token: None,
+            account_auth: None,
+            account_cap_token: None,
+            push: None,
+            push_cap_token: None,
+            session_token: None,
         }
     }
 
@@ -365,9 +763,138 @@ impl Router {
         self
     }
 
-    /// Whether the request carries the configured capability token.
+    /// Enable the live OneDrive info GETs (quota/permissions) (builder style).
+    pub fn with_onedrive_info(mut self, info: std::sync::Arc<dyn OneDriveInfoHandler>) -> Self {
+        self.onedrive_info = Some(info);
+        self
+    }
+
+    /// Enable the SSE `/api/v1/events` change stream (builder style).
+    pub fn with_events(mut self, events: std::sync::Arc<EventBus>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// The injected SSE change bus, if any (used by the streaming server).
+    pub(crate) fn events_bus(&self) -> Option<&std::sync::Arc<EventBus>> {
+        self.events.as_ref()
+    }
+
+    /// Enable the mutable-settings POST, guarded by `cap_token` (builder style).
+    pub fn with_settings(
+        mut self,
+        handler: std::sync::Arc<dyn SettingsHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.settings_handler = Some(handler);
+        self.settings_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the live-mail write POSTs (`/api/v1/mail/*`), guarded by `cap_token`
+    /// (builder style). Injected by the daemon; the read-only `serve` leaves it
+    /// unset so those POSTs 404.
+    pub fn with_mail_write(
+        mut self,
+        handler: std::sync::Arc<dyn MailWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.mail_write = Some(handler);
+        self.mail_write_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the live-calendar write POSTs (builder style, #565).
+    pub fn with_calendar_write(
+        mut self,
+        handler: std::sync::Arc<dyn CalendarWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.calendar_write = Some(handler);
+        self.calendar_write_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the live-contact write POSTs (builder style, #566).
+    pub fn with_contact_write(
+        mut self,
+        handler: std::sync::Arc<dyn ContactWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.contact_write = Some(handler);
+        self.contact_write_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the live-ToDo write POSTs (builder style, #567).
+    pub fn with_task_write(
+        mut self,
+        handler: std::sync::Arc<dyn TaskWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.task_write = Some(handler);
+        self.task_write_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the live-OneNote write POSTs (builder style, #568).
+    pub fn with_onenote_write(
+        mut self,
+        handler: std::sync::Arc<dyn OneNoteWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.onenote_write = Some(handler);
+        self.onenote_write_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Wire the account-auth handler (device-code sign-in + sign-out, #68).
+    pub fn with_account_auth(
+        mut self,
+        handler: std::sync::Arc<dyn AccountAuthHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.account_auth = Some(handler);
+        self.account_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Wire the push-registration handler (FCM device-token store + sender, #576).
+    pub fn with_push(
+        mut self,
+        handler: std::sync::Arc<dyn PushHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.push = Some(handler);
+        self.push_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the mobile session-token gate (#89): every `/api/v1/*` route then
+    /// requires this token. Off (desktop daemon) when never set.
+    pub fn with_session_token(mut self, token: String) -> Self {
+        self.session_token = Some(token);
+        self
+    }
+
+    /// Whether `provided` satisfies the session-token gate. `true` when the gate is
+    /// off (desktop). When on, the token must be present and match in constant time.
+    /// Used by both `route()` (data routes) and the SSE path in `serve.rs`.
+    pub fn session_authorized(&self, provided: Option<&str>) -> bool {
+        match &self.session_token {
+            None => true,
+            Some(expected) => provided.is_some_and(|p| ct_eq(expected.as_bytes(), p.as_bytes())),
+        }
+    }
+
+    /// Whether the request carries the configured capability token. The token is
+    /// compared in **constant time** so a timing side-channel can't reveal it byte
+    /// by byte (the length check only leaks length, which is fixed for our tokens).
     fn cap_ok(expected: &Option<String>, req: &ApiRequest) -> bool {
-        matches!((expected, &req.cap_token), (Some(w), Some(g)) if w == g)
+        let (Some(w), Some(g)) = (expected, &req.cap_token) else {
+            return false;
+        };
+        ct_eq(w.as_bytes(), g.as_bytes())
     }
 
     /// Append a durable audit entry to the account activity log. Destructive
@@ -393,6 +920,18 @@ impl Router {
 
     /// Dispatch one request to a response. Never panics; unknown routes → 404.
     pub fn route(&self, req: &ApiRequest) -> ApiResponse {
+        // Mobile/standalone profile (#89): the data API is fully session-token gated
+        // because the loopback server is reachable by any app on the device. The
+        // static shell (`/`, `/app.js`, `/app.css`, fonts, `/sfx/*`) stays open so
+        // the WebView can bootstrap — it carries no user data and no token. The token
+        // rides a header (`X-Session-Token`) or, for iframe/img `src`, the `_st`
+        // query param. No-op on the desktop daemon (session_token = None).
+        if req.path.starts_with("/api/v1/") {
+            let provided = req.session_token.as_deref().or_else(|| req.q("_st"));
+            if !self.session_authorized(provided) {
+                return ApiResponse::error(401, "missing or invalid session token");
+            }
+        }
         // Hold the store-access gate (if any) for the whole request so a concurrent
         // sync pass and this request never both hold the store's single-instance lock.
         let _gate = self
@@ -407,6 +946,39 @@ impl Router {
                 "/api/v1/sync/resume" => self.sync_command(req, |c| c.resume()),
                 "/api/v1/sync/now" => self.sync_command(req, |c| c.trigger()),
                 "/api/v1/verify" => self.verify_run(req),
+                "/api/v1/settings" => self.update_settings(req),
+                "/api/v1/mail/send" => self.mail_send(req),
+                "/api/v1/mail/reply" => self.mail_reply(req),
+                "/api/v1/mail/forward" => self.mail_forward(req),
+                "/api/v1/mail/move" => self.mail_move(req),
+                "/api/v1/mail/read" => self.mail_read(req),
+                "/api/v1/mail/flag" => self.mail_flag(req),
+                "/api/v1/mail/categories" => self.mail_categories(req),
+                "/api/v1/mail/draft" => self.mail_draft(req),
+                "/api/v1/calendar/create" => self.calendar_create(req),
+                "/api/v1/calendar/update" => self.calendar_update(req),
+                "/api/v1/calendar/delete" => self.calendar_delete(req),
+                "/api/v1/calendar/respond" => self.calendar_respond(req),
+                "/api/v1/contact/create" => self.contact_create(req),
+                "/api/v1/contact/update" => self.contact_update(req),
+                "/api/v1/contact/delete" => self.contact_delete(req),
+                "/api/v1/todo/create" => self.todo_create(req),
+                "/api/v1/todo/update" => self.todo_update(req),
+                "/api/v1/todo/complete" => self.todo_complete(req),
+                "/api/v1/todo/delete" => self.todo_delete(req),
+                "/api/v1/todo/checklist-add" => self.todo_checklist_add(req),
+                "/api/v1/todo/checklist-toggle" => self.todo_checklist_toggle(req),
+                "/api/v1/todo/checklist-delete" => self.todo_checklist_delete(req),
+                "/api/v1/todo/list-create" => self.todo_list_create(req),
+                "/api/v1/todo/list-delete" => self.todo_list_delete(req),
+                "/api/v1/onenote/create" => self.onenote_create(req),
+                "/api/v1/onenote/delete" => self.onenote_delete(req),
+                "/api/v1/onenote/append" => self.onenote_append(req),
+                "/api/v1/account/login/start" => self.account_login_start(req),
+                "/api/v1/account/login/poll" => self.account_login_poll(req),
+                "/api/v1/account/signout" => self.account_signout(req),
+                "/api/v1/push/register" => self.push_register(req),
+                "/api/v1/push/test" => self.push_test(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -438,6 +1010,38 @@ impl Router {
                         "__VERIFY_CAP_TOKEN__",
                         self.verify_cap_token.as_deref().unwrap_or(""),
                     )
+                    .replace(
+                        "__SETTINGS_CAP_TOKEN__",
+                        self.settings_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__MAILWRITE_CAP_TOKEN__",
+                        self.mail_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__CALENDARWRITE_CAP_TOKEN__",
+                        self.calendar_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__CONTACTWRITE_CAP_TOKEN__",
+                        self.contact_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__TASKWRITE_CAP_TOKEN__",
+                        self.task_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__ONENOTEWRITE_CAP_TOKEN__",
+                        self.onenote_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__ACCOUNT_CAP_TOKEN__",
+                        self.account_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__PUSH_CAP_TOKEN__",
+                        self.push_cap_token.as_deref().unwrap_or(""),
+                    )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
                 // browser serve a stale copy across versions.
@@ -456,6 +1060,12 @@ impl Router {
                 // immutable binary asset → cache hard within a version
                 headers: vec![("Cache-Control".into(), "max-age=31536000".into())],
             },
+            "/sfx/shoot.mp3" => audio_response(SFX_SHOOT),
+            "/sfx/boom.mp3" => audio_response(SFX_BOOM),
+            "/sfx/level.mp3" => audio_response(SFX_LEVEL),
+            "/sfx/drop.mp3" => audio_response(SFX_DROP),
+            "/sfx/pickup.mp3" => audio_response(SFX_PICKUP),
+            "/sfx/hit.mp3" => audio_response(SFX_HIT),
             "/api/v1/accounts" => self.accounts(),
             "/api/v1/settings" => self.settings(),
             "/api/v1/activity" => self.activity(req),
@@ -463,12 +1073,1044 @@ impl Router {
             "/api/v1/items" => self.items(req),
             "/api/v1/item" => self.item(req),
             "/api/v1/body" => self.body(req),
+            "/api/v1/attachment" => self.attachment(req),
             "/api/v1/view" => self.view(req),
             "/api/v1/open-external" => self.open_external(req),
             "/api/v1/search" => self.search(req),
             "/api/v1/sync/state" => self.sync_state(),
             "/api/v1/hydrations" => self.hydrations_state(),
+            "/api/v1/drive" => self.drive_info(req),
+            "/api/v1/permissions" => self.item_permissions(req),
+            "/api/v1/contact/photo" => self.contact_photo(req),
             _ => ApiResponse::error(404, "not found"),
+        }
+    }
+
+    /// `POST /api/v1/settings?poll_interval_secs=N` — persist + apply a mutable
+    /// sync setting. Requires the capability token; the work is the injected handler.
+    fn update_settings(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.settings_handler {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "settings are not editable on this server"),
+        };
+        if !Self::cap_ok(&self.settings_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let secs = match req
+            .q("poll_interval_secs")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(s) if (1..=3600).contains(&s) => s,
+            _ => {
+                return ApiResponse::error(400, "poll_interval_secs must be an integer in 1..=3600")
+            }
+        };
+        match handler.set_poll_interval_secs(secs) {
+            Ok(()) => ApiResponse::ok_json(&serde_json::json!({ "poll_interval_secs": secs })),
+            Err(e) => ApiResponse::error(500, &format!("settings: {e}")),
+        }
+    }
+
+    // ---- live-mail write endpoints (#561; UI is #563) -----------------------
+    //
+    // All `/api/v1/mail/*` POSTs share one gate (handler injected + cap token) and
+    // carry their params in the (percent-encoded) query string, like every other
+    // POST here. Each mutation is audited so the intent survives a mid-flight crash.
+
+    /// The shared gate: the handler must be injected (else 404 on the read-only
+    /// server) and the request must carry the mail-write capability token (else 401).
+    fn mail_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn MailWriteHandler>, ApiResponse> {
+        let h = self
+            .mail_write
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "mail write is not enabled on this server"))?;
+        if !Self::cap_ok(&self.mail_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Parse a recipient list param: comma/space/semicolon-separated, trimmed.
+    fn addr_list(raw: Option<&str>) -> Vec<String> {
+        raw.unwrap_or("")
+            .split([',', ' ', ';'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Audit + map a unit mail result to a response. NB: we deliberately do NOT
+    /// fire the SSE change bus on a self-write — the daemon doesn't re-sync mail
+    /// into the store on a write, so an SSE-driven re-fetch would read the *stale*
+    /// store and clobber the UI's optimistic update. The frontend's optimistic
+    /// update is the correct immediate feedback; the store reconciles on the next
+    /// backup. (New *incoming* mail live needs daemon mail-sync — a follow-up.)
+    fn mail_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:mail", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(account, "audit:mail", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    // ---- live-calendar write endpoints (#565 B7) ----------------------------
+    /// Shared gate for `/api/v1/calendar/*` (handler injected + cap token).
+    fn calendar_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn CalendarWriteHandler>, ApiResponse> {
+        let h = self.calendar_write.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "calendar write is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.calendar_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit calendar result (same SSE caveat as mail_result).
+    fn cal_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:calendar", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:calendar", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a Graph event resource from the request's query params (subject,
+    /// start/end with a timezone, location, HTML body, all-day). Only provided
+    /// fields are set; the write layer sanitizes to the writable whitelist.
+    fn event_from_req(req: &ApiRequest) -> Value {
+        let tz = req.q("tz").filter(|s| !s.is_empty()).unwrap_or("UTC");
+        let mut ev = json!({});
+        let obj = ev.as_object_mut().unwrap();
+        if let Some(s) = req.q("subject") {
+            obj.insert("subject".into(), json!(s));
+        }
+        if let Some(s) = req.q("start").filter(|s| !s.is_empty()) {
+            obj.insert("start".into(), json!({ "dateTime": s, "timeZone": tz }));
+        }
+        if let Some(s) = req.q("end").filter(|s| !s.is_empty()) {
+            obj.insert("end".into(), json!({ "dateTime": s, "timeZone": tz }));
+        }
+        if let Some(s) = req.q("location").filter(|s| !s.is_empty()) {
+            obj.insert("location".into(), json!({ "displayName": s }));
+        }
+        if let Some(s) = req.q("body").filter(|s| !s.is_empty()) {
+            obj.insert(
+                "body".into(),
+                json!({ "contentType": "HTML", "content": s }),
+            );
+        }
+        if req.q("all_day") == Some("1") {
+            obj.insert("isAllDay".into(), json!(true));
+        }
+        ev
+    }
+
+    fn calendar_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let ev = Self::event_from_req(req);
+        if ev.get("subject").is_none() || ev.get("start").is_none() {
+            return ApiResponse::error(400, "subject and start are required");
+        }
+        match h.create(account, &ev) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:calendar", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:calendar", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn calendar_update(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let ev = Self::event_from_req(req);
+        self.cal_result(
+            account,
+            &format!("update id={id}"),
+            h.update(account, id, &ev),
+        )
+    }
+
+    fn calendar_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.cal_result(account, &format!("delete id={id}"), h.delete(account, id))
+    }
+
+    fn calendar_respond(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.calendar_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let response = req
+            .q("response")
+            .filter(|r| !r.is_empty())
+            .unwrap_or("accept");
+        let comment = req.q("comment").unwrap_or("");
+        self.cal_result(
+            account,
+            &format!("respond id={id} {response}"),
+            h.respond(account, id, response, comment),
+        )
+    }
+
+    fn contact_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn ContactWriteHandler>, ApiResponse> {
+        let h = self.contact_write.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "contact write is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.contact_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit contact result (same no-SSE-on-self-write caveat as
+    /// `cal_result`: the daemon doesn't re-sync contacts on a write, so an SSE
+    /// refresh would read the stale store and clobber the optimistic UI).
+    fn contact_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:contact", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:contact", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a structured Graph physical address from `<prefix>_{street,city,
+    /// state,zip,country}` query params; `None` when none are set.
+    fn addr_from_req(req: &ApiRequest, prefix: &str) -> Option<Value> {
+        let g = |k: &str| {
+            req.q(&format!("{prefix}_{k}"))
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        };
+        let mut a = serde_json::Map::new();
+        for (q, key) in [
+            ("street", "street"),
+            ("city", "city"),
+            ("state", "state"),
+            ("zip", "postalCode"),
+            ("country", "countryOrRegion"),
+        ] {
+            if let Some(v) = g(q) {
+                a.insert(key.into(), json!(v));
+            }
+        }
+        (!a.is_empty()).then_some(Value::Object(a))
+    }
+
+    /// Build a Graph contact resource from the request's query params (name parts,
+    /// email, phones, company/title, notes, birthday, three structured addresses).
+    /// Only provided fields are set; the write layer sanitizes to the whitelist.
+    fn contact_from_req(req: &ApiRequest) -> Value {
+        let mut c = json!({});
+        let obj = c.as_object_mut().unwrap();
+        for (q, key) in [
+            ("given", "givenName"),
+            ("surname", "surname"),
+            ("display_name", "displayName"),
+            ("nickname", "nickName"),
+            ("title", "title"),
+            ("company", "companyName"),
+            ("job", "jobTitle"),
+            ("department", "department"),
+            ("mobile", "mobilePhone"),
+            ("notes", "personalNotes"),
+            ("birthday", "birthday"),
+        ] {
+            if let Some(s) = req.q(q).filter(|s| !s.is_empty()) {
+                obj.insert(key.into(), json!(s));
+            }
+        }
+        if let Some(e) = req.q("email").filter(|s| !s.is_empty()) {
+            obj.insert("emailAddresses".into(), json!([{ "address": e }]));
+        }
+        if let Some(p) = req.q("business_phone").filter(|s| !s.is_empty()) {
+            obj.insert("businessPhones".into(), json!([p]));
+        }
+        if let Some(p) = req.q("home_phone").filter(|s| !s.is_empty()) {
+            obj.insert("homePhones".into(), json!([p]));
+        }
+        if let Some(a) = Self::addr_from_req(req, "business") {
+            obj.insert("businessAddress".into(), a);
+        }
+        if let Some(a) = Self::addr_from_req(req, "home") {
+            obj.insert("homeAddress".into(), a);
+        }
+        if let Some(a) = Self::addr_from_req(req, "other") {
+            obj.insert("otherAddress".into(), a);
+        }
+        c
+    }
+
+    fn contact_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.contact_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let c = Self::contact_from_req(req);
+        if c.as_object().map(serde_json::Map::is_empty).unwrap_or(true) {
+            return ApiResponse::error(400, "at least one contact field is required");
+        }
+        match h.create(account, &c) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:contact", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:contact", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn contact_update(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.contact_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let c = Self::contact_from_req(req);
+        self.contact_result(
+            account,
+            &format!("update id={id}"),
+            h.update(account, id, &c),
+        )
+    }
+
+    fn contact_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.contact_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.contact_result(account, &format!("delete id={id}"), h.delete(account, id))
+    }
+
+    fn todo_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn TaskWriteHandler>, ApiResponse> {
+        let h = self
+            .task_write
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "todo write is not enabled on this server"))?;
+        if !Self::cap_ok(&self.task_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit ToDo result (no SSE on self-write, like `cal_result`).
+    fn todo_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(account, "audit:todo", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a Graph todoTask from query params (title/body/importance/status,
+    /// due/start/reminder dates, comma-separated categories). The write layer
+    /// sanitizes to the writable whitelist.
+    fn task_from_req(req: &ApiRequest) -> Value {
+        let tz = req.q("tz").filter(|s| !s.is_empty()).unwrap_or("UTC");
+        let mut t = json!({});
+        let o = t.as_object_mut().unwrap();
+        if let Some(s) = req.q("title") {
+            o.insert("title".into(), json!(s));
+        }
+        if let Some(s) = req.q("body").filter(|s| !s.is_empty()) {
+            o.insert(
+                "body".into(),
+                json!({ "contentType": "text", "content": s }),
+            );
+        }
+        if let Some(s) = req.q("importance").filter(|s| !s.is_empty()) {
+            o.insert("importance".into(), json!(s));
+        }
+        if let Some(s) = req.q("status").filter(|s| !s.is_empty()) {
+            o.insert("status".into(), json!(s));
+        }
+        for (q, key) in [
+            ("due", "dueDateTime"),
+            ("start", "startDateTime"),
+            ("reminder", "reminderDateTime"),
+        ] {
+            if let Some(s) = req.q(q).filter(|s| !s.is_empty()) {
+                o.insert(key.into(), json!({ "dateTime": s, "timeZone": tz }));
+                if q == "reminder" {
+                    o.insert("isReminderOn".into(), json!(true));
+                }
+            }
+        }
+        if let Some(s) = req.q("categories").filter(|s| !s.is_empty()) {
+            let cats: Vec<Value> = s
+                .split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(|c| json!(c))
+                .collect();
+            if !cats.is_empty() {
+                o.insert("categories".into(), Value::Array(cats));
+            }
+        }
+        t
+    }
+
+    /// `(account, list)` from the request, both required.
+    fn todo_acc_list(req: &ApiRequest) -> Result<(&str, &str), ApiResponse> {
+        match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("list").filter(|l| !l.is_empty()),
+        ) {
+            (Some(a), Some(l)) => Ok((a, l)),
+            _ => Err(ApiResponse::error(400, "account and list are required")),
+        }
+    }
+
+    fn todo_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let t = Self::task_from_req(req);
+        if t.get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return ApiResponse::error(400, "title is required");
+        }
+        match h.create(account, list, &t) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(account, "audit:todo", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn todo_update(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let id = match req.q("id").filter(|i| !i.is_empty()) {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "id is required"),
+        };
+        let t = Self::task_from_req(req);
+        self.todo_result(
+            account,
+            &format!("update id={id}"),
+            h.update(account, list, id, &t),
+        )
+    }
+
+    fn todo_complete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let id = match req.q("id").filter(|i| !i.is_empty()) {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "id is required"),
+        };
+        self.todo_result(
+            account,
+            &format!("complete id={id}"),
+            h.complete(account, list, id),
+        )
+    }
+
+    fn todo_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let id = match req.q("id").filter(|i| !i.is_empty()) {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "id is required"),
+        };
+        self.todo_result(
+            account,
+            &format!("delete id={id}"),
+            h.delete(account, list, id),
+        )
+    }
+
+    fn todo_checklist_add(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let (task, title) = match (
+            req.q("task").filter(|t| !t.is_empty()),
+            req.q("title").filter(|t| !t.is_empty()),
+        ) {
+            (Some(t), Some(ti)) => (t, ti),
+            _ => return ApiResponse::error(400, "task and title are required"),
+        };
+        match h.checklist_add(account, list, task, title) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", "checklist-add");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:todo",
+                    "error",
+                    &format!("checklist-add: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn todo_checklist_toggle(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let (task, item) = match (
+            req.q("task").filter(|t| !t.is_empty()),
+            req.q("item").filter(|i| !i.is_empty()),
+        ) {
+            (Some(t), Some(i)) => (t, i),
+            _ => return ApiResponse::error(400, "task and item are required"),
+        };
+        let checked = req.q("checked") == Some("1");
+        self.todo_result(
+            account,
+            &format!("checklist-toggle item={item} checked={checked}"),
+            h.checklist_toggle(account, list, task, item, checked),
+        )
+    }
+
+    fn todo_checklist_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, list) = match Self::todo_acc_list(req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let (task, item) = match (
+            req.q("task").filter(|t| !t.is_empty()),
+            req.q("item").filter(|i| !i.is_empty()),
+        ) {
+            (Some(t), Some(i)) => (t, i),
+            _ => return ApiResponse::error(400, "task and item are required"),
+        };
+        self.todo_result(
+            account,
+            &format!("checklist-delete item={item}"),
+            h.checklist_delete(account, list, task, item),
+        )
+    }
+
+    fn todo_list_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, name) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("name").filter(|n| !n.is_empty()),
+        ) {
+            (Some(a), Some(n)) => (a, n),
+            _ => return ApiResponse::error(400, "account and name are required"),
+        };
+        match h.list_create(account, name) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:todo", "ok", "list-create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:todo",
+                    "error",
+                    &format!("list-create: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn todo_list_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.todo_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.todo_result(
+            account,
+            &format!("list-delete id={id}"),
+            h.list_delete(account, id),
+        )
+    }
+
+    fn onenote_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn OneNoteWriteHandler>, ApiResponse> {
+        let h = self.onenote_write.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "onenote write is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.onenote_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit OneNote result (no SSE on self-write, like `cal_result`).
+    fn onenote_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:onenote", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:onenote", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// Build a minimal, well-formed OneNote page HTML from the request's `title` +
+    /// `body` (both HTML-escaped; body newlines become paragraph breaks).
+    fn page_html_from_req(req: &ApiRequest) -> Vec<u8> {
+        let esc = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let title = req
+            .q("title")
+            .filter(|t| !t.is_empty())
+            .unwrap_or("Untitled");
+        let body = req.q("body").unwrap_or("");
+        let body_html = esc(body).replace('\n', "</p><p>");
+        format!(
+            "<!DOCTYPE html><html><head><title>{}</title></head><body><p>{}</p></body></html>",
+            esc(title),
+            body_html
+        )
+        .into_bytes()
+    }
+
+    fn onenote_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onenote_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, section) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("section").filter(|s| !s.is_empty()),
+        ) {
+            (Some(a), Some(s)) => (a, s),
+            _ => return ApiResponse::error(400, "account and section are required"),
+        };
+        let html = Self::page_html_from_req(req);
+        match h.create(account, section, &html) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:onenote", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:onenote", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn onenote_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onenote_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        self.onenote_result(account, &format!("delete id={id}"), h.delete(account, id))
+    }
+
+    fn onenote_append(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onenote_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, text) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("text").filter(|t| !t.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(t)) => (a, i, t),
+            _ => return ApiResponse::error(400, "account, id and text are required"),
+        };
+        self.onenote_result(
+            account,
+            &format!("append id={id}"),
+            h.append(account, id, text),
+        )
+    }
+
+    fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let to = Self::addr_list(req.q("to"));
+        if to.is_empty() {
+            return ApiResponse::error(400, "at least one recipient (to) is required");
+        }
+        let (cc, bcc) = (Self::addr_list(req.q("cc")), Self::addr_list(req.q("bcc")));
+        let importance = req.q("importance").filter(|i| !i.is_empty());
+        let request_read_receipt = req.q("read_receipt") == Some("1");
+        let r = h.send(
+            account,
+            req.q("subject").unwrap_or(""),
+            req.q("body").unwrap_or(""),
+            &to,
+            &cc,
+            &bcc,
+            importance,
+            request_read_receipt,
+        );
+        self.mail_result(account, &format!("send to={}", to.len()), r)
+    }
+
+    fn mail_reply(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let all = req.q("all") == Some("1");
+        // `body` (full HTML from the inline composer) takes the rich path; the
+        // plain-text `comment` path stays as a fallback.
+        let r = match req.q("body").filter(|b| !b.is_empty()) {
+            Some(body) => h.reply_html(account, id, body, all),
+            None => h.reply(account, id, req.q("comment").unwrap_or(""), all),
+        };
+        self.mail_result(account, &format!("reply id={id} all={all}"), r)
+    }
+
+    fn mail_forward(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let to = Self::addr_list(req.q("to"));
+        if to.is_empty() {
+            return ApiResponse::error(400, "at least one recipient (to) is required");
+        }
+        let r = match req.q("body").filter(|b| !b.is_empty()) {
+            Some(body) => h.forward_html(account, id, body, &to),
+            None => h.forward(account, id, req.q("comment").unwrap_or(""), &to),
+        };
+        self.mail_result(account, &format!("forward id={id} to={}", to.len()), r)
+    }
+
+    fn mail_move(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, dest) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("destination").filter(|d| !d.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(d)) => (a, i, d),
+            _ => return ApiResponse::error(400, "account, id and destination are required"),
+        };
+        match h.move_to(account, id, dest) {
+            Ok(new_id) => {
+                let _ = self.audit_account(account, "audit:mail", "ok", &format!("move id={id}"));
+                ApiResponse::ok_json(&json!({ "moved": id, "new_id": new_id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:mail",
+                    "error",
+                    &format!("move id={id}: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn mail_read(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let is_read = req.q("is_read") != Some("0");
+        let r = h.set_read(account, id, is_read);
+        self.mail_result(account, &format!("set_read id={id} is_read={is_read}"), r)
+    }
+
+    fn mail_flag(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let status = req
+            .q("status")
+            .filter(|s| !s.is_empty())
+            .unwrap_or("flagged");
+        if !["notFlagged", "flagged", "complete"].contains(&status) {
+            return ApiResponse::error(400, "status must be notFlagged|flagged|complete");
+        }
+        let due = req.q("due").filter(|s| !s.is_empty());
+        let tz = req.q("tz").filter(|s| !s.is_empty()).unwrap_or("UTC");
+        let r = h.set_flag(account, id, status, due, tz);
+        self.mail_result(
+            account,
+            &format!("set_flag id={id} status={status} due={due:?}"),
+            r,
+        )
+    }
+
+    fn mail_categories(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        // empty categories param clears the categories (a valid operation)
+        let cats: Vec<String> = req
+            .q("categories")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        let r = h.set_categories(account, id, &cats);
+        self.mail_result(
+            account,
+            &format!("set_categories id={id} n={}", cats.len()),
+            r,
+        )
+    }
+
+    /// `POST /api/v1/mail/draft` — create a draft (no `id`) or send an existing
+    /// draft (`id` present). One endpoint covers both draft verbs.
+    fn mail_draft(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        if let Some(id) = req.q("id").filter(|i| !i.is_empty()) {
+            let r = h.send_draft(account, id);
+            return self.mail_result(account, &format!("send_draft id={id}"), r);
+        }
+        let to = Self::addr_list(req.q("to"));
+        match h.create_draft(
+            account,
+            req.q("subject").unwrap_or(""),
+            req.q("body").unwrap_or(""),
+            &to,
+        ) {
+            Ok(draft_id) => {
+                let _ = self.audit_account(account, "audit:mail", "ok", "create_draft");
+                ApiResponse::ok_json(&json!({ "draft_id": draft_id }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:mail",
+                    "error",
+                    &format!("create_draft: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
         }
     }
 
@@ -687,6 +2329,44 @@ impl Router {
         ApiResponse::ok_json(&json!({ "count": active.len(), "active": active }))
     }
 
+    /// The OneDrive storage quota for an account — a live Graph call via the
+    /// daemon's handler (#564). 404 when no handler (read-only CLI `serve`).
+    fn drive_info(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_info {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "OneDrive info is not enabled on this server"),
+        };
+        let account = match req.q("account") {
+            Some(a) if !a.is_empty() => a,
+            _ => return ApiResponse::error(400, "account is required"),
+        };
+        match handler.drive_quota(account) {
+            Ok(q) => ApiResponse::ok_json(&json!({ "quota": q })),
+            // No write token / not connected is an EXPECTED state (e.g. before
+            // login) — return 200 with `available:false` so the UI shows a quiet
+            // "not connected" state instead of a console error from a 5xx fetch.
+            Err(e) => ApiResponse::ok_json(&json!({ "available": false, "reason": e })),
+        }
+    }
+
+    /// A OneDrive item's sharing permissions ("who has access") — a live Graph
+    /// call via the daemon's handler (#564). 404 when no handler; 400 without
+    /// account/id. Fetched lazily by the explorer on detail open.
+    fn item_permissions(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_info {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "OneDrive info is not enabled on this server"),
+        };
+        let (account, id) = match (req.q("account"), req.q("id")) {
+            (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        match handler.permissions(account, id) {
+            Ok(p) => ApiResponse::ok_json(&json!({ "permissions": p })),
+            Err(e) => ApiResponse::error(502, &e),
+        }
+    }
+
     fn store_path(&self, account: &str) -> Option<PathBuf> {
         self.config
             .accounts
@@ -703,6 +2383,110 @@ impl Router {
             .map(|a| json!({ "id": a.id, "username": a.username }))
             .collect();
         ApiResponse::ok_json(&json!({ "accounts": accounts }))
+    }
+
+    /// Account-auth cap check (#68): 404 if sign-in isn't enabled (read-only serve),
+    /// 401 unless the request carries the account capability token.
+    fn account_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn AccountAuthHandler>, ApiResponse> {
+        let h = self.account_auth.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "account sign-in is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.account_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    fn account_login_start(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account") {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "missing 'account'"),
+        };
+        match h.start_login(account) {
+            Ok(v) => ApiResponse::ok_json(&v),
+            Err(e) => ApiResponse::error(502, &e),
+        }
+    }
+
+    fn account_login_poll(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let id = match req.q("id") {
+            Some(i) => i,
+            None => return ApiResponse::error(400, "missing 'id'"),
+        };
+        ApiResponse::ok_json(&h.poll_login(id))
+    }
+
+    fn account_signout(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account") {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "missing 'account'"),
+        };
+        match h.sign_out(account) {
+            Ok(v) => ApiResponse::ok_json(&v),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Push cap check (#576): 404 if push isn't enabled (read-only serve),
+    /// 401 unless the request carries the push capability token.
+    fn push_gate(&self, req: &ApiRequest) -> Result<&std::sync::Arc<dyn PushHandler>, ApiResponse> {
+        let h = self
+            .push
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "push is not enabled on this server"))?;
+        if !Self::cap_ok(&self.push_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Register this device's FCM token (sent by the native shell via the web UI).
+    fn push_register(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.push_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let token = match req.q("token") {
+            Some(t) if !t.is_empty() => t,
+            _ => return ApiResponse::error(400, "missing 'token'"),
+        };
+        match h.register(token) {
+            Ok(()) => ApiResponse::ok_json(&json!({ "registered": true })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Send a test push to every registered device (UI diagnostics).
+    fn push_test(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.push_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        match h.send_test() {
+            Ok(v) => ApiResponse::ok_json(&v),
+            Err(e) => ApiResponse::error(502, &e),
+        }
     }
 
     /// The effective configuration the UI's settings view reads: engine-wide sync
@@ -845,7 +2629,38 @@ impl Router {
             };
             return match kids {
                 Ok(items) => {
-                    let arr: Vec<Value> = items.iter().map(item_json).collect();
+                    // OneDrive rows carry a read-only `preview` parsed from the
+                    // archived DriveItem JSON sidecar (#564): the rich facets the
+                    // indexed columns drop (mimeType/sha256/created-by/EXIF/shared/…).
+                    // Best-effort — an item without a readable sidecar carries none.
+                    let archive_root = (service == "onedrive")
+                        .then(|| {
+                            self.config
+                                .accounts
+                                .iter()
+                                .find(|a| a.id == account)
+                                .map(|a| a.archive_root.clone())
+                        })
+                        .flatten();
+                    let arr: Vec<Value> = items
+                        .iter()
+                        .map(|it| {
+                            let mut v = item_json(it);
+                            if let Some(root) = archive_root.as_ref() {
+                                let rel = isyncyou_connectors::shard_rel(
+                                    "onedrive",
+                                    &it.remote_id,
+                                    "json",
+                                );
+                                if let Some(bytes) = read_under_root(root, &rel) {
+                                    if let Ok(o) = serde_json::from_slice::<Value>(&bytes) {
+                                        v["preview"] = onedrive_preview(&o);
+                                    }
+                                }
+                            }
+                            v
+                        })
+                        .collect();
                     ApiResponse::ok_json(&json!({
                         "items": arr,
                         "count": arr.len(),
@@ -876,70 +2691,82 @@ impl Router {
                 // readable body simply carry no `preview`. Bounded by the page size.
                 // mail = sender/snippet/date/has-html (.eml); the rest parse the
                 // archived JSON (calendar/contacts/todo).
-                let arr: Vec<Value> =
-                    if matches!(service, "mail" | "calendar" | "contacts" | "todo") {
-                        let archive_root = self
-                            .config
-                            .accounts
-                            .iter()
-                            .find(|a| a.id == account)
-                            .map(|a| a.archive_root.clone());
-                        items
-                            .iter()
-                            .map(|it| {
-                                let mut v = item_json(it);
-                                if let (Some(root), Some(rel)) =
-                                    (archive_root.as_ref(), it.local_path.as_ref())
-                                {
-                                    if let Some(bytes) = read_under_root(root, rel) {
-                                        if service == "mail" {
-                                            let p = isyncyou_connectors::mail_preview(&bytes);
-                                            v["preview"] = json!({
-                                                "from": p.from,
-                                                "to": p.to,
-                                                "subject": p.subject,
-                                                "snippet": p.body_snippet,
-                                                "date": p.date,
-                                                "has_html": p.has_html,
-                                                "attachments": p.attachment_count,
-                                                "size": p.size_bytes,
-                                            });
-                                        } else if let Ok(o) =
-                                            serde_json::from_slice::<Value>(&bytes)
-                                        {
-                                            v["preview"] = match service {
-                                                "calendar" => json!({
-                                                    "start": o["start"]["dateTime"],
-                                                    "start_tz": o["start"]["timeZone"],
-                                                    "end": o["end"]["dateTime"],
-                                                    "end_tz": o["end"]["timeZone"],
-                                                    "all_day": o["isAllDay"],
-                                                    "location": o["location"]["displayName"],
-                                                }),
-                                                "contacts" => json!({
-                                                    "company": o["companyName"],
-                                                    "job": o["jobTitle"],
-                                                    "email": o["emailAddresses"][0]["address"],
-                                                }),
-                                                _ => json!({
-                                                    "status": o["status"],
-                                                    "importance": o["importance"],
-                                                    "due": o["dueDateTime"]["dateTime"],
-                                                    "has_note": o["body"]["content"]
-                                                        .as_str()
-                                                        .map(|s| !s.trim().is_empty())
-                                                        .unwrap_or(false),
-                                                }),
-                                            };
-                                        }
+                let arr: Vec<Value> = if matches!(
+                    service,
+                    "mail" | "calendar" | "contacts" | "todo" | "onenote"
+                ) {
+                    let archive_root = self
+                        .config
+                        .accounts
+                        .iter()
+                        .find(|a| a.id == account)
+                        .map(|a| a.archive_root.clone());
+                    items
+                        .iter()
+                        .map(|it| {
+                            let mut v = item_json(it);
+                            if let (Some(root), Some(rel)) =
+                                (archive_root.as_ref(), it.local_path.as_ref())
+                            {
+                                if let Some(bytes) = read_under_root(root, rel) {
+                                    if service == "mail" {
+                                        mail_preview_enrichment(&mut v, it, root, rel, &bytes);
+                                    } else if service == "onenote" {
+                                        // a page's local_path is the .html body, not JSON —
+                                        // onenote_preview reads the _pagemeta_ / flank sidecar.
+                                        v["preview"] = onenote_preview(it, root);
+                                    } else if let Ok(o) = serde_json::from_slice::<Value>(&bytes) {
+                                        v["preview"] = match service {
+                                            "calendar" => calendar_preview(it, &o),
+                                            "contacts" => contact_preview(it, &o, root),
+                                            "todo" => todo_preview(it, &o, root),
+                                            _ => json!({
+                                                "status": o["status"],
+                                                "importance": o["importance"],
+                                                "due": o["dueDateTime"]["dateTime"],
+                                                "has_note": o["body"]["content"]
+                                                    .as_str()
+                                                    .map(|s| !s.trim().is_empty())
+                                                    .unwrap_or(false),
+                                            }),
+                                        };
                                     }
                                 }
-                                v
-                            })
-                            .collect()
-                    } else {
-                        items.iter().map(item_json).collect()
-                    };
+                            }
+                            // #89: show a mail's sender from the indexed `sender`
+                            // (captured at ingest — read with the item, NO extra
+                            // file I/O) whenever the .eml body isn't cached, so a row
+                            // never reads "(unknown sender)". The .eml enrichment
+                            // above wins when the body is present.
+                            if service == "mail" {
+                                if let Some(sender) = it.sender.as_deref() {
+                                    let has_from = v
+                                        .get("preview")
+                                        .and_then(|p| p.get("from"))
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty());
+                                    if !has_from {
+                                        let mut p =
+                                            v.get("preview").cloned().unwrap_or_else(|| json!({}));
+                                        p["from"] = json!(sender);
+                                        if p.get("subject").and_then(Value::as_str).is_none() {
+                                            p["subject"] = json!(it.name);
+                                        }
+                                        if p.get("date").and_then(Value::as_str).is_none() {
+                                            if let Some(d) = it.remote_mtime.as_deref() {
+                                                p["date"] = json!(d);
+                                            }
+                                        }
+                                        v["preview"] = p;
+                                    }
+                                }
+                            }
+                            v
+                        })
+                        .collect()
+                } else {
+                    items.iter().map(item_json).collect()
+                };
                 ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
@@ -1034,6 +2861,126 @@ impl Router {
         }
     }
 
+    /// List (`?account&service&id`) or download (`&index=N`) the attachments of an
+    /// archived mail `.eml` (#562). Listing returns JSON metadata; download serves
+    /// the decoded part bytes with an inert content-type (mapped through the
+    /// attachment filename, `nosniff` always on — never an executable type).
+    fn attachment(&self, req: &ApiRequest) -> ApiResponse {
+        let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
+            (Some(a), Some(s), Some(i)) => (a, s, i),
+            _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
+        };
+        // ToDo attachments live in the `_taskatt_<id>` sub-resource sidecar as Graph
+        // taskFileAttachment[] (inline base64 contentBytes), not a MIME `.eml`
+        // (#567 B4): list/decode them from that JSON instead of mail's mime parser.
+        if service == "todo" {
+            return self.todo_attachment(account, id, req.q("index"));
+        }
+        let bytes = match self.read_archived(account, service, id) {
+            Ok((_, b, _)) => b,
+            Err(e) => return e,
+        };
+        match req.q("index") {
+            None => {
+                let list: Vec<Value> = isyncyou_connectors::list_attachments(&bytes)
+                    .into_iter()
+                    .map(|a| {
+                        json!({
+                            "index": a.index,
+                            "filename": a.filename,
+                            "content_type": a.content_type,
+                            "size": a.size,
+                        })
+                    })
+                    .collect();
+                ApiResponse::ok_json(&json!({ "attachments": list }))
+            }
+            Some(idx_s) => {
+                let idx = match idx_s.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return ApiResponse::error(400, "index must be a non-negative integer")
+                    }
+                };
+                match isyncyou_connectors::extract_attachment(&bytes, idx) {
+                    Some((filename, _ct, data)) => ApiResponse {
+                        status: 200,
+                        content_type: safe_content_type(&filename).into(),
+                        body: data,
+                        headers: Vec::new(),
+                    },
+                    None => ApiResponse::error(404, "attachment index out of range"),
+                }
+            }
+        }
+    }
+
+    /// List/download a task's file attachments from its `_taskatt_<id>` sub-resource
+    /// sidecar (#567 B4). The download decodes the inline base64 `contentBytes` and
+    /// serves it under an inert content-type (the always-on nosniff keeps it
+    /// non-executable, like the mail attachment path).
+    fn todo_attachment(&self, account: &str, task_id: &str, index: Option<&str>) -> ApiResponse {
+        let att_id = format!("_taskatt_{task_id}");
+        let bytes = match self.read_archived(account, "todo", &att_id) {
+            Ok((_, b, _)) => b,
+            Err(_) => return ApiResponse::error(404, "no archived attachments for this task"),
+        };
+        match index {
+            None => {
+                let list: Vec<Value> = isyncyou_connectors::list_task_attachments(&bytes)
+                    .into_iter()
+                    .map(|(i, name, ct, size)| {
+                        json!({ "index": i, "filename": name, "content_type": ct, "size": size })
+                    })
+                    .collect();
+                ApiResponse::ok_json(&json!({ "attachments": list }))
+            }
+            Some(idx_s) => {
+                let idx = match idx_s.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return ApiResponse::error(400, "index must be a non-negative integer")
+                    }
+                };
+                match isyncyou_connectors::extract_task_attachment(&bytes, idx) {
+                    Some((filename, _ct, data)) => ApiResponse {
+                        status: 200,
+                        content_type: safe_content_type(&filename).into(),
+                        body: data,
+                        headers: Vec::new(),
+                    },
+                    None => ApiResponse::error(404, "attachment index out of range"),
+                }
+            }
+        }
+    }
+
+    /// Serve a contact's archived photo (#566). `backup_contact_photos` writes
+    /// it to `contacts/<shard>/<id>.jpg` but never records a `local_path`, so it
+    /// is resolved by id via `shard_rel` under the archive root (the same
+    /// id-addressed trick as the OneDrive sidecar). `image/jpeg` + the always-on
+    /// nosniff; 404 when the contact has no archived photo.
+    fn contact_photo(&self, req: &ApiRequest) -> ApiResponse {
+        let (account, id) = match (req.q("account"), req.q("id")) {
+            (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let acc = match self.config.accounts.iter().find(|a| a.id == account) {
+            Some(a) => a,
+            None => return ApiResponse::error(404, "unknown account"),
+        };
+        let rel = isyncyou_connectors::shard_rel("contacts", id, "jpg");
+        match read_under_root(&acc.archive_root, &rel) {
+            Some(bytes) => ApiResponse {
+                status: 200,
+                content_type: "image/jpeg".into(),
+                body: bytes,
+                headers: Vec::new(),
+            },
+            None => ApiResponse::error(404, "no archived photo for this contact"),
+        }
+    }
+
     /// Render an archived item as a **safe, self-contained HTML page**: our own
     /// canonical JSON (calendar/contacts/todo/onenote) is escaped into a fixed
     /// skeleton — no untrusted markup, no scripts, no external resources. A mail
@@ -1068,6 +3015,10 @@ impl Router {
         if service == "mail" {
             if let Some(html) = isyncyou_connectors::extract_html_with_inline_images(&bytes) {
                 let subject = if name.is_empty() { "Message" } else { &name };
+                // external content (remote images + web fonts) is opt-in (the
+                // reader's "Load external content" button adds ?external=1) —
+                // default blocks it (tracking pixels + privacy)
+                let external = req.q("external") == Some("1");
                 let inline_images: Vec<_> = html
                     .inline_images
                     .iter()
@@ -1078,8 +3029,13 @@ impl Router {
                     })
                     .collect();
                 return ApiResponse::html_with_csp(
-                    &view::mail_page_with_inline_images(subject, &html.html, &inline_images),
-                    view::MAIL_CSP,
+                    &view::mail_page_with_inline_images(
+                        subject,
+                        &html.html,
+                        &inline_images,
+                        external,
+                    ),
+                    view::mail_csp(external),
                 );
             }
         }
@@ -1209,6 +3165,27 @@ fn safe_content_type(rel: &str) -> &'static str {
 }
 
 /// Serialize an item's safe metadata (never the body bytes).
+/// The Live∪Backup status of an element (plan §S-P4.3): the join of the cloud
+/// mirror (the store, refreshed each sync) and the local archive.
+/// - `backup_only` — cloud-deleted but still archived (the backup's value)
+/// - `live_only` — in the cloud, not backed up
+/// - `stale` — backed up, but the cloud changed since (`etag != body_etag`)
+/// - `live_backup` — in the cloud and backed up, up to date
+fn backup_state(it: &Item) -> &'static str {
+    if it.deleted_at.is_some() {
+        // only cloud-deleted items that still have an archived body reach the
+        // listing (see `items_by_service_page`), so this is the archive state.
+        return "backup_only";
+    }
+    if it.local_path.is_none() {
+        return "live_only";
+    }
+    match (it.etag.as_deref(), it.body_etag.as_deref()) {
+        (Some(e), Some(b)) if e != b => "stale",
+        _ => "live_backup",
+    }
+}
+
 fn item_json(it: &Item) -> Value {
     json!({
         "service": it.service,
@@ -1221,6 +3198,8 @@ fn item_json(it: &Item) -> Value {
         "size": it.size,
         "etag": it.etag,
         "has_body": it.local_path.is_some(),
+        "deleted": it.deleted_at.is_some(),
+        "state": backup_state(it),
         "verify_status": it.verify_status,
         "verified_at": it.verified_at,
     })
@@ -1239,10 +3218,358 @@ fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>>
     std::fs::read(&p).ok()
 }
 
+/// Build a calendar item's `preview` from its archived JSON sidecar (#565 B4).
+/// A `calendar` entity exposes its colour (so the UI can colour-code events); an
+/// `event` exposes all the detail the UI surfaces — recurrence rule (for
+/// client-side month/week expansion), Teams join link, my response status,
+/// categories, importance, sensitivity, show-as, cancellation, attachments,
+/// webLink, multiple locations. All best-effort (absent fields → null).
+fn calendar_preview(it: &Item, o: &Value) -> Value {
+    if it.item_type == "calendar" {
+        return json!({
+            "hex_color": o.get("hexColor").and_then(Value::as_str),
+            "color": o.get("color").and_then(Value::as_str),
+            "is_default": o.get("isDefaultCalendar").and_then(Value::as_bool),
+            "can_edit": o.get("canEdit").and_then(Value::as_bool),
+        });
+    }
+    json!({
+        "start": o.pointer("/start/dateTime"),
+        "start_tz": o.pointer("/start/timeZone"),
+        "end": o.pointer("/end/dateTime"),
+        "end_tz": o.pointer("/end/timeZone"),
+        "all_day": o.get("isAllDay"),
+        "location": o.pointer("/location/displayName"),
+        "locations": o.get("locations"),
+        "organizer": o.pointer("/organizer/emailAddress"),
+        "recurrence": o.get("recurrence"),
+        "type": o.get("type").and_then(Value::as_str),
+        "series_master_id": o.get("seriesMasterId").and_then(Value::as_str),
+        "response_status": o.pointer("/responseStatus/response").and_then(Value::as_str),
+        "online_meeting_url": o.get("onlineMeetingUrl").and_then(Value::as_str)
+            .or_else(|| o.pointer("/onlineMeeting/joinUrl").and_then(Value::as_str)),
+        "is_online_meeting": o.get("isOnlineMeeting").and_then(Value::as_bool),
+        "show_as": o.get("showAs").and_then(Value::as_str),
+        "sensitivity": o.get("sensitivity").and_then(Value::as_str),
+        "importance": o.get("importance").and_then(Value::as_str),
+        "categories": o.get("categories"),
+        "is_cancelled": o.get("isCancelled").and_then(Value::as_bool),
+        "has_attachments": o.get("hasAttachments").and_then(Value::as_bool),
+        "web_link": o.get("webLink").and_then(Value::as_str),
+        "reminder_minutes": o.get("reminderMinutesBeforeStart"),
+    })
+}
+
+/// Build a contact's `preview` from its archived JSON sidecar (#566): every
+/// detail the card surfaces — name parts, the **three** addresses, IM, birthday,
+/// categories, relationships, profession/office — plus `has_photo` (does the
+/// archived `.jpg` exist by id), so the UI knows whether to load the photo
+/// avatar. All best-effort.
+fn contact_preview(it: &Item, o: &Value, root: &std::path::Path) -> Value {
+    let addr = |a: &Value| {
+        json!({
+            "street": a.get("street").and_then(Value::as_str),
+            "city": a.get("city").and_then(Value::as_str),
+            "state": a.get("state").and_then(Value::as_str),
+            "postalCode": a.get("postalCode").and_then(Value::as_str),
+            "countryOrRegion": a.get("countryOrRegion").and_then(Value::as_str),
+        })
+    };
+    // The photo id is hashed by shard_rel, so the path can't traverse — a cheap
+    // existence check is safe.
+    let has_photo = root
+        .join(isyncyou_connectors::shard_rel(
+            "contacts",
+            &it.remote_id,
+            "jpg",
+        ))
+        .exists();
+    json!({
+        "company": o.get("companyName").and_then(Value::as_str),
+        "job": o.get("jobTitle").and_then(Value::as_str),
+        "department": o.get("department").and_then(Value::as_str),
+        "email": o.pointer("/emailAddresses/0/address").and_then(Value::as_str),
+        "emails": o.get("emailAddresses"),
+        "mobile": o.get("mobilePhone").and_then(Value::as_str),
+        "business_phones": o.get("businessPhones"),
+        "home_phones": o.get("homePhones"),
+        "birthday": o.get("birthday").and_then(Value::as_str),
+        "business_address": o.get("businessAddress").map(addr),
+        "home_address": o.get("homeAddress").map(addr),
+        "other_address": o.get("otherAddress").map(addr),
+        "im_addresses": o.get("imAddresses"),
+        "categories": o.get("categories"),
+        "assistant": o.get("assistantName").and_then(Value::as_str),
+        "manager": o.get("manager").and_then(Value::as_str),
+        "spouse": o.get("spouseName").and_then(Value::as_str),
+        "children": o.get("children"),
+        "profession": o.get("profession").and_then(Value::as_str),
+        "office_location": o.get("officeLocation").and_then(Value::as_str),
+        "homepage": o.get("businessHomePage").and_then(Value::as_str),
+        "title": o.get("title").and_then(Value::as_str),
+        "nick_name": o.get("nickName").and_then(Value::as_str),
+        "middle_name": o.get("middleName").and_then(Value::as_str),
+        "initials": o.get("initials").and_then(Value::as_str),
+        "generation": o.get("generation").and_then(Value::as_str),
+        "file_as": o.get("fileAs").and_then(Value::as_str),
+        "yomi_given": o.get("yomiGivenName").and_then(Value::as_str),
+        "yomi_surname": o.get("yomiSurname").and_then(Value::as_str),
+        "yomi_company": o.get("yomiCompanyName").and_then(Value::as_str),
+        "has_photo": has_photo,
+    })
+}
+
+/// Build a ToDo item's `preview` from its archived JSON sidecar (#567 B3). A
+/// `list` exposes its list-level fields (`wellknownListName`/`isShared`/
+/// `isOwner`); a `task` exposes status/importance, the date fields, recurrence,
+/// categories, attachment flag, and a checklist summary (`steps_total`/
+/// `steps_done`) read from the `_checklist_<id>` sub-resource sidecar (#567 B2).
+/// All best-effort (absent fields → null).
+fn todo_preview(it: &Item, o: &Value, root: &std::path::Path) -> Value {
+    if it.item_type == "list" {
+        return json!({
+            "wellknown_name": o.get("wellknownListName").and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && *s != "none"),
+            "is_shared": o.get("isShared").and_then(Value::as_bool),
+            "is_owner": o.get("isOwner").and_then(Value::as_bool),
+        });
+    }
+    // Checklist summary from the `_checklist_<id>` sub-resource sidecar (#567 B2):
+    // total steps + how many are checked. The id is hashed by shard_rel, so the
+    // path can't traverse.
+    let (mut steps_total, mut steps_done) = (0usize, 0usize);
+    if let Some(bytes) = read_under_root(
+        root,
+        &isyncyou_connectors::shard_rel("todo", &format!("_checklist_{}", it.remote_id), "json"),
+    ) {
+        if let Ok(cl) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(steps) = cl.get("value").and_then(Value::as_array) {
+                steps_total = steps.len();
+                steps_done = steps
+                    .iter()
+                    .filter(|s| s.get("isChecked").and_then(Value::as_bool) == Some(true))
+                    .count();
+            }
+        }
+    }
+    json!({
+        "status": o.get("status").and_then(Value::as_str),
+        "importance": o.get("importance").and_then(Value::as_str),
+        "due": o.pointer("/dueDateTime/dateTime"),
+        "due_tz": o.pointer("/dueDateTime/timeZone"),
+        "start": o.pointer("/startDateTime/dateTime"),
+        "start_tz": o.pointer("/startDateTime/timeZone"),
+        "reminder": o.pointer("/reminderDateTime/dateTime"),
+        "is_reminder_on": o.get("isReminderOn").and_then(Value::as_bool),
+        "completed": o.pointer("/completedDateTime/dateTime"),
+        "created": o.get("createdDateTime").and_then(Value::as_str),
+        "recurrence": o.get("recurrence"),
+        "categories": o.get("categories"),
+        "body_type": o.pointer("/body/contentType").and_then(Value::as_str),
+        "has_attachments": o.get("hasAttachments").and_then(Value::as_bool),
+        "has_note": o.pointer("/body/content")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        "steps_total": steps_total,
+        "steps_done": steps_done,
+    })
+}
+
+/// Build a OneNote item's `preview` (#568). A page exposes the metadata from its
+/// `_pagemeta_<id>` sidecar (the page's `local_path` is the `.html` body, not JSON) —
+/// createdDateTime, level/order, userTags, the OneNote web/client links, its section
+/// and notebook names, plus `has_resources` (whether a `<page>.resources.json`
+/// manifest exists). A notebook/section/section-group exposes a few fields from its
+/// flank JSON sidecar. All best-effort.
+fn onenote_preview(it: &Item, root: &std::path::Path) -> Value {
+    if it.item_type == "page" {
+        let meta = read_under_root(
+            root,
+            &isyncyou_connectors::shard_rel(
+                "onenote",
+                &format!("_pagemeta_{}", it.remote_id),
+                "json",
+            ),
+        )
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or_else(|| json!({}));
+        let has_resources = it
+            .local_path
+            .as_deref()
+            .map(|rel| root.join(rel).with_extension("resources.json").exists())
+            .unwrap_or(false);
+        return json!({
+            "created": meta.get("createdDateTime").and_then(Value::as_str),
+            "level": meta.get("level"),
+            "order": meta.get("order"),
+            "user_tags": meta.get("userTags"),
+            "web_url": meta.pointer("/links/oneNoteWebUrl/href").and_then(Value::as_str),
+            "client_url": meta.pointer("/links/oneNoteClientUrl/href").and_then(Value::as_str),
+            "section_name": meta.pointer("/parentSection/displayName").and_then(Value::as_str),
+            "notebook_id": meta.pointer("/parentNotebook/id").and_then(Value::as_str),
+            "notebook_name": meta.pointer("/parentNotebook/displayName").and_then(Value::as_str),
+            "has_resources": has_resources,
+        });
+    }
+    // notebook / section / section-group: a few fields from the flank JSON sidecar
+    let o = it
+        .local_path
+        .as_deref()
+        .and_then(|rel| read_under_root(root, rel))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "is_default": o.get("isDefault").and_then(Value::as_bool),
+        "web_url": o.pointer("/links/oneNoteWebUrl/href").and_then(Value::as_str),
+        "created": o.get("createdDateTime").and_then(Value::as_str),
+    })
+}
+
+/// Build a OneDrive item's `preview` from its archived DriveItem JSON sidecar
+/// (#564): the rich facets the indexed columns can't hold. All best-effort —
+/// absent fields serialize as null/false.
+fn onedrive_preview(o: &Value) -> Value {
+    json!({
+        "mime_type": o.pointer("/file/mimeType").and_then(Value::as_str),
+        "sha256": o.pointer("/file/hashes/sha256Hash").and_then(Value::as_str),
+        "created": o.get("createdDateTime").and_then(Value::as_str),
+        "created_by": o.pointer("/createdBy/user/displayName").and_then(Value::as_str),
+        "last_modified_by": o.pointer("/lastModifiedBy/user/displayName").and_then(Value::as_str),
+        "description": o.get("description").and_then(Value::as_str),
+        "web_url": o.get("webUrl").and_then(Value::as_str),
+        // Rich media facets passed through verbatim — the UI reads their fields
+        // (dimensions, EXIF, duration, track tags, GPS) so we never lose any.
+        "image": o.get("image"),
+        "photo": o.get("photo"),
+        "video": o.get("video"),
+        "audio": o.get("audio"),
+        "location": o.get("location"),
+        "shared": o.get("shared").is_some(),
+        "malware": o.get("malware").is_some(),
+        "special_folder": o.pointer("/specialFolder/name").and_then(Value::as_str),
+        "child_count": o.pointer("/folder/childCount").and_then(Value::as_i64),
+        "package_type": o.pointer("/package/type").and_then(Value::as_str),
+    })
+}
+
+/// Build a mail item's `preview` (#562). A `message` carries the `.eml`-parsed
+/// fields (from/to/cc/subject/snippet/date/has_html/size), the attachment list,
+/// and the structured Outlook fields merged from its `<id>.json` sidecar
+/// (categories/isRead/flag/importance/inferenceClassification/bcc/conversationId/
+/// webLink/isDraft/receipt flags). A `category` item exposes its displayName +
+/// colour so the UI can build a colour map. `bytes` is the item's `local_path`
+/// body (`.eml` for a message, `.json` for a category).
+fn mail_preview_enrichment(
+    v: &mut Value,
+    it: &Item,
+    root: &std::path::Path,
+    rel: &str,
+    bytes: &[u8],
+) {
+    match it.item_type.as_str() {
+        "message" => {
+            let p = isyncyou_connectors::mail_preview(bytes);
+            let mut preview = json!({
+                "from": p.from,
+                "to": p.to,
+                "cc": p.cc,
+                "subject": p.subject,
+                "snippet": p.body_snippet,
+                "date": p.date,
+                "has_html": p.has_html,
+                "attachments": p.attachment_count,
+                "size": p.size_bytes,
+            });
+            let atts: Vec<Value> = isyncyou_connectors::list_attachments(bytes)
+                .into_iter()
+                .map(|a| {
+                    json!({
+                        "index": a.index,
+                        "filename": a.filename,
+                        "content_type": a.content_type,
+                        "size": a.size,
+                    })
+                })
+                .collect();
+            preview["attachment_list"] = Value::Array(atts);
+            // Merge the structured Outlook fields from the <id>.json sidecar.
+            if let Some(jrel) = rel.strip_suffix(".eml").map(|s| format!("{s}.json")) {
+                if let Some(jb) = read_under_root(root, &jrel) {
+                    if let Ok(o) = serde_json::from_slice::<Value>(&jb) {
+                        preview["categories"] = o["categories"].clone();
+                        preview["isRead"] = o["isRead"].clone();
+                        preview["flag"] = o["flag"]["flagStatus"].clone();
+                        preview["importance"] = o["importance"].clone();
+                        preview["inferenceClassification"] = o["inferenceClassification"].clone();
+                        preview["conversationId"] = o["conversationId"].clone();
+                        preview["webLink"] = o["webLink"].clone();
+                        preview["isDraft"] = o["isDraft"].clone();
+                        preview["isDeliveryReceiptRequested"] =
+                            o["isDeliveryReceiptRequested"].clone();
+                        preview["isReadReceiptRequested"] = o["isReadReceiptRequested"].clone();
+                        if let Some(bcc) = o["bccRecipients"].as_array() {
+                            preview["bcc"] = Value::Array(
+                                bcc.iter()
+                                    .filter_map(|r| r["emailAddress"]["address"].as_str())
+                                    .map(|s| json!(s))
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+            }
+            v["preview"] = preview;
+        }
+        "category" => {
+            if let Ok(o) = serde_json::from_slice::<Value>(bytes) {
+                v["preview"] = json!({
+                    "displayName": o["displayName"],
+                    "color": o["color"],
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use isyncyou_core::config::AccountConfig;
+
+    // AC1: the 4-state Live∪Backup model is derived correctly per item, and
+    // AC2: a body archived at an older etag than the item's current sync etag
+    // surfaces as `stale`.
+    #[test]
+    fn backup_state_derives_four_states() {
+        // live_only: in the cloud per last sync, no archived body.
+        let mut live = Item::new("a", "mail", "m1", "live", "message");
+        live.etag = Some("E1".into());
+        assert_eq!(backup_state(&live), "live_only");
+
+        // live_backup: archived, and the body matches the current cloud etag.
+        let mut backed = Item::new("a", "mail", "m2", "backed", "message");
+        backed.etag = Some("E1".into());
+        backed.local_path = Some("mail/aa/m2.eml".into());
+        backed.body_etag = Some("E1".into());
+        assert_eq!(backup_state(&backed), "live_backup");
+
+        // stale: archived at E1, but the cloud item moved on to E2.
+        let mut stale = Item::new("a", "mail", "m3", "stale", "message");
+        stale.etag = Some("E2".into());
+        stale.local_path = Some("mail/aa/m3.eml".into());
+        stale.body_etag = Some("E1".into());
+        assert_eq!(backup_state(&stale), "stale");
+
+        // backup_only: cloud-deleted, but we still hold the archived body.
+        let mut gone = Item::new("a", "mail", "m4", "gone", "message");
+        gone.etag = Some("E1".into());
+        gone.local_path = Some("mail/aa/m4.eml".into());
+        gone.body_etag = Some("E1".into());
+        gone.deleted_at = Some("2026-06-18T00:00:00Z".into());
+        assert_eq!(backup_state(&gone), "backup_only");
+    }
 
     fn setup() -> (tempfile::TempDir, Router) {
         let dir = tempfile::tempdir().unwrap();
@@ -1297,6 +3624,186 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert!(resp.content_type.starts_with("text/html"));
         assert!(String::from_utf8_lossy(&resp.body).contains("iSyncYou"));
+    }
+
+    #[test]
+    fn attachment_lists_and_downloads_with_inert_type() {
+        let (dir, router) = setup();
+        // a real .eml with one PNG attachment at m1's archived path
+        let eml = b"From: a@b.com\r\nSubject: Has attach\r\n\
+Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--B\r\nContent-Type: image/png; name=\"pic.png\"\r\n\
+Content-Disposition: attachment; filename=\"pic.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
+        let p = dir.path().join("arch").join("mail/aa/bb/x.eml");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, eml).unwrap();
+
+        // list
+        let list = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=mail&id=m1",
+        ));
+        assert_eq!(list.status, 200);
+        let v = body_json(&list);
+        assert_eq!(v["attachments"][0]["index"], 0);
+        assert_eq!(v["attachments"][0]["filename"], "pic.png");
+        assert_eq!(v["attachments"][0]["content_type"], "image/png");
+
+        // download index 0 → real PNG bytes, served inert as image/png
+        let dl = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=mail&id=m1&index=0",
+        ));
+        assert_eq!(dl.status, 200);
+        assert_eq!(dl.content_type, "image/png");
+        assert_eq!(&dl.body[..4], b"\x89PNG");
+
+        // out of range → 404
+        let oob = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=mail&id=m1&index=9",
+        ));
+        assert_eq!(oob.status, 404);
+    }
+
+    #[test]
+    fn items_mail_preview_exposes_structured_fields_and_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut m = Item::new("a", "mail", "m1", "Hi", "message");
+            m.local_path = Some("mail/aa/bb/msg.eml".into());
+            store.upsert_item(&m).unwrap();
+            let mut c = Item::new("a", "mail", "c1", "Red category", "category");
+            c.local_path = Some("mail/cc/dd/cat.json".into());
+            store.upsert_item(&c).unwrap();
+        }
+        // .eml (cc parsed from headers) + its <id>.json sidecar (structured fields)
+        std::fs::create_dir_all(arch.join("mail/aa/bb")).unwrap();
+        std::fs::write(
+            arch.join("mail/aa/bb/msg.eml"),
+            b"From: a@b.com\r\nTo: t@x.com\r\nCc: c@x.com\r\nSubject: Hi\r\n\r\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            arch.join("mail/aa/bb/msg.json"),
+            serde_json::to_vec(&json!({
+                "categories": ["Red category"],
+                "isRead": false,
+                "flag": { "flagStatus": "flagged" },
+                "importance": "high",
+                "webLink": "https://outlook/x",
+                "isDraft": false,
+                "bccRecipients": [{ "emailAddress": { "address": "b@x.com" } }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // category snapshot
+        std::fs::create_dir_all(arch.join("mail/cc/dd")).unwrap();
+        std::fs::write(
+            arch.join("mail/cc/dd/cat.json"),
+            serde_json::to_vec(&json!({ "displayName": "Red category", "color": "preset0" }))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=mail&limit=100",
+        ));
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        let items = v["items"].as_array().unwrap();
+
+        let msg = items.iter().find(|i| i["remote_id"] == "m1").unwrap();
+        assert_eq!(msg["preview"]["cc"][0], "c@x.com");
+        assert_eq!(msg["preview"]["categories"][0], "Red category");
+        assert_eq!(msg["preview"]["isRead"], false);
+        assert_eq!(msg["preview"]["flag"], "flagged");
+        assert_eq!(msg["preview"]["importance"], "high");
+        assert_eq!(msg["preview"]["webLink"], "https://outlook/x");
+        assert_eq!(msg["preview"]["bcc"][0], "b@x.com");
+
+        let cat = items.iter().find(|i| i["remote_id"] == "c1").unwrap();
+        assert_eq!(cat["preview"]["displayName"], "Red category");
+        assert_eq!(cat["preview"]["color"], "preset0");
+    }
+
+    #[test]
+    fn onedrive_preview_captures_all_rich_facets() {
+        // A DriveItem carrying every facet OneDrive can return — the preview must
+        // surface each one so the detail sheet never silently drops metadata (#564).
+        let o = json!({
+            "createdDateTime": "2026-01-02T03:04:05Z",
+            "description": "Sunset over the Alps",
+            "webUrl": "https://onedrive.live.com/x",
+            "createdBy": { "user": { "displayName": "Alice Admin" } },
+            "lastModifiedBy": { "user": { "displayName": "Bob Editor" } },
+            "file": { "mimeType": "image/jpeg", "hashes": { "sha256Hash": "ABC123" } },
+            "image": { "width": 4032, "height": 3024 },
+            "photo": { "takenDateTime": "2026-01-02T03:00:00Z", "cameraMake": "Google",
+                       "cameraModel": "Pixel 9 Pro", "iso": 100, "fNumber": 1.8, "focalLength": 6.9 },
+            "video": { "width": 1920, "height": 1080, "duration": 30000, "bitrate": 8_000_000 },
+            "audio": { "title": "Belgrade Nights", "artist": "DJ Rakija", "album": "Club Mix",
+                       "duration": 215_000 },
+            "location": { "latitude": 47.1, "longitude": 11.4, "altitude": 600.0 },
+            "shared": { "scope": "users" },
+            "malware": { "description": "trojan" },
+            "specialFolder": { "name": "photos" },
+            "folder": { "childCount": 7 },
+            "package": { "type": "oneNote" },
+        });
+        let p = onedrive_preview(&o);
+        assert_eq!(p["mime_type"], "image/jpeg");
+        assert_eq!(p["sha256"], "ABC123");
+        assert_eq!(p["created"], "2026-01-02T03:04:05Z");
+        assert_eq!(p["created_by"], "Alice Admin");
+        assert_eq!(p["last_modified_by"], "Bob Editor");
+        assert_eq!(p["description"], "Sunset over the Alps");
+        assert_eq!(p["web_url"], "https://onedrive.live.com/x");
+        assert_eq!(p["image"]["width"], 4032);
+        assert_eq!(p["photo"]["cameraModel"], "Pixel 9 Pro");
+        assert_eq!(p["photo"]["iso"], 100);
+        assert_eq!(p["video"]["duration"], 30000);
+        assert_eq!(p["video"]["width"], 1920);
+        assert_eq!(p["audio"]["title"], "Belgrade Nights");
+        assert_eq!(p["audio"]["duration"], 215_000);
+        assert_eq!(p["location"]["latitude"], 47.1);
+        assert_eq!(p["shared"], true);
+        assert_eq!(p["malware"], true);
+        assert_eq!(p["special_folder"], "photos");
+        assert_eq!(p["child_count"], 7);
+        assert_eq!(p["package_type"], "oneNote");
+    }
+
+    #[test]
+    fn onedrive_preview_omits_absent_facets() {
+        // A plain file (no media/share/malware) must not fabricate facet fields:
+        // shared/malware are presence-booleans, the rest stay null.
+        let o = json!({
+            "createdDateTime": "2026-01-02T03:04:05Z",
+            "file": { "mimeType": "application/pdf" },
+        });
+        let p = onedrive_preview(&o);
+        assert_eq!(p["mime_type"], "application/pdf");
+        assert_eq!(p["shared"], false);
+        assert_eq!(p["malware"], false);
+        assert!(p["video"].is_null());
+        assert!(p["audio"].is_null());
+        assert!(p["location"].is_null());
+        assert!(p["description"].is_null());
     }
 
     #[test]
@@ -1390,6 +3897,1001 @@ mod tests {
         let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
             .with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&bad).status, 400);
+    }
+
+    struct OkSettings(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl SettingsHandler for OkSettings {
+        fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String> {
+            self.0.store(secs, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn settings_post_requires_cap_token_and_validates_interval() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_d, router) = setup();
+        // read-only router (no handler injected) refuses the settings POST
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/settings?poll_interval_secs=10"
+                ))
+                .status,
+            404
+        );
+        let seen = std::sync::Arc::new(AtomicU64::new(0));
+        let router = router.with_settings(
+            std::sync::Arc::new(OkSettings(seen.clone())),
+            "secret".into(),
+        );
+        let q = "/api/v1/settings?poll_interval_secs=10";
+        // no / wrong token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // valid token but out-of-range value -> 400, handler not called
+        let oob = ApiRequest::new("POST", "/api/v1/settings?poll_interval_secs=99999")
+            .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&oob).status, 400);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        // valid token + valid value -> 200, handler applied
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        assert_eq!(ok.status, 200);
+        assert_eq!(seen.load(Ordering::SeqCst), 10);
+    }
+
+    /// Records the last mail-write op so the routing + param parsing is checkable.
+    #[derive(Default)]
+    struct RecordMailWrite(std::sync::Mutex<Vec<String>>);
+    impl RecordMailWrite {
+        fn last(&self) -> String {
+            self.0.lock().unwrap().last().cloned().unwrap_or_default()
+        }
+    }
+    impl MailWriteHandler for RecordMailWrite {
+        #[allow(clippy::too_many_arguments)]
+        fn send(
+            &self,
+            _a: &str,
+            subject: &str,
+            _b: &str,
+            to: &[String],
+            cc: &[String],
+            _bcc: &[String],
+            importance: Option<&str>,
+            request_read_receipt: bool,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!(
+                "send subj={subject} to={} cc={} imp={} rr={request_read_receipt}",
+                to.join(","),
+                cc.len(),
+                importance.unwrap_or("-"),
+            ));
+            Ok(())
+        }
+        fn reply(&self, _a: &str, id: &str, _c: &str, all: bool) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("reply id={id} all={all}"));
+            Ok(())
+        }
+        fn forward(&self, _a: &str, id: &str, _c: &str, to: &[String]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("forward id={id} to={}", to.join(",")));
+            Ok(())
+        }
+        fn reply_html(&self, _a: &str, id: &str, body: &str, all: bool) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!(
+                "reply_html id={id} all={all} body_len={}",
+                body.len()
+            ));
+            Ok(())
+        }
+        fn forward_html(
+            &self,
+            _a: &str,
+            id: &str,
+            body: &str,
+            to: &[String],
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!(
+                "forward_html id={id} to={} body_len={}",
+                to.join(","),
+                body.len()
+            ));
+            Ok(())
+        }
+        fn move_to(&self, _a: &str, id: &str, dest: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("move id={id} dest={dest}"));
+            Ok(format!("{id}-moved"))
+        }
+        fn set_read(&self, _a: &str, id: &str, is_read: bool) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("read id={id} is_read={is_read}"));
+            Ok(())
+        }
+        fn set_flag(
+            &self,
+            _a: &str,
+            id: &str,
+            status: &str,
+            _due: Option<&str>,
+            _tz: &str,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("flag id={id} status={status}"));
+            Ok(())
+        }
+        fn set_categories(&self, _a: &str, id: &str, cats: &[String]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("cats id={id} n={}", cats.len()));
+            Ok(())
+        }
+        fn create_draft(
+            &self,
+            _a: &str,
+            subject: &str,
+            _b: &str,
+            _to: &[String],
+        ) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("create_draft subj={subject}"));
+            Ok("draft-9".into())
+        }
+        fn send_draft(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("send_draft id={id}"));
+            Ok(())
+        }
+    }
+
+    struct FakeDriveInfo;
+    impl OneDriveInfoHandler for FakeDriveInfo {
+        fn drive_quota(&self, _account: &str) -> Result<serde_json::Value, String> {
+            Ok(json!({ "total": 1000, "used": 250, "remaining": 750, "state": "normal" }))
+        }
+        fn permissions(&self, _account: &str, _id: &str) -> Result<serde_json::Value, String> {
+            Ok(json!([{ "id": "p1", "roles": ["read"], "link": null, "grantee": "Bob" }]))
+        }
+    }
+
+    #[test]
+    fn drive_quota_route_returns_handler_json_or_404() {
+        let (_d, router) = setup();
+        // read-only server (no handler) -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/drive?account=a"))
+                .status,
+            404
+        );
+        let router = router.with_onedrive_info(std::sync::Arc::new(FakeDriveInfo));
+        // missing account -> 400
+        assert_eq!(router.route(&ApiRequest::get("/api/v1/drive")).status, 400);
+        // with handler + account -> 200 + the quota object
+        let resp = router.route(&ApiRequest::get("/api/v1/drive?account=a"));
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(
+            v.pointer("/quota/remaining").and_then(Value::as_i64),
+            Some(750)
+        );
+    }
+
+    #[test]
+    fn permissions_route_returns_handler_json_or_404() {
+        let (_d, router) = setup();
+        // read-only server (no handler) -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/permissions?account=a&id=x"))
+                .status,
+            404
+        );
+        let router = router.with_onedrive_info(std::sync::Arc::new(FakeDriveInfo));
+        // missing id -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/permissions?account=a"))
+                .status,
+            400
+        );
+        // with handler + account + id -> 200 + the permissions array
+        let resp = router.route(&ApiRequest::get("/api/v1/permissions?account=a&id=x"));
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(
+            v.pointer("/permissions/0/grantee").and_then(Value::as_str),
+            Some("Bob")
+        );
+        assert_eq!(
+            v.pointer("/permissions/0/roles/0").and_then(Value::as_str),
+            Some("read")
+        );
+    }
+
+    #[test]
+    fn onedrive_items_carry_preview_from_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            // a top-level file (no tracked parent => a drive root item)
+            let mut f = Item::new("a", "onedrive", "F1", "photo.jpg", "file");
+            f.remote_mtime = Some("2026-05-01T10:00:00Z".into());
+            store.upsert_item(&f).unwrap();
+        }
+        // its DriveItem JSON sidecar at the sharded archive path (#564 A1 shape)
+        let rel = isyncyou_connectors::shard_rel("onedrive", "F1", "json");
+        let p = arch.join(&rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            serde_json::to_vec(&json!({
+                "id": "F1",
+                "webUrl": "https://1drv.ms/x",
+                "file": { "mimeType": "image/jpeg", "hashes": { "sha256Hash": "ABC123" } },
+                "image": { "width": 4032, "height": 3024 },
+                "shared": { "scope": "users" },
+                "createdBy": { "user": { "displayName": "Jan" } },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=onedrive&parent=root",
+        ));
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        let p0 = &v["items"][0]["preview"];
+        assert_eq!(p0["mime_type"].as_str(), Some("image/jpeg"));
+        assert_eq!(p0["sha256"].as_str(), Some("ABC123"));
+        assert_eq!(p0["created_by"].as_str(), Some("Jan"));
+        assert_eq!(p0["web_url"].as_str(), Some("https://1drv.ms/x"));
+        assert_eq!(p0["shared"].as_bool(), Some(true));
+        assert_eq!(
+            p0.pointer("/image/width").and_then(Value::as_i64),
+            Some(4032)
+        );
+    }
+
+    #[test]
+    fn contact_photo_serves_archived_jpg_or_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .upsert_item(&Item::new("a", "contacts", "C1", "Ada", "contact"))
+                .unwrap();
+            store
+                .upsert_item(&Item::new("a", "contacts", "C2", "Bob", "contact"))
+                .unwrap();
+        }
+        // write C1's photo at the sharded path, exactly where backup_contact_photos does
+        let rel = isyncyou_connectors::shard_rel("contacts", "C1", "jpg");
+        let p = arch.join(&rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"\xFF\xD8\xFF\xE0JFIF...").unwrap();
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        // C1 has a photo -> 200 image/jpeg + the bytes
+        let resp = router.route(&ApiRequest::get("/api/v1/contact/photo?account=a&id=C1"));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.content_type, "image/jpeg");
+        assert_eq!(&resp.body[..2], b"\xFF\xD8");
+        // C2 has no photo -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/contact/photo?account=a&id=C2"))
+                .status,
+            404
+        );
+        // missing id -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/contact/photo?account=a"))
+                .status,
+            400
+        );
+    }
+
+    #[test]
+    fn mail_write_endpoints_are_cap_token_gated_and_route_params() {
+        let (_d, router) = setup();
+        // read-only router (no handler) refuses every mail-write POST
+        for p in [
+            "/api/v1/mail/send",
+            "/api/v1/mail/reply",
+            "/api/v1/mail/move",
+            "/api/v1/mail/draft",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router.with_mail_write(rec.clone(), "secret".into());
+
+        // missing / wrong cap token -> 401
+        let send = "/api/v1/mail/send?account=a&to=x@y.com&subject=Hi";
+        assert_eq!(router.route(&ApiRequest::new("POST", send)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", send).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // valid token but no recipient -> 400, handler not called
+        let bad = ApiRequest::new("POST", "/api/v1/mail/send?account=a&subject=Hi")
+            .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        assert!(rec.0.lock().unwrap().is_empty());
+
+        // valid send -> 200, handler called with parsed params
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&tok(send)).status, 200);
+        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0 imp=- rr=false");
+
+        // importance + read-receipt params are forwarded
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/mail/send?account=a&to=x@y.com&subject=Hi&importance=high&read_receipt=1"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0 imp=high rr=true");
+
+        // reply with all=1 carries the id + flag
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/reply?account=a&id=m1&all=1&comment=ok"))
+                .status,
+            200
+        );
+        assert_eq!(rec.last(), "reply id=m1 all=true");
+
+        // move returns the new id
+        let moved = router.route(&tok(
+            "/api/v1/mail/move?account=a&id=m1&destination=Archive",
+        ));
+        assert_eq!(moved.status, 200);
+        assert_eq!(body_json(&moved)["new_id"], "m1-moved");
+
+        // flag validates the status enum
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/flag?account=a&id=m1&status=bogus"))
+                .status,
+            400
+        );
+
+        // draft with no id creates; with id sends
+        let drafted = router.route(&tok("/api/v1/mail/draft?account=a&subject=D&to=x@y.com"));
+        assert_eq!(body_json(&drafted)["draft_id"], "draft-9");
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/draft?account=a&id=d1"))
+                .status,
+            200
+        );
+        assert_eq!(rec.last(), "send_draft id=d1");
+    }
+
+    #[test]
+    fn mail_write_does_not_notify_the_sse_bus() {
+        // A self-write must NOT fire the SSE bus: the daemon doesn't re-sync mail
+        // into the store on a write, so an SSE-driven re-fetch would read the stale
+        // store and clobber the frontend's optimistic update (found in #563 live
+        // e2e). The optimistic UI is the correct immediate feedback.
+        let (_d, router) = setup();
+        let bus = std::sync::Arc::new(EventBus::new());
+        let router = router.with_events(bus.clone()).with_mail_write(
+            std::sync::Arc::new(RecordMailWrite::default()),
+            "secret".into(),
+        );
+        let g0 = bus.generation();
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/mail/read?account=a&id=m1&is_read=1"))
+                .status,
+            200
+        );
+        assert_eq!(
+            bus.generation(),
+            g0,
+            "a self-write must not notify (would clobber optimistic UI from a stale re-fetch)"
+        );
+    }
+
+    /// app.js carries the mail-write cap token placeholder so #563's UI can POST.
+    #[test]
+    fn app_js_has_mail_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__MAILWRITE_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_calendar_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__CALENDARWRITE_CAP_TOKEN__"));
+    }
+
+    #[derive(Default)]
+    struct RecCalWrite(std::sync::Mutex<Vec<String>>);
+    impl CalendarWriteHandler for RecCalWrite {
+        fn create(&self, _a: &str, event: &Value) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!(
+                "create subj={}",
+                event.get("subject").and_then(Value::as_str).unwrap_or("")
+            ));
+            Ok("ev-new".into())
+        }
+        fn update(&self, _a: &str, id: &str, _e: &Value) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("update id={id}"));
+            Ok(())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("delete id={id}"));
+            Ok(())
+        }
+        fn respond(&self, _a: &str, id: &str, r: &str, _c: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("respond id={id} {r}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn calendar_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/calendar/create",
+            "/api/v1/calendar/update",
+            "/api/v1/calendar/delete",
+            "/api/v1/calendar/respond",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecCalWrite::default());
+        let router = router.with_calendar_write(rec.clone(), "calsecret".into());
+        let create = "/api/v1/calendar/create?account=a&subject=Plan&start=2026-02-04T09:00:00Z";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token but no subject/start -> 400 (handler not called)
+        let bad = ApiRequest::new("POST", "/api/v1/calendar/create?account=a")
+            .with_cap_token(Some("calsecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("calsecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/calendar/update?account=a&id=E1&subject=X"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/calendar/delete?account=a&id=E2"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/calendar/respond?account=a&id=E3&response=decline"
+                ))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        assert_eq!(log[0], "create subj=Plan");
+        assert_eq!(log[1], "update id=E1");
+        assert_eq!(log[2], "delete id=E2");
+        assert_eq!(log[3], "respond id=E3 decline");
+    }
+
+    #[test]
+    fn app_js_has_contact_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__CONTACTWRITE_CAP_TOKEN__"));
+    }
+
+    #[derive(Default)]
+    struct RecConWrite(std::sync::Mutex<Vec<String>>);
+    impl ContactWriteHandler for RecConWrite {
+        fn create(&self, _a: &str, contact: &Value) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!(
+                "create name={} other_city={}",
+                contact
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                contact
+                    .pointer("/otherAddress/city")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ));
+            Ok("con-new".into())
+        }
+        fn update(&self, _a: &str, id: &str, _c: &Value) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("update id={id}"));
+            Ok(())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("delete id={id}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn contact_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/contact/create",
+            "/api/v1/contact/update",
+            "/api/v1/contact/delete",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecConWrite::default());
+        let router = router.with_contact_write(rec.clone(), "consecret".into());
+        let create = "/api/v1/contact/create?account=a&display_name=Ada&other_city=London";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token but no fields -> 400 (handler not called)
+        let bad = ApiRequest::new("POST", "/api/v1/contact/create?account=a")
+            .with_cap_token(Some("consecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("consecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/contact/update?account=a&id=C1&job=Analyst"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/contact/delete?account=a&id=C2"))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        // proves contact_from_req maps display_name + the structured other-address param
+        assert_eq!(log[0], "create name=Ada other_city=London");
+        assert_eq!(log[1], "update id=C1");
+        assert_eq!(log[2], "delete id=C2");
+    }
+
+    #[test]
+    fn app_js_has_task_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__TASKWRITE_CAP_TOKEN__"));
+    }
+
+    #[derive(Default)]
+    struct RecTaskWrite(std::sync::Mutex<Vec<String>>);
+    impl TaskWriteHandler for RecTaskWrite {
+        fn create(&self, _a: &str, list: &str, task: &Value) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!(
+                "create list={list} title={}",
+                task.get("title").and_then(Value::as_str).unwrap_or("")
+            ));
+            Ok("task-new".into())
+        }
+        fn update(&self, _a: &str, list: &str, id: &str, _t: &Value) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("update list={list} id={id}"));
+            Ok(())
+        }
+        fn complete(&self, _a: &str, list: &str, id: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete list={list} id={id}"));
+            Ok(())
+        }
+        fn delete(&self, _a: &str, list: &str, id: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("delete list={list} id={id}"));
+            Ok(())
+        }
+        fn checklist_add(
+            &self,
+            _a: &str,
+            _l: &str,
+            task: &str,
+            title: &str,
+        ) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("cl_add task={task} title={title}"));
+            Ok("ci-new".into())
+        }
+        fn checklist_toggle(
+            &self,
+            _a: &str,
+            _l: &str,
+            task: &str,
+            item: &str,
+            checked: bool,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!(
+                "cl_toggle task={task} item={item} checked={checked}"
+            ));
+            Ok(())
+        }
+        fn checklist_delete(
+            &self,
+            _a: &str,
+            _l: &str,
+            task: &str,
+            item: &str,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("cl_del task={task} item={item}"));
+            Ok(())
+        }
+        fn list_create(&self, _a: &str, name: &str) -> Result<String, String> {
+            self.0.lock().unwrap().push(format!("list_create {name}"));
+            Ok("L-new".into())
+        }
+        fn list_delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("list_delete {id}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn todo_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/todo/create",
+            "/api/v1/todo/complete",
+            "/api/v1/todo/checklist-add",
+            "/api/v1/todo/list-create",
+            "/api/v1/todo/list-delete",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecTaskWrite::default());
+        let router = router.with_task_write(rec.clone(), "tasksecret".into());
+        let create = "/api/v1/todo/create?account=a&list=L1&title=Ship&importance=high";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token, no title -> 400 (handler not called)
+        let bad = ApiRequest::new("POST", "/api/v1/todo/create?account=a&list=L1")
+            .with_cap_token(Some("tasksecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("tasksecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/update?account=a&list=L1&id=t1&status=inProgress"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/complete?account=a&list=L1&id=t1"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/checklist-add?account=a&list=L1&task=t1&title=step"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/checklist-toggle?account=a&list=L1&task=t1&item=ci1&checked=1"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok(
+                    "/api/v1/todo/checklist-delete?account=a&list=L1&task=t1&item=ci1"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/list-create?account=a&name=Groceries"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/delete?account=a&list=L1&id=t1"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/todo/list-delete?account=a&id=L1"))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        assert_eq!(log[0], "create list=L1 title=Ship");
+        assert_eq!(log[1], "update list=L1 id=t1");
+        assert_eq!(log[2], "complete list=L1 id=t1");
+        assert_eq!(log[3], "cl_add task=t1 title=step");
+        assert_eq!(log[4], "cl_toggle task=t1 item=ci1 checked=true");
+        assert_eq!(log[5], "cl_del task=t1 item=ci1");
+        assert_eq!(log[6], "list_create Groceries");
+        assert_eq!(log[7], "delete list=L1 id=t1");
+        assert_eq!(log[8], "list_delete L1");
+    }
+
+    #[test]
+    fn app_js_has_onenote_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__ONENOTEWRITE_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_account_cap_token_placeholder() {
+        assert!(APP_JS.contains("__ACCOUNT_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_push_cap_token_placeholder() {
+        assert!(APP_JS.contains("__PUSH_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn account_routes_refused_without_a_handler() {
+        // The read-only `serve` wires no account-auth handler → every account
+        // login/sign-out POST is refused 404, never reaching the (absent) gate (#68).
+        let r = Router::new(Config::default());
+        for p in [
+            "/api/v1/account/login/start?account=a",
+            "/api/v1/account/login/poll?id=1",
+            "/api/v1/account/signout?account=a",
+        ] {
+            assert_eq!(r.route(&ApiRequest::new("POST", p)).status, 404, "{p}");
+        }
+    }
+
+    #[derive(Default)]
+    struct RecPush {
+        tokens: std::sync::Mutex<Vec<String>>,
+    }
+    impl PushHandler for RecPush {
+        fn register(&self, token: &str) -> Result<(), String> {
+            self.tokens.lock().unwrap().push(token.to_string());
+            Ok(())
+        }
+        fn send_test(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "sent": self.tokens.lock().unwrap().len() }))
+        }
+    }
+
+    #[test]
+    fn push_routes_refused_without_a_handler() {
+        // The read-only `serve` wires no push handler → register/test POSTs 404 (#576).
+        let r = Router::new(Config::default());
+        for p in ["/api/v1/push/register?token=abc", "/api/v1/push/test"] {
+            assert_eq!(r.route(&ApiRequest::new("POST", p)).status, 404, "{p}");
+        }
+    }
+
+    #[test]
+    fn push_register_needs_cap_token_and_records() {
+        let push = std::sync::Arc::new(RecPush::default());
+        let router = Router::new(Config::default()).with_push(push.clone(), "captok".into());
+        // Wrong/absent cap token → 401, token not recorded.
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", "/api/v1/push/register?token=dev1"))
+                .status,
+            401
+        );
+        assert!(push.tokens.lock().unwrap().is_empty());
+        // With the cap token → 200 and the device token is stored.
+        let mut req = ApiRequest::new("POST", "/api/v1/push/register?token=dev1");
+        req.cap_token = Some("captok".into());
+        assert_eq!(router.route(&req).status, 200);
+        assert_eq!(push.tokens.lock().unwrap().as_slice(), ["dev1"]);
+    }
+
+    #[test]
+    fn push_register_rejects_empty_token() {
+        let push = std::sync::Arc::new(RecPush::default());
+        let router = Router::new(Config::default()).with_push(push, "captok".into());
+        let mut req = ApiRequest::new("POST", "/api/v1/push/register?token=");
+        req.cap_token = Some("captok".into());
+        assert_eq!(router.route(&req).status, 400);
+    }
+
+    #[derive(Default)]
+    struct RecOneNoteWrite(std::sync::Mutex<Vec<String>>);
+    impl OneNoteWriteHandler for RecOneNoteWrite {
+        fn create(&self, _a: &str, section: &str, html: &[u8]) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("create section={section} bytes={}", html.len()));
+            Ok("page-new".into())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("delete id={id}"));
+            Ok(())
+        }
+        fn append(&self, _a: &str, id: &str, text: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("append id={id} text={text}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn onenote_write_endpoints_are_cap_gated_and_route_params() {
+        let (_d, router) = setup();
+        for p in [
+            "/api/v1/onenote/create",
+            "/api/v1/onenote/delete",
+            "/api/v1/onenote/append",
+        ] {
+            assert_eq!(
+                router.route(&ApiRequest::new("POST", p)).status,
+                404,
+                "{p} must 404 on the read-only server"
+            );
+        }
+        let rec = std::sync::Arc::new(RecOneNoteWrite::default());
+        let router = router.with_onenote_write(rec.clone(), "notesecret".into());
+        let create = "/api/v1/onenote/create?account=a&section=S1&title=Ideas&body=hello";
+        // missing token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
+        // valid token but no section -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/onenote/create?account=a&title=x")
+            .with_cap_token(Some("notesecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("notesecret".into()));
+        assert_eq!(router.route(&tok(create)).status, 200);
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/onenote/append?account=a&id=P1&text=more"))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&tok("/api/v1/onenote/delete?account=a&id=P1"))
+                .status,
+            200
+        );
+        let log = rec.0.lock().unwrap();
+        // the create built a non-empty page HTML and targeted section S1
+        assert!(log[0].starts_with("create section=S1 bytes="));
+        assert!(!log[0].ends_with("bytes=0"));
+        assert_eq!(log[1], "append id=P1 text=more");
+        assert_eq!(log[2], "delete id=P1");
+    }
+
+    #[test]
+    fn onenote_preview_exposes_page_metadata_from_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        // the page's _pagemeta_<id> sidecar (the page's local_path is the .html body)
+        let meta_rel = isyncyou_connectors::shard_rel("onenote", "_pagemeta_p1", "json");
+        let mp = arch.join(&meta_rel);
+        std::fs::create_dir_all(mp.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mp,
+            br#"{"createdDateTime":"2025-12-01T00:00:00Z","level":1,"order":3,
+                 "userTags":["important"],
+                 "links":{"oneNoteWebUrl":{"href":"https://onenote.com/p1"}},
+                 "parentSection":{"displayName":"Ideas"},
+                 "parentNotebook":{"id":"N1","displayName":"Personal"}}"#,
+        )
+        .unwrap();
+        // the page item: local_path is the .html body
+        std::fs::create_dir_all(arch.join("onenote/aa")).unwrap();
+        std::fs::write(arch.join("onenote/aa/p.html"), b"<html></html>").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut it = Item::new("a", "onenote", "p1", "Ideas page", "page");
+            it.local_path = Some("onenote/aa/p.html".into());
+            it.parent_remote_id = Some("S1".into());
+            store.upsert_item(&it).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let d =
+            body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=onenote")));
+        let p = &d["items"][0]["preview"];
+        assert_eq!(p["created"], "2025-12-01T00:00:00Z");
+        assert_eq!(p["level"], 1);
+        assert_eq!(p["order"], 3);
+        assert_eq!(p["user_tags"][0], "important");
+        assert_eq!(p["web_url"], "https://onenote.com/p1");
+        assert_eq!(p["section_name"], "Ideas");
+        assert_eq!(p["notebook_name"], "Personal");
+        assert_eq!(p["has_resources"], false);
     }
 
     struct OkVerify;
@@ -1598,6 +5100,138 @@ mod tests {
                     && v.contains("default-src 'none'")),
             "app shell must carry a strict CSP header"
         );
+    }
+
+    #[test]
+    fn cap_ok_accepts_only_the_exact_token() {
+        // Regression freeze for AUDIT-2 (#73): the capability gate accepts only an
+        // exact, same-length token and rejects everything else. cap_ok compares in
+        // constant time (length check, then XOR-accumulate over all bytes).
+        let expected = Some("s3cr3t-capability-token-0001".to_string());
+        let pass =
+            ApiRequest::get("/x").with_cap_token(Some("s3cr3t-capability-token-0001".into()));
+        assert!(Router::cap_ok(&expected, &pass), "exact token must pass");
+
+        let wrong =
+            ApiRequest::get("/x").with_cap_token(Some("s3cr3t-capability-token-000X".into()));
+        assert!(!Router::cap_ok(&expected, &wrong), "wrong token must fail");
+
+        let short = ApiRequest::get("/x").with_cap_token(Some("s3cr3t".into()));
+        assert!(
+            !Router::cap_ok(&expected, &short),
+            "wrong-length token must fail"
+        );
+
+        let missing = ApiRequest::get("/x"); // no X-Capability-Token header
+        assert!(
+            !Router::cap_ok(&expected, &missing),
+            "missing request token must fail"
+        );
+
+        assert!(
+            !Router::cap_ok(&None, &pass),
+            "an unconfigured gate must reject everything"
+        );
+    }
+
+    #[test]
+    fn session_gate_off_by_default_desktop() {
+        // #89: the desktop daemon never sets a session token → the gate is off and
+        // GET data routes behave exactly as before (no 401 from the session gate).
+        let r = Router::new(Config::default());
+        assert!(
+            r.session_authorized(None),
+            "gate off must authorize anything"
+        );
+        assert_ne!(
+            r.route(&ApiRequest::get("/api/v1/status")).status,
+            401,
+            "desktop GET must not be session-gated"
+        );
+    }
+
+    #[test]
+    fn session_gate_requires_token_on_data_routes() {
+        // #89 mobile profile: every /api/v1/* route requires the per-process token.
+        let r = Router::new(Config::default()).with_session_token("sess-tok-0001".into());
+        // No token → 401.
+        assert_eq!(
+            r.route(&ApiRequest::get("/api/v1/status")).status,
+            401,
+            "missing session token must 401"
+        );
+        // Wrong token → 401.
+        let wrong = ApiRequest::get("/api/v1/status").with_session_token(Some("nope".into()));
+        assert_eq!(r.route(&wrong).status, 401, "wrong session token must 401");
+        // Correct token via header → passes the gate (not a session-401).
+        let ok = ApiRequest::get("/api/v1/status").with_session_token(Some("sess-tok-0001".into()));
+        assert_ne!(
+            r.route(&ok).status,
+            401,
+            "correct header token must pass the gate"
+        );
+        // Correct token via `_st` query (for iframe/img/EventSource) → passes.
+        let ok_q = ApiRequest::get("/api/v1/status?_st=sess-tok-0001");
+        assert_ne!(
+            r.route(&ok_q).status,
+            401,
+            "correct _st query token must pass the gate"
+        );
+    }
+
+    #[test]
+    fn session_gate_leaves_static_shell_open() {
+        // The bootstrap shell must stay reachable without the token (the WebView has
+        // to load it before the native bridge can hand the token to the JS). It
+        // carries no user data and no token, so this is safe.
+        let r = Router::new(Config::default()).with_session_token("sess-tok-0001".into());
+        assert_eq!(
+            r.route(&ApiRequest::get("/")).status,
+            200,
+            "/ must stay open"
+        );
+        assert_eq!(
+            r.route(&ApiRequest::get("/app.js")).status,
+            200,
+            "/app.js must stay open (bootstrap)"
+        );
+    }
+
+    #[test]
+    fn ct_eq_is_exact_and_length_checked() {
+        assert!(ct_eq(b"abc123", b"abc123"));
+        assert!(!ct_eq(b"abc123", b"abc124"));
+        assert!(!ct_eq(b"abc", b"abc123"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn static_assets_carry_correct_type_and_no_store() {
+        // Regression freeze: the embedded shell assets keep their exact content-type
+        // and Cache-Control: no-store, so a stale/poisoned copy can never persist
+        // across a binary upgrade (the APK asset-cache bug, #79). Together with
+        // app_shell_carries_strict_csp_header (`/`) and
+        // view_renders_safe_html_with_csp_and_escapes_untrusted_values (`/api/v1/view`)
+        // this freezes the per-layer header posture (W0.1 AC2).
+        let r = Router::new(Config::default());
+        for (path, ctype) in [
+            ("/app.js", "application/javascript"),
+            ("/app.css", "text/css"),
+        ] {
+            let resp = r.route(&ApiRequest::get(path));
+            assert_eq!(resp.status, 200, "{path} must serve 200");
+            assert!(
+                resp.content_type.starts_with(ctype),
+                "{path} wrong content-type: {}",
+                resp.content_type
+            );
+            assert!(
+                resp.headers
+                    .iter()
+                    .any(|(k, v)| k == "Cache-Control" && v.contains("no-store")),
+                "{path} must be Cache-Control: no-store"
+            );
+        }
     }
 
     struct MockSync {
@@ -2018,6 +5652,46 @@ mod tests {
     }
 
     #[test]
+    fn items_mail_preview_shows_indexed_sender_without_eml() {
+        // #89: a mail whose .eml body isn't cached (the mobile cache caps bodies)
+        // still shows its sender from the indexed `sender` column (captured at
+        // ingest, read with the item — no per-request file I/O), so the list never
+        // reads "(unknown sender)". Exercises the v11 migration end-to-end.
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut m = Item::new("a", "mail", "m9", "Indexed-sender subject", "message");
+            m.sender = Some("Grace Hopper <grace@example.com>".into());
+            m.remote_mtime = Some("2026-06-25T10:00:00Z".into());
+            // No local_path → the .eml body is NOT cached on this device.
+            store.upsert_item(&m).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let v = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail")));
+        let it = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["remote_id"] == "m9")
+            .expect("m9 listed");
+        assert_eq!(it["preview"]["from"], "Grace Hopper <grace@example.com>");
+        assert_eq!(it["preview"]["subject"], "Indexed-sender subject");
+        assert_eq!(it["preview"]["date"], "2026-06-25T10:00:00Z");
+    }
+
+    #[test]
     fn items_mail_carries_preview_from_archived_eml() {
         let dir = tempfile::tempdir().unwrap();
         let arch = dir.path().join("arch");
@@ -2089,7 +5763,16 @@ Content-Type: text/html; charset=utf-8\r\n\
             br#"{"subject":"Team-Standup",
                  "start":{"dateTime":"2026-02-04T09:00:00.0000000","timeZone":"UTC"},
                  "end":{"dateTime":"2026-02-04T10:00:00.0000000","timeZone":"UTC"},
-                 "isAllDay":false,"location":{"displayName":"Room 1"}}"#,
+                 "isAllDay":false,"location":{"displayName":"Room 1"},
+                 "type":"seriesMaster",
+                 "recurrence":{"pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday"]},"range":{"type":"noEnd"}},
+                 "onlineMeeting":{"joinUrl":"https://teams.microsoft.com/l/xyz"},
+                 "isOnlineMeeting":true,
+                 "responseStatus":{"response":"accepted"},
+                 "categories":["Work","Blue category"],
+                 "importance":"high","sensitivity":"normal","showAs":"busy",
+                 "isCancelled":false,"hasAttachments":true,
+                 "webLink":"https://outlook.live.com/calendar/x"}"#,
         )
         .unwrap();
         {
@@ -2117,6 +5800,56 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(p["end"], "2026-02-04T10:00:00.0000000");
         assert_eq!(p["all_day"], false);
         assert_eq!(p["location"], "Room 1");
+        // #565 B4 rich fields
+        assert_eq!(p["type"], "seriesMaster");
+        assert_eq!(p["recurrence"]["pattern"]["type"], "weekly");
+        assert_eq!(p["online_meeting_url"], "https://teams.microsoft.com/l/xyz");
+        assert_eq!(p["is_online_meeting"], true);
+        assert_eq!(p["response_status"], "accepted");
+        assert_eq!(p["categories"][1], "Blue category");
+        assert_eq!(p["importance"], "high");
+        assert_eq!(p["show_as"], "busy");
+        assert_eq!(p["has_attachments"], true);
+        assert_eq!(p["web_link"], "https://outlook.live.com/calendar/x");
+    }
+
+    #[test]
+    fn items_calendar_entity_carries_colour_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("calendar/cc/dd")).unwrap();
+        std::fs::write(
+            arch.join("calendar/cc/dd/cal.json"),
+            br##"{"name":"Work","hexColor":"#00AA00","color":"lightGreen","isDefaultCalendar":true}"##,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut c = Item::new("a", "calendar", "C9", "Work", "calendar");
+            c.local_path = Some("calendar/cc/dd/cal.json".into());
+            store.upsert_item(&c).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let v =
+            body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=calendar")));
+        let cal = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["item_type"] == "calendar")
+            .unwrap();
+        assert_eq!(cal["preview"]["hex_color"], "#00AA00");
+        assert_eq!(cal["preview"]["is_default"], true);
     }
 
     #[test]
@@ -2128,15 +5861,39 @@ Content-Type: text/html; charset=utf-8\r\n\
         std::fs::write(
             arch.join("contacts/aa/c.json"),
             br#"{"displayName":"Ada Lovelace","companyName":"Analytical Engines",
-                 "jobTitle":"Mathematician",
-                 "emailAddresses":[{"address":"ada@example.com","name":"Ada"}]}"#,
+                 "jobTitle":"Mathematician","department":"Research","title":"Lady",
+                 "nickName":"Ada","middleName":"Augusta","birthday":"1815-12-10T00:00:00Z",
+                 "emailAddresses":[{"address":"ada@example.com","name":"Ada"}],
+                 "mobilePhone":"+1-555-0100","businessPhones":["+1-555-0101"],
+                 "homeAddress":{"street":"1 Engine Way","city":"London","postalCode":"E1","countryOrRegion":"UK"},
+                 "businessAddress":{"street":"2 Math Rd","city":"Cambridge"},
+                 "otherAddress":{"city":"Paris"},
+                 "imAddresses":["ada@im.example"],"categories":["VIP"],
+                 "spouseName":"William","manager":"Babbage",
+                 "profession":"Mathematician","officeLocation":"Tower"}"#,
         )
         .unwrap();
         std::fs::write(
             arch.join("todo/bb/t.json"),
             br#"{"title":"Ship release","status":"inProgress","importance":"high",
                  "dueDateTime":{"dateTime":"2026-03-01T00:00:00.0000000","timeZone":"UTC"},
+                 "startDateTime":{"dateTime":"2026-02-20T00:00:00.0000000","timeZone":"UTC"},
+                 "isReminderOn":true,"reminderDateTime":{"dateTime":"2026-02-28T09:00:00.0000000","timeZone":"UTC"},
+                 "createdDateTime":"2026-02-01T08:00:00Z","hasAttachments":true,
+                 "categories":["Release","Eng"],"recurrence":{"pattern":{"type":"weekly"}},
                  "body":{"content":"check the gate","contentType":"text"}}"#,
+        )
+        .unwrap();
+        // the task's checklist sub-resource sidecar (#567 B2): 3 steps, 2 checked
+        let cl_path = arch.join(isyncyou_connectors::shard_rel(
+            "todo",
+            "_checklist_t1",
+            "json",
+        ));
+        std::fs::create_dir_all(cl_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cl_path,
+            br#"{"value":[{"isChecked":true},{"isChecked":true},{"isChecked":false}]}"#,
         )
         .unwrap();
         {
@@ -2148,6 +5905,11 @@ Content-Type: text/html; charset=utf-8\r\n\
             t.local_path = Some("todo/bb/t.json".into());
             store.upsert_item(&t).unwrap();
         }
+        // c1 has an archived photo at the sharded path -> has_photo must be true
+        let prel = isyncyou_connectors::shard_rel("contacts", "c1", "jpg");
+        let pp = arch.join(&prel);
+        std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+        std::fs::write(&pp, b"\xFF\xD8\xFF").unwrap();
         let cfg = Config {
             accounts: vec![AccountConfig {
                 id: "a".into(),
@@ -2165,12 +5927,142 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(cp["company"], "Analytical Engines");
         assert_eq!(cp["job"], "Mathematician");
         assert_eq!(cp["email"], "ada@example.com");
+        // #566 widened fields
+        assert_eq!(cp["birthday"], "1815-12-10T00:00:00Z");
+        assert_eq!(cp["title"], "Lady");
+        assert_eq!(cp["nick_name"], "Ada");
+        assert_eq!(
+            cp.pointer("/home_address/city").and_then(Value::as_str),
+            Some("London")
+        );
+        assert_eq!(
+            cp.pointer("/business_address/city").and_then(Value::as_str),
+            Some("Cambridge")
+        );
+        assert_eq!(
+            cp.pointer("/other_address/city").and_then(Value::as_str),
+            Some("Paris")
+        );
+        assert_eq!(cp["im_addresses"][0], "ada@im.example");
+        assert_eq!(cp["categories"][0], "VIP");
+        assert_eq!(cp["spouse"], "William");
+        assert_eq!(cp["manager"], "Babbage");
+        assert_eq!(cp["has_photo"], true);
         let t = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=todo")));
         let tp = &t["items"][0]["preview"];
         assert_eq!(tp["status"], "inProgress");
         assert_eq!(tp["importance"], "high");
         assert_eq!(tp["due"], "2026-03-01T00:00:00.0000000");
         assert_eq!(tp["has_note"], true);
+        // #567 B3 widened task fields
+        assert_eq!(tp["start"], "2026-02-20T00:00:00.0000000");
+        assert_eq!(tp["is_reminder_on"], true);
+        assert_eq!(tp["reminder"], "2026-02-28T09:00:00.0000000");
+        assert_eq!(tp["created"], "2026-02-01T08:00:00Z");
+        assert_eq!(tp["has_attachments"], true);
+        assert_eq!(tp["categories"][0], "Release");
+        assert_eq!(
+            tp.pointer("/recurrence/pattern/type")
+                .and_then(Value::as_str),
+            Some("weekly")
+        );
+        // checklist summary read from the _checklist_t1 sub-resource sidecar
+        assert_eq!(tp["steps_total"], 3);
+        assert_eq!(tp["steps_done"], 2);
+    }
+
+    #[test]
+    fn todo_list_preview_exposes_list_level_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(arch.join("todo/cc")).unwrap();
+        std::fs::write(
+            arch.join("todo/cc/l.json"),
+            br#"{"displayName":"Flagged","isShared":true,"isOwner":false,"wellknownListName":"flaggedEmails"}"#,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut l = Item::new("a", "todo", "L1", "Flagged", "list");
+            l.local_path = Some("todo/cc/l.json".into());
+            store.upsert_item(&l).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let t = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=todo")));
+        let lp = &t["items"][0]["preview"];
+        assert_eq!(lp["wellknown_name"], "flaggedEmails");
+        assert_eq!(lp["is_shared"], true);
+        assert_eq!(lp["is_owner"], false);
+    }
+
+    #[test]
+    fn todo_attachment_lists_and_downloads_from_taskatt_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        // the _taskatt_t1 sub-resource sidecar: one base64 attachment ("QUJD" = "ABC")
+        let rel = isyncyou_connectors::shard_rel("todo", "_taskatt_t1", "json");
+        let p = arch.join(&rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            br#"{"value":[{"name":"spec.pdf","contentType":"application/pdf","size":3,"contentBytes":"QUJD"}]}"#,
+        )
+        .unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut a = Item::new(
+                "a",
+                "todo",
+                "_taskatt_t1",
+                "t1 attachments",
+                "task-attachment",
+            );
+            a.local_path = Some(rel.clone());
+            store.upsert_item(&a).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        // list (the UI passes the TASK id; the route resolves _taskatt_<id>)
+        let list = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=todo&id=t1",
+        )));
+        assert_eq!(list["attachments"][0]["filename"], "spec.pdf");
+        assert_eq!(list["attachments"][0]["index"], 0);
+        // download index 0 -> base64 decoded to "ABC"
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/attachment?account=a&service=todo&id=t1&index=0",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ABC");
+        // out of range -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/attachment?account=a&service=todo&id=t1&index=9"
+                ))
+                .status,
+            404
+        );
     }
 
     #[test]

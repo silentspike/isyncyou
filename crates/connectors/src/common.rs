@@ -43,11 +43,16 @@ pub(crate) fn fetch_pages<T: Transport>(
 /// balanced and the filename filesystem-safe — Graph ids contain `/`, `=` and
 /// other characters that are illegal or awkward in path components.
 pub(crate) fn shard_path(root: &Path, service: &str, id: &str, ext: &str) -> PathBuf {
+    root.join(shard_rel(service, id, ext))
+}
+
+/// The **relative** sharded archive path for a remote id
+/// (`<service>/ab/cd/<hash>.<ext>`) — the part under the archive root. Public so
+/// the web UI can locate an item's JSON sidecar by id when its `local_path` is
+/// only a name segment (OneDrive) rather than the archive path.
+pub fn shard_rel(service: &str, id: &str, ext: &str) -> String {
     let hex = format!("{:016x}", fnv1a64(id));
-    root.join(service)
-        .join(&hex[0..2])
-        .join(&hex[2..4])
-        .join(format!("{hex}.{ext}"))
+    format!("{service}/{}/{}/{hex}.{ext}", &hex[0..2], &hex[2..4])
 }
 
 /// FNV-1a 64-bit — a tiny, dependency-free hash; used only to derive balanced

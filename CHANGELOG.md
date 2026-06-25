@@ -95,6 +95,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   status; window identity `org.silentspike.iSyncYou` (WM_CLASS/app_id) + launcher
   `.desktop`.
 
+**Unified live + backup client (Phase 4, epic #556)**
+- **Near-real-time cloud client** for all six M365 services. The daemon polls each
+  account on a configurable interval and pushes changes to the web UI over SSE; the
+  UI's **live-update interval slider** (`POST /api/v1/settings?poll_interval_secs=N`,
+  1 s–60 min, cap-token-gated) persists and applies the cadence without a restart.
+- **Four-state coverage badge** on every item — `live_only` (in the cloud, not yet
+  archived) · `live_backup` (archived and current, `etag == body_etag`) · `stale`
+  (archived copy older than the cloud) · `backup_only` (deleted in the cloud, still
+  in the archive). Derived from a store `body_etag` set at the `set_local_path`
+  chokepoint (store v10); per-service state filter bars in the UI.
+- **Live write** for every service, each a cap-token-gated POST that performs the
+  Graph mutation on the cached restore token and refreshes only the touched item
+  (no SSE echo on self-write):
+  - **Mail** — compose/send, reply/reply-all/forward, flag, read/unread, categories,
+    move; per-message manage UI.
+  - **Calendar** — create/update/delete events; recurrence-aware; colour-mapped
+    calendars.
+  - **Contacts** — create/edit/delete; full detail (multiple addresses, IM,
+    categories, relationships) + contact photo.
+  - **ToDo** — create/complete/edit tasks, checklist steps, linked resources,
+    attachments; list operations.
+  - **OneNote** — notebook → section → page **tree** (notebooks, section groups and
+    sections archived as items with parent chains, not a flat page list); create a
+    page in its original section (404 → default-section fallback), best-effort
+    content append, delete; page metadata sidecar (created/links/level/order/userTags
+    when Graph returns them).
+  - **OneDrive** — drive quota + lazy per-item permissions in the explorer.
+- **Restore-to-original-container**: a re-created item lands back in its source
+  folder/calendar/list/section (same-account), not a default bucket.
+- All writes require an `X-Capability-Token` minted per daemon boot and injected into
+  the served `app.js`; an absent/invalid token returns `401`. Bodies are rendered in
+  a sandboxed iframe under the strict 3-layer CSP (ammonia-sanitised, scripts
+  stripped, remote resources blocked).
+
 **Tooling & ops**
 - `isyncyou` CLI (init/check/login/status/sync/backup/search/restore/export/migrate/serve;
   Linux: mount/make-available/dolphin-status); `isyncyoud` daemon (serves the web UI,

@@ -1,0 +1,36 @@
+[package]
+name = "isyncyou-app-host"
+description = "Shared web-UI router assembly + live request handlers, reused by the desktop daemon and the standalone mobile client (#89)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+isyncyou-core = { path = "../core" }
+isyncyou-store = { path = "../store", default-features = false }
+isyncyou-graph = { path = "../graph", features = ["http"] }
+isyncyou-connectors = { path = "../connectors", features = ["http"], default-features = false }
+isyncyou-engine = { path = "../engine", default-features = false }
+isyncyou-webui = { path = "../../gui/webui", default-features = false }
+serde_json = { workspace = true }
+
+[features]
+# Desktop default; the mobile crate depends with default-features = false so the
+# whole chain (store, engine, connectors, webui) builds plain (no SQLCipher/OpenSSL,
+# no D-Bus keyring) for Android. See #89 P0.
+default = ["encrypted-store", "desktop-keyring"]
+desktop-keyring = ["isyncyou-engine/desktop-keyring"]
+encrypted-store = [
+    "isyncyou-store/encrypted-store",
+    "isyncyou-engine/encrypted-store",
+    "isyncyou-connectors/encrypted-store",
+    "isyncyou-webui/encrypted-store",
+]
+plain-store = [
+    "isyncyou-store/plain-store",
+    "isyncyou-engine/plain-store",
+    "isyncyou-connectors/plain-store",
+    "isyncyou-webui/plain-store",
+]

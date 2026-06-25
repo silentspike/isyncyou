@@ -8,14 +8,169 @@
 //! on a delta query (Graph rejects it); the canonical record is the raw JSON,
 //! `.ics` is only an export concern handled elsewhere.
 
-use crate::common::fetch_pages;
+use crate::archive::{ArchiveReport, JsonFetcher};
+use crate::common::{fetch_pages, shard_path};
 use crate::onedrive::SyncError;
 use isyncyou_graph::{run_delta, DeltaCursor, Transport};
 use isyncyou_store::{Item, Store};
 use serde_json::Value;
+use std::path::Path;
 
 const SERVICE: &str = "calendar";
 const CALENDARS_URL: &str = "https://graph.microsoft.com/v1.0/me/calendars?$top=100";
+
+/// Upsert a JSON-snapshot store item under `service="calendar"` and archive its
+/// canonical JSON to `calendar/<shard>/<id>.json` (atomic tmp+rename), recording
+/// the relative path as `local_path`. Shared by the calendar-flank snapshots
+/// (calendars / groups / permissions). Returns the byte count written.
+fn archive_json_item(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    id: &str,
+    name: &str,
+    item_type: &str,
+    value: &Value,
+) -> Result<u64, SyncError> {
+    let mut it = Item::new(account, SERVICE, id, name, item_type);
+    it.sync_state = "remote_dirty".into();
+    store.upsert_item(&it)?;
+
+    let abs = shard_path(archive_root, SERVICE, id, "json");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    let tmp = abs.with_extension("json.part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &abs)?;
+    let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+    store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// Back up the calendar flanks (#565 B1 + B3): one `item_type="calendar"`
+/// snapshot per calendar from `/me/calendars` (so the UI can colour-code events
+/// by each calendar's `hexColor`/`color`), a `calendar-group` snapshot of
+/// `/me/calendarGroups`, and a `calendar-permission` snapshot of each calendar's
+/// `/me/calendars/{id}/calendarPermissions`. Re-fetched each pass (small data).
+pub fn backup_calendar_flanks<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<ArchiveReport, SyncError> {
+    let mut report = ArchiveReport::default();
+
+    let cals = fetcher
+        .fetch_json("/me/calendars?$top=100")
+        .map_err(SyncError::Remote)?;
+    for cal in cals
+        .get("value")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = cal.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = cal.get("name").and_then(Value::as_str).unwrap_or(id);
+        report.bytes += archive_json_item(store, account, archive_root, id, name, "calendar", cal)?;
+        report.archived += 1;
+
+        // Per-calendar sharing permissions (#565 B3, snapshot-only).
+        if let Ok(perms) = fetcher.fetch_json(&format!("/me/calendars/{id}/calendarPermissions")) {
+            let pid = format!("_calperm_{id}");
+            report.bytes += archive_json_item(
+                store,
+                account,
+                archive_root,
+                &pid,
+                &format!("{name} permissions"),
+                "calendar-permission",
+                &perms,
+            )?;
+            report.archived += 1;
+        }
+    }
+
+    // Calendar groups (#565 B3) — one snapshot of the whole list.
+    let groups = fetcher
+        .fetch_json("/me/calendarGroups")
+        .map_err(SyncError::Remote)?;
+    report.bytes += archive_json_item(
+        store,
+        account,
+        archive_root,
+        "_calendar_groups",
+        "Calendar groups",
+        "calendar-group",
+        &groups,
+    )?;
+    report.archived += 1;
+
+    Ok(report)
+}
+
+/// Back up event attachments (#565 B3): for each archived event whose JSON shows
+/// `hasAttachments`, fetch `/me/events/{id}/attachments` and snapshot the list as
+/// an `event-attachment` item (file attachments carry their bytes inline as
+/// base64 `contentBytes`). Gated on the sidecar so non-attachment events cost no
+/// request. Bounded by `limit` (0 = all). Best-effort per event.
+pub fn backup_event_attachments<F: JsonFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    limit: usize,
+) -> Result<ArchiveReport, SyncError> {
+    let mut report = ArchiveReport::default();
+    for it in store.items_by_service(account, SERVICE)? {
+        if it.item_type != "event" || it.deleted_at.is_some() {
+            continue;
+        }
+        if limit != 0 && report.archived >= limit {
+            break;
+        }
+        // Gate on the archived event JSON's hasAttachments (no sidecar => skip).
+        let Some(rel) = it.local_path.as_deref() else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(archive_root.join(rel)) else {
+            continue;
+        };
+        let Ok(ev) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if ev.get("hasAttachments").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Ok(atts) = fetcher.fetch_json(&format!("/me/events/{}/attachments", it.remote_id))
+        else {
+            continue;
+        };
+        let has_any = atts
+            .get("value")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if !has_any {
+            continue;
+        }
+        let aid = format!("_evatt_{}", it.remote_id);
+        report.bytes += archive_json_item(
+            store,
+            account,
+            archive_root,
+            &aid,
+            &format!("{} attachments", it.name),
+            "event-attachment",
+            &atts,
+        )?;
+        report.archived += 1;
+    }
+    Ok(report)
+}
 
 /// What one calendar sync changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -114,6 +269,64 @@ pub fn incremental_sync_calendar<T: Transport>(
                         report.masters += 1;
                     }
                 }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Sync calendars via `/me/events` (#565 B2, the default model): list each
+/// calendar, then page **all** its events. Recurring series come back as their
+/// MASTER (carrying the recurrence rule), never expanded into occurrences — so a
+/// daily series is one stored row, not tens of thousands (AC-N). There is no
+/// date window, so far-future events are captured (AC-3). Plain `/me/events` has
+/// no Graph delta, so deletions are reconciled by set-difference against the
+/// current id list per calendar.
+pub fn events_sync_calendar<T: Transport>(
+    transport: &mut T,
+    store: &Store,
+    account: &str,
+    now: &str,
+) -> Result<CalendarReport, SyncError> {
+    transport.set_prefer_immutable_id(true);
+    let raw = fetch_pages(transport, CALENDARS_URL)?;
+    let calendars = parse_calendars(&raw);
+    let mut report = CalendarReport {
+        calendars: calendars.len(),
+        ..Default::default()
+    };
+
+    for cal in &calendars {
+        let mut ci = Item::new(account, SERVICE, &cal.id, &cal.name, "calendar");
+        ci.sync_state = "remote_dirty".into();
+        store.upsert_item(&ci)?;
+
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/calendars/{}/events?$top=50",
+            cal.id
+        );
+        let events = fetch_pages(transport, &url)?;
+        let mut seen: Vec<String> = Vec::with_capacity(events.len());
+        for ev in &events {
+            if let Some(id) = ev.get("id").and_then(Value::as_str) {
+                seen.push(id.to_string());
+            }
+            match ingest_event(store, account, &cal.id, ev, now)? {
+                Ingest::Upserted => report.upserted += 1,
+                Ingest::Deleted => report.deleted += 1,
+                Ingest::Skipped => report.skipped += 1,
+            }
+        }
+        // No delta on plain /me/events, so reconcile deletions: a live event under
+        // this calendar that the cloud no longer lists has been removed.
+        for it in store.items_by_service(account, SERVICE)? {
+            if it.item_type == "event"
+                && it.parent_remote_id.as_deref() == Some(cal.id.as_str())
+                && it.deleted_at.is_none()
+                && !seen.iter().any(|s| s == &it.remote_id)
+            {
+                store.mark_deleted(account, SERVICE, &it.remote_id, now)?;
+                report.deleted += 1;
             }
         }
     }
@@ -362,6 +575,170 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("D2")
+        );
+    }
+
+    #[test]
+    fn events_mode_stores_master_and_far_future_without_explosion() {
+        let store = Store::open_in_memory().unwrap();
+        // /me/events returns the recurring MASTER (with its rule) + a far-future
+        // single — neither expanded into occurrences.
+        let master = json!({
+            "id": "M1", "subject": "Daily standup", "type": "seriesMaster",
+            "@odata.etag": "W/\"M\"", "lastModifiedDateTime": "2026-01-01T00:00:00Z",
+            "recurrence": { "pattern": { "type": "daily", "interval": 1 }, "range": { "type": "noEnd" } }
+        });
+        let far = json!({
+            "id": "F1", "subject": "2040 plan", "type": "singleInstance",
+            "@odata.etag": "W/\"F\"", "lastModifiedDateTime": "2040-06-01T00:00:00Z"
+        });
+        let mut t = MockTransport(
+            vec![
+                Response::ok(json!({ "value": [cal("C1", "Calendar")] })),
+                Response::ok(json!({ "value": [master, far] })), // one page, no nextLink
+            ],
+            0,
+        );
+        let r = events_sync_calendar(&mut t, &store, "acc", "2026-06-21T00:00:00Z").unwrap();
+        assert_eq!(r.upserted, 2);
+        // the daily series is exactly ONE stored row (the master), not occurrences
+        let m = store.get_item("acc", SERVICE, "M1").unwrap().unwrap();
+        assert_eq!(m.item_type, "event");
+        assert!(m.series_master_id.is_none(), "the master has no master");
+        // the 2040 event is captured despite no date window
+        assert!(store.get_item("acc", SERVICE, "F1").unwrap().is_some());
+        let events = store
+            .items_by_service("acc", SERVICE)
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.item_type == "event")
+            .count();
+        assert_eq!(events, 2, "no occurrence explosion (AC-N)");
+    }
+
+    #[test]
+    fn events_mode_reconciles_deletions() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t1 = MockTransport(
+            vec![
+                Response::ok(json!({ "value": [cal("C1", "Calendar")] })),
+                Response::ok(json!({ "value": [event("e1", "A"), event("e2", "B")] })),
+            ],
+            0,
+        );
+        events_sync_calendar(&mut t1, &store, "acc", "t").unwrap();
+        // second pass: e2 is gone from the listing -> reconciled as deleted
+        let mut t2 = MockTransport(
+            vec![
+                Response::ok(json!({ "value": [cal("C1", "Calendar")] })),
+                Response::ok(json!({ "value": [event("e1", "A")] })),
+            ],
+            0,
+        );
+        let r = events_sync_calendar(&mut t2, &store, "acc", "2026-06-21T00:00:00Z").unwrap();
+        assert_eq!(r.deleted, 1);
+        assert!(store
+            .get_item("acc", SERVICE, "e2")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_some());
+        assert!(store
+            .get_item("acc", SERVICE, "e1")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none());
+    }
+
+    // URL-aware mock so calendars / permissions / groups get distinct snapshots.
+    struct MockJsonFetcher;
+    impl JsonFetcher for MockJsonFetcher {
+        fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+            if url.contains("calendarPermissions") {
+                Ok(json!({ "value": [{ "id": "perm1", "role": "read" }] }))
+            } else if url.contains("calendarGroups") {
+                Ok(json!({ "value": [{ "id": "g1", "name": "My calendars" }] }))
+            } else if url.contains("/me/calendars") {
+                Ok(json!({ "value": [
+                    { "id": "C1", "name": "Calendar", "hexColor": "#FF0000", "color": "lightRed", "isDefaultCalendar": true },
+                    { "id": "C2", "name": "Work", "hexColor": "#00AA00", "color": "lightGreen" },
+                ]}))
+            } else {
+                Ok(json!({ "value": [] }))
+            }
+        }
+    }
+
+    #[test]
+    fn backup_calendar_flanks_snapshots_calendars_groups_and_permissions() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        // 2 calendars + 2 per-calendar permissions + 1 groups snapshot = 5
+        let r = backup_calendar_flanks(&MockJsonFetcher, &store, "acc", arch.path()).unwrap();
+        assert_eq!(r.archived, 5);
+        let c1 = store.get_item("acc", SERVICE, "C1").unwrap().unwrap();
+        assert_eq!(c1.item_type, "calendar");
+        let rel = c1.local_path.expect("sidecar path recorded");
+        let v: Value =
+            serde_json::from_slice(&std::fs::read(arch.path().join(&rel)).unwrap()).unwrap();
+        assert_eq!(v.get("hexColor").and_then(Value::as_str), Some("#FF0000"));
+        assert_eq!(
+            v.get("isDefaultCalendar").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_calendar_groups")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "calendar-group"
+        );
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "_calperm_C1")
+                .unwrap()
+                .unwrap()
+                .item_type,
+            "calendar-permission"
+        );
+    }
+
+    #[test]
+    fn backup_event_attachments_snapshots_only_events_with_attachments() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        for (id, has) in [("e1", true), ("e2", false)] {
+            let ev =
+                json!({ "id": id, "subject": id, "hasAttachments": has, "type": "singleInstance" });
+            archive_json_item(&store, "acc", arch.path(), id, id, "event", &ev).unwrap();
+        }
+        struct AttFetcher;
+        impl JsonFetcher for AttFetcher {
+            fn fetch_json(&self, url: &str) -> std::result::Result<Value, String> {
+                if url.contains("/events/e1/attachments") {
+                    Ok(json!({ "value": [{ "id": "a1", "name": "agenda.pdf",
+                        "contentType": "application/pdf", "contentBytes": "QUJD" }] }))
+                } else {
+                    Ok(json!({ "value": [] }))
+                }
+            }
+        }
+        let r = backup_event_attachments(&AttFetcher, &store, "acc", arch.path(), 0).unwrap();
+        assert_eq!(r.archived, 1, "only e1 (has attachments) is snapshotted");
+        let att = store
+            .get_item("acc", SERVICE, "_evatt_e1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(att.item_type, "event-attachment");
+        let v: Value = serde_json::from_slice(
+            &std::fs::read(arch.path().join(att.local_path.unwrap())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.pointer("/value/0/name").and_then(Value::as_str),
+            Some("agenda.pdf")
         );
     }
 

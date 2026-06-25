@@ -29,16 +29,21 @@ pub use archive::{
     backup_onenote_bodies, backup_onenote_resources, backup_todo_bodies, ArchiveReport,
     BytesFetcher, JsonFetcher, OneNoteResourceReport,
 };
-pub use calendar::{incremental_sync_calendar, CalendarReport};
+pub use calendar::{
+    backup_calendar_flanks, backup_event_attachments, events_sync_calendar,
+    incremental_sync_calendar, CalendarReport,
+};
+pub use common::shard_rel;
 pub use contacts::{backup_contact_photos, incremental_sync_contacts, ContactsReport, PhotoReport};
 pub use export::{contact_to_vcard, event_to_ics};
 pub use mail::{
-    backup_message_bodies, incremental_sync_mail, index_mail_bodies, BodyReport, MailReport,
-    MimeFetcher,
+    backup_mailbox_flanks, backup_message_bodies, incremental_sync_mail, index_mail_bodies,
+    BodyReport, MailReport, MimeFetcher,
 };
 pub use mime::{
-    extract_html, extract_html_with_inline_images, extract_text, mail_preview, set_message_id,
-    HtmlWithInlineImages, InlineImage, MailPreview,
+    extract_attachment, extract_html, extract_html_with_inline_images, extract_text,
+    list_attachments, mail_preview, set_message_id, AttachmentMeta, HtmlWithInlineImages,
+    InlineImage, MailPreview,
 };
 pub use onedrive::{
     apply_local_deletes, apply_local_modifies, incremental_sync, local_rel_path,
@@ -46,7 +51,9 @@ pub use onedrive::{
     scan_local_creates, scan_local_deletes, scan_local_modifies, ContentReplacer, Downloader,
     MaterializeReport, ModifyReport, PendingLocalDelete, RemoteWriter, SyncError, SyncReport,
 };
-pub use onenote::{incremental_sync_onenote, OneNoteReport};
+pub use onenote::{
+    backup_onenote_hierarchy, incremental_sync_onenote, OneNoteHierarchyReport, OneNoteReport,
+};
 pub use quickxor::{quickxor, quickxor_base64};
 pub use restore::{
     restore_contact, restore_event, restore_message, restore_page, restore_page_with_resources,
@@ -54,7 +61,10 @@ pub use restore::{
     OneNoteResourcePart, PageCreator, Restorer,
 };
 pub use shared::{sync_shared_with_me, SharedReport};
-pub use todo::{incremental_sync_todo, TodoReport};
+pub use todo::{
+    backup_task_subresources, backup_todo_list_flanks, extract_task_attachment,
+    incremental_sync_todo, list_task_attachments, TodoReport,
+};
 
 /// Serializes the `live_*` integration tests. They all exercise one shared,
 /// rate-limited throwaway account, so running them concurrently self-throttles

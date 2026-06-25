@@ -1,0 +1,12 @@
+{
+  "name": "isyncyou-ci-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "description": "CI-only headless UI smoke tooling for the staging-e2e job. Not part of the shipped product (the web UI is hand-written vanilla JS embedded into the Rust daemon).",
+  "scripts": {
+    "ui-smoke": "node tools/ci-ui-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.61.1"
+  }
+}

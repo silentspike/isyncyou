@@ -13,7 +13,10 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// PathBuf is only used by the encrypted-store migrate/credential paths.
+#[cfg(feature = "encrypted-store")]
+use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -34,7 +37,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 11;
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -238,6 +241,24 @@ ALTER TABLE items ADD COLUMN verified_at TEXT;
 ALTER TABLE items ADD COLUMN verify_status TEXT;
 "#;
 
+/// v10: the cloud version the archived body corresponds to. `body_etag` is set to
+/// the item's `etag` when the body is archived (`set_local_path`). The delta ingest
+/// overwrites `etag` with the new remote value but NOT `body_etag`, so the web UI's
+/// 4-state status can detect a **stale** backup (`etag != body_etag` = cloud changed
+/// since the body was archived) vs. an up-to-date one. NULL = no body archived.
+const MIGRATION_V10: &str = r#"
+ALTER TABLE items ADD COLUMN body_etag TEXT;
+"#;
+
+/// v11: the display sender of a mail item (`"Name <addr>"`), captured at ingest
+/// straight from the delta payload — so the list shows who a message is from even
+/// when its `.eml` body isn't cached (the mobile cache caps bodies; without this the
+/// row reads "(unknown sender)"). Set by the mail connector's ingest; `NULL` for
+/// every non-mail service. Read with the item — no per-request body/sidecar I/O.
+const MIGRATION_V11: &str = r#"
+ALTER TABLE items ADD COLUMN sender TEXT;
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -283,6 +304,13 @@ pub struct Item {
     pub verified_at: Option<String>,
     /// Outcome of the last verify pass: `verified` / `changed` / `failed`.
     pub verify_status: Option<String>,
+    /// The item's `etag` at the time its body was archived (`set_local_path`).
+    /// `etag != body_etag` (with a body present) = the cloud changed since the
+    /// backup → the web UI shows a **stale** status. `None` = no body archived.
+    pub body_etag: Option<String>,
+    /// Display sender of a mail item (`"Name <addr>"`), captured at ingest so the
+    /// list shows the sender without the `.eml` body. `None` for non-mail / unknown.
+    pub sender: Option<String>,
 }
 
 impl Item {
@@ -314,8 +342,10 @@ impl Item {
             ical_uid: None,
             series_master_id: None,
             body_sha256: None,
+            body_etag: None,
             verified_at: None,
             verify_status: None,
+            sender: None,
         }
     }
 }
@@ -337,13 +367,18 @@ impl Store {
     /// closed when the key is absent or wrong; new stores are created encrypted
     /// when the key is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        match configured_store_key()? {
-            Some(secret) => Self::open_encrypted(path, &secret),
-            None => Self::open_plain(path),
+        // With `plain-store` (Android) there is no key path — open plaintext. The
+        // SQLCipher `sqlite3_key` FFI symbol does not exist in the bundled-plain
+        // build, so the encrypted branch must be compiled out entirely.
+        #[cfg(feature = "encrypted-store")]
+        if let Some(secret) = configured_store_key()? {
+            return Self::open_encrypted(path, &secret);
         }
+        Self::open_plain(path)
     }
 
     /// Open (or create) a SQLCipher-encrypted store using `secret`.
+    #[cfg(feature = "encrypted-store")]
     pub fn open_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
         if secret.is_empty() {
             return Err(StoreError::InvalidStoreSecret(
@@ -402,7 +437,7 @@ impl Store {
     /// rows are preserved; the FTS indexes are rebuilt from their content tables.
     ///
     /// Key semantics are identical to [`Store::open_encrypted`] by construction:
-    /// only [`apply_sqlcipher_key`] ever touches the key, and the plaintext source
+    /// only `apply_sqlcipher_key` ever touches the key, and the plaintext source
     /// is attached *from the keyed connection* with an empty `KEY ''` (SQLCipher's
     /// documented plaintext attach) — so the migrated store opens with the same
     /// secret later.
@@ -412,6 +447,7 @@ impl Store {
     /// usable, plus a stale temp file that the next run removes); migrating an
     /// already-encrypted store fails with [`StoreError::AlreadyEncrypted`] so a
     /// re-run after success is a clean, detectable no-op for the caller.
+    #[cfg(feature = "encrypted-store")]
     pub fn migrate_to_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<()> {
         let path = path.as_ref();
         if secret.is_empty() {
@@ -521,9 +557,20 @@ impl Store {
             .write(true)
             .truncate(false)
             .open(&lock_path)?;
-        f.try_lock_exclusive()
-            .map_err(|_| StoreError::AlreadyRunning(lock_path.clone()))?;
-        Ok(f)
+        // The lock is held only for a Store's lifetime (a single request or sync
+        // pass), so concurrent opens within one process — the multi-threaded web
+        // server firing several store reads at once — just need to wait out the
+        // current holder. Retry briefly (~1s); a genuinely long-held lock (a second
+        // daemon instance) still fails after the window, preserving single-writer.
+        for attempt in 0..40 {
+            if f.try_lock_exclusive().is_ok() {
+                return Ok(f);
+            }
+            if attempt < 39 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        Err(StoreError::AlreadyRunning(lock_path))
     }
 
     fn init(conn: &Connection) -> Result<()> {
@@ -548,8 +595,8 @@ impl Store {
             r#"INSERT INTO items
                  (account_id, service, remote_id, parent_remote_id, name, local_path,
                   item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at,
-                  change_key, internet_message_id, ical_uid, series_master_id)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                  change_key, internet_message_id, ical_uid, series_master_id, sender)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
                ON CONFLICT(account_id, service, remote_id) DO UPDATE SET
                  parent_remote_id    = excluded.parent_remote_id,
                  name                = excluded.name,
@@ -565,7 +612,8 @@ impl Store {
                  change_key          = excluded.change_key,
                  internet_message_id = excluded.internet_message_id,
                  ical_uid            = excluded.ical_uid,
-                 series_master_id    = excluded.series_master_id"#,
+                 series_master_id    = excluded.series_master_id,
+                 sender              = COALESCE(excluded.sender, sender)"#,
             params![
                 it.account_id,
                 it.service,
@@ -584,8 +632,25 @@ impl Store {
                 it.change_key,
                 it.internet_message_id,
                 it.ical_uid,
-                it.series_master_id
+                it.series_master_id,
+                it.sender
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Set just the `sender` column for one item (CC-1 backfill) without rewriting
+    /// the row or disturbing FTS/sync-state. No-op if the item doesn't exist.
+    pub fn set_sender(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        sender: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET sender=?4 WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, sender],
         )?;
         Ok(())
     }
@@ -730,8 +795,12 @@ impl Store {
         offset: u32,
     ) -> Result<Vec<Item>> {
         let mut stmt = self.conn.prepare(&format!(
+            // include cloud-deleted items that still have an archived body so the
+            // UI can show the 'backup-only' state (the backup's whole point);
+            // truly-gone items (deleted + never archived) stay hidden.
             "SELECT {COLS} FROM items
-             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL
+             WHERE account_id=?1 AND service=?2
+               AND (deleted_at IS NULL OR local_path IS NOT NULL)
              ORDER BY item_type, name
              LIMIT ?3 OFFSET ?4"
         ))?;
@@ -743,7 +812,8 @@ impl Store {
     pub fn count_by_service(&self, account: &str, service: &str) -> Result<u64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM items
-             WHERE account_id=?1 AND service=?2 AND deleted_at IS NULL",
+             WHERE account_id=?1 AND service=?2
+               AND (deleted_at IS NULL OR local_path IS NOT NULL)",
             params![account, service],
             |r| r.get::<_, i64>(0),
         )? as u64)
@@ -776,8 +846,14 @@ impl Store {
         remote_id: &str,
         local_path: Option<&str>,
     ) -> Result<bool> {
+        // Record the cloud version this archived body corresponds to: when a body
+        // is set, `body_etag` snapshots the item's current `etag`; when cleared, it
+        // resets to NULL. The delta ingest never touches `body_etag`, so a later
+        // `etag` change (cloud edit) makes `etag != body_etag` → a stale backup.
         let n = self.conn.execute(
-            "UPDATE items SET local_path=?4
+            "UPDATE items
+             SET local_path=?4,
+                 body_etag=CASE WHEN ?4 IS NOT NULL THEN etag ELSE NULL END
              WHERE account_id=?1 AND service=?2 AND remote_id=?3",
             params![account, service, remote_id, local_path],
         )?;
@@ -1262,6 +1338,7 @@ impl Store {
     }
 }
 
+#[cfg(feature = "encrypted-store")]
 pub fn configured_store_key() -> Result<Option<Vec<u8>>> {
     if let Some(path) = std::env::var_os(STORE_KEY_FILE_ENV) {
         return read_store_secret_file(Path::new(&path)).map(Some);
@@ -1303,6 +1380,7 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+#[cfg(feature = "encrypted-store")]
 fn apply_sqlcipher_key(conn: &Connection, secret: &[u8]) -> Result<()> {
     let len: i32 = secret
         .len()
@@ -1322,6 +1400,7 @@ fn apply_sqlcipher_key(conn: &Connection, secret: &[u8]) -> Result<()> {
 /// Whether the file at `path` starts with the plaintext SQLite magic. A
 /// SQLCipher-encrypted database encrypts the header too, so this distinguishes a
 /// plaintext store from an encrypted one without a key.
+#[cfg(feature = "encrypted-store")]
 fn is_plaintext_sqlite(path: &Path) -> Result<bool> {
     use std::io::Read;
     let mut f = File::open(path)?;
@@ -1337,7 +1416,7 @@ fn is_plaintext_sqlite(path: &Path) -> Result<bool> {
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
                     item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
                     change_key, internet_message_id, ical_uid, series_master_id, \
-                    body_sha256, verified_at, verify_status";
+                    body_sha256, verified_at, verify_status, body_etag, sender";
 
 fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     Ok(Item {
@@ -1362,6 +1441,8 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         body_sha256: r.get(18)?,
         verified_at: r.get(19)?,
         verify_status: r.get(20)?,
+        body_etag: r.get(21)?,
+        sender: r.get(22)?,
     })
 }
 
@@ -1509,6 +1590,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 9 {
         conn.execute_batch(MIGRATION_V9)?;
     }
+    if v < 10 {
+        conn.execute_batch(MIGRATION_V10)?;
+    }
+    if v < 11 {
+        conn.execute_batch(MIGRATION_V11)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1525,6 +1612,43 @@ mod tests {
     fn migrates_to_current_version() {
         let s = Store::open_in_memory().unwrap();
         assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn set_local_path_records_body_etag_for_stale_detection() {
+        let s = Store::open_in_memory().unwrap();
+        let mut a = item("acc", "id-a", "A.json");
+        a.etag = Some("E1".into());
+        s.upsert_item(&a).unwrap();
+        // no body yet → no body_etag
+        let g = s.get_item("acc", "onedrive", "id-a").unwrap().unwrap();
+        assert_eq!(g.body_etag, None);
+        // archive the body → body_etag snapshots the current etag
+        s.set_local_path("acc", "onedrive", "id-a", Some("ct/aa/id-a.json"))
+            .unwrap();
+        let g = s.get_item("acc", "onedrive", "id-a").unwrap().unwrap();
+        assert_eq!(g.body_etag.as_deref(), Some("E1"));
+        // a cloud edit (delta ingest) overwrites etag but NOT body_etag → stale
+        let mut a2 = item("acc", "id-a", "A.json");
+        a2.etag = Some("E2".into());
+        a2.local_path = Some("ct/aa/id-a.json".into());
+        s.upsert_item(&a2).unwrap();
+        let g = s.get_item("acc", "onedrive", "id-a").unwrap().unwrap();
+        assert_eq!(g.etag.as_deref(), Some("E2"));
+        assert_eq!(
+            g.body_etag.as_deref(),
+            Some("E1"),
+            "stale: cloud etag moved but the archived body's etag is pinned"
+        );
+        // clearing the body resets body_etag
+        s.set_local_path("acc", "onedrive", "id-a", None).unwrap();
+        assert_eq!(
+            s.get_item("acc", "onedrive", "id-a")
+                .unwrap()
+                .unwrap()
+                .body_etag,
+            None
+        );
     }
 
     #[test]
@@ -1832,6 +1956,28 @@ mod tests {
             Err(StoreError::AlreadyRunning(_)) => {}
             Err(e) => panic!("expected AlreadyRunning, got {e:?}"),
             Ok(_) => panic!("expected AlreadyRunning, got a second store"),
+        }
+    }
+
+    #[test]
+    fn concurrent_opens_from_one_process_all_succeed() {
+        // The multi-threaded web server opens the store per request, so several
+        // short-lived opens can overlap; the brief retry in acquire_lock must let
+        // them all succeed rather than racing the AlreadyRunning lock (#564).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        Store::open(&path).unwrap(); // create the store, then drop (release lock)
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let s = Store::open(&p).expect("concurrent open should succeed");
+                    let _ = s.count_by_service("a", "onedrive");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
         }
     }
 

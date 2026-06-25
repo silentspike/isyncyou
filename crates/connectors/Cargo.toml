@@ -9,7 +9,7 @@ authors.workspace = true
 
 [dependencies]
 isyncyou-graph = { path = "../graph" }
-isyncyou-store = { path = "../store" }
+isyncyou-store = { path = "../store", default-features = false }
 isyncyou-pathmap = { path = "../pathmap" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -17,6 +17,11 @@ thiserror = { workspace = true }
 [features]
 # Enable the live reqwest transport (pulls graph's http feature).
 http = ["isyncyou-graph/http"]
+# Forward the store at-rest-encryption profile so the whole dep chain (engine,
+# webui) can pick plain-store for Android. Desktop default = encrypted-store.
+default = ["encrypted-store"]
+encrypted-store = ["isyncyou-store/encrypted-store"]
+plain-store = ["isyncyou-store/plain-store"]
 
 [dev-dependencies]
 tempfile = "3"
