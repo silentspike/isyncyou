@@ -1,30 +1,35 @@
 # iSyncYou — Android client
 
-A minimal, hardened **WebView** app onto the local iSyncYou daemon's web UI, so the
-same UI runs as a native Android app with proper touch + swipe. A thin shell — all
-features live in the web UI (`gui/webui/`), so this stays small.
+A **standalone** Android app (#89): it **embeds the real iSyncYou engine in the app
+process** (`crates/mobile` → `libisyncyou_mobile.so`) and serves the web UI over
+loopback; the WebView loads `http://127.0.0.1:<port>/`. No desktop daemon and no
+`adb reverse` — the phone is a self-contained iSyncYou **live companion** over mobile
+data (the laptop remains the backup-of-record). A thin shell — all features live in the
+web UI (`gui/webui/`), so the Kotlin stays small.
 
-## Build (Gradle + Kotlin)
+## Build (Gradle + Kotlin + cargo-ndk)
 
 Standard Gradle project (migrated from the old manual `build.sh`, #573). Needs a
-JDK (17+) and an Android SDK with `build-tools;34.0.0` + `platforms;android-34`.
-Point the SDK via `local.properties` (`sdk.dir=…`, gitignored) or `ANDROID_HOME`.
+JDK (17+), an Android SDK with `build-tools;34.0.0` + `platforms;android-34` + an NDK,
+the `aarch64-linux-android` Rust target and `cargo-ndk`. Point the SDK via
+`local.properties` (`sdk.dir=…`, gitignored) or `ANDROID_HOME`.
 
 ```sh
 ./gradlew :app:assembleDebug      # -> app/build/outputs/apk/debug/app-debug.apk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-On-device the daemon is reached over `adb reverse tcp:8869 tcp:8869` (`SERVER_URL` in
-`MainActivity.kt` defaults to `http://localhost:8869/`):
+The `cargoNdkBuild` Gradle task cross-compiles the embedded engine into
+`app/src/main/jniLibs/arm64-v8a/libisyncyou_mobile.so` before assembling (arm64 only for
+now; multi-arch is deferred). On launch, `MainActivity` calls `NativeEngine.nativeStart`,
+gets the loopback port + session token, and loads the local UI:
 
 ```sh
-adb reverse tcp:8869 tcp:8869
 adb shell am start -n com.silentspike.isyncyou/.MainActivity
 ```
 
-A real deployment points `SERVER_URL` at the daemon's reachable address (LAN IP /
-NetBird VPN).
+Sign in once via the in-app account menu (device-code); the engine fills a local cache
+store and serves the live view. The loopback API is fully session-token gated (#89 P1).
 
 ### Release build
 

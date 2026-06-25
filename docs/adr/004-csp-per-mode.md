@@ -37,3 +37,13 @@ to exactly the mode that needs it.
   token-bearing mode can reach Graph.
 - **−** Two CSP variants to maintain and test; a meta-CSP for the APK is weaker than a
   header (cannot express `frame-ancestors`), acceptable for a self-contained app.
+
+## Revised for #89 (2026-06-25)
+
+#89 embeds the engine and serves the UI from the **same in-process HTTP server** the
+desktop daemon uses (not a `file://`/asset origin), so it **delivers CSP as an HTTP
+header** exactly as desktop does — the weaker `<meta>`-CSP variant this ADR contemplated
+is **not needed**. And because the embedded UI talks only to its own loopback server
+(which proxies nothing to Graph from JS — the engine makes the Graph calls), the shell
+keeps the audited `connect-src 'self'`; no Graph/login origins are added to the WebView
+CSP. The per-mode widening here applies only to the abandoned direct-Graph-JS mode.

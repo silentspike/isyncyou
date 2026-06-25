@@ -48,3 +48,17 @@ local-HTTP daemon.
 - **+** Unblocks `WebViewAssetLoader`, FCM, and a properly signed standalone APK.
 - **−** A Gradle toolchain to vendor, pin, and wire into CI — real maintenance weight;
   this is why it is a deliberate decision rather than a default.
+
+## Implementation status (2026-06-25, #89) — Accepted + partly built
+
+- **Build system: Gradle is implemented**, not just proposed (AGP 8.5.2, Kotlin 1.9.24,
+  Gradle 8.7, signing + FCM). The standalone APK adds a `cargoNdkBuild` Gradle task that
+  cross-compiles the embedded Rust engine (`libisyncyou_mobile.so`) into `jniLibs` via
+  cargo-ndk (NDK r27d) — arm64 first; multi-arch is deferred hardening.
+- **On-device auth: device-code (not Auth-Code+PKCE/Custom-Tabs) for now.** The existing
+  device-code login already works on mobile with no redirect-URI registration; PKCE is a
+  later UX polish.
+- **`WebViewAssetLoader` is NOT the #89 path.** Because the engine runs in-process and
+  serves the UI over loopback (the same `include_str!` assets the daemon serves), the app
+  needs no asset-origin loader. `usesCleartextTraffic` is removed globally and scoped to
+  `127.0.0.1` via `network_security_config.xml` (Graph is HTTPS).

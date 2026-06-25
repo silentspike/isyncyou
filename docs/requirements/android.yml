@@ -145,3 +145,75 @@ requirements:
       - Multiple services join in a stable order in one notification.
     verified_by:
       - test: backup_delta_notification_text
+
+  # --- Standalone "live companion" APK (#89). The app embeds the real Rust engine
+  # in-process and serves the web UI over loopback — no desktop daemon. Supersedes the
+  # daemon-less direct-Graph-JS direction (ADR-003); see ADR-005 for the chosen path.
+  - id: REQ-AND-011
+    title: The standalone app embeds the engine and serves the UI over loopback
+    statement: >
+      A native library (libisyncyou_mobile.so) runs the real iSyncYou engine in the
+      app process and serves the web UI on an OS-assigned loopback port; the WebView
+      loads http://127.0.0.1:<port>/. start is idempotent (Activity recreation reuses
+      the running port) and panic-isolated (a request panic cannot kill the app).
+    status: implemented
+    acceptance:
+      - Starting the engine binds a real loopback port.
+      - A second start returns the same port (no double-bind).
+      - The session token is set before serving.
+    verified_by:
+      - test: start_engine_binds_a_port_and_is_idempotent
+  - id: REQ-AND-012
+    title: The mobile loopback data API is fully session-token gated
+    statement: >
+      Because any app on the device can reach 127.0.0.1, every /api/v1/* route in the
+      mobile profile requires an unguessable per-process session token (header, _st
+      query, or loopback cookie) and returns 401 without it; the static shell stays
+      open so the WebView can bootstrap. The desktop daemon is unaffected (gate off).
+    status: implemented
+    acceptance:
+      - Without the token, data routes return 401 over HTTP.
+      - A valid header / _st query / cookie passes; a wrong one is rejected.
+      - The static shell (`/`, `/app.js`) stays reachable without the token.
+    verified_by:
+      - test: session_token_gates_data_routes_over_http
+      - test: session_gate_requires_token_on_data_routes
+  - id: REQ-AND-013
+    title: The mobile profile is a cache, never a backup-of-record (restore off)
+    statement: >
+      The phone is a live companion; the laptop holds the backup. build_live_router
+      omits the restore and outbound-share handlers, so those routes 404 on mobile and
+      the UI hides every restore action (no restore capability token is injected). The
+      UI wording reads "cached on this device", not "backup".
+    status: implemented
+    acceptance:
+      - A POST to /api/v1/restore or /api/v1/share is 404 in the mobile router.
+      - A wired live-write route is reached (cap-gated 401), proving omission is selective.
+    verified_by:
+      - test: mobile_live_router_omits_restore_and_share
+  - id: REQ-AND-014
+    title: A single device-code login fills the on-device cache
+    statement: >
+      A fresh phone signs in once (device-code, write/restore scopes). The read-only
+      cache-refresh resolves reads via that write/restore token (its *.ReadWrite scopes
+      are read-capable), so the local store fills without a separate read login.
+    status: implemented
+    acceptance:
+      - The cache-refresh token resolver prefers the read token, else the write token.
+      - With neither cached it surfaces the write-token error (proving the fallback ran).
+    verified_by:
+      - test: cache_refresh_token_prefers_read_then_falls_back_to_write
+  - id: REQ-AND-015
+    title: No Google service-account ships in the APK
+    statement: >
+      The daemon's FCM push *sender* (which holds the Firebase service-account) is
+      never wired into the standalone engine — only the native FCM *receiver* remains.
+      The embedded mobile crate depends on no push sender, so no service-account or
+      secret is packaged in the APK.
+    status: implemented
+    design: docs/adr/006-push-relay.md
+    acceptance:
+      - The mobile crate wires no push sender / service-account.
+      - The built APK contains no firebase-service-account / secret file.
+    verified_by:
+      - file: crates/mobile/src/lib.rs

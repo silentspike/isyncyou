@@ -47,3 +47,16 @@ needs.
   accepted mobile-client architecture (every native M365 app stores a token on device);
   it is bounded by read-only scope, short TTL, and no refresh token in the client.
 - **−** Requires the per-mode CSP of ADR-004 so the common mode is not widened.
+
+## Superseded for #89 (2026-06-25)
+
+The standalone APK (#89) chose a different architecture: it **embeds the real Rust
+engine in the app process** and serves the existing web UI over loopback
+(`crates/mobile` + `crates/app-host::build_live_router`), instead of a daemon-less
+direct-Graph JS client. The UI calls 48 `/api/v1/*` endpoints with no data-source
+seam, and the server-side HTML sanitization + item shaping would have to be
+reimplemented (and re-secured) in JS — a thinner product that also discards the backup
+engine. The embed path reuses everything and exposes **no** Graph token to JS.
+**This ADR's direct-Graph-JS token model is therefore not used by #89** (retained only
+as the abandoned direct-mode design). #89's on-device model is the existing device-code
+login + the per-process session-token gate (REQ-AND-012/014).
