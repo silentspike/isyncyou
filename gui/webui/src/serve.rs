@@ -311,23 +311,35 @@ fn handle_sse<S: Conn>(stream: &mut S, bus: &EventBus) -> std::io::Result<()> {
     }
 }
 
-/// Bind `addr` and serve `router` forever (single-threaded). Returns only on a
-/// fatal bind/accept error.
-pub fn serve(addr: &str, router: Router) -> std::io::Result<()> {
+/// Bind a **loopback** TCP address, refusing any non-loopback host. Use `:0` for an
+/// OS-assigned free port and read it from `local_addr()` (the standalone mobile
+/// client does this, then hands the port to its WebView, #89).
+pub fn bind_loopback(addr: &str) -> std::io::Result<TcpListener> {
     if !is_loopback_bind_addr(addr) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "refusing non-loopback TCP bind address; use --socket for owner-only local access",
         ));
     }
-    let listener = TcpListener::bind(addr)?;
-    let local = listener.local_addr()?;
-    eprintln!("iSyncYou web UI listening on http://{local}/");
+    TcpListener::bind(addr)
+}
+
+/// Serve `router` forever on an already-bound loopback `listener`. Returns only on a
+/// fatal accept error. Lets a caller read the bound port before serving (mobile).
+pub fn serve_listener(listener: TcpListener, router: Router) -> std::io::Result<()> {
     let router = Arc::new(router);
     for stream in listener.incoming() {
         spawn_conn(stream?, Arc::clone(&router), AccessPolicy::TcpLoopback);
     }
     Ok(())
+}
+
+/// Bind `addr` and serve `router` forever. Returns only on a fatal bind/accept error.
+pub fn serve(addr: &str, router: Router) -> std::io::Result<()> {
+    let listener = bind_loopback(addr)?;
+    let local = listener.local_addr()?;
+    eprintln!("iSyncYou web UI listening on http://{local}/");
+    serve_listener(listener, router)
 }
 
 /// Handle one accepted connection on its own thread (so a long-lived SSE stream

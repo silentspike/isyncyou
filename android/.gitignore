@@ -5,6 +5,8 @@ local.properties
 *.keystore
 *.jks
 *.dex
+# Rust JNI libs are built by the cargo-ndk Gradle task (#89), never committed.
+app/src/main/jniLibs/
 # credentials the user supplies (never committed): release signing + FCM
 google-services.json
 *-signing.env

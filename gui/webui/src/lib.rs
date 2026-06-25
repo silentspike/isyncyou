@@ -29,9 +29,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod serve;
 mod view;
+pub use serve::{bind_loopback, format_http, parse_request_line, serve, serve_listener};
 #[cfg(unix)]
 pub use serve::{default_unix_socket_path, serve_unix};
-pub use serve::{format_http, parse_request_line, serve};
 
 /// The embedded single-page UI (served at `/`). Talks to the JSON API via fetch.
 pub const INDEX_HTML: &str = include_str!("index.html");
