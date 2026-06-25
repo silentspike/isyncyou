@@ -1551,6 +1551,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "isyncyou-app-host"
+version = "0.1.0"
+dependencies = [
+ "isyncyou-connectors",
+ "isyncyou-core",
+ "isyncyou-engine",
+ "isyncyou-graph",
+ "isyncyou-store",
+ "isyncyou-webui",
+ "serde_json",
+]
+
+[[package]]
 name = "isyncyou-change-source"
 version = "0.1.0"
 dependencies = [
@@ -1606,6 +1619,7 @@ name = "isyncyou-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "isyncyou-app-host",
  "isyncyou-change-source",
  "isyncyou-connectors",
  "isyncyou-core",
