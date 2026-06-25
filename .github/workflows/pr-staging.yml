@@ -211,10 +211,51 @@ jobs:
       - name: Build the debug APK
         run: cd android && ./gradlew :app:assembleDebug
 
+  # DAST: OWASP ZAP baseline against the served fixture UI, on top of the functional
+  # serve-smoke — the active runtime-security pass dev/main don't have. Builds + serves
+  # the same token-free fixture as staging-e2e, then runs the ZAP baseline. `-I` reports
+  # warnings in the artifact but only FAILs block (the hardened static UI yields 0 FAILs
+  # locally; the warnings are intentional, e.g. Cache-Control: no-store). ZAP pinned by
+  # digest; --network host lets it reach the loopback daemon.
+  staging-dast:
+    name: staging-dast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.0
+      - name: Install Linux GUI build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - name: Build the daemon
+        run: cargo build -p isyncyou-daemon
+      - name: Seed a token-free fixture
+        run: |
+          cargo run -p isyncyou-connectors --example seed_fixture \
+            --no-default-features --features plain-store -- "$RUNNER_TEMP/fixture"
+      - name: Serve the fixture and run the ZAP baseline
+        run: |
+          target/debug/isyncyoud --config "$RUNNER_TEMP/fixture/isyncyou.toml" \
+            --tcp --bind 127.0.0.1:8876 --sync-secs 0 --token-refresh-secs 0 --heartbeat-secs 0 &
+          dpid=$!
+          trap 'kill "$dpid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:8876/ && break; sleep 1; done
+          mkdir -p "$RUNNER_TEMP/zap" && chmod 777 "$RUNNER_TEMP/zap"
+          docker run --rm --network host -v "$RUNNER_TEMP/zap":/zap/wrk:rw \
+            ghcr.io/zaproxy/zaproxy@sha256:7c2f8afc893e4e4000be8ad3fd22013fc36e5cce59359349f5a2d45626e2ccb9 \
+            zap-baseline.py -t http://127.0.0.1:8876/ -I -r zap-report.html
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: zap-baseline-report
+          path: ${{ runner.temp }}/zap/zap-report.html
+          if-no-files-found: ignore
+
   staging-pass:
     name: staging-pass
     if: always()
-    needs: [content-check, fmt, clippy, test, deny, docs, staging-e2e, release-build, android-build]
+    needs: [content-check, fmt, clippy, test, deny, docs, staging-e2e, release-build, android-build, staging-dast]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed
