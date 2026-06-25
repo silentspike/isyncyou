@@ -25,6 +25,11 @@ android {
         targetSdk = 34
         versionCode = (System.getenv("ISY_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("ISY_VERSION_NAME") ?: "0.1"
+        // The embedded Rust engine ships arm64 only for the first milestone (#89);
+        // multi-arch is deferred hardening.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     if (hasReleaseSigning) {
@@ -65,3 +70,20 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")
 }
+
+// #89: build the embedded Rust engine (libisyncyou_mobile.so) with cargo-ndk into
+// app/src/main/jniLibs before assembling the APK. The Rust workspace is the parent
+// of android/. Pins the MSRV toolchain + the installed NDK; uses the rustup cargo
+// proxy so `+1.95.0` resolves.
+val cargoNdkBuild by tasks.registering(Exec::class) {
+    workingDir = rootProject.projectDir.parentFile
+    val home = System.getProperty("user.home")
+    environment("ANDROID_NDK_HOME", "${android.sdkDirectory}/ndk/27.3.13750724")
+    commandLine(
+        "$home/.cargo/bin/cargo", "+1.95.0", "ndk",
+        "-t", "arm64-v8a",
+        "-o", "android/app/src/main/jniLibs",
+        "build", "-p", "isyncyou-mobile", "--release",
+    )
+}
+tasks.named("preBuild") { dependsOn(cargoNdkBuild) }
