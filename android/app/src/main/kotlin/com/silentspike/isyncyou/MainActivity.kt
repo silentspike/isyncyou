@@ -114,9 +114,21 @@ class MainActivity : Activity() {
         // binds a socket), then load the local UI on the UI thread once it's up.
         val filesPath = filesDir.absolutePath
         Thread {
-            val port = NativeEngine.nativeStart(filesPath)
-            val token = if (port > 0) NativeEngine.nativeSessionToken() else ""
-            runOnUiThread { onEngineReady(port, token) }
+            // Catch Throwable: a failed System.loadLibrary (UnsatisfiedLinkError /
+            // ExceptionInInitializerError) or a native panic would otherwise kill this
+            // thread silently — onEngineReady would never run and the UI would hang on a
+            // blank WebView with no log. Logging the start + the outcome makes engine
+            // failures visible (the CI emulator smoke and on-device diagnostics rely on it).
+            try {
+                android.util.Log.i(TAG, "engine thread: calling nativeStart")
+                val port = NativeEngine.nativeStart(filesPath)
+                val token = if (port > 0) NativeEngine.nativeSessionToken() else ""
+                android.util.Log.i(TAG, "engine thread: nativeStart returned port=$port")
+                runOnUiThread { onEngineReady(port, token) }
+            } catch (t: Throwable) {
+                android.util.Log.e(TAG, "engine thread crashed starting the native engine", t)
+                runOnUiThread { onEngineReady(-1, "") }
+            }
         }.start()
     }
 

@@ -13,8 +13,10 @@ status bar + FUSE, on Linux) **and** the standalone Android app as a full 1.0 co
 an on-device embedded engine, a **signed release APK** (per-build `versionName`/
 `versionCode`), build-once/promote-many release attachment, a KVM **emulator smoke**, and
 **Obtainium** OTA distribution (`REQ-AND-002…007`, all implemented). All 55 tracked
-requirements are implemented. The only Android item still pending is the on-device **FCM
-push end-to-end proof** (#578), which needs the Firebase service-account credential.
+requirements are implemented, and the **FCM push end-to-end was verified live** (daemon →
+device notification on a physical Pixel 8 Pro). The only outstanding Android item is
+*automating* that push proof in CI (#578) — the `live_fcm_send` check is `#[ignore]`
+because it needs the Firebase service-account as a CI secret; a 1.1 follow-up.
 
 ### Supported platforms (1.0)
 
