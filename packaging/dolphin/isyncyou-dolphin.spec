@@ -9,7 +9,7 @@
 #
 
 Name:           isyncyou-dolphin
-Version:        0.1.0
+Version:        1.0.0
 Release:        0
 Summary:        Dolphin integration for iSyncYou (overlay icons + service menu)
 License:        Apache-2.0
