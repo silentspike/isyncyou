@@ -173,8 +173,10 @@ hardening; ⏳ means designed and queued, not built.
 | Acceptance harness (A1–A10) + chaos tests | ✅ | data-loss / crash-point matrix |
 | Release archive + systemd unit | ✅ | tarball + `systemd --user` service |
 
-A deployed staging environment and a full end-to-end suite are still **not** claimed
-as done — that release-engineering work is tracked openly in the issues. Release
+A self-hosted staging deployment runs a nightly end-to-end suite (see
+[Known limitations](#known-limitations)): its web-UI, visual-regression, migration and
+verify journeys run green, while the full live-account mutation matrix is **still being
+hardened** — that release-engineering work is tracked openly in the issues. Release
 artifacts are built by CI with a CycloneDX SBOM and signed GitHub artifact
 attestations.
 
@@ -291,8 +293,8 @@ This section is deliberately blunt — it is the inverse of the status table.
   (atomic; refuses without a configured key). Without a store key, stores remain
   plaintext and `isyncyou-doctor` warns. Do not point plaintext stores at
   sensitive data on a shared machine.
-- **The nightly staging E2E runs against a live account — treat its findings as
-  the source of truth.** A self-hosted staging deployment runs `isyncyoud`
+- **A nightly staging E2E runs against a live account — its findings are the
+  source of truth.** A self-hosted staging deployment runs `isyncyoud`
   (hardened systemd service, encrypted store + token caches) and a **nightly
   end-to-end run against the dedicated throwaway account** covering every user
   journey: backup of all five services, OneDrive sync, **upload + cloud teardown,
@@ -300,9 +302,12 @@ This section is deliberately blunt — it is the inverse of the status table.
   teardown, archive migration round-trip, doctor**, search, restore-to-local and
   verify — plus the web UI (functional + visual regression) and the native status
   bar, with pass/fail pushed to a notification channel. No tokens ever go to CI.
-  Its first runs caught three real bugs before any release shipped them. Release
-  artifacts are built by CI with a CycloneDX SBOM, signed GitHub artifact
-  attestations and self-verified cosign signatures.
+  The web-UI, visual-regression, migration and verify journeys run green; the full
+  live-account mutation matrix (backup / conflict / cloud-restore / teardown) is
+  **still being stabilized**, and current failures are tracked openly in the issues —
+  which is exactly what a source-of-truth nightly is for. Release artifacts are built
+  by CI with a CycloneDX SBOM, signed GitHub artifact attestations and self-verified
+  cosign signatures.
 - **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are built and
   live-verified on Linux/KDE, but remain platform/environment-gated.** They need a
   display server, `/dev/fuse`, or a host-side KF6 plugin respectively, so they are
