@@ -801,6 +801,10 @@ pub mod flow {
 mod tests {
     use super::*;
 
+    // flow (classify_poll/PollOutcome) is behind `feature = "http"`, so this test
+    // only compiles with that feature — gate it to match, or a no-http test build
+    // fails to resolve `super::flow` (matches the gating at the http tests below).
+    #[cfg(feature = "http")]
     #[test]
     fn device_code_poll_keeps_going_on_transient_and_stops_on_terminal() {
         use super::flow::{classify_poll, PollOutcome};
