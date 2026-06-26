@@ -30,7 +30,8 @@ jobs:
         with:
           python-version: "3.x"
       - name: Install checker deps
-        run: pip install --quiet pyyaml jsonschema
+        # Version-pinned for reproducible CI (these are dev-only doc-validation helpers).
+        run: pip install --quiet pyyaml==6.0.3 jsonschema==4.26.0
       - name: Generate HEAD-pinned evidence manifest
         run: python3 tools/generate_evidence_manifest.py
       - name: Validate generated manifest (must match HEAD)
