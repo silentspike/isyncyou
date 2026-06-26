@@ -25,6 +25,9 @@ jobs:
     # on it is an attack surface — unacceptable for a public repo. release.yml installs its
     # own host deps below, so it is fully self-contained on ubuntu-latest.
     runs-on: ubuntu-latest
+    # The signed Android APK is built once (android-apk job) and reused here, so the
+    # bytes published are exactly the bytes apksigner-verified there (REQ-AND-005).
+    needs: [android-apk]
     permissions:
       contents: write # publish the RC/release + upload assets
       id-token: write # cosign keyless (OIDC) + provenance
@@ -101,6 +104,39 @@ jobs:
              && sha256sum isyncyou-windows-x86_64.zip > isyncyou-windows-x86_64.zip.sha256)
           ls -la dist
 
+      # Bring the signed APK that android-apk built this run into dist/ (REQ-AND-005:
+      # build-once). On a stable tag we instead reuse the byte-identical APK from the
+      # RC prerelease that was built from this exact commit, so users get exactly the
+      # bytes that were tested (promote-many).
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: isyncyou-android-apk
+          path: dist
+      - name: Reuse the matching RC's APK on a stable tag (REQ-AND-005)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The stable tag must point at the exact commit an RC was built from. Find
+          # that RC prerelease and download its APK, replacing the one rebuilt this run,
+          # then verify the checksum — guaranteeing identical bytes (build-once).
+          sha="${{ github.sha }}"
+          rc=""
+          while read -r tag; do
+            tsha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" -q '.object.sha' 2>/dev/null || true)
+            if [ "$tsha" = "$sha" ]; then rc="$tag"; break; fi
+          done < <(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                     -q '.[] | select(.prerelease==true) | .tag_name')
+          if [ -z "$rc" ]; then
+            echo "::error::No RC prerelease was built from $sha — tag the exact commit an RC was built from (build-once / promote-many, REQ-AND-005)."
+            exit 1
+          fi
+          echo "reusing the signed APK from prerelease $rc"
+          rm -f dist/isyncyou-android-arm64.apk dist/isyncyou-android-arm64.apk.sha256
+          gh release download "$rc" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'isyncyou-android-arm64.apk*' --dir dist
+          (cd dist && sha256sum -c isyncyou-android-arm64.apk.sha256)
+
       - name: Generate release SBOM and checksums
         run: |
           python3 tools/generate_sbom.py --output dist/isyncyou.sbom.cdx.json
@@ -108,6 +144,7 @@ jobs:
             isyncyou-linux-x86_64.tar.gz \
             isyncyou-x86_64.AppImage \
             isyncyou-windows-x86_64.zip \
+            isyncyou-android-arm64.apk \
             isyncyou.sbom.cdx.json > SHA256SUMS)
 
       # Vuln-scan the released dependency composition: trivy over the just-generated
@@ -139,6 +176,7 @@ jobs:
             isyncyou-linux-x86_64.tar.gz \
             isyncyou-x86_64.AppImage \
             isyncyou-windows-x86_64.zip \
+            isyncyou-android-arm64.apk \
             isyncyou.sbom.cdx.json \
             SHA256SUMS; do
             ok=0
@@ -162,6 +200,7 @@ jobs:
             isyncyou-linux-x86_64.tar.gz \
             isyncyou-x86_64.AppImage \
             isyncyou-windows-x86_64.zip \
+            isyncyou-android-arm64.apk \
             isyncyou.sbom.cdx.json \
             SHA256SUMS; do
             cosign verify-blob "dist/$f" \
@@ -178,6 +217,7 @@ jobs:
             dist/isyncyou-linux-x86_64.tar.gz
             dist/isyncyou-x86_64.AppImage
             dist/isyncyou-windows-x86_64.zip
+            dist/isyncyou-android-arm64.apk
             dist/isyncyou.sbom.cdx.json
             dist/SHA256SUMS
 
@@ -200,6 +240,8 @@ jobs:
             dist/isyncyou-x86_64.AppImage.sha256
             dist/isyncyou-windows-x86_64.zip
             dist/isyncyou-windows-x86_64.zip.sha256
+            dist/isyncyou-android-arm64.apk
+            dist/isyncyou-android-arm64.apk.sha256
             dist/SHA256SUMS
             dist/isyncyou.sbom.cdx.json
             dist/*.cosign.bundle
@@ -219,6 +261,8 @@ jobs:
             dist/isyncyou-x86_64.AppImage.sha256
             dist/isyncyou-windows-x86_64.zip
             dist/isyncyou-windows-x86_64.zip.sha256
+            dist/isyncyou-android-arm64.apk
+            dist/isyncyou-android-arm64.apk.sha256
             dist/SHA256SUMS
             dist/isyncyou.sbom.cdx.json
             dist/*.cosign.bundle
@@ -246,7 +290,96 @@ jobs:
             dist/isyncyou-x86_64.AppImage.sha256
             dist/isyncyou-windows-x86_64.zip
             dist/isyncyou-windows-x86_64.zip.sha256
+            dist/isyncyou-android-arm64.apk
+            dist/isyncyou-android-arm64.apk.sha256
             dist/SHA256SUMS
             dist/isyncyou.sbom.cdx.json
             dist/*.cosign.bundle
           generate_release_notes: true
+
+  # Build the SIGNED release APK exactly once (REQ-AND-002/003/005). The build job
+  # depends on this and attaches the produced APK to the RC prerelease; a stable tag
+  # reuses the byte-identical APK from the matching RC. Token-free except for the
+  # release secrets (keystore + passwords + Firebase config), which are repo secrets
+  # — never committed (REQ-AND-003). GitHub-hosted ubuntu-latest only.
+  android-apk:
+    name: android signed APK (build-once)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+      - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-ndk
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - name: Install the pinned NDK + build-tools (NDK matches android.ndkVersion)
+        run: |
+          yes | sdkmanager --install "ndk;27.3.13750724" "build-tools;34.0.0"
+      - name: Materialize release signing material from secrets (REQ-AND-003)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          # A missing release secret must fail loudly here AND in gradle
+          # (ISY_REQUIRE_RELEASE_SIGNING below) — never ship an unsigned release APK.
+          for v in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD GOOGLE_SERVICES_JSON; do
+            if [ -z "${!v}" ]; then
+              echo "::error::release secret $v is empty — set the ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD / GOOGLE_SERVICES_JSON repo secrets"
+              exit 1
+            fi
+          done
+          printf '%s' "$KEYSTORE_B64" | base64 -d > android/release.jks
+          {
+            echo "storeFile=$GITHUB_WORKSPACE/android/release.jks"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/signing.properties
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+      - name: Build the signed release APK, versioned from the RC (REQ-AND-002)
+        env:
+          ISY_REQUIRE_RELEASE_SIGNING: "1"
+          ISY_VERSION_CODE: ${{ github.run_number }}
+        run: |
+          # versionName = the workspace version of this commit; versionCode = the
+          # monotonic CI run number. No literal "1"/"0.1" reaches the manifest.
+          ver=$(awk '/^\[workspace\.package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)
+          echo "workspace version: $ver  versionCode: $ISY_VERSION_CODE"
+          (cd android && ISY_VERSION_NAME="$ver" ./gradlew :app:assembleRelease)
+      - name: Verify the APK is signed with the release key (REQ-AND-003)
+        run: |
+          shopt -s nullglob
+          apks=(android/app/build/outputs/apk/release/*.apk)
+          apk="${apks[0]}"
+          bts=("$ANDROID_HOME"/build-tools/*/)
+          bt=$(printf '%s\n' "${bts[@]}" | sort -V | tail -1)
+          "${bt}apksigner" verify --print-certs "$apk"
+          mkdir -p out
+          cp "$apk" out/isyncyou-android-arm64.apk
+          (cd out && sha256sum isyncyou-android-arm64.apk > isyncyou-android-arm64.apk.sha256)
+      - name: Scrub signing material
+        if: always()
+        run: rm -f android/release.jks android/signing.properties android/app/google-services.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: isyncyou-android-apk
+          path: |
+            out/isyncyou-android-arm64.apk
+            out/isyncyou-android-arm64.apk.sha256
