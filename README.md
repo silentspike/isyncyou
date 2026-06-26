@@ -163,7 +163,7 @@ hardening; ⏳ means designed and queued, not built.
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
 | Change-source backend | ✅ | local-change detection wakes the sync early — an unprivileged inotify accelerator (default) or a privileged mount-wide **fanotify** backend (`change_source = "ebpf"`/`"fanotify"`; Linux, needs `CAP_SYS_ADMIN`, no per-watch limit, overflow-safe; falls back to inotify when unprivileged/unsupported). Wired into `isyncyou --watch` and the daemon; the periodic reconciler stays authoritative |
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
-| Standalone Android app | ✅ built + on-device | the same UI from an **on-device embedded engine** (no daemon/server), bottom-tab navigation, responsive at 390 px (CI smoke asserts no horizontal overflow across all views); built + CodeQL-scanned in CI, live-verified on a physical device. Not yet a published release artifact (the APK delivery is tracked in the issues) |
+| Standalone Android app | ✅ beta companion | the same UI from an **on-device embedded engine** (no daemon/server), bottom-tab navigation, responsive at 390 px (CI smoke asserts no horizontal overflow across all views); built + CodeQL-scanned in CI, live-verified on a physical device. Ships as a **beta companion** in 1.0; release delivery (signed APK, Obtainium/Releases distribution) and the on-device FCM end-to-end proof are cut to milestone *1.1 — Android delivery & FCM E2E* |
 | Native status bar + tray (SNI) | ✅ | tray-first SNI indicator; left-click unfolds a frameless status flyout at the icon (live status) with a link into the web UI; own `tiny-skia` + `cosmic-text` renderer; display-gated |
 | Dolphin overlay icons | ✅ | KF6 KIO plugin: `placeholder` / `syncing` / `materialized` emblems over DBus; host-packaged; Linux/KDE |
 | FUSE on-demand placeholders | ✅ Linux | placeholder mount (browse the whole tree instantly), on-read materialize to an on-disk cache, batch-coalesced download notifications; read-only mount is non-blocking (downloads run off the dispatch thread); needs `/dev/fuse` |
@@ -173,10 +173,11 @@ hardening; ⏳ means designed and queued, not built.
 | Acceptance harness (A1–A10) + chaos tests | ✅ | data-loss / crash-point matrix |
 | Release archive + systemd unit | ✅ | tarball + `systemd --user` service |
 
-A self-hosted staging deployment runs a nightly end-to-end suite (see
-[Known limitations](#known-limitations)): its web-UI, visual-regression, migration and
-verify journeys run green, while the full live-account mutation matrix is **still being
-hardened** — that release-engineering work is tracked openly in the issues. Release
+The full live-account journey matrix — login + doctor, backup of all six services,
+cap-gated live write per service, restore-to-local, crash-safe cloud restore, and the
+web UI — is **verified end-to-end against a dedicated throwaway account** (see
+[Known limitations](#known-limitations)). A self-hosted staging deployment additionally
+runs this suite nightly; its harness is being kept current with the UI. Release
 artifacts are built by CI with a CycloneDX SBOM and signed GitHub artifact
 attestations.
 
@@ -302,12 +303,13 @@ This section is deliberately blunt — it is the inverse of the status table.
   teardown, archive migration round-trip, doctor**, search, restore-to-local and
   verify — plus the web UI (functional + visual regression) and the native status
   bar, with pass/fail pushed to a notification channel. No tokens ever go to CI.
-  The web-UI, visual-regression, migration and verify journeys run green; the full
-  live-account mutation matrix (backup / conflict / cloud-restore / teardown) is
-  **still being stabilized**, and current failures are tracked openly in the issues —
-  which is exactly what a source-of-truth nightly is for. Release artifacts are built
-  by CI with a CycloneDX SBOM, signed GitHub artifact attestations and self-verified
-  cosign signatures.
+  Every journey above is **verified end-to-end** with the current binaries against the
+  throwaway account (backup of all services incl. OneNote, per-service live write,
+  restore-to-local, crash-safe cloud restore with teardown). The nightly's **harness**
+  (selectors + visual baselines) is being refreshed to the redesigned UI, so its own
+  green run tracks the latest code rather than a stale snapshot. Release artifacts are
+  built by CI with a CycloneDX SBOM, signed GitHub artifact attestations and
+  self-verified cosign signatures.
 - **The windowed GUI, tray, Dolphin overlays and FUSE placeholders are built and
   live-verified on Linux/KDE, but remain platform/environment-gated.** They need a
   display server, `/dev/fuse`, or a host-side KF6 plugin respectively, so they are

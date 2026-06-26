@@ -22,7 +22,7 @@ isyncyou-graph = { path = "../../crates/graph", features = ["http", "desktop-key
 isyncyou-engine = { path = "../../crates/engine" }
 isyncyou-pbs = { path = "../../crates/pbs" }
 isyncyou-webui = { path = "../../gui/webui" }
-isyncyou-change-source = { version = "0.1.0", path = "../../crates/change-source" }
+isyncyou-change-source = { version = "1.0.0", path = "../../crates/change-source" }
 
 # Linux-only deps: the FUSE placeholder mount (fuser, mounts via fusermount3) and
 # the `dolphin-status` DBus client. Gated to linux so the cli cross-builds cleanly

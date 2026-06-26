@@ -6,6 +6,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-06-26
+
+First stable release — the desktop/core product (CLI + daemon + web UI + native
+status bar + FUSE, on Linux). The standalone Android app ships as a **beta companion**
+(on-device embedded engine, on-device-verified); Android *release delivery* (the six
+`REQ-AND-002…007` requirements) and the on-device FCM end-to-end proof (#578) are cut to
+milestone **"1.1 — Android delivery & FCM E2E"**. In scope: 49 of 55 tracked
+requirements.
+
+### Supported platforms (1.0)
+
+| Platform | Status | Artifact |
+|---|---|---|
+| Linux x86_64 (CLI + daemon + GUI/tray/FUSE) | **Supported** | `isyncyou-linux-x86_64.tar.gz`, `isyncyou-x86_64.AppImage` |
+| Windows x86_64 | Built (CLI/daemon; no GUI tray/FUSE) | `isyncyou-windows-x86_64.zip` |
+| Android (arm64) | **Beta companion** | APK delivery in 1.1 |
+| macOS | Not built — code is `cfg`-portable, no Apple build host (EULA) | — |
+
+Each release publishes a CycloneDX SBOM, `SHA256SUMS`, and cosign bundles per artifact.
+
 ### Added
 
 **Engine (Phase 1)**
@@ -226,6 +246,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   token, so a sync that had local changes to push would fail. Matches the daemon.
 
 ### Fixed
+- **OneNote page-content backup builder error** (#470/#471): `get_bytes` now prefixes
+  a relative Graph path with the API base before reqwest builds the request, so the
+  OneNote page-content URL (`/me/onenote/pages/{id}/content`) no longer fails with a
+  *builder error* (relative URL without a host).
+- **Reachable dependency advisories**: `quinn-proto` → 0.11.15 (RUSTSEC-2026-0185,
+  remote memory exhaustion via reqwest's QUIC transport) and `memmap2` → 0.9.11
+  (RUSTSEC-2026-0186, unchecked pointer offset via the GUI font/buffer stack).
 - **Download-path data loss on edit-edit conflicts** (found by the staging E2E's
   live conflict journey): when a file was edited locally AND remotely between
   syncs, the one-shot sync downloaded the remote version **over the local edit**
