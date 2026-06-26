@@ -5,8 +5,10 @@ WebView APK is built: REQ-AND-001..007 are all `implemented` (`docs/requirements
 realized in `release.yml` (the `android-apk` build-once job), `pr-staging.yml`
 (`android-emulator-smoke`) and `docs/android-distribution.md` (Obtainium). The release
 keystore + signing passwords + Firebase config are user-provided CI secrets — never
-generated or committed in-repo. The remaining gated item is the on-device FCM push
-end-to-end proof (#578), which needs the Firebase service-account credential.
+generated or committed in-repo. The FCM push end-to-end has been **verified live**
+(daemon → device notification); the only remaining item is **automating that proof in
+CI** (#578) — the `live_fcm_send` check is `#[ignore]` because it needs the Firebase
+service-account as a CI secret (a 1.1 follow-up).
 
 ## Why
 The Rust workspace already cascades dev→staging→main with `v1.0.0-rc.<run>` RC tags. The
