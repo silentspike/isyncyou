@@ -365,8 +365,11 @@ jobs:
           (cd android && ISY_VERSION_NAME="$ver" ./gradlew :app:assembleRelease)
       - name: Verify the APK is signed with the release key (REQ-AND-003)
         run: |
-          apk=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
-          bt=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          shopt -s nullglob
+          apks=(android/app/build/outputs/apk/release/*.apk)
+          apk="${apks[0]}"
+          bts=("$ANDROID_HOME"/build-tools/*/)
+          bt=$(printf '%s\n' "${bts[@]}" | sort -V | tail -1)
           "${bt}apksigner" verify --print-certs "$apk"
           mkdir -p out
           cp "$apk" out/isyncyou-android-arm64.apk
