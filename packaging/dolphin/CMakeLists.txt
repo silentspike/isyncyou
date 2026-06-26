@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(isyncyou-dolphin VERSION 0.1.0 LANGUAGES CXX)
+project(isyncyou-dolphin VERSION 1.0.0 LANGUAGES CXX)
 
 # Top-level build for the iSyncYou Dolphin integration. Builds the overlay-icon
 # plugin and installs it together with the right-click ServiceMenu to the system
