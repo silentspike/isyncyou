@@ -252,6 +252,12 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: v1.0.0-rc.${{ github.run_number }}
+          # Pin the RC tag to the exact commit this run built (the push-to-main SHA).
+          # Without this, softprops creates the tag on the default branch (dev), so the
+          # RC tag points at a dev commit that is only tree-identical to main — and the
+          # stable-tag APK-reuse step (which matches a stable tag's commit to an RC tag's
+          # commit) could never find it. With this, v1.0.0-rc.<run> == the main commit.
+          target_commitish: ${{ github.sha }}
           name: iSyncYou v1.0.0-rc.${{ github.run_number }}
           prerelease: true
           files: |
