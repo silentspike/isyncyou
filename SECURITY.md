@@ -10,10 +10,24 @@ Do **not** open a public issue for security problems. There is no email or PGP c
 
 ## Supported versions
 
-iSyncYou ships **release-candidate prereleases** (`v0.1.0-rc.N`, built from `main` on
+iSyncYou ships **release-candidate prereleases** (`v1.0.0-rc.N`, built from `main` on
 every merge). The latest RC — and the tip of `main` — is the supported line; please
-report against it. Once a stable `vX.Y.Z` is tagged, the latest minor release line will
+report against it. Once `v1.0.0` is tagged, the latest minor release line will
 receive security fixes.
+
+## Secret scanning
+
+Secrets are scanned by **Gitleaks** — in CI on every PR (`secret-scan.yml`, a
+checksum-pinned Gitleaks install) and locally via the `core.hooksPath` pre-commit
+hook. A dummy PEM test fixture is fingerprint-allowlisted in `.gitleaksignore`; no
+real secret is tracked.
+
+GitHub-native secret scanning + push protection are **free for public repositories**
+and would add partner-token validity checks and commit-time push protection on top of
+Gitleaks. They are currently **disabled by an enterprise policy** (the org sits under an
+enterprise that centrally governs this setting); enabling them is an enterprise-owner
+action and costs nothing for a public repo. Until then, Gitleaks is the active secret
+scanner and covers the repository.
 
 ## Scope
 
