@@ -290,7 +290,12 @@ jobs:
       - name: Build the x86_64 debug APK for the emulator
         env:
           ISY_ANDROID_ABIS: x86_64
-        run: cd android && ./gradlew :app:assembleDebug
+        run: |
+          cd android && ./gradlew :app:assembleDebug
+          # The embedded engine .so must be packaged for this ABI, or NativeEngine's
+          # System.loadLibrary fails at runtime and the engine thread dies silently.
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -q 'lib/x86_64/libisyncyou_mobile.so' \
+            || { echo "::error::x86_64 engine .so missing from the APK"; exit 1; }
       - name: Boot the emulator and smoke-test the WebView shell
         uses: reactivecircus/android-emulator-runner@e89f39f1abbbd05b1113a29cf4db69e7540cae5a # v2.37.0
         with:
@@ -311,7 +316,7 @@ jobs:
             adb shell pm grant com.silentspike.isyncyou android.permission.POST_NOTIFICATIONS || true
             adb logcat -c
             adb shell am start -W -n com.silentspike.isyncyou/com.silentspike.isyncyou.MainActivity
-            if timeout 180 adb logcat iSyncYou:I '*:S' | grep -q "shell loaded: http://127.0.0.1"; then echo "WebView shell loaded — REQ-AND-004 ok"; else echo "::error::WebView shell did not load within 180s"; adb logcat -d iSyncYou:* '*:S' | tail -120; exit 1; fi
+            if timeout 180 adb logcat iSyncYou:I '*:S' | grep -q "shell loaded: http://127.0.0.1"; then echo "WebView shell loaded — REQ-AND-004 ok"; else echo "::error::WebView shell did not load within 180s; app + crash logs follow:"; adb logcat -d | grep -iE 'isyncyou|AndroidRuntime|FATAL|chromium|WebView|System.err|linker|UnsatisfiedLink|cr_|jniLibs|dlopen|abort|died|lowmemorykiller|ActivityManager|ActivityTaskManager' | tail -250; exit 1; fi
 
   staging-pass:
     name: staging-pass
