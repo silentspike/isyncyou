@@ -70,6 +70,14 @@ pub enum ToolAction {
         target: Option<String>,
         change: serde_json::Value,
     },
+    /// Share an item outward (link / invite / permissions). Destructive/external; gated.
+    Share {
+        account: String,
+        service: String,
+        id: String,
+        #[serde(default)]
+        recipient: Option<String>,
+    },
 }
 
 /// Read-class actions run immediately; destructive-class actions require confirmation.
@@ -90,7 +98,8 @@ impl ToolAction {
             | ToolAction::RestoreLocal { .. } => ToolClass::Read,
             ToolAction::Backup { .. }
             | ToolAction::RestoreCloud { .. }
-            | ToolAction::LiveWrite { .. } => ToolClass::Destructive,
+            | ToolAction::LiveWrite { .. }
+            | ToolAction::Share { .. } => ToolClass::Destructive,
         }
     }
 
@@ -105,6 +114,7 @@ impl ToolAction {
             ToolAction::Backup { .. } => "backup",
             ToolAction::RestoreCloud { .. } => "restore-cloud",
             ToolAction::LiveWrite { .. } => "live-write",
+            ToolAction::Share { .. } => "share",
         }
     }
 }
@@ -119,7 +129,8 @@ pub fn help_text() -> String {
      restore-local {account, service, id} · \
      backup {account, services?} [confirm] · \
      restore-cloud {account, service, id} [confirm] · \
-     live-write {account, service, target?, change} [confirm]. \
+     live-write {account, service, target?, change} [confirm] · \
+     share {account, service, id, recipient?} [confirm]. \
      There is no shell/filesystem/OS/network op."
         .to_string()
 }
@@ -153,7 +164,7 @@ pub fn tool_schema() -> serde_json::Value {
                     "type": "string",
                     "enum": [
                         "search", "read", "list", "export",
-                        "restore-local", "backup", "restore-cloud", "live-write"
+                        "restore-local", "backup", "restore-cloud", "live-write", "share"
                     ]
                 },
                 "account": { "type": "string" },
@@ -165,6 +176,7 @@ pub fn tool_schema() -> serde_json::Value {
                 "max_bytes": { "type": "integer" },
                 "parent": { "type": "string" },
                 "target": { "type": "string" },
+                "recipient": { "type": "string" },
                 "change": {}
             },
             "required": ["op", "account"]
@@ -212,8 +224,8 @@ mod tests {
         let read =
             json!({"op": "restore-local", "account": "me", "service": "onedrive", "id": "x"});
         assert_eq!(parse_action(&read).unwrap().class(), ToolClass::Read);
-        for op in ["backup", "restore-cloud", "live-write"] {
-            let v = json!({"op": op, "account": "me", "service": "mail", "id": "x", "change": {}});
+        for op in ["backup", "restore-cloud", "live-write", "share"] {
+            let v = json!({"op": op, "account": "me", "service": "mail", "id": "x", "change": {}, "recipient": "a@b.c"});
             assert_eq!(
                 parse_action(&v).unwrap().class(),
                 ToolClass::Destructive,
