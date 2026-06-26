@@ -318,13 +318,18 @@ jobs:
           # the Chromium stack stalls under -no-window on the runner). Asserting the render here
           # would be a flaky gate for a capability already proven on real hardware.
           script: |
+            adb logcat -G 16M
             adb install -r android/app/build/outputs/apk/debug/app-debug.apk
             adb shell pm grant com.silentspike.isyncyou android.permission.POST_NOTIFICATIONS || true
             adb logcat -c
             adb shell am start -W -n com.silentspike.isyncyou/com.silentspike.isyncyou.MainActivity
             sleep 30
+            echo "--- app logcat (iSyncYou engine thread + crashes) ---"
+            adb logcat -d -s iSyncYou:V AndroidRuntime:E | tail -80
+            echo "--- top activity ---"
+            adb shell dumpsys activity top | grep -iE 'ACTIVITY com.silentspike|mResumed|mFinished|realActivity' | head
             if [ -z "$(adb shell pidof com.silentspike.isyncyou | tr -d '\r\n ')" ]; then echo "::error::the APK launched but the process is not alive after 30s (crash); logs:"; adb logcat -d | grep -iE 'isyncyou|AndroidRuntime|FATAL|Process:|linker|UnsatisfiedLink|dlopen|abort' | tail -120; exit 1; fi
-            if adb logcat -d iSyncYou:I '*:S' | grep -q "shell loaded: http://127.0.0.1"; then echo "REQ-AND-004 ok: APK installs + launches + the embedded-engine WebView rendered the shell"; else echo "REQ-AND-004 ok: APK installs + launches + stays alive (no crash). The embedded-engine WebView shell render is verified on a physical device and a local emulator; the headless GitHub-hosted runner emulator does not reliably render it."; fi
+            if adb logcat -d -s iSyncYou:V | grep -q "shell loaded: http://127.0.0.1"; then echo "REQ-AND-004 ok: APK installs + launches + the embedded-engine WebView rendered the shell"; else echo "REQ-AND-004 ok: APK installs + launches + stays alive (no crash). The embedded-engine WebView shell render is verified on a physical device and a local emulator; the headless GitHub-hosted runner emulator does not reliably render it (the app logcat above shows how far the engine got)."; fi
 
   staging-pass:
     name: staging-pass
