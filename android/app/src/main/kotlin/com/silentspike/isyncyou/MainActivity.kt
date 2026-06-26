@@ -23,6 +23,10 @@ import android.webkit.WebViewClient
  */
 class MainActivity : Activity() {
 
+    private companion object {
+        const val TAG = "iSyncYou"
+    }
+
     private lateinit var web: WebView
 
     /** The device's FCM registration token (fetched async; read by the JS bridge). */
@@ -75,6 +79,15 @@ class MainActivity : Activity() {
                     true
                 }
             }
+
+            // Emit a stable signal once the local shell has rendered. Used by the CI
+            // emulator smoke (REQ-AND-004) to assert the WebView loaded the embedded
+            // UI, and handy for on-device diagnostics.
+            override fun onPageFinished(view: WebView, url: String) {
+                if (url.startsWith("http://127.0.0.1") || url.startsWith("http://localhost")) {
+                    android.util.Log.i(TAG, "shell loaded: $url")
+                }
+            }
         }
         setContentView(web)
 
@@ -110,6 +123,7 @@ class MainActivity : Activity() {
     /** Wire the session token into the WebView and load the local UI (UI thread). */
     private fun onEngineReady(port: Int, token: String) {
         if (port <= 0) {
+            android.util.Log.e(TAG, "embedded engine failed to start")
             web.loadData(
                 "<html><body style='font-family:sans-serif;padding:2rem'>" +
                     "<h2>iSyncYou</h2><p>The local engine failed to start.</p></body></html>",
@@ -136,6 +150,7 @@ class MainActivity : Activity() {
         }
         // nativeStart is idempotent, so on Activity recreation the port is the same
         // origin and the UI simply reloads.
+        android.util.Log.i(TAG, "engine bound 127.0.0.1:$port")
         web.loadUrl("$origin/")
     }
 

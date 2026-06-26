@@ -9,11 +9,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [1.0.0] — 2026-06-26
 
 First stable release — the desktop/core product (CLI + daemon + web UI + native
-status bar + FUSE, on Linux). The standalone Android app ships as a **beta companion**
-(on-device embedded engine, on-device-verified); Android *release delivery* (the six
-`REQ-AND-002…007` requirements) and the on-device FCM end-to-end proof (#578) are cut to
-milestone **"1.1 — Android delivery & FCM E2E"**. In scope: 49 of 55 tracked
-requirements.
+status bar + FUSE, on Linux) **and** the standalone Android app as a full 1.0 component:
+an on-device embedded engine, a **signed release APK** (per-build `versionName`/
+`versionCode`), build-once/promote-many release attachment, a KVM **emulator smoke**, and
+**Obtainium** OTA distribution (`REQ-AND-002…007`, all implemented). All 55 tracked
+requirements are implemented. The only Android item still pending is the on-device **FCM
+push end-to-end proof** (#578), which needs the Firebase service-account credential.
 
 ### Supported platforms (1.0)
 
@@ -21,7 +22,7 @@ requirements.
 |---|---|---|
 | Linux x86_64 (CLI + daemon + GUI/tray/FUSE) | **Supported** | `isyncyou-linux-x86_64.tar.gz`, `isyncyou-x86_64.AppImage` |
 | Windows x86_64 | Built (CLI/daemon; no GUI tray/FUSE) | `isyncyou-windows-x86_64.zip` |
-| Android (arm64) | **Beta companion** | APK delivery in 1.1 |
+| Android (arm64) | **Supported** | `isyncyou-android-arm64.apk` (signed; OTA via Obtainium) |
 | macOS | Not built — code is `cfg`-portable, no Apple build host (EULA) | — |
 
 Each release publishes a CycloneDX SBOM, `SHA256SUMS`, and cosign bundles per artifact.
