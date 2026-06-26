@@ -25,6 +25,40 @@ val releaseProps = Properties().apply {
     if (hasReleaseSigning) signingProps.inputStream().use { load(it) }
 }
 
+// REQ-AND-003: when release signing is REQUIRED (the CI release path sets
+// ISY_REQUIRE_RELEASE_SIGNING=1), a missing keystore or an incomplete
+// signing.properties must fail the build LOUDLY — never silently produce an
+// unsigned release APK. Local dev builds (the env unset) keep the unsigned-release
+// convenience.
+if (System.getenv("ISY_REQUIRE_RELEASE_SIGNING") == "1") {
+    val problem: String? = if (!hasReleaseSigning) {
+        "android/signing.properties is absent"
+    } else {
+        val empties = listOf("storeFile", "keyAlias", "storePassword", "keyPassword")
+            .filter { releaseProps.getProperty(it).isNullOrBlank() }
+        if (empties.isNotEmpty()) {
+            empties.joinToString(", ") { "$it is empty" }
+        } else {
+            val ks = rootProject.file(releaseProps.getProperty("storeFile"))
+            if (!ks.exists()) "keystore file ${ks.path} does not exist" else null
+        }
+    }
+    if (problem != null) {
+        throw GradleException(
+            "Release signing is required (ISY_REQUIRE_RELEASE_SIGNING=1) but $problem. " +
+                "Provide the release keystore and signing.properties — in CI these come " +
+                "from the ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD / " +
+                "ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD secrets.",
+        )
+    }
+}
+
+// The shipped APK is arm64-only (#89). CI can override ISY_ANDROID_ABIS to build an
+// x86_64 variant for the KVM-accelerated emulator smoke (REQ-AND-004) — the release
+// build leaves it unset and stays arm64-v8a.
+val androidAbis = (System.getenv("ISY_ANDROID_ABIS") ?: "arm64-v8a")
+    .split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
 android {
     namespace = "com.silentspike.isyncyou"
     compileSdk = 34
@@ -38,10 +72,9 @@ android {
         targetSdk = 34
         versionCode = (System.getenv("ISY_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("ISY_VERSION_NAME") ?: "0.1"
-        // The embedded Rust engine ships arm64 only for the first milestone (#89);
-        // multi-arch is deferred hardening.
+        // arm64 by default; ISY_ANDROID_ABIS lets CI build an x86_64 emulator variant.
         ndk {
-            abiFilters += "arm64-v8a"
+            abiFilters += androidAbis
         }
     }
 
@@ -95,11 +128,12 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     val cargo = System.getenv("CARGO") ?: "$home/.cargo/bin/cargo"
     val toolchain = System.getenv("ISY_RUST_TOOLCHAIN") ?: "1.95.0"
     environment("ANDROID_NDK_HOME", "${android.sdkDirectory}/ndk/${android.ndkVersion}")
+    // One -t per ABI; cargo-ndk maps arm64-v8a -> aarch64-linux-android and
+    // x86_64 -> x86_64-linux-android, building each requested target's .so.
+    val targetFlags = androidAbis.flatMap { listOf("-t", it) }
     commandLine(
-        cargo, "+$toolchain", "ndk",
-        "-t", "arm64-v8a",
-        "-o", "android/app/src/main/jniLibs",
-        "build", "-p", "isyncyou-mobile", "--release",
+        listOf(cargo, "+$toolchain", "ndk") + targetFlags +
+            listOf("-o", "android/app/src/main/jniLibs", "build", "-p", "isyncyou-mobile", "--release"),
     )
 }
 tasks.named("preBuild") { dependsOn(cargoNdkBuild) }
