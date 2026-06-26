@@ -35,14 +35,17 @@ implemented; only the initial device-code login needs a human — see
 
 ## Distribution (implemented)
 
-`.github/workflows/release.yml` builds release binaries on a self-hosted runner and
+`.github/workflows/release.yml` builds release binaries on a GitHub-hosted
+`ubuntu-latest` runner (self-hosted runners are forbidden in the public repo) and
 bundles **`isyncyou-linux-x86_64.tar.gz`** = the three binaries + `SHA256SUMS` +
 the documented `isyncyou.toml.sample` + `isyncyoud.service` + a README. The same
-workflow builds the AppImage and Windows zip, generates
+workflow builds the AppImage and Windows zip, builds the **signed Android APK**
+once in the `android-apk` job and attaches `isyncyou-android-arm64.apk` (see
+[`android-distribution.md`](android-distribution.md)), generates
 `dist/isyncyou.sbom.cdx.json` from `cargo metadata --locked`, publishes a top-level
 `dist/SHA256SUMS`, and requests GitHub artifact attestations for the release
-archives, AppImage, Windows zip, SBOM, and checksum file. Consumers can verify the
-published attestation with:
+archives, AppImage, Windows zip, APK, SBOM, and checksum file. Consumers can verify
+the published attestation with:
 
 ```sh
 gh attestation verify isyncyou-linux-x86_64.tar.gz -R silentspike/isyncyou
