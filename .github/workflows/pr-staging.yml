@@ -299,14 +299,16 @@ jobs:
           arch: x86_64
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim -camera-back none
+          # android-emulator-runner runs each top-level line as a separate `sh -c`, so a
+          # shell variable set on one line is empty on the next — the package is hardcoded
+          # rather than held in $pkg. Multi-line compound statements (the if-block) run as
+          # one unit, so they are fine.
           script: |
-            set -u
-            pkg=com.silentspike.isyncyou
             adb install -r android/app/build/outputs/apk/debug/app-debug.apk
-            adb shell pm grant "$pkg" android.permission.POST_NOTIFICATIONS || true
+            adb shell pm grant com.silentspike.isyncyou android.permission.POST_NOTIFICATIONS || true
             adb logcat -c
             # -W blocks until the activity is up; a crash here already fails the step.
-            adb shell am start -W -n "$pkg/$pkg.MainActivity"
+            adb shell am start -W -n com.silentspike.isyncyou/com.silentspike.isyncyou.MainActivity
             # Assert the embedded engine bound a loopback port and the WebView rendered
             # the local shell (MainActivity logs "shell loaded: http://127.0.0.1:<port>").
             if timeout 120 adb logcat iSyncYou:I '*:S' | grep -m1 "shell loaded: http://127.0.0.1"; then
