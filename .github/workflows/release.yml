@@ -289,6 +289,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
+          # The git tag ref is already authoritative for provenance, but pin the
+          # release object's target_commitish to the tag's commit too, so the displayed
+          # target is the main commit (not the default branch). github.sha == the
+          # tagged commit on a tag push.
+          target_commitish: ${{ github.sha }}
           files: |
             dist/isyncyou-linux-x86_64.tar.gz
             dist/isyncyou-linux-x86_64.tar.gz.sha256
