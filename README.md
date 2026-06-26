@@ -8,7 +8,7 @@
 [![coverage](https://github.com/silentspike/isyncyou/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/silentspike/isyncyou/actions/workflows/coverage.yml)
 [![scorecard](https://api.securityscorecards.dev/projects/github.com/silentspike/isyncyou/badge)](https://securityscorecards.dev/viewer/?uri=github.com/silentspike/isyncyou)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
+[![platform](https://img.shields.io/badge/platform-Linux%20%7C%20Android-lightgrey)]()
 [![language](https://img.shields.io/badge/built%20with-Rust-orange)]()
 
 iSyncYou keeps a Linux machine in two-way sync with **OneDrive** and keeps a
@@ -29,6 +29,36 @@ engineering actually is.
 
 ## Screenshots
 
+**Local web UI** — the daemon serves a fast, framework-free archive browser to
+`localhost`: browse per account and per service, full-text search, read inert
+bodies in a sandboxed reader, and run restores. No browser engine is embedded —
+it's just your own browser.
+
+<p align="center">
+  <img src="docs/assets/webui-mail.png" width="900" alt="Web UI mail client: a folder + status sidebar (All messages, With attachments, Restore-ready, Unread, Flagged, and per-coverage backup-status filters), a message list where every row carries a 'Live + backup' coverage badge, and an opened message rendering its sanitized HTML body inside a sandboxed reader, above integrity-verified / last-archived stat cards.">
+</p>
+
+<p align="center">
+  <img src="docs/assets/webui-overview.png" width="440" alt="Web UI overview: archive health, items protected across six services, archived-body coverage, and a per-service breakdown (OneDrive, Mail, Contacts, To Do, Calendar, OneNote) with colored share bars.">
+  &nbsp;
+  <img src="docs/assets/webui-calendar.png" width="440" alt="Web UI calendar: an agenda grouped by day showing event times, locations and a 'Live + backup' coverage badge per event.">
+</p>
+
+<p align="center">
+  <img src="docs/assets/webui-onedrive.png" width="900" alt="Web UI OneDrive browser: a file and folder grid with type-specific icons (folders, .pptx, .xlsx, .jpg, .pdf, .md, .zip), file sizes and coverage badges over a subtle constellation backdrop.">
+</p>
+
+**On mobile** — the standalone Android app renders the same UI from an
+**on-device embedded engine** (no daemon, no server in the loop), with a bottom
+tab bar and a fully responsive layout that the CI smoke checks for horizontal
+overflow at 390 px across every view.
+
+<p align="center">
+  <img src="docs/assets/mobile-overview.png" width="240" alt="Android app overview: stacked archive-health and statistic cards (items protected, archived bodies, failed runs, trash retention) above a bottom tab bar — Overview, Mail, OneDrive, Calendar, Contacts, To Do, OneNote, Settings.">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/mobile-mail.png" width="240" alt="Android app mail reader: an opened message with its sanitized body and external-content blocked, with the mobile bottom tab bar.">
+</p>
+
 **Native status bar** — a tiny tray app rendered by an own engine (no webkit, no
 GTK). It shows live transfers and is deliberately honest about throttling: when
 Microsoft returns `429`, it tells you *it's Microsoft, not your line.*
@@ -39,20 +69,9 @@ Microsoft returns `429`, it tells you *it's Microsoft, not your line.*
   <img src="docs/assets/statusbar-throttled.png" width="300" alt="Native status bar while throttled: an amber 'Throttled 14s' pill and a banner reading 'Throttled by Microsoft (429) — not your connection'.">
 </p>
 
-**Local web UI** — the daemon serves a dark, JS-light archive browser to
-`localhost`. Browse per account and per service, full-text search, view inert
-bodies, and run restores. No browser engine is embedded — it's just your browser.
-
-<p align="center">
-  <img src="docs/assets/webui-overview.png" width="840" alt="Web UI archive overview: per-service item cards (OneDrive, Mail, Calendar, Contacts, ToDo, OneNote), totals (24 items, archived bodies, OneDrive cursor) and a settings panel (sync root, archive root, trash retention, FTS body index, change source, delete guard).">
-</p>
-
-<p align="center">
-  <img src="docs/assets/webui-mail.png" width="840" alt="Web UI mail browser: a search box and a table of archived messages (Type, Name, Modified, Body, Restore) listing subjects like 'Invoice #2041', 'Q3 roadmap review' and 'Team offsite — agenda'.">
-</p>
-
-> The screenshots above are rendered against **synthetic sample data** — no real
-> account is involved.
+> Every screenshot above is rendered against **synthetic sample data**
+> (`crates/connectors/examples/seed_fixture.rs`, the same token-free fixture the
+> CI UI smoke drives) — no real account is involved.
 
 ---
 
@@ -144,6 +163,7 @@ hardening; ⏳ means designed and queued, not built.
 | CLI + daemon | ✅ | `isyncyou` / `isyncyoud`; scheduled incremental sync |
 | Change-source backend | ✅ | local-change detection wakes the sync early — an unprivileged inotify accelerator (default) or a privileged mount-wide **fanotify** backend (`change_source = "ebpf"`/`"fanotify"`; Linux, needs `CAP_SYS_ADMIN`, no per-watch limit, overflow-safe; falls back to inotify when unprivileged/unsupported). Wired into `isyncyou --watch` and the daemon; the periodic reconciler stays authoritative |
 | Local web UI | ✅ | account/service browsing, search, inert body viewing; no browser engine |
+| Standalone Android app | ✅ built + on-device | the same UI from an **on-device embedded engine** (no daemon/server), bottom-tab navigation, responsive at 390 px (CI smoke asserts no horizontal overflow across all views); built + CodeQL-scanned in CI, live-verified on a physical device. Not yet a published release artifact (the APK delivery is tracked in the issues) |
 | Native status bar + tray (SNI) | ✅ | tray-first SNI indicator; left-click unfolds a frameless status flyout at the icon (live status) with a link into the web UI; own `tiny-skia` + `cosmic-text` renderer; display-gated |
 | Dolphin overlay icons | ✅ | KF6 KIO plugin: `placeholder` / `syncing` / `materialized` emblems over DBus; host-packaged; Linux/KDE |
 | FUSE on-demand placeholders | ✅ Linux | placeholder mount (browse the whole tree instantly), on-read materialize to an on-disk cache, batch-coalesced download notifications; read-only mount is non-blocking (downloads run off the dispatch thread); needs `/dev/fuse` |
@@ -306,6 +326,26 @@ harness, the id-based reconciliation model) are written up as architecture decis
 records, not buried in commits. The protocol itself is in
 [`docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md`](docs/ai/AI_ASSISTED_ENGINEERING_PROTOCOL.md);
 the restore-safety design is [ADR-001](docs/adr/001-restore-semantics.md).
+
+## CI / release pipeline
+
+Work flows through four branches, each with a **calibrated** gate — shift-left and
+cheap on `dev`, heaviest on `staging` (the gate before production), release-grade
+on `main`, attested on the RC:
+
+| Stage | What runs |
+|---|---|
+| **dev** | `fmt` · `clippy -D warnings` · unit tests · MSRV · JS parse-check · **Semgrep** (JS/Kotlin/secrets SAST) · `cargo deny` · dependency review · gitleaks · a 75 % coverage gate |
+| **staging** *(heaviest, pre-prod)* | a token-free **deploy + end-to-end UI smoke**, an **Android build**, **CodeQL** (Rust + JavaScript + Kotlin), an **OWASP ZAP** baseline DAST against the live UI, a CycloneDX **SBOM**, and the release build |
+| **main** | the release-grade build · a **Trivy** vulnerability scan · CodeQL |
+| **RC** | every merge to `main` publishes a prerelease whose artifacts are **cosign keyless-signed**, with **SLSA provenance** and an **SBOM attestation** |
+
+Promotion between stages is an automated **tree-overlay** (the promoted tree is
+byte-identical to its source), so a change is *gated*, never re-edited, on the way
+up. The release **artifacts** are cryptographically signed; the **promotion**
+itself is an automated bot merge, not a signed commit — that distinction, and the
+full supply-chain lane, are written up in
+[docs/supply-chain.md](docs/supply-chain.md).
 
 ## Docs
 
