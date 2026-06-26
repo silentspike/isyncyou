@@ -1,6 +1,9 @@
 # Contributing to iSyncYou
 
-Thanks for your interest. iSyncYou is private until RC; external contributions open up later.
+Thanks for your interest. iSyncYou is public and at the release-candidate stage.
+**Bug reports and issues are welcome from anyone.** All coding, however, is done by the
+silentspike org — **external pull requests are not accepted**; please open an issue
+instead. The workflow below documents how the org develops the project.
 
 ## Ground rules
 
@@ -30,9 +33,9 @@ Promotion flows `feature → dev → staging → main`, each with its own gate:
 
 | Branch | PR gate (workflow) | Scope |
 |--------|--------------------|-------|
-| `dev` | `dev-checks` (`pr-dev.yml`) | fast: fmt + clippy + unit tests — quick to merge |
-| `staging` | `staging-pass` (`pr-staging.yml`) | full: build/test + cargo-deny + docs (later: integration + UI snapshots) |
-| `main` | `main-pass` (`pr-main.yml`) | release-grade: staging checks + release build |
+| `dev` | `dev-checks` (`pr-dev.yml`) | fast shift-left: fmt + clippy + unit tests + MSRV + JS parse-check + Semgrep SAST + cargo-deny + 75% coverage gate |
+| `staging` | `staging-pass` (`pr-staging.yml`) + CodeQL | heaviest, pre-prod: token-free deploy + end-to-end UI smoke, Android build, CodeQL (Rust/JS/Kotlin), OWASP ZAP DAST, CycloneDX SBOM, release build |
+| `main` | `main-pass` (`pr-main.yml`) + CodeQL | release-grade: full build + Trivy vulnerability scan + CodeQL |
 
 Always-on (required on every PR into `dev`/`staging`/`main`): secret scan (Gitleaks),
 Conventional-Commit PR-title check, the **English-only language check** (`language-check`),
@@ -42,11 +45,11 @@ non-English (locale files, encoding/MIME test fixtures) is allowlisted in
 `tools/lang_allowlist.txt` or with an inline `lang-allow` marker.
 
 **Automation:**
-- Merging into `dev`/`staging` auto-opens the next-stage promotion PR (`promote.yml`).
+- Merging into `dev`/`staging` auto-opens **and auto-merges** the next-stage promotion PR (`promote.yml` — a PAT-driven tree-overlay so the promoted tree is byte-identical to its source) once the target's required checks pass, so `dev → staging → main` cascades hands-off.
 - Merging into `main` builds binaries and publishes an **RC prerelease** (`release.yml`); a `vX.Y.Z` tag publishes a full release.
 - Dependabot PRs auto-merge once the branch gate passes.
 
-CI runs on the project's **self-hosted runners** while the repo is private (no hosted-minutes usage). At public launch this switches back to GitHub-hosted runners.
+CI runs entirely on **GitHub-hosted runners** — no self-hosted runner touches this repo (a self-hosted runner would live on private infra and be an attack surface on a public repo; see the note in `release.yml`).
 
 ## Working in parallel (multi-agent)
 
@@ -72,13 +75,13 @@ clear; the orchestrator is the human-in-the-loop judgement on top of them.
   branches therefore have independent histories with the same *content*; reconcile by
   promoting forward (a promotion PR's diff is the content delta), not by expecting shared
   SHAs.
-- **The orchestrator opens the promotion PRs** and merges them. The org currently does
-  not allow GitHub Actions to open PRs, so `promote.yml` is a best-effort helper only;
-  opening the `dev → staging` / `staging → main` PR is the orchestrator's deliberate
-  gate. (Enable the org "Allow GitHub Actions to create and approve pull requests" toggle
-  for full auto-promotion.) When a promotion's gate fails for a runner-infra reason (not
-  content), the orchestrator may admin-merge a content-verified promotion; `main` keeps
-  `enforce_admins`, so that requires a deliberate, restored protection toggle.
+- **Promotion is automated** end-to-end: `promote.yml` opens and auto-merges the
+  `dev → staging` and `staging → main` tree-overlay PRs via a fine-grained PAT
+  (`PROMOTE_TOKEN`), once the target's required checks pass. The orchestrator stays the
+  human-in-the-loop for `feature → dev`, and can intervene at any hop. When a promotion's
+  gate fails for a runner-infra reason (not content), the orchestrator may admin-merge a
+  content-verified promotion; `main` keeps `enforce_admins`, so that requires a
+  deliberate, restored protection toggle.
 
 ### Review policy (solo-merge is intentional)
 
