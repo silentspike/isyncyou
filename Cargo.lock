@@ -1545,7 +1545,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "isyncyou-acceptance"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-change-source",
  "isyncyou-core",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-app-host"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-connectors",
  "isyncyou-core",
@@ -1571,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-change-source"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-core",
  "libc",
@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "isyncyou-change-source",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-connectors"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-graph",
  "isyncyou-pathmap",
@@ -1612,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "isyncyou-app-host",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-dbus-status"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-store",
  "tokio",
@@ -1650,14 +1650,14 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-doctor"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-doctor-lib",
 ]
 
 [[package]]
 name = "isyncyou-doctor-lib"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "fs2",
  "isyncyou-core",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hmac",
  "isyncyou-connectors",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-fuse"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "fuser",
  "isyncyou-store",
@@ -1690,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-graph"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "keyring-core",
@@ -1703,7 +1703,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-ipc-types"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-mobile"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-app-host",
  "isyncyou-core",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-pathmap"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1733,11 +1733,11 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-pbs"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "isyncyou-statusbar"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cosmic-text",
  "tiny-skia",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-statusbar-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "isyncyou-statusbar",
  "ksni",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "fs2",
  "rusqlite",
@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "isyncyou-webui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ammonia",
  "isyncyou-connectors",
