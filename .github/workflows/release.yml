@@ -8,10 +8,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Least-privilege default for the whole workflow; the build job below elevates to
+# exactly what it needs (publish the release, sign keylessly, attest).
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -25,6 +25,10 @@ jobs:
     # on it is an attack surface — unacceptable for a public repo. release.yml installs its
     # own host deps below, so it is fully self-contained on ubuntu-latest.
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # publish the RC/release + upload assets
+      id-token: write # cosign keyless (OIDC) + provenance
+      attestations: write # SBOM / build provenance attestations
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
