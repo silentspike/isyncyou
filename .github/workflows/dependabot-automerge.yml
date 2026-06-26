@@ -4,14 +4,17 @@ name: Dependabot auto-merge
 # branch's required checks pass (keeps deps current without manual work).
 on: pull_request
 
+# Least-privilege default; the automerge job elevates to what it needs.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   automerge:
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to merge the PR
+      pull-requests: write # enable auto-merge on the PR
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:

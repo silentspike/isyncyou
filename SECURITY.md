@@ -10,9 +10,9 @@ Do **not** open a public issue for security problems. There is no email or PGP c
 
 ## Supported versions
 
-iSyncYou is pre-release (private until its first release candidate). Until the
-first tagged release, only the tip of the `dev` branch is supported — please report
-issues against `dev`. After the first release, the latest minor release line will
+iSyncYou ships **release-candidate prereleases** (`v0.1.0-rc.N`, built from `main` on
+every merge). The latest RC — and the tip of `main` — is the supported line; please
+report against it. Once a stable `vX.Y.Z` is tagged, the latest minor release line will
 receive security fixes.
 
 ## Scope
