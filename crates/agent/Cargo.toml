@@ -1,0 +1,20 @@
+[package]
+name = "isyncyou-agent"
+description = "In-app M365 agent harness: provider-agnostic turn loop, a single app-scoped `isyncyou` tool, and a FakeProvider for CI (no real LLM tokens)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Live LLM HTTP transport (the agent's OWN client, not GraphClient). Off by default so
+# the pure-logic build (loop, tools, FakeProvider) stays fast and dependency-light;
+# the retry/backoff classification is pure and tested without this feature.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+
+[features]
+http = ["dep:reqwest"]
