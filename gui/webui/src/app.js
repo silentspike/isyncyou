@@ -955,7 +955,11 @@ function onRoute() {
   if (App.route === "invaders" && !eggOn()) App.route = "overview";   // egg-gated route
   // Close any open overlay (detail sheet / command palette) on a real navigation
   // so it can't leak across routes; a same-route refresh keeps it open.
-  if (App.route !== prevRoute) { closeSheet(); closePalette(); }
+  if (App.route !== prevRoute) {
+    closeSheet(); closePalette();
+    // Leaving the assistant: close any live token stream so it can't leak across routes.
+    if (prevRoute === "assistant" && AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
+  }
   renderShell();
   const view = $("#view");
   let p;
@@ -3687,9 +3691,27 @@ async function startAiLogin(provider) {
   }
 }
 
+let AGENT_ES = null;     // the active per-turn token stream (EventSource)
+let ASST_LOG = [];       // in-view transcript: [{role:'user'|'assistant', text, chips:[]}]
+
 async function renderAssistantView(view) {
   clear(view).append(
     el("h1", { class: "view-title", text: "AI Assistant" }),
+    el("div", { id: "asst-body" }),
+  );
+  const body = $("#asst-body");
+  body.append(el("div", { class: "card", style: "max-width:36rem;margin:1.25rem auto;padding:1.4rem" },
+    el("div", { class: "skel", style: "height:20px;width:50%" })));
+  let st = {};
+  try { st = await api("/api/v1/agent/status"); } catch (_) { st = {}; }
+  clear(body);
+  if (st && st.connected) renderAssistantChat(body, st);
+  else renderAssistantConnect(body);
+}
+
+// The connect card (shown until an AI account is connected).
+function renderAssistantConnect(body) {
+  body.append(
     el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
     el("div", { class: "card", style: "max-width:36rem;margin:1.25rem auto;text-align:center;padding:2.5rem 2rem" },
       el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff;box-shadow:0 8px 24px rgba(99,102,241,.35)" }, icon("sparkles")),
@@ -3702,6 +3724,92 @@ async function renderAssistantView(view) {
       el("p", { class: "dim", style: "margin:1.3rem 0 0;font-size:.8rem", text: "Experimental — uses your own subscription. You can disconnect any time." }),
     ),
   );
+}
+
+// The chat surface (shown once connected). Streams tokens over the per-turn SSE.
+function renderAssistantChat(body, st) {
+  body.append(
+    el("div", { style: "display:flex;align-items:center;gap:.5rem;max-width:46rem;margin:.1rem auto .9rem" },
+      el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
+      el("span", { class: "dim", style: "font-size:.85rem", text: st.model || "" }),
+    ),
+    el("div", { id: "asst-log", style: "display:flex;flex-direction:column;gap:.8rem;max-width:46rem;margin:0 auto;width:100%;padding-bottom:1rem" }),
+    el("div", { style: "position:sticky;bottom:0;max-width:46rem;margin:0 auto;width:100%" },
+      el("div", { style: "display:flex;gap:.5rem;padding:.5rem 0", class: "asst-inputrow" },
+        el("textarea", { id: "asst-input", class: "input", rows: "1", placeholder: "Ask about your mail, files, calendar…", style: "flex:1;resize:none;min-height:46px;max-height:160px", onkeydown: agentKeydown }),
+        el("button", { class: "btn primary", title: "Send", onclick: agentSendFromInput }, icon("send", "icon-sm")),
+      ),
+    ),
+  );
+  const log = $("#asst-log");
+  if (!ASST_LOG.length) {
+    log.append(el("div", { class: "dim", style: "text-align:center;padding:2.5rem 1rem", text: "Ask me anything about your Microsoft 365 — I'll read your archive and answer with sources." }));
+  } else {
+    ASST_LOG.forEach(m => log.append(renderAsstMsg(m)));
+    requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
+  }
+}
+
+function renderAsstMsg(m) {
+  const isUser = m.role === "user";
+  const bubble = el("div", {
+    class: "card asst-bubble",
+    style: `max-width:82%;padding:.7rem .9rem;${isUser ? "background:linear-gradient(135deg,#6366f1,#7c5cff);color:#fff" : ""}`,
+  }, el("div", { class: "asst-text", style: "white-space:pre-wrap;line-height:1.5", text: m.text || (isUser ? "" : "…") }));
+  (m.chips || []).forEach(c => bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: c })));
+  return el("div", { style: `display:flex;${isUser ? "justify-content:flex-end" : ""}` }, bubble);
+}
+
+function agentKeydown(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); agentSendFromInput(); }
+}
+function agentSendFromInput() {
+  const inp = $("#asst-input"); if (!inp) return;
+  const text = inp.value.trim(); if (!text) return;
+  inp.value = "";
+  agentSend(text);
+}
+
+// Start a turn and stream its tokens into a fresh assistant bubble.
+async function agentSend(text) {
+  const log = $("#asst-log"); if (!log) return;
+  if (!ASST_LOG.length) clear(log);   // drop the empty-state hint
+
+  ASST_LOG.push({ role: "user", text });
+  log.append(renderAsstMsg(ASST_LOG[ASST_LOG.length - 1]));
+  const asst = { role: "assistant", text: "", chips: [] };
+  ASST_LOG.push(asst);
+  const asstEl = renderAsstMsg(asst);
+  log.append(asstEl);
+  const textEl = asstEl.querySelector(".asst-text");
+  const bubble = asstEl.querySelector(".asst-bubble");
+  log.scrollTop = log.scrollHeight;
+  const setText = (t) => { asst.text = t; textEl.textContent = t || "…"; log.scrollTop = log.scrollHeight; };
+  const addChip = (label) => { asst.chips.push(label); bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: label })); log.scrollTop = log.scrollHeight; };
+
+  if (AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
+  let turn;
+  try {
+    const r = await post("/api/v1/agent/turn?" + qs({ account: App.account, prompt: text }), CAP.agent);
+    turn = r && r.turn;
+  } catch (e) { setText("Error: " + (e.message || e)); return; }
+  if (!turn) { setText("Error: could not start the turn"); return; }
+
+  const tok = sessionToken();
+  const url = "/api/v1/agent/stream?" + qs({ turn }) + (tok ? "&_st=" + encodeURIComponent(tok) : "");
+  const es = new EventSource(url);
+  AGENT_ES = es;
+  es.onmessage = (ev) => {
+    let d; try { d = JSON.parse(ev.data); } catch (_) { return; }
+    switch (d.event) {
+      case "token": setText(asst.text + (d.text || "")); break;
+      case "tool_call": addChip("→ isyncyou " + ((d.input && d.input.op) || "")); break;
+      case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
+      case "error": setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
+      case "done": es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("(no response)"); break;
+    }
+  };
+  es.onerror = () => { es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("⚠ connection lost"); };
 }
 
 function renderAccountMenu(body) {

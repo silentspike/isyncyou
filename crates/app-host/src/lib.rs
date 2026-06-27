@@ -372,6 +372,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         self.store_token(&token)?;
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn status_json(&self) -> String {
+        let connected = self.subscription_token().is_some();
+        let model =
+            std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        serde_json::json!({ "connected": connected, "enabled": true, "model": model }).to_string()
+    }
 }
 
 /// Web-UI archive integrity verify (#528): re-hash every archived body and

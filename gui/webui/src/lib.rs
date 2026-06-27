@@ -251,6 +251,12 @@ pub trait AgentHandler: Send + Sync {
     fn oauth_callback(&self, _code: &str, _state: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
+
+    /// Connection status as a JSON string — the Assistant UI reads it to decide between
+    /// the connect card and the chat. Default: not connected.
+    fn status_json(&self) -> String {
+        "{\"connected\":false}".to_string()
+    }
 }
 
 /// Creates an outbound sharing link for a OneDrive item on behalf of a POST
@@ -1054,6 +1060,9 @@ impl Router {
             // is exactly `/callback` because provider OAuth clients register the loopback
             // redirect as http://127.0.0.1:<port>/callback (RFC 8252).
             "/callback" => self.agent_oauth_callback(req),
+            // Agent connection status (session-gated by the /api/v1/ gate above; read-only,
+            // so no capability token). The Assistant UI reads it to switch connect⇄chat.
+            "/api/v1/agent/status" => self.agent_status(req),
             // app.js carries the (same-origin) capability tokens so the UI can POST
             // restore/share/sync; empty when an action is disabled, hiding its UI.
             "/app.js" => ApiResponse {
@@ -2617,6 +2626,21 @@ impl Router {
         ApiResponse::ok_json(&json!({ "cancelled": turn }))
     }
 
+    /// Agent connection status as JSON (`{connected, model?}`). Read-only; returns
+    /// `enabled:false` when no agent is wired so the UI can hide the assistant entirely.
+    fn agent_status(&self, _req: &ApiRequest) -> ApiResponse {
+        let body = match self.agent.as_ref() {
+            Some(h) => h.status_json(),
+            None => "{\"connected\":false,\"enabled\":false}".to_string(),
+        };
+        ApiResponse {
+            status: 200,
+            content_type: "application/json".into(),
+            body: body.into_bytes(),
+            headers: Vec::new(),
+        }
+    }
+
     /// Begin the EXPERIMENTAL subscription OAuth login (S-AG.12). Cap+session gated
     /// (the app initiates it); returns the authorize URL the UI opens in the system
     /// browser. `redirect` is the loopback callback the client supplies (its origin).
@@ -4093,6 +4117,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
             Ok(format!("<html>connected code={code} state={state}</html>"))
         }
+        fn status_json(&self) -> String {
+            "{\"connected\":true,\"enabled\":true,\"model\":\"fake-1\"}".to_string()
+        }
     }
 
     #[test]
@@ -4137,6 +4164,20 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .with_cap_token(Some("x".into())),
         );
         assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn agent_status_route_reports_enabled_and_connected() {
+        let (_d, router) = setup();
+        // No agent wired -> enabled:false (UI hides the assistant).
+        let off = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
+        assert_eq!(off.status, 200);
+        assert!(String::from_utf8_lossy(&off.body).contains("\"enabled\":false"));
+        // Agent wired -> the handler's status (read-only, no cap token needed).
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let on = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
+        assert_eq!(on.status, 200);
+        assert!(String::from_utf8_lossy(&on.body).contains("\"connected\":true"));
     }
 
     #[test]
