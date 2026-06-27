@@ -43,14 +43,8 @@ impl Default for OAuthConfig {
             token_url: "https://console.anthropic.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
             manual_redirect_url: "https://console.anthropic.com/oauth/code/callback".to_string(),
-            // The Claude Code subscription-login scopes (verified against a real token):
-            // inference + profile + the claude-code session scope. NOT `org:create_api_key`
-            // (that is the separate "create an API key" setup flow, not direct inference).
-            scopes: vec![
-                "user:inference".to_string(),
-                "user:profile".to_string(),
-                "user:sessions:claude_code".to_string(),
-            ],
+            // Exactly what the real `claude setup-token` requests (captured): user:inference.
+            scopes: vec!["user:inference".to_string()],
         }
     }
 }
