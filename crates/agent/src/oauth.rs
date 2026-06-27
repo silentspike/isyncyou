@@ -33,7 +33,9 @@ impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
             authorize_url: "https://claude.ai/oauth/authorize".to_string(),
-            token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
+            // Verified from the real Claude Code client (cli.js): the token endpoint is
+            // console.anthropic.com, NOT platform.claude.com.
+            token_url: "https://console.anthropic.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
             // The Claude Code subscription-login scopes (verified against a real token):
             // inference + profile + the claude-code session scope. NOT `org:create_api_key`
@@ -85,15 +87,18 @@ pub fn build_authorize_url(
     state: &str,
 ) -> String {
     let scope = cfg.scopes.join(" ");
+    // Param set + order mirror the real Claude Code client (verified from its cli.js):
+    // the leading `code=true` is required — without it claude.ai rejects the authorize
+    // submit with "Invalid request format".
     format!(
-        "{base}?response_type=code&client_id={cid}&redirect_uri={ru}\
-         &code_challenge={ch}&code_challenge_method=S256&state={st}&scope={sc}",
+        "{base}?code=true&client_id={cid}&response_type=code&redirect_uri={ru}\
+         &scope={sc}&code_challenge={ch}&code_challenge_method=S256&state={st}",
         base = cfg.authorize_url,
         cid = pct(&cfg.client_id),
         ru = pct(redirect_uri),
+        sc = pct(&scope),
         ch = pct(challenge),
         st = pct(state),
-        sc = pct(&scope),
     )
 }
 
@@ -214,6 +219,7 @@ mod tests {
     fn authorize_url_has_pkce_s256_and_encoded_params() {
         let url = build_authorize_url(&cfg(), "http://127.0.0.1:5000/agent/oauth/callback", "CH", "ST");
         assert!(url.starts_with("https://example.invalid/oauth/authorize?"));
+        assert!(url.contains("code=true")); // required by the Claude Code authorize flow
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=client-123"));
         assert!(url.contains("code_challenge=CH"));
