@@ -62,5 +62,19 @@ pub trait LlmProvider {
     ) -> Result<Vec<AssistantBlock>, crate::AgentError>;
 }
 
+/// Token usage reported by a provider (surfaced to the UI's usage chip).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+// The official providers' pure request/parse logic is unit-tested without `http`; the
+// live structs need it. Compile the modules only when `http` is on or under test, so a
+// plain default build doesn't carry their (then-unused) helpers.
+#[cfg(any(feature = "http", test))]
+pub mod anthropic;
 pub mod fake;
+#[cfg(any(feature = "http", test))]
+pub mod openai;
 pub use fake::FakeProvider;

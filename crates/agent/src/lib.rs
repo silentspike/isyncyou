@@ -38,7 +38,7 @@ pub mod turn;
 pub use archive::{ArchiveSource, ItemRef};
 pub use confirm::{ConfirmError, PendingAction, PendingRegistry};
 pub use error::AgentError;
-pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent};
+pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
 pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
 pub use session::{detect_fork, new_ulid, InMemoryTransport, Session, SessionTransport, Turn};
@@ -51,5 +51,7 @@ pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
+#[cfg(feature = "http")]
+pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
