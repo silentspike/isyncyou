@@ -131,9 +131,14 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     // One -t per ABI; cargo-ndk maps arm64-v8a -> aarch64-linux-android and
     // x86_64 -> x86_64-linux-android, building each requested target's .so.
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
+    // EXPERIMENTAL opt-in (risk R8): a personal build can enable extra cargo features
+    // (e.g. agent-subscription-experimental) via ISY_CARGO_FEATURES. Unset in CI/release,
+    // so the default artifact never carries the subscription login.
+    val extraFeatures = System.getenv("ISY_CARGO_FEATURES")
+    val featureFlags = if (!extraFeatures.isNullOrBlank()) listOf("--features", extraFeatures) else emptyList()
     commandLine(
         listOf(cargo, "+$toolchain", "ndk") + targetFlags +
-            listOf("-o", "android/app/src/main/jniLibs", "build", "-p", "isyncyou-mobile", "--release"),
+            listOf("-o", "android/app/src/main/jniLibs", "build", "-p", "isyncyou-mobile", "--release") + featureFlags,
     )
 }
 tasks.named("preBuild") { dependsOn(cargoNdkBuild) }

@@ -34,6 +34,10 @@ encrypted-store = [
     "isyncyou-app-host/encrypted-store",
     "isyncyou-engine/encrypted-store",
 ]
+# EXPERIMENTAL, default-OFF, personal-build only (risk R8): the in-app subscription
+# OAuth login + provider. Enabled only for the operator's own APK via
+# ISY_CARGO_FEATURES; never in CI/release artifacts.
+agent-subscription-experimental = ["isyncyou-app-host/agent-subscription-experimental"]
 
 [dev-dependencies]
 tempfile = "3"
