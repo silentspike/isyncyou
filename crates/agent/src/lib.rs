@@ -26,6 +26,8 @@ pub mod archive;
 pub mod confirm;
 mod error;
 pub mod http;
+#[cfg(feature = "agent-subscription-experimental")]
+pub mod oauth;
 pub mod provider;
 pub mod retrieval;
 pub mod secrets;
@@ -51,6 +53,8 @@ pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
+#[cfg(feature = "agent-subscription-experimental")]
+pub use oauth::{AgentOAuth, OAuthConfig, StartedLogin};
 #[cfg(feature = "agent-subscription-experimental")]
 pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
 #[cfg(feature = "http")]
