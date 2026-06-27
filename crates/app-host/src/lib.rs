@@ -70,6 +70,124 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
     }
 }
 
+/// A read-class tool executor placeholder until S-AG.8/#623 wires the real archive
+/// retrieval executor. A canned text turn never calls it.
+struct StubExecutor;
+impl isyncyou_agent::ToolExecutor for StubExecutor {
+    fn execute_read(
+        &self,
+        _action: &isyncyou_agent::ToolAction,
+    ) -> Result<String, isyncyou_agent::AgentError> {
+        Ok("{\"note\":\"retrieval is wired in S-AG.8/#623\"}".to_string())
+    }
+}
+
+/// Serialize one stream event to a single-line JSON SSE-data payload.
+fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
+    use isyncyou_agent::StreamEvent as E;
+    let v = match ev {
+        E::Token(t) => serde_json::json!({ "event": "token", "text": t }),
+        E::ToolCall { id, name, input } => {
+            serde_json::json!({ "event": "tool_call", "id": id, "name": name, "input": input })
+        }
+        E::ToolResult { id, content, untrusted } => serde_json::json!({
+            "event": "tool_result", "id": id, "content": content, "untrusted": untrusted
+        }),
+        E::ConfirmationRequired { id, preview, .. } => {
+            serde_json::json!({ "event": "confirmation_required", "tool_id": id, "preview": preview })
+        }
+        E::Error(e) => serde_json::json!({ "event": "error", "message": e }),
+        E::Done => serde_json::json!({ "event": "done" }),
+    };
+    v.to_string()
+}
+
+/// The in-app agent handler (S-AG.6/#621). This foundation drives a deterministic
+/// `FakeProvider` turn (no real LLM token); official providers + real retrieval land in
+/// S-AG.8/#623 and operations execution in S-AG.9/#624. It owns the stream hub and the
+/// pending-action registry, so the model never holds a capability token.
+pub struct DaemonAgent {
+    #[allow(dead_code)] // wired into the real retrieval/restore path in #623/#624
+    cfg: Config,
+    hub: Arc<isyncyou_agent::AgentStreamHub>,
+    pending: Arc<isyncyou_agent::PendingRegistry>,
+    streams: Mutex<std::collections::HashMap<String, std::sync::mpsc::Receiver<String>>>,
+    seq: AtomicU64,
+}
+
+impl DaemonAgent {
+    pub fn new(cfg: Config) -> Self {
+        Self {
+            cfg,
+            hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
+            pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
+            streams: Mutex::new(std::collections::HashMap::new()),
+            seq: AtomicU64::new(0),
+        }
+    }
+}
+
+impl isyncyou_webui::AgentHandler for DaemonAgent {
+    fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String> {
+        let n = self.seq.fetch_add(1, Ordering::SeqCst);
+        let turn_id = format!("turn-{n}-{}", unix_now());
+        let rx_events = self.hub.open(&turn_id, 256);
+        let (tx_str, rx_str) = std::sync::mpsc::channel::<String>();
+        // Forward hub StreamEvents -> JSON strings until the turn closes.
+        std::thread::spawn(move || {
+            while let Ok(ev) = rx_events.recv() {
+                if tx_str.send(agent_event_json(&ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.streams.lock().unwrap().insert(turn_id.clone(), rx_str);
+        // Run a deterministic FakeProvider turn on a background thread (no real token).
+        let hub = self.hub.clone();
+        let tid = turn_id.clone();
+        let account = account.to_string();
+        let prompt = prompt.to_string();
+        std::thread::spawn(move || {
+            let answer = format!(
+                "iSyncYou agent foundation is live (account {account}). You said: {prompt}\n\
+                 The official model + archive retrieval arrive in S-AG.8/#623."
+            );
+            let mut provider = isyncyou_agent::FakeProvider::new(vec![vec![
+                isyncyou_agent::AssistantBlock::Text(answer),
+            ]]);
+            let exec = StubExecutor;
+            let mut history = vec![isyncyou_agent::Message::user(prompt)];
+            let _ = isyncyou_agent::run_turn(&mut provider, &exec, &mut history, &mut |ev| {
+                hub.emit(&tid, ev);
+            });
+            hub.close(&tid);
+        });
+        Ok(turn_id)
+    }
+
+    fn confirm(&self, pending_id: &str, token: &str) -> Result<String, String> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        match self.pending.confirm(pending_id, token, now_ms) {
+            Ok(action) => Ok(format!(
+                "confirmed {} (execution lands in S-AG.9/#624)",
+                action.op()
+            )),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    }
+
+    fn cancel(&self, turn_id: &str) {
+        self.hub.cancel(turn_id);
+    }
+
+    fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+        self.streams.lock().unwrap().remove(turn_id)
+    }
+}
+
 /// Web-UI archive integrity verify (#528): re-hash every archived body and
 /// persist per-item status. Local-only (reads on-disk bodies, writes the store),
 /// so it needs no token/network and is always available.
@@ -697,6 +815,10 @@ pub fn build_live_router(
                 cfg: cfg.clone(),
                 logins: Mutex::new(std::collections::HashMap::new()),
             }),
+            mint_cap_token(),
+        )
+        .with_agent(
+            Arc::new(DaemonAgent::new(cfg.clone())) as Arc<dyn isyncyou_webui::AgentHandler>,
             mint_cap_token(),
         )
         .with_events(events)

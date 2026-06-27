@@ -1577,6 +1577,7 @@ dependencies = [
 name = "isyncyou-app-host"
 version = "1.0.0"
 dependencies = [
+ "isyncyou-agent",
  "isyncyou-connectors",
  "isyncyou-core",
  "isyncyou-engine",

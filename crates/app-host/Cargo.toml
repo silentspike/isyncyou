@@ -14,6 +14,10 @@ isyncyou-graph = { path = "../graph", features = ["http"] }
 isyncyou-connectors = { path = "../connectors", features = ["http"], default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
+# Agent harness (S-AG.6/#621). Default features only — no store/SQLCipher pull, so it
+# adds no bundling-feature pressure to the encrypted/plain chains. The real retrieval
+# executor + official providers (the store/http/onedrive features) land with S-AG.8/#623.
+isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 
 [features]
