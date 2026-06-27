@@ -15,3 +15,4 @@ Status values: **Proposed** · **Accepted** · **Superseded by ADR-NNN**.
 | [004](004-csp-per-mode.md) | Per-mode Content-Security-Policy | Accepted (design) |
 | [005](005-android-build-system.md) | Android build system & on-device auth | Proposed |
 | [006](006-push-relay.md) | Push notification delivery (relay + transport) | Proposed |
+| [007](007-agent-architecture.md) | In-app M365 agent architecture | Proposed |
