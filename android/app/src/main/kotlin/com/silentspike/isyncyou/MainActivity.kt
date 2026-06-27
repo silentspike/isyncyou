@@ -100,15 +100,21 @@ class MainActivity : Activity() {
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
-        com.google.firebase.messaging.FirebaseMessaging.getInstance().token
-            .addOnCompleteListener { t ->
-                if (t.isSuccessful) {
-                    fcmToken = t.result
-                    // Persist so a later rotation (onNewToken) and the web UI's push
-                    // registration read a single, current source.
-                    IsyncMessagingService.saveToken(this, t.result)
+        // A Firebase-less build (no google-services.json — the documented token-free
+        // assembleDebug path) has no default FirebaseApp, so FirebaseMessaging.getInstance()
+        // would throw and crash onCreate. Guard on it: without Firebase the app still runs
+        // fully (push is simply unavailable), which is what the Firebase-less build intends.
+        if (com.google.firebase.FirebaseApp.getApps(this).isNotEmpty()) {
+            com.google.firebase.messaging.FirebaseMessaging.getInstance().token
+                .addOnCompleteListener { t ->
+                    if (t.isSuccessful) {
+                        fcmToken = t.result
+                        // Persist so a later rotation (onNewToken) and the web UI's push
+                        // registration read a single, current source.
+                        IsyncMessagingService.saveToken(this, t.result)
+                    }
                 }
-            }
+        }
 
         // Start the embedded engine off the UI thread (it touches the filesystem and
         // binds a socket), then load the local UI on the UI thread once it's up.
