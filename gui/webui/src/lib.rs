@@ -2656,10 +2656,9 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let redirect = match req.q("redirect") {
-            Some(r) if !r.is_empty() => r,
-            _ => return ApiResponse::error(400, "redirect is required"),
-        };
+        // redirect is optional: the manual (copy-paste) flow uses the provider's manual
+        // redirect, so the client need not supply a loopback origin.
+        let redirect = req.q("redirect").unwrap_or("");
         let provider = req.q("provider").unwrap_or("default");
         match handler.oauth_start(provider, redirect) {
             Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
@@ -4216,10 +4215,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let ok = router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
-        // missing redirect -> 400
-        let bad = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=anthropic")
+        // redirect is optional now (manual flow) -> still 200 without it
+        let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=anthropic")
             .with_cap_token(Some("agentsecret".into()));
-        assert_eq!(router.route(&bad).status, 400);
+        assert_eq!(router.route(&noredir).status, 200);
     }
 
     #[test]
