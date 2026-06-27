@@ -207,7 +207,12 @@ requirements:
       omits the restore and outbound-share handlers, so those routes 404 on mobile and
       the UI hides every restore action (no restore capability token is injected). The
       UI wording reads "cached on this device", not "backup".
+      NOTE: planned supersession — the in-app agent (Epic #614) makes the phone a full
+      cloud-write node (REQ-AND-016, story S-AG.10/#625). This requirement holds and is
+      enforced until that ships with its full Android security model; it is not dropped,
+      it is replaced by a stronger, gated requirement.
     status: implemented
+    superseded_by: REQ-AND-016
     acceptance:
       - A POST to /api/v1/restore or /api/v1/share is 404 in the mobile router.
       - A wired live-write route is reached (cap-gated 401), proving omission is selective.
@@ -239,3 +244,23 @@ requirements:
       - The built APK contains no firebase-service-account / secret file.
     verified_by:
       - file: crates/mobile/src/lib.rs
+  - id: REQ-AND-016
+    title: Mobile is a full cloud-write node, gated by the agent security model (supersedes REQ-AND-013)
+    statement: >
+      With the in-app agent (Epic #614), the mobile profile becomes a full cloud-write
+      node: build_live_router on mobile gains the restore/backup/share surface. This
+      deliberately supersedes REQ-AND-013 and is a release blocker only together with the
+      full Android security model — session-token gate (REQ-AND-012), a one-time
+      PendingAction confirmation token (the model never holds a cap token), Android
+      Keystore for credentials, a mandatory BiometricPrompt for restore-cloud/share/backup/
+      live-write, a foreground-service backup with visible status, and destructive actions
+      as resumable crash-safe ledger jobs. (Stories S-AG.10/#625 + S-AG.11/#626.)
+    status: planned
+    design: docs/adr/007-agent-architecture.md
+    supersedes: REQ-AND-013
+    acceptance:
+      - A POST to /api/v1/restore|share|backup is reachable on mobile (not 404) but session-token gated.
+      - Every destructive mobile action requires a passed BiometricPrompt before the one-time token is minted.
+      - A backup/restore-cloud runs as a foreground-service job and recovers (no dup/loss) after app restart.
+    verified_by:
+      - test: mobile_full_node_router_exposes_gated_restore_and_backup
