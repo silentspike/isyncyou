@@ -35,10 +35,13 @@ impl Default for OAuthConfig {
             authorize_url: "https://claude.ai/oauth/authorize".to_string(),
             token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
+            // The Claude Code subscription-login scopes (verified against a real token):
+            // inference + profile + the claude-code session scope. NOT `org:create_api_key`
+            // (that is the separate "create an API key" setup flow, not direct inference).
             scopes: vec![
-                "org:create_api_key".to_string(),
-                "user:profile".to_string(),
                 "user:inference".to_string(),
+                "user:profile".to_string(),
+                "user:sessions:claude_code".to_string(),
             ],
         }
     }

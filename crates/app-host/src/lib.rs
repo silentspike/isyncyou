@@ -102,10 +102,23 @@ fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
     v.to_string()
 }
 
-/// The in-app agent handler (S-AG.6/#621). This foundation drives a deterministic
-/// `FakeProvider` turn (no real LLM token); official providers + real retrieval land in
-/// S-AG.8/#623 and operations execution in S-AG.9/#624. It owns the stream hub and the
-/// pending-action registry, so the model never holds a capability token.
+/// Default model for the in-app agent (override with `ISYNCYOU_AGENT_MODEL`). The
+/// subscription serves Sonnet/Opus; Sonnet is the cheaper default for general use.
+#[cfg(feature = "agent-subscription-experimental")]
+const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+
+/// The agent's system prompt — app-/M365-scoped (the only tool is `isyncyou`).
+const AGENT_SYSTEM_PROMPT: &str = "You are the iSyncYou in-app assistant. You help the user with \
+their own Microsoft 365 data that iSyncYou manages — mail, OneDrive files and photos, calendar, \
+contacts, tasks and notes — plus iSyncYou's backup and restore. Your only tool is `isyncyou`; you \
+never touch anything outside the user's M365 domain. Read with the tool before answering and cite \
+the items you used. Destructive actions (backup, restore-cloud, live-write, share) are confirmed by \
+the user out of band — propose them, never assume they ran.";
+
+/// The in-app agent handler (S-AG.6/#621). Drives a real turn: the experimental
+/// subscription provider when the user has connected an account, otherwise a deterministic
+/// "not connected" message. Owns the stream hub + pending-action registry, so the model
+/// never holds a capability token.
 pub struct DaemonAgent {
     #[allow(dead_code)] // wired into the real retrieval/restore path in #623/#624
     cfg: Config,
@@ -138,6 +151,27 @@ impl DaemonAgent {
             #[cfg(feature = "agent-subscription-experimental")]
             oauth: isyncyou_agent::AgentOAuth::new(),
         }
+    }
+
+    /// Pick the turn provider: the connected subscription (experimental feature) when a
+    /// token is present, otherwise a deterministic "not connected" message so the UI still
+    /// streams a clear instruction instead of erroring.
+    fn build_turn_provider(&self, system: &str) -> Box<dyn isyncyou_agent::LlmProvider + Send> {
+        #[cfg(feature = "agent-subscription-experimental")]
+        {
+            if let Some(p) = self.try_subscription_provider(system) {
+                return p;
+            }
+        }
+        #[cfg(not(feature = "agent-subscription-experimental"))]
+        let _ = system;
+        Box::new(isyncyou_agent::FakeProvider::new(vec![vec![
+            isyncyou_agent::AssistantBlock::Text(
+                "The AI assistant isn't connected yet — open the Assistant tab and connect your \
+                 Claude account, then try again."
+                    .to_string(),
+            ),
+        ]]))
     }
 }
 
@@ -184,6 +218,75 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             )
             .map_err(|e| e.to_string())
     }
+
+    /// The subscription access token: our stored token (mobile, from the device OAuth
+    /// callback) first, else the existing `claude` CLI login on desktop
+    /// (`~/.claude/.credentials.json` → `claudeAiOauth.accessToken`). Never logged.
+    fn subscription_token(&self) -> Option<String> {
+        let dir = self.oauth_dir.join("agent-credentials");
+        if dir.exists() {
+            let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
+            let store = isyncyou_agent::CredentialStore::new(dir, key);
+            if let Ok(Some(secret)) =
+                store.get(isyncyou_agent::SecretClass::ProviderOAuthRefresh, "subscription")
+            {
+                if let Ok(s) = std::str::from_utf8(secret.expose()) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+        let home = std::env::var_os("HOME")?;
+        let data =
+            std::fs::read_to_string(PathBuf::from(home).join(".claude/.credentials.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+        v.get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// The subscription config: the in-repo recipe + (on desktop) the account identity from
+    /// `~/.claude.json` for `metadata.user_id`.
+    fn subscription_config(&self) -> isyncyou_agent::SubscriptionConfig {
+        let mut cfg = isyncyou_agent::SubscriptionConfig::default();
+        if let Some(home) = std::env::var_os("HOME") {
+            if let Ok(data) = std::fs::read_to_string(PathBuf::from(home).join(".claude.json")) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if let Some(a) = v
+                        .get("oauthAccount")
+                        .and_then(|o| o.get("accountUuid"))
+                        .and_then(|x| x.as_str())
+                    {
+                        cfg.account_uuid = a.to_string();
+                    }
+                    if let Some(d) = v.get("userID").and_then(|x| x.as_str()) {
+                        cfg.device_id = d.to_string();
+                    }
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Build the subscription provider if a token is available (else None → fallback).
+    fn try_subscription_provider(
+        &self,
+        system: &str,
+    ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
+        let token = self.subscription_token()?;
+        let model =
+            std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let p = isyncyou_agent::SubscriptionProvider::new(
+            token,
+            model,
+            system,
+            self.subscription_config(),
+        )
+        .ok()?;
+        Some(Box::new(p))
+    }
 }
 
 impl isyncyou_webui::AgentHandler for DaemonAgent {
@@ -201,22 +304,17 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             }
         });
         self.streams.lock().unwrap().insert(turn_id.clone(), rx_str);
-        // Run a deterministic FakeProvider turn on a background thread (no real token).
+        // Build the provider on this thread (it may read the local token), then run the
+        // turn on a background thread streaming events into the hub.
         let hub = self.hub.clone();
         let tid = turn_id.clone();
-        let account = account.to_string();
+        let system = format!("{AGENT_SYSTEM_PROMPT}\n\nActive account: {account}.");
         let prompt = prompt.to_string();
+        let mut provider = self.build_turn_provider(&system);
         std::thread::spawn(move || {
-            let answer = format!(
-                "iSyncYou agent foundation is live (account {account}). You said: {prompt}\n\
-                 The official model + archive retrieval arrive in S-AG.8/#623."
-            );
-            let mut provider = isyncyou_agent::FakeProvider::new(vec![vec![
-                isyncyou_agent::AssistantBlock::Text(answer),
-            ]]);
             let exec = StubExecutor;
             let mut history = vec![isyncyou_agent::Message::user(prompt)];
-            let _ = isyncyou_agent::run_turn(&mut provider, &exec, &mut history, &mut |ev| {
+            let _ = isyncyou_agent::run_turn(provider.as_mut(), &exec, &mut history, &mut |ev| {
                 hub.emit(&tid, ev);
             });
             hub.close(&tid);
