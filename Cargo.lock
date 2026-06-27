@@ -1557,6 +1557,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "isyncyou-agent"
+version = "1.0.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "isyncyou-app-host"
 version = "1.0.0"
 dependencies = [
