@@ -222,6 +222,23 @@ pub trait RestoreHandler: Send + Sync {
     fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String>;
 }
 
+/// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
+/// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
+/// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
+/// `Receiver<String>`) so the webui crate stays decoupled from `isyncyou-agent`.
+/// The model never receives a capability token; destructive actions become a pending
+/// action confirmed out-of-band via `confirm` (REQ-AGENT-003/004).
+pub trait AgentHandler: Send + Sync {
+    /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
+    fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
+    /// Confirm a pending destructive action with its one-time token; returns a summary.
+    fn confirm(&self, pending_id: &str, token: &str) -> Result<String, String>;
+    /// Cancel an in-flight turn.
+    fn cancel(&self, turn_id: &str);
+    /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
+    fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
+}
+
 /// Creates an outbound sharing link for a OneDrive item on behalf of a POST
 /// request (#494). Injected by the daemon (which owns the Graph stack). Returns
 /// the link's `webUrl`.
@@ -617,6 +634,10 @@ pub struct Router {
     push: Option<std::sync::Arc<dyn PushHandler>>,
     /// Separate capability token for push register/test POSTs.
     push_cap_token: Option<String>,
+    /// In-app agent (S-AG.6/#621). `None` => `/api/v1/agent/*` is refused (read-only).
+    agent: Option<std::sync::Arc<dyn AgentHandler>>,
+    /// Separate capability token for agent POSTs (chat/confirm/cancel).
+    agent_cap_token: Option<String>,
     /// Mobile/standalone profile (#89): an unguessable per-process token required on
     /// EVERY `/api/v1/*` route. On Android `127.0.0.1` is reachable by any app on the
     /// device, so unlike the desktop daemon (GET open, POST cap-gated) the data API
@@ -671,6 +692,8 @@ impl Router {
             account_cap_token: None,
             push: None,
             push_cap_token: None,
+            agent: None,
+            agent_cap_token: None,
             session_token: None,
         }
     }
@@ -708,6 +731,8 @@ impl Router {
             account_cap_token: None,
             push: None,
             push_cap_token: None,
+            agent: None,
+            agent_cap_token: None,
             session_token: None,
         }
     }
@@ -721,6 +746,22 @@ impl Router {
         self.restore = Some(handler);
         self.restore_cap_token = Some(cap_token);
         self
+    }
+
+    /// Enable the in-app agent (S-AG.6/#621), guarded by `cap_token` (builder style).
+    pub fn with_agent(
+        mut self,
+        handler: std::sync::Arc<dyn AgentHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.agent = Some(handler);
+        self.agent_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Crate-internal accessor for the agent handler (used by the SSE stream in serve.rs).
+    pub(crate) fn agent_handler(&self) -> Option<&std::sync::Arc<dyn AgentHandler>> {
+        self.agent.as_ref()
     }
 
     /// Enable the outbound-sharing POST, guarded by `cap_token` (builder style).
@@ -979,6 +1020,9 @@ impl Router {
                 "/api/v1/account/signout" => self.account_signout(req),
                 "/api/v1/push/register" => self.push_register(req),
                 "/api/v1/push/test" => self.push_test(req),
+                "/api/v1/agent/turn" => self.agent_turn(req),
+                "/api/v1/agent/confirm" => self.agent_confirm(req),
+                "/api/v1/agent/cancel" => self.agent_cancel(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -1041,6 +1085,10 @@ impl Router {
                     .replace(
                         "__PUSH_CAP_TOKEN__",
                         self.push_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__AGENT_CAP_TOKEN__",
+                        self.agent_cap_token.as_deref().unwrap_or(""),
                     )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
@@ -2489,6 +2537,64 @@ impl Router {
         }
     }
 
+    /// Resolve the agent handler + check its cap token (shared by the agent POSTs).
+    fn agent_gate(&self, req: &ApiRequest) -> Result<&std::sync::Arc<dyn AgentHandler>, ApiResponse> {
+        let handler = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "the agent is not enabled on this server"))?;
+        if !Self::cap_ok(&self.agent_cap_token, req) {
+            return Err(ApiResponse::error(401, "missing or invalid capability token"));
+        }
+        Ok(handler)
+    }
+
+    /// Start an agent turn; the client streams it from `/api/v1/agent/stream?turn=<id>`.
+    fn agent_turn(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, prompt) = match (req.q("account"), req.q("prompt")) {
+            (Some(a), Some(p)) if !a.is_empty() && !p.is_empty() => (a, p),
+            _ => return ApiResponse::error(400, "account and prompt are required"),
+        };
+        match handler.start_turn(account, prompt) {
+            Ok(turn_id) => ApiResponse::ok_json(&json!({ "turn": turn_id })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Confirm a pending destructive action with its one-time token (REQ-AGENT-003).
+    fn agent_confirm(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (pending, token) = match (req.q("pending"), req.q("token")) {
+            (Some(i), Some(t)) if !i.is_empty() && !t.is_empty() => (i, t),
+            _ => return ApiResponse::error(400, "pending and token are required"),
+        };
+        match handler.confirm(pending, token) {
+            Ok(summary) => ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary })),
+            Err(e) => ApiResponse::error(409, &e),
+        }
+    }
+
+    /// Cancel an in-flight agent turn.
+    fn agent_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let turn = match req.q("turn") {
+            Some(t) if !t.is_empty() => t,
+            _ => return ApiResponse::error(400, "turn is required"),
+        };
+        handler.cancel(turn);
+        ApiResponse::ok_json(&json!({ "cancelled": turn }))
+    }
+
     /// The effective configuration the UI's settings view reads: engine-wide sync
     /// settings + each account's id/username/roots. Fields are **explicitly
     /// whitelisted** (not a blanket serialize of `Config`) so a future secret-
@@ -3899,6 +4005,81 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(router.route(&bad).status, 400);
     }
 
+    struct FakeAgent;
+    impl AgentHandler for FakeAgent {
+        fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
+            Ok("turn-123".into())
+        }
+        fn confirm(&self, pending: &str, token: &str) -> Result<String, String> {
+            if token == "right" {
+                Ok(format!("ran {pending}"))
+            } else {
+                Err("bad token".into())
+            }
+        }
+        fn cancel(&self, _t: &str) {}
+        fn open_stream(&self, turn: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            if turn != "turn-123" {
+                return None;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send("{\"event\":\"token\",\"text\":\"hi\"}".into()).ok();
+            Some(rx)
+        }
+    }
+
+    #[test]
+    fn agent_routes_require_cap_token_and_validate_params() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let q = "/api/v1/agent/turn?account=a&prompt=hi";
+        // no / wrong cap token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // correct token -> 200 + the turn id
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("agentsecret".into())));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("turn-123"));
+        // missing params -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/agent/turn?account=a")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        // confirm: wrong one-time token -> 409, right -> 200
+        let cwrong = ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=wrong")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&cwrong).status, 409);
+        let cok = ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=right")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&cok).status, 200);
+        // cancel -> 200
+        let cancel = ApiRequest::new("POST", "/api/v1/agent/cancel?turn=turn-123")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&cancel).status, 200);
+    }
+
+    #[test]
+    fn agent_routes_are_404_when_not_enabled() {
+        let (_d, router) = setup();
+        let r = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
+                .with_cap_token(Some("x".into())),
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn agent_handler_open_stream_yields_a_receiver() {
+        let h = FakeAgent;
+        let rx = h.open_stream("turn-123").expect("stream");
+        assert!(rx.recv().unwrap().contains("token"));
+        assert!(h.open_stream("other").is_none());
+    }
+
     struct OkSettings(std::sync::Arc<std::sync::atomic::AtomicU64>);
     impl SettingsHandler for OkSettings {
         fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String> {
@@ -4707,6 +4888,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn app_js_has_push_cap_token_placeholder() {
         assert!(APP_JS.contains("__PUSH_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_agent_cap_token_placeholder() {
+        assert!(APP_JS.contains("__AGENT_CAP_TOKEN__"));
     }
 
     #[test]

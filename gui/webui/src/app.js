@@ -299,6 +299,7 @@ const CAP = {
   onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
   account: "__ACCOUNT_CAP_TOKEN__",
   push: "__PUSH_CAP_TOKEN__",
+  agent: "__AGENT_CAP_TOKEN__",
 };
 
 /* ---------------------------------------------------------------- push registration (#576)

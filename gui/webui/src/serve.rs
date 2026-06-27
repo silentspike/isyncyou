@@ -279,6 +279,39 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             return handle_sse(stream, bus);
         }
     }
+    // Agent token stream (S-AG.6/#621): a long-lived per-turn SSE driven by the agent
+    // handler's `Receiver<String>` (pre-serialized JSON data lines). Same session gate;
+    // the turn id rides the `turn` query param (EventSource can't set headers).
+    if method == "GET" && req.path == "/api/v1/agent/stream" {
+        let st_query = req
+            .query
+            .iter()
+            .find(|(k, _)| k == "_st")
+            .map(|(_, v)| v.as_str());
+        let provided = req.session_token.as_deref().or(st_query);
+        if !router.session_authorized(provided) {
+            let resp = ApiResponse::error(401, "missing or invalid session token");
+            stream.write_all(&format_http(&resp))?;
+            return stream.flush();
+        }
+        let turn = req
+            .query
+            .iter()
+            .find(|(k, _)| k == "turn")
+            .map(|(_, v)| v.as_str());
+        let rx = match (router.agent_handler(), turn) {
+            (Some(handler), Some(turn)) if !turn.is_empty() => handler.open_stream(turn),
+            _ => None,
+        };
+        match rx {
+            Some(rx) => return handle_agent_sse(stream, rx),
+            None => {
+                let resp = ApiResponse::error(404, "unknown or missing turn");
+                stream.write_all(&format_http(&resp))?;
+                return stream.flush();
+            }
+        }
+    }
     let resp = router.route(&req);
     stream.write_all(&format_http(&resp))?;
     stream.flush()
@@ -306,6 +339,36 @@ fn handle_sse<S: Conn>(stream: &mut S, bus: &EventBus) -> std::io::Result<()> {
                 .write_all(format!("event: change\ndata: {{\"generation\":{g}}}\n\n").as_bytes())?;
         } else {
             stream.write_all(b": keep-alive\n\n")?; // heartbeat
+        }
+        stream.flush()?; // Err when the peer closed -> end the stream
+    }
+}
+
+/// Stream one agent turn's pre-serialized events as SSE until the turn ends or the peer
+/// disconnects. Each `Receiver<String>` item is a single-line JSON `data:` payload; a
+/// 15 s timeout emits a heartbeat; `Disconnected` (the turn closed its sender) ends the
+/// stream cleanly with a `done` event.
+fn handle_agent_sse<S: Conn>(
+    stream: &mut S,
+    rx: std::sync::mpsc::Receiver<String>,
+) -> std::io::Result<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let head = "HTTP/1.1 200 OK\r\n\
+        Content-Type: text/event-stream\r\n\
+        Cache-Control: no-store\r\n\
+        Connection: keep-alive\r\n\
+        X-Content-Type-Options: nosniff\r\n\r\n";
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(b": connected\n\n")?;
+    stream.flush()?;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(data) => stream.write_all(format!("data: {data}\n\n").as_bytes())?,
+            Err(RecvTimeoutError::Timeout) => stream.write_all(b": keep-alive\n\n")?,
+            Err(RecvTimeoutError::Disconnected) => {
+                stream.write_all(b"event: done\ndata: {}\n\n")?;
+                return stream.flush();
+            }
         }
         stream.flush()?; // Err when the peer closed -> end the stream
     }
