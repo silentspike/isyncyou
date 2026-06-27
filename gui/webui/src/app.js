@@ -3673,21 +3673,48 @@ function openAccountSwitcher() {
 // it. The WebView hands the external https URL to the system browser (shouldOverride-
 // UrlLoading), where the operator signs in to their own provider account; the browser
 // returns to our loopback callback, which exchanges the code and stores the token.
+// Manual (copy-paste) login: the engine builds the authorize URL with the provider's
+// manual redirect (claude.ai shows a code instead of redirecting to a loopback server —
+// far more robust on mobile). We open it in the system browser, then collect the pasted
+// code. No callback server, no loopback host/port fragility.
 async function startAiLogin(provider) {
   try {
-    // Path MUST be exactly "/callback": provider OAuth clients register the loopback
-    // redirect as http://127.0.0.1:<port>/callback (RFC 8252); any other path is
-    // rejected as an invalid OAuth request.
-    const redirect = location.origin + "/callback";
-    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
-    if (d && d.authorize_url) {
-      toast("Opening sign-in in your browser…");
-      location.href = d.authorize_url;
-    } else {
-      toast("Could not start sign-in");
-    }
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider }), CAP.agent);
+    if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
+    showCodeStep();                  // show the paste UI so it's ready when the user returns
+    toast("Opening sign-in in your browser…");
+    location.href = d.authorize_url; // the WebView hands the external URL to the system browser
   } catch (e) {
     toast("Sign-in unavailable: " + (e.message || e));
+  }
+}
+
+// Swap the connect card to the "paste your code" step.
+function showCodeStep() {
+  const card = document.getElementById("asst-connect-card");
+  if (!card) return;
+  clear(card).append(
+    el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
+    el("h2", { style: "margin:.3rem 0 .5rem", text: "Paste your code" }),
+    el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.3rem;max-width:27rem", text: "After you approve in the browser, copy the code it shows and paste it here to finish connecting." }),
+    el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
+    el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
+      el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
+      el("button", { class: "btn", onclick: () => renderAssistantView($("#view")) }, "Cancel"),
+    ),
+  );
+}
+
+async function completeAiLogin() {
+  const inp = document.getElementById("asst-code");
+  const code = inp && inp.value.trim();
+  if (!code) { toast("Paste the code first"); return; }
+  try {
+    await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    toast("Connected!");
+    renderAssistantView($("#view"));   // re-fetch status -> switches to chat
+  } catch (e) {
+    toast("Couldn't connect: " + (e.message || e));
   }
 }
 
@@ -3713,7 +3740,7 @@ async function renderAssistantView(view) {
 function renderAssistantConnect(body) {
   body.append(
     el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
-    el("div", { class: "card", style: "max-width:36rem;margin:1.25rem auto;text-align:center;padding:2.5rem 2rem" },
+    el("div", { id: "asst-connect-card", class: "card", style: "max-width:36rem;margin:1.25rem auto;text-align:center;padding:2.5rem 2rem" },
       el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff;box-shadow:0 8px 24px rgba(99,102,241,.35)" }, icon("sparkles")),
       el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
       el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.6rem;max-width:27rem", text: "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login — your credentials go only to the provider — and this device is then authorized." }),

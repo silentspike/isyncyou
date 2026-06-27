@@ -27,6 +27,9 @@ pub struct OAuthConfig {
     pub token_url: String,
     pub client_id: String,
     pub scopes: Vec<String>,
+    /// The manual (copy-paste) redirect: claude.ai shows the code on this page instead of
+    /// redirecting to a loopback server. Avoids the whole loopback-redirect fragility.
+    pub manual_redirect_url: String,
 }
 
 impl Default for OAuthConfig {
@@ -37,6 +40,7 @@ impl Default for OAuthConfig {
             // console.anthropic.com, NOT platform.claude.com.
             token_url: "https://console.anthropic.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
+            manual_redirect_url: "https://console.anthropic.com/oauth/code/callback".to_string(),
             // The Claude Code subscription-login scopes (verified against a real token):
             // inference + profile + the claude-code session scope. NOT `org:create_api_key`
             // (that is the separate "create an API key" setup flow, not direct inference).
@@ -162,8 +166,19 @@ impl PendingInsert for Mutex<HashMap<String, PendingLogin>> {
     }
 }
 
-/// Exchange an authorization `code` for an access token (PKCE). Claude's token endpoint
-/// takes a JSON body; the exact endpoint/client come from `cfg` (recipe-out-of-repo).
+/// Split a pasted manual code. The manual page shows `code#state`; some flows show just
+/// the code. Returns (code, optional state).
+pub fn parse_pasted_code(pasted: &str) -> (String, Option<String>) {
+    let p = pasted.trim();
+    match p.split_once('#') {
+        Some((c, s)) => (c.to_string(), Some(s.to_string())),
+        None => (p.to_string(), None),
+    }
+}
+
+/// Exchange an authorization `code` for an access token (PKCE). The token endpoint takes a
+/// JSON body; the exact endpoint/client come from `cfg`. `state` is included because the
+/// real Claude Code client sends it on exchange (verified from cli.js `ml0`).
 #[cfg(feature = "http")]
 pub fn exchange(
     http: &crate::http::HttpTransport,
@@ -171,6 +186,7 @@ pub fn exchange(
     code: &str,
     verifier: &str,
     redirect_uri: &str,
+    state: &str,
 ) -> Result<String, AgentError> {
     let body = serde_json::json!({
         "grant_type": "authorization_code",
@@ -178,6 +194,7 @@ pub fn exchange(
         "redirect_uri": redirect_uri,
         "client_id": cfg.client_id,
         "code_verifier": verifier,
+        "state": state,
     });
     let (status, text) = http.post_json(&cfg.token_url, &[], &body)?;
     if status >= 400 {
@@ -203,6 +220,7 @@ mod tests {
             token_url: "https://example.invalid/oauth/token".into(),
             client_id: "client-123".into(),
             scopes: vec!["a".into(), "b".into()],
+            manual_redirect_url: "https://console.invalid/oauth/code/callback".into(),
         }
     }
 
@@ -238,5 +256,15 @@ mod tests {
         assert!(!verifier.is_empty());
         assert_eq!(redirect, "http://127.0.0.1:5000/agent/oauth/callback");
         assert!(oauth.take(&started.state).is_none()); // single-use
+    }
+
+    #[test]
+    fn parse_pasted_code_splits_code_and_state() {
+        let (c, s) = parse_pasted_code("  abc123#st-9  ");
+        assert_eq!(c, "abc123");
+        assert_eq!(s.as_deref(), Some("st-9"));
+        let (c2, s2) = parse_pasted_code("onlycode");
+        assert_eq!(c2, "onlycode");
+        assert_eq!(s2, None);
     }
 }

@@ -392,21 +392,42 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         self.streams.lock().unwrap().remove(turn_id)
     }
 
-    /// EXPERIMENTAL (S-AG.12). Begin a device OAuth login: PKCE + state from the local
-    /// recipe; the app opens the returned URL in the system browser. Only present with
-    /// the feature; otherwise the trait default returns "not enabled".
+    /// EXPERIMENTAL (S-AG.12). Begin the MANUAL device OAuth login: PKCE + state, with the
+    /// manual (copy-paste) redirect — claude.ai shows a code instead of redirecting to a
+    /// loopback server. The app opens the returned URL in the system browser. Robust on
+    /// mobile (no loopback host/port/IPv6 fragility).
     #[cfg(feature = "agent-subscription-experimental")]
-    fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
+    fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
         let cfg = self.load_oauth_config()?;
         let started = self
             .oauth
-            .start(&cfg, redirect_uri)
+            .start(&cfg, &cfg.manual_redirect_url)
             .map_err(|e| e.to_string())?;
         Ok(started.authorize_url)
     }
 
-    /// EXPERIMENTAL (S-AG.12). The system browser returns here; exchange the code with
-    /// the stored PKCE verifier and persist the token, then show a success page.
+    /// EXPERIMENTAL (S-AG.12). Complete the MANUAL login: the operator pastes the
+    /// `code#state` shown by claude.ai. Look up the PKCE verifier by state, exchange, and
+    /// persist the token.
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn oauth_complete(&self, pasted: &str) -> Result<String, String> {
+        let (code, state_opt) = isyncyou_agent::oauth::parse_pasted_code(pasted);
+        let state = state_opt.ok_or("the pasted code is missing its #state part")?;
+        let (verifier, redirect_uri) = self
+            .oauth
+            .take(&state)
+            .ok_or("unknown or expired login — start the login again")?;
+        let cfg = self.load_oauth_config()?;
+        let http = isyncyou_agent::http::HttpTransport::new().map_err(|e| e.to_string())?;
+        let token =
+            isyncyou_agent::oauth::exchange(&http, &cfg, &code, &verifier, &redirect_uri, &state)
+                .map_err(|e| e.to_string())?;
+        self.store_token(&token)?;
+        Ok("connected".to_string())
+    }
+
+    /// EXPERIMENTAL (S-AG.12). The loopback callback path (kept for the auto flow); exchange
+    /// the code with the stored verifier + state and persist the token, then show a page.
     #[cfg(feature = "agent-subscription-experimental")]
     fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
         let (verifier, redirect_uri) = self
@@ -415,8 +436,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .ok_or("unknown or expired login state")?;
         let cfg = self.load_oauth_config()?;
         let http = isyncyou_agent::http::HttpTransport::new().map_err(|e| e.to_string())?;
-        let token = isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri)
-            .map_err(|e| e.to_string())?;
+        let token =
+            isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri, state)
+                .map_err(|e| e.to_string())?;
         self.store_token(&token)?;
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }

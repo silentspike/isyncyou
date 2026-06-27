@@ -252,6 +252,12 @@ pub trait AgentHandler: Send + Sync {
         Err("subscription login is not enabled on this server".into())
     }
 
+    /// EXPERIMENTAL manual-login completion (S-AG.12): the operator pastes the `code#state`
+    /// that claude.ai showed; the handler exchanges it and stores the token.
+    fn oauth_complete(&self, _pasted: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
+
     /// Connection status as a JSON string — the Assistant UI reads it to decide between
     /// the connect card and the chat. Default: not connected.
     fn status_json(&self) -> String {
@@ -1044,6 +1050,7 @@ impl Router {
                 "/api/v1/agent/confirm" => self.agent_confirm(req),
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
+                "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -2657,6 +2664,23 @@ impl Router {
         match handler.oauth_start(provider, redirect) {
             Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
             Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Complete the manual login (S-AG.12): the app POSTs the pasted `code#state`. Cap+
+    /// session gated (the app initiates it). Exchanges + stores the token.
+    fn agent_oauth_complete(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let code = match req.q("code") {
+            Some(c) if !c.is_empty() => c,
+            _ => return ApiResponse::error(400, "code is required"),
+        };
+        match handler.oauth_complete(code) {
+            Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
+            Err(e) => ApiResponse::error(400, &e),
         }
     }
 
