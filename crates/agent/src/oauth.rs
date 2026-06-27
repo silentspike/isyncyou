@@ -191,6 +191,8 @@ pub fn exchange(
         "client_id": cfg.client_id,
         "code_verifier": verifier,
         "state": state,
+        // The real `claude setup-token` sends this on exchange (cli.js ml0).
+        "expires_in": 31_536_000,
     });
     let (status, text) = http.post_json(&cfg.token_url, &[], &body)?;
     if status >= 400 {

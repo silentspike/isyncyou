@@ -397,11 +397,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     /// loopback server. The app opens the returned URL in the system browser. Robust on
     /// mobile (no loopback host/port/IPv6 fragility).
     #[cfg(feature = "agent-subscription-experimental")]
-    fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
+    fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
         let cfg = self.load_oauth_config()?;
+        // Loopback-primary (matches the real claude client): use the client's loopback
+        // redirect when supplied; fall back to the manual (copy-paste) redirect otherwise.
+        let redirect = if redirect_uri.is_empty() {
+            cfg.manual_redirect_url.as_str()
+        } else {
+            redirect_uri
+        };
         let started = self
             .oauth
-            .start(&cfg, &cfg.manual_redirect_url)
+            .start(&cfg, redirect)
             .map_err(|e| e.to_string())?;
         Ok(started.authorize_url)
     }

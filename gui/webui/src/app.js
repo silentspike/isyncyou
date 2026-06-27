@@ -3679,14 +3679,43 @@ function openAccountSwitcher() {
 // code. No callback server, no loopback host/port fragility.
 async function startAiLogin(provider) {
   try {
-    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider }), CAP.agent);
+    // Loopback-primary (matches the real claude client): the browser returns to the
+    // engine's own /callback, which completes server-side. Use `localhost` (not 127.0.0.1)
+    // for provider redirect-URI compatibility.
+    const redirect = "http://localhost:" + location.port + "/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    showCodeStep();                  // show the paste UI so it's ready when the user returns
+    showWaitingStep();               // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
     location.href = d.authorize_url; // the WebView hands the external URL to the system browser
   } catch (e) {
     toast("Sign-in unavailable: " + (e.message || e));
   }
+}
+
+// After the browser login the engine's /callback stores the token; poll status until
+// connected, then switch to the chat.
+let AGENT_POLL_ON = false;
+function showWaitingStep() {
+  const card = document.getElementById("asst-connect-card");
+  if (card) {
+    clear(card).append(
+      el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
+      el("h2", { style: "margin:.3rem 0 .5rem", text: "Finishing sign-in…" }),
+      el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.3rem;max-width:27rem", text: "Approve the login in your browser, then come back here — this connects automatically." }),
+      el("div", { class: "skel", style: "height:8px;width:60%;margin:0 auto;border-radius:4px" }),
+    );
+  }
+  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0); }
+}
+async function pollAgentStatus(n) {
+  if (App.route !== "assistant") { AGENT_POLL_ON = false; return; }
+  try {
+    const s = await api("/api/v1/agent/status");
+    if (s && s.connected) { AGENT_POLL_ON = false; toast("Connected!"); renderAssistantView($("#view")); return; }
+  } catch (_) {}
+  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1), 2000); }
+  else { AGENT_POLL_ON = false; }
 }
 
 // Swap the connect card to the "paste your code" step.
