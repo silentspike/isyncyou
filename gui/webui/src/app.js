@@ -85,6 +85,7 @@ const ICONS = {
   "trash-2": "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6",
   tag: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82zM7 7h.01",
   "mail-open": "M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8M3 8l9-6 9 6M3 8l9 6 9-6",
+  sparkles: "M12 3l2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2z",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -865,6 +866,8 @@ function renderShell() {
         el("span", { class: "nav-meta" }, el("span", { id: "alerts-badge", class: "count", text: "·" }))),
       el("button", { id: "nav-settings", class: "nav-item" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") },
         icon("settings"), el("span", { class: "label", text: "Settings" })),
+      CAP.agent ? el("button", { id: "nav-assistant", class: "nav-item" + (App.route === "assistant" ? " active" : ""), title: "AI Assistant", onclick: () => go("assistant") },
+        icon("sparkles"), el("span", { class: "label", text: "Assistant" })) : null,
       eggOn() ? el("button", { id: "nav-ufo", class: "nav-item" + (App.route === "invaders" ? " active" : ""), title: "Invaders", onclick: () => go("invaders") },
         ufoGlyph(), el("span", { class: "label", text: "Invaders" })) : null),
     el("div", { id: "sync-widget", class: "sync-widget" }),
@@ -936,7 +939,7 @@ function updateNavCounts() {
 
 /* ---------------------------------------------------------------- router */
 function go(route) { location.hash = "#/" + route; }
-const EXTRA_ROUTES = { search: "Search", settings: "Settings", invaders: "Invaders" };
+const EXTRA_ROUTES = { search: "Search", settings: "Settings", assistant: "Assistant", invaders: "Invaders" };
 const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
   // Preserve the scroll position across a SAME-route re-render (e.g. an SSE
@@ -965,6 +968,7 @@ function onRoute() {
   else if (App.route === "onenote") p = renderOnenoteView(view);
   else if (App.route === "search") p = renderSearchView(view);
   else if (App.route === "settings") p = renderSettingsView(view);
+  else if (App.route === "assistant") p = renderAssistantView(view);
   else if (App.route === "invaders") p = renderInvaders(view);
   else p = renderServiceView(view, App.route);
   if (prevScroll && App.route === prevRoute) {
@@ -3660,6 +3664,43 @@ function openAccountSwitcher() {
   document.body.append(accountMenu);
   renderAccountMenu(body);
 }
+/* ---------------------------------------------------------------- assistant (S-AG.12: connect) */
+// Begin the device OAuth login: ask the engine for an authorize URL, then navigate to
+// it. The WebView hands the external https URL to the system browser (shouldOverride-
+// UrlLoading), where the operator signs in to their own provider account; the browser
+// returns to our loopback callback, which exchanges the code and stores the token.
+async function startAiLogin(provider) {
+  try {
+    const redirect = location.origin + "/agent/oauth/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
+    if (d && d.authorize_url) {
+      toast("Opening sign-in in your browser…");
+      location.href = d.authorize_url;
+    } else {
+      toast("Could not start sign-in");
+    }
+  } catch (e) {
+    toast("Sign-in unavailable: " + (e.message || e));
+  }
+}
+
+async function renderAssistantView(view) {
+  clear(view).append(
+    el("h1", { class: "view-title", text: "AI Assistant" }),
+    el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
+    el("div", { class: "card", style: "max-width:36rem;margin:1.25rem auto;text-align:center;padding:2.5rem 2rem" },
+      el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff;box-shadow:0 8px 24px rgba(99,102,241,.35)" }, icon("sparkles")),
+      el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
+      el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.6rem;max-width:27rem", text: "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login — your credentials go only to the provider — and this device is then authorized." }),
+      el("div", { style: "display:flex;flex-direction:column;gap:.6rem;max-width:21rem;margin:0 auto" },
+        el("button", { id: "asst-connect-anthropic", class: "btn primary", onclick: () => startAiLogin("anthropic") }, icon("sparkles", "icon-sm"), "Connect Claude (Anthropic)"),
+        el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai") }, icon("sparkles", "icon-sm"), "Connect ChatGPT (OpenAI)"),
+      ),
+      el("p", { class: "dim", style: "margin:1.3rem 0 0;font-size:.8rem", text: "Experimental — uses your own subscription. You can disconnect any time." }),
+    ),
+  );
+}
+
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
   clear(body);
