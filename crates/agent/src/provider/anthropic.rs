@@ -49,6 +49,14 @@ pub(crate) fn build_messages(history: &[Message]) -> Vec<Value> {
 /// Build the full Messages request body. `tool_schema()` already has Anthropic's
 /// `{name, description, input_schema}` shape.
 pub(crate) fn build_request(model: &str, system: &str, history: &[Message]) -> Value {
+    build_request_blocks(model, json!(system), history)
+}
+
+/// Like [`build_request`] but takes the `system` field as an arbitrary value — a plain
+/// string for the official provider, or a multi-block array (e.g. a leading billing
+/// block) for the experimental subscription provider. Keeps the messages/tools shaping
+/// in one place so both providers stay wire-identical except for `system`.
+pub(crate) fn build_request_blocks(model: &str, system: Value, history: &[Message]) -> Value {
     json!({
         "model": model,
         "max_tokens": DEFAULT_MAX_TOKENS,

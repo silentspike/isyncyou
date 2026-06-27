@@ -18,14 +18,30 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Local, **uncommitted** OAuth endpoints/client (the operator supplies these).
-#[derive(Debug, Clone, Default, Deserialize)]
+/// OAuth endpoints/client. Defaults to the public Claude OAuth client (PKCE public
+/// client — these are not secrets); an operator may override via a local config file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct OAuthConfig {
     pub authorize_url: String,
     pub token_url: String,
     pub client_id: String,
-    #[serde(default)]
     pub scopes: Vec<String>,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            authorize_url: "https://claude.ai/oauth/authorize".to_string(),
+            token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
+            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
+            scopes: vec![
+                "org:create_api_key".to_string(),
+                "user:profile".to_string(),
+                "user:inference".to_string(),
+            ],
+        }
+    }
 }
 
 fn rand_b64(n: usize) -> Result<String, AgentError> {

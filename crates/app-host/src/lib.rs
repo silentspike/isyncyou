@@ -156,16 +156,18 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
 <h1>Connected</h1><p>This device is now authorized. You can close this tab and return to iSyncYou.</p>\
 </div></body></html>";
 
-    /// Load the operator's local OAuth recipe (uncommitted).
+    /// The OAuth recipe: the in-repo Claude default, with optional local overrides from
+    /// `agent-oauth.json` next to the config (the recipe may now live in-repo, so no file
+    /// is required for the default Claude flow to work).
     fn load_oauth_config(&self) -> Result<isyncyou_agent::OAuthConfig, String> {
         let path = self.oauth_dir.join("agent-oauth.json");
-        let s = std::fs::read_to_string(&path).map_err(|e| {
-            format!(
-                "OAuth recipe not found at {} — the operator must place it locally: {e}",
-                path.display()
-            )
-        })?;
-        serde_json::from_str(&s).map_err(|e| format!("OAuth recipe is invalid JSON: {e}"))
+        if path.exists() {
+            let s = std::fs::read_to_string(&path)
+                .map_err(|e| format!("OAuth recipe: {e}"))?;
+            serde_json::from_str(&s).map_err(|e| format!("OAuth recipe is invalid JSON: {e}"))
+        } else {
+            Ok(isyncyou_agent::OAuthConfig::default())
+        }
     }
 
     /// Persist the obtained access token at rest under a device-local key.
