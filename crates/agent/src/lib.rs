@@ -27,6 +27,8 @@ mod error;
 pub mod http;
 pub mod provider;
 pub mod retrieval;
+pub mod session;
+pub mod session_crypto;
 pub mod tool;
 pub mod turn;
 
@@ -34,6 +36,8 @@ pub use archive::{ArchiveSource, ItemRef};
 pub use error::AgentError;
 pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent};
 pub use retrieval::RetrievalExecutor;
+pub use session::{detect_fork, new_ulid, InMemoryTransport, Session, SessionTransport, Turn};
+pub use session_crypto::{open, seal, SealedTurn};
 pub use tool::{
     help_text, parse_action, registry_tool_names, tool_schema, ToolAction, ToolClass, TOOL_NAME,
 };
@@ -41,3 +45,5 @@ pub use turn::{run_turn, Message, Role, ToolExecutor, TurnOutcome};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
+#[cfg(feature = "onedrive")]
+pub use session::OneDriveTransport;

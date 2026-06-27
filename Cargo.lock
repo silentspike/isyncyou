@@ -1560,10 +1560,13 @@ dependencies = [
 name = "isyncyou-agent"
 version = "1.0.0"
 dependencies = [
+ "base64",
  "isyncyou-connectors",
  "isyncyou-core",
+ "isyncyou-graph",
  "isyncyou-store",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
