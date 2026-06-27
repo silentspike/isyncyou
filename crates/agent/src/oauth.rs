@@ -35,9 +35,11 @@ pub struct OAuthConfig {
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
-            authorize_url: "https://claude.ai/oauth/authorize".to_string(),
-            // Verified from the real Claude Code client (cli.js): the token endpoint is
-            // console.anthropic.com, NOT platform.claude.com.
+            // Captured from the REAL `claude` CLI (xdg-open intercept on `claude
+            // setup-token`): the authorize endpoint is claude.com/cai/oauth/authorize —
+            // NOT claude.ai/oauth/authorize (which renders a generic consent that fails
+            // the submit with "Invalid request format"). This was the root cause.
+            authorize_url: "https://claude.com/cai/oauth/authorize".to_string(),
             token_url: "https://console.anthropic.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
             manual_redirect_url: "https://console.anthropic.com/oauth/code/callback".to_string(),
