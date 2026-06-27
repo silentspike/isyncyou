@@ -1,0 +1,41 @@
+# Agent threat model
+
+Scope: the in-app M365 agent (Epic #614) — the data assistant and operations agent that
+run inside the desktop daemon and the Android engine. This document enumerates the agent's
+attack surface and the mitigations that become release-blocker acceptance criteria in the
+implementing stories. Design: [ADR-007](../adr/007-agent-architecture.md). Requirements:
+[`agent.yml`](../requirements/agent.yml). Residual risks: [risk register](risk-register.md).
+
+## Assets
+- The user's M365 content (already archived locally and in OneDrive).
+- The user's provider credentials (official API keys / OAuth tokens).
+- The cross-device session history (may summarize M365 content).
+- The ability to perform destructive cloud operations (restore-cloud, live-write, share).
+
+## Trust boundaries
+- **WebView ↔ loopback API.** The UI talks only to `127.0.0.1`; the LLM call is server-side
+  (CSP `connect-src 'self'`, ADR-004). On Android, **any app on the device can reach
+  `127.0.0.1`**, so every `/api/v1/agent/*` route is session-token gated (REQ-AND-012).
+- **Agent loop ↔ provider.** Outbound HTTPS to the provider carries selected M365 content;
+  this requires explicit one-time user consent at setup.
+- **Agent ↔ tools.** The agent's only capability is the `isyncyou` tool over the M365
+  domain — no shell/FS/OS/device/free-form-HTTP (REQ-AGENT-001).
+
+## Threats and mitigations
+| # | Threat | Mitigation |
+|---|---|---|
+| T1 | **Prompt injection** — retrieved mail/document content instructs the model to take a destructive action ("delete my inbox"). | Tool calls are taken only from the model's `tool_use` structure, never parsed from content; tool results are tagged `untrusted_content`; the system prompt forbids content from overriding policy; destructive actions require a human-confirmed one-time token (REQ-AGENT-005, REQ-AGENT-002/003). |
+| T2 | **Model self-authorization** — the model obtains a capability token and authorizes its own destructive action. | The model never receives a capability/confirmation token; the server mints a one-time, action-bound, single-use token only after a human confirms via a session-authenticated request (REQ-AGENT-003/004). |
+| T3 | **Scope escape** — the agent reaches the device/OS/filesystem beyond M365. | App-scope invariant: a single `isyncyou` tool, enforced by a tool-registry snapshot test; no other tool exists (REQ-AGENT-001). |
+| T4 | **Loopback abuse on mobile** — a malicious local app calls the agent API. | Session-token gate on every `/api/v1/agent/*` route (REQ-AND-012); destructive actions additionally require the native BiometricPrompt gate (REQ-AND-016, S-AG.11). |
+| T5 | **Session history disclosure** — plaintext M365 excerpts in OneDrive. | Per-turn files are AES-256-GCM encrypted with a pairing-derived key (Argon2id/HKDF), not the device-local key; only ciphertext is uploaded (REQ-AGENT-006). |
+| T6 | **Credential theft** — provider API keys/tokens leak. | Credentials are stored encrypted at rest (owner-only on Unix; Android Keystore where available), never logged, never sent to the WebView; the LLM call is server-side (S-AG.5, REQ-AGENT-008). |
+| T7 | **Interrupted destructive job on mobile** — a backup/restore-cloud job is killed mid-flight and re-runs, duplicating cloud items. | Destructive mobile actions run as resumable jobs over the crash-safe restore ledger (run_restore_op / recover_pending_restores); idempotent recovery on app restart (REQ-AND-016, R1). |
+| T8 | **Subscription provider exposure** — the experimental subscription path leaks a reproducible wire recipe or ships in a release. | The subscription provider is feature-gated (default-off), absent from CI/release/README, documented only under `docs/experimental/` as unsupported; detailed wire format stays in private local evidence, never the repo (R8, S-AG.0/#615, S-AG.12/#627). |
+
+## Mobile full-write surface (supersedes REQ-AND-013)
+Making the phone a full cloud-write node enlarges the surface (T4, T7). It is gated by the
+combination of: session-token gate (T4), one-time PendingAction token (T2), Android Keystore
+for credentials (T6), BiometricPrompt for every destructive confirmation (T4), and
+resumable ledger jobs (T7). This package is a **release blocker** for the mobile full node
+(REQ-AND-016, stories S-AG.10/#625 + S-AG.11/#626) — not optional hardening.
