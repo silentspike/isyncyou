@@ -107,6 +107,12 @@ fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
 #[cfg(feature = "agent-subscription-experimental")]
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+/// A turn-provider builder (a `DaemonAgent` method): given the system prompt, return a
+/// boxed provider if its credentials are present.
+#[cfg(feature = "agent-subscription-experimental")]
+type ProviderBuilder =
+    fn(&DaemonAgent, &str) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>>;
+
 /// The agent's system prompt — app-/M365-scoped (the only tool is `isyncyou`).
 const AGENT_SYSTEM_PROMPT: &str = "You are the iSyncYou in-app assistant. You help the user with \
 their own Microsoft 365 data that iSyncYou manages — mail, OneDrive files and photos, calendar, \
@@ -159,7 +165,15 @@ impl DaemonAgent {
     fn build_turn_provider(&self, system: &str) -> Box<dyn isyncyou_agent::LlmProvider + Send> {
         #[cfg(feature = "agent-subscription-experimental")]
         {
-            if let Some(p) = self.try_subscription_provider(system) {
+            // Provider preference: ISYNCYOU_AGENT_PROVIDER=codex picks ChatGPT, otherwise
+            // Claude; either falls back to the other if only one is connected.
+            let prefer_codex = std::env::var("ISYNCYOU_AGENT_PROVIDER").as_deref() == Ok("codex");
+            let (first, second): (ProviderBuilder, ProviderBuilder) = if prefer_codex {
+                (Self::try_codex_provider, Self::try_subscription_provider)
+            } else {
+                (Self::try_subscription_provider, Self::try_codex_provider)
+            };
+            if let Some(p) = first(self, system).or_else(|| second(self, system)) {
                 return p;
             }
         }
@@ -287,6 +301,40 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         .ok()?;
         Some(Box::new(p))
     }
+
+    /// ChatGPT/Codex credentials: the existing `codex` CLI login on desktop
+    /// (`~/.codex/auth.json` → tokens.access_token + account_id). Never logged.
+    fn codex_credentials(&self) -> Option<(String, String)> {
+        let home = std::env::var_os("HOME")?;
+        let data =
+            std::fs::read_to_string(PathBuf::from(home).join(".codex/auth.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+        let t = v.get("tokens")?;
+        let token = t.get("access_token")?.as_str()?.to_string();
+        let account = t
+            .get("account_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if token.is_empty() {
+            return None;
+        }
+        Some((token, account))
+    }
+
+    /// Build the Codex (ChatGPT) provider if credentials are available.
+    fn try_codex_provider(
+        &self,
+        instructions: &str,
+    ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
+        let (token, account) = self.codex_credentials()?;
+        let cfg = isyncyou_agent::CodexConfig {
+            account_id: account,
+            ..Default::default()
+        };
+        let p = isyncyou_agent::CodexProvider::new(token, instructions, cfg).ok()?;
+        Some(Box::new(p))
+    }
 }
 
 impl isyncyou_webui::AgentHandler for DaemonAgent {
@@ -375,10 +423,28 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
 
     #[cfg(feature = "agent-subscription-experimental")]
     fn status_json(&self) -> String {
-        let connected = self.subscription_token().is_some();
-        let model =
-            std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        serde_json::json!({ "connected": connected, "enabled": true, "model": model }).to_string()
+        let claude = self.subscription_token().is_some();
+        let codex = self.codex_credentials().is_some();
+        let prefer_codex = std::env::var("ISYNCYOU_AGENT_PROVIDER").as_deref() == Ok("codex");
+        let (provider, model) = if codex && (prefer_codex || !claude) {
+            ("codex", isyncyou_agent::CodexConfig::default().model)
+        } else if claude {
+            (
+                "claude",
+                std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
+            )
+        } else {
+            ("", String::new())
+        };
+        serde_json::json!({
+            "connected": claude || codex,
+            "enabled": true,
+            "provider": provider,
+            "model": model,
+            "claude": claude,
+            "codex": codex,
+        })
+        .to_string()
     }
 }
 
