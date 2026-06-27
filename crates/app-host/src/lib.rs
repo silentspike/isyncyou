@@ -113,17 +113,74 @@ pub struct DaemonAgent {
     pending: Arc<isyncyou_agent::PendingRegistry>,
     streams: Mutex<std::collections::HashMap<String, std::sync::mpsc::Receiver<String>>>,
     seq: AtomicU64,
+    /// Directory holding the operator's local, uncommitted OAuth recipe
+    /// (`agent-oauth.json`) and the credential store — the parent of the config file.
+    /// Only read by the experimental subscription login (S-AG.12).
+    #[cfg_attr(
+        not(feature = "agent-subscription-experimental"),
+        allow(dead_code)
+    )]
+    oauth_dir: PathBuf,
+    /// Tracks in-flight device OAuth logins between start and the browser callback.
+    #[cfg(feature = "agent-subscription-experimental")]
+    oauth: isyncyou_agent::AgentOAuth,
 }
 
 impl DaemonAgent {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(cfg: Config, oauth_dir: PathBuf) -> Self {
         Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
             pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
             streams: Mutex::new(std::collections::HashMap::new()),
             seq: AtomicU64::new(0),
+            oauth_dir,
+            #[cfg(feature = "agent-subscription-experimental")]
+            oauth: isyncyou_agent::AgentOAuth::new(),
         }
+    }
+}
+
+/// EXPERIMENTAL subscription device-OAuth (S-AG.12) — only compiled with
+/// `agent-subscription-experimental`. The operator's recipe (endpoints/client_id) and
+/// the obtained token both live locally; nothing provider-specific is hardcoded.
+#[cfg(feature = "agent-subscription-experimental")]
+impl DaemonAgent {
+    /// A human-facing success page shown in the **system browser** after the callback.
+    const OAUTH_SUCCESS_HTML: &'static str = "<!doctype html><html><head><meta charset=utf-8>\
+<meta name=viewport content=\"width=device-width,initial-scale=1\">\
+<title>iSyncYou connected</title><style>body{font-family:system-ui;background:#0b0d12;color:#e8eaf0;\
+display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}\
+.c{text-align:center;max-width:22rem;padding:2rem}h1{font-size:1.4rem;margin:.5rem 0}\
+p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
+<h1>Connected</h1><p>This device is now authorized. You can close this tab and return to iSyncYou.</p>\
+</div></body></html>";
+
+    /// Load the operator's local OAuth recipe (uncommitted).
+    fn load_oauth_config(&self) -> Result<isyncyou_agent::OAuthConfig, String> {
+        let path = self.oauth_dir.join("agent-oauth.json");
+        let s = std::fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "OAuth recipe not found at {} — the operator must place it locally: {e}",
+                path.display()
+            )
+        })?;
+        serde_json::from_str(&s).map_err(|e| format!("OAuth recipe is invalid JSON: {e}"))
+    }
+
+    /// Persist the obtained access token at rest under a device-local key.
+    fn store_token(&self, token: &str) -> Result<(), String> {
+        let dir = self.oauth_dir.join("agent-credentials");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
+        let store = isyncyou_agent::CredentialStore::new(dir, key);
+        store
+            .put(
+                isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+                "subscription",
+                &isyncyou_agent::Secret::new(token.as_bytes().to_vec()),
+            )
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -185,6 +242,35 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
 
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
         self.streams.lock().unwrap().remove(turn_id)
+    }
+
+    /// EXPERIMENTAL (S-AG.12). Begin a device OAuth login: PKCE + state from the local
+    /// recipe; the app opens the returned URL in the system browser. Only present with
+    /// the feature; otherwise the trait default returns "not enabled".
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
+        let cfg = self.load_oauth_config()?;
+        let started = self
+            .oauth
+            .start(&cfg, redirect_uri)
+            .map_err(|e| e.to_string())?;
+        Ok(started.authorize_url)
+    }
+
+    /// EXPERIMENTAL (S-AG.12). The system browser returns here; exchange the code with
+    /// the stored PKCE verifier and persist the token, then show a success page.
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
+        let (verifier, redirect_uri) = self
+            .oauth
+            .take(state)
+            .ok_or("unknown or expired login state")?;
+        let cfg = self.load_oauth_config()?;
+        let http = isyncyou_agent::http::HttpTransport::new().map_err(|e| e.to_string())?;
+        let token = isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri)
+            .map_err(|e| e.to_string())?;
+        self.store_token(&token)?;
+        Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
 }
 
@@ -774,6 +860,12 @@ pub fn build_live_router(
     config_path: PathBuf,
     live_interval: Arc<AtomicU64>,
 ) -> isyncyou_webui::Router {
+    // The experimental subscription login reads its local recipe + stores its token
+    // next to the config file (on mobile that is the app-private filesDir).
+    let oauth_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     let base = match gate {
         Some(g) => isyncyou_webui::Router::with_gate(cfg.clone(), g),
         None => isyncyou_webui::Router::new(cfg.clone()),
@@ -818,7 +910,7 @@ pub fn build_live_router(
             mint_cap_token(),
         )
         .with_agent(
-            Arc::new(DaemonAgent::new(cfg.clone())) as Arc<dyn isyncyou_webui::AgentHandler>,
+            Arc::new(DaemonAgent::new(cfg.clone(), oauth_dir)) as Arc<dyn isyncyou_webui::AgentHandler>,
             mint_cap_token(),
         )
         .with_events(events)

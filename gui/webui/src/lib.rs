@@ -237,6 +237,20 @@ pub trait AgentHandler: Send + Sync {
     fn cancel(&self, turn_id: &str);
     /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
+
+    /// EXPERIMENTAL subscription login (S-AG.12). Begin a device OAuth login for
+    /// `provider`; `redirect_uri` is the loopback callback the browser returns to
+    /// (the client supplies its own origin). Returns the authorize URL the UI opens
+    /// in the **system browser**. Default: not available (handler opted out).
+    fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
+    /// EXPERIMENTAL subscription login callback. The system browser returns here with
+    /// the authorization `code` and the CSRF `state`; the handler exchanges the code
+    /// and stores the token, then returns a human-facing success page (HTML).
+    fn oauth_callback(&self, _code: &str, _state: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
 }
 
 /// Creates an outbound sharing link for a OneDrive item on behalf of a POST
@@ -1023,6 +1037,7 @@ impl Router {
                 "/api/v1/agent/turn" => self.agent_turn(req),
                 "/api/v1/agent/confirm" => self.agent_confirm(req),
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
+                "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -1032,6 +1047,11 @@ impl Router {
         match req.path.as_str() {
             // The shell is static; the strict app CSP header locks it to our assets.
             "/" => ApiResponse::html_with_csp(INDEX_HTML, APP_SHELL_CSP),
+            // EXPERIMENTAL subscription OAuth callback (S-AG.12). The **system browser**
+            // returns here after the operator's login; deliberately NOT under `/api/v1/`
+            // so it is exempt from the session-token gate (the browser has no token).
+            // CSRF-protected by the `state` minted at oauth/start (single-use).
+            "/agent/oauth/callback" => self.agent_oauth_callback(req),
             // app.js carries the (same-origin) capability tokens so the UI can POST
             // restore/share/sync; empty when an action is disabled, hiding its UI.
             "/app.js" => ApiResponse {
@@ -2595,6 +2615,43 @@ impl Router {
         ApiResponse::ok_json(&json!({ "cancelled": turn }))
     }
 
+    /// Begin the EXPERIMENTAL subscription OAuth login (S-AG.12). Cap+session gated
+    /// (the app initiates it); returns the authorize URL the UI opens in the system
+    /// browser. `redirect` is the loopback callback the client supplies (its origin).
+    fn agent_oauth_start(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let redirect = match req.q("redirect") {
+            Some(r) if !r.is_empty() => r,
+            _ => return ApiResponse::error(400, "redirect is required"),
+        };
+        let provider = req.q("provider").unwrap_or("default");
+        match handler.oauth_start(provider, redirect) {
+            Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// The system-browser OAuth callback (S-AG.12). NOT cap/session gated — the browser
+    /// holds no token; the `state` minted at start is the CSRF defence. Exchanges the
+    /// code, stores the token, and returns a human-facing success page.
+    fn agent_oauth_callback(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent.as_ref() {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "the agent is not enabled on this server"),
+        };
+        let (code, state) = match (req.q("code"), req.q("state")) {
+            (Some(c), Some(s)) if !c.is_empty() && !s.is_empty() => (c, s),
+            _ => return ApiResponse::error(400, "code and state are required"),
+        };
+        match handler.oauth_callback(code, state) {
+            Ok(html) => ApiResponse::html(&html),
+            Err(e) => ApiResponse::error(400, &e),
+        }
+    }
+
     /// The effective configuration the UI's settings view reads: engine-wide sync
     /// settings + each account's id/username/roots. Fields are **explicitly
     /// whitelisted** (not a blanket serialize of `Config`) so a future secret-
@@ -4026,6 +4083,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             tx.send("{\"event\":\"token\",\"text\":\"hi\"}".into()).ok();
             Some(rx)
         }
+        fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
+            Ok(format!(
+                "https://auth.example/authorize?redirect_uri={redirect_uri}&state=st-1"
+            ))
+        }
+        fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
+            Ok(format!("<html>connected code={code} state={state}</html>"))
+        }
     }
 
     #[test]
@@ -4070,6 +4135,49 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .with_cap_token(Some("x".into())),
         );
         assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn agent_oauth_start_is_cap_gated_and_returns_authorize_url() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let redir = "http%3A%2F%2F127.0.0.1%3A5000%2Fagent%2Foauth%2Fcallback";
+        let q = format!("/api/v1/agent/oauth/start?provider=anthropic&redirect={redir}");
+        // no cap token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", &q)).status, 401);
+        // with cap token -> 200 + an authorize URL the UI opens in the system browser
+        let ok = router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
+        // missing redirect -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=anthropic")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+    }
+
+    #[test]
+    fn agent_oauth_callback_is_session_gate_exempt_for_the_browser() {
+        let (_d, router) = setup();
+        // Mobile profile: the data API is session-token gated...
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("sess".into());
+        // /api/v1/* without the session token is refused (sanity: the gate is on)...
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", "/api/v1/agent/cancel?turn=t").with_cap_token(Some("agentsecret".into())))
+                .status,
+            401
+        );
+        // ...but the browser callback (not under /api/v1/) reaches the handler with NO
+        // session token and NO cap token — only the `state` protects it.
+        let cb = ApiRequest::new("GET", "/agent/oauth/callback?code=abc&state=st-1");
+        let r = router.route(&cb);
+        assert_eq!(r.status, 200);
+        assert!(String::from_utf8_lossy(&r.body).contains("connected code=abc"));
+        // missing code/state -> 400
+        let bad = ApiRequest::new("GET", "/agent/oauth/callback?code=abc");
+        assert_eq!(router.route(&bad).status, 400);
     }
 
     #[test]
