@@ -47,7 +47,7 @@ pub use stream::AgentStreamHub;
 pub use tool::{
     help_text, parse_action, registry_tool_names, tool_schema, ToolAction, ToolClass, TOOL_NAME,
 };
-pub use turn::{run_turn, Message, Role, ToolExecutor, TurnOutcome};
+pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
