@@ -51,6 +51,8 @@ pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
+#[cfg(feature = "agent-subscription-experimental")]
+pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
 #[cfg(feature = "http")]
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
 #[cfg(feature = "onedrive")]
