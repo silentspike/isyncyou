@@ -73,6 +73,15 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Mitigation** | `cargo deny` runs in the gate (advisories + licenses + bans); Dependabot tracks updates. The release workflow generates a CycloneDX SBOM from the locked Cargo graph and requests GitHub artifact attestations for the release archives, AppImage, Windows zip, SBOM, and checksum file. |
 | **Status** | **In progress** — `cargo deny`, Dependabot, SBOM generation, and signed GitHub artifact attestations are wired; deployed staging/full live-E2E evidence is still open. |
 
+## R8 — Experimental subscription provider is visible in a public repo
+
+| | |
+|---|---|
+| **Risk** | The in-app agent (Epic #614) includes an experimental Claude/Codex *subscription* provider that mimics an official client's identity to ride the user's own consumer subscription. Even gated, its source is visible in a public repo, and a per-app consent dialog does not make the access provider-ToS-compliant — only the provider could. |
+| **Impact** | Medium — a reputational/compliance signal in an audit-clean public repo; brittle against provider header/wire drift. |
+| **Mitigation** | The official providers (Anthropic Messages, OpenAI Responses) are the default product path. The subscription provider is behind a default-off `agent-subscription-experimental` Cargo feature, **excluded from CI and release artifacts**, **absent from the README**, and documented only under `docs/experimental/` as `unsupported / personal-build only` (no product/marketing claim). The detailed subscription wire format stays in **private local evidence**; the public surface carries no reproducible recipe, token, or secret (S-AG.0/#615, S-AG.12/#627). The sole operator accepts the residual with eyes open. |
+| **Status** | **Accepted** — a deliberate, documented trade-off: the experimental path is fenced (feature-gated, non-release, non-README, private-evidence-only) so the public product path stays audit-clean while the operator retains a personal-build option. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
 ---
 
 ## How this register is maintained
