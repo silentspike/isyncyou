@@ -78,5 +78,7 @@ pub mod fake;
 #[cfg(any(feature = "http", test))]
 pub mod openai;
 #[cfg(feature = "agent-subscription-experimental")]
+pub mod codex;
+#[cfg(feature = "agent-subscription-experimental")]
 pub mod subscription;
 pub use fake::FakeProvider;

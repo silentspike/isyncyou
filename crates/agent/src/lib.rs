@@ -56,6 +56,8 @@ pub use archive::StoreArchive;
 #[cfg(feature = "agent-subscription-experimental")]
 pub use oauth::{AgentOAuth, OAuthConfig, StartedLogin};
 #[cfg(feature = "agent-subscription-experimental")]
+pub use provider::codex::{CodexConfig, CodexProvider};
+#[cfg(feature = "agent-subscription-experimental")]
 pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
 #[cfg(feature = "http")]
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
