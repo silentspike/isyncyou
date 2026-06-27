@@ -27,6 +27,7 @@ mod error;
 pub mod http;
 pub mod provider;
 pub mod retrieval;
+pub mod secrets;
 pub mod session;
 pub mod session_crypto;
 pub mod tool;
@@ -36,6 +37,7 @@ pub use archive::{ArchiveSource, ItemRef};
 pub use error::AgentError;
 pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent};
 pub use retrieval::RetrievalExecutor;
+pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
 pub use session::{detect_fork, new_ulid, InMemoryTransport, Session, SessionTransport, Turn};
 pub use session_crypto::{open, seal, SealedTurn};
 pub use tool::{

@@ -31,6 +31,9 @@ isyncyou-connectors = { path = "../connectors", default-features = false, option
 # pre-resolved Files.ReadWrite token, so no engine dependency is needed here.
 isyncyou-graph = { path = "../graph", default-features = false, optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 http = ["dep:reqwest"]
 onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http"]
