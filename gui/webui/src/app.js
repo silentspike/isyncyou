@@ -3671,7 +3671,10 @@ function openAccountSwitcher() {
 // returns to our loopback callback, which exchanges the code and stores the token.
 async function startAiLogin(provider) {
   try {
-    const redirect = location.origin + "/agent/oauth/callback";
+    // Path MUST be exactly "/callback": provider OAuth clients register the loopback
+    // redirect as http://127.0.0.1:<port>/callback (RFC 8252); any other path is
+    // rejected as an invalid OAuth request.
+    const redirect = location.origin + "/callback";
     const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
     if (d && d.authorize_url) {
       toast("Opening sign-in in your browser…");

@@ -1050,8 +1050,10 @@ impl Router {
             // EXPERIMENTAL subscription OAuth callback (S-AG.12). The **system browser**
             // returns here after the operator's login; deliberately NOT under `/api/v1/`
             // so it is exempt from the session-token gate (the browser has no token).
-            // CSRF-protected by the `state` minted at oauth/start (single-use).
-            "/agent/oauth/callback" => self.agent_oauth_callback(req),
+            // CSRF-protected by the `state` minted at oauth/start (single-use). The path
+            // is exactly `/callback` because provider OAuth clients register the loopback
+            // redirect as http://127.0.0.1:<port>/callback (RFC 8252).
+            "/callback" => self.agent_oauth_callback(req),
             // app.js carries the (same-origin) capability tokens so the UI can POST
             // restore/share/sync; empty when an action is disabled, hiding its UI.
             "/app.js" => ApiResponse {
@@ -4171,12 +4173,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         // ...but the browser callback (not under /api/v1/) reaches the handler with NO
         // session token and NO cap token — only the `state` protects it.
-        let cb = ApiRequest::new("GET", "/agent/oauth/callback?code=abc&state=st-1");
+        let cb = ApiRequest::new("GET", "/callback?code=abc&state=st-1");
         let r = router.route(&cb);
         assert_eq!(r.status, 200);
         assert!(String::from_utf8_lossy(&r.body).contains("connected code=abc"));
         // missing code/state -> 400
-        let bad = ApiRequest::new("GET", "/agent/oauth/callback?code=abc");
+        let bad = ApiRequest::new("GET", "/callback?code=abc");
         assert_eq!(router.route(&bad).status, 400);
     }
 
