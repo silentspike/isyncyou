@@ -27,7 +27,7 @@ pub struct OAuthConfig {
     pub token_url: String,
     pub client_id: String,
     pub scopes: Vec<String>,
-    /// The manual (copy-paste) redirect: claude.ai shows the code on this page instead of
+    /// The manual (copy-paste) redirect: Claude shows the code on this page instead of
     /// redirecting to a loopback server. Avoids the whole loopback-redirect fragility.
     pub manual_redirect_url: String,
 }
@@ -35,14 +35,11 @@ pub struct OAuthConfig {
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
-            // Captured from the REAL `claude` CLI (xdg-open intercept on `claude
-            // setup-token`): the authorize endpoint is claude.com/cai/oauth/authorize —
-            // NOT claude.ai/oauth/authorize (which renders a generic consent that fails
-            // the submit with "Invalid request format"). This was the root cause.
+            // Captured from the native Claude Code 2.1.195 `setup-token` flow.
             authorize_url: "https://claude.com/cai/oauth/authorize".to_string(),
-            token_url: "https://console.anthropic.com/v1/oauth/token".to_string(),
+            token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
-            manual_redirect_url: "https://console.anthropic.com/oauth/code/callback".to_string(),
+            manual_redirect_url: "https://platform.claude.com/oauth/code/callback".to_string(),
             // Exactly what the real `claude setup-token` requests (captured): user:inference.
             scopes: vec!["user:inference".to_string()],
         }

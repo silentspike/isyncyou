@@ -3679,13 +3679,16 @@ function openAccountSwitcher() {
 // code. No callback server, no loopback host/port fragility.
 async function startAiLogin(provider) {
   try {
-    // Loopback-primary (matches the real claude client): the browser returns to the
-    // engine's own /callback, which completes server-side. Use `localhost` (not 127.0.0.1)
-    // for provider redirect-URI compatibility.
-    const redirect = "http://localhost:" + location.port + "/callback";
-    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
+    // Desktop can use the Claude Code loopback flow. On Android, the external browser
+    // is user-selected; Microsoft Edge rejects this flow at the consent submit, so use
+    // Claude's manual code page there.
+    const isAndroid = !!window.AndroidSession;
+    const params = { provider };
+    if (!isAndroid) params.redirect = "http://localhost:" + location.port + "/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    showWaitingStep();               // waiting UI + poll; completes when /callback fires
+    if (isAndroid) showCodeStep();
+    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
     location.href = d.authorize_url; // the WebView hands the external URL to the system browser
   } catch (e) {
