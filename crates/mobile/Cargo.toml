@@ -16,7 +16,7 @@ isyncyou-core = { path = "../core" }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-app-host = { path = "../app-host", default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
-jni = "0.21"
+jni = "0.22"
 
 [features]
 # Android ships plain-store (bundled sqlite, no OpenSSL/SQLCipher) — see #89 P0.
