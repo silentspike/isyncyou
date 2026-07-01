@@ -263,6 +263,24 @@ pub trait AgentHandler: Send + Sync {
     fn status_json(&self) -> String {
         "{\"connected\":false}".to_string()
     }
+
+    /// EXPERIMENTAL subscription credential import (S-AG.12): store an access token +
+    /// refresh token obtained on another device (where the OAuth consent works), so this
+    /// device can run + self-refresh the subscription. Default: not available.
+    fn subscription_import(
+        &self,
+        _access: &str,
+        _refresh: &str,
+        _expires_at_ms: u64,
+    ) -> Result<(), String> {
+        Err("subscription import is not enabled on this server".into())
+    }
+
+    /// Set the active provider + model (the in-app model switcher). The offered models are
+    /// reported in `status_json`'s `models` field. Default: not available.
+    fn set_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
+        Err("model selection is not enabled on this server".into())
+    }
 }
 
 /// Creates an outbound sharing link for a OneDrive item on behalf of a POST
@@ -1051,6 +1069,8 @@ impl Router {
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
                 "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
+                "/api/v1/agent/subscription/import" => self.agent_subscription_import(req),
+                "/api/v1/agent/model" => self.agent_set_model(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -2679,6 +2699,47 @@ impl Router {
         };
         match handler.oauth_complete(code) {
             Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
+            Err(e) => ApiResponse::error(400, &e),
+        }
+    }
+
+    /// Import a subscription credential obtained on another device (S-AG.12). Cap + session
+    /// gated (the app initiates it). `access_token`, `refresh_token` and `expires_at_ms`
+    /// come as query params (the router parses no body); the handler stores it encrypted.
+    fn agent_subscription_import(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let access = req.q("access_token").unwrap_or("");
+        if access.is_empty() {
+            return ApiResponse::error(400, "access_token is required");
+        }
+        let refresh = req.q("refresh_token").unwrap_or("");
+        let expires_at_ms = req
+            .q("expires_at_ms")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        match handler.subscription_import(access, refresh, expires_at_ms) {
+            Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
+            Err(e) => ApiResponse::error(400, &e),
+        }
+    }
+
+    /// Set the active provider + model from the in-app switcher (S-AG.6). Cap + session
+    /// gated; `provider` and `model` come as query params.
+    fn agent_set_model(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let provider = req.q("provider").unwrap_or("");
+        let model = req.q("model").unwrap_or("");
+        if provider.is_empty() || model.is_empty() {
+            return ApiResponse::error(400, "provider and model are required");
+        }
+        match handler.set_model(provider, model) {
+            Ok(_) => ApiResponse::ok_json(&json!({ "provider": provider, "model": model })),
             Err(e) => ApiResponse::error(400, &e),
         }
     }

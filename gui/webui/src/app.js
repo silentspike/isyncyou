@@ -52,7 +52,7 @@ const ICONS = {
   "rotate-ccw": "M3 2v6h6M3.5 8a9 9 0 1 0 2.1-3.4L3 8",
   play: "M5 3l14 9-14 9z", pause: "M6 4h4v16H6zM14 4h4v16h-4z",
   "refresh-cw": "M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16",
-  x: "M18 6L6 18M6 6l12 12", "chevron-right": "M9 6l6 6-6 6", "chevron-left": "M15 6l-6 6 6 6",
+  x: "M18 6L6 18M6 6l12 12", "chevron-right": "M9 6l6 6-6 6", "chevron-left": "M15 6l-6 6 6 6", "chevron-down": "M6 9l6 6 6-6",
   plus: "M12 5v14M5 12h14",
   paperclip: "M21.4 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48",
   "external-link": "M15 3h6v6M10 14L21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
@@ -3679,10 +3679,21 @@ function openAccountSwitcher() {
 // Android rejects the Claude consent submit — users on Edge should pick another default.
 async function startAiLogin(provider) {
   try {
-    const redirect = "http://localhost:" + location.port + "/callback";
-    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
+    // Claude/Anthropic uses the MANUAL flow (console redirect + paste the code): on-device,
+    // claude.ai rejects the loopback redirect (both `localhost` and `127.0.0.1`) with "Invalid
+    // request format", while the console redirect is verified to complete a real token
+    // exchange. The manual flow also sidesteps the background-network block — the exchange runs
+    // in `oauth_complete` while the app is FOREGROUND (the user is back pasting the code), not
+    // while it is backgrounded behind the browser. Codex keeps its loopback flow (its own
+    // 127.0.0.1:1455 callback listener).
+    const manual = provider === "anthropic";
+    const query = manual
+      ? qs({ provider })
+      : qs({ provider, redirect: "http://127.0.0.1:" + location.port + "/callback" });
+    const d = await post("/api/v1/agent/oauth/start?" + query, CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    showWaitingStep();               // waiting UI + poll; completes when /callback fires
+    if (manual) showCodeStep();      // "paste your code" UI (manual/console redirect)
+    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
     location.href = d.authorize_url; // the WebView hands the external URL to the system browser
   } catch (e) {
@@ -3784,7 +3795,7 @@ function renderAssistantChat(body, st) {
   body.append(
     el("div", { style: "display:flex;align-items:center;gap:.5rem;max-width:46rem;margin:.1rem auto .9rem" },
       el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
-      el("span", { class: "dim", style: "font-size:.85rem", text: st.model || "" }),
+      agentModelSwitcher(st),
     ),
     el("div", { id: "asst-log", style: "display:flex;flex-direction:column;gap:.8rem;max-width:46rem;margin:0 auto;width:100%;padding-bottom:1rem" }),
     el("div", { style: "position:sticky;bottom:0;max-width:46rem;margin:0 auto;width:100%" },
@@ -3801,6 +3812,89 @@ function renderAssistantChat(body, st) {
     ASST_LOG.forEach(m => log.append(renderAsstMsg(m)));
     requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
   }
+}
+
+// Model switcher: pick any available Claude/Codex model. The choice is persisted
+// server-side (agent-settings) and applies to the next turn.
+// Custom in-UI model picker (no native <select>): a glass panel that unfolds with a
+// spring animation, models grouped by provider, active one highlighted. Falls back to a
+// plain label when nothing is connected.
+function agentModelSwitcher(st) {
+  const models = st.models || {};
+  const cur = (st.provider || "") + "|" + (st.model || "");
+  const curLabel = () => {
+    for (const [prov, tag] of [["claude", "Claude"], ["codex", "ChatGPT"]]) {
+      const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
+      if (m) return tag + " · " + m.label;
+    }
+    return st.model || "Select model";
+  };
+  const rows = [];
+  const addGroup = (prov, connected, tag) => {
+    if (!connected) return;
+    rows.push(el("div", { class: "mdl-group" }, tag));
+    (models[prov] || []).forEach((m) => {
+      const val = prov + "|" + m.id;
+      rows.push(el("div",
+        { class: "mdl-item" + (val === cur ? " active" : ""), role: "option", onclick: () => pickModel(prov, m.id) },
+        el("span", { class: "mdl-dot" }),
+        el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
+    });
+  };
+  addGroup("claude", st.claude, "Claude");
+  addGroup("codex", st.codex, "ChatGPT");
+  if (!st.codex) {
+    rows.push(el("div", { class: "mdl-item mdl-connect", onclick: () => connectCodex() },
+      el("span", { class: "mdl-plus" }, "＋"),
+      el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
+  }
+  if (!rows.length) return el("span", { class: "dim", style: "font-size:.85rem", text: st.model || "" });
+
+  const wrap = el("div", { class: "mdl" });
+  const closeOutside = (ev) => { if (!wrap.contains(ev.target)) close(); };
+  const close = () => { wrap.classList.remove("open"); document.removeEventListener("pointerdown", closeOutside, true); };
+  const trigger = el("button",
+    { class: "mdl-trigger", type: "button", "aria-haspopup": "listbox", title: "Switch model",
+      onclick: (ev) => {
+        ev.stopPropagation();
+        if (wrap.classList.toggle("open")) document.addEventListener("pointerdown", closeOutside, true);
+        else document.removeEventListener("pointerdown", closeOutside, true);
+      } },
+    el("span", { class: "mdl-cur", text: curLabel() }), icon("chevron-down", "mdl-caret"));
+  wrap.append(trigger, el("div", { class: "mdl-panel", role: "listbox" }, ...rows));
+  return wrap;
+}
+async function pickModel(provider, model) {
+  try {
+    await post("/api/v1/agent/model?" + qs({ provider, model }), CAP.agent);
+    toast("Model: " + model);
+    renderAssistantView($("#view"));
+  } catch (err) {
+    toast("Could not switch model: " + (err.message || err));
+  }
+}
+// Start the real on-device ChatGPT/Codex OAuth (opens the system browser; the daemon's
+// loopback callback server catches the redirect). Then poll until codex connects.
+async function connectCodex() {
+  try {
+    // Codex ignores this redirect (its engine binds a fixed 127.0.0.1:1455 callback listener);
+    // we pass a loopback origin only for symmetry with the API.
+    const redirect = "http://127.0.0.1:" + location.port + "/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider: "codex", redirect }), CAP.agent);
+    if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
+    toast("Opening ChatGPT sign-in…");
+    location.href = d.authorize_url;
+    pollCodexStatus(0);
+  } catch (e) {
+    toast("ChatGPT sign-in unavailable: " + (e.message || e));
+  }
+}
+async function pollCodexStatus(n) {
+  try {
+    const s = await api("/api/v1/agent/status");
+    if (s && s.codex) { toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
+  } catch (_) {}
+  if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
 }
 
 function renderAsstMsg(m) {

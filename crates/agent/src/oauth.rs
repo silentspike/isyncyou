@@ -35,13 +35,23 @@ pub struct OAuthConfig {
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
-            // Captured from the native Claude Code 2.1.195 `setup-token` flow.
-            authorize_url: "https://claude.com/cai/oauth/authorize".to_string(),
+            // `authorize_url` verified against Claude Code `cli.js`. `token_url`: LIVE-verified
+            // on-device 2026-07-01 — `console.anthropic.com/v1/oauth/token` returns HTTP 404,
+            // `platform.claude.com/v1/oauth/token` returns HTTP 200 with a real subscription
+            // token (access+refresh, scope `user:inference`, 8h expiry). The earlier
+            // `console.anthropic.com` value was wrong; the live token endpoint is platform.claude.com.
+            authorize_url: "https://claude.ai/oauth/authorize".to_string(),
             token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
-            manual_redirect_url: "https://platform.claude.com/oauth/code/callback".to_string(),
-            // Exactly what the real `claude setup-token` requests (captured): user:inference.
-            scopes: vec!["user:inference".to_string()],
+            manual_redirect_url: "https://console.anthropic.com/oauth/code/callback".to_string(),
+            // The full scope set the real client requests (cli.js `Fp0`); requesting only
+            // `user:inference` renders the consent but the authorize submit is rejected.
+            scopes: vec![
+                "org:create_api_key".to_string(),
+                "user:profile".to_string(),
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ],
         }
     }
 }
@@ -74,6 +84,12 @@ pub fn pkce() -> Result<(String, String), AgentError> {
     let verifier = rand_b64(32)?;
     let digest = ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes());
     Ok((verifier, B64URL.encode(digest.as_ref())))
+}
+
+/// A random URL-safe CSRF `state` token (used by flows that don't go through
+/// [`AgentOAuth`], e.g. the Codex loopback-server flow).
+pub fn rand_state() -> Result<String, AgentError> {
+    rand_b64(16)
 }
 
 /// Build the provider authorize URL (PKCE S256) the system browser opens.
@@ -180,7 +196,7 @@ pub fn exchange(
     verifier: &str,
     redirect_uri: &str,
     state: &str,
-) -> Result<String, AgentError> {
+) -> Result<RefreshedToken, AgentError> {
     let body = serde_json::json!({
         "grant_type": "authorization_code",
         "code": code,
@@ -188,8 +204,10 @@ pub fn exchange(
         "client_id": cfg.client_id,
         "code_verifier": verifier,
         "state": state,
-        // The real `claude setup-token` sends this on exchange (cli.js ml0).
-        "expires_in": 31_536_000,
+        // NOTE: the `expires_in` field (used by the long-lived `claude setup-token` flow) is
+        // deliberately NOT sent for the normal subscription OAuth — platform.claude.com rejects
+        // it with HTTP 400 "Invalid expiry for scope" (LIVE-verified 2026-07-01). Omitting it
+        // yields the standard 8h subscription token (expires_in 28800) + refresh_token.
     });
     let (status, text) = http.post_json(&cfg.token_url, &[], &body)?;
     if status >= 400 {
@@ -199,10 +217,236 @@ pub fn exchange(
     }
     let v: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| AgentError::Provider(format!("oauth token JSON: {e}")))?;
-    v.get("access_token")
+    let access_token = v
+        .get("access_token")
         .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| AgentError::Provider("oauth response had no access_token".into()))
+        .ok_or_else(|| AgentError::Provider("oauth response had no access_token".into()))?
+        .to_string();
+    // Keep the refresh token + lifetime so the credential can self-refresh; the subscription
+    // token lasts only ~8h (expires_in 28800), so without these the client would
+    // "connection-lost" every 8h with no way to renew (LIVE-verified 2026-07-01).
+    let refresh_token = v
+        .get("refresh_token")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let expires_in = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(0);
+    Ok(RefreshedToken {
+        access_token,
+        refresh_token,
+        expires_in,
+    })
+}
+
+/// A refreshed subscription token: the new access token plus the (possibly rotated)
+/// refresh token and its lifetime in seconds.
+#[cfg(feature = "http")]
+pub struct RefreshedToken {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: u64,
+}
+
+/// Refresh an expired subscription access token (mirrors the real client's `dl0`): POST the
+/// refresh token to the token endpoint for a fresh access token (+ possibly a rotated refresh
+/// token). The scope mirrors the real refresh request; the endpoint comes from `cfg`.
+#[cfg(feature = "http")]
+pub fn refresh(
+    http: &crate::http::HttpTransport,
+    cfg: &OAuthConfig,
+    refresh_token: &str,
+) -> Result<RefreshedToken, AgentError> {
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": cfg.client_id,
+        "scope": "user:profile user:inference user:sessions:claude_code",
+    });
+    let (status, text) = http.post_json(&cfg.token_url, &[], &body)?;
+    if status >= 400 {
+        return Err(AgentError::Provider(format!(
+            "oauth token refresh failed (status {status})"
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| AgentError::Provider(format!("oauth refresh JSON: {e}")))?;
+    let access_token = v
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| AgentError::Provider("refresh response had no access_token".into()))?
+        .to_string();
+    // The token endpoint may rotate the refresh token; if it doesn't, keep the current one.
+    let refresh_token = v
+        .get("refresh_token")
+        .and_then(|t| t.as_str())
+        .unwrap_or(refresh_token)
+        .to_string();
+    let expires_in = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(0);
+    Ok(RefreshedToken {
+        access_token,
+        refresh_token,
+        expires_in,
+    })
+}
+
+// ---------------------------------------------------------------------------------------
+// EXPERIMENTAL Codex/ChatGPT (OpenAI) device OAuth. Captured from the `codex` CLI
+// (auth.openai.com). Loopback flow on the fixed port the client registers; the token
+// endpoint wants form-urlencoding (not JSON), and the ChatGPT account id lives in the
+// id_token's `https://api.openai.com/auth` claim.
+// ---------------------------------------------------------------------------------------
+
+/// OpenAI OAuth endpoints/client for the Codex flow. Defaults to the public `codex` CLI
+/// client (a PKCE public client — not a secret).
+#[derive(Debug, Clone)]
+pub struct CodexOAuthConfig {
+    pub authorize_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: String,
+}
+
+impl Default for CodexOAuthConfig {
+    fn default() -> Self {
+        Self {
+            authorize_url: "https://auth.openai.com/oauth/authorize".to_string(),
+            token_url: "https://auth.openai.com/oauth/token".to_string(),
+            client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
+            // OpenAI registers exactly this loopback redirect; other ports are rejected
+            // (verified: an arbitrary port returns `authorize_hydra_invalid_request`).
+            redirect_uri: "http://localhost:1455/auth/callback".to_string(),
+            scope: "openid profile email offline_access api.connectors.read api.connectors.invoke"
+                .to_string(),
+        }
+    }
+}
+
+/// Build the Codex authorize URL (PKCE S256) the system browser opens. NOTE: we deliberately
+/// do **not** send `codex_cli_simplified_flow` — that makes the consent hand the code to the
+/// loopback server over a JS `fetch` (CORS) handshake the CLI's own server implements; we use
+/// the plain redirect flow instead, so the browser just navigates to `redirect_uri?code=…`.
+/// `id_token_add_organizations` is kept so the id_token carries the ChatGPT account id.
+pub fn codex_build_authorize_url(cfg: &CodexOAuthConfig, challenge: &str, state: &str) -> String {
+    format!(
+        "{base}?response_type=code&client_id={cid}&redirect_uri={ru}&scope={sc}\
+         &code_challenge={ch}&code_challenge_method=S256&state={st}\
+         &id_token_add_organizations=true",
+        base = cfg.authorize_url,
+        cid = pct(&cfg.client_id),
+        ru = pct(&cfg.redirect_uri),
+        sc = pct(&cfg.scope),
+        ch = pct(challenge),
+        st = pct(state),
+    )
+}
+
+/// A Codex/ChatGPT credential from the token endpoint.
+#[cfg(feature = "http")]
+pub struct CodexTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub account_id: String,
+    pub expires_in: u64,
+}
+
+/// Extract the ChatGPT `account_id` from an id_token JWT (claim
+/// `https://api.openai.com/auth` → `chatgpt_account_id`). Empty if it cannot be read.
+#[cfg(feature = "http")]
+fn codex_account_id_from_id_token(id_token: &str) -> String {
+    let payload = match id_token.split('.').nth(1) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let bytes = match B64URL.decode(payload) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("https://api.openai.com/auth")
+                .and_then(|a| a.get("chatgpt_account_id"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "http")]
+fn codex_parse_tokens(text: &str, fallback_refresh: &str) -> Result<CodexTokens, AgentError> {
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| AgentError::Provider(format!("codex token JSON: {e}")))?;
+    let access_token = v
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| AgentError::Provider("codex response had no access_token".into()))?
+        .to_string();
+    let refresh_token = v
+        .get("refresh_token")
+        .and_then(|t| t.as_str())
+        .unwrap_or(fallback_refresh)
+        .to_string();
+    let account_id =
+        codex_account_id_from_id_token(v.get("id_token").and_then(|t| t.as_str()).unwrap_or(""));
+    let expires_in = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(0);
+    Ok(CodexTokens {
+        access_token,
+        refresh_token,
+        account_id,
+        expires_in,
+    })
+}
+
+/// Exchange a Codex authorization `code` (form-urlencoded, PKCE) for tokens.
+#[cfg(feature = "http")]
+pub fn codex_exchange(
+    http: &crate::http::HttpTransport,
+    cfg: &CodexOAuthConfig,
+    code: &str,
+    verifier: &str,
+) -> Result<CodexTokens, AgentError> {
+    let (status, text) = http.post_form(
+        &cfg.token_url,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", &cfg.redirect_uri),
+            ("client_id", &cfg.client_id),
+            ("code_verifier", verifier),
+        ],
+    )?;
+    if status >= 400 {
+        return Err(AgentError::Provider(format!(
+            "codex token exchange failed (status {status}): {}",
+            text.chars().take(300).collect::<String>()
+        )));
+    }
+    codex_parse_tokens(&text, "")
+}
+
+/// Refresh a Codex access token (form-urlencoded).
+#[cfg(feature = "http")]
+pub fn codex_refresh(
+    http: &crate::http::HttpTransport,
+    cfg: &CodexOAuthConfig,
+    refresh_token: &str,
+) -> Result<CodexTokens, AgentError> {
+    let (status, text) = http.post_form(
+        &cfg.token_url,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", &cfg.client_id),
+            ("scope", &cfg.scope),
+        ],
+    )?;
+    if status >= 400 {
+        return Err(AgentError::Provider(format!(
+            "codex token refresh failed (status {status})"
+        )));
+    }
+    codex_parse_tokens(&text, refresh_token)
 }
 
 #[cfg(test)]

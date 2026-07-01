@@ -1259,3 +1259,61 @@ a.note-meta-chip:hover { color: var(--accent); }
   touch-action: none;
 }
 /* movement is touch-drag (mobile) or ← → (desktop); fire is automatic */
+
+/* ── Assistant model picker: in-UI dropdown with spring unfold ───────────── */
+.mdl { position: relative; display: inline-block; }
+.mdl-trigger {
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  font-size: var(--fs-sm); font-weight: 500; color: var(--text-hi);
+  padding: 5px 10px; border-radius: var(--r-md);
+  background: var(--glass); border: 1px solid var(--glass-border);
+  cursor: pointer; transition: background .15s, border-color .15s;
+}
+.mdl-trigger:hover { background: color-mix(in oklab, var(--accent) 9%, var(--glass)); border-color: var(--accent-line); }
+.mdl-caret { width: 14px; height: 14px; color: var(--text-lo); transition: transform .28s cubic-bezier(.34,1.56,.64,1); }
+.mdl.open .mdl-caret { transform: rotate(180deg); color: var(--accent-2); }
+.mdl-panel {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 60;
+  min-width: 15rem; padding: 5px;
+  background: color-mix(in oklab, var(--bg-1) 90%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.5); backdrop-filter: blur(18px) saturate(1.5);
+  border: 1px solid var(--glass-border); border-radius: var(--r-lg);
+  box-shadow: 0 18px 48px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.04);
+  transform-origin: top left; transform: translateY(-6px) scale(.95);
+  opacity: 0; pointer-events: none;
+  transition: transform .26s cubic-bezier(.34,1.56,.64,1), opacity .18s ease;
+}
+.mdl.open .mdl-panel { transform: translateY(0) scale(1); opacity: 1; pointer-events: auto; }
+.mdl-group {
+  font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .07em;
+  color: var(--text-lo); padding: 8px 9px 3px; font-weight: 600;
+}
+.mdl-item {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 8px 9px; border-radius: var(--r-md);
+  color: var(--text-mid); font-size: var(--fs-base); cursor: pointer;
+  transition: background .13s, color .13s;
+}
+.mdl-item:hover { background: var(--accent-soft); color: var(--text-hi); }
+.mdl-item.active { background: color-mix(in oklab, var(--accent) 18%, transparent); color: var(--text-hi); }
+.mdl-dot { width: 8px; height: 8px; border-radius: var(--r-full); background: var(--text-lo); opacity: .45; flex: none; transition: background .13s; }
+.mdl-item.active .mdl-dot { background: var(--grad-accent); opacity: 1; box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 70%, transparent); }
+.mdl-lbl { flex: 1; }
+.mdl-connect { color: var(--accent-2); font-weight: 500; }
+.mdl-plus { width: 8px; text-align: center; font-weight: 700; flex: none; }
+/* staggered fade-in of each row when the panel opens */
+.mdl-panel > * { opacity: 0; }
+.mdl.open .mdl-panel > * { animation: mdlRowIn .28s cubic-bezier(.34,1.4,.64,1) forwards; }
+.mdl.open .mdl-panel > *:nth-child(1) { animation-delay: .03s; }
+.mdl.open .mdl-panel > *:nth-child(2) { animation-delay: .05s; }
+.mdl.open .mdl-panel > *:nth-child(3) { animation-delay: .07s; }
+.mdl.open .mdl-panel > *:nth-child(4) { animation-delay: .09s; }
+.mdl.open .mdl-panel > *:nth-child(5) { animation-delay: .11s; }
+.mdl.open .mdl-panel > *:nth-child(6) { animation-delay: .13s; }
+.mdl.open .mdl-panel > *:nth-child(7) { animation-delay: .15s; }
+.mdl.open .mdl-panel > *:nth-child(8) { animation-delay: .17s; }
+.mdl.open .mdl-panel > *:nth-child(n+9) { animation-delay: .19s; }
+@keyframes mdlRowIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) {
+  .mdl-panel, .mdl-caret, .mdl.open .mdl-panel > * { transition: none !important; animation: none !important; opacity: 1 !important; transform: none !important; }
+}
