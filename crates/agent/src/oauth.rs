@@ -149,7 +149,10 @@ impl AgentOAuth {
         let state = rand_b64(32)?;
         let authorize_url = build_authorize_url(cfg, redirect_uri, &challenge, &state);
         self.pending.borrow_insert(&state, verifier, redirect_uri);
-        Ok(StartedLogin { authorize_url, state })
+        Ok(StartedLogin {
+            authorize_url,
+            state,
+        })
     }
 
     /// Take the pending login for `state` (single-use), returning (verifier, redirect_uri).
@@ -478,7 +481,12 @@ mod tests {
 
     #[test]
     fn authorize_url_has_pkce_s256_and_encoded_params() {
-        let url = build_authorize_url(&cfg(), "http://127.0.0.1:5000/agent/oauth/callback", "CH", "ST");
+        let url = build_authorize_url(
+            &cfg(),
+            "http://127.0.0.1:5000/agent/oauth/callback",
+            "CH",
+            "ST",
+        );
         assert!(url.starts_with("https://example.invalid/oauth/authorize?"));
         assert!(url.contains("code=true")); // required by the Claude Code authorize flow
         assert!(url.contains("response_type=code"));
@@ -493,8 +501,12 @@ mod tests {
     #[test]
     fn start_then_take_is_single_use() {
         let oauth = AgentOAuth::new();
-        let started = oauth.start(&cfg(), "http://127.0.0.1:5000/agent/oauth/callback").unwrap();
-        assert!(started.authorize_url.contains(&format!("state={}", pct(&started.state))));
+        let started = oauth
+            .start(&cfg(), "http://127.0.0.1:5000/agent/oauth/callback")
+            .unwrap();
+        assert!(started
+            .authorize_url
+            .contains(&format!("state={}", pct(&started.state))));
         let (verifier, redirect) = oauth.take(&started.state).expect("pending present");
         assert!(!verifier.is_empty());
         assert_eq!(redirect, "http://127.0.0.1:5000/agent/oauth/callback");

@@ -116,7 +116,10 @@ impl SubscriptionProvider {
                 "authorization".to_string(),
                 format!("Bearer {}", self.access_token),
             ),
-            ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+            (
+                "anthropic-version".to_string(),
+                ANTHROPIC_VERSION.to_string(),
+            ),
             ("anthropic-beta".to_string(), ANTHROPIC_BETA.to_string()),
             (
                 "anthropic-dangerous-direct-browser-access".to_string(),
@@ -200,29 +203,47 @@ mod tests {
     #[test]
     fn default_config_is_the_claude_code_recipe() {
         let c = SubscriptionConfig::default();
-        assert_eq!(c.messages_url, "https://api.anthropic.com/v1/messages?beta=true");
+        assert_eq!(
+            c.messages_url,
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
         assert_eq!(c.cli_version, "2.1.195");
     }
 
     #[test]
     fn headers_mimic_the_claude_code_client() {
-        let p =
-            SubscriptionProvider::new("tok123", "claude-x", "base system", SubscriptionConfig::default())
-                .unwrap();
+        let p = SubscriptionProvider::new(
+            "tok123",
+            "claude-x",
+            "base system",
+            SubscriptionConfig::default(),
+        )
+        .unwrap();
         let h = p.request_headers();
         let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert_eq!(get("authorization").unwrap(), "Bearer tok123");
         assert_eq!(get("anthropic-version").unwrap(), "2023-06-01");
-        assert_eq!(get("anthropic-beta").unwrap(), "claude-code-20250219,oauth-2025-04-20");
+        assert_eq!(
+            get("anthropic-beta").unwrap(),
+            "claude-code-20250219,oauth-2025-04-20"
+        );
         assert_eq!(get("x-app").unwrap(), "cli");
-        assert_eq!(get("user-agent").unwrap(), "claude-cli/2.1.195 (external, sdk-cli)");
+        assert_eq!(
+            get("user-agent").unwrap(),
+            "claude-cli/2.1.195 (external, sdk-cli)"
+        );
         assert!(get("x-claude-code-session-id").is_some());
     }
 
     #[test]
     fn first_system_block_is_the_billing_header() {
-        let p = SubscriptionProvider::new("t", "m", "the real system prompt", SubscriptionConfig::default())
-            .unwrap();
+        let p = SubscriptionProvider::new(
+            "t",
+            "m",
+            "the real system prompt",
+            SubscriptionConfig::default(),
+        )
+        .unwrap();
         let s = p.system_blocks();
         let first = s[0]["text"].as_str().unwrap();
         assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.195.cab;"));
@@ -254,6 +275,9 @@ mod tests {
         let parts: Vec<&str> = u.split('-').collect();
         assert_eq!(parts.len(), 5);
         assert!(parts[2].starts_with('4')); // version 4
-        assert!(matches!(parts[3].chars().next().unwrap(), '8' | '9' | 'a' | 'b'));
+        assert!(matches!(
+            parts[3].chars().next().unwrap(),
+            '8' | '9' | 'a' | 'b'
+        ));
     }
 }

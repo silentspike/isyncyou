@@ -59,12 +59,20 @@ mod live {
         // `cloudflare-dns.com` to its web IPs (reachable wherever the site itself is).
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
-            .resolve("cloudflare-dns.com", SocketAddr::new(IpAddr::from([104, 16, 248, 249]), 443))
-            .resolve("cloudflare-dns.com", SocketAddr::new(IpAddr::from([104, 16, 249, 249]), 443))
+            .resolve(
+                "cloudflare-dns.com",
+                SocketAddr::new(IpAddr::from([104, 16, 248, 249]), 443),
+            )
+            .resolve(
+                "cloudflare-dns.com",
+                SocketAddr::new(IpAddr::from([104, 16, 249, 249]), 443),
+            )
             .build()
             .map_err(|e| e.to_string())?;
         let text = client
-            .get(format!("https://cloudflare-dns.com/dns-query?name={host}&type=A"))
+            .get(format!(
+                "https://cloudflare-dns.com/dns-query?name={host}&type=A"
+            ))
             .header("accept", "application/dns-json")
             .send()
             .map_err(|e| {
@@ -160,21 +168,16 @@ mod live {
             url: &str,
             form: &[(&str, &str)],
         ) -> Result<(u16, String), AgentError> {
-            let resp = self
-                .client
-                .post(url)
-                .form(form)
-                .send()
-                .map_err(|e| {
-                    use std::error::Error;
-                    let mut msg = e.to_string();
-                    let mut src = e.source();
-                    while let Some(s) = src {
-                        msg.push_str(&format!(" | {s}"));
-                        src = s.source();
-                    }
-                    AgentError::Transport(msg)
-                })?;
+            let resp = self.client.post(url).form(form).send().map_err(|e| {
+                use std::error::Error;
+                let mut msg = e.to_string();
+                let mut src = e.source();
+                while let Some(s) = src {
+                    msg.push_str(&format!(" | {s}"));
+                    src = s.source();
+                }
+                AgentError::Transport(msg)
+            })?;
             let status = resp.status().as_u16();
             let text = resp
                 .text()

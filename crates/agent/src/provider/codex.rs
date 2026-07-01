@@ -234,7 +234,10 @@ mod live {
                     "authorization".to_string(),
                     format!("Bearer {}", self.access_token),
                 ),
-                ("chatgpt-account-id".to_string(), self.cfg.account_id.clone()),
+                (
+                    "chatgpt-account-id".to_string(),
+                    self.cfg.account_id.clone(),
+                ),
                 ("originator".to_string(), ORIGINATOR.to_string()),
                 ("openai-beta".to_string(), OPENAI_BETA.to_string()),
                 (
@@ -268,7 +271,9 @@ mod live {
                 ));
             }
             if status >= 400 {
-                return Err(AgentError::Provider(format!("codex: backend status {status}")));
+                return Err(AgentError::Provider(format!(
+                    "codex: backend status {status}"
+                )));
             }
             let (blocks, usage) = parse_sse(&text)?;
             self.last_usage = usage;
@@ -293,7 +298,10 @@ mod tests {
     #[test]
     fn default_config_is_the_codex_recipe() {
         let c = CodexConfig::default();
-        assert_eq!(c.responses_url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            c.responses_url,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
         assert_eq!(c.model, "gpt-5.5");
     }
 
