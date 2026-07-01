@@ -3952,6 +3952,37 @@ async function agentSend(text) {
   const setText = (t) => { asst.text = t; textEl.textContent = t || "…"; log.scrollTop = log.scrollHeight; };
   const addChip = (label) => { asst.chips.push(label); bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: label })); log.scrollTop = log.scrollHeight; };
 
+  // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
+  // and a result list that grows as PartialResult events arrive.
+  const STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
+  let searchBox = null, resultsBox = null; const stageRow = {};
+  const ensureSearchUI = () => {
+    if (searchBox) return;
+    searchBox = el("div", { class: "asst-search" });
+    resultsBox = el("div", { class: "asst-results" });
+    bubble.append(searchBox, resultsBox);
+    log.scrollTop = log.scrollHeight;
+  };
+  const onSearchStage = (d) => {
+    ensureSearchUI();
+    let row = stageRow[d.stage];
+    if (!row) {
+      row = el("div", { class: "asst-stage" }, el("span", { class: "asst-stage-ic" }), el("span", { class: "grow", text: STAGE_LABEL[d.stage] || d.stage }), el("span", { class: "asst-stage-n dim" }));
+      stageRow[d.stage] = row; searchBox.append(row);
+    }
+    const done = d.status === "done";
+    row.classList.toggle("done", done);
+    row.querySelector(".asst-stage-ic").textContent = done ? "✓" : "";
+    if (done) row.querySelector(".asst-stage-n").textContent = d.hits + (d.hits === 1 ? " hit" : " hits");
+    log.scrollTop = log.scrollHeight;
+  };
+  const onPartialResult = (d) => {
+    ensureSearchUI();
+    (d.items || []).forEach((it) => resultsBox.append(
+      el("div", { class: "asst-result" }, el("span", { class: "asst-result-svc", text: it.service }), el("span", { class: "grow truncate", text: it.name }))));
+    log.scrollTop = log.scrollHeight;
+  };
+
   if (AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
   let turn;
   try {
@@ -3968,6 +3999,8 @@ async function agentSend(text) {
     let d; try { d = JSON.parse(ev.data); } catch (_) { return; }
     switch (d.event) {
       case "token": setText(asst.text + (d.text || "")); break;
+      case "search_stage": onSearchStage(d); break;
+      case "partial_result": onPartialResult(d); break;
       case "tool_call": addChip("→ isyncyou " + ((d.input && d.input.op) || "")); break;
       case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
       case "error": setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
