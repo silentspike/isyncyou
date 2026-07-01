@@ -3673,22 +3673,16 @@ function openAccountSwitcher() {
 // it. The WebView hands the external https URL to the system browser (shouldOverride-
 // UrlLoading), where the operator signs in to their own provider account; the browser
 // returns to our loopback callback, which exchanges the code and stores the token.
-// Manual (copy-paste) login: the engine builds the authorize URL with the provider's
-// manual redirect (claude.ai shows a code instead of redirecting to a loopback server —
-// far more robust on mobile). We open it in the system browser, then collect the pasted
-// code. No callback server, no loopback host/port fragility.
+// Loopback-primary login (matches the real claude client): the browser returns to the
+// engine's own /callback, which completes the exchange server-side; the UI polls status.
+// Works in any standard Chromium browser (Chrome, Vivaldi, Brave). Note: Microsoft Edge on
+// Android rejects the Claude consent submit — users on Edge should pick another default.
 async function startAiLogin(provider) {
   try {
-    // Desktop can use the Claude Code loopback flow. On Android, the external browser
-    // is user-selected; Microsoft Edge rejects this flow at the consent submit, so use
-    // Claude's manual code page there.
-    const isAndroid = !!window.AndroidSession;
-    const params = { provider };
-    if (!isAndroid) params.redirect = "http://localhost:" + location.port + "/callback";
-    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
+    const redirect = "http://localhost:" + location.port + "/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    if (isAndroid) showCodeStep();
-    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
+    showWaitingStep();               // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
     location.href = d.authorize_url; // the WebView hands the external URL to the system browser
   } catch (e) {
