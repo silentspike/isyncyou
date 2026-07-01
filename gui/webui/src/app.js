@@ -3686,6 +3686,16 @@ function openExternalAuth(url) {
   if (window.AndroidNav && window.AndroidNav.openExternal) window.AndroidNav.openExternal(url);
   else location.href = url;
 }
+// Hold the app process foreground (via a short-lived FGS) across the OAuth browser
+// round-trip, so the loopback token exchange isn't killed by the APP_BACKGROUND network
+// restriction. No-op off-Android. Always paired with endNetworkGuard() on completion/
+// timeout/cancel (#640).
+function beginNetworkGuard() {
+  if (window.AndroidNav && window.AndroidNav.beginNetworkGuard) window.AndroidNav.beginNetworkGuard();
+}
+function endNetworkGuard() {
+  if (window.AndroidNav && window.AndroidNav.endNetworkGuard) window.AndroidNav.endNetworkGuard();
+}
 
 async function startAiLogin(provider) {
   try {
@@ -3700,6 +3710,7 @@ async function startAiLogin(provider) {
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
     showWaitingStep();               // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
+    beginNetworkGuard();             // keep the loopback exchange alive while backgrounded (#640)
     openExternalAuth(d.authorize_url); // native bridge (raw URL) — NOT location.href (see below)
   } catch (e) {
     toast("Sign-in unavailable: " + (e.message || e));
@@ -3722,13 +3733,13 @@ function showWaitingStep() {
   if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0); }
 }
 async function pollAgentStatus(n) {
-  if (App.route !== "assistant") { AGENT_POLL_ON = false; return; }
+  if (App.route !== "assistant") { AGENT_POLL_ON = false; endNetworkGuard(); return; }
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.connected) { AGENT_POLL_ON = false; toast("Connected!"); renderAssistantView($("#view")); return; }
+    if (s && s.connected) { AGENT_POLL_ON = false; endNetworkGuard(); toast("Connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
   if (n < 90) { setTimeout(() => pollAgentStatus(n + 1), 2000); }
-  else { AGENT_POLL_ON = false; }
+  else { AGENT_POLL_ON = false; endNetworkGuard(); }
 }
 
 // Swap the connect card to the "paste your code" step.
@@ -3888,6 +3899,7 @@ async function connectCodex() {
     const d = await post("/api/v1/agent/oauth/start?" + qs({ provider: "codex", redirect }), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
     toast("Opening ChatGPT sign-in…");
+    beginNetworkGuard();             // keep the 1455 loopback exchange alive while backgrounded (#640)
     openExternalAuth(d.authorize_url);
     pollCodexStatus(0);
   } catch (e) {
@@ -3897,9 +3909,10 @@ async function connectCodex() {
 async function pollCodexStatus(n) {
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.codex) { toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
+    if (s && s.codex) { endNetworkGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
   if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
+  else endNetworkGuard();
 }
 
 function renderAsstMsg(m) {

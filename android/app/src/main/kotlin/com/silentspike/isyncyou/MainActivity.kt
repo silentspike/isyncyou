@@ -209,6 +209,24 @@ class MainActivity : Activity() {
                 }
             }
         }
+
+        /**
+         * Start the OAuth network-guard foreground service just before opening the browser,
+         * so the loopback token exchange survives the app being backgrounded during sign-in
+         * (see [OAuthGuardService]). Must be called while the Activity is still foreground —
+         * it is, since the user just tapped "Connect" — so the Android 14 background-FGS-start
+         * restriction does not apply.
+         */
+        @android.webkit.JavascriptInterface
+        fun beginNetworkGuard() {
+            runOnUiThread { OAuthGuardService.start(this@MainActivity) }
+        }
+
+        /** Stop the guard once sign-in completes, times out, or is cancelled. */
+        @android.webkit.JavascriptInterface
+        fun endNetworkGuard() {
+            runOnUiThread { OAuthGuardService.stop(this@MainActivity) }
+        }
     }
 
     /** Hardware/gesture back navigates WebView history before leaving the app. */
@@ -218,5 +236,11 @@ class MainActivity : Activity() {
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /** Safety net: never leak the sign-in network guard past the Activity's life. */
+    override fun onDestroy() {
+        OAuthGuardService.stop(this)
+        super.onDestroy()
     }
 }
