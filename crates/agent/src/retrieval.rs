@@ -5,6 +5,7 @@
 //! is tested with an in-memory fake (no store).
 
 use crate::archive::{ArchiveSource, ItemRef};
+use crate::provider::StreamEvent;
 use crate::tool::{ToolAction, ToolClass};
 use crate::turn::ToolExecutor;
 use crate::AgentError;
@@ -63,6 +64,90 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             "returned": results.len(),
             "total_matches": total,
             "results": results,
+        })
+        .to_string())
+    }
+
+    /// Progressive search (S-AG.18/#643): the same merge as [`search`], but run as
+    /// visible stages — **stage 1** fast name/subject match, **stage 2** full-text over
+    /// bodies — emitting a `SearchStage` boundary + a `PartialResult` of the newly-added,
+    /// deduped, source-tagged hits after each, so the UI grows the list live. The final
+    /// JSON is identical to [`search`] (plus a `deep_search_hint`): the returned string is
+    /// what the model answers from; **stage 3** (agentic metadata-scan + candidate
+    /// deep-read for wording the query never contains) is the model's own follow-up
+    /// `list`/`read` calls, guided by that hint.
+    fn search_staged(
+        &self,
+        services: &[String],
+        query: &str,
+        limit: Option<u32>,
+        emit: &mut dyn FnMut(StreamEvent),
+    ) -> Result<String, AgentError> {
+        let in_scope =
+            |it: &ItemRef| services.is_empty() || services.iter().any(|s| s == &it.service);
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut hits: Vec<ItemRef> = Vec::new();
+
+        // Stage 1 — fast name/subject match (indexed).
+        emit(StreamEvent::SearchStage {
+            stage: "names".into(),
+            status: "running".into(),
+            hits: 0,
+        });
+        let mut stage1: Vec<serde_json::Value> = Vec::new();
+        for it in self.source.search_names(query)? {
+            if in_scope(&it) && seen.insert((it.service.clone(), it.id.clone())) {
+                stage1.push(Self::source_ref(&it));
+                hits.push(it);
+            }
+        }
+        emit(StreamEvent::PartialResult {
+            stage: "names".into(),
+            items: serde_json::Value::Array(stage1),
+        });
+        emit(StreamEvent::SearchStage {
+            stage: "names".into(),
+            status: "done".into(),
+            hits: hits.len(),
+        });
+
+        // Stage 2 — full-text over indexed bodies (only items stage 1 didn't already have).
+        emit(StreamEvent::SearchStage {
+            stage: "bodies".into(),
+            status: "running".into(),
+            hits: hits.len(),
+        });
+        let mut stage2: Vec<serde_json::Value> = Vec::new();
+        for (service, id) in self.source.search_bodies(query)? {
+            if seen.insert((service.clone(), id.clone())) {
+                if let Some(it) = self.source.get(&service, &id)? {
+                    if in_scope(&it) {
+                        stage2.push(Self::source_ref(&it));
+                        hits.push(it);
+                    }
+                }
+            }
+        }
+        emit(StreamEvent::PartialResult {
+            stage: "bodies".into(),
+            items: serde_json::Value::Array(stage2),
+        });
+        emit(StreamEvent::SearchStage {
+            stage: "bodies".into(),
+            status: "done".into(),
+            hits: hits.len(),
+        });
+
+        let cap = limit.unwrap_or(DEFAULT_SEARCH_LIMIT) as usize;
+        let total = hits.len();
+        let results: Vec<serde_json::Value> = hits.iter().take(cap).map(Self::source_ref).collect();
+        Ok(serde_json::json!({
+            "query": query,
+            "returned": results.len(),
+            "total_matches": total,
+            "results": results,
+            "deep_search_hint": "Keyword passes (name + full-text) are done. For matches that never contain the query wording, `list` the relevant service and `read` likely candidates by subject/sender.",
         })
         .to_string())
     }
@@ -177,6 +262,23 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 "unsupported read op: {}",
                 other.op()
             ))),
+        }
+    }
+
+    fn execute_read_streamed(
+        &self,
+        action: &ToolAction,
+        emit: &mut dyn FnMut(StreamEvent),
+    ) -> Result<String, AgentError> {
+        // Only search runs as visible stages; every other read is single-shot.
+        match action {
+            ToolAction::Search {
+                services,
+                query,
+                limit,
+                ..
+            } => self.search_staged(services, query, *limit, emit),
+            _ => self.execute_read(action),
         }
     }
 }
@@ -294,6 +396,81 @@ mod tests {
         for r in v["results"].as_array().unwrap() {
             assert!(r["service"].is_string() && r["id"].is_string() && r["path"].is_string());
         }
+    }
+
+    #[test]
+    fn progressive_search_streams_staged_deduped_results() {
+        let ex = fixture();
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let out = ex
+            .search_staged(&[], "spotify", None, &mut |e| events.push(e))
+            .unwrap();
+
+        // Stage boundaries, in order: names running→done, then bodies running→done.
+        let stages: Vec<(String, String, usize)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::SearchStage {
+                    stage,
+                    status,
+                    hits,
+                } => Some((stage.clone(), status.clone(), *hits)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                ("names".into(), "running".into(), 0),
+                ("names".into(), "done".into(), 2), // m1 + f1 matched by name
+                ("bodies".into(), "running".into(), 2),
+                ("bodies".into(), "done".into(), 2), // m1's body dup deduped → no growth
+            ]
+        );
+
+        // Partial results: stage 1 carries the two name hits; stage 2 is empty (deduped).
+        let partials: Vec<(String, usize)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::PartialResult { stage, items } => {
+                    Some((stage.clone(), items.as_array().unwrap().len()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(partials, vec![("names".into(), 2), ("bodies".into(), 0)]);
+
+        // Final JSON equals the non-staged search: deduped total, source-tagged, + hint.
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total_matches"], 2);
+        assert!(v["deep_search_hint"].is_string());
+        for r in v["results"].as_array().unwrap() {
+            assert!(r["service"].is_string() && r["id"].is_string());
+        }
+    }
+
+    #[test]
+    fn progressive_search_stage2_adds_body_only_hits() {
+        // "receipt" appears only in m1's body, in no name — stage 2 (full-text) must add it.
+        let ex = fixture();
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let out = ex
+            .search_staged(&[], "receipt", None, &mut |e| events.push(e))
+            .unwrap();
+        let done: Vec<(String, usize)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::SearchStage {
+                    stage,
+                    status,
+                    hits,
+                } if status == "done" => Some((stage.clone(), *hits)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done, vec![("names".into(), 0), ("bodies".into(), 1)]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["results"][0]["id"], "m1");
     }
 
     #[test]

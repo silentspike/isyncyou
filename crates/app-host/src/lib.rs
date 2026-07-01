@@ -124,6 +124,16 @@ fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
         E::ConfirmationRequired { id, preview, .. } => {
             serde_json::json!({ "event": "confirmation_required", "tool_id": id, "preview": preview })
         }
+        E::SearchStage {
+            stage,
+            status,
+            hits,
+        } => serde_json::json!({
+            "event": "search_stage", "stage": stage, "status": status, "hits": hits
+        }),
+        E::PartialResult { stage, items } => {
+            serde_json::json!({ "event": "partial_result", "stage": stage, "items": items })
+        }
         E::Error(e) => serde_json::json!({ "event": "error", "message": e }),
         E::Done => serde_json::json!({ "event": "done" }),
     };

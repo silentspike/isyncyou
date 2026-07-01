@@ -22,6 +22,21 @@ pub enum StreamEvent {
         content: String,
         untrusted: bool,
     },
+    /// A progressive-search stage boundary (S-AG.18/#643): `stage` is "names" (fast
+    /// subject match), "bodies" (full-text), or "deep"; `status` is "running" | "done";
+    /// `hits` is the running deduped total. Lets the UI show a per-stage checkmark.
+    SearchStage {
+        stage: String,
+        status: String,
+        hits: usize,
+    },
+    /// Items a search stage added (deduped against earlier stages), streamed so the UI
+    /// can grow the result list before the turn's final answer. Each item is
+    /// source-tagged (`{service, id, name, item_type, path}`).
+    PartialResult {
+        stage: String,
+        items: serde_json::Value,
+    },
     /// A destructive action is awaiting human confirmation (REQ-AGENT-002). The turn
     /// stops here; the model never receives a capability token (REQ-AGENT-004).
     ConfirmationRequired {
@@ -74,11 +89,11 @@ pub struct Usage {
 // plain default build doesn't carry their (then-unused) helpers.
 #[cfg(any(feature = "http", test))]
 pub mod anthropic;
+#[cfg(feature = "agent-subscription-experimental")]
+pub mod codex;
 pub mod fake;
 #[cfg(any(feature = "http", test))]
 pub mod openai;
-#[cfg(feature = "agent-subscription-experimental")]
-pub mod codex;
 #[cfg(feature = "agent-subscription-experimental")]
 pub mod subscription;
 pub use fake::FakeProvider;

@@ -66,6 +66,20 @@ impl Message {
 /// return canned data.
 pub trait ToolExecutor {
     fn execute_read(&self, action: &ToolAction) -> Result<String, crate::AgentError>;
+
+    /// Execute a read that MAY stream intermediate progress via `emit` — used by the
+    /// progressive search (S-AG.18/#643) to emit `SearchStage`/`PartialResult` between
+    /// the fast, full-text and deep passes — returning the same final JSON as
+    /// [`execute_read`]. The default is non-streaming (delegates), so the stub and other
+    /// executors are unaffected.
+    fn execute_read_streamed(
+        &self,
+        action: &ToolAction,
+        emit: &mut dyn FnMut(StreamEvent),
+    ) -> Result<String, crate::AgentError> {
+        let _ = emit;
+        self.execute_read(action)
+    }
 }
 
 /// How a turn ended.
@@ -149,7 +163,10 @@ pub fn run_turn(
 
             match action.class() {
                 ToolClass::Read => {
-                    let result = executor.execute_read(&action)?;
+                    // Streamed read: a progressive search emits its stage/partial-result
+                    // events via `emit` before returning the final JSON (S-AG.18/#643);
+                    // all other reads delegate to the plain path (default impl).
+                    let result = executor.execute_read_streamed(&action, emit)?;
                     // Results carrying archived content are untrusted input.
                     emit(StreamEvent::ToolResult {
                         id: tu.id.clone(),
