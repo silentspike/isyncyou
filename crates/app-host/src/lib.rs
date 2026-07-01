@@ -72,14 +72,38 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
 
 /// A read-class tool executor placeholder until S-AG.8/#623 wires the real archive
 /// retrieval executor. A canned text turn never calls it.
+/// Fallback read executor for builds without the experimental agent (no store/SQLCipher
+/// pull): returns a placeholder so the turn loop still runs in CI/release shapes.
+#[cfg(not(feature = "agent-subscription-experimental"))]
 struct StubExecutor;
+#[cfg(not(feature = "agent-subscription-experimental"))]
 impl isyncyou_agent::ToolExecutor for StubExecutor {
     fn execute_read(
         &self,
         _action: &isyncyou_agent::ToolAction,
     ) -> Result<String, isyncyou_agent::AgentError> {
-        Ok("{\"note\":\"retrieval is wired in S-AG.8/#623\"}".to_string())
+        Ok("{\"note\":\"retrieval needs the agent-subscription-experimental build\"}".to_string())
     }
+}
+
+/// Build the read-class tool executor for a turn. The experimental agent build binds the
+/// real `StoreArchive` retrieval executor (searches the encrypted store + on-disk body
+/// files for `account` under `archive_root`, S-AG.18/#643); other builds get the stub.
+#[cfg(feature = "agent-subscription-experimental")]
+fn make_executor(
+    account: &str,
+    archive_root: std::path::PathBuf,
+) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    Box::new(isyncyou_agent::retrieval::RetrievalExecutor::new(
+        isyncyou_agent::archive::StoreArchive::new(account, archive_root),
+    ))
+}
+#[cfg(not(feature = "agent-subscription-experimental"))]
+fn make_executor(
+    _account: &str,
+    _archive_root: std::path::PathBuf,
+) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    Box::new(StubExecutor)
 }
 
 /// Serialize one stream event to a single-line JSON SSE-data payload.
@@ -90,7 +114,11 @@ fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
         E::ToolCall { id, name, input } => {
             serde_json::json!({ "event": "tool_call", "id": id, "name": name, "input": input })
         }
-        E::ToolResult { id, content, untrusted } => serde_json::json!({
+        E::ToolResult {
+            id,
+            content,
+            untrusted,
+        } => serde_json::json!({
             "event": "tool_result", "id": id, "content": content, "untrusted": untrusted
         }),
         E::ConfirmationRequired { id, preview, .. } => {
@@ -138,7 +166,8 @@ the user out of band — propose them, never assume they ran.";
 /// "not connected" message. Owns the stream hub + pending-action registry, so the model
 /// never holds a capability token.
 pub struct DaemonAgent {
-    #[allow(dead_code)] // wired into the real retrieval/restore path in #623/#624
+    /// Source of each account's `archive_root` for the retrieval executor
+    /// (`archive_root_for`); the restore path lands in #624.
     cfg: Config,
     hub: Arc<isyncyou_agent::AgentStreamHub>,
     pending: Arc<isyncyou_agent::PendingRegistry>,
@@ -147,10 +176,7 @@ pub struct DaemonAgent {
     /// Directory holding the operator's local, uncommitted OAuth recipe
     /// (`agent-oauth.json`) and the credential store — the parent of the config file.
     /// Only read by the experimental subscription login (S-AG.12).
-    #[cfg_attr(
-        not(feature = "agent-subscription-experimental"),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(feature = "agent-subscription-experimental"), allow(dead_code))]
     oauth_dir: PathBuf,
     /// Tracks in-flight device OAuth logins between start and the browser callback.
     #[cfg(feature = "agent-subscription-experimental")]
@@ -169,6 +195,19 @@ impl DaemonAgent {
             #[cfg(feature = "agent-subscription-experimental")]
             oauth: isyncyou_agent::AgentOAuth::new(),
         }
+    }
+
+    /// Resolve an account's archive root (holds `.isyncyou-store.db` + the on-disk body
+    /// files) for the retrieval executor. Matches by account id, else the first account,
+    /// else an empty path (an empty store simply yields no hits — never a panic).
+    fn archive_root_for(&self, account: &str) -> std::path::PathBuf {
+        self.cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .or_else(|| self.cfg.accounts.first())
+            .map(|a| a.archive_root.clone())
+            .unwrap_or_default()
     }
 
     /// Pick the turn provider: the connected subscription (experimental feature) when a
@@ -291,7 +330,10 @@ impl CodexStoredCredential {
 
 /// Persist a Codex credential to the encrypted store under `oauth_dir` (id `codex`).
 #[cfg(feature = "agent-subscription-experimental")]
-fn store_codex_blob(oauth_dir: &std::path::Path, cred: &CodexStoredCredential) -> Result<(), String> {
+fn store_codex_blob(
+    oauth_dir: &std::path::Path,
+    cred: &CodexStoredCredential,
+) -> Result<(), String> {
     let dir = oauth_dir.join("agent-credentials");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let key = isyncyou_agent::LocalKey::new(oauth_dir.join("agent-credentials.key"));
@@ -408,7 +450,8 @@ fn codex_callback_serve(
             ("anthropic", "160.79.104.10:443"),
         ] {
             if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
-                let r = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5));
+                let r =
+                    std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5));
                 dbg.push_str(&format!(
                     "tcp {label} = {}\n",
                     match r {
@@ -443,7 +486,11 @@ fn codex_callback_serve(
                 Ok(tok) => {
                     dbg.push_str(&format!(
                         "exchange=OK account_id={}\n",
-                        if tok.account_id.is_empty() { "EMPTY" } else { "present" }
+                        if tok.account_id.is_empty() {
+                            "EMPTY"
+                        } else {
+                            "present"
+                        }
                     ));
                     let expires_at_ms = if tok.expires_in > 0 {
                         now_ms() + tok.expires_in * 1000
@@ -503,8 +550,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn load_oauth_config(&self) -> Result<isyncyou_agent::OAuthConfig, String> {
         let path = self.oauth_dir.join("agent-oauth.json");
         if path.exists() {
-            let s = std::fs::read_to_string(&path)
-                .map_err(|e| format!("OAuth recipe: {e}"))?;
+            let s = std::fs::read_to_string(&path).map_err(|e| format!("OAuth recipe: {e}"))?;
             serde_json::from_str(&s).map_err(|e| format!("OAuth recipe is invalid JSON: {e}"))
         } else {
             Ok(isyncyou_agent::OAuthConfig::default())
@@ -548,12 +594,12 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// The persisted provider+model selection (the switcher), falling back to the env
     /// override then the in-repo default. Stored next to the credential store.
     fn agent_settings(&self) -> (String, String) {
-        let default_provider =
-            if std::env::var("ISYNCYOU_AGENT_PROVIDER").as_deref() == Ok("codex") {
-                "codex"
-            } else {
-                "claude"
-            };
+        let default_provider = if std::env::var("ISYNCYOU_AGENT_PROVIDER").as_deref() == Ok("codex")
+        {
+            "codex"
+        } else {
+            "claude"
+        };
         if let Ok(s) = std::fs::read_to_string(self.oauth_dir.join("agent-settings.json")) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
                 let provider = v
@@ -581,8 +627,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
         match provider {
             "codex" => isyncyou_agent::CodexConfig::default().model,
-            _ => std::env::var("ISYNCYOU_AGENT_MODEL")
-                .unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
+            _ => {
+                std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+            }
         }
     }
 
@@ -602,8 +649,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             "model": model,
         }))
         .map_err(|e| e.to_string())?;
-        std::fs::write(self.oauth_dir.join("agent-settings.json"), blob)
-            .map_err(|e| e.to_string())
+        std::fs::write(self.oauth_dir.join("agent-settings.json"), blob).map_err(|e| e.to_string())
     }
 
     /// The subscription access token: our stored token (mobile, from the device OAuth
@@ -614,9 +660,10 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         if dir.exists() {
             let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
             let store = isyncyou_agent::CredentialStore::new(dir, key);
-            if let Ok(Some(secret)) =
-                store.get(isyncyou_agent::SecretClass::ProviderOAuthRefresh, "subscription")
-            {
+            if let Ok(Some(secret)) = store.get(
+                isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+                "subscription",
+            ) {
                 let raw = secret.expose();
                 // Newer format: a JSON credential blob (access + refresh + expiry). Older
                 // format (pre-refresh): the bare access token as UTF-8.
@@ -652,7 +699,8 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         if !cred.refresh_token.is_empty() && (near_expiry || cred.access_token.is_empty()) {
             if let Ok(cfg) = self.load_oauth_config() {
                 if let Ok(http) = isyncyou_agent::http::HttpTransport::new() {
-                    if let Ok(t) = isyncyou_agent::oauth::refresh(&http, &cfg, &cred.refresh_token) {
+                    if let Ok(t) = isyncyou_agent::oauth::refresh(&http, &cfg, &cred.refresh_token)
+                    {
                         let expires_at_ms = if t.expires_in > 0 {
                             now_ms + t.expires_in * 1000
                         } else {
@@ -852,13 +900,22 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let tid = turn_id.clone();
         let system = format!("{AGENT_SYSTEM_PROMPT}\n\nActive account: {account}.");
         let prompt = prompt.to_string();
+        // Resolve the account's archive root now (reads config on this thread), so the
+        // turn thread can build the real store-backed retrieval executor for it.
+        let account_id = account.to_string();
+        let archive_root = self.archive_root_for(&account_id);
         let mut provider = self.build_turn_provider(&system);
         std::thread::spawn(move || {
-            let exec = StubExecutor;
+            let exec = make_executor(&account_id, archive_root);
             let mut history = vec![isyncyou_agent::Message::user(prompt)];
-            let _ = isyncyou_agent::run_turn(provider.as_mut(), &exec, &mut history, &mut |ev| {
-                hub.emit(&tid, ev);
-            });
+            let _ = isyncyou_agent::run_turn(
+                provider.as_mut(),
+                exec.as_ref(),
+                &mut history,
+                &mut |ev| {
+                    hub.emit(&tid, ev);
+                },
+            );
             hub.close(&tid);
         });
         Ok(turn_id)
@@ -973,11 +1030,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let claude = self.subscription_token().is_some();
         let codex = self.codex_credentials().is_some();
         let (sel_provider, _) = self.agent_settings();
-        // Effective provider: the selection if it is connected, else whichever is.
+        // Effective provider: the selection if it is connected, else whichever is
+        // (Claude preferred). A selected+connected Claude is already covered by the
+        // `else if claude` arm, so it needs no separate branch.
         let provider = if sel_provider == "codex" && codex {
             "codex"
-        } else if sel_provider == "claude" && claude {
-            "claude"
         } else if claude {
             "claude"
         } else if codex {
@@ -1651,7 +1708,8 @@ pub fn build_live_router(
             mint_cap_token(),
         )
         .with_agent(
-            Arc::new(DaemonAgent::new(cfg.clone(), oauth_dir)) as Arc<dyn isyncyou_webui::AgentHandler>,
+            Arc::new(DaemonAgent::new(cfg.clone(), oauth_dir))
+                as Arc<dyn isyncyou_webui::AgentHandler>,
             mint_cap_token(),
         )
         .with_events(events)

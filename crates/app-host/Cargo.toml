@@ -41,5 +41,10 @@ plain-store = [
 # EXPERIMENTAL, default-OFF, personal-build only (risk R8): enables the subscription
 # OAuth login + provider in the agent harness. Never enabled in CI/release artifacts;
 # the operator opts in for their own Desktop/Android build. Pulls the agent's http
-# stack (reqwest/rustls).
-agent-subscription-experimental = ["isyncyou-agent/agent-subscription-experimental"]
+# stack (reqwest/rustls) AND the real retrieval executor (`StoreArchive` over the
+# encrypted store + body files, S-AG.18/#643) so the assistant actually searches the
+# archive instead of the stub.
+agent-subscription-experimental = [
+    "isyncyou-agent/agent-subscription-experimental",
+    "isyncyou-agent/retrieval",
+]
