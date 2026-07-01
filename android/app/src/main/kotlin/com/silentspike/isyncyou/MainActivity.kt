@@ -158,6 +158,7 @@ class MainActivity : Activity() {
         // token is never served in a static asset another app could read.
         web.addJavascriptInterface(SessionBridge(), "AndroidSession")
         web.addJavascriptInterface(PushBridge(), "AndroidPush")
+        web.addJavascriptInterface(NavBridge(), "AndroidNav")
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setCookie("$origin/", "isy_session=$token; Path=/")
@@ -186,6 +187,27 @@ class MainActivity : Activity() {
             // falling back to the value fetched at startup.
             val persisted = IsyncMessagingService.currentToken(this@MainActivity)
             return if (persisted.isNotEmpty()) persisted else (fcmToken ?: "")
+        }
+    }
+
+    /**
+     * JS bridge: open an external URL by handing the RAW string straight to the system browser.
+     * Using `location.href` instead would route the URL through the WebView's own navigation,
+     * which re-parses/normalises it — mangling the percent-encoded `redirect_uri`/`scope` and
+     * following the `claude.com/cai`→`claude.ai` redirect in-WebView before hand-off. claude.ai
+     * then rejects the consent submit with "Invalid request format". `Uri.parse` on the raw
+     * string preserves the exact encoding, matching a direct `am start`/`xdg-open` (verified
+     * on-device 2026-07-01: direct open completes the consent, WebView `location.href` fails).
+     */
+    private inner class NavBridge {
+        @android.webkit.JavascriptInterface
+        fun openExternal(url: String) {
+            runOnUiThread {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                } catch (_: Exception) {
+                }
+            }
         }
     }
 

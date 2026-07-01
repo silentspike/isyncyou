@@ -35,23 +35,22 @@ pub struct OAuthConfig {
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
-            // `authorize_url` verified against Claude Code `cli.js`. `token_url`: LIVE-verified
-            // on-device 2026-07-01 — `console.anthropic.com/v1/oauth/token` returns HTTP 404,
-            // `platform.claude.com/v1/oauth/token` returns HTTP 200 with a real subscription
-            // token (access+refresh, scope `user:inference`, 8h expiry). The earlier
-            // `console.anthropic.com` value was wrong; the live token endpoint is platform.claude.com.
-            authorize_url: "https://claude.ai/oauth/authorize".to_string(),
+            // Verified LIVE against the real `claude setup-token` 2.1.197 flow (2026-07-01):
+            // an isolated `claude setup-token` (own CLAUDE_CONFIG_DIR) completed the consent AND
+            // returned a code at `http://localhost:<port>/callback` using EXACTLY these values,
+            // even with a pre-existing grant on the account. The factors that made our earlier
+            // attempts fail with "Invalid request format" were (a) the authorize host —
+            // `claude.com/cai`, NOT `claude.ai`, and (b) the scope — `user:inference` ONLY (the
+            // full org:create_api_key/user:profile/user:sessions set is rejected once a grant
+            // exists). token endpoint `platform.claude.com/v1/oauth/token` → HTTP 200.
+            authorize_url: "https://claude.com/cai/oauth/authorize".to_string(),
             token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
-            manual_redirect_url: "https://console.anthropic.com/oauth/code/callback".to_string(),
-            // The full scope set the real client requests (cli.js `Fp0`); requesting only
-            // `user:inference` renders the consent but the authorize submit is rejected.
-            scopes: vec![
-                "org:create_api_key".to_string(),
-                "user:profile".to_string(),
-                "user:inference".to_string(),
-                "user:sessions:claude_code".to_string(),
-            ],
+            manual_redirect_url: "https://platform.claude.com/oauth/code/callback".to_string(),
+            // setup-token scope: `user:inference` ONLY — exactly what the real `claude
+            // setup-token` requests and what the live flow accepted. This is all the agent
+            // needs (inference on the subscription).
+            scopes: vec!["user:inference".to_string()],
         }
     }
 }
@@ -89,7 +88,7 @@ pub fn pkce() -> Result<(String, String), AgentError> {
 /// A random URL-safe CSRF `state` token (used by flows that don't go through
 /// [`AgentOAuth`], e.g. the Codex loopback-server flow).
 pub fn rand_state() -> Result<String, AgentError> {
-    rand_b64(16)
+    rand_b64(32)
 }
 
 /// Build the provider authorize URL (PKCE S256) the system browser opens.
@@ -143,7 +142,11 @@ impl AgentOAuth {
     /// supplies its own origin, RFC 8252 loopback).
     pub fn start(&self, cfg: &OAuthConfig, redirect_uri: &str) -> Result<StartedLogin, AgentError> {
         let (verifier, challenge) = pkce()?;
-        let state = rand_b64(16)?;
+        // 32 bytes (43 base64url chars) — matches the real `claude` CLI. A shorter state
+        // (16 bytes / 22 chars) is REJECTED by claude.ai's authorize submit with "Invalid
+        // request format" (LIVE-verified on-device 2026-07-01: 22-char state fails, 32-char
+        // state succeeds). This was the root cause of the in-app Claude login failing.
+        let state = rand_b64(32)?;
         let authorize_url = build_authorize_url(cfg, redirect_uri, &challenge, &state);
         self.pending.borrow_insert(&state, verifier, redirect_uri);
         Ok(StartedLogin { authorize_url, state })
@@ -204,10 +207,11 @@ pub fn exchange(
         "client_id": cfg.client_id,
         "code_verifier": verifier,
         "state": state,
-        // NOTE: the `expires_in` field (used by the long-lived `claude setup-token` flow) is
-        // deliberately NOT sent for the normal subscription OAuth — platform.claude.com rejects
-        // it with HTTP 400 "Invalid expiry for scope" (LIVE-verified 2026-07-01). Omitting it
-        // yields the standard 8h subscription token (expires_in 28800) + refresh_token.
+        // setup-token exchange: send expires_in=1y. With the `user:inference` scope this is the
+        // long-lived-token flow the real `claude setup-token` uses (returns a ~1y token). The
+        // earlier 400 "Invalid expiry for scope" happened only when expires_in was sent together
+        // with the FULL scope set; it is correct with user:inference.
+        "expires_in": 31_536_000,
     });
     let (status, text) = http.post_json(&cfg.token_url, &[], &body)?;
     if status >= 400 {

@@ -3675,27 +3675,32 @@ function openAccountSwitcher() {
 // returns to our loopback callback, which exchanges the code and stores the token.
 // Loopback-primary login (matches the real claude client): the browser returns to the
 // engine's own /callback, which completes the exchange server-side; the UI polls status.
-// Works in any standard Chromium browser (Chrome, Vivaldi, Brave). Note: Microsoft Edge on
-// Android rejects the Claude consent submit — users on Edge should pick another default.
+
+// Open an external auth URL by handing the RAW string to the native bridge (→ ACTION_VIEW).
+// NOT location.href: that routes the URL through the WebView's own navigation, which re-parses/
+// normalises it — mangling the percent-encoded redirect_uri/scope and following the
+// claude.com/cai→claude.ai redirect in-WebView before hand-off — after which claude.ai rejects
+// the consent submit with "Invalid request format". Verified on-device 2026-07-01: a direct
+// browser open completes the consent, the WebView location.href fails. Desktop → location.href.
+function openExternalAuth(url) {
+  if (window.AndroidNav && window.AndroidNav.openExternal) window.AndroidNav.openExternal(url);
+  else location.href = url;
+}
+
 async function startAiLogin(provider) {
   try {
-    // Claude/Anthropic uses the MANUAL flow (console redirect + paste the code): on-device,
-    // claude.ai rejects the loopback redirect (both `localhost` and `127.0.0.1`) with "Invalid
-    // request format", while the console redirect is verified to complete a real token
-    // exchange. The manual flow also sidesteps the background-network block — the exchange runs
-    // in `oauth_complete` while the app is FOREGROUND (the user is back pasting the code), not
-    // while it is backgrounded behind the browser. Codex keeps its loopback flow (its own
-    // 127.0.0.1:1455 callback listener).
-    const manual = provider === "anthropic";
-    const query = manual
-      ? qs({ provider })
-      : qs({ provider, redirect: "http://127.0.0.1:" + location.port + "/callback" });
-    const d = await post("/api/v1/agent/oauth/start?" + query, CAP.agent);
+    // Loopback flow with a `localhost` redirect — matches the real `claude setup-token`, which
+    // uses `http://localhost:<port>/callback` and completes the consent. Controlled comparison
+    // (2026-07-01, same host `claude.com/cai` + scope `user:inference`): the loopback redirect
+    // is ACCEPTED, while the manual `platform.claude.com/oauth/code/callback` redirect is
+    // rejected on-device with "Invalid request format". Codex ignores this redirect (its engine
+    // binds its own 127.0.0.1:1455 listener). The engine's `/callback` completes the exchange.
+    const redirect = "http://localhost:" + location.port + "/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    if (manual) showCodeStep();      // "paste your code" UI (manual/console redirect)
-    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
+    showWaitingStep();               // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    location.href = d.authorize_url; // the WebView hands the external URL to the system browser
+    openExternalAuth(d.authorize_url); // native bridge (raw URL) — NOT location.href (see below)
   } catch (e) {
     toast("Sign-in unavailable: " + (e.message || e));
   }
@@ -3883,7 +3888,7 @@ async function connectCodex() {
     const d = await post("/api/v1/agent/oauth/start?" + qs({ provider: "codex", redirect }), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
     toast("Opening ChatGPT sign-in…");
-    location.href = d.authorize_url;
+    openExternalAuth(d.authorize_url);
     pollCodexStatus(0);
   } catch (e) {
     toast("ChatGPT sign-in unavailable: " + (e.message || e));
