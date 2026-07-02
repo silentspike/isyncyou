@@ -3600,6 +3600,12 @@ async function renderSettingsView(view) {
     if (CAP.account) acctCard.append(el("button", { class: "btn", style: "margin-top:12px", onclick: openAccountSwitcher },
       icon("rotate-ccw", "icon-sm"), "Sign in / reconnect account"));
     body.append(acctCard);
+    // Diagnostics: a live perf overlay flag (CPU/RAM/disk-IO of the whole app process).
+    const perfLbl = el("span", { text: localStorage.getItem("isy_perf") === "1" ? "Hide performance overlay" : "Show performance overlay" });
+    body.append(el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Diagnostics" }),
+      el("p", { class: "dim", style: "font-size:13px;margin:.2rem 0 .7rem", text: "Live overlay of the app's whole-process load — CPU, RAM and disk IO — for performance testing." }),
+      el("button", { class: "btn", onclick: () => { const on = togglePerf(); perfLbl.textContent = on ? "Hide performance overlay" : "Show performance overlay"; } },
+        icon("clock", "icon-sm"), perfLbl)));
     const syncCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Sync" }),
       kvList([["Scheduled", st.enabled ? (st.paused ? "paused" : "running") : "off"], ["Trash retention", (sy.trash_retention_days ?? "—") + " days"], ["Body index (FTS)", sy.body_index ? "on" : "off"], ["Change source", sy.change_source || "—"]]));
     if (st.enabled && CAP.sync) syncCard.append(el("div", { style: "display:flex;gap:8px;margin-top:12px" },
@@ -4250,8 +4256,55 @@ function setupSwipe() {
     else if (dx > 0 && i > 0) go(order[i - 1]);           // right → previous tab
   }, { passive: true });
 }
+// Performance overlay (test flag): a live HUD of the app's whole-process load — CPU%, RAM,
+// disk IO — from /api/v1/debug/stats (embedded engine + WebView are one process, so it's the
+// total the app causes). Toggled from Settings → Diagnostics, or window.togglePerf().
+let _perfTimer = null, _perfPrev = null;
+function perfRate(bps) {
+  if (!isFinite(bps) || bps < 1) return "0";
+  const u = ["B/s", "KB/s", "MB/s"]; let i = 0;
+  while (bps >= 1024 && i < 2) { bps /= 1024; i++; }
+  return bps.toFixed(i ? 1 : 0) + " " + u[i];
+}
+function startPerfOverlay() {
+  if (document.getElementById("perf-hud")) return;
+  const mk = (k, id) => el("div", { class: "perf-row" }, el("span", { class: "perf-k", text: k }), el("span", { id, class: "perf-v", text: "…" }));
+  document.body.append(el("div", { id: "perf-hud", class: "perf-hud" },
+    mk("CPU", "perf-cpu"), mk("RAM", "perf-ram"), mk("Disk R", "perf-ior"), mk("Disk W", "perf-iow")));
+  _perfPrev = null;
+  const tick = async () => {
+    let s; try { s = await api("/api/v1/debug/stats"); } catch { return; }
+    const now = performance.now();
+    if (_perfPrev) {
+      const dt = (now - _perfPrev.t) / 1000;
+      const cores = s.cores || 1;
+      const cpu = dt > 0 ? Math.max(0, (s.cpu_ms - _perfPrev.cpu_ms) / (dt * 1000) * 100) : 0;
+      const cpuEl = $("#perf-cpu");
+      if (cpuEl) { cpuEl.textContent = cpu.toFixed(0) + "%"; cpuEl.classList.toggle("hot", cpu > cores * 55); }
+      if ($("#perf-ior")) $("#perf-ior").textContent = perfRate(dt > 0 ? (s.io_read - _perfPrev.io_read) / dt : 0);
+      if ($("#perf-iow")) $("#perf-iow").textContent = perfRate(dt > 0 ? (s.io_write - _perfPrev.io_write) / dt : 0);
+    }
+    if ($("#perf-ram")) $("#perf-ram").textContent = (s.rss_kb / 1024).toFixed(0) + " MB";
+    _perfPrev = { t: now, cpu_ms: s.cpu_ms, io_read: s.io_read, io_write: s.io_write };
+  };
+  tick();
+  _perfTimer = setInterval(tick, 1000);
+}
+function stopPerfOverlay() {
+  if (_perfTimer) { clearInterval(_perfTimer); _perfTimer = null; }
+  document.getElementById("perf-hud")?.remove();
+}
+function togglePerf() {
+  const on = localStorage.getItem("isy_perf") === "1";
+  if (on) { localStorage.removeItem("isy_perf"); stopPerfOverlay(); }
+  else { localStorage.setItem("isy_perf", "1"); startPerfOverlay(); }
+  return !on;
+}
+window.togglePerf = togglePerf;
+
 async function init() {
   document.body.append(el("div", { id: "toasts", class: "toasts" }));
+  if (localStorage.getItem("isy_perf") === "1") startPerfOverlay();
   paintBackdrop();
   window.addEventListener("resize", () => { clearTimeout(_bdT); _bdT = setTimeout(paintBackdrop, 200); });
   window.addEventListener("hashchange", onRoute);

@@ -1188,6 +1188,7 @@ impl Router {
             "/api/v1/drive" => self.drive_info(req),
             "/api/v1/permissions" => self.item_permissions(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
+            "/api/v1/debug/stats" => self.debug_stats(),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -2422,6 +2423,47 @@ impl Router {
             Some(c) => ApiResponse::ok_json(&json!({ "enabled": true, "paused": c.is_paused() })),
             None => ApiResponse::ok_json(&json!({ "enabled": false, "paused": false })),
         }
+    }
+
+    /// `GET /api/v1/debug/stats` — the app's whole-process load. The embedded engine and the
+    /// WebView share ONE OS process, so `/proc/self` is the total load the app causes (CPU +
+    /// RAM + disk IO), which powers the perf overlay. Linux/Android; each field defaults to 0
+    /// when unreadable. Self-stats only — not sensitive.
+    fn debug_stats(&self) -> ApiResponse {
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        // CPU: (utime+stime) ticks from /proc/self/stat. After the last ')', index 11 = utime,
+        // 12 = stime; assume 100 Hz (Android/Linux) → 10 ms per tick. The client turns the
+        // cumulative cpu_ms into a live % across polls.
+        let cpu_ms = read("/proc/self/stat")
+            .rsplit_once(')')
+            .map(|(_, rest)| {
+                let f: Vec<&str> = rest.split_whitespace().collect();
+                let u = f.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let s = f.get(12).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                (u + s) * 10
+            })
+            .unwrap_or(0);
+        // RSS: resident pages (field 2 of /proc/self/statm) × 4 KiB.
+        let rss_kb = read("/proc/self/statm")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|pages| pages * 4)
+            .unwrap_or(0);
+        // Disk IO: actual bytes to/from the block device (/proc/self/io).
+        let io = read("/proc/self/io");
+        let io_field = |k: &str| {
+            io.lines()
+                .find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))
+                .unwrap_or(0)
+        };
+        ApiResponse::ok_json(&json!({
+            "cpu_ms": cpu_ms,
+            "rss_kb": rss_kb,
+            "io_read": io_field("read_bytes:"),
+            "io_write": io_field("write_bytes:"),
+            "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        }))
     }
 
     /// In-flight FUSE placeholder hydrations (on-demand downloads). `active` is the

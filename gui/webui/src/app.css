@@ -1377,6 +1377,19 @@ a.note-meta-chip:hover { color: var(--accent); }
 /* The embedded real viewer (sandboxed /api/v1/view): a fixed-height, internally-scrolling
    preview pane; "Open full" gives the whole thing full-screen. */
 .asst-result-frame { display: block; width: 100%; height: 340px; border: 0; border-radius: 6px; background: #fff; margin-bottom: .5rem; }
+
+/* Performance overlay HUD (test flag). Deliberately no backdrop-blur/shadow — it must not
+   add the very GPU load it measures. Fixed, unobtrusive, non-interactive. */
+.perf-hud {
+  position: fixed; top: calc(env(safe-area-inset-top, 0px) + 8px); right: 8px; z-index: 9999;
+  background: rgba(8, 10, 16, .9); border: 1px solid rgba(255, 255, 255, .12); border-radius: 8px;
+  padding: .35rem .55rem; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #cbd5e1; pointer-events: none; min-width: 92px;
+}
+.perf-row { display: flex; justify-content: space-between; gap: .7rem; line-height: 1.5; }
+.perf-k { opacity: .6; }
+.perf-v { font-weight: 700; color: #e2e8f0; }
+.perf-v.hot { color: #f87171; }
 .asst-result-open {
   display: inline-flex; align-items: center; gap: .4rem; font-size: .76rem;
   color: var(--accent, #6366f1); text-decoration: none;
