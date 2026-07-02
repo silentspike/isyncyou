@@ -58,21 +58,45 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             self.source
                 .read_body(&it.service, &it.id)
                 .ok()
-                .map(|b| {
-                    String::from_utf8_lossy(&b)
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(PREVIEW_CHARS)
-                        .collect::<String>()
-                })
+                .map(|b| Self::body_preview(&it.service, &b))
                 .unwrap_or_default()
         } else {
             String::new()
         };
         v["snippet"] = serde_json::Value::String(preview);
         v
+    }
+
+    /// Turn a raw archived body into a readable, whitespace-collapsed preview capped at
+    /// [`PREVIEW_CHARS`]. Mail bodies are full `.eml` MIME, so extract the `text/plain`
+    /// part (tag-stripped `text/html` fallback) — the same [`isyncyou_connectors::mime`]
+    /// text the store indexes — instead of showing raw headers/boundaries. Other services
+    /// archive already-readable bodies (ics/vCard/text), so pass them through.
+    fn body_preview(service: &str, body: &[u8]) -> String {
+        #[cfg(feature = "retrieval")]
+        let text = if service == "mail" {
+            // Real mail is `.eml` MIME → extract the readable text. A non-MIME/plain body
+            // (or a message extract_text can't parse) falls back to raw so nothing is lost.
+            let t = isyncyou_connectors::mime::extract_text(body);
+            if t.trim().is_empty() {
+                String::from_utf8_lossy(body).into_owned()
+            } else {
+                t
+            }
+        } else {
+            String::from_utf8_lossy(body).into_owned()
+        };
+        #[cfg(not(feature = "retrieval"))]
+        let text = {
+            let _ = service;
+            String::from_utf8_lossy(body).into_owned()
+        };
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(PREVIEW_CHARS)
+            .collect()
     }
 
     fn search(
