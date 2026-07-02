@@ -25,6 +25,8 @@
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 /// A 256-bit body key (from the Android Keystore on mobile; a test/derived key elsewhere).
 pub type BodyKey = [u8; 32];
@@ -163,6 +165,98 @@ pub fn open(blob: &[u8], key: &BodyKey) -> Result<Vec<u8>, EnvelopeError> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------- process key registry
+// The active body key (from the Android Keystore on mobile) plus any older keys retained
+// for reading blobs sealed before a rotation. Set once at startup; a rotation prepends a
+// new active key and keeps the old ones for decrypt. No key material is ever logged.
+
+struct KeyRegistry {
+    active: Option<(u32, BodyKey)>,
+    older: Vec<(u32, BodyKey)>,
+}
+static KEYS: OnceLock<Mutex<KeyRegistry>> = OnceLock::new();
+fn keys() -> &'static Mutex<KeyRegistry> {
+    KEYS.get_or_init(|| {
+        Mutex::new(KeyRegistry {
+            active: None,
+            older: Vec::new(),
+        })
+    })
+}
+
+/// Install the active body key (`key_id`, 32 bytes) — called once at startup after the
+/// platform unwraps it (Keystore on mobile). A later call rotates: the previous active key
+/// is retained so pre-rotation blobs still decrypt. No-op key material never leaves here.
+pub fn set_body_key(key_id: u32, key: BodyKey) {
+    let mut reg = keys().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(prev) = reg.active.take() {
+        if prev.0 != key_id {
+            reg.older.push(prev);
+        }
+    }
+    reg.active = Some((key_id, key));
+}
+
+/// The active key id, or `None` when no key is installed (desktop plaintext / pre-unwrap).
+pub fn active_key_id() -> Option<u32> {
+    keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .active
+        .map(|(id, _)| id)
+}
+
+fn key_for_id(key_id: u32) -> Option<BodyKey> {
+    let reg = keys().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((id, k)) = reg.active {
+        if id == key_id {
+            return Some(k);
+        }
+    }
+    reg.older.iter().find(|(id, _)| *id == key_id).map(|(_, k)| *k)
+}
+
+/// Write `plaintext` to `final_path` **atomically** (temp file + rename) and **sealed** when
+/// a body key is active — so a large file is never left partly written and no plaintext temp
+/// file survives. With no active key (desktop) it writes plaintext, preserving today's
+/// behaviour. The parent directory must already exist.
+pub fn write_body_atomic(final_path: &Path, plaintext: &[u8]) -> std::io::Result<()> {
+    let bytes = match keys().lock().unwrap_or_else(|e| e.into_inner()).active {
+        Some((key_id, key)) => seal(plaintext, &key, key_id),
+        None => plaintext.to_vec(),
+    };
+    let tmp = tmp_sibling(final_path);
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, final_path)
+}
+
+/// Read a body file written by [`write_body_atomic`]. If the file is a sealed envelope it is
+/// opened with the matching key (by the header's `key_id`, honouring rotation); a plaintext
+/// file (no magic — e.g. from before encryption, or desktop) is returned as-is. Fails
+/// (never returns plaintext) if a sealed blob's key is missing or verification fails.
+pub fn read_body(path: &Path) -> std::io::Result<Vec<u8>> {
+    let raw = std::fs::read(path)?;
+    match blob_key_id(&raw) {
+        Some(key_id) => {
+            let key = key_for_id(key_id).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no body key for blob")
+            })?;
+            open(&raw, &key).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
+        None => Ok(raw), // plaintext (pre-encryption / desktop)
+    }
+}
+
+/// A temp sibling path in the SAME directory (so the rename is atomic on one filesystem).
+fn tmp_sibling(final_path: &Path) -> std::path::PathBuf {
+    let mut name = final_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".isytmp");
+    final_path.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +317,47 @@ mod tests {
         let mut blob = seal(b"hello world", &KEY, 1);
         blob.truncate(HEADER_LEN + 3); // header ok, body truncated
         assert!(matches!(open(&blob, &KEY), Err(EnvelopeError::Malformed(_))));
+    }
+
+    // One test owns the process-global key registry (so parallel tests don't race it).
+    #[test]
+    fn body_io_seals_on_disk_reads_plaintext_passthrough_and_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        set_body_key(1, KEY);
+        assert_eq!(active_key_id(), Some(1));
+
+        // A written body is sealed on disk: magic present, plaintext absent, no temp left.
+        let path = dir.path().join("body.bin");
+        let pt = b"sensitive-onedrive-body-CONTENT-x".repeat(200);
+        write_body_atomic(&path, &pt).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(blob_key_id(&on_disk), Some(1), "on-disk is a sealed envelope");
+        assert!(
+            on_disk.windows(7).all(|w| w != b"CONTENT"),
+            "no plaintext on disk"
+        );
+        assert!(
+            !path.with_file_name("body.bin.isytmp").exists(),
+            "no leftover temp file"
+        );
+        assert_eq!(read_body(&path).unwrap(), pt, "read_body decrypts back");
+
+        // A plaintext file (no magic) passes through unchanged even with a key active.
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, b"i am plaintext").unwrap();
+        assert_eq!(read_body(&plain).unwrap(), b"i am plaintext");
+
+        // A blob whose key isn't registered → fail closed (never plaintext).
+        let orphan = dir.path().join("orphan.bin");
+        std::fs::write(&orphan, seal(b"secret", &[9u8; 32], 777)).unwrap();
+        assert_eq!(
+            read_body(&orphan).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        // Rotation: a new active key still lets the old (key_id 1) blob decrypt.
+        set_body_key(2, [2u8; 32]);
+        assert_eq!(active_key_id(), Some(2));
+        assert_eq!(read_body(&path).unwrap(), pt, "pre-rotation blob still decrypts");
     }
 }
