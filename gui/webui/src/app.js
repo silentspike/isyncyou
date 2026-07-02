@@ -3915,6 +3915,53 @@ async function pollCodexStatus(n) {
   else endNetworkGuard();
 }
 
+// Progressive-search rendering (S-AG.18/#643, S-AG.19/#644). Module-level so BOTH the live
+// stream (agentSend) and a re-render from ASST_LOG (renderAsstMsg, after a view switch) build
+// identical cards — the transcript keeps its search stages + result cards, not just the text.
+const ASST_STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
+function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" })[s] || "file"; }
+// One typed result: header (name) + body-preview line; click → animated pull-down with the
+// full body + a direct link to the item (the app's canonical /api/v1/view).
+function asstResultCard(it) {
+  const q = { account: App.account, service: it.service, id: it.id };
+  const snip = (it.snippet || "").trim();
+  const head = el("div", { class: "asst-result-head" },
+    el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
+    el("div", { class: "asst-result-main grow" },
+      el("div", { class: "asst-result-name truncate", text: it.name || "(no name)" }),
+      el("div", { class: "asst-result-sub truncate", text: snip || (it.item_type || it.service) })),
+    el("span", { class: "asst-result-type", text: it.item_type || it.service }),
+    el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
+  const panelKids = [];
+  if (snip) panelKids.push(el("div", { class: "asst-result-body", text: snip }));
+  panelKids.push(el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
+    icon("external-link", "icon-sm"), el("span", { text: "Open " + (it.item_type || "item") })));
+  const row = el("div", { class: "asst-result" }, head, el("div", { class: "asst-result-panel" }, ...panelKids));
+  head.addEventListener("click", () => row.classList.toggle("open"));
+  return row;
+}
+function asstStageRowDone(stage, hits) {
+  return el("div", { class: "asst-stage done" },
+    el("span", { class: "asst-stage-ic", text: "✓" }),
+    el("span", { class: "grow", text: ASST_STAGE_LABEL[stage] || stage }),
+    el("span", { class: "asst-stage-n dim", text: hits + (hits === 1 ? " hit" : " hits") }));
+}
+// Rebuild a turn's search block (final stages + result cards) from stored data.
+function asstSearchBlock(stages, results) {
+  const frag = document.createDocumentFragment();
+  if (stages && stages.length) {
+    const sb = el("div", { class: "asst-search" });
+    stages.forEach(s => sb.append(asstStageRowDone(s.stage, s.hits)));
+    frag.append(sb);
+  }
+  if (results && results.length) {
+    const rb = el("div", { class: "asst-results" });
+    results.forEach(it => rb.append(asstResultCard(it)));
+    frag.append(rb);
+  }
+  return frag;
+}
+
 function renderAsstMsg(m) {
   const isUser = m.role === "user";
   const bubble = el("div", {
@@ -3922,6 +3969,9 @@ function renderAsstMsg(m) {
     style: `max-width:82%;padding:.7rem .9rem;${isUser ? "background:linear-gradient(135deg,#6366f1,#7c5cff);color:#fff" : ""}`,
   }, el("div", { class: "asst-text", style: "white-space:pre-wrap;line-height:1.5", text: m.text || (isUser ? "" : "…") }));
   (m.chips || []).forEach(c => bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: c })));
+  // Re-render the turn's search stages + result cards (persisted in the message), so a view
+  // switch brings the whole conversation back — not just the text (#644).
+  if ((m.stages && m.stages.length) || (m.results && m.results.length)) bubble.append(asstSearchBlock(m.stages, m.results));
   return el("div", { style: `display:flex;${isUser ? "justify-content:flex-end" : ""}` }, bubble);
 }
 
@@ -3942,7 +3992,7 @@ async function agentSend(text) {
 
   ASST_LOG.push({ role: "user", text });
   log.append(renderAsstMsg(ASST_LOG[ASST_LOG.length - 1]));
-  const asst = { role: "assistant", text: "", chips: [] };
+  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [] };
   ASST_LOG.push(asst);
   const asstEl = renderAsstMsg(asst);
   log.append(asstEl);
@@ -3973,34 +4023,18 @@ async function agentSend(text) {
     const done = d.status === "done";
     row.classList.toggle("done", done);
     row.querySelector(".asst-stage-ic").textContent = done ? "✓" : "";
-    if (done) row.querySelector(".asst-stage-n").textContent = d.hits + (d.hits === 1 ? " hit" : " hits");
+    if (done) {
+      row.querySelector(".asst-stage-n").textContent = d.hits + (d.hits === 1 ? " hit" : " hits");
+      const e = asst.stages.find(s => s.stage === d.stage);   // persist final stage state
+      if (e) e.hits = d.hits; else asst.stages.push({ stage: d.stage, hits: d.hits });
+    }
     log.scrollTop = log.scrollHeight;
   };
-  // Map an M365 service to its nav icon (matches SERVICES); fall back to a generic file.
-  const svcIcon = (s) => ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" }[s] || "file");
   const onPartialResult = (d) => {
     ensureSearchUI();
     (d.items || []).forEach((it) => {
-      // A typed element rendered as header (subject/name) + body (content preview), click
-      // to expand into the full body + a link straight to the item (the app's canonical
-      // /api/v1/view, as used in the service lists).
-      const q = { account: App.account, service: it.service, id: it.id };
-      const snip = (it.snippet || "").trim();
-      const head = el("div", { class: "asst-result-head" },
-        el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(svcIcon(it.service), "icon-sm")),
-        el("div", { class: "asst-result-main grow" },
-          el("div", { class: "asst-result-name truncate", text: it.name || "(no name)" }),
-          el("div", { class: "asst-result-sub truncate", text: snip || (it.item_type || it.service) })),
-        el("span", { class: "asst-result-type", text: it.item_type || it.service }),
-        el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
-      const panelKids = [];
-      if (snip) panelKids.push(el("div", { class: "asst-result-body", text: snip }));
-      panelKids.push(el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
-        icon("external-link", "icon-sm"), el("span", { text: "Open " + (it.item_type || "item") })));
-      const panel = el("div", { class: "asst-result-panel" }, ...panelKids);
-      const row = el("div", { class: "asst-result" }, head, panel);
-      head.addEventListener("click", () => row.classList.toggle("open"));
-      resultsBox.append(row);
+      asst.results.push(it);                 // persist so the cards survive a view switch
+      resultsBox.append(asstResultCard(it));  // module-level builder (shared with re-render)
     });
     log.scrollTop = log.scrollHeight;
   };
