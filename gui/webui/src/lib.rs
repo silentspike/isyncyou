@@ -704,6 +704,15 @@ pub struct Router {
     /// must be fully gated. `None` => desktop daemon behaviour (no extra gate). The
     /// token reaches the WebView via the native bridge, never in a static asset.
     session_token: Option<String>,
+    /// Mobile biometric gate (#onedrive-mobile 0.6). `true` only when the standalone
+    /// Android app builds the router (via `with_biometric_gate`). When set, destructive
+    /// ops in the gate catalogue require a per-action token that is only valid after a
+    /// native `BiometricPrompt` — a defense the WebView/agent cannot satisfy on its own
+    /// even though it holds the cap-tokens. `false` (desktop) => unchanged behaviour.
+    biometric_gate: bool,
+    /// Registry of destructive actions awaiting/holding a biometric confirmation. Used
+    /// only when `biometric_gate` is set; the native side confirms entries over JNI.
+    pending: isyncyou_core::pending::PendingActionRegistry,
 }
 
 /// Constant-time byte-equality (no early return on first mismatch) so token checks
@@ -755,6 +764,8 @@ impl Router {
             agent: None,
             agent_cap_token: None,
             session_token: None,
+            biometric_gate: false,
+            pending: isyncyou_core::pending::PendingActionRegistry::new(),
         }
     }
 
@@ -794,6 +805,8 @@ impl Router {
             agent: None,
             agent_cap_token: None,
             session_token: None,
+            biometric_gate: false,
+            pending: isyncyou_core::pending::PendingActionRegistry::new(),
         }
     }
 
@@ -822,6 +835,69 @@ impl Router {
     /// Crate-internal accessor for the agent handler (used by the SSE stream in serve.rs).
     pub(crate) fn agent_handler(&self) -> Option<&std::sync::Arc<dyn AgentHandler>> {
         self.agent.as_ref()
+    }
+
+    /// Enable the mobile biometric gate (#onedrive-mobile 0.6, builder style). Only the
+    /// standalone Android app calls this; the desktop daemon leaves it off.
+    pub fn with_biometric_gate(mut self) -> Self {
+        self.biometric_gate = true;
+        self
+    }
+
+    /// Record a successful native `BiometricPrompt` for a pending destructive action.
+    /// Called ONLY from the native JNI path — the WebView has no route to it, which is
+    /// exactly what makes the per-action token a real second factor even though the UI
+    /// holds every cap-token. Returns `false` for an unknown or expired id.
+    pub fn confirm_biometric(&self, pending_id: &str) -> bool {
+        self.pending
+            .confirm_biometric(pending_id, isyncyou_core::pending::now_ms())
+    }
+
+    /// The mobile biometric gate for one destructive op. Returns:
+    /// - `None` — proceed (desktop profile, op not in the gate catalogue, or a valid
+    ///   single-use token rode in on `_pat` and was consumed);
+    /// - `Some(confirmation_required)` — mobile + gated + no token yet: a pending action
+    ///   was registered; the UI must run the native biometric and re-issue with `_pat`;
+    /// - `Some(403)` — a token was presented but was bad/expired/replayed/mismatched.
+    fn biometric_challenge(
+        &self,
+        op: &str,
+        account: &str,
+        service: &str,
+        item: &str,
+        req: &ApiRequest,
+    ) -> Option<ApiResponse> {
+        if !self.biometric_gate || !isyncyou_core::pending::requires_confirmation(op) {
+            return None;
+        }
+        let now = isyncyou_core::pending::now_ms();
+        match req.q("_pat").filter(|s| !s.is_empty()) {
+            Some(pat) => match self.pending.consume(pat, op, account, service, item, now) {
+                Ok(()) => None,
+                Err(e) => Some(ApiResponse::error(
+                    403,
+                    &format!("biometric confirmation invalid: {e:?}"),
+                )),
+            },
+            None => match self.pending.register(
+                op,
+                account,
+                service,
+                item,
+                now,
+                isyncyou_core::pending::DEFAULT_TTL_MS,
+            ) {
+                Some(id) => Some(ApiResponse::ok_json(&json!({
+                    "status": "confirmation_required",
+                    "pending_action_id": id,
+                    "op": op,
+                    "account": account,
+                    "service": service,
+                    "item": item,
+                }))),
+                None => Some(ApiResponse::error(500, "could not create confirmation token")),
+            },
+        }
     }
 
     /// Enable the outbound-sharing POST, guarded by `cap_token` (builder style).
@@ -1511,6 +1587,9 @@ impl Router {
             (Some(a), Some(i)) => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "calendar", id, req) {
+            return r;
+        }
         self.cal_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
@@ -1696,6 +1775,9 @@ impl Router {
             (Some(a), Some(i)) => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "contacts", id, req) {
+            return r;
+        }
         self.contact_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
@@ -1872,6 +1954,9 @@ impl Router {
             Some(i) => i,
             None => return ApiResponse::error(400, "id is required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "todo", id, req) {
+            return r;
+        }
         self.todo_result(
             account,
             &format!("delete id={id}"),
@@ -2098,6 +2183,9 @@ impl Router {
             (Some(a), Some(i)) => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "onenote", id, req) {
+            return r;
+        }
         self.onenote_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
@@ -5098,6 +5186,110 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             200
         );
         assert_eq!(rec.last(), "send_draft id=d1");
+    }
+
+    #[derive(Default)]
+    struct FakeCalendarWrite {
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+    impl CalendarWriteHandler for FakeCalendarWrite {
+        fn create(&self, _a: &str, _e: &Value) -> Result<String, String> {
+            Ok("new".into())
+        }
+        fn update(&self, _a: &str, _id: &str, _e: &Value) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.deletes.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn respond(&self, _a: &str, _id: &str, _r: &str, _c: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    // #onedrive-mobile 0.6: the mobile biometric gate wired through a real route.
+    #[test]
+    fn biometric_gate_challenges_and_consumes_a_per_action_token() {
+        let del = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+
+        // Desktop profile (gate off): a delete with the cap token goes straight through.
+        let (_d0, r0) = setup();
+        let f0 = std::sync::Arc::new(FakeCalendarWrite::default());
+        let desktop = r0.with_calendar_write(f0.clone(), "cap".into());
+        assert_eq!(
+            desktop
+                .route(&del("/api/v1/calendar/delete?account=a&id=e1"))
+                .status,
+            200
+        );
+        assert_eq!(*f0.deletes.lock().unwrap(), vec!["e1"]);
+
+        // Mobile profile (gate on): the same delete is challenged; handler NOT called.
+        let (_d1, r1) = setup();
+        let f1 = std::sync::Arc::new(FakeCalendarWrite::default());
+        let mobile = r1
+            .with_calendar_write(f1.clone(), "cap".into())
+            .with_biometric_gate();
+        let ch = mobile.route(&del("/api/v1/calendar/delete?account=a&id=e1"));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(
+            f1.deletes.lock().unwrap().is_empty(),
+            "handler must not run before biometric"
+        );
+
+        // Re-issue with the token but NO biometric yet -> 403 (not confirmed).
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert!(f1.deletes.lock().unwrap().is_empty());
+
+        // Native biometric confirms over the JNI-only path -> re-issue proceeds once.
+        assert!(mobile.confirm_biometric(&pat));
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
+                )))
+                .status,
+            200
+        );
+        assert_eq!(*f1.deletes.lock().unwrap(), vec!["e1"]);
+
+        // Replay of the consumed token -> 403 (single-use); handler not called again.
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert_eq!(f1.deletes.lock().unwrap().len(), 1);
+
+        // A token minted+confirmed for e2 cannot authorize deleting e1 (hash immutable).
+        let ch2 = mobile.route(&del("/api/v1/calendar/delete?account=a&id=e2"));
+        let pat2 = body_json(&ch2)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(mobile.confirm_biometric(&pat2));
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat2}"
+                )))
+                .status,
+            403
+        );
     }
 
     #[test]
