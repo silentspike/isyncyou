@@ -11,9 +11,11 @@
 //! route. Tokens are NEVER logged.
 
 use isyncyou_core::{AccountConfig, Config};
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -89,6 +91,88 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     out.extend_from_slice(ct);
     out.extend_from_slice(&resp.body);
     out
+}
+
+// ---------------------------------------------------------------- push streams (#0A)
+// The bridge's SSE replacement: each open stream is a `Receiver<String>` of ready-to-embed
+// JSON event objects. Kotlin runs one thread per stream: open → loop next → close. Single
+// consumer per stream, so `next` takes the receiver out of the registry for the (blocking)
+// recv and puts it back — `open`/`close` stay responsive. `close` while a `next` is
+// in-flight tombstones the id so the receiver is dropped on return.
+
+#[derive(Default)]
+struct StreamRegistry {
+    rx: HashMap<i64, Receiver<String>>,
+    closed: HashSet<i64>,
+}
+static STREAMS: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();
+static STREAM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn streams() -> &'static Mutex<StreamRegistry> {
+    STREAMS.get_or_init(|| Mutex::new(StreamRegistry::default()))
+}
+
+/// Open a bridge push stream (#0A) for `path`, session-gated. Returns a stream id (>0), or
+/// 0 when the engine hasn't started / the stream is unknown / the session is unauthorized.
+pub fn stream_open(path: &str, session_token: Option<&str>) -> i64 {
+    let router = {
+        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| Arc::clone(&s.router))
+    };
+    let Some(router) = router else {
+        return 0;
+    };
+    let Some(rx) = router.open_bridge_stream(path, session_token) else {
+        return 0;
+    };
+    let id = STREAM_SEQ.fetch_add(1, Ordering::SeqCst) as i64;
+    streams()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .rx
+        .insert(id, rx);
+    id
+}
+
+/// Block for the next event on stream `id` (a JSON `{event,data}` object). Returns "" when
+/// the stream ended, was closed, or is unknown; a `ping` heartbeat on idle timeout.
+pub fn stream_next(id: i64) -> String {
+    let rx = {
+        let mut reg = streams().lock().unwrap_or_else(|e| e.into_inner());
+        if reg.closed.remove(&id) {
+            reg.rx.remove(&id);
+            return String::new();
+        }
+        match reg.rx.remove(&id) {
+            Some(rx) => rx,
+            None => return String::new(),
+        }
+    };
+    let outcome = rx.recv_timeout(Duration::from_secs(20));
+    let mut reg = streams().lock().unwrap_or_else(|e| e.into_inner());
+    if reg.closed.remove(&id) {
+        return String::new(); // closed during recv → drop the receiver, end the stream
+    }
+    match outcome {
+        Ok(s) => {
+            reg.rx.insert(id, rx);
+            s
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            reg.rx.insert(id, rx);
+            r#"{"event":"ping","data":""}"#.to_string()
+        }
+        Err(RecvTimeoutError::Disconnected) => String::new(), // source ended → drop, don't reinsert
+    }
+}
+
+/// Close a bridge push stream. If a `next` is currently blocked on it, the stream is
+/// tombstoned so the receiver is dropped when that `next` returns.
+pub fn stream_close(id: i64) {
+    let mut reg = streams().lock().unwrap_or_else(|e| e.into_inner());
+    if reg.rx.remove(&id).is_none() {
+        reg.closed.insert(id);
+    }
 }
 
 /// The per-process session token Kotlin must hand to the WebView (header + cookie)
@@ -282,6 +366,48 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// JNI: open a bridge push stream (#0A), returning a stream id (>0) or 0. The session
+/// token is passed explicitly (the WebView can't set headers on a native stream open).
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOpen(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    path: jni::objects::JString,
+    session_token: jni::objects::JString,
+) -> jni::sys::jlong {
+    let path: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    let tok: String = env.get_string(&session_token).map(Into::into).unwrap_or_default();
+    let tok = if tok.is_empty() { None } else { Some(tok) };
+    std::panic::catch_unwind(AssertUnwindSafe(|| stream_open(&path, tok.as_deref()))).unwrap_or(0)
+}
+
+/// JNI: block for the next event on stream `id` (a JSON `{event,data}` object), or "" when
+/// the stream ended/closed. Kotlin's per-stream thread loops on this. Never logs.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamNext(
+    env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    id: jni::sys::jlong,
+) -> jni::sys::jstring {
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| stream_next(id))).unwrap_or_default();
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// JNI: close a bridge push stream.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamClose(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    id: jni::sys::jlong,
+) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| stream_close(id)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +515,29 @@ mod tests {
             String::from_utf8_lossy(body).contains("<"),
             "shell body is HTML"
         );
+    }
+
+    #[test]
+    fn stream_registry_opens_gated_and_closes() {
+        // #0A: the push-stream FFI plumbing — gating + open/close registry. Event delivery
+        // semantics are proven in webui's open_bridge_stream test; the full push round-trip
+        // is device-verified.
+        let dir = tempfile::tempdir().unwrap();
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let tok = session_token().expect("token");
+        assert_eq!(
+            stream_open("/api/v1/events", None),
+            0,
+            "unauthorized → no stream"
+        );
+        assert_eq!(
+            stream_open("/api/v1/nope", Some(&tok)),
+            0,
+            "unknown path → no stream"
+        );
+        let id = stream_open("/api/v1/events", Some(&tok));
+        assert!(id > 0, "authorized events stream opens");
+        stream_close(id);
+        assert_eq!(stream_next(id), "", "a closed stream yields nothing");
     }
 }

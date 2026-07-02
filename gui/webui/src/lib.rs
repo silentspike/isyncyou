@@ -988,6 +988,78 @@ impl Router {
         }
     }
 
+    /// Open a push stream for the Android in-process bridge (#0A) — the replacement for the
+    /// two `EventSource` endpoints on the phone, where no loopback port exists to hold an
+    /// SSE socket open. Items are ready-to-embed JSON event objects
+    /// `{"event":<name>,"data":<string>}`; the native side wraps each in a bridge push
+    /// message. Session-gated exactly like the HTTP SSE paths (header or `_st` query).
+    /// `None` when unauthorized or the stream is unknown/absent. Dropping the returned
+    /// receiver ends the source thread (the next `send` fails).
+    pub fn open_bridge_stream(
+        &self,
+        target: &str,
+        session_token: Option<&str>,
+    ) -> Option<std::sync::mpsc::Receiver<String>> {
+        let req = ApiRequest::new("GET", target)
+            .with_session_token(session_token.map(str::to_string));
+        let st_query = req
+            .query
+            .iter()
+            .find(|(k, _)| k == "_st")
+            .map(|(_, v)| v.as_str());
+        if !self.session_authorized(req.session_token.as_deref().or(st_query)) {
+            return None;
+        }
+        match req.path.as_str() {
+            "/api/v1/events" => {
+                let bus = self.events_bus()?.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut last = bus.generation();
+                    loop {
+                        let g = bus.wait_change(last, std::time::Duration::from_secs(15));
+                        // A `change` on a real generation bump, else a `ping` heartbeat —
+                        // both double as the dropped-receiver check (send fails → exit).
+                        let msg = if g != last {
+                            last = g;
+                            r#"{"event":"change","data":""}"#
+                        } else {
+                            r#"{"event":"ping","data":""}"#
+                        };
+                        if tx.send(msg.to_string()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Some(rx)
+            }
+            "/api/v1/agent/stream" => {
+                let turn = req
+                    .query
+                    .iter()
+                    .find(|(k, _)| k == "turn")
+                    .map(|(_, v)| v.as_str())
+                    .filter(|t| !t.is_empty())?;
+                let inner = self.agent_handler()?.open_stream(turn)?;
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    // Each inner item is one pre-serialized agent event (a JSON string);
+                    // carry it as the `data` field so app.js JSON-parses it as it does the
+                    // EventSource `data:` line. Terminate with a `done` event.
+                    for line in inner.iter() {
+                        let msg = serde_json::json!({ "event": "message", "data": line }).to_string();
+                        if tx.send(msg).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(r#"{"event":"done","data":""}"#.to_string());
+                });
+                Some(rx)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the request carries the configured capability token. The token is
     /// compared in **constant time** so a timing side-channel can't reveal it byte
     /// by byte (the length check only leaks length, which is fixed for our tokens).
@@ -4469,6 +4541,57 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let cancel = ApiRequest::new("POST", "/api/v1/agent/cancel?turn=turn-123")
             .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&cancel).status, 200);
+    }
+
+    #[test]
+    fn open_bridge_stream_gates_events_and_agent() {
+        // #0A: the bridge push channel replaces both EventSource endpoints, with the same
+        // session gate. Change stream pushes on notify; agent stream wraps each line.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let bus = std::sync::Arc::new(EventBus::new());
+        let (_d, router) = setup();
+        let router = router
+            .with_events(bus.clone())
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("s".into());
+        // Unauthorized → None (identical gate to the HTTP SSE path).
+        assert!(router.open_bridge_stream("/api/v1/events", None).is_none());
+        // Authorized change stream (token via _st) → a change follows a notify. A
+        // background notifier removes the capture-vs-notify race (mirrors the SSE test).
+        let rx = router
+            .open_bridge_stream("/api/v1/events?_st=s", None)
+            .expect("events stream");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (n, s2) = (bus.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !s2.load(Ordering::SeqCst) {
+                n.notify();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let mut got_change = false;
+        for _ in 0..40 {
+            if let Ok(m) = rx.recv_timeout(Duration::from_millis(500)) {
+                if m.contains("\"change\"") {
+                    got_change = true;
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(got_change, "change stream must push a change after notify");
+        // Agent stream (session + turn) → the pre-serialized line wrapped as `data`.
+        let arx = router
+            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123&_st=s", None)
+            .expect("agent stream");
+        let first = arx.recv_timeout(Duration::from_secs(2)).expect("an event");
+        assert!(
+            first.contains("\"message\"") && first.contains("token"),
+            "agent line wrapped as data: {first}"
+        );
+        // Unknown path → None.
+        assert!(router.open_bridge_stream("/api/v1/nope", Some("s")).is_none());
     }
 
     #[test]
