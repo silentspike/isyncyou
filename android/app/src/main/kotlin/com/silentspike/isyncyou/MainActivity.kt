@@ -9,12 +9,14 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import java.io.ByteArrayInputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import org.json.JSONObject
@@ -31,6 +33,12 @@ class MainActivity : Activity() {
 
     private companion object {
         const val TAG = "iSyncYou"
+
+        /** The stable app origin the WebView loads from (#0A) — WebView's reserved
+         *  virtual host. GET assets/subresources are served in-process via
+         *  `shouldInterceptRequest`, so no loopback TCP port is exposed. */
+        const val APP_HOST = "appassets.androidplatform.net"
+        const val APP_ORIGIN = "https://$APP_HOST"
     }
 
     private lateinit var web: WebView
@@ -68,10 +76,9 @@ class MainActivity : Activity() {
         }
         web.clearCache(true)
         web.webViewClient = object : WebViewClient() {
-            // The local UI (127.0.0.1) stays in the WebView; hand any external
-            // navigation — e.g. the device-code sign-in at login.live.com — to the
-            // system browser so the auth page never takes over the app's own UI
-            // (#89; aligns with RFC 8252: use the system browser for OAuth).
+            // The app-origin UI stays in the WebView; hand any external navigation —
+            // e.g. the device-code sign-in at login.live.com — to the system browser so
+            // the auth page never takes over the app's own UI (#89; RFC 8252).
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest,
@@ -82,9 +89,10 @@ class MainActivity : Activity() {
                 // depth so a hostile link can't drive the WebView into a local scheme.
                 val scheme = url.scheme?.lowercase()
                 if (scheme != "http" && scheme != "https") return true
-                // The local UI stays in the WebView.
+                // The app-origin UI (and, during the staged rollout, loopback) stays in
+                // the WebView.
                 val host = url.host
-                if (host == "127.0.0.1" || host == "localhost") return false
+                if (host == APP_HOST || host == "127.0.0.1" || host == "localhost") return false
                 // External http(s) — e.g. the device-code sign-in at login.live.com —
                 // goes to the system browser, never inside the app's own UI.
                 return try {
@@ -96,11 +104,37 @@ class MainActivity : Activity() {
                 }
             }
 
-            // Emit a stable signal once the local shell has rendered. Used by the CI
-            // emulator smoke (REQ-AND-004) to assert the WebView loaded the embedded
-            // UI, and handy for on-device diagnostics.
+            // Serve every app-origin GET (the shell + any img/iframe/viewer the WebView
+            // loads itself) in-process from the embedded engine (#0A) — no loopback TCP
+            // port. POST/PATCH/DELETE ride the message bridge (they carry a body, which a
+            // WebResourceRequest cannot expose), so they are left to the network stack and
+            // never reach here. External / non-app-origin requests return null (normal
+            // handling → shouldOverrideUrlLoading).
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest,
+            ): WebResourceResponse? {
+                val url = request.url
+                if (url.host != APP_HOST) return null
+                if (!request.method.equals("GET", ignoreCase = true)) return null
+                val path = (url.encodedPath ?: "/") + (url.encodedQuery?.let { "?$it" } ?: "")
+                // The session cookie auto-rides subresources; read it for the engine gate.
+                val cookie = CookieManager.getInstance().getCookie(url.toString()) ?: ""
+                return try {
+                    decodeAssetResponse(NativeEngine.nativeAssetRequest(path, cookie))
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "asset serve failed for ${url.encodedPath}", e)
+                    null
+                }
+            }
+
+            // Emit a stable signal once the shell has rendered. Used by the CI emulator
+            // smoke (REQ-AND-004) and handy for on-device diagnostics.
             override fun onPageFinished(view: WebView, url: String) {
-                if (url.startsWith("http://127.0.0.1") || url.startsWith("http://localhost")) {
+                if (url.startsWith(APP_ORIGIN) ||
+                    url.startsWith("http://127.0.0.1") ||
+                    url.startsWith("http://localhost")
+                ) {
                     android.util.Log.i(TAG, "shell loaded: $url")
                 }
             }
@@ -167,32 +201,28 @@ class MainActivity : Activity() {
             return
         }
         sessionToken = token
-        val origin = "http://127.0.0.1:$port"
-        // Deliver the session token two ways (#89 P1): a JS bridge for the web UI's
-        // fetch() X-Session-Token header, and a loopback cookie that auto-rides
-        // iframe/img/EventSource subresource requests. Both are set out-of-band — the
-        // token is never served in a static asset another app could read.
+        // The WebView loads from the stable **app origin** (#0A); GET assets/subresources
+        // are served in-process by shouldInterceptRequest and the data path rides the
+        // message bridge, so no loopback TCP port is exposed to other apps.
         web.addJavascriptInterface(SessionBridge(), "AndroidSession")
         web.addJavascriptInterface(PushBridge(), "AndroidPush")
         web.addJavascriptInterface(NavBridge(), "AndroidNav")
-        // In-process message bridge (#0A): the data path (api/post/streams) rides an
-        // origin-bound WebMessageListener instead of a loopback TCP round-trip. Registered
-        // alongside the loopback server (staged rollout) — when present, app.js routes
-        // through it; the loopback still serves the shell + subresources. Bound to the
-        // engine's exact origin so no other frame/origin can reach it.
-        setupBridge(origin)
+        // Origin-bound message bridge (#0A): the data path (api/post/streams) rides an
+        // origin-bound WebMessageListener bound to the app origin — no other frame/origin
+        // (and, with the no-script sandboxed viewers, no untrusted iframe) can reach it.
+        setupBridge(APP_ORIGIN)
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
-            setCookie("$origin/", "isy_session=$token; Path=/")
+            // The session cookie auto-rides app-origin subresources (iframe/img); it is set
+            // out-of-band, never served in a static asset another app could read (#89 P1).
+            setCookie("$APP_ORIGIN/", "isy_session=$token; Path=/")
             // setCookie is async; flush() persists it synchronously so the very first
-            // subresource requests (iframe/img/EventSource) already carry the session
-            // cookie and don't 401 on the initial load (#89 P1).
+            // subresource requests already carry the session cookie.
             flush()
         }
-        // nativeStart is idempotent, so on Activity recreation the port is the same
-        // origin and the UI simply reloads.
-        android.util.Log.i(TAG, "engine bound 127.0.0.1:$port")
-        web.loadUrl("$origin/")
+        // nativeStart is idempotent, so on Activity recreation the same engine reloads.
+        android.util.Log.i(TAG, "engine ready (in-process), loading $APP_ORIGIN")
+        web.loadUrl("$APP_ORIGIN/")
     }
 
     /** JS bridge: the web UI reads the session token to gate its loopback API calls. */
@@ -327,6 +357,41 @@ class MainActivity : Activity() {
             NativeEngine.nativeStreamClose(nativeId)
             reply.postMessage("{\"t\":\"end\",\"id\":\"$jsId\"}")
         }
+    }
+
+    /**
+     * Decode the framed bytes from [NativeEngine.nativeAssetRequest] (#0A) into a
+     * WebResourceResponse: `[status:u16][ct_len:u16][content_type][hdr_len:u16][headers][body]`.
+     * Preserves the engine's status, content-type (mime + charset) and extra response
+     * headers (e.g. a viewer's Content-Security-Policy), plus `nosniff`.
+     */
+    private fun decodeAssetResponse(framed: ByteArray): WebResourceResponse {
+        fun u16(i: Int) = ((framed[i].toInt() and 0xff) shl 8) or (framed[i + 1].toInt() and 0xff)
+        if (framed.size < 6) {
+            return WebResourceResponse(
+                "text/plain", "utf-8", 503, "Unavailable",
+                emptyMap(), ByteArrayInputStream(ByteArray(0)),
+            )
+        }
+        val status = u16(0)
+        val ctLen = u16(2)
+        val ctFull = String(framed, 4, ctLen, Charsets.UTF_8)
+        val hdrOff = 4 + ctLen
+        val hdrLen = u16(hdrOff)
+        val hdrsRaw = String(framed, hdrOff + 2, hdrLen, Charsets.UTF_8)
+        val body = framed.copyOfRange(hdrOff + 2 + hdrLen, framed.size)
+
+        val mime = ctFull.substringBefore(";").trim().ifEmpty { "application/octet-stream" }
+        val enc = Regex("charset=([^;]+)", RegexOption.IGNORE_CASE)
+            .find(ctFull)?.groupValues?.get(1)?.trim()
+        val headers = HashMap<String, String>()
+        headers["X-Content-Type-Options"] = "nosniff"
+        hdrsRaw.split("\r\n").forEach { line ->
+            val i = line.indexOf(':')
+            if (i > 0) headers[line.substring(0, i).trim()] = line.substring(i + 1).trim()
+        }
+        val reason = if (status in 200..299) "OK" else "Status $status"
+        return WebResourceResponse(mime, enc, status, reason, headers, ByteArrayInputStream(body))
     }
 
     /** Hardware/gesture back navigates WebView history before leaving the app. */

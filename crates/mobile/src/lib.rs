@@ -24,10 +24,12 @@ use std::time::Duration;
 const ACCOUNT: &str = "me";
 
 struct EngineState {
-    port: u16,
     session_token: String,
-    /// The live router, shared with the loopback server. Held so the in-process message
-    /// bridge (#0A) answers requests against the **same** router (no second TCP port).
+    /// The live router. In the default build it is reached **only** in-process (the
+    /// message bridge + `shouldInterceptRequest` asset path) — no TCP port is bound, so no
+    /// other app on the device can reach it (#0A netstat AC). A loopback server is bound
+    /// **only** under the experimental agent-subscription feature (whose OAuth flow needs a
+    /// `http://127.0.0.1/callback` redirect target); its port is not retained here.
     router: Arc<isyncyou_webui::Router>,
 }
 
@@ -39,20 +41,20 @@ fn cell() -> &'static Mutex<Option<EngineState>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Start the embedded engine if not already running, returning the bound loopback
-/// port. Idempotent. Host-testable (no JNI): the JNI entry is a thin wrapper.
-pub fn start_engine(files_dir: &str) -> Result<u16, String> {
+/// Start the embedded engine if not already running. Idempotent. Host-testable (no JNI):
+/// the JNI entry is a thin wrapper. No loopback port is bound in the default build (#0A);
+/// the UI reaches the engine only in-process (bridge + asset path).
+pub fn start_engine(files_dir: &str) -> Result<(), String> {
     let mut guard = cell().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(st) = guard.as_ref() {
-        return Ok(st.port); // already running — reuse it
+    if guard.is_some() {
+        return Ok(()); // already running — idempotent
     }
-    let (port, session_token, router) = start_inner(files_dir)?;
+    let (session_token, router) = start_inner(files_dir)?;
     *guard = Some(EngineState {
-        port,
         session_token,
         router,
     });
-    Ok(port)
+    Ok(())
 }
 
 /// Handle one JSON-framed request from the Android in-process bridge (#0A) against the
@@ -72,9 +74,10 @@ pub fn bridge_request(request_json: &str) -> String {
 
 /// Answer one browser-initiated GET subresource (#0A) — the static shell and any
 /// `img`/`iframe`/viewer the WebView loads itself — for Kotlin's `shouldInterceptRequest`.
-/// **Binary-safe** (unlike the JSON bridge envelope, which is text-only): returns
-/// `[status: u16 BE][content_type_len: u16 BE][content_type][body]`. Cookie-gated exactly
-/// like the loopback path. Empty vec when the engine hasn't started.
+/// **Binary-safe** (unlike the JSON bridge envelope, which is text-only) and header-faithful
+/// so a viewer's per-response `Content-Security-Policy` survives. Frame:
+/// `[status:u16 BE][ct_len:u16 BE][content_type][hdr_len:u16 BE][headers "K: V\r\n"…][body]`.
+/// Cookie-gated exactly like the loopback path. Empty vec when the engine hasn't started.
 pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     let router = {
         let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
@@ -85,10 +88,19 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     };
     let resp = isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
     let ct = resp.content_type.as_bytes();
-    let mut out = Vec::with_capacity(4 + ct.len() + resp.body.len());
+    // Extra response headers (e.g. the viewer's CSP) as "Key: Value\r\n", CRLF-sanitised.
+    let mut hdrs = String::new();
+    for (k, v) in &resp.headers {
+        let v = v.replace(['\r', '\n'], " ");
+        hdrs.push_str(&format!("{k}: {v}\r\n"));
+    }
+    let hdrs = hdrs.as_bytes();
+    let mut out = Vec::with_capacity(6 + ct.len() + hdrs.len() + resp.body.len());
     out.extend_from_slice(&resp.status.to_be_bytes());
     out.extend_from_slice(&(ct.len() as u16).to_be_bytes());
     out.extend_from_slice(ct);
+    out.extend_from_slice(&(hdrs.len() as u16).to_be_bytes());
+    out.extend_from_slice(hdrs);
     out.extend_from_slice(&resp.body);
     out
 }
@@ -185,7 +197,7 @@ pub fn session_token() -> Option<String> {
         .map(|s| s.session_token.clone())
 }
 
-fn start_inner(files_dir: &str) -> Result<(u16, String, Arc<isyncyou_webui::Router>), String> {
+fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
     let base = PathBuf::from(files_dir);
     let archive_root = base.join("archive");
     let sync_root = base.join("sync");
@@ -197,7 +209,7 @@ fn start_inner(files_dir: &str) -> Result<(u16, String, Arc<isyncyou_webui::Rout
     std::fs::create_dir_all(&cache_root).map_err(|e| e.to_string())?;
     let config_path = base.join("isyncyou.toml");
 
-    let cfg = Config {
+    let mut cfg = Config {
         accounts: vec![AccountConfig {
             id: ACCOUNT.into(),
             username: ACCOUNT.into(),
@@ -208,6 +220,10 @@ fn start_inner(files_dir: &str) -> Result<(u16, String, Arc<isyncyou_webui::Rout
         }],
         ..Default::default()
     };
+    // A phone is a cache/live companion, not the desktop's 5 s near-real-time loop:
+    // poll every 30 s to spare battery/mobile-data and cut the periodic view refresh
+    // frequency (the live-refresh is otherwise driven every poll a change lands).
+    cfg.sync.poll_interval_secs = 30;
     // Persist so DaemonSettings (which reads/writes the config file) works on-device.
     cfg.save(&config_path)?;
 
@@ -230,19 +246,23 @@ fn start_inner(files_dir: &str) -> Result<(u16, String, Arc<isyncyou_webui::Rout
         .with_session_token(session_token.clone()),
     );
 
-    // OS-assigned free loopback port (read it back before serving).
-    let listener = isyncyou_webui::bind_loopback("127.0.0.1:0").map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-
-    // Serve on a background thread, panic-isolated: a request-handling panic must
-    // never take down the host app process. The same router is shared with the
-    // in-process bridge (#0A) via the stored `Arc` clone.
-    let serve_router = Arc::clone(&router);
-    std::thread::spawn(move || {
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _ = isyncyou_webui::serve_listener_shared(listener, serve_router);
-        }));
-    });
+    // #0A: NO loopback TCP port in the default build — the WebView reaches the engine only
+    // in-process (the message bridge for data, `shouldInterceptRequest`→`asset_request` for
+    // GET assets), so nothing is reachable by another app on the device. A loopback server
+    // is bound ONLY under the experimental agent-subscription feature, whose device-code
+    // OAuth flow returns to a `http://127.0.0.1:<port>/callback` redirect the browser hits.
+    #[cfg(feature = "agent-subscription-experimental")]
+    {
+        let listener = isyncyou_webui::bind_loopback("127.0.0.1:0").map_err(|e| e.to_string())?;
+        // Serve on a background thread, panic-isolated: a request-handling panic must never
+        // take down the host app process. Shares the same router as the in-process bridge.
+        let serve_router = Arc::clone(&router);
+        std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = isyncyou_webui::serve_listener_shared(listener, serve_router);
+            }));
+        });
+    }
 
     // Cache-refresh thread (#89 P2): once the account is signed in, periodically pull
     // mail/calendar/contacts/todo/onenote from Graph into the local cache store
@@ -250,7 +270,7 @@ fn start_inner(files_dir: &str) -> Result<(u16, String, Arc<isyncyou_webui::Rout
     // UI refreshes. Skips silently until a token is cached.
     std::thread::spawn(move || refresh_loop(cfg, gate, events, live_interval));
 
-    Ok((port, session_token, router))
+    Ok((session_token, router))
 }
 
 fn refresh_loop(
@@ -304,8 +324,10 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart(
         Ok(s) => s.into(),
         Err(_) => return -1,
     };
+    // The default build binds no loopback port, so there is no port to return: 1 = started,
+    // -1 = failed. Kotlin only checks `> 0` to know the engine is up (#0A).
     match start_engine(&dir) {
-        Ok(port) => jni::sys::jint::from(port as i32),
+        Ok(()) => 1,
         Err(_) => -1,
     }
 }
@@ -413,66 +435,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_engine_binds_a_port_and_is_idempotent() {
-        // Host test of the non-JNI core (#89 P4): start binds a loopback port and a
-        // second call returns the SAME port (Activity recreation must not double-bind).
+    fn start_engine_is_idempotent_and_mints_a_session_token() {
+        // Host test of the non-JNI core (#89 P4 / #0A): start succeeds, mints a session
+        // token, and a second call reuses the SAME running engine (Activity recreation must
+        // not start a second one). No loopback port is bound in the default build.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        let port1 = start_engine(path).expect("engine starts");
-        assert!(port1 > 0, "must bind a real port");
-        let port2 = start_engine(path).expect("idempotent restart");
-        assert_eq!(port1, port2, "second start must reuse the running port");
-        // The session token is set and non-empty (gates the data API).
-        let tok = session_token().expect("token present");
-        assert!(!tok.is_empty(), "session token must be set");
+        start_engine(path).expect("engine starts");
+        let tok1 = session_token().expect("token present");
+        assert!(!tok1.is_empty(), "session token must be set");
+        start_engine(path).expect("idempotent restart");
+        let tok2 = session_token().expect("token present");
+        assert_eq!(tok1, tok2, "second start must reuse the running engine");
     }
 
     #[test]
-    fn standalone_serves_ui_and_gates_the_api_end_to_end() {
-        // #89 P7 (host slice): the embedded engine — the exact code that runs on the
-        // phone — serves the web UI over loopback and fully session-token gates the
-        // data API. The WebView visual + device-code login + over-LTE render are the
-        // genuinely device-bound parts; the engine/serving/gating is proven here.
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
+    fn standalone_serves_ui_and_gates_the_api_in_process() {
+        // #89 P7 / #0A (host slice): the embedded engine — the exact code that runs on the
+        // phone — serves the UI shell and fully session-token gates the data API **entirely
+        // in-process**, with NO loopback TCP port. `asset_request` serves the shell (as the
+        // WebView's shouldInterceptRequest does); `bridge_request` carries the data API.
         let dir = tempfile::tempdir().unwrap();
-        let port = start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
 
-        let req = |raw: &str| {
-            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            c.write_all(raw.as_bytes()).unwrap();
-            let mut s = String::new();
-            c.read_to_string(&mut s).unwrap();
-            s
-        };
-        // The UI shell is served by the embedded engine (no daemon).
-        let shell = req("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
-        assert!(
-            shell.starts_with("HTTP/1.1 200"),
-            "engine must serve the UI: {shell}"
+        // The UI shell is served in-process (binary-safe asset frame, status in the head).
+        let shell = asset_request("/", None);
+        assert!(shell.len() > 6, "shell framed response");
+        assert_eq!(
+            u16::from_be_bytes([shell[0], shell[1]]),
+            200,
+            "engine must serve the UI shell in-process"
         );
-        // Data route without the session token → 401 (the Android-loopback fix).
-        let no_tok =
-            req("GET /api/v1/items?account=me&service=mail HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        // Data route without the session token → 401 (the Android-exposure gate, now over
+        // the bridge rather than an open port).
+        let no_tok = bridge_request(
+            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+        );
         assert!(
-            no_tok.starts_with("HTTP/1.1 401"),
+            no_tok.contains("\"status\":401"),
             "data API must be gated: {no_tok}"
         );
         // With the session token → reaches the handler (not a 401).
-        let with_tok = req(&format!(
-            "GET /api/v1/items?account=me&service=mail HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Session-Token: {tok}\r\n\r\n"
+        let with_tok = bridge_request(&format!(
+            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
-            !with_tok.starts_with("HTTP/1.1 401"),
+            !with_tok.contains("\"status\":401"),
             "valid token must pass: {with_tok}"
         );
         // Restore is absent in the mobile profile (cache, not backup-of-record) → 404.
-        let restore = req(&format!(
-            "POST /api/v1/restore?account=me&service=mail&id=x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Session-Token: {tok}\r\n\r\n"
+        let restore = bridge_request(&format!(
+            r#"{{"method":"POST","path":"/api/v1/restore?account=me&service=mail&id=x","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
-            restore.starts_with("HTTP/1.1 404"),
+            restore.contains("\"status\":404"),
             "restore must be absent on mobile: {restore}"
         );
     }
@@ -504,13 +521,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let framed = asset_request("/", None);
-        assert!(framed.len() > 4, "framed response has a header");
+        assert!(framed.len() > 6, "framed response has a header");
         let status = u16::from_be_bytes([framed[0], framed[1]]);
         assert_eq!(status, 200, "the shell serves 200");
         let ctlen = u16::from_be_bytes([framed[2], framed[3]]) as usize;
         let ct = String::from_utf8_lossy(&framed[4..4 + ctlen]);
         assert!(ct.contains("text/html"), "shell content-type: {ct}");
-        let body = &framed[4 + ctlen..];
+        let hdr_off = 4 + ctlen;
+        let hdrlen = u16::from_be_bytes([framed[hdr_off], framed[hdr_off + 1]]) as usize;
+        let body = &framed[hdr_off + 2 + hdrlen..];
         assert!(
             String::from_utf8_lossy(body).contains("<"),
             "shell body is HTML"
