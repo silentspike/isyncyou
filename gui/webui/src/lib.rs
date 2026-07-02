@@ -354,6 +354,27 @@ pub trait HydrationStatus: Send + Sync {
     fn active(&self) -> Vec<String>;
 }
 
+/// One in-flight transfer's progress (#onedrive-mobile 0.8). `bytes_total == 0` means
+/// the size is not yet known; `retry_after_secs > 0` means it is backing off on a 429.
+pub struct TransferState {
+    pub id: String,
+    pub name: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub retry_after_secs: u64,
+}
+
+/// Progress + cancellation for in-flight downloads/materializations (#onedrive-mobile
+/// 0.8 foundation). The real transfer engine (Phase 3/4) implements it; until then the
+/// endpoints report an idle state. Mirrors [`HydrationStatus`]; the cancel side is a
+/// cap-gated POST.
+pub trait TransferProgress: Send + Sync {
+    /// In-flight transfers with per-file progress.
+    fn transfers(&self) -> Vec<TransferState>;
+    /// Request cancellation of one transfer by id. Returns true if it was known.
+    fn cancel(&self, id: &str) -> bool;
+}
+
 /// Runs an archive integrity verify pass for an account on behalf of a POST
 /// (re-hashes every archived body, persists per-item status). Injected by the
 /// daemon (which owns the engine); the read-only CLI `serve` does not set it.
@@ -713,6 +734,11 @@ pub struct Router {
     /// Registry of destructive actions awaiting/holding a biometric confirmation. Used
     /// only when `biometric_gate` is set; the native side confirms entries over JNI.
     pending: isyncyou_core::pending::PendingActionRegistry,
+    /// Optional in-flight transfer progress/cancel handler (#onedrive-mobile 0.8). `None`
+    /// => the transfers endpoint reports idle and cancel 404s (the read-only CLI `serve`).
+    transfers: Option<std::sync::Arc<dyn TransferProgress>>,
+    /// Capability token for the cancel POST (distinct blast radius).
+    transfer_cap_token: Option<String>,
 }
 
 /// Constant-time byte-equality (no early return on first mismatch) so token checks
@@ -766,6 +792,8 @@ impl Router {
             session_token: None,
             biometric_gate: false,
             pending: isyncyou_core::pending::PendingActionRegistry::new(),
+            transfers: None,
+            transfer_cap_token: None,
         }
     }
 
@@ -807,6 +835,8 @@ impl Router {
             session_token: None,
             biometric_gate: false,
             pending: isyncyou_core::pending::PendingActionRegistry::new(),
+            transfers: None,
+            transfer_cap_token: None,
         }
     }
 
@@ -937,6 +967,18 @@ impl Router {
     /// Enable the read-only FUSE hydration status GET (builder style).
     pub fn with_hydrations(mut self, hydrations: std::sync::Arc<dyn HydrationStatus>) -> Self {
         self.hydrations = Some(hydrations);
+        self
+    }
+
+    /// Enable the transfer progress GET + cancel POST (#onedrive-mobile 0.8), the cancel
+    /// guarded by `cap_token` (builder style).
+    pub fn with_transfers(
+        mut self,
+        transfers: std::sync::Arc<dyn TransferProgress>,
+        cap_token: String,
+    ) -> Self {
+        self.transfers = Some(transfers);
+        self.transfer_cap_token = Some(cap_token);
         self
     }
 
@@ -1252,6 +1294,7 @@ impl Router {
                 "/api/v1/onenote/create" => self.onenote_create(req),
                 "/api/v1/onenote/delete" => self.onenote_delete(req),
                 "/api/v1/onenote/append" => self.onenote_append(req),
+                "/api/v1/onedrive/transfers/cancel" => self.transfers_cancel(req),
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
                 "/api/v1/account/signout" => self.account_signout(req),
@@ -1378,6 +1421,8 @@ impl Router {
             "/api/v1/search" => self.search(req),
             "/api/v1/sync/state" => self.sync_state(),
             "/api/v1/hydrations" => self.hydrations_state(),
+            "/api/v1/onedrive/transfers" => self.transfers_state(),
+            "/api/v1/onedrive/policy" => self.policy_state(),
             "/api/v1/drive" => self.drive_info(req),
             "/api/v1/permissions" => self.item_permissions(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
@@ -2735,6 +2780,63 @@ impl Router {
             .map(|h| h.active())
             .unwrap_or_default();
         ApiResponse::ok_json(&json!({ "count": active.len(), "active": active }))
+    }
+
+    /// `GET /api/v1/onedrive/transfers` — in-flight download/materialization progress
+    /// (#onedrive-mobile 0.8). Idle (`[]`) when no transfer engine is wired yet.
+    fn transfers_state(&self) -> ApiResponse {
+        let list = self
+            .transfers
+            .as_ref()
+            .map(|t| t.transfers())
+            .unwrap_or_default();
+        let items: Vec<Value> = list
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "name": t.name,
+                    "bytes_done": t.bytes_done,
+                    "bytes_total": t.bytes_total,
+                    "retry_after_secs": t.retry_after_secs,
+                })
+            })
+            .collect();
+        ApiResponse::ok_json(&json!({ "count": items.len(), "transfers": items }))
+    }
+
+    /// `POST /api/v1/onedrive/transfers/cancel?id=…` — cap-gated cancel of one in-flight
+    /// transfer (#onedrive-mobile 0.8). 404 when no transfer engine is wired.
+    fn transfers_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.transfers {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "transfers are not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.transfer_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let id = match req.q("id") {
+            Some(i) if !i.is_empty() => i,
+            _ => return ApiResponse::error(400, "id is required"),
+        };
+        ApiResponse::ok_json(&json!({ "cancelled": handler.cancel(id) }))
+    }
+
+    /// `GET /api/v1/onedrive/policy` — the effective mobile transfer policy plus the
+    /// mass-delete-guard status (#onedrive-mobile 0.8). Read-only; reads the config.
+    fn policy_state(&self) -> ApiResponse {
+        let s = &self.config.sync;
+        let g = &s.delete_guard;
+        ApiResponse::ok_json(&json!({
+            "wifi_only": s.wifi_only,
+            "charging_only": s.charging_only,
+            "min_free_bytes": s.min_free_bytes,
+            "delete_guard": {
+                "max_absolute": g.max_absolute,
+                "max_fraction": g.max_fraction,
+                "fraction_min_total": g.fraction_min_total,
+            },
+        }))
     }
 
     /// The OneDrive storage quota for an account — a live Graph call via the
@@ -6291,6 +6393,80 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let s = String::from_utf8_lossy(&r.body);
         assert!(s.contains("\"count\":2"), "got {s}");
         assert!(s.contains("a.pdf") && s.contains("b.docx"), "got {s}");
+    }
+
+    // #onedrive-mobile 0.8: transfer progress/cancel scaffold + policy/delete-guard status.
+    #[test]
+    fn transfers_progress_cancel_and_policy_endpoints() {
+        // policy GET reads the config (no handler) — reports the mobile transfer policy
+        // AND the mass-delete-guard status.
+        let bare = Router::new(Config::default());
+        let p = bare.route(&ApiRequest::get("/api/v1/onedrive/policy"));
+        assert_eq!(p.status, 200);
+        let pj = body_json(&p);
+        assert_eq!(pj["wifi_only"], false);
+        assert_eq!(pj["charging_only"], false);
+        assert_eq!(pj["min_free_bytes"].as_u64(), Some(268_435_456));
+        assert_eq!(pj["delete_guard"]["max_absolute"].as_u64(), Some(1000));
+
+        // transfers GET is idle without a handler; cancel 404s without one.
+        let idle = bare.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
+        assert_eq!(idle.status, 200);
+        assert_eq!(body_json(&idle)["count"].as_u64(), Some(0));
+        assert_eq!(
+            bare.route(&ApiRequest::new("POST", "/api/v1/onedrive/transfers/cancel?id=x"))
+                .status,
+            404
+        );
+
+        // with a handler: progress is reported and cancel is cap-gated.
+        struct MockTransfers {
+            cancelled: std::sync::Mutex<Vec<String>>,
+        }
+        impl TransferProgress for MockTransfers {
+            fn transfers(&self) -> Vec<TransferState> {
+                vec![TransferState {
+                    id: "t1".into(),
+                    name: "big.zip".into(),
+                    bytes_done: 50,
+                    bytes_total: 100,
+                    retry_after_secs: 0,
+                }]
+            }
+            fn cancel(&self, id: &str) -> bool {
+                self.cancelled.lock().unwrap().push(id.into());
+                id == "t1"
+            }
+        }
+        let mock = std::sync::Arc::new(MockTransfers {
+            cancelled: std::sync::Mutex::new(vec![]),
+        });
+        let router = Router::new(Config::default()).with_transfers(mock.clone(), "cap".into());
+        let t = router.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
+        let tj = body_json(&t);
+        assert_eq!(tj["count"].as_u64(), Some(1));
+        assert_eq!(tj["transfers"][0]["name"], "big.zip");
+        assert_eq!(tj["transfers"][0]["bytes_done"].as_u64(), Some(50));
+
+        // cancel without the cap token → 401, handler not called.
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/onedrive/transfers/cancel?id=t1"
+                ))
+                .status,
+            401
+        );
+        assert!(mock.cancelled.lock().unwrap().is_empty());
+        // with the cap token → 200 and the handler ran once.
+        let ok = router.route(
+            &ApiRequest::new("POST", "/api/v1/onedrive/transfers/cancel?id=t1")
+                .with_cap_token(Some("cap".into())),
+        );
+        assert_eq!(ok.status, 200);
+        assert_eq!(body_json(&ok)["cancelled"], true);
+        assert_eq!(*mock.cancelled.lock().unwrap(), vec!["t1"]);
     }
 
     #[test]
