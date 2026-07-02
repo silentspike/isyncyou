@@ -18,4 +18,34 @@ object NativeEngine {
 
     /** The per-process session token the WebView must send on every data API call. */
     external fun nativeSessionToken(): String
+
+    /**
+     * Answer one in-process bridge request (#0A). [requestJson] is the JSON envelope from
+     * the WebView's `__isyBridge` (`{t:"req",id,method,path,headers,body}`); the return is
+     * the complete reply envelope (`{t:"res",id,status,body}`) to post back verbatim — no
+     * loopback TCP port is used. All parsing lives in Rust; this side is a dumb forwarder.
+     */
+    external fun nativeBridgeRequest(requestJson: String): String
+
+    /**
+     * Answer one browser-initiated GET subresource (the shell + any img/iframe/viewer) for
+     * `shouldInterceptRequest` (#0A). Binary-safe: returns
+     * `[status:u16 BE][content_type_len:u16 BE][content_type][body]`.
+     */
+    external fun nativeAssetRequest(path: String, cookie: String): ByteArray
+
+    /**
+     * Open a bridge push stream (the SSE replacement, #0A) for [path], gated by
+     * [sessionToken]. Returns a stream id (>0), or 0 if unknown/unauthorized/not started.
+     */
+    external fun nativeStreamOpen(path: String, sessionToken: String): Long
+
+    /**
+     * Block for the next event on stream [id] (a JSON `{event,data}` object), or "" when the
+     * stream ended or was closed. The per-stream forwarding thread loops on this.
+     */
+    external fun nativeStreamNext(id: Long): String
+
+    /** Close a bridge push stream. */
+    external fun nativeStreamClose(id: Long)
 }

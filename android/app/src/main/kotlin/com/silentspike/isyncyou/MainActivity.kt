@@ -12,6 +12,12 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import org.json.JSONObject
 
 /**
  * iSyncYou Android client (#89) — a hardened WebView onto the iSyncYou engine that
@@ -36,6 +42,16 @@ class MainActivity : Activity() {
     /** The embedded engine's session token — gates the loopback data API (#89 P1). */
     @Volatile
     private var sessionToken: String = ""
+
+    /** Forwarding threads for the in-process bridge (#0A): one per request/stream, so a
+     *  blocking `nativeStreamNext` never stalls the UI thread or another request. */
+    private val bridgeExecutor = Executors.newCachedThreadPool()
+
+    /** JS stream id -> native stream id, for `unsub`/teardown (#0A). */
+    private val bridgeStreams = ConcurrentHashMap<String, Long>()
+
+    /** Latches true on the first bridge message so we log the live data path once (#0A). */
+    private val bridgeSeen = java.util.concurrent.atomic.AtomicBoolean(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -159,6 +175,12 @@ class MainActivity : Activity() {
         web.addJavascriptInterface(SessionBridge(), "AndroidSession")
         web.addJavascriptInterface(PushBridge(), "AndroidPush")
         web.addJavascriptInterface(NavBridge(), "AndroidNav")
+        // In-process message bridge (#0A): the data path (api/post/streams) rides an
+        // origin-bound WebMessageListener instead of a loopback TCP round-trip. Registered
+        // alongside the loopback server (staged rollout) — when present, app.js routes
+        // through it; the loopback still serves the shell + subresources. Bound to the
+        // engine's exact origin so no other frame/origin can reach it.
+        setupBridge(origin)
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setCookie("$origin/", "isy_session=$token; Path=/")
@@ -226,6 +248,84 @@ class MainActivity : Activity() {
         @android.webkit.JavascriptInterface
         fun endNetworkGuard() {
             runOnUiThread { OAuthGuardService.stop(this@MainActivity) }
+        }
+    }
+
+    /**
+     * Register the origin-bound in-process message bridge `__isyBridge` (#0A). The JS side
+     * (`app.js`) posts `{t:"req"|"sub"|"unsub",...}`; we forward to the embedded engine and
+     * post replies back on the reply proxy. `allowedOriginRules` binds the object to the
+     * engine's **exact** origin, so no other origin (and, with the sandboxed no-script
+     * viewers, no untrusted iframe) can obtain it. No-op when the device's WebView lacks the
+     * feature — app.js then falls back to loopback fetch, so the app still works.
+     */
+    private fun setupBridge(origin: String) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            android.util.Log.w(TAG, "WEB_MESSAGE_LISTENER unsupported; using loopback fetch")
+            return
+        }
+        try {
+            WebViewCompat.addWebMessageListener(web, "__isyBridge", setOf(origin)) {
+                _, message, _, _, replyProxy ->
+                (message.data)?.let { onBridgeMessage(it, replyProxy) }
+            }
+            android.util.Log.i(TAG, "bridge listener registered for $origin")
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "bridge registration failed; using loopback fetch", e)
+        }
+    }
+
+    /** Dispatch one inbound bridge message off the UI thread (#0A). */
+    private fun onBridgeMessage(data: String, reply: JavaScriptReplyProxy) {
+        val t = try {
+            JSONObject(data).optString("t")
+        } catch (_: Exception) {
+            return // not our envelope
+        }
+        // One-time signal that the WebView actually routes through the bridge (not the
+        // loopback fetch fallback) — proves the in-process data path is live. No payload.
+        if (bridgeSeen.compareAndSet(false, true)) {
+            android.util.Log.i(TAG, "bridge active: first message t=$t")
+        }
+        when (t) {
+            "req" -> bridgeExecutor.execute {
+                // Rust returns the complete {t:"res",id,status,body} reply — post it verbatim.
+                val resp = NativeEngine.nativeBridgeRequest(data)
+                reply.postMessage(resp)
+            }
+            "sub" -> {
+                val obj = JSONObject(data)
+                val jsId = obj.optString("id")
+                val path = obj.optString("path")
+                if (jsId.isNotEmpty()) bridgeExecutor.execute { runBridgeStream(jsId, path, reply) }
+            }
+            "unsub" -> {
+                val jsId = JSONObject(data).optString("id")
+                bridgeStreams.remove(jsId)?.let { NativeEngine.nativeStreamClose(it) }
+            }
+        }
+    }
+
+    /** Drain one push stream, forwarding each event to the WebView until it ends (#0A). */
+    private fun runBridgeStream(jsId: String, path: String, reply: JavaScriptReplyProxy) {
+        val nativeId = NativeEngine.nativeStreamOpen(path, sessionToken)
+        if (nativeId <= 0L) {
+            reply.postMessage("{\"t\":\"end\",\"id\":\"$jsId\"}")
+            return
+        }
+        bridgeStreams[jsId] = nativeId
+        try {
+            // Keep forwarding until the stream ends (empty) or an unsub removed our mapping.
+            while (bridgeStreams[jsId] == nativeId) {
+                val ev = NativeEngine.nativeStreamNext(nativeId)
+                if (ev.isEmpty()) break
+                // ev is a JSON {event,data} object — embed it as the `ev` field.
+                reply.postMessage("{\"t\":\"evt\",\"id\":\"$jsId\",\"ev\":$ev}")
+            }
+        } finally {
+            bridgeStreams.remove(jsId)
+            NativeEngine.nativeStreamClose(nativeId)
+            reply.postMessage("{\"t\":\"end\",\"id\":\"$jsId\"}")
         }
     }
 
