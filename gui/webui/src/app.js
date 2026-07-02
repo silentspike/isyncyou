@@ -1176,7 +1176,25 @@ async function renderOverview(view) {
         connItem("Body index", sync.body_index ? "On (full-text)" : "Off"),
         connItem("OneDrive delta", st.onedrive_cursor ? "Active" : "—"),
         connItem("Last successful", lastOk ? fmtFullDate(lastOk.finished_at) : "—")))));
+    // Live-refresh the dashboard when a sync tick actually changes the counts (fixes the
+    // stale "0 items" Overview on mobile, where the initial render happens before the first
+    // sync populates data). Repaints only on a real change — never per tick.
+    App._ovSig = overviewSignature(st);
+    App.liveUpdate = overviewLiveUpdate;
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
+}
+function overviewSignature(st) {
+  const svc = (st.services || []).map(s => s.service + ":" + s.items).join(",");
+  return (st.totals?.items ?? 0) + "/" + (st.totals?.archived ?? 0) + "/" + svc;
+}
+async function overviewLiveUpdate() {
+  let st;
+  try { st = await api("/api/v1/status?" + qs({ account: App.account })); }
+  catch (_) { return; }
+  if (overviewSignature(st) === App._ovSig) return; // counts unchanged → no repaint
+  const view = $("#view"), vsc = view ? view.scrollTop : 0;
+  await renderOverview($("#view")); // re-renders; re-arms App._ovSig + App.liveUpdate
+  const v2 = $("#view"); if (v2) v2.scrollTop = vsc;
 }
 function connItem(k, v) { return el("div", { class: "conn-item" }, el("dt", { text: k }), el("dd", { text: v == null ? "—" : String(v) })); }
 
