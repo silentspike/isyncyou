@@ -2569,6 +2569,12 @@ impl Router {
             }
             _ => return ApiResponse::error(400, "account, service and id are required"),
         };
+        // #onedrive-mobile 0.9: sharing is external/destructive — on the mobile profile it
+        // requires a biometric per-action token bound to exactly this (share, account,
+        // service, id). Covers both invite and anonymous-link modes. Desktop is unaffected.
+        if let Some(r) = self.biometric_challenge("share", account, service, id, req) {
+            return r;
+        }
         // Invite mode (#504): an `email` param (comma/space-separated) invites named
         // people instead of creating an anonymous link. `role` = read|write.
         if let Some(emails_raw) = req.q("email").filter(|e| !e.is_empty()) {
@@ -6055,6 +6061,34 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             404
         );
+    }
+
+    // #onedrive-mobile 0.9: on the mobile profile share is additionally biometric-gated —
+    // the cap token alone (which the WebView holds) is not enough to produce a link.
+    #[test]
+    fn share_is_biometric_gated_on_mobile() {
+        let (_d, router) = setup();
+        let mobile = router
+            .with_share(std::sync::Arc::new(OkShare), "secret".into())
+            .with_biometric_gate();
+        let cap = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        let q = "/api/v1/share?account=a&service=onedrive&id=x";
+        // cap token alone → a confirmation challenge, NOT a link
+        let ch = mobile.route(&cap(q));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(!String::from_utf8_lossy(&ch.body).contains("1drv.ms"));
+        // token but no biometric yet → 403
+        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        // native biometric confirms → share proceeds and returns the link
+        assert!(mobile.confirm_biometric(&pat));
+        let ok = mobile.route(&cap(&format!("{q}&_pat={pat}")));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("https://1drv.ms/x/abc"));
+        // replay of the consumed token → 403 (single-use)
+        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
     }
 
     #[test]

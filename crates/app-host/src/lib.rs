@@ -1725,6 +1725,14 @@ pub fn build_live_router(
                 as Arc<dyn isyncyou_webui::AgentHandler>,
             mint_cap_token(),
         )
+        // #onedrive-mobile 0.9: outbound sharing is wired here (was daemon-only) so the
+        // mobile profile gets it too. On mobile it is additionally biometric-gated (op
+        // "share" is in the per-action-token catalogue); the cap token is the CSRF gate.
+        // restore-cloud stays daemon-only (excluded on mobile).
+        .with_share(
+            Arc::new(DaemonShare::new(cfg.clone())) as Arc<dyn isyncyou_webui::ShareHandler>,
+            mint_cap_token(),
+        )
         .with_events(events)
 }
 
@@ -1767,10 +1775,12 @@ mod tests {
     }
 
     #[test]
-    fn mobile_live_router_omits_restore_and_share() {
-        // #89 profile contract: build_live_router wires the live handlers but NOT the
-        // daemon-only restore/share. POSTs to those routes are refused 404 (handler
-        // absent); a wired live-write route is reached and cap-gated (401, not 404).
+    fn mobile_live_router_wires_share_but_omits_restore() {
+        // #89 + #onedrive-mobile 0.9 profile contract: build_live_router wires the live
+        // handlers AND (now) share, but NOT the daemon-only restore-cloud. restore POSTs
+        // are refused 404 (absent); share + a live-write route are reached and cap-gated
+        // (401, not 404). On mobile share is additionally biometric-gated by the app's
+        // with_biometric_gate (not exercised here — this builds the base router only).
         let events = Arc::new(isyncyou_webui::EventBus::new());
         let router = build_live_router(
             Config::default(),
@@ -1787,14 +1797,14 @@ mod tests {
                 ))
                 .status,
             404,
-            "restore must be absent in the mobile profile"
+            "restore-cloud must be absent in the mobile profile"
         );
         assert_eq!(
             router
                 .route(&ApiRequest::new("POST", "/api/v1/share"))
                 .status,
-            404,
-            "share must be absent in the mobile profile"
+            401,
+            "share must be wired (cap-gated, not absent)"
         );
         assert_eq!(
             router
