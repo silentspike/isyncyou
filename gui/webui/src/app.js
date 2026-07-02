@@ -3920,8 +3920,15 @@ async function pollCodexStatus(n) {
 // identical cards — the transcript keeps its search stages + result cards, not just the text.
 const ASST_STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
 function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" })[s] || "file"; }
-// One typed result: header (name) + body-preview line; click → animated pull-down with the
-// full body + a direct link to the item (the app's canonical /api/v1/view).
+// The app's canonical item viewer — the SAME sandboxed, same-origin iframe the Mail reader
+// uses (`/api/v1/view` renders sanitized-HTML mail / a rendered item; frame-src 'self' +
+// frame-ancestors 'self' allow the shell to embed it). Reused so search shows the real,
+// properly-formatted body — not a hand-rolled text extract.
+function asstViewerFrame(q) {
+  return el("iframe", { class: "asst-result-frame", src: `/api/v1/view?${qs(q)}`, title: "Item preview", sandbox: "allow-same-origin" });
+}
+// One typed result: header (name) + one-line preview; click → animated pull-down that
+// lazily embeds the real viewer for the body + a link to open it full-screen.
 function asstResultCard(it) {
   const q = { account: App.account, service: it.service, id: it.id };
   const snip = (it.snippet || "").trim();
@@ -3932,12 +3939,20 @@ function asstResultCard(it) {
       el("div", { class: "asst-result-sub truncate", text: snip || (it.item_type || it.service) })),
     el("span", { class: "asst-result-type", text: it.item_type || it.service }),
     el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
-  const panelKids = [];
-  if (snip) panelKids.push(el("div", { class: "asst-result-body", text: snip }));
-  panelKids.push(el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
-    icon("external-link", "icon-sm"), el("span", { text: "Open " + (it.item_type || "item") })));
-  const row = el("div", { class: "asst-result" }, head, el("div", { class: "asst-result-panel" }, ...panelKids));
-  head.addEventListener("click", () => row.classList.toggle("open"));
+  const panel = el("div", { class: "asst-result-panel" });
+  const row = el("div", { class: "asst-result" }, head, panel);
+  let loaded = false;
+  head.addEventListener("click", () => {
+    const opening = !row.classList.contains("open");
+    row.classList.toggle("open");
+    if (opening && !loaded) {   // lazy: only load the viewer when the user opens the card
+      loaded = true;
+      panel.append(
+        asstViewerFrame(q),
+        el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
+          icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+    }
+  });
   return row;
 }
 function asstStageRowDone(stage, hits) {
@@ -3998,8 +4013,17 @@ async function agentSend(text) {
   log.append(asstEl);
   const textEl = asstEl.querySelector(".asst-text");
   const bubble = asstEl.querySelector(".asst-bubble");
+  // Immediate animated "working" ack (#644) instead of a bare "…" while the model thinks
+  // before its first token / search stage. Removed on the first real content.
+  textEl.textContent = "";
+  const thinkingEl = el("div", { class: "asst-thinking" },
+    el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }),
+    el("span", { class: "asst-thinking-label dim", text: "Searching your Microsoft 365…" }));
+  bubble.insertBefore(thinkingEl, textEl);
+  let thinkingDone = false;
+  const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
   log.scrollTop = log.scrollHeight;
-  const setText = (t) => { asst.text = t; textEl.textContent = t || "…"; log.scrollTop = log.scrollHeight; };
+  const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; log.scrollTop = log.scrollHeight; };
   const addChip = (label) => { asst.chips.push(label); bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: label })); log.scrollTop = log.scrollHeight; };
 
   // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
@@ -4007,6 +4031,7 @@ async function agentSend(text) {
   const STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
   let searchBox = null, resultsBox = null; const stageRow = {};
   const ensureSearchUI = () => {
+    clearThinking();   // the search plan replaces the generic "working" indicator
     if (searchBox) return;
     searchBox = el("div", { class: "asst-search" });
     resultsBox = el("div", { class: "asst-results" });
@@ -4061,11 +4086,11 @@ async function agentSend(text) {
       // already show what's happening, so we don't surface "→ isyncyou read" noise.
       case "tool_call": break;
       case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
-      case "error": setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
-      case "done": es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("(no response)"); break;
+      case "error": clearThinking(); setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
+      case "done": clearThinking(); es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("(no response)"); break;
     }
   };
-  es.onerror = () => { es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("⚠ connection lost"); };
+  es.onerror = () => { clearThinking(); es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("⚠ connection lost"); };
 }
 
 function renderAccountMenu(body) {
