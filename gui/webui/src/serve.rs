@@ -147,21 +147,24 @@ pub fn dispatch_message(
     ))
 }
 
-/// Handle one JSON-framed request from the Android in-process bridge (#0A) and return the
-/// JSON-framed response. The Kotlin side is a **dumb forwarder** — all parsing lives here
-/// so it is host-testable. Request shape: `{"method","path","headers":{..},"body":<str|null>}`.
-/// Response shape: `{"status":<u16>,"body":<string>}` (the response bytes as UTF-8; today's
-/// API is JSON/text). SSE routes are not handled here — the bridge streams them over its
-/// own push channel. Header lookup is case-insensitive.
+/// Handle one JSON-framed unary request from the Android in-process bridge (#0A) and
+/// return the **complete reply message** the native side posts back verbatim — the Kotlin
+/// side is a truly dumb forwarder, so all parsing and framing live here (host-testable).
+/// Request shape: `{"t":"req","id":<str>,"method","path","headers":{..},"body":<str|null>}`.
+/// Reply shape: `{"t":"res","id":<str>,"status":<u16>,"body":<string>}` (the response bytes
+/// as UTF-8; today's API is JSON/text — binary GET subresources use the asset path). SSE
+/// routes are not handled here — the bridge streams them over its own push channel. Header
+/// lookup is case-insensitive; `id` is echoed so the JS promise resolves.
 pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
     use serde_json::Value;
     let v: Value = match serde_json::from_str(request_json) {
         Ok(v) => v,
-        Err(_) => return bridge_error_envelope(400, "bad bridge request"),
+        Err(_) => return bridge_error_envelope(None, 400, "bad bridge request"),
     };
+    let id = v.get("id").and_then(Value::as_str);
     let path = match v.get("path").and_then(Value::as_str) {
         Some(p) => p,
-        None => return bridge_error_envelope(400, "missing path"),
+        None => return bridge_error_envelope(id, 400, "missing path"),
     };
     let method = v.get("method").and_then(Value::as_str).unwrap_or("GET");
     let headers = v.get("headers").and_then(Value::as_object);
@@ -188,15 +191,19 @@ pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
         body,
     );
     serde_json::json!({
+        "t": "res",
+        "id": id,
         "status": resp.status,
         "body": String::from_utf8_lossy(&resp.body),
     })
     .to_string()
 }
 
-/// A bridge response envelope carrying an error the same way [`ApiResponse::error`] would.
-fn bridge_error_envelope(status: u16, message: &str) -> String {
+/// A bridge reply carrying an error, echoing `id` so the JS promise still resolves.
+fn bridge_error_envelope(id: Option<&str>, status: u16, message: &str) -> String {
     serde_json::json!({
+        "t": "res",
+        "id": id,
         "status": status,
         "body": serde_json::json!({ "error": message }).to_string(),
     })
@@ -1092,9 +1099,11 @@ mod tests {
         let open = Router::new(Config::default());
         let out = handle_bridge_request(
             &open,
-            r#"{"method":"GET","path":"/api/v1/accounts","headers":{},"body":null}"#,
+            r#"{"t":"req","id":"r7","method":"GET","path":"/api/v1/accounts","headers":{},"body":null}"#,
         );
         let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["t"], "res", "reply is framed for the JS onmessage router");
+        assert_eq!(v["id"], "r7", "id is echoed so the JS promise resolves");
         assert_eq!(v["status"], 200);
         assert!(
             v["body"].as_str().unwrap().contains("accounts"),

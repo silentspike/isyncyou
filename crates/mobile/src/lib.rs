@@ -63,8 +63,32 @@ pub fn bridge_request(request_json: &str) -> String {
     };
     match router {
         Some(router) => isyncyou_webui::handle_bridge_request(&router, request_json),
-        None => r#"{"status":503,"body":"{\"error\":\"engine not started\"}"}"#.to_string(),
+        None => r#"{"t":"res","id":null,"status":503,"body":"{\"error\":\"engine not started\"}"}"#
+            .to_string(),
     }
+}
+
+/// Answer one browser-initiated GET subresource (#0A) — the static shell and any
+/// `img`/`iframe`/viewer the WebView loads itself — for Kotlin's `shouldInterceptRequest`.
+/// **Binary-safe** (unlike the JSON bridge envelope, which is text-only): returns
+/// `[status: u16 BE][content_type_len: u16 BE][content_type][body]`. Cookie-gated exactly
+/// like the loopback path. Empty vec when the engine hasn't started.
+pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
+    let router = {
+        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| Arc::clone(&s.router))
+    };
+    let Some(router) = router else {
+        return Vec::new();
+    };
+    let resp = isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
+    let ct = resp.content_type.as_bytes();
+    let mut out = Vec::with_capacity(4 + ct.len() + resp.body.len());
+    out.extend_from_slice(&resp.status.to_be_bytes());
+    out.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+    out.extend_from_slice(ct);
+    out.extend_from_slice(&resp.body);
+    out
 }
 
 /// The per-process session token Kotlin must hand to the WebView (header + cookie)
@@ -228,10 +252,33 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeBridgeRe
         Err(_) => return std::ptr::null_mut(),
     };
     // Panic-isolate: a request-handling panic must never unwind across the FFI boundary.
-    let resp = std::panic::catch_unwind(AssertUnwindSafe(|| bridge_request(&req)))
-        .unwrap_or_else(|_| r#"{"status":500,"body":"{\"error\":\"internal error\"}"}"#.to_string());
+    let resp = std::panic::catch_unwind(AssertUnwindSafe(|| bridge_request(&req))).unwrap_or_else(
+        |_| r#"{"t":"res","id":null,"status":500,"body":"{\"error\":\"internal error\"}"}"#.to_string(),
+    );
     env.new_string(resp)
         .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// JNI: answer one browser-initiated GET subresource (#0A) for `shouldInterceptRequest`,
+/// returning the framed bytes (see [`asset_request`]). Binary-safe. Never logs the cookie.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetRequest(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    path: jni::objects::JString,
+    cookie: jni::objects::JString,
+) -> jni::sys::jbyteArray {
+    let path: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let cookie: String = env.get_string(&cookie).map(Into::into).unwrap_or_default();
+    let cookie = if cookie.is_empty() { None } else { Some(cookie) };
+    let bytes = std::panic::catch_unwind(AssertUnwindSafe(|| asset_request(&path, cookie)))
+        .unwrap_or_default();
+    env.byte_array_from_slice(&bytes)
+        .map(|a| a.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
 
@@ -322,5 +369,25 @@ mod tests {
             r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(!ok.contains("\"status\":401"), "valid token must pass: {ok}");
+    }
+
+    #[test]
+    fn asset_request_serves_the_shell_framed_binary_safe() {
+        // #0A: browser-initiated GETs (shell + subresources) are served binary-safe with
+        // an explicit content-type, so images/viewers survive intact (no lossy UTF-8).
+        let dir = tempfile::tempdir().unwrap();
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let framed = asset_request("/", None);
+        assert!(framed.len() > 4, "framed response has a header");
+        let status = u16::from_be_bytes([framed[0], framed[1]]);
+        assert_eq!(status, 200, "the shell serves 200");
+        let ctlen = u16::from_be_bytes([framed[2], framed[3]]) as usize;
+        let ct = String::from_utf8_lossy(&framed[4..4 + ctlen]);
+        assert!(ct.contains("text/html"), "shell content-type: {ct}");
+        let body = &framed[4 + ctlen..];
+        assert!(
+            String::from_utf8_lossy(body).contains("<"),
+            "shell body is HTML"
+        );
     }
 }
