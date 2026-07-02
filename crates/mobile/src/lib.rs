@@ -437,7 +437,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamCl
 /// bad length so Kotlin can surface a setup failure.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyKey(
-    mut env: jni::JNIEnv,
+    env: jni::JNIEnv,
     _class: jni::objects::JClass,
     key_id: jni::sys::jint,
     key: jni::objects::JByteArray,
@@ -452,7 +452,11 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyK
     let mut k = [0u8; 32];
     k.copy_from_slice(&bytes);
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        isyncyou_core::envelope::set_body_key(key_id as u32, k)
+        // One Keystore-unwrapped data key protects both: the body-file envelope (#0B) AND
+        // the SQLCipher store DB (its PRAGMA key). Both installed before the engine opens
+        // the store or writes a body.
+        isyncyou_core::envelope::set_body_key(key_id as u32, k);
+        isyncyou_store::set_store_key(k.to_vec());
     }));
     1
 }

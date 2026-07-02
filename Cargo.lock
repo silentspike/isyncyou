@@ -1736,6 +1736,7 @@ dependencies = [
  "isyncyou-app-host",
  "isyncyou-core",
  "isyncyou-engine",
+ "isyncyou-store",
  "isyncyou-webui",
  "jni 0.21.1",
  "tempfile",

@@ -13,23 +13,27 @@ crate-type = ["cdylib"]
 
 [dependencies]
 isyncyou-core = { path = "../core" }
+isyncyou-store = { path = "../store", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-app-host = { path = "../app-host", default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
 jni = "0.21"
 
 [features]
-# Android ships plain-store (bundled sqlite, no OpenSSL/SQLCipher) — see #89 P0.
-# In the host workspace build the daemon also pulls these crates with
-# `encrypted-store`, so they unify to SQLCipher there (fine on Linux); the isolated
-# `cargo ndk -p isyncyou-mobile` build has no daemon, so it stays plain.
-default = ["plain-store"]
+# Android ships SQLCipher (#0B): the vendored-OpenSSL arm64 cross-build works via
+# cargo-ndk + NDK r27, so the phone's store DB is encrypted at rest with a
+# hardware-backed (Android Keystore) key. Body files get their own AES-256-GCM
+# envelope (`isyncyou-core::envelope`). With no key installed the store still opens
+# plaintext (host tests), so only the on-device run is encrypted.
+default = ["encrypted-store"]
 plain-store = [
+    "isyncyou-store/plain-store",
     "isyncyou-webui/plain-store",
     "isyncyou-app-host/plain-store",
     "isyncyou-engine/plain-store",
 ]
 encrypted-store = [
+    "isyncyou-store/encrypted-store",
     "isyncyou-webui/encrypted-store",
     "isyncyou-app-host/encrypted-store",
     "isyncyou-engine/encrypted-store",

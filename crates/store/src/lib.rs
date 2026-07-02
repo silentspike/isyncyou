@@ -1719,8 +1719,33 @@ impl Store {
     }
 }
 
+/// A process-installed SQLCipher key — the Android Keystore-unwrapped key on mobile —
+/// taking precedence over the env/keyring sources so the standalone app opens SQLCipher with
+/// a hardware-backed key and no env vars. Set once at startup via [`set_store_key`]. Always
+/// present so mobile can install the key regardless of the compiled store profile; only the
+/// (encrypted-store) `configured_store_key` reads it.
+static INSTALLED_STORE_KEY: std::sync::OnceLock<std::sync::Mutex<Option<Vec<u8>>>> =
+    std::sync::OnceLock::new();
+
+/// Install the process store key (mobile: from the Keystore, #0B). Overrides the env/keyring
+/// sources for every subsequent [`Store::open`]. The key stays in process memory only.
+pub fn set_store_key(secret: Vec<u8>) {
+    let cell = INSTALLED_STORE_KEY.get_or_init(|| std::sync::Mutex::new(None));
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret);
+}
+
+#[cfg(feature = "encrypted-store")]
+fn installed_store_key() -> Option<Vec<u8>> {
+    INSTALLED_STORE_KEY
+        .get()
+        .and_then(|c| c.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
 #[cfg(feature = "encrypted-store")]
 pub fn configured_store_key() -> Result<Option<Vec<u8>>> {
+    if let Some(k) = installed_store_key() {
+        return Ok(Some(k)); // process-installed (mobile Keystore) wins
+    }
     if let Some(path) = std::env::var_os(STORE_KEY_FILE_ENV) {
         return read_store_secret_file(Path::new(&path)).map(Some);
     }
