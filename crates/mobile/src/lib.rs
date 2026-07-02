@@ -24,6 +24,9 @@ const ACCOUNT: &str = "me";
 struct EngineState {
     port: u16,
     session_token: String,
+    /// The live router, shared with the loopback server. Held so the in-process message
+    /// bridge (#0A) answers requests against the **same** router (no second TCP port).
+    router: Arc<isyncyou_webui::Router>,
 }
 
 /// Process-global engine handle. `start` is idempotent (Activity recreation must not
@@ -41,12 +44,27 @@ pub fn start_engine(files_dir: &str) -> Result<u16, String> {
     if let Some(st) = guard.as_ref() {
         return Ok(st.port); // already running — reuse it
     }
-    let (port, session_token) = start_inner(files_dir)?;
+    let (port, session_token, router) = start_inner(files_dir)?;
     *guard = Some(EngineState {
         port,
         session_token,
+        router,
     });
     Ok(port)
+}
+
+/// Handle one JSON-framed request from the Android in-process bridge (#0A) against the
+/// running engine's router — **no loopback TCP port involved**. Returns a JSON response
+/// envelope, or an error envelope when the engine hasn't started. Host-testable.
+pub fn bridge_request(request_json: &str) -> String {
+    let router = {
+        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| Arc::clone(&s.router))
+    };
+    match router {
+        Some(router) => isyncyou_webui::handle_bridge_request(&router, request_json),
+        None => r#"{"status":503,"body":"{\"error\":\"engine not started\"}"}"#.to_string(),
+    }
 }
 
 /// The per-process session token Kotlin must hand to the WebView (header + cookie)
@@ -59,7 +77,7 @@ pub fn session_token() -> Option<String> {
         .map(|s| s.session_token.clone())
 }
 
-fn start_inner(files_dir: &str) -> Result<(u16, String), String> {
+fn start_inner(files_dir: &str) -> Result<(u16, String, Arc<isyncyou_webui::Router>), String> {
     let base = PathBuf::from(files_dir);
     let archive_root = base.join("archive");
     let sync_root = base.join("sync");
@@ -93,24 +111,28 @@ fn start_inner(files_dir: &str) -> Result<(u16, String), String> {
     let events = Arc::new(isyncyou_webui::EventBus::new());
     let live_interval = Arc::new(AtomicU64::new(cfg.sync.poll_interval_secs.max(1)));
 
-    let router = isyncyou_app_host::build_live_router(
-        cfg.clone(),
-        Some(gate.clone()),
-        events.clone(),
-        config_path,
-        live_interval.clone(),
-    )
-    .with_session_token(session_token.clone());
+    let router = Arc::new(
+        isyncyou_app_host::build_live_router(
+            cfg.clone(),
+            Some(gate.clone()),
+            events.clone(),
+            config_path,
+            live_interval.clone(),
+        )
+        .with_session_token(session_token.clone()),
+    );
 
     // OS-assigned free loopback port (read it back before serving).
     let listener = isyncyou_webui::bind_loopback("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
     // Serve on a background thread, panic-isolated: a request-handling panic must
-    // never take down the host app process.
+    // never take down the host app process. The same router is shared with the
+    // in-process bridge (#0A) via the stored `Arc` clone.
+    let serve_router = Arc::clone(&router);
     std::thread::spawn(move || {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _ = isyncyou_webui::serve_listener(listener, router);
+            let _ = isyncyou_webui::serve_listener_shared(listener, serve_router);
         }));
     });
 
@@ -120,7 +142,7 @@ fn start_inner(files_dir: &str) -> Result<(u16, String), String> {
     // UI refreshes. Skips silently until a token is cached.
     std::thread::spawn(move || refresh_loop(cfg, gate, events, live_interval));
 
-    Ok((port, session_token))
+    Ok((port, session_token, router))
 }
 
 fn refresh_loop(
@@ -192,6 +214,27 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSessionT
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// JNI: answer one in-process bridge request (#0A). Kotlin passes the JSON request
+/// envelope from the `WebMessageListener` and posts the returned JSON envelope back on the
+/// message port — no loopback TCP port is used. SECURITY: never logs tokens or bodies.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeBridgeRequest(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    request_json: jni::objects::JString,
+) -> jni::sys::jstring {
+    let req: String = match env.get_string(&request_json) {
+        Ok(s) => s.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    // Panic-isolate: a request-handling panic must never unwind across the FFI boundary.
+    let resp = std::panic::catch_unwind(AssertUnwindSafe(|| bridge_request(&req)))
+        .unwrap_or_else(|_| r#"{"status":500,"body":"{\"error\":\"internal error\"}"}"#.to_string());
+    env.new_string(resp)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +302,25 @@ mod tests {
             restore.starts_with("HTTP/1.1 404"),
             "restore must be absent on mobile: {restore}"
         );
+    }
+
+    #[test]
+    fn bridge_request_routes_against_the_running_engine_without_a_port() {
+        // #0A: the in-process bridge answers against the same router as loopback and
+        // enforces the same session gate — proving the phone needs no TCP port to serve
+        // its own UI's data calls.
+        let dir = tempfile::tempdir().unwrap();
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let tok = session_token().expect("token");
+        // No session token → 401 envelope (the loopback-exposure gate applies here too).
+        let denied = bridge_request(
+            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+        );
+        assert!(denied.contains("\"status\":401"), "bridge must gate: {denied}");
+        // With the token → reaches the handler (not a 401).
+        let ok = bridge_request(&format!(
+            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+        ));
+        assert!(!ok.contains("\"status\":401"), "valid token must pass: {ok}");
     }
 }

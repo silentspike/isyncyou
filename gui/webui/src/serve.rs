@@ -147,6 +147,62 @@ pub fn dispatch_message(
     ))
 }
 
+/// Handle one JSON-framed request from the Android in-process bridge (#0A) and return the
+/// JSON-framed response. The Kotlin side is a **dumb forwarder** — all parsing lives here
+/// so it is host-testable. Request shape: `{"method","path","headers":{..},"body":<str|null>}`.
+/// Response shape: `{"status":<u16>,"body":<string>}` (the response bytes as UTF-8; today's
+/// API is JSON/text). SSE routes are not handled here — the bridge streams them over its
+/// own push channel. Header lookup is case-insensitive.
+pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
+    use serde_json::Value;
+    let v: Value = match serde_json::from_str(request_json) {
+        Ok(v) => v,
+        Err(_) => return bridge_error_envelope(400, "bad bridge request"),
+    };
+    let path = match v.get("path").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return bridge_error_envelope(400, "missing path"),
+    };
+    let method = v.get("method").and_then(Value::as_str).unwrap_or("GET");
+    let headers = v.get("headers").and_then(Value::as_object);
+    let header = |name: &str| {
+        headers.and_then(|obj| {
+            obj.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .and_then(|(_, val)| val.as_str())
+                .map(str::to_string)
+        })
+    };
+    let body = v
+        .get("body")
+        .and_then(Value::as_str)
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_default();
+    let resp = dispatch_message(
+        router,
+        method,
+        path,
+        header("X-Capability-Token"),
+        header("X-Session-Token"),
+        header("Cookie"),
+        body,
+    );
+    serde_json::json!({
+        "status": resp.status,
+        "body": String::from_utf8_lossy(&resp.body),
+    })
+    .to_string()
+}
+
+/// A bridge response envelope carrying an error the same way [`ApiResponse::error`] would.
+fn bridge_error_envelope(status: u16, message: &str) -> String {
+    serde_json::json!({
+        "status": status,
+        "body": serde_json::json!({ "error": message }).to_string(),
+    })
+    .to_string()
+}
+
 /// Serialize a response as an HTTP/1.1 message with `Connection: close`.
 pub fn format_http(resp: &ApiResponse) -> Vec<u8> {
     format_http_conn(resp, false)
@@ -512,14 +568,21 @@ pub fn bind_loopback(addr: &str) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr)
 }
 
-/// Serve `router` forever on an already-bound loopback `listener`. Returns only on a
-/// fatal accept error. Lets a caller read the bound port before serving (mobile).
-pub fn serve_listener(listener: TcpListener, router: Router) -> std::io::Result<()> {
-    let router = Arc::new(router);
+/// Serve a **shared** `router` forever on an already-bound loopback `listener`. The
+/// caller keeps its own `Arc<Router>` clone — the standalone mobile client needs one to
+/// answer in-process bridge requests ([`dispatch_message`]) against the same router that
+/// serves loopback (#0A). Returns only on a fatal accept error.
+pub fn serve_listener_shared(listener: TcpListener, router: Arc<Router>) -> std::io::Result<()> {
     for stream in listener.incoming() {
         spawn_conn(stream?, Arc::clone(&router), AccessPolicy::TcpLoopback);
     }
     Ok(())
+}
+
+/// Serve `router` forever on an already-bound loopback `listener`. Returns only on a
+/// fatal accept error. Lets a caller read the bound port before serving (mobile).
+pub fn serve_listener(listener: TcpListener, router: Router) -> std::io::Result<()> {
+    serve_listener_shared(listener, Arc::new(router))
 }
 
 /// Bind `addr` and serve `router` forever. Returns only on a fatal bind/accept error.
@@ -1018,6 +1081,46 @@ mod tests {
             Vec::new(),
         );
         assert_ne!(allowed.status, 401, "bridge with token must pass the gate");
+    }
+
+    #[test]
+    fn handle_bridge_request_frames_json_response_and_enforces_session() {
+        // #0A: the bridge's JSON wire protocol — Kotlin forwards strings, all parsing is
+        // here. Request envelope in, response envelope out; the session gate applies.
+        use isyncyou_core::Config;
+        use serde_json::Value;
+        let open = Router::new(Config::default());
+        let out = handle_bridge_request(
+            &open,
+            r#"{"method":"GET","path":"/api/v1/accounts","headers":{},"body":null}"#,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], 200);
+        assert!(
+            v["body"].as_str().unwrap().contains("accounts"),
+            "envelope body: {out}"
+        );
+
+        // A gated router refuses without a token, passes with the canonical header
+        // (case-insensitively matched).
+        let gated = Router::new(Config::default()).with_session_token("sess-br".into());
+        let denied = handle_bridge_request(
+            &gated,
+            r#"{"method":"GET","path":"/api/v1/status","headers":{}}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&denied).unwrap()["status"],
+            401
+        );
+        let ok = handle_bridge_request(
+            &gated,
+            r#"{"method":"GET","path":"/api/v1/status","headers":{"x-session-token":"sess-br"}}"#,
+        );
+        assert_ne!(serde_json::from_str::<Value>(&ok).unwrap()["status"], 401);
+
+        // Malformed JSON → a 400 envelope, never a panic.
+        let bad = handle_bridge_request(&open, "not json");
+        assert_eq!(serde_json::from_str::<Value>(&bad).unwrap()["status"], 400);
     }
 
     #[test]

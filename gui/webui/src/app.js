@@ -358,15 +358,52 @@ function sessionHeaders() { const t = sessionToken(); return t ? { "X-Session-To
    profile (no restore capability token is injected). */
 const MOBILE = typeof window !== "undefined" &&
   (!!window.AndroidSession || cookieVal("isy_session") !== "");
-async function api(path) { const r = await fetch(path, { headers: sessionHeaders() }); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
-async function post(path, capToken) {
+/* Transport (#0A): the standalone phone may expose an in-process message bridge
+   (window.__isyBridge — an origin-bound WebMessageListener) so the data path needs no
+   loopback TCP port, unreachable from any other app. When it is absent (the desktop
+   daemon, or a phone build before the bridge) everything falls back to fetch() with
+   identical behaviour. The bridge also carries a request body natively — the query-string
+   API needs none today, but uploads will. The push/EventSource half is converted together
+   with the native bridge (on-device) so the two ends of the wire are tested as one. */
+const BRIDGE = (typeof window !== "undefined" && window.__isyBridge) || null;
+let _bridgeSeq = 0;
+const _bridgePending = new Map(); // request id -> { resolve }
+if (BRIDGE) {
+  BRIDGE.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+    if (m.t === "res") {
+      const p = _bridgePending.get(m.id);
+      if (p) { _bridgePending.delete(m.id); p.resolve({ status: m.status, body: m.body }); }
+    }
+  };
+}
+function bridgeSend(method, path, headers, body) {
+  return new Promise((resolve) => {
+    const id = "r" + (++_bridgeSeq);
+    _bridgePending.set(id, { resolve });
+    BRIDGE.postMessage(JSON.stringify({ t: "req", id, method, path, headers, body: body ?? null }));
+  });
+}
+/* One request over the active transport; returns parsed JSON, throws on non-2xx. */
+async function request(method, path, opts) {
+  const o = opts || {};
   const headers = sessionHeaders();
-  if (capToken) headers["X-Capability-Token"] = capToken;
-  const r = await fetch(path, { method: "POST", headers });
+  if (o.capToken) headers["X-Capability-Token"] = o.capToken;
+  if (BRIDGE) {
+    const res = await bridgeSend(method, path, headers, o.body);
+    let d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
+    if (res.status < 200 || res.status >= 300) throw new Error(d.error || res.status);
+    return d;
+  }
+  const init = { method, headers };
+  if (o.body !== undefined) init.body = o.body;
+  const r = await fetch(path, init);
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || r.status);
   return d;
 }
+async function api(path) { return request("GET", path); }
+async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
 const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
 const initials = (s) => (s || "?").trim().split(/[\s@.]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join("") || "?";
 

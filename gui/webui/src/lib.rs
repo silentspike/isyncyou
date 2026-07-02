@@ -30,7 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod serve;
 mod view;
 pub use serve::{
-    bind_loopback, dispatch_message, format_http, parse_request_line, serve, serve_listener,
+    bind_loopback, dispatch_message, format_http, handle_bridge_request, parse_request_line, serve,
+    serve_listener, serve_listener_shared,
 };
 #[cfg(unix)]
 pub use serve::{default_unix_socket_path, serve_unix};
