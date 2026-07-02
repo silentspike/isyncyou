@@ -14,6 +14,15 @@ use crate::AgentError;
 pub const DEFAULT_READ_BUDGET: u64 = 64 * 1024;
 /// Default search result cap when the model does not set `limit`.
 pub const DEFAULT_SEARCH_LIMIT: u32 = 20;
+/// Default number of candidate bodies a single deep-search pass reads (budget). Bounds
+/// cost on a large mailbox; the model resumes via `next_cursor` to "search deeper".
+pub const DEFAULT_DEEP_READS: u32 = 12;
+/// Hard cap on a deep-search pass regardless of the model's `max_reads`.
+pub const MAX_DEEP_READS: u32 = 40;
+/// The M365 services a deep scan covers when the model names none.
+pub const SCANNABLE_SERVICES: &[&str] = &[
+    "mail", "onedrive", "calendar", "contacts", "todo", "onenote",
+];
 
 /// Executes read-class actions against an [`ArchiveSource`].
 pub struct RetrievalExecutor<A: ArchiveSource> {
@@ -73,9 +82,9 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
     /// bodies — emitting a `SearchStage` boundary + a `PartialResult` of the newly-added,
     /// deduped, source-tagged hits after each, so the UI grows the list live. The final
     /// JSON is identical to [`search`] (plus a `deep_search_hint`): the returned string is
-    /// what the model answers from; **stage 3** (agentic metadata-scan + candidate
-    /// deep-read for wording the query never contains) is the model's own follow-up
-    /// `list`/`read` calls, guided by that hint.
+    /// what the model answers from; **stage 3** is the [`deep_search`](Self::deep_search)
+    /// op, which the model calls (guided by that hint) to surface matches whose wording the
+    /// query never contains.
     fn search_staged(
         &self,
         services: &[String],
@@ -147,7 +156,104 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             "returned": results.len(),
             "total_matches": total,
             "results": results,
-            "deep_search_hint": "Keyword passes (name + full-text) are done. For matches that never contain the query wording, `list` the relevant service and `read` likely candidates by subject/sender.",
+            "deep_search_hint": "Keyword passes (name + full-text) are done. If the user may mean something these missed (different wording/synonyms), call `deep-search` — it scans metadata and reads unmatched candidate bodies for you to judge; resume with its `next_cursor` to search deeper.",
+        })
+        .to_string())
+    }
+
+    /// Stage 3 — agentic deep read (S-AG.18/#643). Keyword search (`search`) only finds
+    /// items whose name or body literally contains the query; this surfaces the ones it
+    /// missed so the model can judge them semantically. It builds the keyword-matched set
+    /// (to exclude), metadata-scans the in-scope services, then reads up to a **budget** of
+    /// unmatched candidate bodies from `cursor`, returning short snippets + a coverage note
+    /// and a `next_cursor` to continue. It never reads the whole mailbox in one pass.
+    fn deep_search(
+        &self,
+        services: &[String],
+        query: &str,
+        cursor: Option<u32>,
+        max_reads: Option<u32>,
+        emit: &mut dyn FnMut(StreamEvent),
+    ) -> Result<String, AgentError> {
+        emit(StreamEvent::SearchStage {
+            stage: "deep".into(),
+            status: "running".into(),
+            hits: 0,
+        });
+
+        // Items the keyword passes already found — the deep read only covers the misses.
+        let mut matched: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for it in self.source.search_names(query)? {
+            matched.insert((it.service, it.id));
+        }
+        for pair in self.source.search_bodies(query)? {
+            matched.insert(pair);
+        }
+
+        // Metadata scan (names only, cheap) across the in-scope services, stable order,
+        // keeping only unmatched items that actually have an archived body to read.
+        let scan: Vec<String> = if services.is_empty() {
+            SCANNABLE_SERVICES.iter().map(|s| s.to_string()).collect()
+        } else {
+            services.to_vec()
+        };
+        let mut candidates: Vec<ItemRef> = Vec::new();
+        for svc in &scan {
+            for it in self.source.list(svc, None)? {
+                if it.path.is_some() && !matched.contains(&(it.service.clone(), it.id.clone())) {
+                    candidates.push(it);
+                }
+            }
+        }
+        let total = candidates.len();
+
+        // Budgeted read window from `cursor`.
+        let start = cursor.unwrap_or(0) as usize;
+        let budget = max_reads.unwrap_or(DEFAULT_DEEP_READS).min(MAX_DEEP_READS) as usize;
+        let mut read_items: Vec<serde_json::Value> = Vec::new();
+        for it in candidates.iter().skip(start).take(budget) {
+            let body = self
+                .source
+                .read_body(&it.service, &it.id)
+                .unwrap_or_default();
+            let snippet: String = String::from_utf8_lossy(&body).chars().take(280).collect();
+            let mut r = Self::source_ref(it);
+            r["snippet"] = serde_json::Value::String(snippet);
+            read_items.push(r);
+        }
+        let next = start + read_items.len();
+        let more = next < total;
+
+        emit(StreamEvent::PartialResult {
+            stage: "deep".into(),
+            items: serde_json::Value::Array(read_items.clone()),
+        });
+        emit(StreamEvent::SearchStage {
+            stage: "deep".into(),
+            status: "done".into(),
+            hits: read_items.len(),
+        });
+
+        let coverage = if more {
+            format!(
+                "Read {} of {total} unmatched candidates (from {start}). Judge these by \
+                 content; to search deeper, call deep-search again with cursor={next}.",
+                read_items.len()
+            )
+        } else {
+            format!("Read all {total} unmatched candidates — this is the full deep scan.")
+        };
+        Ok(serde_json::json!({
+            "query": query,
+            "stage": "deep",
+            "candidates_total": total,
+            "read": read_items.len(),
+            "cursor": start,
+            "next_cursor": if more { Some(next) } else { None },
+            "budget_reached": more,
+            "candidates": read_items,
+            "coverage_note": coverage,
         })
         .to_string())
     }
@@ -244,6 +350,13 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 limit,
                 ..
             } => self.search(services, query, *limit),
+            ToolAction::DeepSearch {
+                services,
+                query,
+                cursor,
+                max_reads,
+                ..
+            } => self.deep_search(services, query, *cursor, *max_reads, &mut |_| {}),
             ToolAction::Read {
                 service,
                 id,
@@ -270,7 +383,7 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
         action: &ToolAction,
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<String, AgentError> {
-        // Only search runs as visible stages; every other read is single-shot.
+        // Search + deep-search run as visible stages; every other read is single-shot.
         match action {
             ToolAction::Search {
                 services,
@@ -278,6 +391,13 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 limit,
                 ..
             } => self.search_staged(services, query, *limit, emit),
+            ToolAction::DeepSearch {
+                services,
+                query,
+                cursor,
+                max_reads,
+                ..
+            } => self.deep_search(services, query, *cursor, *max_reads, emit),
             _ => self.execute_read(action),
         }
     }
@@ -471,6 +591,103 @@ mod tests {
         assert_eq!(done, vec![("names".into(), 0), ("bodies".into(), 1)]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["results"][0]["id"], "m1");
+    }
+
+    #[test]
+    fn deep_search_surfaces_keyword_less_candidate_and_excludes_matched() {
+        // m1's body literally contains the query (found by plain search → excluded from the
+        // deep pass); m2 is about the same topic but never says "distrokid" (the keyword-less
+        // match the deep read must surface); m3 is noise.
+        let ex = RetrievalExecutor::new(FakeArchive {
+            items: vec![
+                FakeArchive::item(
+                    "mail",
+                    "m1",
+                    "Invoice March",
+                    Some("Your DistroKid renewal, 22.99"),
+                ),
+                FakeArchive::item(
+                    "mail",
+                    "m2",
+                    "Music payout",
+                    Some("Your streaming distributor paid out 41.00"),
+                ),
+                FakeArchive::item("mail", "m3", "Lunch", Some("see you at noon")),
+            ],
+        });
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let out = ex
+            .deep_search(&["mail".into()], "distrokid", None, Some(10), &mut |e| {
+                events.push(e)
+            })
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let ids: Vec<&str> = v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids.contains(&"m2"),
+            "keyword-less candidate must be surfaced"
+        );
+        assert!(
+            !ids.contains(&"m1"),
+            "keyword-matched item is excluded from the deep pass"
+        );
+        let m2 = v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "m2")
+            .unwrap();
+        assert!(
+            m2["snippet"].as_str().unwrap().contains("distributor"),
+            "the candidate body is surfaced for the model to judge"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::SearchStage { stage, status, .. } if stage == "deep" && status == "done"
+        )));
+    }
+
+    #[test]
+    fn deep_search_budget_and_cursor_paginate() {
+        let items: Vec<_> = (0..5)
+            .map(|i| {
+                FakeArchive::item(
+                    "mail",
+                    &format!("d{i}"),
+                    &format!("Note {i}"),
+                    Some(&format!("body {i}")),
+                )
+            })
+            .collect();
+        let ex = RetrievalExecutor::new(FakeArchive { items });
+        // Query matches nothing → all 5 are unmatched candidates; budget of 2 per pass.
+        let out = ex
+            .deep_search(&["mail".into()], "zzzznomatch", None, Some(2), &mut |_| {})
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["read"], 2);
+        assert_eq!(v["candidates_total"], 5);
+        assert_eq!(v["budget_reached"], true);
+        assert_eq!(v["next_cursor"], 2);
+        // Resume from the cursor to search deeper.
+        let out2 = ex
+            .deep_search(
+                &["mail".into()],
+                "zzzznomatch",
+                Some(2),
+                Some(2),
+                &mut |_| {},
+            )
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(v2["cursor"], 2);
+        assert_eq!(v2["read"], 2);
+        assert_eq!(v2["next_cursor"], 4);
     }
 
     #[test]
