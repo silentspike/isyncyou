@@ -1620,6 +1620,7 @@ dependencies = [
 name = "isyncyou-connectors"
 version = "1.0.0"
 dependencies = [
+ "isyncyou-core",
  "isyncyou-graph",
  "isyncyou-pathmap",
  "isyncyou-store",

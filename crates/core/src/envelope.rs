@@ -216,6 +216,17 @@ fn key_for_id(key_id: u32) -> Option<BodyKey> {
     reg.older.iter().find(|(id, _)| *id == key_id).map(|(_, k)| *k)
 }
 
+/// Return the bytes to write to a body file: **sealed** when a body key is active, else the
+/// plaintext unchanged (desktop / pre-unwrap). Lets a caller keep its own atomic
+/// temp-file+rename while getting encryption-at-rest — the temp file then holds ciphertext,
+/// so no plaintext temp survives. Read the file back with [`read_body`].
+pub fn seal_for_disk(plaintext: &[u8]) -> Vec<u8> {
+    match keys().lock().unwrap_or_else(|e| e.into_inner()).active {
+        Some((key_id, key)) => seal(plaintext, &key, key_id),
+        None => plaintext.to_vec(),
+    }
+}
+
 /// Write `plaintext` to `final_path` **atomically** (temp file + rename) and **sealed** when
 /// a body key is active — so a large file is never left partly written and no plaintext temp
 /// file survives. With no active key (desktop) it writes plaintext, preserving today's

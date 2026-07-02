@@ -182,7 +182,7 @@ fn write_item_json(archive_root: &Path, id: &str, item: &Value) -> Result<(), Sy
     }
     let bytes = serde_json::to_vec(item).map_err(|e| SyncError::Malformed(e.to_string()))?;
     let tmp = abs.with_extension("json.part");
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
     std::fs::rename(&tmp, &abs)?;
     Ok(())
 }
@@ -392,7 +392,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
         "{}.isync-tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
-    std::fs::write(&tmp, data)?;
+    std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(data))?;
     std::fs::rename(&tmp, path)
 }
 
@@ -520,7 +520,7 @@ fn locally_edited_since_sync(full: &Path, ssize: i64, smtime: i64, shash: Option
     if disk_mtime == Some(smtime) {
         return false;
     }
-    match (shash, std::fs::read(full)) {
+    match (shash, isyncyou_core::envelope::read_body(full)) {
         (Some(h), Ok(data)) => crate::quickxor::quickxor_base64(&data) != h,
         // no stored hash / unreadable: same size + different mtime alone is not
         // enough evidence to declare a conflict
@@ -819,7 +819,9 @@ pub fn push_local_creates<W: RemoteWriter>(
     let mut uploaded = 0;
     for rel in creates {
         let full = sync_root.join(rel);
-        let data = std::fs::read(&full)?;
+        // Decrypt the local body before upload — the on-disk copy is a sealed envelope on
+        // mobile, and the cloud must receive the plaintext, never ciphertext (#0B).
+        let data = isyncyou_core::envelope::read_body(&full)?;
         let dest = cloud_dest_path(rel);
         // preserve the file's local mtime on the cloud item (best-effort)
         let local_mtime = local_mtime_secs(&full);
@@ -958,7 +960,7 @@ fn is_local_modified(full: &Path, it: &Item) -> bool {
         return true;
     }
     // size matches but mtime differs: only a content hash can decide.
-    match (&it.quickxorhash, std::fs::read(full)) {
+    match (&it.quickxorhash, isyncyou_core::envelope::read_body(full)) {
         (Some(stored), Ok(data)) => crate::quickxor::quickxor_base64(&data) != *stored,
         _ => false,
     }
@@ -999,7 +1001,8 @@ pub fn apply_local_modifies<R: ContentReplacer>(
 ) -> Result<ModifyReport, SyncError> {
     let mut report = ModifyReport::default();
     for (id, rel, etag) in modifies {
-        let data = match std::fs::read(sync_root.join(rel)) {
+        // Decrypt the local body before re-upload — never send ciphertext to the cloud (#0B).
+        let data = match isyncyou_core::envelope::read_body(&sync_root.join(rel)) {
             Ok(d) => d,
             Err(_) => {
                 report.failed += 1;

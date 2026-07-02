@@ -3390,10 +3390,14 @@ impl Router {
         };
         let path = body_root.join(&rel);
         match (path.canonicalize(), body_root.canonicalize()) {
-            (Ok(p), Ok(root)) if p.starts_with(&root) => match std::fs::read(&p) {
-                Ok(bytes) => Ok((rel, bytes, name)),
-                Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
-            },
+            (Ok(p), Ok(root)) if p.starts_with(&root) => {
+                // Decrypt the sealed body envelope on read (#0B); a plaintext file (desktop)
+                // passes through unchanged.
+                match isyncyou_core::envelope::read_body(&p) {
+                    Ok(bytes) => Ok((rel, bytes, name)),
+                    Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
+                }
+            }
             (Ok(_), Ok(_)) => Err(ApiResponse::error(400, "body path escapes its root")),
             _ => Err(ApiResponse::error(404, "body file missing")),
         }
@@ -3789,7 +3793,8 @@ fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>>
     if !p.starts_with(&root) {
         return None;
     }
-    std::fs::read(&p).ok()
+    // Decrypt the sealed body envelope on read (#0B); plaintext (desktop) passes through.
+    isyncyou_core::envelope::read_body(&p).ok()
 }
 
 /// Build a calendar item's `preview` from its archived JSON sidecar (#565 B4).

@@ -533,7 +533,8 @@ fn read_archived_body(
         .local_path
         .clone()
         .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
-    let bytes = std::fs::read(acc.archive_root.join(&rel)).map_err(|e| e.to_string())?;
+    let bytes = isyncyou_core::envelope::read_body(&acc.archive_root.join(&rel))
+        .map_err(|e| e.to_string())?;
     Ok((item, bytes))
 }
 
@@ -799,11 +800,15 @@ mod tests {
             "a no-op refresh must not count as changed"
         );
         // Any single non-zero count flips it to changed.
-        let mut c = RefreshCounts::default();
-        c.mail_upserted = 1;
+        let c = RefreshCounts {
+            mail_upserted: 1,
+            ..Default::default()
+        };
         assert!(c.changed(), "one upserted mail is a real change");
-        let mut c2 = RefreshCounts::default();
-        c2.onenote_containers = 2;
+        let c2 = RefreshCounts {
+            onenote_containers: 2,
+            ..Default::default()
+        };
         assert!(c2.changed(), "a change in the last field must count too");
     }
 
