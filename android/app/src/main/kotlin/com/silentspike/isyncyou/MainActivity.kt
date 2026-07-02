@@ -1,7 +1,6 @@
 package com.silentspike.isyncyou
 
 import android.Manifest
-import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -13,6 +12,10 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
@@ -30,7 +33,7 @@ import org.json.JSONObject
  * self-contained iSyncYou node over mobile data. A thin shell: all features live in
  * the web UI.
  */
-class MainActivity : Activity() {
+class MainActivity : FragmentActivity() {
 
     private companion object {
         const val TAG = "iSyncYou"
@@ -352,7 +355,61 @@ class MainActivity : Activity() {
                 val jsId = JSONObject(data).optString("id")
                 bridgeStreams.remove(jsId)?.let { NativeEngine.nativeStreamClose(it) }
             }
+            // #onedrive-mobile 0.6: the WebUI asks for a biometric before a destructive op.
+            // We show BiometricPrompt HERE (native, WebView-unreachable) and only on success
+            // arm the server's per-action token via nativeConfirmAction. The reply carries no
+            // token — just whether the human confirmed — so the WebView re-issues with `_pat`.
+            "bio" -> {
+                val obj = JSONObject(data)
+                val reqId = obj.optString("id")
+                val pat = obj.optString("pat")
+                val label = obj.optString("label").ifEmpty { "Confirm this action" }
+                if (reqId.isNotEmpty() && pat.isNotEmpty()) {
+                    runOnUiThread { runBiometric(reqId, pat, label, reply) }
+                }
+            }
         }
+    }
+
+    /**
+     * Show a `BiometricPrompt` (#onedrive-mobile 0.6). On success, arm the server-side
+     * per-action token over the JNI-only [NativeEngine.nativeConfirmAction] path (the WebView
+     * cannot reach it), then reply `{t:"bio",id,ok}`. Strong biometric with a device-credential
+     * (PIN/pattern) fallback. Must be called on the UI thread.
+     */
+    private fun runBiometric(reqId: String, pat: String, label: String, reply: JavaScriptReplyProxy) {
+        fun done(ok: Boolean) = reply.postMessage("{\"t\":\"bio\",\"id\":\"$reqId\",\"ok\":$ok}")
+        val mgr = BiometricManager.from(this)
+        val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG or
+            BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        if (mgr.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
+            android.util.Log.w(TAG, "biometric unavailable; destructive op denied")
+            done(false)
+            return
+        }
+        val prompt = BiometricPrompt(
+            this,
+            ContextCompat.getMainExecutor(this),
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    val armed = try {
+                        NativeEngine.nativeConfirmAction(pat)
+                    } catch (e: Exception) {
+                        android.util.Log.w(TAG, "nativeConfirmAction failed", e); false
+                    }
+                    done(armed)
+                }
+                override fun onAuthenticationError(code: Int, msg: CharSequence) = done(false)
+                // A single non-match keeps the prompt up; no reply until success/error/cancel.
+                override fun onAuthenticationFailed() {}
+            },
+        )
+        val info = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Confirm action")
+            .setSubtitle(label)
+            .setAllowedAuthenticators(authenticators)
+            .build()
+        prompt.authenticate(info)
     }
 
     /** Drain one push stream, forwarding each event to the WebView until it ends (#0A). */

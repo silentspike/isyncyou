@@ -55,4 +55,12 @@ object NativeEngine {
      * first body write/read is already sealed. Returns 1 on success, 0 on a bad key length.
      */
     external fun nativeSetBodyKey(keyId: Int, key: ByteArray): Int
+
+    /**
+     * Record a successful native `BiometricPrompt` for a pending destructive action
+     * (#onedrive-mobile 0.6). Called ONLY from the biometric success callback — the WebView
+     * has no path to it, which makes the per-action token a real second factor. Returns true
+     * when the pending id was found and armed for consumption.
+     */
+    external fun nativeConfirmAction(pendingId: String): Boolean
 }

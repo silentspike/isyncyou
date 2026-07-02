@@ -369,12 +369,17 @@ const BRIDGE = (typeof window !== "undefined" && window.__isyBridge) || null;
 let _bridgeSeq = 0;
 const _bridgePending = new Map(); // request id -> { resolve }
 const _bridgeStreams = new Map(); // stream id -> onEvent handler
+const _bioPending = new Map();    // biometric request id -> { resolve } (#0.6)
 if (BRIDGE) {
   BRIDGE.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
     if (m.t === "res") {
       const p = _bridgePending.get(m.id);
       if (p) { _bridgePending.delete(m.id); p.resolve({ status: m.status, body: m.body }); }
+    } else if (m.t === "bio") {
+      // Native BiometricPrompt result (#0.6): {ok} tells us whether the human confirmed.
+      const p = _bioPending.get(m.id);
+      if (p) { _bioPending.delete(m.id); p.resolve(!!m.ok); }
     } else if (m.t === "evt") {
       const h = _bridgeStreams.get(m.id);
       if (h && m.ev) h.onEvent(m.ev.event || "message", m.ev.data || "");
@@ -390,6 +395,23 @@ function bridgeSend(method, path, headers, body) {
     _bridgePending.set(id, { resolve });
     BRIDGE.postMessage(JSON.stringify({ t: "req", id, method, path, headers, body: body ?? null }));
   });
+}
+/* Ask the native side (#0.6) to run a BiometricPrompt and, on success, arm the server's
+   per-action token for `pat`. Resolves true only if the human authenticated. Without the
+   native bridge there is no biometric path, so a destructive op cannot be confirmed. */
+function runBiometricConfirm(pat, label) {
+  if (!BRIDGE) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const id = "b" + (++_bridgeSeq);
+    _bioPending.set(id, { resolve });
+    BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat, label }));
+  });
+}
+/* A short human label for the biometric sheet from the challenge payload (#0.6). */
+function biometricLabel(d) {
+  const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
+    : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
+  return `${verb} in ${d.service || "Microsoft 365"}`;
 }
 /* Open an SSE-style stream over the active transport (#0A): the native bridge push
    channel when present, else EventSource. `onEvent(name, data)` fires per event (name is
@@ -415,17 +437,30 @@ async function request(method, path, opts) {
   const o = opts || {};
   const headers = sessionHeaders();
   if (o.capToken) headers["X-Capability-Token"] = o.capToken;
+  let status, d;
   if (BRIDGE) {
     const res = await bridgeSend(method, path, headers, o.body);
-    let d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
-    if (res.status < 200 || res.status >= 300) throw new Error(d.error || res.status);
-    return d;
+    status = res.status;
+    d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
+  } else {
+    const init = { method, headers };
+    if (o.body !== undefined) init.body = o.body;
+    const r = await fetch(path, init);
+    status = r.status;
+    d = await r.json().catch(() => ({}));
   }
-  const init = { method, headers };
-  if (o.body !== undefined) init.body = o.body;
-  const r = await fetch(path, init);
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || r.status);
+  // #onedrive-mobile 0.6: a destructive op the mobile router gated answers with a
+  // confirmation_required challenge instead of acting. Run the native biometric and, on a
+  // human confirm, re-issue exactly once with the per-action token. Guarded against loops:
+  // a request that already carries `_pat` is never re-challenged into another biometric.
+  if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
+      && d.pending_action_id && !/[?&]_pat=/.test(path)) {
+    const ok = await runBiometricConfirm(d.pending_action_id, biometricLabel(d));
+    if (!ok) throw new Error("Confirmation cancelled");
+    const sep = path.includes("?") ? "&" : "?";
+    return request(method, `${path}${sep}_pat=${encodeURIComponent(d.pending_action_id)}`, opts);
+  }
+  if (status < 200 || status >= 300) throw new Error(d.error || status);
   return d;
 }
 async function api(path) { return request("GET", path); }

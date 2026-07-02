@@ -115,6 +115,9 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.webkit:webkit:1.11.0")
+    // Biometric per-action confirmation for destructive ops (#onedrive-mobile 0.6).
+    // Pulls androidx.fragment; MainActivity is a FragmentActivity for BiometricPrompt.
+    implementation("androidx.biometric:biometric:1.1.0")
     // Firebase Cloud Messaging via the BoM (#575) — version-aligned, messaging only.
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")

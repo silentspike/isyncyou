@@ -197,6 +197,22 @@ pub fn session_token() -> Option<String> {
         .map(|s| s.session_token.clone())
 }
 
+/// Record a successful native `BiometricPrompt` for a pending destructive action
+/// (#onedrive-mobile 0.6). Kotlin calls this ONLY after the biometric succeeds; the
+/// WebView has no route to it, which is what makes the per-action token a real second
+/// factor even though the UI holds every cap-token. Returns `false` when the engine
+/// hasn't started or the id is unknown/expired.
+pub fn confirm_action(pending_id: &str) -> bool {
+    let router = {
+        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| Arc::clone(&s.router))
+    };
+    match router {
+        Some(r) => r.confirm_biometric(pending_id),
+        None => false,
+    }
+}
+
 fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
     let base = PathBuf::from(files_dir);
     let archive_root = base.join("archive");
@@ -243,7 +259,11 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
             config_path,
             live_interval.clone(),
         )
-        .with_session_token(session_token.clone()),
+        .with_session_token(session_token.clone())
+        // #onedrive-mobile 0.6: only the standalone Android app arms the biometric gate.
+        // Destructive routes then require a per-action token that is valid only after a
+        // native BiometricPrompt (confirmed over `nativeConfirmAction`, below).
+        .with_biometric_gate(),
     );
 
     // #0A: NO loopback TCP port in the default build — the WebView reaches the engine only
@@ -459,6 +479,24 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyK
         isyncyou_store::set_store_key(k.to_vec());
     }));
     1
+}
+
+/// JNI: record a successful native `BiometricPrompt` for a pending destructive action
+/// (#onedrive-mobile 0.6). Kotlin calls this ONLY from the biometric success callback, so
+/// the confirmation cannot originate in the WebView (which holds every cap-token). Returns
+/// 1 when the pending id was found and armed, 0 otherwise (unknown/expired/engine down).
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConfirmAction(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    pending_id: jni::objects::JString,
+) -> jni::sys::jboolean {
+    let id: String = match env.get_string(&pending_id) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    let ok = std::panic::catch_unwind(AssertUnwindSafe(|| confirm_action(&id))).unwrap_or(false);
+    u8::from(ok)
 }
 
 #[cfg(test)]
