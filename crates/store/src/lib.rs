@@ -37,7 +37,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -311,6 +311,34 @@ UPDATE items SET content_state='not_applicable'
   WHERE service='onedrive' AND item_type = 'folder';
 "#;
 
+/// v15: the **cloud-write operation ledger** (#onedrive-mobile 0D). Every mutating
+/// OneDrive op (create/upload/replace/rename/move/delete/share) records an idempotent
+/// intent BEFORE it hits Graph, so a crash *after* the Graph mutation but *before* the
+/// local store update is recoverable: boot recovery re-probes each `pending`/`inflight`
+/// op and reconciles. `idempotency_key` (UNIQUE per account) dedups a re-issued intent to
+/// the same row — never a second cloud effect. `if_match_etag` carries the optimistic-
+/// concurrency guard for replace/rename/move/delete. Modeled on `restore_operations` (v7).
+const MIGRATION_V15: &str = r#"
+CREATE TABLE cloud_write_operations (
+    op_id            TEXT PRIMARY KEY,
+    account_id       TEXT NOT NULL,
+    service          TEXT NOT NULL,
+    op_kind          TEXT NOT NULL,
+    target_id        TEXT,
+    idempotency_key  TEXT NOT NULL,
+    if_match_etag    TEXT,
+    state            TEXT NOT NULL,
+    result_id        TEXT,
+    intent_json      TEXT,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    last_error       TEXT,
+    UNIQUE(account_id, idempotency_key)
+);
+CREATE INDEX idx_cloud_write_ops_open ON cloud_write_operations(account_id, state);
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -437,6 +465,86 @@ impl Item {
             conflict_state: None,
         }
     }
+}
+
+/// A OneDrive cloud-write op kind (#onedrive-mobile 0D). Each kind has a defined
+/// crash-recovery probe, run by boot recovery in the engine when it finds a
+/// `pending`/`inflight` ledger row after a crash:
+/// - **Create / Upload**: probe the parent listing / an idempotency marker; if the item
+///   is already present in the cloud → `applied` (adopt its id), else re-issue.
+/// - **Replace**: re-send guarded by `if_match_etag`; a `412` means the cloud moved on
+///   → **conflict** (keep-both), never a blind overwrite.
+/// - **Rename / Move**: probe the item's current name/parent; if already at the target →
+///   `applied`, else re-issue (id-stable).
+/// - **Delete**: a `404` == success (already gone) → `applied`; the ONLY kind safe to
+///   blindly re-send.
+/// - **Share**: probe existing links/permissions first → never a duplicate invite/link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudOpKind {
+    Create,
+    Upload,
+    Replace,
+    Rename,
+    Move,
+    Delete,
+    Share,
+}
+
+impl CloudOpKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CloudOpKind::Create => "create",
+            CloudOpKind::Upload => "upload",
+            CloudOpKind::Replace => "replace",
+            CloudOpKind::Rename => "rename",
+            CloudOpKind::Move => "move",
+            CloudOpKind::Delete => "delete",
+            CloudOpKind::Share => "share",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "create" => CloudOpKind::Create,
+            "upload" => CloudOpKind::Upload,
+            "replace" => CloudOpKind::Replace,
+            "rename" => CloudOpKind::Rename,
+            "move" => CloudOpKind::Move,
+            "delete" => CloudOpKind::Delete,
+            "share" => CloudOpKind::Share,
+            _ => return None,
+        })
+    }
+    /// Whether a crashed op of this kind is safe to **blindly re-send** during recovery.
+    /// Only `Delete` is (a repeat delete is a no-op / 404=success); every other kind must
+    /// be **probed** before re-issue to avoid a duplicate cloud effect.
+    pub fn is_blind_replay_safe(&self) -> bool {
+        matches!(self, CloudOpKind::Delete)
+    }
+}
+
+/// One row of the cloud-write operation ledger (#0D): an idempotent record of a mutating
+/// OneDrive op, written BEFORE the Graph call so a crash mid-op is recoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudWriteOp {
+    pub op_id: String,
+    pub account_id: String,
+    pub service: String,
+    /// One of [`CloudOpKind`]'s wire strings.
+    pub op_kind: String,
+    /// The item id the op targets (or the parent for `create`), if known before the call.
+    pub target_id: Option<String>,
+    /// Dedup key: the same intent re-issued yields the same row, never a second effect.
+    pub idempotency_key: String,
+    /// Optimistic-concurrency guard for replace/rename/move/delete.
+    pub if_match_etag: Option<String>,
+    /// `pending` → `inflight` → `applied` | `failed` | `conflict` | `superseded`.
+    pub state: String,
+    /// The resulting cloud id (create/upload), once applied.
+    pub result_id: Option<String>,
+    /// The op payload (path/name/new-parent/recipient/…) as JSON.
+    pub intent_json: Option<String>,
+    pub attempts: i64,
+    pub last_error: Option<String>,
 }
 
 /// The store. Holds the DB connection and (for on-disk stores) the instance lock.
@@ -822,6 +930,102 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    // ---- Cloud-write operation ledger (#onedrive-mobile 0D) -----------------
+
+    /// Record a cloud-write intent BEFORE issuing it to Graph. Idempotent by
+    /// `(account_id, idempotency_key)`: a re-issued intent maps to the existing row and
+    /// does NOT create a second op. Returns `true` when a new row was inserted, `false`
+    /// when the key already existed (the caller then recovers/reuses that op).
+    pub fn record_cloud_write(&self, op: &CloudWriteOp, now: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO cloud_write_operations \
+             (op_id, account_id, service, op_kind, target_id, idempotency_key, if_match_etag, \
+              state, result_id, intent_json, attempts, created_at, updated_at, last_error) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?13)",
+            params![
+                op.op_id,
+                op.account_id,
+                op.service,
+                op.op_kind,
+                op.target_id,
+                op.idempotency_key,
+                op.if_match_etag,
+                op.state,
+                op.result_id,
+                op.intent_json,
+                op.attempts,
+                now,
+                op.last_error,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Fetch a ledger op by its dedup key (to recover/reuse a re-issued intent).
+    pub fn cloud_write_by_key(
+        &self,
+        account: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<CloudWriteOp>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {CLOUD_WRITE_COLS} FROM cloud_write_operations \
+                     WHERE account_id=?1 AND idempotency_key=?2"
+                ),
+                params![account, idempotency_key],
+                row_to_cloud_write,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Advance a ledger op's state (`pending`→`inflight`→`applied|failed|conflict`),
+    /// recording the resulting cloud id / error and bumping the attempt counter.
+    pub fn set_cloud_write_state(
+        &self,
+        op_id: &str,
+        state: &str,
+        result_id: Option<&str>,
+        last_error: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cloud_write_operations \
+             SET state=?2, result_id=COALESCE(?3, result_id), last_error=?4, \
+                 attempts=attempts+1, updated_at=?5 \
+             WHERE op_id=?1",
+            params![op_id, state, result_id, last_error, now],
+        )?;
+        Ok(())
+    }
+
+    /// All not-yet-terminal ops for an account (`pending`/`inflight`) — the boot-recovery
+    /// work-list. Each is re-probed per [`CloudOpKind`]'s recovery semantics.
+    pub fn pending_cloud_writes(&self, account: &str) -> Result<Vec<CloudWriteOp>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CLOUD_WRITE_COLS} FROM cloud_write_operations \
+             WHERE account_id=?1 AND state IN ('pending','inflight') ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map(params![account], row_to_cloud_write)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Diagnostic export (#0E): the cloud-write ledger's state distribution for an account
+    /// as `(state, count)` pairs. Secret-free by construction (only states + counts); a
+    /// caller that also surfaces `last_error` strings redacts them via `core::obs::redact`
+    /// (store is a low-level crate with no core dependency).
+    pub fn cloud_write_ledger_summary(&self, account: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state, COUNT(*) FROM cloud_write_operations \
+             WHERE account_id=?1 GROUP BY state ORDER BY state",
+        )?;
+        let rows = stmt.query_map(params![account], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_item(&self, account: &str, service: &str, remote_id: &str) -> Result<Option<Item>> {
@@ -1635,6 +1839,26 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     })
 }
 
+const CLOUD_WRITE_COLS: &str = "op_id, account_id, service, op_kind, target_id, \
+    idempotency_key, if_match_etag, state, result_id, intent_json, attempts, last_error";
+
+fn row_to_cloud_write(r: &rusqlite::Row) -> rusqlite::Result<CloudWriteOp> {
+    Ok(CloudWriteOp {
+        op_id: r.get(0)?,
+        account_id: r.get(1)?,
+        service: r.get(2)?,
+        op_kind: r.get(3)?,
+        target_id: r.get(4)?,
+        idempotency_key: r.get(5)?,
+        if_match_etag: r.get(6)?,
+        state: r.get(7)?,
+        result_id: r.get(8)?,
+        intent_json: r.get(9)?,
+        attempts: r.get(10)?,
+        last_error: r.get(11)?,
+    })
+}
+
 /// The state of one cloud-restore operation in the ledger (ADR-001).
 ///
 /// Legal transitions form the recovery-safe machine:
@@ -1794,6 +2018,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 14 {
         conn.execute_batch(MIGRATION_V14)?;
     }
+    if v < 15 {
+        conn.execute_batch(MIGRATION_V15)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1928,7 +2155,6 @@ mod tests {
         // them to available; a metadata re-upsert must not clobber that state.
         let s = Store::open_in_memory().unwrap();
         assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 14, "this test pins the v14 layout");
         let it = Item::new("a", "onedrive", "f1", "file.txt", "file");
         s.upsert_item(&it).unwrap();
         let g = s.get_item("a", "onedrive", "f1").unwrap().unwrap();
@@ -1982,6 +2208,91 @@ mod tests {
                 .as_deref(),
             Some("available"),
             "backfill must mark an existing OneDrive body as available"
+        );
+    }
+
+    #[test]
+    fn cloud_write_ledger_is_idempotent_and_recovers_pending() {
+        // #0D: a mutating OneDrive op is recorded idempotently before it hits Graph, so a
+        // crash mid-op is recoverable and a re-issued intent never causes a second effect.
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.schema_version().unwrap(), 15);
+        let op = CloudWriteOp {
+            op_id: "op1".into(),
+            account_id: "a".into(),
+            service: "onedrive".into(),
+            op_kind: CloudOpKind::Delete.as_str().into(),
+            target_id: Some("f1".into()),
+            idempotency_key: "del-f1-E1".into(),
+            if_match_etag: Some("E1".into()),
+            state: "pending".into(),
+            result_id: None,
+            intent_json: None,
+            attempts: 0,
+            last_error: None,
+        };
+        assert!(s.record_cloud_write(&op, 100).unwrap(), "first record inserts");
+        // re-issue the SAME intent (same idempotency_key, different op_id) → deduped
+        let mut dup = op.clone();
+        dup.op_id = "op2".into();
+        assert!(
+            !s.record_cloud_write(&dup, 101).unwrap(),
+            "same idempotency_key must dedup — no second cloud op"
+        );
+        // exactly one pending op recoverable at boot
+        let pending = s.pending_cloud_writes("a").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].op_id, "op1");
+        assert_eq!(pending[0].op_kind, "delete");
+        assert_eq!(
+            s.cloud_write_by_key("a", "del-f1-E1").unwrap().unwrap().op_id,
+            "op1"
+        );
+        // advance to applied → leaves the pending work-list, records result + attempt
+        s.set_cloud_write_state("op1", "applied", Some("f1"), None, 200)
+            .unwrap();
+        assert!(s.pending_cloud_writes("a").unwrap().is_empty());
+        let done = s.cloud_write_by_key("a", "del-f1-E1").unwrap().unwrap();
+        assert_eq!(done.state, "applied");
+        assert_eq!(done.result_id.as_deref(), Some("f1"));
+        assert_eq!(done.attempts, 1);
+        // recovery-probe semantics: only delete is safe to blindly re-send
+        assert!(CloudOpKind::Delete.is_blind_replay_safe());
+        assert!(!CloudOpKind::Create.is_blind_replay_safe());
+        assert!(!CloudOpKind::Replace.is_blind_replay_safe());
+        assert_eq!(CloudOpKind::parse("share"), Some(CloudOpKind::Share));
+        assert_eq!(CloudOpKind::parse("bogus"), None);
+    }
+
+    #[test]
+    fn cloud_write_ledger_summary_counts_by_state() {
+        // Diagnostic export (#0E): state distribution for a support dump.
+        let s = Store::open_in_memory().unwrap();
+        let mk = |id: &str, key: &str, state: &str| CloudWriteOp {
+            op_id: id.into(),
+            account_id: "a".into(),
+            service: "onedrive".into(),
+            op_kind: "delete".into(),
+            target_id: None,
+            idempotency_key: key.into(),
+            if_match_etag: None,
+            state: state.into(),
+            result_id: None,
+            intent_json: None,
+            attempts: 0,
+            last_error: None,
+        };
+        s.record_cloud_write(&mk("o1", "k1", "pending"), 1).unwrap();
+        s.record_cloud_write(&mk("o2", "k2", "pending"), 1).unwrap();
+        s.record_cloud_write(&mk("o3", "k3", "applied"), 1).unwrap();
+        let sum = s.cloud_write_ledger_summary("a").unwrap();
+        assert_eq!(
+            sum,
+            vec![("applied".to_string(), 1), ("pending".to_string(), 2)]
+        );
+        assert!(
+            s.cloud_write_ledger_summary("other").unwrap().is_empty(),
+            "summary is per-account"
         );
     }
 

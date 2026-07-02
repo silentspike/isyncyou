@@ -7,6 +7,7 @@
 pub mod config;
 pub mod conflict;
 pub mod guard;
+pub mod obs;
 pub mod recovery;
 pub mod sync_state;
 
