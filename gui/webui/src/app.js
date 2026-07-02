@@ -1015,6 +1015,10 @@ function go(route) { location.hash = "#/" + route; }
 const EXTRA_ROUTES = { search: "Search", settings: "Settings", assistant: "Assistant", invaders: "Invaders" };
 const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
+  // Each navigation rebuilds the view from scratch; the view's render re-registers its
+  // own live-update handler (or leaves it null). Reset it here so a stale handler from
+  // the previous route can't run against the new DOM (#0A soft refresh).
+  App.liveUpdate = null;
   // Preserve the scroll position across a SAME-route re-render (e.g. an SSE
   // "change" tick / a live update) so the user isn't bounced back to the top of
   // a long page mid-scroll. Navigation to a different route starts at the top.
@@ -1359,6 +1363,11 @@ async function renderMailView(view) {
     refreshMailSubnav(); // rebuild the sidebar now that the real categories are known
     fillSubnavCounts("mail", Mail.all);
     mailRenderMetrics(); mailRender();
+    // Register the soft live-update for background sync ticks (#0A): re-fetch + patch the
+    // list in place (no teardown, no filter/scroll reset), repainting only when the
+    // visible set actually changed.
+    Mail._sig = mailListSignature();
+    App.liveUpdate = mailLiveUpdate;
     // re-open the message that was selected before a live (SSE) refresh, if it survived
     if (Mail.pendingSelect) {
       const keep = Mail.all.find(x => x.remote_id === Mail.pendingSelect);
@@ -1366,6 +1375,31 @@ async function renderMailView(view) {
       if (keep) mailSelect(keep);
     }
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
+}
+
+// Signature of the currently *visible* mailbox (ids + read state, honouring the active
+// filter/search/sort) — lets a background refresh detect whether anything on screen
+// actually changed before repainting (#0A).
+function mailListSignature() {
+  return mailFiltered().map(it => it.remote_id + (((it.preview || {}).isRead) ? "1" : "0")).join(",");
+}
+// Soft background refresh for the mailbox (#0A): re-fetch, update counts, and repaint the
+// list ONLY when the visible set changed — preserving filter/search/sort/scroll/selection
+// so a sync tick never reloads the screen.
+async function mailLiveUpdate() {
+  let d;
+  try { d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 })); }
+  catch (_) { return; }
+  Mail.all = (d.items || []).filter(it => it.item_type === "message");
+  App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
+  const sig = mailListSignature();
+  if (sig === Mail._sig) { mailRenderMetrics(); return; } // nothing on screen changed → no repaint
+  Mail._sig = sig;
+  const list = $("#mail-list"), view = $("#view");
+  const lsc = list ? list.scrollTop : 0, vsc = view ? view.scrollTop : 0;
+  mailRenderMetrics(); mailRender();
+  const l2 = $("#mail-list"); if (l2) l2.scrollTop = lsc;
+  const v2 = $("#view"); if (v2) v2.scrollTop = vsc;
 }
 // fill an existing .con-metrics-row container in place from card specs
 function fillMetrics(row, cards) {
@@ -4317,10 +4351,16 @@ function subscribeEvents() {
   openEventStream(path, (name) => {
     if (name !== "change") return; // ignore ping heartbeats
     clearTimeout(_evtT);
-    // preserve the open message across a live refresh so an SSE tick (new mail /
-    // a reconciled write) doesn't kick the user out of what they're reading.
-    if (App.route === "mail" && Mail.selected) Mail.pendingSelect = Mail.selected.remote_id;
-    _evtT = setTimeout(onRoute, 150);
+    _evtT = setTimeout(() => {
+      // Soft, in-place refresh — NO shell/view teardown, no filter/search/scroll/selection
+      // reset, so a background sync tick never "reloads the whole screen". A view that
+      // supports live updates registers App.liveUpdate (mail does); it re-fetches and
+      // patches only what changed. Views without one keep the old full refresh on desktop
+      // and refresh on the next navigation on the phone (never a jarring full reload).
+      if (App.liveUpdate) { try { App.liveUpdate(); } catch (_) {} return; }
+      if (MOBILE) return;
+      onRoute();
+    }, 150);
   // EventSource auto-reconnects natively; the bridge push channel doesn't, so re-subscribe
   // after a short backoff when a bridge stream drops.
   }, BRIDGE ? () => setTimeout(subscribeEvents, 3000) : undefined);

@@ -1112,6 +1112,12 @@ a.note-meta-chip:hover { color: var(--accent); }
   }
   .mail-layout.reading .mail-reader { transform: translateX(0); }
   .mail-back { display: inline-flex; }
+  /* Reader header on a phone: the fixed-width action toolbar must NOT squeeze the
+     subject into a one-word-per-line sliver. Let the header wrap so the subject +
+     meta take the full width and the actions drop onto their own wrapping row. */
+  .mail-reader-head { flex-wrap: wrap; row-gap: var(--sp-2); }
+  .mail-reader-head > .grow { flex: 1 1 auto; min-width: 0; }
+  .mr-actions { order: 3; flex: 1 0 100%; flex-wrap: wrap; justify-content: flex-start; }
 }
 /* onenote: collapse the two-pane to a single column on a narrow content area */
 @container (max-width: 760px) {
