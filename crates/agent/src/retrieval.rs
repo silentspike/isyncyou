@@ -14,6 +14,9 @@ use crate::AgentError;
 pub const DEFAULT_READ_BUDGET: u64 = 64 * 1024;
 /// Default search result cap when the model does not set `limit`.
 pub const DEFAULT_SEARCH_LIMIT: u32 = 20;
+/// Body preview length (chars) attached to each hit: enough for a real content preview in
+/// the expanded card, not just the one-line header. Whitespace is collapsed first.
+pub const PREVIEW_CHARS: usize = 1200;
 /// Default number of candidate bodies a single deep-search pass reads (budget). Bounds
 /// cost on a large mailbox; the model resumes via `next_cursor` to "search deeper".
 pub const DEFAULT_DEEP_READS: u32 = 12;
@@ -42,6 +45,34 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             "item_type": it.item_type,
             "path": it.path,
         })
+    }
+
+    /// Like [`source_ref`], plus a body `preview` (best-effort) so the UI can render a real
+    /// content preview per hit — the card header shows the first line, the expanded panel
+    /// shows this whole preview — and the model can judge relevance without a second
+    /// round-trip. Whitespace-collapsed and capped at [`PREVIEW_CHARS`]; empty when the
+    /// item has no archived body or the read fails.
+    fn hit_json(&self, it: &ItemRef) -> serde_json::Value {
+        let mut v = Self::source_ref(it);
+        let preview = if it.path.is_some() {
+            self.source
+                .read_body(&it.service, &it.id)
+                .ok()
+                .map(|b| {
+                    String::from_utf8_lossy(&b)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(PREVIEW_CHARS)
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        v["snippet"] = serde_json::Value::String(preview);
+        v
     }
 
     fn search(
@@ -107,7 +138,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         let mut stage1: Vec<serde_json::Value> = Vec::new();
         for it in self.source.search_names(query)? {
             if in_scope(&it) && seen.insert((it.service.clone(), it.id.clone())) {
-                stage1.push(Self::source_ref(&it));
+                stage1.push(self.hit_json(&it));
                 hits.push(it);
             }
         }
@@ -132,7 +163,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             if seen.insert((service.clone(), id.clone())) {
                 if let Some(it) = self.source.get(&service, &id)? {
                     if in_scope(&it) {
-                        stage2.push(Self::source_ref(&it));
+                        stage2.push(self.hit_json(&it));
                         hits.push(it);
                     }
                 }
@@ -150,7 +181,8 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
 
         let cap = limit.unwrap_or(DEFAULT_SEARCH_LIMIT) as usize;
         let total = hits.len();
-        let results: Vec<serde_json::Value> = hits.iter().take(cap).map(Self::source_ref).collect();
+        let results: Vec<serde_json::Value> =
+            hits.iter().take(cap).map(|it| self.hit_json(it)).collect();
         Ok(serde_json::json!({
             "query": query,
             "returned": results.len(),
@@ -213,14 +245,8 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         let budget = max_reads.unwrap_or(DEFAULT_DEEP_READS).min(MAX_DEEP_READS) as usize;
         let mut read_items: Vec<serde_json::Value> = Vec::new();
         for it in candidates.iter().skip(start).take(budget) {
-            let body = self
-                .source
-                .read_body(&it.service, &it.id)
-                .unwrap_or_default();
-            let snippet: String = String::from_utf8_lossy(&body).chars().take(280).collect();
-            let mut r = Self::source_ref(it);
-            r["snippet"] = serde_json::Value::String(snippet);
-            read_items.push(r);
+            // Same content-preview shape as the keyword hits (header + body preview).
+            read_items.push(self.hit_json(it));
         }
         let next = start + read_items.len();
         let more = next < total;

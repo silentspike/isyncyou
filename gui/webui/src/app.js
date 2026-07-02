@@ -3976,10 +3976,32 @@ async function agentSend(text) {
     if (done) row.querySelector(".asst-stage-n").textContent = d.hits + (d.hits === 1 ? " hit" : " hits");
     log.scrollTop = log.scrollHeight;
   };
+  // Map an M365 service to its nav icon (matches SERVICES); fall back to a generic file.
+  const svcIcon = (s) => ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" }[s] || "file");
   const onPartialResult = (d) => {
     ensureSearchUI();
-    (d.items || []).forEach((it) => resultsBox.append(
-      el("div", { class: "asst-result" }, el("span", { class: "asst-result-svc", text: it.service }), el("span", { class: "grow truncate", text: it.name }))));
+    (d.items || []).forEach((it) => {
+      // A typed element rendered as header (subject/name) + body (content preview), click
+      // to expand into the full body + a link straight to the item (the app's canonical
+      // /api/v1/view, as used in the service lists).
+      const q = { account: App.account, service: it.service, id: it.id };
+      const snip = (it.snippet || "").trim();
+      const head = el("div", { class: "asst-result-head" },
+        el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(svcIcon(it.service), "icon-sm")),
+        el("div", { class: "asst-result-main grow" },
+          el("div", { class: "asst-result-name truncate", text: it.name || "(no name)" }),
+          el("div", { class: "asst-result-sub truncate", text: snip || (it.item_type || it.service) })),
+        el("span", { class: "asst-result-type", text: it.item_type || it.service }),
+        el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
+      const panelKids = [];
+      if (snip) panelKids.push(el("div", { class: "asst-result-body", text: snip }));
+      panelKids.push(el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
+        icon("external-link", "icon-sm"), el("span", { text: "Open " + (it.item_type || "item") })));
+      const panel = el("div", { class: "asst-result-panel" }, ...panelKids);
+      const row = el("div", { class: "asst-result" }, head, panel);
+      head.addEventListener("click", () => row.classList.toggle("open"));
+      resultsBox.append(row);
+    });
     log.scrollTop = log.scrollHeight;
   };
 
@@ -4001,7 +4023,9 @@ async function agentSend(text) {
       case "token": setText(asst.text + (d.text || "")); break;
       case "search_stage": onSearchStage(d); break;
       case "partial_result": onPartialResult(d); break;
-      case "tool_call": addChip("→ isyncyou " + ((d.input && d.input.op) || "")); break;
+      // Raw tool calls (search/read/…) are internal — the stage checkmarks + result cards
+      // already show what's happening, so we don't surface "→ isyncyou read" noise.
+      case "tool_call": break;
       case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
       case "error": setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
       case "done": es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("(no response)"); break;
