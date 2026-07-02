@@ -465,6 +465,14 @@ async function request(method, path, opts) {
 }
 async function api(path) { return request("GET", path); }
 async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
+/* Confirm a destructive action before it is sent (#0.6). On the standalone phone the
+   native biometric per-action gate IS the confirmation — a strictly stronger one shown
+   right before the op — so the blocking window.confirm() is skipped there (the WebView
+   has no dialog handler for it anyway). Desktop keeps the classic confirm(). */
+function confirmDestructive(message) {
+  if (MOBILE) return true;
+  return confirm(message);
+}
 const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
 const initials = (s) => (s || "?").trim().split(/[\s@.]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join("") || "?";
 
@@ -2653,7 +2661,7 @@ function eventRespondInline(ev, response, host) {
   requestAnimationFrame(() => panel.classList.add("open"));
 }
 async function deleteEvent(ev) {
-  if (!confirm("Delete this event? This removes it from your calendar.")) return;
+  if (!confirmDestructive("Delete this event? This removes it from your calendar.")) return;
   try {
     await post("/api/v1/calendar/delete?" + qs({ account: App.account, id: ev.it.remote_id }), CAP.calendarwrite);
     toast("Event deleted"); closeSheet(); calLoad();
@@ -2802,7 +2810,7 @@ async function composeContactSubmit(btn, id) {
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function deleteContact(it) {
-  if (!confirm("Delete this contact? This removes it from your Microsoft 365 account.")) return;
+  if (!confirmDestructive("Delete this contact? This removes it from your Microsoft 365 account.")) return;
   try {
     await post("/api/v1/contact/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.contactwrite);
     toast("Contact deleted");
@@ -3416,7 +3424,7 @@ async function reopenTask(t) {
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function deleteTask(t) {
-  if (!confirm("Delete this task from your Microsoft 365 account?")) return;
+  if (!confirmDestructive("Delete this task from your Microsoft 365 account?")) return;
   try { await post("/api/v1/todo/delete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task deleted"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -3637,7 +3645,7 @@ async function composePageSubmit(btn) {
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function deletePage(it) {
-  if (!confirm("Delete this page from your Microsoft 365 account?")) return;
+  if (!confirmDestructive("Delete this page from your Microsoft 365 account?")) return;
   try {
     await post("/api/v1/onenote/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onenotewrite);
     toast("Page deleted"); Note.selected = null; renderNoteReader(null); noteReload();
