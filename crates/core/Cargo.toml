@@ -11,6 +11,11 @@ authors.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "1.1"
+# At-rest body-file envelope encryption (#onedrive-mobile 0B). ring is already in the
+# arm64 build (via graph), so it cross-compiles for Android without an OpenSSL toolchain —
+# unlike SQLCipher's vendored OpenSSL, which is why the file bodies (not covered by
+# SQLCipher anyway) get their own AES-256-GCM envelope.
+ring = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

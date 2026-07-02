@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod conflict;
+pub mod envelope;
 pub mod guard;
 pub mod obs;
 pub mod recovery;

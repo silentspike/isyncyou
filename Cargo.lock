@@ -1632,6 +1632,7 @@ dependencies = [
 name = "isyncyou-core"
 version = "1.0.0"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
