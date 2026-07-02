@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod guard;
 pub mod obs;
 pub mod pending;
+pub mod policy;
 pub mod recovery;
 pub mod sync_state;
 

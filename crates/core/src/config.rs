@@ -105,6 +105,16 @@ pub struct SyncConfig {
     /// occurrence explosion. `"calendar_view"` keeps the legacy windowed
     /// `calendarView/delta` (incremental but window-bound) as a rollback.
     pub calendar_sync_mode: String,
+    /// Mobile transfer policy (#onedrive-mobile 0.8): only run downloads/materialization
+    /// on an unmetered network (Wi-Fi). Off = any network. Enforced by [`crate::policy`].
+    pub wifi_only: bool,
+    /// Mobile transfer policy (#onedrive-mobile 0.8): only run downloads/materialization
+    /// while the device is charging. Off = any power state. Enforced by [`crate::policy`].
+    pub charging_only: bool,
+    /// Device-protection storage floor in bytes (#onedrive-mobile 0.8): below this much
+    /// free space, NEW downloads/materialization stop — existing files are kept. This is
+    /// an OS safety floor to protect the device, NOT a user storage quota. Default 256 MiB.
+    pub min_free_bytes: u64,
 }
 
 impl Default for SyncConfig {
@@ -117,6 +127,9 @@ impl Default for SyncConfig {
             poll_interval_secs: 5,
             poll_idle_factor: 6,
             calendar_sync_mode: "events".into(),
+            wifi_only: false,
+            charging_only: false,
+            min_free_bytes: 268_435_456, // 256 MiB device-protection floor
         }
     }
 }
@@ -351,6 +364,23 @@ mod tests {
         assert_eq!(c2.sync.poll_interval_secs, 5);
         assert_eq!(c2.sync.poll_idle_factor, 6);
         assert_eq!(c2.sync.trash_retention_days, 14);
+        // the mobile transfer-policy fields default when omitted
+        assert!(!c2.sync.wifi_only);
+        assert!(!c2.sync.charging_only);
+        assert_eq!(c2.sync.min_free_bytes, 268_435_456);
+    }
+
+    #[test]
+    fn transfer_policy_fields_round_trip() {
+        // #onedrive-mobile 0.8: wifi_only/charging_only/min_free_bytes survive toml
+        let mut c = Config::default();
+        c.sync.wifi_only = true;
+        c.sync.charging_only = true;
+        c.sync.min_free_bytes = 512 * 1024 * 1024;
+        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert!(back.sync.wifi_only);
+        assert!(back.sync.charging_only);
+        assert_eq!(back.sync.min_free_bytes, 512 * 1024 * 1024);
     }
 
     #[test]
