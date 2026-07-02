@@ -48,4 +48,11 @@ object NativeEngine {
 
     /** Close a bridge push stream. */
     external fun nativeStreamClose(id: Long)
+
+    /**
+     * Install the at-rest body key (#0B): the 32-byte data key the Android Keystore
+     * unwrapped, with its [keyId] for rotation. MUST be called before [nativeStart] so the
+     * first body write/read is already sealed. Returns 1 on success, 0 on a bad key length.
+     */
+    external fun nativeSetBodyKey(keyId: Int, key: ByteArray): Int
 }

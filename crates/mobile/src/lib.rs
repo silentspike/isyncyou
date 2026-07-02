@@ -430,6 +430,33 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamCl
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| stream_close(id)));
 }
 
+/// JNI: install the at-rest body key (#0B) — the 32-byte data key the Android Keystore
+/// unwrapped, plus its `key_id` for rotation. MUST be called before [`nativeStart`] so the
+/// first body write/read is already sealed. SECURITY: the key bytes are used in-process
+/// only (ring needs raw key material); they are never logged. Returns 1 on success, 0 on a
+/// bad length so Kotlin can surface a setup failure.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyKey(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    key_id: jni::sys::jint,
+    key: jni::objects::JByteArray,
+) -> jni::sys::jint {
+    let bytes = match env.convert_byte_array(&key) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    if bytes.len() != 32 {
+        return 0;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&bytes);
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        isyncyou_core::envelope::set_body_key(key_id as u32, k)
+    }));
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

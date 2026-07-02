@@ -17,6 +17,7 @@ import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import org.json.JSONObject
@@ -176,6 +177,24 @@ class MainActivity : Activity() {
             // blank WebView with no log. Logging the start + the outcome makes engine
             // failures visible (the CI emulator smoke and on-device diagnostics rely on it).
             try {
+                // Install the at-rest body key from the Keystore BEFORE the engine touches
+                // disk (#0B), so the first body write/read is already sealed.
+                BodyKeyStore.getOrCreate(filesDir)?.let { r ->
+                    if (r.justCreated) {
+                        // First encrypted run: discard the pre-encryption plaintext CACHE (the
+                        // store DB + body files) so it re-syncs sealed — but KEEP the auth
+                        // token (also under archive/, `.isyncyou-token*`) so the user stays
+                        // signed in. The cache is reproducible; the token is not.
+                        File(filesDir, "archive").listFiles()?.forEach { f ->
+                            if (!f.name.startsWith(".isyncyou-token")) f.deleteRecursively()
+                        }
+                        File(filesDir, "sync").deleteRecursively()
+                        File(filesDir, "cache").deleteRecursively()
+                        android.util.Log.i(TAG, "body encryption on: discarded plaintext cache (kept auth)")
+                    }
+                    NativeEngine.nativeSetBodyKey(r.keyId, r.key)
+                    java.util.Arrays.fill(r.key, 0) // wipe the data key from the JVM heap
+                }
                 android.util.Log.i(TAG, "engine thread: calling nativeStart")
                 val port = NativeEngine.nativeStart(filesPath)
                 val token = if (port > 0) NativeEngine.nativeSessionToken() else ""
