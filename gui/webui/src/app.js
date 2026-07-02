@@ -368,12 +368,19 @@ const MOBILE = typeof window !== "undefined" &&
 const BRIDGE = (typeof window !== "undefined" && window.__isyBridge) || null;
 let _bridgeSeq = 0;
 const _bridgePending = new Map(); // request id -> { resolve }
+const _bridgeStreams = new Map(); // stream id -> onEvent handler
 if (BRIDGE) {
   BRIDGE.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
     if (m.t === "res") {
       const p = _bridgePending.get(m.id);
       if (p) { _bridgePending.delete(m.id); p.resolve({ status: m.status, body: m.body }); }
+    } else if (m.t === "evt") {
+      const h = _bridgeStreams.get(m.id);
+      if (h && m.ev) h.onEvent(m.ev.event || "message", m.ev.data || "");
+    } else if (m.t === "end") {
+      const h = _bridgeStreams.get(m.id);
+      if (h) { _bridgeStreams.delete(m.id); if (h.onError) h.onError(); }
     }
   };
 }
@@ -383,6 +390,25 @@ function bridgeSend(method, path, headers, body) {
     _bridgePending.set(id, { resolve });
     BRIDGE.postMessage(JSON.stringify({ t: "req", id, method, path, headers, body: body ?? null }));
   });
+}
+/* Open an SSE-style stream over the active transport (#0A): the native bridge push
+   channel when present, else EventSource. `onEvent(name, data)` fires per event (name is
+   the SSE `event:` field — "message" when unnamed); `onError()` on stream end/drop.
+   Returns a handle with close(). The two ends of the wire (this + Router::open_bridge_stream)
+   are verified together on-device. */
+function openEventStream(path, onEvent, onError) {
+  if (BRIDGE) {
+    const id = "s" + (++_bridgeSeq);
+    _bridgeStreams.set(id, { onEvent, onError });
+    BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path }));
+    return { close() { _bridgeStreams.delete(id); try { BRIDGE.postMessage(JSON.stringify({ t: "unsub", id })); } catch (_) {} } };
+  }
+  const es = new EventSource(path);
+  es.onmessage = (e) => onEvent("message", e.data);
+  es.addEventListener("change", () => onEvent("change", ""));
+  es.addEventListener("done", () => onEvent("done", ""));
+  es.onerror = () => { if (onError) onError(); };
+  return { close() { try { es.close(); } catch (_) {} } };
 }
 /* One request over the active transport; returns parsed JSON, throws on non-2xx. */
 async function request(method, path, opts) {
@@ -4151,10 +4177,15 @@ async function agentSend(text) {
 
   const tok = sessionToken();
   const url = "/api/v1/agent/stream?" + qs({ turn }) + (tok ? "&_st=" + encodeURIComponent(tok) : "");
-  const es = new EventSource(url);
-  AGENT_ES = es;
-  es.onmessage = (ev) => {
-    let d; try { d = JSON.parse(ev.data); } catch (_) { return; }
+  // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
+  // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
+  // event or a stream drop ends the turn.
+  let stream;
+  const finish = (msg) => { clearThinking(); try { stream.close(); } catch (_) {} if (AGENT_ES === stream) AGENT_ES = null; if (!asst.text && msg) setText(msg); };
+  stream = openEventStream(url, (name, data) => {
+    if (name === "done") { finish("(no response)"); return; }
+    if (name !== "message") return; // ignore ping heartbeats
+    let d; try { d = JSON.parse(data); } catch (_) { return; }
     switch (d.event) {
       case "token": setText(asst.text + (d.text || "")); break;
       case "search_stage": onSearchStage(d); break;
@@ -4164,10 +4195,10 @@ async function agentSend(text) {
       case "tool_call": break;
       case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
       case "error": clearThinking(); setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
-      case "done": clearThinking(); es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("(no response)"); break;
+      case "done": finish("(no response)"); break;
     }
-  };
-  es.onerror = () => { clearThinking(); es.close(); if (AGENT_ES === es) AGENT_ES = null; if (!asst.text) setText("⚠ connection lost"); };
+  }, () => finish("⚠ connection lost"));
+  AGENT_ES = stream;
 }
 
 function renderAccountMenu(body) {
@@ -4278,15 +4309,21 @@ let _bdT, _evtT;
 // Subscribe to the daemon's SSE change stream: on a cloud/sync change, refetch the
 // active view (near-real-time). EventSource auto-reconnects if the daemon restarts.
 function subscribeEvents() {
-  if (!window.EventSource) return;
-  const es = new EventSource("/api/v1/events");
-  es.addEventListener("change", () => {
+  if (!BRIDGE && !window.EventSource) return;
+  // Transport-abstracted (#0A): the native bridge push channel on the phone (which carries
+  // the session token itself), EventSource on desktop. `_st` covers the EventSource path.
+  const tok = sessionToken();
+  const path = "/api/v1/events" + (tok ? "?_st=" + encodeURIComponent(tok) : "");
+  openEventStream(path, (name) => {
+    if (name !== "change") return; // ignore ping heartbeats
     clearTimeout(_evtT);
     // preserve the open message across a live refresh so an SSE tick (new mail /
     // a reconciled write) doesn't kick the user out of what they're reading.
     if (App.route === "mail" && Mail.selected) Mail.pendingSelect = Mail.selected.remote_id;
     _evtT = setTimeout(onRoute, 150);
-  });
+  // EventSource auto-reconnects natively; the bridge push channel doesn't, so re-subscribe
+  // after a short backoff when a bridge stream drops.
+  }, BRIDGE ? () => setTimeout(subscribeEvents, 3000) : undefined);
 }
 // Mobile touch navigation (#77): a horizontal swipe on the content navigates —
 // a right-swipe with an open detail goes back to the list; otherwise swipe
