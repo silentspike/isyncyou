@@ -63,8 +63,12 @@ fn start_inner(files_dir: &str) -> Result<(u16, String), String> {
     let base = PathBuf::from(files_dir);
     let archive_root = base.join("archive");
     let sync_root = base.join("sync");
+    // OneDrive online/sync-mode lazy previews live here, apart from the offline working
+    // copy in sync_root (#onedrive-mobile 0C); the writeback scanner ignores it.
+    let cache_root = base.join("cache");
     std::fs::create_dir_all(&archive_root).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&sync_root).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&cache_root).map_err(|e| e.to_string())?;
     let config_path = base.join("isyncyou.toml");
 
     let cfg = Config {
@@ -73,6 +77,7 @@ fn start_inner(files_dir: &str) -> Result<(u16, String), String> {
             username: ACCOUNT.into(),
             sync_root,
             archive_root,
+            cache_root,
             mount_point: None,
         }],
         ..Default::default()
@@ -135,7 +140,13 @@ fn refresh_loop(
                     Ok(read) => {
                         let write =
                             isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT).ok();
-                        isyncyou_engine::refresh_cache_account(&cfg, ACCOUNT, read, write).is_ok()
+                        // Notify the UI ONLY when the pass actually changed something —
+                        // a no-op refresh (the common idle case every poll_interval_secs)
+                        // must not wake SSE, or the whole view reloads periodically (the
+                        // visible "screen flicker"). `.changed()` is false for a no-op.
+                        isyncyou_engine::refresh_cache_account(&cfg, ACCOUNT, read, write)
+                            .map(|counts| counts.changed())
+                            .unwrap_or(false)
                     }
                     Err(_) => false, // not signed in yet — skip quietly
                 }

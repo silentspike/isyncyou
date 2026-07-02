@@ -59,10 +59,21 @@ pub struct GraphClient {
 /// The `Prefer` header value for the Outlook immutable-ID policy (plan §6).
 const PREFER_IMMUTABLE_ID: &str = r#"IdType="ImmutableId", outlook.timezone="UTC""#;
 
+/// The default HTTP client for Graph calls (#0.4): a request timeout so a hung
+/// connection can never wedge a sync/read pass, plus a connect timeout. Falls back to
+/// a plain client if the builder ever fails (it doesn't in practice).
+fn default_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 impl GraphClient {
     pub fn new(access_token: impl Into<String>) -> Self {
         GraphClient {
-            client: reqwest::blocking::Client::new(),
+            client: default_client(),
             token: access_token.into(),
             base: GRAPH.into(),
             prefer_immutable_id: false,
@@ -105,6 +116,26 @@ fn parse_retry_after(resp: &reqwest::blocking::Response) -> Option<Duration> {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
 }
+
+/// Central retry policy (#0.4): 429 (throttled) and 5xx (transient server) are safe to
+/// retry for an *idempotent* request; everything else is returned as-is. Non-idempotent
+/// writes (POST/PATCH/PUT/DELETE) never go through the retry path — their recovery is
+/// ledger-driven (#0D), never a blind re-send that could double-apply.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+/// Exponential backoff for retry attempt `n` (1-based), capped, used when the server
+/// gave no `Retry-After`.
+fn backoff_delay(attempt: u32) -> Duration {
+    let ms = 200u64.saturating_mul(1u64 << attempt.min(5));
+    Duration::from_millis(ms).min(MAX_RETRY_WAIT)
+}
+
+/// Bounded attempts for an idempotent GET and the cap on any single backoff/Retry-After
+/// wait (so a hostile `Retry-After` can't wedge the pass).
+const MAX_GET_ATTEMPTS: u32 = 4;
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(20);
 
 impl Transport for GraphClient {
     fn get(&mut self, url: &str) -> Response {
@@ -613,14 +644,44 @@ impl GraphClient {
     /// the API base (like [`get_json`](Self::get_json)/[`post_json`](Self::post_json))
     /// — without this, a relative path (e.g. the OneNote page-content URL built by
     /// the archive driver) has no host and reqwest fails with a builder error.
+    /// Send an **idempotent** GET through the central retry policy (#0.4): honor
+    /// `Retry-After`, else exponential backoff (both capped), bounded attempts; log the
+    /// Graph `request-id` for correlation (#0E). Rebuilds the request each attempt (a
+    /// `RequestBuilder` is single-use). `url` must already be absolute.
+    fn get_with_retry(&self, url: &str) -> Result<reqwest::blocking::Response, UploadError> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let mut req = self.client.get(url).bearer_auth(&self.token);
+            if self.prefer_immutable_id {
+                req = req.header("Prefer", PREFER_IMMUTABLE_ID);
+            }
+            let resp = req
+                .send()
+                .map_err(|e| UploadError::Transport(e.to_string()))?;
+            let status = resp.status().as_u16();
+            if let Some(rid) = resp
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok())
+            {
+                // request-ids are correlation tokens, not secrets — safe to log (#0E).
+                eprintln!("isyncyou-graph: GET status={status} request-id={rid} attempt={attempt}");
+            }
+            if is_retryable_status(status) && attempt < MAX_GET_ATTEMPTS {
+                let wait = parse_retry_after(&resp)
+                    .unwrap_or_else(|| backoff_delay(attempt))
+                    .min(MAX_RETRY_WAIT);
+                std::thread::sleep(wait);
+                continue;
+            }
+            return Ok(resp);
+        }
+    }
+
     pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, UploadError> {
         let url = self.abs(url);
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        let resp = self.get_with_retry(&url)?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(UploadError::Http {
@@ -637,18 +698,30 @@ impl GraphClient {
     /// poll loop). `url` may be absolute or a `/me/...` path. Used to fetch a
     /// single item's canonical JSON for the content archive.
     pub fn get_json(&self, url: &str) -> Result<serde_json::Value, UploadError> {
+        // The immutable-ID `Prefer` header (#565) is applied inside `get_with_retry`,
+        // which also carries the central retry/Retry-After/backoff policy (#0.4).
         let url = self.abs(url);
-        let mut req = self.client.get(&url).bearer_auth(&self.token);
-        // Honor the immutable-ID policy on JSON GETs too (#565): otherwise a
-        // calendar listed via the delta Transport (immutable ids) and the same
-        // calendar fetched here (default ids) would get two different store rows.
-        if self.prefer_immutable_id {
-            req = req.header("Prefer", PREFER_IMMUTABLE_ID);
-        }
-        let resp = req
-            .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        let resp = self.get_with_retry(&url)?;
         json_or_err(resp)
+    }
+
+    /// GET a Graph listing, following `@odata.nextLink` to completion and returning the
+    /// concatenated `value` arrays (#0.4 paging — `get_json` returns only one page).
+    /// Each page goes through the central retry policy. `nextLink` is absolute per Graph.
+    pub fn get_json_paged(&self, url: &str) -> Result<Vec<serde_json::Value>, UploadError> {
+        let mut items = Vec::new();
+        let mut next = Some(self.abs(url));
+        while let Some(u) = next {
+            let page = json_or_err(self.get_with_retry(&u)?)?;
+            if let Some(arr) = page.get("value").and_then(|v| v.as_array()) {
+                items.extend(arr.iter().cloned());
+            }
+            next = page
+                .get("@odata.nextLink")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        Ok(items)
     }
 
     /// Download a drive item's content by id (follows the redirect to the
@@ -1648,6 +1721,88 @@ mod tests {
     }
 
     #[test]
+    fn get_json_retries_on_429_then_succeeds() {
+        // Central retry policy (#0.4): an idempotent GET honors Retry-After and retries.
+        let (base, server) = serve(vec![
+            http_response(429, "Too Many Requests", "Retry-After: 0\r\n", "{}"),
+            http_response(200, "OK", "", r#"{"ok":true}"#),
+        ]);
+        let c = GraphClient::new("tok");
+        let v = c.get_json(&base).unwrap();
+        assert_eq!(v["ok"], true);
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 2, "must have retried the 429 exactly once");
+    }
+
+    #[test]
+    fn writes_do_not_blind_retry_on_429() {
+        // Non-idempotent writes must be single-shot — a blind re-POST could double-apply;
+        // their recovery is ledger-driven (#0D), not a retry here.
+        let (base, server) =
+            serve(vec![http_response(429, "Too Many Requests", "Retry-After: 0\r\n", "{}")]);
+        let c = GraphClient::new("tok");
+        let r = c.post_json(&base, &serde_json::json!({"x": 1}));
+        assert!(
+            matches!(r, Err(UploadError::Http { status: 429, .. })),
+            "a throttled write must surface 429, not retry"
+        );
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 1, "a write must not be re-sent");
+    }
+
+    #[test]
+    fn get_json_paged_follows_odata_nextlink() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let page1 = http_response(
+            200,
+            "OK",
+            "",
+            &format!(r#"{{"value":[1,2],"@odata.nextLink":"{base}/p2"}}"#),
+        );
+        let page2 = http_response(200, "OK", "", r#"{"value":[3]}"#);
+        let handle = std::thread::spawn(move || {
+            for resp in [page1, page2] {
+                let (mut sock, _) = listener.accept().unwrap();
+                read_request(&mut sock);
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let c = GraphClient::new("tok");
+        let items = c.get_json_paged(&format!("{base}/p1")).unwrap();
+        assert_eq!(items.len(), 3, "both pages' value arrays must be concatenated");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn client_times_out_on_a_hung_connection() {
+        // #0.4: a request timeout means a server that accepts but never answers can't
+        // wedge the caller. Uses a short-timeout client to prove the mechanism quickly;
+        // `GraphClient::new` sets the production timeout via the same builder.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _hang = std::thread::spawn(move || {
+            let _s = listener.accept();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let short = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let c = GraphClient::with_client(short, "tok");
+        let start = std::time::Instant::now();
+        let r = c.get_bytes(&format!("http://{addr}/x"));
+        assert!(r.is_err(), "a hung connection must time out, not block forever");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "the timeout must fire promptly (was {:?})",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn get_json_classifies_4xx_with_truncated_body() {
         let long_body = "e".repeat(900);
         let (base, _server) = serve(vec![http_response(403, "Forbidden", "", &long_body)]);
@@ -1675,10 +1830,14 @@ mod tests {
             GraphClient::new("tok").get_bytes(&base).unwrap(),
             b"raw-bytes-here"
         );
-        let (base2, _s2) = serve(vec![http_response(503, "Unavailable", "", "busy")]);
+        // A 5xx on an idempotent GET is now retried (#0.4); when it persists across the
+        // bounded attempts it surfaces as an Http error. Serve one 503 per attempt
+        // (Retry-After: 0 keeps the test fast).
+        let five_oh_three = || http_response(503, "Unavailable", "Retry-After: 0\r\n", "busy");
+        let (base2, _s2) = serve((0..MAX_GET_ATTEMPTS).map(|_| five_oh_three()).collect());
         match GraphClient::new("tok").get_bytes(&base2).unwrap_err() {
             UploadError::Http { status, .. } => assert_eq!(status, 503),
-            other => panic!("expected Http error, got {other}"),
+            other => panic!("expected Http error after retries, got {other}"),
         }
     }
 

@@ -39,21 +39,50 @@ impl Default for DeleteGuardConfig {
     }
 }
 
+/// True for an unset (empty) path — keeps a defaulted `cache_root` out of serialized TOML.
+fn path_is_empty(p: &PathBuf) -> bool {
+    p.as_os_str().is_empty()
+}
+
 /// One configured Microsoft account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub id: String,
     pub username: String,
-    /// Bidirectionally-synced OneDrive folder.
+    /// Bidirectionally-synced OneDrive folder — the **offline** working copy
+    /// (Mode 3). Only this root is scanned for local→cloud writeback.
     pub sync_root: PathBuf,
     /// Archive/backup directory for the other services.
     pub archive_root: PathBuf,
+    /// Lazy-preview cache root for OneDrive **online/sync** modes (1/2): on-demand
+    /// downloads land here, kept apart from the editable offline copy in `sync_root`
+    /// so preview cache and working copy never mix (the writeback scanner ignores it).
+    /// Empty in older configs → [`AccountConfig::effective_cache_root`] derives a
+    /// sibling `cache` dir. (#onedrive-mobile 0C.)
+    #[serde(default, skip_serializing_if = "path_is_empty")]
+    pub cache_root: PathBuf,
     /// Optional FUSE placeholder mount point (Files-on-Demand). When set, the
     /// daemon mounts a read-only view of the whole OneDrive tree here; files
     /// materialize on first read. Independent of `sync_root` (which stays the
     /// bidirectional full sync). Unset = no placeholder mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_point: Option<PathBuf>,
+}
+
+impl AccountConfig {
+    /// The effective OneDrive lazy-preview cache root: the configured `cache_root`,
+    /// or — for older configs that predate it — a `cache` sibling of `archive_root`.
+    /// Always distinct from `sync_root`/`archive_root` (asserted by config validation).
+    pub fn effective_cache_root(&self) -> PathBuf {
+        if self.cache_root.as_os_str().is_empty() {
+            self.archive_root
+                .parent()
+                .map(|p| p.join("cache"))
+                .unwrap_or_else(|| self.archive_root.join("_cache"))
+        } else {
+            self.cache_root.clone()
+        }
+    }
 }
 
 /// Engine-wide sync settings.
@@ -190,6 +219,17 @@ impl Config {
             if !a.sync_root.as_os_str().is_empty() && a.sync_root == a.archive_root {
                 errs.push(format!("{who}: sync_root and archive_root must differ"));
             }
+            // The three OneDrive roots must be distinct (#onedrive-mobile 0C): the offline
+            // working copy (sync_root), the other-services archive (archive_root), and the
+            // lazy-preview cache (cache_root) must never overlap, or writeback/cleanup and
+            // conflict handling become ambiguous. Checked against the *effective* cache_root.
+            let cache = a.effective_cache_root();
+            if !a.sync_root.as_os_str().is_empty() && cache == a.sync_root {
+                errs.push(format!("{who}: cache_root and sync_root must differ"));
+            }
+            if !a.archive_root.as_os_str().is_empty() && cache == a.archive_root {
+                errs.push(format!("{who}: cache_root and archive_root must differ"));
+            }
         }
 
         let g = &self.sync.delete_guard;
@@ -221,8 +261,36 @@ mod tests {
             username: format!("{id}@outlook.com"),
             sync_root: PathBuf::from(format!("/home/u/{id}/OneDrive")),
             archive_root: PathBuf::from(format!("/home/u/{id}/Archive")),
+            cache_root: PathBuf::from(format!("/home/u/{id}/Cache")),
             mount_point: None,
         }
+    }
+
+    #[test]
+    fn cache_root_defaults_distinct_and_validation_rejects_overlap() {
+        // Absent in older TOML -> empty field, effective_cache_root derives a distinct
+        // `cache` sibling of archive_root; validation passes.
+        let toml = "[[accounts]]\nid=\"a\"\nusername=\"a@x.com\"\n\
+                    sync_root=\"/home/u/a/OneDrive\"\narchive_root=\"/home/u/a/Archive\"\n";
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.accounts[0].cache_root.as_os_str().is_empty());
+        assert_eq!(
+            c.accounts[0].effective_cache_root(),
+            PathBuf::from("/home/u/a/cache")
+        );
+        c.validate().unwrap();
+        // An explicit cache_root that collides with sync_root must be rejected.
+        let mut bad = account("b");
+        bad.cache_root = bad.sync_root.clone();
+        let cfg = Config {
+            accounts: vec![bad],
+            ..Default::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("cache_root and sync_root must differ")),
+            "expected cache/sync overlap error, got {errs:?}"
+        );
     }
 
     #[test]

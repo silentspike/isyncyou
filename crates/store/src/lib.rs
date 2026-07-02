@@ -11,7 +11,7 @@
 //! against corruption from concurrent daemons.
 
 use fs2::FileExt;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 // PathBuf is only used by the encrypted-store migrate/credential paths.
@@ -37,7 +37,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 14;
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -259,6 +259,58 @@ const MIGRATION_V11: &str = r#"
 ALTER TABLE items ADD COLUMN sender TEXT;
 "#;
 
+/// v12: the item's list-row `preview` (the exact JSON the web UI's list consumes),
+/// computed once at ingest from the archived body + sidecar and cached here. Without
+/// it `/api/v1/items` re-reads and re-parses every `.eml` (and base64-decodes every
+/// attachment just for its size) on every mailbox load — hundreds of file reads +
+/// MIME passes per view. Read straight with the item = no per-request body/sidecar
+/// I/O. `NULL` = not yet computed (falls back to on-the-fly parse, which then
+/// back-fills this column). Refreshed whenever the body is re-archived.
+const MIGRATION_V12: &str = r#"
+ALTER TABLE items ADD COLUMN preview_json TEXT;
+"#;
+
+/// v13: the `items_fts` index only covers `name`, but the original `items_au` trigger
+/// fired on **every** `UPDATE items` — including the metadata-only writes a sync does
+/// in bulk (`set_local_path`, `set_preview_json`, `set_sender`, body/verify columns),
+/// none of which touch `name`. Each firing deleted + re-inserted the FTS row, amplifying
+/// WAL/FTS writes during the sync burst for no benefit. Rebuild the trigger to fire only
+/// when `name` is in the UPDATE and actually changed — functionally identical for name
+/// search, far less write churn while a sync runs.
+const MIGRATION_V13: &str = r#"
+DROP TRIGGER IF EXISTS items_au;
+CREATE TRIGGER items_au AFTER UPDATE OF name ON items
+WHEN old.name IS NOT new.name
+BEGIN
+    INSERT INTO items_fts(items_fts, rowid, name) VALUES ('delete', old.id, old.name);
+    INSERT INTO items_fts(rowid, name) VALUES (new.id, new.name);
+END;
+"#;
+
+/// v14: OneDrive per-item content state (mobile modes online/sync/offline, #onedrive-mobile).
+/// `local_path.is_some()` conflates "sync path known" with "body present", which breaks a
+/// metadata-only (Mode 2) row that has no downloaded body. These columns model the body
+/// explicitly so `has_body` derives from `body_state=='available'` (a valid, decryptable
+/// body) rather than a filesystem probe. Generic on `items` but only populated for OneDrive;
+/// every other service leaves them NULL and keeps its `local_path`-based `has_body`.
+/// `body_etag` already exists (v10) and is reused. Backfill: an existing OneDrive body
+/// (a present `local_path`) is a materialized/available body; folders are not-applicable.
+const MIGRATION_V14: &str = r#"
+ALTER TABLE items ADD COLUMN content_state TEXT;
+ALTER TABLE items ADD COLUMN body_location TEXT;
+ALTER TABLE items ADD COLUMN body_state TEXT;
+ALTER TABLE items ADD COLUMN plaintext_size INTEGER;
+ALTER TABLE items ADD COLUMN plaintext_hash TEXT;
+ALTER TABLE items ADD COLUMN encrypted_blob_version INTEGER;
+ALTER TABLE items ADD COLUMN materialized_at TEXT;
+ALTER TABLE items ADD COLUMN last_download_error TEXT;
+ALTER TABLE items ADD COLUMN conflict_state TEXT;
+UPDATE items SET content_state='materialized', body_location='sync', body_state='available'
+  WHERE service='onedrive' AND item_type != 'folder' AND local_path IS NOT NULL;
+UPDATE items SET content_state='not_applicable'
+  WHERE service='onedrive' AND item_type = 'folder';
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -311,6 +363,33 @@ pub struct Item {
     /// Display sender of a mail item (`"Name <addr>"`), captured at ingest so the
     /// list shows the sender without the `.eml` body. `None` for non-mail / unknown.
     pub sender: Option<String>,
+    /// The item's cached list-row `preview` as a JSON string (the exact object the
+    /// web UI list consumes), computed once from the body + sidecar so `/api/v1/items`
+    /// never re-parses `.eml`/`.json` per row. `None` = not yet computed (on-the-fly
+    /// fallback + back-fill). Refreshed when the body is re-archived. (Schema v12.)
+    pub preview_json: Option<String>,
+    // ---- OneDrive per-item content state (schema v14) -----------------------
+    // Only populated for OneDrive (the mobile online/sync/offline modes); NULL for
+    // every other service, whose `has_body` stays `local_path`-based.
+    /// `online` | `cached` | `materialized` | `not_applicable` (folders).
+    pub content_state: Option<String>,
+    /// Where the body lives: `none` | `cache` (Mode 1/2 lazy) | `sync` (Mode 3 offline).
+    pub body_location: Option<String>,
+    /// `downloading` | `available` | `failed` | `missing` | `conflict`. `has_body` is
+    /// `body_state == "available"` (a valid, decryptable body), not a filesystem probe.
+    pub body_state: Option<String>,
+    /// Plaintext byte length of the body (the on-disk blob is a ciphertext container).
+    pub plaintext_size: Option<i64>,
+    /// Hash of the *plaintext* body (integrity across the encrypted envelope).
+    pub plaintext_hash: Option<String>,
+    /// Version of the encrypted-body envelope format (for key rotation / re-wrap).
+    pub encrypted_blob_version: Option<i64>,
+    /// RFC3339 time the body was materialized locally.
+    pub materialized_at: Option<String>,
+    /// Last download error message, if `body_state == "failed"`.
+    pub last_download_error: Option<String>,
+    /// Non-null when a local↔cloud conflict is pending (keep-both semantics).
+    pub conflict_state: Option<String>,
 }
 
 impl Item {
@@ -346,6 +425,16 @@ impl Item {
             verified_at: None,
             verify_status: None,
             sender: None,
+            preview_json: None,
+            content_state: None,
+            body_location: None,
+            body_state: None,
+            plaintext_size: None,
+            plaintext_hash: None,
+            encrypted_blob_version: None,
+            materialized_at: None,
+            last_download_error: None,
+            conflict_state: None,
         }
     }
 }
@@ -404,6 +493,35 @@ impl Store {
         Ok(Store {
             conn,
             _lock: Some(lock),
+        })
+    }
+
+    /// Open the store for **concurrent reads**: no exclusive `<db>.lock` and no schema
+    /// migration, so a GET endpoint never has to wait out the writer's instance lock —
+    /// the fix for a mailbox load stalling behind an in-flight sync.
+    ///
+    /// Deliberately opened **read-write** (not `READ_ONLY`): a WAL reader must be able to
+    /// update the `-shm` index to see a live snapshot while a writer is active. A pure
+    /// `READ_ONLY` handle can't touch `-shm` and, during heavy concurrent writes, falls
+    /// back to a slow/blocking path — which is exactly the multi-second stall we're
+    /// removing. WAL already allows many connections in one process; the `.lock` only
+    /// guarded against a *second process*, and this handle only ever runs SELECTs, so
+    /// skipping it keeps the single-writer invariant intact. The DB must already exist
+    /// and be migrated by a writer. **Never call a mutating method on the returned store.**
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        // No CREATE flag: a missing DB errors here so the caller falls back to a
+        // writable open that creates + migrates it. NO_MUTEX: single-threaded per handle.
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(path, flags)?;
+        #[cfg(feature = "encrypted-store")]
+        if let Some(secret) = configured_store_key()? {
+            apply_sqlcipher_key(&conn, &secret)?;
+        }
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Store {
+            conn,
+            _lock: None,
         })
     }
 
@@ -655,6 +773,57 @@ impl Store {
         Ok(())
     }
 
+    /// Cache one item's computed list-row `preview` JSON (schema v12) without
+    /// rewriting the row or disturbing FTS/sync-state. Set by the read path once the
+    /// body/sidecar have been parsed, so later mailbox loads read it straight from the
+    /// DB instead of re-parsing the `.eml`. No-op if the item doesn't exist.
+    /// Invalidated by [`set_local_path`](Self::set_local_path) when the body changes.
+    pub fn set_preview_json(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        preview_json: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET preview_json=?4 WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, preview_json],
+        )?;
+        Ok(())
+    }
+
+    /// Update a OneDrive item's content-state fields (schema v14): the body lifecycle
+    /// (`content_state`, `body_location`, `body_state`, `materialized_at`). Written by the
+    /// download/materialize paths so `has_body` derives from `body_state=='available'`
+    /// rather than a filesystem probe. No-op if the item doesn't exist. Any argument left
+    /// `None` clears that column.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_content_state(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        content_state: Option<&str>,
+        body_location: Option<&str>,
+        body_state: Option<&str>,
+        materialized_at: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET content_state=?4, body_location=?5, body_state=?6, materialized_at=?7 \
+             WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![
+                account,
+                service,
+                remote_id,
+                content_state,
+                body_location,
+                body_state,
+                materialized_at
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn get_item(&self, account: &str, service: &str, remote_id: &str) -> Result<Option<Item>> {
         let it = self
             .conn
@@ -850,9 +1019,17 @@ impl Store {
         // is set, `body_etag` snapshots the item's current `etag`; when cleared, it
         // resets to NULL. The delta ingest never touches `body_etag`, so a later
         // `etag` change (cloud edit) makes `etag != body_etag` → a stale backup.
+        //
+        // Invalidate the cached `preview_json` ONLY when the body actually changed —
+        // i.e. the current `etag` differs from the `body_etag` recorded at the last
+        // archive (`IS NOT` so a first archive, body_etag=NULL, also refreshes). A sync
+        // that re-archives an *unchanged* body (etag == body_etag) keeps the cache, so a
+        // mailbox load during a sync stays on the fast path instead of re-parsing every
+        // `.eml`. `CASE` reads the OLD row values, evaluated before the SET applies.
         let n = self.conn.execute(
             "UPDATE items
-             SET local_path=?4,
+             SET preview_json=CASE WHEN etag IS NOT body_etag THEN NULL ELSE preview_json END,
+                 local_path=?4,
                  body_etag=CASE WHEN ?4 IS NOT NULL THEN etag ELSE NULL END
              WHERE account_id=?1 AND service=?2 AND remote_id=?3",
             params![account, service, remote_id, local_path],
@@ -1416,7 +1593,9 @@ fn is_plaintext_sqlite(path: &Path) -> Result<bool> {
 const COLS: &str = "account_id, service, remote_id, parent_remote_id, name, local_path, \
                     item_type, etag, ctag, quickxorhash, size, remote_mtime, sync_state, deleted_at, \
                     change_key, internet_message_id, ical_uid, series_master_id, \
-                    body_sha256, verified_at, verify_status, body_etag, sender";
+                    body_sha256, verified_at, verify_status, body_etag, sender, preview_json, \
+                    content_state, body_location, body_state, plaintext_size, plaintext_hash, \
+                    encrypted_blob_version, materialized_at, last_download_error, conflict_state";
 
 fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     Ok(Item {
@@ -1443,6 +1622,16 @@ fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         verify_status: r.get(20)?,
         body_etag: r.get(21)?,
         sender: r.get(22)?,
+        preview_json: r.get(23)?,
+        content_state: r.get(24)?,
+        body_location: r.get(25)?,
+        body_state: r.get(26)?,
+        plaintext_size: r.get(27)?,
+        plaintext_hash: r.get(28)?,
+        encrypted_blob_version: r.get(29)?,
+        materialized_at: r.get(30)?,
+        last_download_error: r.get(31)?,
+        conflict_state: r.get(32)?,
     })
 }
 
@@ -1596,6 +1785,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 11 {
         conn.execute_batch(MIGRATION_V11)?;
     }
+    if v < 12 {
+        conn.execute_batch(MIGRATION_V12)?;
+    }
+    if v < 13 {
+        conn.execute_batch(MIGRATION_V13)?;
+    }
+    if v < 14 {
+        conn.execute_batch(MIGRATION_V14)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1648,6 +1846,142 @@ mod tests {
                 .unwrap()
                 .body_etag,
             None
+        );
+    }
+
+    #[test]
+    fn preview_json_roundtrip_and_body_change_invalidation() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = Item::new("acc", "mail", "m1", "Subject", "message");
+        m.etag = Some("E1".into());
+        s.upsert_item(&m).unwrap();
+        // freshly ingested: no cached preview
+        assert_eq!(
+            s.get_item("acc", "mail", "m1").unwrap().unwrap().preview_json,
+            None
+        );
+        // the read path caches the computed preview
+        s.set_preview_json("acc", "mail", "m1", r#"{"from":"a@b.c"}"#)
+            .unwrap();
+        assert_eq!(
+            s.get_item("acc", "mail", "m1")
+                .unwrap()
+                .unwrap()
+                .preview_json
+                .as_deref(),
+            Some(r#"{"from":"a@b.c"}"#)
+        );
+        // a metadata-only re-sync (upsert) must PRESERVE the cached preview
+        let mut m2 = Item::new("acc", "mail", "m1", "Subject edited", "message");
+        m2.etag = Some("E1".into());
+        s.upsert_item(&m2).unwrap();
+        assert_eq!(
+            s.get_item("acc", "mail", "m1")
+                .unwrap()
+                .unwrap()
+                .preview_json
+                .as_deref(),
+            Some(r#"{"from":"a@b.c"}"#),
+            "a metadata upsert must not clobber the cached preview"
+        );
+        // first archive (body_etag was NULL) refreshes the cache → recompute next read
+        s.set_local_path("acc", "mail", "m1", Some("mail/aa/m1.eml"))
+            .unwrap();
+        assert_eq!(
+            s.get_item("acc", "mail", "m1").unwrap().unwrap().preview_json,
+            None,
+            "the first body archive drops any stale cached preview"
+        );
+        // re-cache, then a sync re-archives the SAME body (etag unchanged, still E1 ==
+        // body_etag): the cache MUST be kept so a mailbox load during a sync stays on the
+        // fast path instead of re-parsing the .eml. This is the cold-start-hang fix.
+        s.set_preview_json("acc", "mail", "m1", r#"{"from":"x"}"#)
+            .unwrap();
+        s.set_local_path("acc", "mail", "m1", Some("mail/aa/m1.eml"))
+            .unwrap();
+        assert_eq!(
+            s.get_item("acc", "mail", "m1")
+                .unwrap()
+                .unwrap()
+                .preview_json
+                .as_deref(),
+            Some(r#"{"from":"x"}"#),
+            "re-archiving an unchanged body must keep the cached preview"
+        );
+        // a cloud edit (new etag E2) then re-archive: the body changed → cache dropped
+        let mut m3 = Item::new("acc", "mail", "m1", "Subject", "message");
+        m3.etag = Some("E2".into());
+        s.upsert_item(&m3).unwrap();
+        s.set_local_path("acc", "mail", "m1", Some("mail/aa/m1.eml"))
+            .unwrap();
+        assert_eq!(
+            s.get_item("acc", "mail", "m1").unwrap().unwrap().preview_json,
+            None,
+            "a changed body (new etag) must invalidate the cached preview"
+        );
+    }
+
+    #[test]
+    fn onedrive_content_state_roundtrips_and_backfills_available() {
+        // Schema v14: OneDrive per-item body state. Fresh rows start with no state
+        // (Mode 1 online, nothing cached); the download/materialize path transitions
+        // them to available; a metadata re-upsert must not clobber that state.
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 14, "this test pins the v14 layout");
+        let it = Item::new("a", "onedrive", "f1", "file.txt", "file");
+        s.upsert_item(&it).unwrap();
+        let g = s.get_item("a", "onedrive", "f1").unwrap().unwrap();
+        assert_eq!(g.body_state, None);
+        assert_eq!(g.content_state, None);
+        // transition to a materialized/offline body
+        s.set_content_state(
+            "a",
+            "onedrive",
+            "f1",
+            Some("materialized"),
+            Some("sync"),
+            Some("available"),
+            Some("2026-07-02T00:00:00Z"),
+        )
+        .unwrap();
+        let g = s.get_item("a", "onedrive", "f1").unwrap().unwrap();
+        assert_eq!(g.content_state.as_deref(), Some("materialized"));
+        assert_eq!(g.body_location.as_deref(), Some("sync"));
+        assert_eq!(g.body_state.as_deref(), Some("available"));
+        assert_eq!(g.materialized_at.as_deref(), Some("2026-07-02T00:00:00Z"));
+        // a metadata-only re-upsert (rename) must PRESERVE the content state
+        s.upsert_item(&Item::new("a", "onedrive", "f1", "renamed.txt", "file"))
+            .unwrap();
+        assert_eq!(
+            s.get_item("a", "onedrive", "f1")
+                .unwrap()
+                .unwrap()
+                .body_state
+                .as_deref(),
+            Some("available"),
+            "a metadata upsert must not clobber OneDrive content state"
+        );
+
+        // Backfill (MIGRATION_V14): an existing OneDrive body present on disk pre-v14
+        // (a set `local_path`) is materialized/available. Simulate the pre-migration
+        // shape by clearing the state, then re-running the same backfill statements.
+        s.conn
+            .execute_batch(
+                "UPDATE items SET content_state=NULL, body_location=NULL, body_state=NULL WHERE remote_id='f1';
+                 UPDATE items SET local_path='onedrive/aa/f1' WHERE remote_id='f1';
+                 UPDATE items SET content_state='materialized', body_location='sync', body_state='available'
+                   WHERE service='onedrive' AND item_type != 'folder' AND local_path IS NOT NULL;",
+            )
+            .unwrap();
+        assert_eq!(
+            s.get_item("a", "onedrive", "f1")
+                .unwrap()
+                .unwrap()
+                .body_state
+                .as_deref(),
+            Some("available"),
+            "backfill must mark an existing OneDrive body as available"
         );
     }
 
@@ -1865,6 +2199,14 @@ mod tests {
         // diacritics-insensitive tokenizer
         s.upsert_item(&item("a", "r4", "Lebenslauf.pdf")).unwrap();
         assert_eq!(s.search_names("a", "lebenslauf").unwrap().len(), 1);
+        // v13: the name-only FTS trigger must still track a rename …
+        s.upsert_item(&item("a", "r1", "holiday summary.txt")).unwrap();
+        assert!(s.search_names("a", "report").unwrap().is_empty(), "old name must drop out");
+        assert_eq!(s.search_names("a", "holiday").unwrap()[0].remote_id, "r1");
+        // … while a metadata-only update (no name change) leaves the index intact.
+        s.set_local_path("a", "onedrive", "r1", Some("od/aa/r1.bin")).unwrap();
+        s.set_preview_json("a", "onedrive", "r1", r#"{"x":1}"#).unwrap();
+        assert_eq!(s.search_names("a", "holiday").unwrap()[0].remote_id, "r1");
     }
 
     #[test]
@@ -1957,6 +2299,30 @@ mod tests {
             Err(e) => panic!("expected AlreadyRunning, got {e:?}"),
             Ok(_) => panic!("expected AlreadyRunning, got a second store"),
         }
+    }
+
+    #[test]
+    fn open_readonly_reads_while_a_writer_holds_the_lock() {
+        // The GET fast path: a read-only WAL reader must open and read even while a
+        // writer (a sync pass) still holds the exclusive instance lock — this is what
+        // stops a mailbox load from stalling behind an in-flight sync. A second
+        // *writable* open would (correctly) fail with AlreadyRunning; the read-only one
+        // must succeed and see committed rows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let writer = Store::open(&path).unwrap(); // holds the .lock for its lifetime
+        writer.upsert_item(&item("a", "r1", "keep.txt")).unwrap();
+        // a competing writable open is blocked …
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        // … but a read-only open goes straight through and sees the committed row.
+        let reader = Store::open_readonly(&path).unwrap();
+        assert_eq!(
+            reader.get_item("a", "onedrive", "r1").unwrap().unwrap().name,
+            "keep.txt"
+        );
     }
 
     #[test]

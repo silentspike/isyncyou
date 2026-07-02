@@ -1019,10 +1019,39 @@ impl Router {
         }
         // Hold the store-access gate (if any) for the whole request so a concurrent
         // sync pass and this request never both hold the store's single-instance lock.
-        let _gate = self
-            .gate
-            .as_ref()
-            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        //
+        // EXCEPTION — every GET that either (a) reads the store read-only (a WAL reader
+        // takes no instance lock, safe concurrent with the writer) or (b) touches no store
+        // at all skips the gate. Otherwise a long sync pass that holds the gate stalls
+        // these requests, and — because responses are `Connection: close`, so each is its
+        // own TCP connection — the blocked ones exhaust the WebView's small per-origin
+        // connection pool, queueing even the exempt reads *browser-side* (the measured
+        // cold-start hang). `sync_state`/`accounts`/`settings`/`debug_stats` read config or
+        // `/proc` only; the static shell touches nothing. Writable-store GETs (item,
+        // search, drive, …) and all POSTs still take the gate. Preview back-fill on the
+        // read path uses its own short writable open, best-effort.
+        const GATE_EXEMPT_GET: &[&str] = &[
+            "/api/v1/items",
+            "/api/v1/activity",
+            "/api/v1/status",
+            "/api/v1/sync/state",
+            "/api/v1/accounts",
+            "/api/v1/settings",
+            "/api/v1/debug/stats",
+        ];
+        let static_get = req.method == "GET"
+            && (matches!(req.path.as_str(), "/" | "/app.js" | "/app.css" | "/callback")
+                || req.path.ends_with(".woff2")
+                || req.path.starts_with("/sfx/"));
+        let gate_exempt =
+            static_get || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()));
+        let _gate = if gate_exempt {
+            None
+        } else {
+            self.gate
+                .as_ref()
+                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
+        };
         if req.method == "POST" {
             return match req.path.as_str() {
                 "/api/v1/restore" => self.restore(req),
@@ -2427,22 +2456,23 @@ impl Router {
 
     /// `GET /api/v1/debug/stats` — the app's whole-process load. The embedded engine and the
     /// WebView share ONE OS process, so `/proc/self` is the total load the app causes (CPU +
-    /// RAM + disk IO), which powers the perf overlay. Linux/Android; each field defaults to 0
-    /// when unreadable. Self-stats only — not sensitive.
+    /// GPU/render threads + RAM + disk IO + disk wait), which powers the perf overlay.
+    /// Linux/Android; each field defaults to 0 when unreadable. Self-stats only (plus the
+    /// world-readable system IO-queue depth) — not sensitive.
     fn debug_stats(&self) -> ApiResponse {
         let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
-        // CPU: (utime+stime) ticks from /proc/self/stat. After the last ')', index 11 = utime,
-        // 12 = stime; assume 100 Hz (Android/Linux) → 10 ms per tick. The client turns the
-        // cumulative cpu_ms into a live % across polls.
-        let cpu_ms = read("/proc/self/stat")
+        // Fields after the final ')' in /proc/<pid>/stat: index i = field (i+3). We read
+        // utime (idx 11), stime (idx 12) → CPU, and delayacct_blkio_ticks (idx 39) → the time
+        // the process spent *blocked on disk IO*. All at 100 Hz (Android/Linux) → 10 ms/tick.
+        // The client turns the cumulative ms counters into live %/rates across polls.
+        let (cpu_ms, blkio_ms) = read("/proc/self/stat")
             .rsplit_once(')')
             .map(|(_, rest)| {
                 let f: Vec<&str> = rest.split_whitespace().collect();
-                let u = f.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                let s = f.get(12).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                (u + s) * 10
+                let g = |i: usize| f.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                ((g(11) + g(12)) * 10, g(39) * 10)
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
         // RSS: resident pages (field 2 of /proc/self/statm) × 4 KiB.
         let rss_kb = read("/proc/self/statm")
             .split_whitespace()
@@ -2450,18 +2480,72 @@ impl Router {
             .and_then(|s| s.parse::<u64>().ok())
             .map(|pages| pages * 4)
             .unwrap_or(0);
-        // Disk IO: actual bytes to/from the block device (/proc/self/io).
+        // Disk IO (/proc/self/io): rchar/wchar = all read/write activity incl. the page cache
+        // (what the app actually moves — usually non-zero); read_bytes/write_bytes = bytes that
+        // truly hit the block device (often 0 when served from cache). We expose both.
         let io = read("/proc/self/io");
         let io_field = |k: &str| {
             io.lines()
                 .find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))
                 .unwrap_or(0)
         };
+        // GPU proxy: Android exposes no per-process GPU%, and the WebView's heavy renderer runs
+        // in an ISOLATED child process this app can't read (different uid). So we sum the CPU of
+        // the render/compositor/GPU threads that DO live in-process — RenderThread, VizWebView,
+        // the in-process GPU thread (comm is capped at 15 chars → "Chrome_InProcGp", so match the
+        // truncated "InProcGp" too), and the mali driver threads. Same tick→ms scale as cpu_ms.
+        // This tracks the in-app render load; the out-of-process WebView renderer is not included.
+        let mut render_ms = 0u64;
+        if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+            for e in entries.flatten() {
+                let p = e.path();
+                let comm = std::fs::read_to_string(p.join("comm")).unwrap_or_default();
+                let c = comm.trim();
+                if c.contains("RenderThread")
+                    || c.contains("InProcGp")
+                    || c.contains("Gpu")
+                    || c.contains("GPU")
+                    || c.contains("Viz")
+                    || c.contains("mali")
+                {
+                    if let Some((_, rest)) = std::fs::read_to_string(p.join("stat"))
+                        .unwrap_or_default()
+                        .rsplit_once(')')
+                    {
+                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let g =
+                            |i: usize| f.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                        render_ms += (g(11) + g(12)) * 10;
+                    }
+                }
+            }
+        }
+        // IO queue depth (system-wide, /proc/diskstats): "I/Os currently in progress" is field 9
+        // (token index 11) per device. Report the busiest real block device (skip loop/ram/zram)
+        // — an instantaneous indicator of disk saturation the per-process counters can't show.
+        let mut io_inflight = 0u64;
+        for line in read("/proc/diskstats").lines() {
+            let t: Vec<&str> = line.split_whitespace().collect();
+            let name = match t.get(2) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
+                continue;
+            }
+            let inflight = t.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            io_inflight = io_inflight.max(inflight);
+        }
         ApiResponse::ok_json(&json!({
             "cpu_ms": cpu_ms,
+            "render_ms": render_ms,
             "rss_kb": rss_kb,
-            "io_read": io_field("read_bytes:"),
-            "io_write": io_field("write_bytes:"),
+            "io_read": io_field("rchar:"),
+            "io_write": io_field("wchar:"),
+            "io_disk_read": io_field("read_bytes:"),
+            "io_disk_write": io_field("write_bytes:"),
+            "blkio_ms": blkio_ms,
+            "io_inflight": io_inflight,
             "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }))
     }
@@ -2839,7 +2923,7 @@ impl Router {
             .filter(|n| *n > 0)
             .unwrap_or(50)
             .min(500);
-        let store = match self.open(Some(account)) {
+        let store = match self.open_readonly(Some(account)) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -2872,7 +2956,7 @@ impl Router {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
         };
-        let store = match self.open(Some(account)) {
+        let store = match self.open_readonly(Some(account)) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -2921,12 +3005,32 @@ impl Router {
         Store::open(path).map_err(|e| ApiResponse::error(500, &format!("store: {e}")))
     }
 
+    /// Read-only store open for GET endpoints: a WAL reader that takes no instance
+    /// lock, so a list load never waits out an in-flight sync holding the writer lock
+    /// (the measured cause of multi-second mailbox loads). Falls back to a writable
+    /// open only if the DB isn't there yet (fresh account, pre-migration).
+    fn open_readonly(&self, account: Option<&str>) -> Result<Store, ApiResponse> {
+        let account = account.ok_or_else(|| ApiResponse::error(400, "missing 'account'"))?;
+        let path = self
+            .store_path(account)
+            .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
+        match Store::open_readonly(&path) {
+            Ok(s) => Ok(s),
+            // No migrated DB yet (first run): fall back to a writable open, which
+            // creates + migrates it, so the endpoint still works before the first sync.
+            Err(_) => Store::open(&path).map_err(|e| ApiResponse::error(500, &format!("store: {e}"))),
+        }
+    }
+
     fn items(&self, req: &ApiRequest) -> ApiResponse {
         let service = match req.q("service") {
             Some(s) => s,
             None => return ApiResponse::error(400, "missing 'service'"),
         };
-        let store = match self.open(req.q("account")) {
+        // GETs use a read-only WAL connection so a list load is never serialized behind
+        // an in-flight sync holding the writer lock (the measured cause of slow mailbox
+        // loads). Any preview back-fill happens afterwards on a brief writable open.
+        let store = match self.open_readonly(req.q("account")) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -3006,6 +3110,10 @@ impl Router {
                 // readable body simply carry no `preview`. Bounded by the page size.
                 // mail = sender/snippet/date/has-html (.eml); the rest parse the
                 // archived JSON (calendar/contacts/todo).
+                // Mail previews parsed on the fly (no cached row yet) are collected here
+                // and persisted once, after the response is built, on a brief writable
+                // open — so the read above never takes the writer lock.
+                let mut backfill: Vec<(String, String)> = Vec::new();
                 let arr: Vec<Value> = if matches!(
                     service,
                     "mail" | "calendar" | "contacts" | "todo" | "onenote"
@@ -3020,59 +3128,88 @@ impl Router {
                         .iter()
                         .map(|it| {
                             let mut v = item_json(it);
-                            if let (Some(root), Some(rel)) =
-                                (archive_root.as_ref(), it.local_path.as_ref())
-                            {
-                                if let Some(bytes) = read_under_root(root, rel) {
-                                    if service == "mail" {
-                                        mail_preview_enrichment(&mut v, it, root, rel, &bytes);
-                                    } else if service == "onenote" {
-                                        // a page's local_path is the .html body, not JSON —
-                                        // onenote_preview reads the _pagemeta_ / flank sidecar.
-                                        v["preview"] = onenote_preview(it, root);
-                                    } else if let Ok(o) = serde_json::from_slice::<Value>(&bytes) {
-                                        v["preview"] = match service {
-                                            "calendar" => calendar_preview(it, &o),
-                                            "contacts" => contact_preview(it, &o, root),
-                                            "todo" => todo_preview(it, &o, root),
-                                            _ => json!({
-                                                "status": o["status"],
-                                                "importance": o["importance"],
-                                                "due": o["dueDateTime"]["dateTime"],
-                                                "has_note": o["body"]["content"]
-                                                    .as_str()
-                                                    .map(|s| !s.trim().is_empty())
-                                                    .unwrap_or(false),
-                                            }),
-                                        };
+                            // Fast path (schema v12): a mail row whose `preview` was
+                            // already computed is served straight from the DB column —
+                            // no `.eml`/`.json` read, no MIME parse, no attachment decode.
+                            // This is the hot mailbox-load path once bodies are warmed.
+                            let cached = service == "mail"
+                                && it
+                                    .preview_json
+                                    .as_deref()
+                                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                    .map(|pv| v["preview"] = pv)
+                                    .is_some();
+                            if !cached {
+                                if let (Some(root), Some(rel)) =
+                                    (archive_root.as_ref(), it.local_path.as_ref())
+                                {
+                                    if let Some(bytes) = read_under_root(root, rel) {
+                                        if service == "mail" {
+                                            mail_preview_enrichment(&mut v, it, root, rel, &bytes);
+                                        } else if service == "onenote" {
+                                            // a page's local_path is the .html body, not JSON —
+                                            // onenote_preview reads the _pagemeta_ / flank sidecar.
+                                            v["preview"] = onenote_preview(it, root);
+                                        } else if let Ok(o) =
+                                            serde_json::from_slice::<Value>(&bytes)
+                                        {
+                                            v["preview"] = match service {
+                                                "calendar" => calendar_preview(it, &o),
+                                                "contacts" => contact_preview(it, &o, root),
+                                                "todo" => todo_preview(it, &o, root),
+                                                _ => json!({
+                                                    "status": o["status"],
+                                                    "importance": o["importance"],
+                                                    "due": o["dueDateTime"]["dateTime"],
+                                                    "has_note": o["body"]["content"]
+                                                        .as_str()
+                                                        .map(|s| !s.trim().is_empty())
+                                                        .unwrap_or(false),
+                                                }),
+                                            };
+                                        }
                                     }
                                 }
-                            }
-                            // #89: show a mail's sender from the indexed `sender`
-                            // (captured at ingest — read with the item, NO extra
-                            // file I/O) whenever the .eml body isn't cached, so a row
-                            // never reads "(unknown sender)". The .eml enrichment
-                            // above wins when the body is present.
-                            if service == "mail" {
-                                if let Some(sender) = it.sender.as_deref() {
-                                    let has_from = v
-                                        .get("preview")
-                                        .and_then(|p| p.get("from"))
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|s| !s.is_empty());
-                                    if !has_from {
-                                        let mut p =
-                                            v.get("preview").cloned().unwrap_or_else(|| json!({}));
-                                        p["from"] = json!(sender);
-                                        if p.get("subject").and_then(Value::as_str).is_none() {
-                                            p["subject"] = json!(it.name);
-                                        }
-                                        if p.get("date").and_then(Value::as_str).is_none() {
-                                            if let Some(d) = it.remote_mtime.as_deref() {
-                                                p["date"] = json!(d);
+                                // #89: show a mail's sender from the indexed `sender`
+                                // (captured at ingest — read with the item, NO extra
+                                // file I/O) whenever the .eml body isn't cached, so a row
+                                // never reads "(unknown sender)". The .eml enrichment
+                                // above wins when the body is present.
+                                if service == "mail" {
+                                    if let Some(sender) = it.sender.as_deref() {
+                                        let has_from = v
+                                            .get("preview")
+                                            .and_then(|p| p.get("from"))
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|s| !s.is_empty());
+                                        if !has_from {
+                                            let mut p = v
+                                                .get("preview")
+                                                .cloned()
+                                                .unwrap_or_else(|| json!({}));
+                                            p["from"] = json!(sender);
+                                            if p.get("subject").and_then(Value::as_str).is_none() {
+                                                p["subject"] = json!(it.name);
                                             }
+                                            if p.get("date").and_then(Value::as_str).is_none() {
+                                                if let Some(d) = it.remote_mtime.as_deref() {
+                                                    p["date"] = json!(d);
+                                                }
+                                            }
+                                            v["preview"] = p;
                                         }
-                                        v["preview"] = p;
+                                    }
+                                }
+                                // Collect the freshly computed mail preview for a
+                                // post-response write-through so every later load takes the
+                                // fast path. Only for a mail with an archived body (the
+                                // expensive case); `set_local_path` clears it when the body
+                                // is re-archived.
+                                if service == "mail" && it.local_path.is_some() {
+                                    if let Some(pv) = v.get("preview") {
+                                        if let Ok(s) = serde_json::to_string(pv) {
+                                            backfill.push((it.remote_id.clone(), s));
+                                        }
                                     }
                                 }
                             }
@@ -3082,6 +3219,16 @@ impl Router {
                 } else {
                     items.iter().map(item_json).collect()
                 };
+                // Persist freshly parsed previews so later loads hit the DB fast path.
+                // Brief writable open; if the writer lock is busy (a sync is running) this
+                // simply no-ops and the next load retries — it never blocks the read above.
+                if !backfill.is_empty() {
+                    if let Ok(w) = self.open(Some(account)) {
+                        for (id, s) in &backfill {
+                            let _ = w.set_preview_json(account, "mail", id, s);
+                        }
+                    }
+                }
                 ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
@@ -3129,23 +3276,29 @@ impl Router {
             .iter()
             .find(|a| a.id == account)
             .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
-        // OneDrive `local_path` is relative to the synced folder; every archived
-        // service stores its body under the archive root.
-        let body_root = if service == "onedrive" {
-            acc.sync_root.clone()
-        } else {
-            acc.archive_root.clone()
-        };
         let store = self.open(Some(account))?;
-        let (rel, name) = match store.get_item(account, service, id) {
-            Ok(Some(it)) => {
-                let rel = it
-                    .local_path
-                    .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?;
-                (rel, it.name)
-            }
+        let it = match store.get_item(account, service, id) {
+            Ok(Some(it)) => it,
             Ok(None) => return Err(ApiResponse::error(404, "item not found")),
             Err(e) => return Err(ApiResponse::error(500, &format!("query: {e}"))),
+        };
+        let rel = it
+            .local_path
+            .clone()
+            .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?;
+        let name = it.name.clone();
+        // Root-aware body location (#onedrive-mobile 0C): a OneDrive body lives in the
+        // offline working copy (`sync_root`) when `body_location=="sync"`, else the
+        // lazy-preview cache (`cache_root`); legacy rows without a location fall back to
+        // `sync_root`. Every other archived service reads from the archive root. The
+        // OneDrive `local_path` is relative to the chosen root.
+        let body_root = if service == "onedrive" {
+            match it.body_location.as_deref() {
+                Some("cache") => acc.effective_cache_root(),
+                _ => acc.sync_root.clone(),
+            }
+        } else {
+            acc.archive_root.clone()
         };
         let path = body_root.join(&rel);
         match (path.canonicalize(), body_root.canonicalize()) {
@@ -3502,7 +3655,18 @@ fn backup_state(it: &Item) -> &'static str {
 }
 
 fn item_json(it: &Item) -> Value {
-    json!({
+    // `has_body`: for OneDrive (mobile modes, schema v14) a body is only "present" when
+    // it is materialized AND valid — `body_state == "available"`; a filesystem probe
+    // (`local_path`) would falsely mark a metadata-only Mode-2 row as openable. Every
+    // other service keeps the `local_path`-based meaning (its body is a plain archived
+    // file). OneDrive rows also carry their content-state fields so the UI can render
+    // online / syncing / offline / conflict without a second request.
+    let has_body = if it.service == "onedrive" {
+        it.body_state.as_deref() == Some("available")
+    } else {
+        it.local_path.is_some()
+    };
+    let mut v = json!({
         "service": it.service,
         "remote_id": it.remote_id,
         "name": it.name,
@@ -3512,12 +3676,19 @@ fn item_json(it: &Item) -> Value {
         "remote_mtime": it.remote_mtime,
         "size": it.size,
         "etag": it.etag,
-        "has_body": it.local_path.is_some(),
+        "has_body": has_body,
         "deleted": it.deleted_at.is_some(),
         "state": backup_state(it),
         "verify_status": it.verify_status,
         "verified_at": it.verified_at,
-    })
+    });
+    if it.service == "onedrive" {
+        v["content_state"] = json!(it.content_state);
+        v["body_location"] = json!(it.body_location);
+        v["body_state"] = json!(it.body_state);
+        v["conflict_state"] = json!(it.conflict_state);
+    }
+    v
 }
 
 /// Best-effort read of an archived body file that must stay under `archive_root`
@@ -3910,6 +4081,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -4030,6 +4202,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -4622,6 +4795,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -4669,6 +4843,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5339,6 +5514,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5981,6 +6157,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6028,6 +6205,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6137,6 +6315,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6152,6 +6331,39 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(it["preview"]["from"], "Grace Hopper <grace@example.com>");
         assert_eq!(it["preview"]["subject"], "Indexed-sender subject");
         assert_eq!(it["preview"]["date"], "2026-06-25T10:00:00Z");
+    }
+
+    #[test]
+    fn item_json_has_body_derives_per_service() {
+        // OneDrive (schema v14): has_body from body_state=='available', NOT local_path —
+        // a Mode-2 row can know its sync path without a downloaded body.
+        let mut od = Item::new("a", "onedrive", "f1", "file.txt", "file");
+        od.local_path = Some("onedrive/aa/f1".into()); // path known…
+        od.body_state = Some("missing".into()); // …but body not materialized
+        let j = item_json(&od);
+        assert_eq!(
+            j["has_body"], serde_json::json!(false),
+            "OneDrive body 'missing' must not be has_body despite local_path"
+        );
+        assert_eq!(j["body_state"], serde_json::json!("missing")); // state surfaced for the UI
+        od.body_state = Some("available".into());
+        assert_eq!(
+            item_json(&od)["has_body"], serde_json::json!(true),
+            "an available OneDrive body IS has_body"
+        );
+        // Non-OneDrive is unchanged: has_body from local_path, body_state ignored.
+        let mut mail = Item::new("a", "mail", "m1", "Subject", "message");
+        mail.body_state = Some("missing".into()); // irrelevant for mail
+        assert_eq!(
+            item_json(&mail)["has_body"], serde_json::json!(false),
+            "mail without local_path = no body"
+        );
+        assert!(item_json(&mail).get("body_state").is_none(), "state fields are OneDrive-only");
+        mail.local_path = Some("mail/aa/m1.eml".into());
+        assert_eq!(
+            item_json(&mail)["has_body"], serde_json::json!(true),
+            "mail with local_path = has_body (unchanged semantics)"
+        );
     }
 
     #[test]
@@ -6193,6 +6405,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6250,6 +6463,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6298,6 +6512,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6379,6 +6594,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6456,6 +6672,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6500,6 +6717,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6552,6 +6770,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6639,6 +6858,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6684,6 +6904,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6748,6 +6969,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: sync,
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6766,6 +6988,59 @@ Content-Type: text/html; charset=utf-8\r\n\
         ));
         assert_eq!(i.status, 200);
         assert_eq!(i.content_type, "image/png");
+    }
+
+    #[test]
+    fn body_serves_onedrive_cache_mode_file_from_cache_root() {
+        // Root-aware serving (#onedrive-mobile 0C): a `body_location=="cache"` OneDrive
+        // item must be read from cache_root, NOT sync_root. Same relative name exists in
+        // both roots with different content to prove the correct root is chosen.
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        let sync = dir.path().join("od");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(sync.join("doc.txt"), b"OFFLINE COPY").unwrap();
+        std::fs::write(cache.join("doc.txt"), b"CACHED PREVIEW").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut f = Item::new("a", "onedrive", "c1", "doc.txt", "file");
+            f.local_path = Some("doc.txt".into());
+            store.upsert_item(&f).unwrap();
+            store
+                .set_content_state(
+                    "a",
+                    "onedrive",
+                    "c1",
+                    Some("cached"),
+                    Some("cache"),
+                    Some("available"),
+                    None,
+                )
+                .unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: sync,
+                archive_root: arch,
+                cache_root: cache,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let r = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=onedrive&id=c1",
+        ));
+        assert_eq!(r.status, 200);
+        assert_eq!(
+            r.body, b"CACHED PREVIEW",
+            "cache-mode body must be served from cache_root, not sync_root"
+        );
     }
 
     #[test]
@@ -6800,6 +7075,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()

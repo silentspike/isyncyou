@@ -1384,7 +1384,7 @@ a.note-meta-chip:hover { color: var(--accent); }
   position: fixed; top: calc(env(safe-area-inset-top, 0px) + 8px); right: 8px; z-index: 9999;
   background: rgba(8, 10, 16, .9); border: 1px solid rgba(255, 255, 255, .12); border-radius: 8px;
   padding: .35rem .55rem; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  color: #cbd5e1; pointer-events: none; min-width: 92px;
+  color: #cbd5e1; pointer-events: none; min-width: 116px;
 }
 .perf-row { display: flex; justify-content: space-between; gap: .7rem; line-height: 1.5; }
 .perf-k { opacity: .6; }

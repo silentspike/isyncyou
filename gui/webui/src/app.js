@@ -134,6 +134,11 @@ const Net = (() => {
   let raf = 0, last = 0;
   const reduce = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const TWO_PI = Math.PI * 2;
+  // Frame throttle: the constellation drifts slowly, so 60 fps is wasted work — every redraw
+  // forces the glass layers' backdrop-filter blur to recompute (the measured CPU/GPU hotspot).
+  // Cap to ~20 fps: physics use the real elapsed time so the drift speed is identical, only the
+  // redraw (and thus blur-recompute) frequency drops ~3×. The animation itself is unchanged.
+  const FRAME_MS = 1000 / 20;
   function makeNodes(w, h, topWeighted) {
     const rnd = rng(0x51e3a17), N = Math.max(8, Math.round(w * h / 11000)), nodes = [];
     for (let i = 0; i < N; i++) {
@@ -146,7 +151,9 @@ const Net = (() => {
   function resize(layer) {
     const r = layer.canvas.getBoundingClientRect();
     layer.w = Math.max(1, r.width); layer.h = Math.max(1, r.height);
-    layer.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // The constellation sits behind blurred glass, so sub-native resolution is invisible; cap
+    // the DPR lower than the display's to cut canvas fill-rate (fewer pixels to paint + blur).
+    layer.dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     layer.canvas.width = Math.round(layer.w * layer.dpr); layer.canvas.height = Math.round(layer.h * layer.dpr);
     layer.ctx.setTransform(layer.dpr, 0, 0, layer.dpr, 0, 0);
     layer.nodes = makeNodes(layer.w, layer.h, layer.topWeighted);
@@ -171,8 +178,11 @@ const Net = (() => {
   }
   function tick(now) {
     if (!last) last = now;
-    const dt = Math.min(2, (now - last) / 16.67); last = now;
-    if (!document.hidden) {
+    const elapsed = now - last;
+    if (document.hidden) {
+      last = now;                                   // don't bank a huge dt while hidden
+    } else if (elapsed >= FRAME_MS) {               // throttle: skip frames under the fps cap
+      const dt = Math.min(4, elapsed / 16.67); last = now;
       for (const layer of layers) {
         if (!layer.canvas.isConnected) { layers.delete(layer); continue; }   // self-heal
         const m = 8;
@@ -1253,7 +1263,7 @@ async function renderMailView(view) {
     // toolbar
     el("div", { class: "mail-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
-        el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); } })),
+        el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { clearTimeout(Mail._qT); Mail._qT = setTimeout(() => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); }, 140); } })),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
         el("select", { class: "input", onchange: (e) => { Mail.sort = e.target.value; mailRender(); } },
@@ -1335,6 +1345,10 @@ function mailRender() {
   const archived = Mail.all.filter(it => it.has_body).length;
   const m = $("#mail-metrics"); if (m) m.textContent = `${Mail.all.length} messages · ${archived} with content · ${withAtt} with attachments`;
   clear(list);
+  // Bump the render generation on every (re-)render so any in-flight progressive
+  // batch from a previous render — including one interrupted by an early return
+  // below — stops before touching this freshly cleared list.
+  const gen = (Mail._renderGen = (Mail._renderGen || 0) + 1);
   if (!Mail.all.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." }))); return; }
   if (!rows.length) { list.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "Adjust the filter or search." }))); return; }
   // Conversation grouping (#563): collapse messages sharing a conversationId into
@@ -1351,9 +1365,29 @@ function mailRender() {
   } else {
     display = rows.map(it => ({ it, n: 1 }));
   }
-  const frag = document.createDocumentFragment();
-  display.forEach(e => frag.append(mailRow(e.it, e.n)));
-  list.append(frag);
+  // Progressive render: fill the viewport instantly, then append the rest in
+  // requestAnimationFrame batches so building the (potentially hundreds of) rows
+  // never blocks the main thread — the mailbox appears immediately instead of the
+  // UI freezing on a synchronous full build. A generation token cancels an in-flight
+  // render when the list is re-rendered (search/filter/sort/thread/SSE refresh), so
+  // stale batches never leak into a newer list. Every row is still rendered, in order
+  // — no feature lost; only the *timing* of the off-screen rows changes.
+  const FIRST = 24, BATCH = 40;
+  const paint = (from, to) => {
+    const frag = document.createDocumentFragment();
+    for (let i = from; i < to && i < display.length; i++) frag.append(mailRow(display[i].it, display[i].n));
+    list.append(frag);
+  };
+  paint(0, FIRST);
+  if (display.length > FIRST) {
+    let i = FIRST;
+    const step = () => {
+      if (Mail._renderGen !== gen || !list.isConnected) return; // superseded by a newer render
+      paint(i, i + BATCH); i += BATCH;
+      if (i < display.length) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
 }
 function mailRow(it, threadCount = 1) {
   const p = it.preview || {};
@@ -4256,9 +4290,13 @@ function setupSwipe() {
     else if (dx > 0 && i > 0) go(order[i - 1]);           // right → previous tab
   }, { passive: true });
 }
-// Performance overlay (test flag): a live HUD of the app's whole-process load — CPU%, RAM,
-// disk IO — from /api/v1/debug/stats (embedded engine + WebView are one process, so it's the
-// total the app causes). Toggled from Settings → Diagnostics, or window.togglePerf().
+// Performance overlay (test flag): a live HUD of the app's whole-process load — CPU%, the
+// GPU/render-thread cost, RAM, disk IO, disk-wait and the system IO-queue depth — from
+// /api/v1/debug/stats (embedded engine + WebView are one process, so it's the total the app
+// causes). Toggled from Settings → Diagnostics, or window.togglePerf().
+//
+// "GPU/Rend" is a proxy: Android exposes no per-process GPU%, so we surface the CPU spent by the
+// WebView render/compositor/GPU threads — the render work GPU-bound animation drives.
 let _perfTimer = null, _perfPrev = null;
 function perfRate(bps) {
   if (!isFinite(bps) || bps < 1) return "0";
@@ -4270,22 +4308,34 @@ function startPerfOverlay() {
   if (document.getElementById("perf-hud")) return;
   const mk = (k, id) => el("div", { class: "perf-row" }, el("span", { class: "perf-k", text: k }), el("span", { id, class: "perf-v", text: "…" }));
   document.body.append(el("div", { id: "perf-hud", class: "perf-hud" },
-    mk("CPU", "perf-cpu"), mk("RAM", "perf-ram"), mk("Disk R", "perf-ior"), mk("Disk W", "perf-iow")));
+    mk("CPU", "perf-cpu"), mk("GPU/Rend", "perf-gpu"), mk("RAM", "perf-ram"),
+    mk("Disk R", "perf-ior"), mk("Disk W", "perf-iow"),
+    mk("Disk wait", "perf-iowait"), mk("IO queue", "perf-ioq")));
   _perfPrev = null;
   const tick = async () => {
     let s; try { s = await api("/api/v1/debug/stats"); } catch { return; }
     const now = performance.now();
+    const cores = s.cores || 1;
     if (_perfPrev) {
       const dt = (now - _perfPrev.t) / 1000;
-      const cores = s.cores || 1;
-      const cpu = dt > 0 ? Math.max(0, (s.cpu_ms - _perfPrev.cpu_ms) / (dt * 1000) * 100) : 0;
+      const pct = (cur, prev) => dt > 0 ? Math.max(0, (cur - prev) / (dt * 1000) * 100) : 0;
+      const cpu = pct(s.cpu_ms, _perfPrev.cpu_ms);
       const cpuEl = $("#perf-cpu");
       if (cpuEl) { cpuEl.textContent = cpu.toFixed(0) + "%"; cpuEl.classList.toggle("hot", cpu > cores * 55); }
+      const gpu = pct(s.render_ms || 0, _perfPrev.render_ms || 0);
+      const gpuEl = $("#perf-gpu");
+      if (gpuEl) { gpuEl.textContent = gpu.toFixed(0) + "%"; gpuEl.classList.toggle("hot", gpu > 60); }
       if ($("#perf-ior")) $("#perf-ior").textContent = perfRate(dt > 0 ? (s.io_read - _perfPrev.io_read) / dt : 0);
       if ($("#perf-iow")) $("#perf-iow").textContent = perfRate(dt > 0 ? (s.io_write - _perfPrev.io_write) / dt : 0);
+      const wait = pct(s.blkio_ms || 0, _perfPrev.blkio_ms || 0);
+      const waitEl = $("#perf-iowait");
+      if (waitEl) { waitEl.textContent = wait.toFixed(0) + "%"; waitEl.classList.toggle("hot", wait > 20); }
     }
+    const q = s.io_inflight || 0;
+    const qEl = $("#perf-ioq");
+    if (qEl) { qEl.textContent = String(q); qEl.classList.toggle("hot", q >= 4); }
     if ($("#perf-ram")) $("#perf-ram").textContent = (s.rss_kb / 1024).toFixed(0) + " MB";
-    _perfPrev = { t: now, cpu_ms: s.cpu_ms, io_read: s.io_read, io_write: s.io_write };
+    _perfPrev = { t: now, cpu_ms: s.cpu_ms, render_ms: s.render_ms || 0, io_read: s.io_read, io_write: s.io_write, blkio_ms: s.blkio_ms || 0 };
   };
   tick();
   _perfTimer = setInterval(tick, 1000);

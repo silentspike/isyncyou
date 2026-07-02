@@ -301,6 +301,35 @@ pub struct RefreshCounts {
     pub onenote_containers: usize,
 }
 
+impl RefreshCounts {
+    /// Whether this pass actually changed anything (any item ingested, deleted, body
+    /// or resource fetched across any service). A refresh that touched nothing must NOT
+    /// wake the UI — otherwise every idle poll triggers a full view reload (the visible
+    /// periodic "screen flicker"); the SSE notify is gated on this.
+    pub fn changed(&self) -> bool {
+        self.mail_folders
+            + self.mail_upserted
+            + self.mail_deleted
+            + self.mail_bodies
+            + self.mail_flanks
+            + self.calendar_events
+            + self.calendar_bodies
+            + self.calendar_flanks
+            + self.contacts_upserted
+            + self.contacts_bodies
+            + self.contacts_photos
+            + self.todo_indexed
+            + self.todo_bodies
+            + self.todo_flanks
+            + self.todo_sub
+            + self.onenote_pages
+            + self.onenote_bodies
+            + self.onenote_resources
+            + self.onenote_containers
+            > 0
+    }
+}
+
 /// Refresh the local store for `account` from Microsoft Graph across mail, calendar,
 /// contacts, ToDo and OneNote — the read-only pass that both the daemon's scheduled
 /// backup and the standalone mobile client use. `read_access` is the primary token
@@ -762,6 +791,23 @@ mod tests {
     }
 
     #[test]
+    fn refresh_counts_changed_is_false_only_for_a_noop_pass() {
+        // The SSE-notify (and thus a full UI reload) is gated on this: a no-op refresh
+        // must report `changed() == false` so an idle poll never flickers the screen.
+        assert!(
+            !RefreshCounts::default().changed(),
+            "a no-op refresh must not count as changed"
+        );
+        // Any single non-zero count flips it to changed.
+        let mut c = RefreshCounts::default();
+        c.mail_upserted = 1;
+        assert!(c.changed(), "one upserted mail is a real change");
+        let mut c2 = RefreshCounts::default();
+        c2.onenote_containers = 2;
+        assert!(c2.changed(), "a change in the last field must count too");
+    }
+
+    #[test]
     fn restore_cloud_refuses_when_disabled_by_default() {
         // Default config has restore.cloud_restore_enabled = false. The gate must
         // fire before any store access or network call, so even a missing account
@@ -924,6 +970,7 @@ mod tests {
                 username: "a@example.com".into(),
                 sync_root: dir.join("od"),
                 archive_root: arch.clone(),
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -952,6 +999,7 @@ mod tests {
                 username: "a@example.com".into(),
                 sync_root: std::path::PathBuf::from("/nonexistent/sync"),
                 archive_root: std::path::PathBuf::from("/nonexistent/arch"),
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
