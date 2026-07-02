@@ -29,7 +29,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod serve;
 mod view;
-pub use serve::{bind_loopback, format_http, parse_request_line, serve, serve_listener};
+pub use serve::{
+    bind_loopback, dispatch_message, format_http, parse_request_line, serve, serve_listener,
+};
 #[cfg(unix)]
 pub use serve::{default_unix_socket_path, serve_unix};
 
@@ -89,6 +91,11 @@ pub struct ApiRequest {
     /// The `X-Session-Token` header value (#89 mobile profile): required on every
     /// `/api/v1/*` route when the Router runs with a session token.
     pub session_token: Option<String>,
+    /// The request body bytes (#0A transport). Empty for the query-string GETs that
+    /// make up today's API; carried so a body-bearing request survives **both**
+    /// transports — HTTP (`serve.rs` reads it instead of draining) and the Android
+    /// in-process message bridge (which has no query-string ergonomics for uploads).
+    pub body: Vec<u8>,
 }
 
 impl ApiRequest {
@@ -112,6 +119,7 @@ impl ApiRequest {
             query,
             cap_token: None,
             session_token: None,
+            body: Vec::new(),
         }
     }
 
@@ -124,6 +132,13 @@ impl ApiRequest {
     /// Attach the captured `X-Session-Token` header (builder style, #89).
     pub fn with_session_token(mut self, token: Option<String>) -> Self {
         self.session_token = token;
+        self
+    }
+
+    /// Attach the request body (builder style, #0A) — the HTTP adapter reads it from
+    /// the socket, the Android bridge passes it straight from the `WebMessage`.
+    pub fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
         self
     }
 

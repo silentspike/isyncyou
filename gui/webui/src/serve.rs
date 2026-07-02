@@ -28,6 +28,11 @@ use std::time::Duration;
 const MAX_CONNS: usize = 128;
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 
+/// Upper bound on an in-memory request body (#0A). Generous enough for a document
+/// upload yet bounded so a bogus `Content-Length` can't make the server allocate without
+/// limit; an oversized body is refused (413) rather than buffered.
+const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+
 /// Decrements the live-connection counter when a connection thread ends.
 struct ConnGuard;
 impl Drop for ConnGuard {
@@ -94,6 +99,52 @@ pub fn parse_request_line(line: &str) -> Option<(String, String)> {
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
     Some((method, target))
+}
+
+/// Build the routed [`ApiRequest`] from a transport-agnostic set of inputs: resolve the
+/// effective session token (explicit `X-Session-Token`, else the `isy_session` loopback
+/// cookie) and attach the cap-token + body. Shared by the HTTP [`handle`] loop and the
+/// in-process [`dispatch_message`] bridge so both transports route **identically** (#0A).
+fn build_request(
+    method: &str,
+    target: &str,
+    cap_token: Option<String>,
+    session_token: Option<String>,
+    cookie: Option<String>,
+    body: Vec<u8>,
+) -> ApiRequest {
+    let session_token =
+        session_token.or_else(|| cookie.as_deref().and_then(|c| cookie_value(c, "isy_session")));
+    ApiRequest::new(method, target)
+        .with_cap_token(cap_token)
+        .with_session_token(session_token)
+        .with_body(body)
+}
+
+/// Dispatch one request that arrived over the Android in-process `WebMessage` bridge
+/// (#0A) — **no TCP port is involved**. Applies the same session-token resolution and
+/// routing as the HTTP path; host/origin checks don't apply because the bridge is bound
+/// to the app origin natively by `WebMessageListener`'s `allowedOriginRules`. SSE routes
+/// (`/api/v1/events`, `/api/v1/agent/stream`) are NOT served here — the bridge carries
+/// those streams over its own native push channel. Returns the response for the native
+/// side to post back on the message port.
+pub fn dispatch_message(
+    router: &Router,
+    method: &str,
+    target: &str,
+    cap_token: Option<String>,
+    session_token: Option<String>,
+    cookie: Option<String>,
+    body: Vec<u8>,
+) -> ApiResponse {
+    router.route(&build_request(
+        method,
+        target,
+        cap_token,
+        session_token,
+        cookie,
+        body,
+    ))
 }
 
 /// Serialize a response as an HTTP/1.1 message with `Connection: close`.
@@ -290,33 +341,36 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             stream.flush()?;
             return Ok(()); // rejected → close
         }
-        // Effective session token (#89): an explicit `X-Session-Token` header (used by
-        // the web UI's fetch() calls) OR a loopback `isy_session` cookie set natively by
-        // the Android shell — the cookie auto-rides iframe/img/EventSource subresource
-        // requests, so embedded resources are gated without per-URL `_st` threading.
-        let session_token = headers.session_token.clone().or_else(|| {
-            headers
-                .cookie
-                .as_deref()
-                .and_then(|c| cookie_value(c, "isy_session"))
-        });
-        let req = ApiRequest::new(&method, &target)
-            .with_cap_token(headers.cap_token.clone())
-            .with_session_token(session_token);
-        // Drain any request body so the next request on this keep-alive connection is
-        // framed correctly (this server's own clients send params in the query string,
-        // so bodies are normally absent — this just keeps framing robust).
-        if content_length > 0 {
-            let mut remaining = content_length;
-            let mut buf = [0u8; 4096];
-            while remaining > 0 {
-                let want = remaining.min(buf.len());
-                match reader.read(&mut buf[..want])? {
-                    0 => return Ok(()), // client closed mid-body
-                    n => remaining -= n,
-                }
+        // Read any request body into memory (bounded) so a body-bearing request works
+        // over HTTP too (#0A); the query-string GETs that dominate today carry none. An
+        // oversized body is refused (413) rather than buffered — it can't be reframed
+        // safely on a keep-alive connection, so that path also closes.
+        let body = if content_length > MAX_REQUEST_BODY {
+            let resp = ApiResponse::error(413, "request body too large");
+            stream.write_all(&format_http(&resp))?;
+            stream.flush()?;
+            return Ok(());
+        } else if content_length > 0 {
+            let mut buf = vec![0u8; content_length];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => buf,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
             }
-        }
+        } else {
+            Vec::new()
+        };
+        // Build the routed request from the same transport-agnostic path the in-process
+        // bridge uses (#0A): explicit `X-Session-Token`, else the `isy_session` loopback
+        // cookie that auto-rides iframe/img/EventSource subresource requests.
+        let req = build_request(
+            &method,
+            &target,
+            headers.cap_token.clone(),
+            headers.session_token.clone(),
+            headers.cookie.clone(),
+            body,
+        );
         // SSE change stream: a long-lived connection that bypasses the one-shot
         // response model. Reached only after header validation, so the same
         // loopback/origin rules apply; needs the injected EventBus (daemon only).
@@ -897,5 +951,107 @@ mod tests {
             resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
             "got: {resp}"
         );
+    }
+
+    #[test]
+    fn build_request_resolves_cookie_session_and_carries_body() {
+        // #0A: the shared request builder carries the body and resolves the session from
+        // the loopback cookie when no explicit header is present.
+        let r = build_request(
+            "POST",
+            "/api/v1/x?a=1",
+            Some("cap-1".into()),
+            None,
+            Some("other=z; isy_session=cook-tok".into()),
+            b"hello-body".to_vec(),
+        );
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.path, "/api/v1/x");
+        assert_eq!(r.cap_token.as_deref(), Some("cap-1"));
+        assert_eq!(r.session_token.as_deref(), Some("cook-tok"));
+        assert_eq!(r.body, b"hello-body");
+        // An explicit X-Session-Token header wins over the cookie.
+        let r2 = build_request(
+            "GET",
+            "/api/v1/x",
+            None,
+            Some("hdr-tok".into()),
+            Some("isy_session=cook-tok".into()),
+            Vec::new(),
+        );
+        assert_eq!(r2.session_token.as_deref(), Some("hdr-tok"));
+        assert!(r2.body.is_empty());
+    }
+
+    #[test]
+    fn dispatch_message_routes_without_a_socket() {
+        // #0A: the in-process bridge path routes identically to HTTP — no TCP port bound.
+        use isyncyou_core::Config;
+        let open = Router::new(Config::default());
+        let ok = dispatch_message(
+            &open,
+            "GET",
+            "/api/v1/accounts",
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(ok.status, 200, "bridge GET should route");
+        assert!(
+            String::from_utf8_lossy(&ok.body).contains("accounts"),
+            "bridge body: {}",
+            String::from_utf8_lossy(&ok.body)
+        );
+        // The session gate applies through the bridge too (same Router::route).
+        let gated = Router::new(Config::default()).with_session_token("sess-bridge".into());
+        let denied =
+            dispatch_message(&gated, "GET", "/api/v1/status", None, None, None, Vec::new());
+        assert_eq!(denied.status, 401, "bridge without token must 401");
+        let allowed = dispatch_message(
+            &gated,
+            "GET",
+            "/api/v1/status",
+            None,
+            Some("sess-bridge".into()),
+            None,
+            Vec::new(),
+        );
+        assert_ne!(allowed.status, 401, "bridge with token must pass the gate");
+    }
+
+    #[test]
+    fn http_reads_body_then_serves_next_request_on_same_connection() {
+        // #0A: a Content-Length body is read (not drained ad-hoc), so the next request on
+        // the same keep-alive connection is still framed correctly.
+        use isyncyou_core::Config;
+        let router = Arc::new(Router::new(Config::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                spawn_conn(stream.unwrap(), Arc::clone(&router), AccessPolicy::TcpLoopback);
+            }
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // A POST with a 5-byte body to an unknown route: the body must be consumed.
+        c.write_all(
+            b"POST /api/v1/nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .unwrap();
+        let first = read_http_response(&mut c);
+        assert!(first.starts_with("HTTP/1.1 "), "first response: {first}");
+        // The follow-up GET on the SAME connection routes cleanly — proof the 5 body
+        // bytes did not bleed into this request's parse.
+        c.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let second = read_http_response(&mut c);
+        assert!(
+            second.starts_with("HTTP/1.1 200 OK\r\n"),
+            "follow-up after body must succeed: {second}"
+        );
+        assert!(second.contains("\"accounts\""), "body: {second}");
     }
 }

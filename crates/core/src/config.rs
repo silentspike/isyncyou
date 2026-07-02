@@ -40,7 +40,7 @@ impl Default for DeleteGuardConfig {
 }
 
 /// True for an unset (empty) path — keeps a defaulted `cache_root` out of serialized TOML.
-fn path_is_empty(p: &PathBuf) -> bool {
+fn path_is_empty(p: &Path) -> bool {
     p.as_os_str().is_empty()
 }
 
