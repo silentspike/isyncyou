@@ -5,6 +5,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
+import android.security.keystore.KeyProperties
 import android.view.KeyEvent
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
@@ -21,8 +24,11 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.security.KeyStore
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
 import org.json.JSONObject
 
 /**
@@ -377,19 +383,78 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    /** Keystore alias for the biometric-bound confirmation key (#WP-8). */
+    private val bioKeyAlias = "isyncyou-bio-confirm-v1"
+
     /**
-     * Show a `BiometricPrompt` (#onedrive-mobile 0.6). On success, arm the server-side
-     * per-action token over the JNI-only [NativeEngine.nativeConfirmAction] path (the WebView
-     * cannot reach it), then reply `{t:"bio",id,ok}`. Strong biometric with a device-credential
-     * (PIN/pattern) fallback. Must be called on the UI thread.
+     * Get-or-create an AndroidKeyStore AES-256-GCM key that REQUIRES a fresh strong-biometric
+     * auth for every use (#WP-8), and return a `Cipher` initialised under it. Binding the
+     * confirmation to this key is what makes it unforgeable: the crypto op in [runBiometric]'s
+     * success callback only completes after a real biometric unlock, so a spoofed
+     * `onAuthenticationSucceeded` cannot arm the token. `null` if the Keystore/key is
+     * unavailable (no crypto object → the confirmation is denied, never silently bypassed).
+     */
+    private fun bioConfirmCipher(): Cipher? = try {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val key = (ks.getEntry(bioKeyAlias, null) as? KeyStore.SecretKeyEntry)?.secretKey ?: run {
+            val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+            kg.init(
+                KeyGenParameterSpec.Builder(
+                    bioKeyAlias,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .setUserAuthenticationRequired(true)
+                    // A new biometric enrollment invalidates the key (re-enroll = re-consent).
+                    .setInvalidatedByBiometricEnrollment(true)
+                    .apply {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            setUserAuthenticationValidityDurationSeconds(-1)
+                        }
+                    }
+                    .build(),
+            )
+            kg.generateKey()
+        }
+        Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key) }
+    } catch (e: KeyPermanentlyInvalidatedException) {
+        // Biometric set changed → the old key is dead; drop it so the next attempt recreates it.
+        android.util.Log.w(TAG, "bio confirm key invalidated by new enrollment; recreating", e)
+        try {
+            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(bioKeyAlias)
+        } catch (_: Exception) {
+        }
+        null
+    } catch (e: Exception) {
+        android.util.Log.w(TAG, "bio confirm key/cipher unavailable", e)
+        null
+    }
+
+    /**
+     * Show a `BiometricPrompt` (#onedrive-mobile 0.6, #WP-8). On success, run a crypto op with
+     * the biometric-unlocked Keystore key ([bioConfirmCipher]) — proof of a real strong-biometric
+     * auth — then arm the server-side per-action token over the JNI-only
+     * [NativeEngine.nativeConfirmAction] path (the WebView cannot reach it) and reply
+     * `{t:"bio",id,ok}`. Requires STRONG biometric: a CryptoObject cannot ride a device-credential
+     * unlock below API 30, and destructive M365 ops warrant a hardware-bound gate. Must be called
+     * on the UI thread.
      */
     private fun runBiometric(reqId: String, pat: String, label: String, reply: JavaScriptReplyProxy) {
         fun done(ok: Boolean) = reply.postMessage("{\"t\":\"bio\",\"id\":\"$reqId\",\"ok\":$ok}")
         val mgr = BiometricManager.from(this)
-        val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG or
-            BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG
         if (mgr.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
-            android.util.Log.w(TAG, "biometric unavailable; destructive op denied")
+            android.util.Log.w(TAG, "strong biometric unavailable; destructive op denied")
+            done(false)
+            return
+        }
+        val cipher = bioConfirmCipher()
+        if (cipher == null) {
             done(false)
             return
         }
@@ -399,9 +464,14 @@ class MainActivity : FragmentActivity() {
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                     val armed = try {
+                        // Crypto op under the biometric-unlocked key: only succeeds after a real
+                        // strong-biometric auth, so it proves presence before arming the token.
+                        result.cryptoObject?.cipher?.doFinal(pat.toByteArray(Charsets.UTF_8))
+                            ?: throw IllegalStateException("no crypto object in auth result")
                         NativeEngine.nativeConfirmAction(pat)
                     } catch (e: Exception) {
-                        android.util.Log.w(TAG, "nativeConfirmAction failed", e); false
+                        android.util.Log.w(TAG, "confirm crypto/arming failed", e)
+                        false
                     }
                     done(armed)
                 }
@@ -415,7 +485,7 @@ class MainActivity : FragmentActivity() {
             .setSubtitle(label)
             .setAllowedAuthenticators(authenticators)
             .build()
-        prompt.authenticate(info)
+        prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
     }
 
     /** Drain one push stream, forwarding each event to the WebView until it ends (#0A). */
