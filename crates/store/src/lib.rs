@@ -783,13 +783,18 @@ impl Store {
         // The lock is held only for a Store's lifetime (a single request or sync
         // pass), so concurrent opens within one process — the multi-threaded web
         // server firing several store reads at once — just need to wait out the
-        // current holder. Retry briefly (~1s); a genuinely long-held lock (a second
-        // daemon instance) still fails after the window, preserving single-writer.
-        for attempt in 0..40 {
+        // current holder. Retry up to ~5s (matching the SQLite busy_timeout used on
+        // the connection): each open holds the lock for a full open+query, so under
+        // heavy CI parallelism an 8-wide burst of concurrent opens made the unluckiest
+        // waiter exhaust a ~1s window and race the AlreadyRunning lock (#564 flake). A
+        // genuinely long-held lock (a second daemon instance) still fails after the
+        // window, preserving single-writer.
+        const LOCK_RETRY_ATTEMPTS: u32 = 200; // 200 * 25ms = ~5s
+        for attempt in 0..LOCK_RETRY_ATTEMPTS {
             if f.try_lock_exclusive().is_ok() {
                 return Ok(f);
             }
-            if attempt < 39 {
+            if attempt < LOCK_RETRY_ATTEMPTS - 1 {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
