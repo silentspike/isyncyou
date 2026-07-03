@@ -330,12 +330,18 @@ jobs:
           # ResumedActivity=MainActivity + "shell loaded" engine log) and a local CI-matching
           # emulator. Follow-up: a real-device-farm launch signal will make this headless-
           # emulator check advisory rather than required.
+          #
+          # PACKAGE: the debug buildType sets `applicationIdSuffix = ".debug"`
+          # (android/app/build.gradle.kts), so the INSTALLED package is
+          # com.silentspike.isyncyou.debug — the Activity CLASS stays
+          # com.silentspike.isyncyou.MainActivity. Target that package below; a bare
+          # com.silentspike.isyncyou makes `am start` report "class does not exist".
           script: |
             adb logcat -G 16M
             out=$(adb install -r android/app/build/outputs/apk/debug/app-debug.apk 2>&1); echo "$out"; echo "$out" | grep -q 'Success' || { echo "::error::APK did not install"; exit 1; }
-            adb shell pm grant com.silentspike.isyncyou android.permission.POST_NOTIFICATIONS || true
+            adb shell pm grant com.silentspike.isyncyou.debug android.permission.POST_NOTIFICATIONS || true
             adb logcat -c
-            n=0; ok=0; while [ $n -lt 6 ]; do n=$((n+1)); out=$(adb shell am start -W -n com.silentspike.isyncyou/com.silentspike.isyncyou.MainActivity 2>&1); echo "am start attempt $n: $(echo "$out" | tr '\n' ' ')"; echo "$out" | grep -qiE 'does not exist|Class not found|Unable to resolve' && { echo "::error::no launchable MainActivity (real regression)"; exit 1; }; echo "$out" | grep -q 'Status: ok' && { ok=1; echo "launched: am start reported Status: ok"; break; }; adb shell pidof com.silentspike.isyncyou >/dev/null 2>&1 && adb shell dumpsys activity activities 2>/dev/null | grep -q 'com.silentspike.isyncyou/.MainActivity' && { ok=1; echo "launched: process alive + MainActivity in the activity stack (am start raced a starvation force-finish)"; break; }; sleep 6; done; [ $ok -eq 1 ] || { echo "::error::MainActivity did not launch after $n attempts (process never came up)"; adb logcat -d | grep -iE 'isyncyou|AndroidRuntime|FATAL|linker|UnsatisfiedLink|dlopen|abort' | tail -120; exit 1; }
+            n=0; ok=0; while [ $n -lt 6 ]; do n=$((n+1)); out=$(adb shell am start -W -n com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity 2>&1); echo "am start attempt $n: $(echo "$out" | tr '\n' ' ')"; echo "$out" | grep -qiE 'does not exist|Class not found|Unable to resolve' && { echo "::error::no launchable MainActivity (real regression)"; exit 1; }; echo "$out" | grep -q 'Status: ok' && { ok=1; echo "launched: am start reported Status: ok"; break; }; adb shell pidof com.silentspike.isyncyou.debug >/dev/null 2>&1 && adb shell dumpsys activity activities 2>/dev/null | grep -q 'com.silentspike.isyncyou.debug/' && { ok=1; echo "launched: process alive + MainActivity in the activity stack (am start raced a starvation force-finish)"; break; }; sleep 6; done; [ $ok -eq 1 ] || { echo "::error::MainActivity did not launch after $n attempts (process never came up)"; adb logcat -d | grep -iE 'isyncyou|AndroidRuntime|FATAL|linker|UnsatisfiedLink|dlopen|abort' | tail -120; exit 1; }
             adb logcat -d | grep -iE 'FATAL EXCEPTION|UnsatisfiedLinkError|dlopen failed|Fatal signal' && { echo "::error::launch-time crash detected in logcat (real regression)"; exit 1; } || echo "no launch-time crash in logcat"
             echo "REQ-AND-004 ok: APK installs + MainActivity launches without a launch-time crash"
             sleep 25
