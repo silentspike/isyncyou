@@ -43,7 +43,9 @@ pub struct FolderScope {
 /// `active_scopes` is the deepest active ancestor — that scope owns the item. A scope
 /// root owns itself (its own id leads its ancestry).
 pub fn owning_scope<'a>(ancestry: &[&str], active_scopes: &BTreeSet<&'a str>) -> Option<&'a str> {
-    ancestry.iter().find_map(|id| active_scopes.get(*id).copied())
+    ancestry
+        .iter()
+        .find_map(|id| active_scopes.get(*id).copied())
 }
 
 #[cfg(test)]

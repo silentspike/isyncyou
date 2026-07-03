@@ -452,14 +452,8 @@ pub fn incremental_sync_scoped<T: Transport>(
             scope_id: scope.folder_id.as_str(),
             active: &active,
         };
-        let resynced = walk_scope_delta(
-            transport,
-            store,
-            account,
-            ctx.scope_id,
-            &base,
-            5,
-            |arr| {
+        let resynced =
+            walk_scope_delta(transport, store, account, ctx.scope_id, &base, 5, |arr| {
                 for item in arr {
                     match ingest_item_scoped(
                         store,
@@ -476,8 +470,7 @@ pub fn incremental_sync_scoped<T: Transport>(
                     }
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         report.resynced |= resynced;
     }
     Ok(report)
@@ -1570,7 +1563,10 @@ mod tests {
             .deleted_at
             .is_some());
         assert_eq!(
-            store.get_delta_cursor("acc", SERVICE, "S").unwrap().as_deref(),
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
             Some("CS")
         );
     }
@@ -1618,9 +1614,16 @@ mod tests {
 
         let x = store.get_item("acc", SERVICE, "X").unwrap().unwrap();
         assert!(x.deleted_at.is_none(), "moved item must stay alive");
-        assert_eq!(x.parent_remote_id.as_deref(), Some("C"), "id-stable reparent");
+        assert_eq!(
+            x.parent_remote_id.as_deref(),
+            Some("C"),
+            "id-stable reparent"
+        );
         assert_eq!(report.deleted, 0);
-        assert_eq!(report.skipped, 1, "P's @removed skipped (owned by deeper C)");
+        assert_eq!(
+            report.skipped, 1,
+            "P's @removed skipped (owned by deeper C)"
+        );
         assert_eq!(report.upserted, 1, "C claimed the move-in");
     }
 
@@ -1658,7 +1661,10 @@ mod tests {
         // page 1 was ingested and its nextLink persisted as the resume point
         assert!(store.get_item("acc", SERVICE, "A").unwrap().is_some());
         assert_eq!(
-            store.get_delta_cursor("acc", SERVICE, "S").unwrap().as_deref(),
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
             Some("https://graph/next/u2")
         );
 
@@ -1681,7 +1687,10 @@ mod tests {
         .unwrap();
         assert!(store.get_item("acc", SERVICE, "B").unwrap().is_some());
         assert_eq!(
-            store.get_delta_cursor("acc", SERVICE, "S").unwrap().as_deref(),
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
             Some("CS")
         );
         assert_eq!(report.upserted, 1);
@@ -1725,7 +1734,10 @@ mod tests {
         let x = store.get_item("acc", SERVICE, "X").unwrap().unwrap();
         assert_eq!(x.name, "new.txt", "last write wins");
         assert_eq!(
-            store.get_delta_cursor("acc", SERVICE, "S").unwrap().as_deref(),
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
             Some("CS")
         );
     }
@@ -1777,11 +1789,17 @@ mod tests {
         // P's page: folder C (owned by C) + X (owned by C) → both skipped by P.
         assert_eq!(report.skipped, 2, "P skips items owned by deeper C");
         assert_eq!(
-            store.get_delta_cursor("acc", SERVICE, "C").unwrap().as_deref(),
+            store
+                .get_delta_cursor("acc", SERVICE, "C")
+                .unwrap()
+                .as_deref(),
             Some("CC")
         );
         assert_eq!(
-            store.get_delta_cursor("acc", SERVICE, "P").unwrap().as_deref(),
+            store
+                .get_delta_cursor("acc", SERVICE, "P")
+                .unwrap()
+                .as_deref(),
             Some("CP")
         );
     }

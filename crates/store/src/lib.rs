@@ -2506,11 +2506,15 @@ mod tests {
         s.set_delta_cursor("a", "onedrive", "F1", "T1").unwrap();
         s.set_delta_cursor("a", "onedrive", "F2", "T2").unwrap();
         assert_eq!(
-            s.get_delta_cursor("a", "onedrive", "F1").unwrap().as_deref(),
+            s.get_delta_cursor("a", "onedrive", "F1")
+                .unwrap()
+                .as_deref(),
             Some("T1")
         );
         assert_eq!(
-            s.get_delta_cursor("a", "onedrive", "F2").unwrap().as_deref(),
+            s.get_delta_cursor("a", "onedrive", "F2")
+                .unwrap()
+                .as_deref(),
             Some("T2")
         );
         // Bumping F1 does not touch F2's generation.
@@ -2518,7 +2522,9 @@ mod tests {
         assert_eq!(s.delta_generation("a", "onedrive", "F1").unwrap(), Some(2));
         assert_eq!(s.delta_generation("a", "onedrive", "F2").unwrap(), Some(1));
         assert_eq!(
-            s.get_delta_cursor("a", "onedrive", "F2").unwrap().as_deref(),
+            s.get_delta_cursor("a", "onedrive", "F2")
+                .unwrap()
+                .as_deref(),
             Some("T2")
         );
     }
@@ -2533,7 +2539,9 @@ mod tests {
         assert_eq!(s.get_delta_cursor("a", "onedrive", "F1").unwrap(), None);
         // Sibling scope untouched.
         assert_eq!(
-            s.get_delta_cursor("a", "onedrive", "F2").unwrap().as_deref(),
+            s.get_delta_cursor("a", "onedrive", "F2")
+                .unwrap()
+                .as_deref(),
             Some("T2")
         );
         // Clearing an absent scope returns false, no error.
