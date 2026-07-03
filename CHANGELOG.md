@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- OneDrive per-folder mode policy: an account-scoped `onedrive_modes` map (a `default_mode`
+  plus per-folder `folder_modes`) in the config, with a pure `effective_mode` resolver
+  (the deepest explicit ancestor wins, else the account default) and a tombstoned-entry
+  cleanup helper. Distinct axis from the per-item `content_state` (#650).
+
 ## [1.0.0] — 2026-06-26
 
 First stable release — the desktop/core product (CLI + daemon + web UI + native
