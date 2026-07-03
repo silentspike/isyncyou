@@ -113,8 +113,11 @@ fn build_request(
     cookie: Option<String>,
     body: Vec<u8>,
 ) -> ApiRequest {
-    let session_token =
-        session_token.or_else(|| cookie.as_deref().and_then(|c| cookie_value(c, "isy_session")));
+    let session_token = session_token.or_else(|| {
+        cookie
+            .as_deref()
+            .and_then(|c| cookie_value(c, "isy_session"))
+    });
     ApiRequest::new(method, target)
         .with_cap_token(cap_token)
         .with_session_token(session_token)
@@ -800,13 +803,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                spawn_conn(stream.unwrap(), Arc::clone(&router), AccessPolicy::TcpLoopback);
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
             }
         });
         // A single TCP connection serves three sequential requests — proof the server
         // does not close after each response (persistent HTTP/1.1).
         let mut c = TcpStream::connect(addr).unwrap();
-        c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         for i in 0..3 {
             c.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .unwrap();
@@ -1075,8 +1083,15 @@ mod tests {
         );
         // The session gate applies through the bridge too (same Router::route).
         let gated = Router::new(Config::default()).with_session_token("sess-bridge".into());
-        let denied =
-            dispatch_message(&gated, "GET", "/api/v1/status", None, None, None, Vec::new());
+        let denied = dispatch_message(
+            &gated,
+            "GET",
+            "/api/v1/status",
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
         assert_eq!(denied.status, 401, "bridge without token must 401");
         let allowed = dispatch_message(
             &gated,
@@ -1142,7 +1157,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                spawn_conn(stream.unwrap(), Arc::clone(&router), AccessPolicy::TcpLoopback);
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
             }
         });
         let mut c = TcpStream::connect(addr).unwrap();

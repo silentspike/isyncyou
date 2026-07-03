@@ -925,7 +925,10 @@ impl Router {
                     "service": service,
                     "item": item,
                 }))),
-                None => Some(ApiResponse::error(500, "could not create confirmation token")),
+                None => Some(ApiResponse::error(
+                    500,
+                    "could not create confirmation token",
+                )),
             },
         }
     }
@@ -1118,8 +1121,8 @@ impl Router {
         target: &str,
         session_token: Option<&str>,
     ) -> Option<std::sync::mpsc::Receiver<String>> {
-        let req = ApiRequest::new("GET", target)
-            .with_session_token(session_token.map(str::to_string));
+        let req =
+            ApiRequest::new("GET", target).with_session_token(session_token.map(str::to_string));
         let st_query = req
             .query
             .iter()
@@ -1165,7 +1168,8 @@ impl Router {
                     // carry it as the `data` field so app.js JSON-parses it as it does the
                     // EventSource `data:` line. Terminate with a `done` event.
                     for line in inner.iter() {
-                        let msg = serde_json::json!({ "event": "message", "data": line }).to_string();
+                        let msg =
+                            serde_json::json!({ "event": "message", "data": line }).to_string();
                         if tx.send(msg).is_err() {
                             return;
                         }
@@ -1246,8 +1250,10 @@ impl Router {
             "/api/v1/debug/stats",
         ];
         let static_get = req.method == "GET"
-            && (matches!(req.path.as_str(), "/" | "/app.js" | "/app.css" | "/callback")
-                || req.path.ends_with(".woff2")
+            && (matches!(
+                req.path.as_str(),
+                "/" | "/app.js" | "/app.css" | "/callback"
+            ) || req.path.ends_with(".woff2")
                 || req.path.starts_with("/sfx/"));
         let gate_exempt =
             static_get || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()));
@@ -3006,13 +3012,19 @@ impl Router {
     }
 
     /// Resolve the agent handler + check its cap token (shared by the agent POSTs).
-    fn agent_gate(&self, req: &ApiRequest) -> Result<&std::sync::Arc<dyn AgentHandler>, ApiResponse> {
+    fn agent_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn AgentHandler>, ApiResponse> {
         let handler = self
             .agent
             .as_ref()
             .ok_or_else(|| ApiResponse::error(404, "the agent is not enabled on this server"))?;
         if !Self::cap_ok(&self.agent_cap_token, req) {
-            return Err(ApiResponse::error(401, "missing or invalid capability token"));
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
         }
         Ok(handler)
     }
@@ -3044,7 +3056,9 @@ impl Router {
             _ => return ApiResponse::error(400, "pending and token are required"),
         };
         match handler.confirm(pending, token) {
-            Ok(summary) => ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary })),
+            Ok(summary) => {
+                ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary }))
+            }
             Err(e) => ApiResponse::error(409, &e),
         }
     }
@@ -3302,7 +3316,9 @@ impl Router {
             Ok(s) => Ok(s),
             // No migrated DB yet (first run): fall back to a writable open, which
             // creates + migrates it, so the endpoint still works before the first sync.
-            Err(_) => Store::open(&path).map_err(|e| ApiResponse::error(500, &format!("store: {e}"))),
+            Err(_) => {
+                Store::open(&path).map_err(|e| ApiResponse::error(500, &format!("store: {e}")))
+            }
         }
     }
 
@@ -4724,7 +4740,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             401
         );
         // correct token -> 200 + the turn id
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("agentsecret".into())));
+        let ok =
+            router.route(&ApiRequest::new("POST", q).with_cap_token(Some("agentsecret".into())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("turn-123"));
         // missing params -> 400
@@ -4792,7 +4809,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "agent line wrapped as data: {first}"
         );
         // Unknown path → None.
-        assert!(router.open_bridge_stream("/api/v1/nope", Some("s")).is_none());
+        assert!(router
+            .open_bridge_stream("/api/v1/nope", Some("s"))
+            .is_none());
     }
 
     #[test]
@@ -4828,7 +4847,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // no cap token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", &q)).status, 401);
         // with cap token -> 200 + an authorize URL the UI opens in the system browser
-        let ok = router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
+        let ok =
+            router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
         // redirect is optional now (manual flow) -> still 200 without it
@@ -4847,7 +4867,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // /api/v1/* without the session token is refused (sanity: the gate is on)...
         assert_eq!(
             router
-                .route(&ApiRequest::new("POST", "/api/v1/agent/cancel?turn=t").with_cap_token(Some("agentsecret".into())))
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/agent/cancel?turn=t")
+                        .with_cap_token(Some("agentsecret".into()))
+                )
                 .status,
             401
         );
@@ -6448,8 +6471,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(idle.status, 200);
         assert_eq!(body_json(&idle)["count"].as_u64(), Some(0));
         assert_eq!(
-            bare.route(&ApiRequest::new("POST", "/api/v1/onedrive/transfers/cancel?id=x"))
-                .status,
+            bare.route(&ApiRequest::new(
+                "POST",
+                "/api/v1/onedrive/transfers/cancel?id=x"
+            ))
+            .status,
             404
         );
 
@@ -6888,26 +6914,33 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         od.body_state = Some("missing".into()); // …but body not materialized
         let j = item_json(&od);
         assert_eq!(
-            j["has_body"], serde_json::json!(false),
+            j["has_body"],
+            serde_json::json!(false),
             "OneDrive body 'missing' must not be has_body despite local_path"
         );
         assert_eq!(j["body_state"], serde_json::json!("missing")); // state surfaced for the UI
         od.body_state = Some("available".into());
         assert_eq!(
-            item_json(&od)["has_body"], serde_json::json!(true),
+            item_json(&od)["has_body"],
+            serde_json::json!(true),
             "an available OneDrive body IS has_body"
         );
         // Non-OneDrive is unchanged: has_body from local_path, body_state ignored.
         let mut mail = Item::new("a", "mail", "m1", "Subject", "message");
         mail.body_state = Some("missing".into()); // irrelevant for mail
         assert_eq!(
-            item_json(&mail)["has_body"], serde_json::json!(false),
+            item_json(&mail)["has_body"],
+            serde_json::json!(false),
             "mail without local_path = no body"
         );
-        assert!(item_json(&mail).get("body_state").is_none(), "state fields are OneDrive-only");
+        assert!(
+            item_json(&mail).get("body_state").is_none(),
+            "state fields are OneDrive-only"
+        );
         mail.local_path = Some("mail/aa/m1.eml".into());
         assert_eq!(
-            item_json(&mail)["has_body"], serde_json::json!(true),
+            item_json(&mail)["has_body"],
+            serde_json::json!(true),
             "mail with local_path = has_body (unchanged semantics)"
         );
     }

@@ -331,10 +331,7 @@ mod tests {
         );
         // still there — a later biometric + consume succeeds
         assert!(reg.confirm_biometric(&id, 2));
-        assert_eq!(
-            reg.consume(&id, "delete", "me", "onenote", "p1", 3),
-            Ok(())
-        );
+        assert_eq!(reg.consume(&id, "delete", "me", "onenote", "p1", 3), Ok(()));
     }
 
     #[test]

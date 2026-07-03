@@ -1756,8 +1756,12 @@ mod tests {
     fn writes_do_not_blind_retry_on_429() {
         // Non-idempotent writes must be single-shot — a blind re-POST could double-apply;
         // their recovery is ledger-driven (#0D), not a retry here.
-        let (base, server) =
-            serve(vec![http_response(429, "Too Many Requests", "Retry-After: 0\r\n", "{}")]);
+        let (base, server) = serve(vec![http_response(
+            429,
+            "Too Many Requests",
+            "Retry-After: 0\r\n",
+            "{}",
+        )]);
         let c = GraphClient::new("tok");
         let r = c.post_json(&base, &serde_json::json!({"x": 1}));
         assert!(
@@ -1790,7 +1794,11 @@ mod tests {
         });
         let c = GraphClient::new("tok");
         let items = c.get_json_paged(&format!("{base}/p1")).unwrap();
-        assert_eq!(items.len(), 3, "both pages' value arrays must be concatenated");
+        assert_eq!(
+            items.len(),
+            3,
+            "both pages' value arrays must be concatenated"
+        );
         handle.join().unwrap();
     }
 
@@ -1812,7 +1820,10 @@ mod tests {
         let c = GraphClient::with_client(short, "tok");
         let start = std::time::Instant::now();
         let r = c.get_bytes(&format!("http://{addr}/x"));
-        assert!(r.is_err(), "a hung connection must time out, not block forever");
+        assert!(
+            r.is_err(),
+            "a hung connection must time out, not block forever"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "the timeout must fire promptly (was {:?})",
@@ -2139,7 +2150,9 @@ mod tests {
         let base = format!("http://{addr}");
         let mut pages: Vec<String> = Vec::new();
         for p in 0..5 {
-            let vals: Vec<String> = (0..60).map(|i| format!(r#"{{"id":"it-{p}-{i}"}}"#)).collect();
+            let vals: Vec<String> = (0..60)
+                .map(|i| format!(r#"{{"id":"it-{p}-{i}"}}"#))
+                .collect();
             let body = if p < 4 {
                 format!(
                     r#"{{"value":[{}],"@odata.nextLink":"{base}/p{}"}}"#,

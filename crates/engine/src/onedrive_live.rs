@@ -108,7 +108,11 @@ mod tests {
         let kids = OneDriveLister::list_children(&client, "FOLDER").unwrap();
         h.join().unwrap();
 
-        assert_eq!(kids.len(), 1, "the live listing returns the folder's children");
+        assert_eq!(
+            kids.len(),
+            1,
+            "the live listing returns the folder's children"
+        );
         assert_eq!(kids[0]["name"], "f.txt");
         // The whole point of Mode 1: no store row is written.
         assert_eq!(store.count_by_service("me", "onedrive").unwrap(), 0);

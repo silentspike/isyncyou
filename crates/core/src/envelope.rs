@@ -101,16 +101,19 @@ fn seal_with_chunk(plaintext: &[u8], key: &BodyKey, key_id: u32, chunk_size: u32
         .fill(&mut nonce_base)
         .expect("system RNG must be available");
     let header = build_header(key_id, chunk_size, plaintext.len() as u64, nonce_base);
-    let sealing = LessSafeKey::new(
-        UnboundKey::new(&AES_256_GCM, key).expect("AES-256 key is 32 bytes"),
-    );
+    let sealing =
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("AES-256 key is 32 bytes"));
     let mut out = Vec::with_capacity(header.len() + plaintext.len() + TAG_LEN);
     out.extend_from_slice(&header);
     let cs = chunk_size as usize;
     for (i, chunk) in plaintext.chunks(cs.max(1)).enumerate() {
         let mut buf = chunk.to_vec();
         sealing
-            .seal_in_place_append_tag(chunk_nonce(&nonce_base, i as u32), Aad::from(&header), &mut buf)
+            .seal_in_place_append_tag(
+                chunk_nonce(&nonce_base, i as u32),
+                Aad::from(&header),
+                &mut buf,
+            )
             .expect("seal cannot fail for a valid key/nonce");
         out.extend_from_slice(&buf);
     }
@@ -138,16 +141,17 @@ pub fn open(blob: &[u8], key: &BodyKey) -> Result<Vec<u8>, EnvelopeError> {
         return Err(EnvelopeError::Malformed("zero chunk size"));
     }
 
-    let opening = LessSafeKey::new(
-        UnboundKey::new(&AES_256_GCM, key).expect("AES-256 key is 32 bytes"),
-    );
+    let opening =
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("AES-256 key is 32 bytes"));
     let mut out = Vec::with_capacity(plaintext_len);
     let mut pos = HEADER_LEN;
     let mut i: u32 = 0;
     while out.len() < plaintext_len {
         let this_pt = (plaintext_len - out.len()).min(chunk_size);
         let ct_len = this_pt + TAG_LEN;
-        let end = pos.checked_add(ct_len).ok_or(EnvelopeError::Malformed("overflow"))?;
+        let end = pos
+            .checked_add(ct_len)
+            .ok_or(EnvelopeError::Malformed("overflow"))?;
         if end > blob.len() {
             return Err(EnvelopeError::Malformed("truncated body"));
         }
@@ -213,7 +217,10 @@ fn key_for_id(key_id: u32) -> Option<BodyKey> {
             return Some(k);
         }
     }
-    reg.older.iter().find(|(id, _)| *id == key_id).map(|(_, k)| *k)
+    reg.older
+        .iter()
+        .find(|(id, _)| *id == key_id)
+        .map(|(_, k)| *k)
 }
 
 /// Return the bytes to write to a body file: **sealed** when a body key is active, else the
@@ -276,7 +283,14 @@ mod tests {
 
     #[test]
     fn roundtrips_empty_small_and_multichunk() {
-        for len in [0usize, 1, 100, DEFAULT_CHUNK as usize, DEFAULT_CHUNK as usize + 1, 200_000] {
+        for len in [
+            0usize,
+            1,
+            100,
+            DEFAULT_CHUNK as usize,
+            DEFAULT_CHUNK as usize + 1,
+            200_000,
+        ] {
             let pt: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let blob = seal(&pt, &KEY, 1);
             assert_eq!(open(&blob, &KEY).unwrap(), pt, "roundtrip len={len}");
@@ -324,10 +338,16 @@ mod tests {
     #[test]
     fn malformed_blobs_error_not_panic() {
         assert!(matches!(open(b"", &KEY), Err(EnvelopeError::Malformed(_))));
-        assert!(matches!(open(b"short", &KEY), Err(EnvelopeError::Malformed(_))));
+        assert!(matches!(
+            open(b"short", &KEY),
+            Err(EnvelopeError::Malformed(_))
+        ));
         let mut blob = seal(b"hello world", &KEY, 1);
         blob.truncate(HEADER_LEN + 3); // header ok, body truncated
-        assert!(matches!(open(&blob, &KEY), Err(EnvelopeError::Malformed(_))));
+        assert!(matches!(
+            open(&blob, &KEY),
+            Err(EnvelopeError::Malformed(_))
+        ));
     }
 
     // One test owns the process-global key registry (so parallel tests don't race it).
@@ -342,7 +362,11 @@ mod tests {
         let pt = b"sensitive-onedrive-body-CONTENT-x".repeat(200);
         write_body_atomic(&path, &pt).unwrap();
         let on_disk = std::fs::read(&path).unwrap();
-        assert_eq!(blob_key_id(&on_disk), Some(1), "on-disk is a sealed envelope");
+        assert_eq!(
+            blob_key_id(&on_disk),
+            Some(1),
+            "on-disk is a sealed envelope"
+        );
         assert!(
             on_disk.windows(7).all(|w| w != b"CONTENT"),
             "no plaintext on disk"
@@ -369,6 +393,10 @@ mod tests {
         // Rotation: a new active key still lets the old (key_id 1) blob decrypt.
         set_body_key(2, [2u8; 32]);
         assert_eq!(active_key_id(), Some(2));
-        assert_eq!(read_body(&path).unwrap(), pt, "pre-rotation blob still decrypts");
+        assert_eq!(
+            read_body(&path).unwrap(),
+            pt,
+            "pre-rotation blob still decrypts"
+        );
     }
 }

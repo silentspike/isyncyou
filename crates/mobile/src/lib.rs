@@ -86,7 +86,8 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     let Some(router) = router else {
         return Vec::new();
     };
-    let resp = isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
+    let resp =
+        isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
     let ct = resp.content_type.as_bytes();
     // Extra response headers (e.g. the viewer's CSP) as "Key: Value\r\n", CRLF-sanitised.
     let mut hdrs = String::new();
@@ -378,9 +379,11 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeBridgeRe
         Err(_) => return std::ptr::null_mut(),
     };
     // Panic-isolate: a request-handling panic must never unwind across the FFI boundary.
-    let resp = std::panic::catch_unwind(AssertUnwindSafe(|| bridge_request(&req))).unwrap_or_else(
-        |_| r#"{"t":"res","id":null,"status":500,"body":"{\"error\":\"internal error\"}"}"#.to_string(),
-    );
+    let resp =
+        std::panic::catch_unwind(AssertUnwindSafe(|| bridge_request(&req))).unwrap_or_else(|_| {
+            r#"{"t":"res","id":null,"status":500,"body":"{\"error\":\"internal error\"}"}"#
+                .to_string()
+        });
     env.new_string(resp)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
@@ -400,7 +403,11 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
         Err(_) => return std::ptr::null_mut(),
     };
     let cookie: String = env.get_string(&cookie).map(Into::into).unwrap_or_default();
-    let cookie = if cookie.is_empty() { None } else { Some(cookie) };
+    let cookie = if cookie.is_empty() {
+        None
+    } else {
+        Some(cookie)
+    };
     let bytes = std::panic::catch_unwind(AssertUnwindSafe(|| asset_request(&path, cookie)))
         .unwrap_or_default();
     env.byte_array_from_slice(&bytes)
@@ -421,7 +428,10 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOp
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
-    let tok: String = env.get_string(&session_token).map(Into::into).unwrap_or_default();
+    let tok: String = env
+        .get_string(&session_token)
+        .map(Into::into)
+        .unwrap_or_default();
     let tok = if tok.is_empty() { None } else { Some(tok) };
     std::panic::catch_unwind(AssertUnwindSafe(|| stream_open(&path, tok.as_deref()))).unwrap_or(0)
 }
@@ -575,12 +585,18 @@ mod tests {
         let denied = bridge_request(
             r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
         );
-        assert!(denied.contains("\"status\":401"), "bridge must gate: {denied}");
+        assert!(
+            denied.contains("\"status\":401"),
+            "bridge must gate: {denied}"
+        );
         // With the token → reaches the handler (not a 401).
         let ok = bridge_request(&format!(
             r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
-        assert!(!ok.contains("\"status\":401"), "valid token must pass: {ok}");
+        assert!(
+            !ok.contains("\"status\":401"),
+            "valid token must pass: {ok}"
+        );
     }
 
     #[test]

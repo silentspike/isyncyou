@@ -627,10 +627,7 @@ impl Store {
             apply_sqlcipher_key(&conn, &secret)?;
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(Store {
-            conn,
-            _lock: None,
-        })
+        Ok(Store { conn, _lock: None })
     }
 
     /// In-memory store for tests (no lock, no WAL).
@@ -2122,7 +2119,10 @@ mod tests {
         s.upsert_item(&m).unwrap();
         // freshly ingested: no cached preview
         assert_eq!(
-            s.get_item("acc", "mail", "m1").unwrap().unwrap().preview_json,
+            s.get_item("acc", "mail", "m1")
+                .unwrap()
+                .unwrap()
+                .preview_json,
             None
         );
         // the read path caches the computed preview
@@ -2153,7 +2153,10 @@ mod tests {
         s.set_local_path("acc", "mail", "m1", Some("mail/aa/m1.eml"))
             .unwrap();
         assert_eq!(
-            s.get_item("acc", "mail", "m1").unwrap().unwrap().preview_json,
+            s.get_item("acc", "mail", "m1")
+                .unwrap()
+                .unwrap()
+                .preview_json,
             None,
             "the first body archive drops any stale cached preview"
         );
@@ -2180,7 +2183,10 @@ mod tests {
         s.set_local_path("acc", "mail", "m1", Some("mail/aa/m1.eml"))
             .unwrap();
         assert_eq!(
-            s.get_item("acc", "mail", "m1").unwrap().unwrap().preview_json,
+            s.get_item("acc", "mail", "m1")
+                .unwrap()
+                .unwrap()
+                .preview_json,
             None,
             "a changed body (new etag) must invalidate the cached preview"
         );
@@ -2269,7 +2275,10 @@ mod tests {
             attempts: 0,
             last_error: None,
         };
-        assert!(s.record_cloud_write(&op, 100).unwrap(), "first record inserts");
+        assert!(
+            s.record_cloud_write(&op, 100).unwrap(),
+            "first record inserts"
+        );
         // re-issue the SAME intent (same idempotency_key, different op_id) → deduped
         let mut dup = op.clone();
         dup.op_id = "op2".into();
@@ -2283,7 +2292,10 @@ mod tests {
         assert_eq!(pending[0].op_id, "op1");
         assert_eq!(pending[0].op_kind, "delete");
         assert_eq!(
-            s.cloud_write_by_key("a", "del-f1-E1").unwrap().unwrap().op_id,
+            s.cloud_write_by_key("a", "del-f1-E1")
+                .unwrap()
+                .unwrap()
+                .op_id,
             "op1"
         );
         // advance to applied → leaves the pending work-list, records result + attempt
@@ -2599,12 +2611,18 @@ mod tests {
         s.upsert_item(&item("a", "r4", "Lebenslauf.pdf")).unwrap();
         assert_eq!(s.search_names("a", "lebenslauf").unwrap().len(), 1);
         // v13: the name-only FTS trigger must still track a rename …
-        s.upsert_item(&item("a", "r1", "holiday summary.txt")).unwrap();
-        assert!(s.search_names("a", "report").unwrap().is_empty(), "old name must drop out");
+        s.upsert_item(&item("a", "r1", "holiday summary.txt"))
+            .unwrap();
+        assert!(
+            s.search_names("a", "report").unwrap().is_empty(),
+            "old name must drop out"
+        );
         assert_eq!(s.search_names("a", "holiday").unwrap()[0].remote_id, "r1");
         // … while a metadata-only update (no name change) leaves the index intact.
-        s.set_local_path("a", "onedrive", "r1", Some("od/aa/r1.bin")).unwrap();
-        s.set_preview_json("a", "onedrive", "r1", r#"{"x":1}"#).unwrap();
+        s.set_local_path("a", "onedrive", "r1", Some("od/aa/r1.bin"))
+            .unwrap();
+        s.set_preview_json("a", "onedrive", "r1", r#"{"x":1}"#)
+            .unwrap();
         assert_eq!(s.search_names("a", "holiday").unwrap()[0].remote_id, "r1");
     }
 
@@ -2719,7 +2737,11 @@ mod tests {
         // … but a read-only open goes straight through and sees the committed row.
         let reader = Store::open_readonly(&path).unwrap();
         assert_eq!(
-            reader.get_item("a", "onedrive", "r1").unwrap().unwrap().name,
+            reader
+                .get_item("a", "onedrive", "r1")
+                .unwrap()
+                .unwrap()
+                .name,
             "keep.txt"
         );
     }

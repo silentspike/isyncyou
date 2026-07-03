@@ -335,7 +335,8 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("cache_root and sync_root must differ")),
+            errs.iter()
+                .any(|e| e.contains("cache_root and sync_root must differ")),
             "expected cache/sync overlap error, got {errs:?}"
         );
     }

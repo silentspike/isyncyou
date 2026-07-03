@@ -116,8 +116,14 @@ mod tests {
     fn redact_blanks_bearer_and_secret_keys_but_keeps_context() {
         let raw = "GET /x Authorization: Bearer eyJabc.DEF-123_ghi request-id=abc-1 status=200";
         let r = redact(raw);
-        assert!(!r.contains("eyJabc.DEF-123_ghi"), "bearer token must be gone: {r}");
-        assert!(r.contains("request-id=abc-1"), "non-secret context kept: {r}");
+        assert!(
+            !r.contains("eyJabc.DEF-123_ghi"),
+            "bearer token must be gone: {r}"
+        );
+        assert!(
+            r.contains("request-id=abc-1"),
+            "non-secret context kept: {r}"
+        );
         assert!(r.contains("status=200"));
     }
 
@@ -125,13 +131,22 @@ mod tests {
     fn redact_blanks_token_values_in_json_and_query() {
         let json = r#"{"access_token":"SEKRET-AAA","name":"ada","refresh_token":"RRR.bbb"}"#;
         let r = redact(json);
-        assert!(!r.contains("SEKRET-AAA"), "access_token value must be redacted: {r}");
-        assert!(!r.contains("RRR.bbb"), "refresh_token value must be redacted: {r}");
+        assert!(
+            !r.contains("SEKRET-AAA"),
+            "access_token value must be redacted: {r}"
+        );
+        assert!(
+            !r.contains("RRR.bbb"),
+            "refresh_token value must be redacted: {r}"
+        );
         assert!(r.contains(r#""name":"ada""#), "non-secret field kept: {r}");
 
         let q = "code=OAUTH-CODE-XYZ&state=s1&client_secret=SHH";
         let rq = redact(q);
-        assert!(!rq.contains("OAUTH-CODE-XYZ"), "auth code must be redacted: {rq}");
+        assert!(
+            !rq.contains("OAUTH-CODE-XYZ"),
+            "auth code must be redacted: {rq}"
+        );
         assert!(!rq.contains("SHH"), "client_secret must be redacted: {rq}");
         assert!(rq.contains("state=s1"), "non-secret query kept: {rq}");
     }
@@ -153,7 +168,13 @@ mod tests {
         );
         assert!(line.contains("op=op-42"), "op-id present: {line}");
         assert!(line.contains("event=inflight"), "event present: {line}");
-        assert!(line.contains("request-id=graph-abc-9"), "request-id kept: {line}");
-        assert!(!line.contains("eyJLEAKED.tok_123"), "bearer must be gone: {line}");
+        assert!(
+            line.contains("request-id=graph-abc-9"),
+            "request-id kept: {line}"
+        );
+        assert!(
+            !line.contains("eyJLEAKED.tok_123"),
+            "bearer must be gone: {line}"
+        );
     }
 }
