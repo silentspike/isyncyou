@@ -8,11 +8,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-**OneDrive on Mobile (Phase 1 — Mode 1 Online)**
+**OneDrive on Mobile (Phase 1 — modes foundation)**
 - `graph`: `GraphClient::list_children` — live, fully paged (`@odata.nextLink` to
   completion) folder listing over the central retry policy; no store write (#647).
 - `engine`: `OneDriveLister` trait + `onedrive_lister` constructor surfacing the
   live listing for the daemon (read-capable, mobile-friendly token) (#647).
+- `core`: OneDrive per-folder mode policy — an account-scoped `onedrive_modes` map (a
+  `default_mode` plus per-folder `folder_modes`) in the config, with a pure `effective_mode`
+  resolver (the deepest explicit ancestor wins, else the account default) and a
+  tombstoned-entry cleanup helper. Distinct axis from the per-item `content_state` (#650).
 
 ## [1.0.0] — 2026-06-26
 

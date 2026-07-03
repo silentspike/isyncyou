@@ -1,8 +1,10 @@
 //! TOML configuration — the single source of truth shared by the daemon and GUI.
 //! Loaded once, validated, and written back atomically.
 
+use crate::onedrive_mode::OneDriveModes;
 use crate::recovery::atomic_write;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Which change-detection backend to use.
@@ -182,6 +184,11 @@ pub struct Config {
     /// Optional PBS backup target (snapshot/restore of the store).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pbs: Option<PbsConfig>,
+    /// Per-account OneDrive folder-mode policy (#650), keyed by account id. Kept here (not
+    /// on the literal-constructed `AccountConfig`) so it is purely additive: every
+    /// `Config { .. }` uses `..Default::default()`, so no other construction site changes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub onedrive_modes: BTreeMap<String, OneDriveModes>,
 }
 
 impl Config {
@@ -256,17 +263,44 @@ impl Config {
             errs.push("sync.delete_guard.max_absolute must be > 0".to_string());
         }
 
+        // Per-account OneDrive mode policy (#650): each `onedrive_modes` entry must name a
+        // configured account, and its folder-mode keys must be non-empty.
+        let known: std::collections::HashSet<&str> =
+            self.accounts.iter().map(|a| a.id.as_str()).collect();
+        for (acct, modes) in &self.onedrive_modes {
+            if !known.contains(acct.as_str()) {
+                errs.push(format!("onedrive_modes: unknown account id '{acct}'"));
+            }
+            errs.extend(modes.validation_errors(&format!("onedrive_modes[{acct}]")));
+        }
+
         if errs.is_empty() {
             Ok(())
         } else {
             Err(errs)
         }
     }
+
+    /// Effective OneDrive mode for a folder within an account. Falls back to `Online` when the
+    /// account has no mode policy. `ancestry` is deepest-first — see
+    /// [`crate::onedrive_mode::OneDriveModes::effective_mode`].
+    pub fn effective_mode(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        ancestry: &[&str],
+    ) -> crate::onedrive_mode::OneDriveMode {
+        self.onedrive_modes
+            .get(account_id)
+            .map(|m| m.effective_mode(folder_id, ancestry))
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onedrive_mode::OneDriveMode;
 
     fn account(id: &str) -> AccountConfig {
         AccountConfig {
@@ -480,5 +514,128 @@ mod tests {
         c.sync.delete_guard.max_absolute = 0; // bad
         let errs = c.validate().unwrap_err();
         assert!(errs.len() >= 2);
+    }
+
+    // ---- #650 AC1: onedrive_modes round-trips through TOML + defaults when omitted ----
+    #[test]
+    fn onedrive_modes_round_trip_and_default_when_omitted() {
+        // An explicit per-account policy round-trips, including a realistic OneDrive folder
+        // id that contains '!' (TOML must quote it as a key and reparse it identically).
+        let mut c = Config::default();
+        c.accounts.push(account("me"));
+        let mut modes = OneDriveModes {
+            default_mode: OneDriveMode::Sync,
+            ..Default::default()
+        };
+        modes
+            .folder_modes
+            .insert("01ABCDEF!123".to_string(), OneDriveMode::Offline);
+        modes
+            .folder_modes
+            .insert("01ABCDEF!456".to_string(), OneDriveMode::Sync);
+        c.onedrive_modes.insert("me".to_string(), modes);
+        c.validate().unwrap();
+
+        let s = c.to_toml().unwrap();
+        let back = Config::from_toml(&s).unwrap();
+        assert_eq!(back, c, "onedrive_modes round-trips through TOML");
+        assert_eq!(
+            back.onedrive_modes["me"].folder_modes["01ABCDEF!123"],
+            OneDriveMode::Offline,
+            "the '!'-bearing folder id survived TOML key quoting + reparse"
+        );
+
+        // Default-when-omitted: a config that never mentions [onedrive_modes] parses to an
+        // empty map (Config's derived Default carries the new field), and every folder then
+        // resolves to the Online default.
+        let toml = r#"
+            [[accounts]]
+            id = "me"
+            username = "me@outlook.com"
+            sync_root = "/d/od"
+            archive_root = "/d/a"
+        "#;
+        let c2 = Config::from_toml(toml).unwrap();
+        assert!(c2.onedrive_modes.is_empty());
+        assert_eq!(
+            c2.effective_mode("me", "any-folder", &[]),
+            OneDriveMode::Online
+        );
+        // An empty map is skipped on serialize (no noise in written configs).
+        assert!(!Config::default()
+            .to_toml()
+            .unwrap()
+            .contains("onedrive_modes"));
+
+        // A default (Online) default_mode is skipped on serialize but still round-trips.
+        let mut c3 = Config::default();
+        c3.accounts.push(account("me"));
+        let mut m3 = OneDriveModes::default(); // default_mode = Online
+        m3.folder_modes
+            .insert("f1".to_string(), OneDriveMode::Offline);
+        c3.onedrive_modes.insert("me".to_string(), m3);
+        let s3 = c3.to_toml().unwrap();
+        assert!(
+            !s3.contains("default_mode"),
+            "default Online is skipped: {s3}"
+        );
+        let back3 = Config::from_toml(&s3).unwrap();
+        assert_eq!(
+            back3.onedrive_modes["me"].default_mode,
+            OneDriveMode::Online
+        );
+        assert_eq!(back3, c3);
+    }
+
+    // ---- #650 AC3: validation rejects invalid entries ----
+    #[test]
+    fn onedrive_modes_validation_rejects_invalid_entries() {
+        // (1) an empty / whitespace-only folder-id key is rejected
+        let mut c = Config::default();
+        c.accounts.push(account("me"));
+        let mut modes = OneDriveModes::default();
+        modes
+            .folder_modes
+            .insert("  ".to_string(), OneDriveMode::Sync);
+        c.onedrive_modes.insert("me".to_string(), modes);
+        let errs = c.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("empty folder_modes key")),
+            "expected empty-key error, got {errs:?}"
+        );
+
+        // (2) a modes entry for an account that isn't configured is rejected
+        let mut c2 = Config::default();
+        c2.accounts.push(account("me"));
+        c2.onedrive_modes
+            .insert("ghost".to_string(), OneDriveModes::default());
+        let errs2 = c2.validate().unwrap_err();
+        assert!(
+            errs2
+                .iter()
+                .any(|e| e.contains("unknown account id 'ghost'")),
+            "expected unknown-account error, got {errs2:?}"
+        );
+    }
+
+    // ---- #650 AC3: validation rejects duplicate entries (TOML parser) ----
+    #[test]
+    fn onedrive_modes_duplicate_key_rejected_by_parser() {
+        // Two identical folder-id keys under the same account is a TOML duplicate-key error.
+        let toml = r#"
+            [[accounts]]
+            id = "me"
+            username = "me@outlook.com"
+            sync_root = "/d/od"
+            archive_root = "/d/a"
+
+            [onedrive_modes.me.folder_modes]
+            "01ABC!1" = "sync"
+            "01ABC!1" = "offline"
+        "#;
+        assert!(
+            Config::from_toml(toml).is_err(),
+            "duplicate folder_modes key must be rejected by the TOML parser"
+        );
     }
 }
