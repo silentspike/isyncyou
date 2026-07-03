@@ -131,7 +131,10 @@ mod tests {
         // A deeper explicit entry on `grandchild` itself beats the ancestor `child`.
         let m2 = modes(
             OneDriveMode::Online,
-            &[("child", OneDriveMode::Offline), ("grandchild", OneDriveMode::Sync)],
+            &[
+                ("child", OneDriveMode::Offline),
+                ("grandchild", OneDriveMode::Sync),
+            ],
         );
         assert_eq!(
             m2.effective_mode("grandchild", &["child", "root"]),
@@ -156,7 +159,10 @@ mod tests {
     fn effective_mode_folder_itself_beats_ancestors() {
         let m = modes(
             OneDriveMode::Online,
-            &[("folder", OneDriveMode::Sync), ("parent", OneDriveMode::Offline)],
+            &[
+                ("folder", OneDriveMode::Sync),
+                ("parent", OneDriveMode::Offline),
+            ],
         );
         // The folder's own explicit mode wins even though an ancestor is also explicit.
         assert_eq!(
@@ -186,14 +192,30 @@ mod tests {
     // ---- serde string form matches as_str --------------------------------------
     #[test]
     fn serde_lowercase_matches_as_str() {
-        assert_eq!(serde_json::to_string(&OneDriveMode::Offline).unwrap(), "\"offline\"");
-        assert_eq!(serde_json::to_string(&OneDriveMode::Sync).unwrap(), "\"sync\"");
-        assert_eq!(serde_json::to_string(&OneDriveMode::Online).unwrap(), "\"online\"");
+        assert_eq!(
+            serde_json::to_string(&OneDriveMode::Offline).unwrap(),
+            "\"offline\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OneDriveMode::Sync).unwrap(),
+            "\"sync\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OneDriveMode::Online).unwrap(),
+            "\"online\""
+        );
         let back: OneDriveMode = serde_json::from_str("\"sync\"").unwrap();
         assert_eq!(back, OneDriveMode::Sync);
         // as_str() is deckungsgleich with the serde form for every variant.
-        for m in [OneDriveMode::Online, OneDriveMode::Sync, OneDriveMode::Offline] {
-            assert_eq!(serde_json::to_string(&m).unwrap(), format!("\"{}\"", m.as_str()));
+        for m in [
+            OneDriveMode::Online,
+            OneDriveMode::Sync,
+            OneDriveMode::Offline,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&m).unwrap(),
+                format!("\"{}\"", m.as_str())
+            );
         }
         // Online is the default (used for skip-when-default).
         assert_eq!(OneDriveMode::default(), OneDriveMode::Online);

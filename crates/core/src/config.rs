@@ -562,7 +562,10 @@ mod tests {
             OneDriveMode::Online
         );
         // An empty map is skipped on serialize (no noise in written configs).
-        assert!(!Config::default().to_toml().unwrap().contains("onedrive_modes"));
+        assert!(!Config::default()
+            .to_toml()
+            .unwrap()
+            .contains("onedrive_modes"));
 
         // A default (Online) default_mode is skipped on serialize but still round-trips.
         let mut c3 = Config::default();
@@ -572,9 +575,15 @@ mod tests {
             .insert("f1".to_string(), OneDriveMode::Offline);
         c3.onedrive_modes.insert("me".to_string(), m3);
         let s3 = c3.to_toml().unwrap();
-        assert!(!s3.contains("default_mode"), "default Online is skipped: {s3}");
+        assert!(
+            !s3.contains("default_mode"),
+            "default Online is skipped: {s3}"
+        );
         let back3 = Config::from_toml(&s3).unwrap();
-        assert_eq!(back3.onedrive_modes["me"].default_mode, OneDriveMode::Online);
+        assert_eq!(
+            back3.onedrive_modes["me"].default_mode,
+            OneDriveMode::Online
+        );
         assert_eq!(back3, c3);
     }
 
@@ -602,7 +611,9 @@ mod tests {
             .insert("ghost".to_string(), OneDriveModes::default());
         let errs2 = c2.validate().unwrap_err();
         assert!(
-            errs2.iter().any(|e| e.contains("unknown account id 'ghost'")),
+            errs2
+                .iter()
+                .any(|e| e.contains("unknown account id 'ghost'")),
             "expected unknown-account error, got {errs2:?}"
         );
     }
