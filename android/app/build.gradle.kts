@@ -98,6 +98,9 @@ android {
             )
             if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
         }
+        debug {
+            applicationIdSuffix = ".debug"
+        }
     }
 
     compileOptions {
@@ -112,6 +115,9 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.webkit:webkit:1.11.0")
+    // Biometric per-action confirmation for destructive ops (#onedrive-mobile 0.6).
+    // Pulls androidx.fragment; MainActivity is a FragmentActivity for BiometricPrompt.
+    implementation("androidx.biometric:biometric:1.1.0")
     // Firebase Cloud Messaging via the BoM (#575) — version-aligned, messaging only.
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")
@@ -131,9 +137,14 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     // One -t per ABI; cargo-ndk maps arm64-v8a -> aarch64-linux-android and
     // x86_64 -> x86_64-linux-android, building each requested target's .so.
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
+    // EXPERIMENTAL opt-in (risk R8): a personal build can enable extra cargo features
+    // (e.g. agent-subscription-experimental) via ISY_CARGO_FEATURES. Unset in CI/release,
+    // so the default artifact never carries the subscription login.
+    val extraFeatures = System.getenv("ISY_CARGO_FEATURES")
+    val featureFlags = if (!extraFeatures.isNullOrBlank()) listOf("--features", extraFeatures) else emptyList()
     commandLine(
         listOf(cargo, "+$toolchain", "ndk") + targetFlags +
-            listOf("-o", "android/app/src/main/jniLibs", "build", "-p", "isyncyou-mobile", "--release"),
+            listOf("-o", "android/app/src/main/jniLibs", "build", "-p", "isyncyou-mobile", "--release") + featureFlags,
     )
 }
 tasks.named("preBuild") { dependsOn(cargoNdkBuild) }
