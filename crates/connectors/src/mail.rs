@@ -163,7 +163,7 @@ pub fn backup_message_bodies<F: MimeFetcher>(
         }
         // tmp + rename: a crash never leaves a half-written .eml in place.
         let tmp = abs.with_extension("eml.part");
-        std::fs::write(&tmp, &mime)?;
+        std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&mime))?;
         std::fs::rename(&tmp, &abs)?;
 
         let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
@@ -197,7 +197,7 @@ pub fn index_mail_bodies(
         if limit != 0 && indexed >= limit {
             break;
         }
-        let bytes = std::fs::read(archive_root.join(rel))?;
+        let bytes = isyncyou_core::envelope::read_body(&archive_root.join(rel))?;
         let text = extract_text(&bytes);
         store.index_body(account, SERVICE, &msg.remote_id, &text)?;
         indexed += 1;
@@ -228,7 +228,7 @@ fn archive_json_item(
     }
     let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
     let tmp = abs.with_extension("json.part");
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
     std::fs::rename(&tmp, &abs)?;
     let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
     store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
@@ -311,7 +311,7 @@ fn write_message_json(archive_root: &Path, id: &str, msg: &Value) -> Result<(), 
     }
     let bytes = serde_json::to_vec(msg).map_err(|e| SyncError::Malformed(e.to_string()))?;
     let tmp = abs.with_extension("json.part");
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
     std::fs::rename(&tmp, &abs)?;
     Ok(())
 }
@@ -357,7 +357,7 @@ pub fn backfill_mail_senders(
             continue;
         }
         let p = shard_path(archive_root, SERVICE, &it.remote_id, "json");
-        let Ok(bytes) = std::fs::read(&p) else {
+        let Ok(bytes) = isyncyou_core::envelope::read_body(&p) else {
             continue; // no sidecar (e.g. never body-archived) — leave for next sync
         };
         let Ok(o) = serde_json::from_slice::<Value>(&bytes) else {

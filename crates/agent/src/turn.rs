@@ -14,11 +14,22 @@ pub enum Role {
     Tool,
 }
 
-/// One conversation message.
+/// A tool call the assistant made, recorded on its turn so a real provider can
+/// round-trip it (assistant `tool_use` ↔ the matching `tool_result`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolUseRef {
+    pub id: String,
+    pub input: serde_json::Value,
+}
+
+/// One conversation message. `tool_uses` is set on assistant turns that called tools;
+/// `tool_use_id` is set on tool-result turns to bind them to the call they answer.
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    pub tool_uses: Vec<ToolUseRef>,
+    pub tool_use_id: Option<String>,
 }
 
 impl Message {
@@ -26,6 +37,26 @@ impl Message {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_uses: Vec::new(),
+            tool_use_id: None,
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>, tool_uses: Vec<ToolUseRef>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_uses,
+            tool_use_id: None,
+        }
+    }
+
+    pub fn tool(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_uses: Vec::new(),
+            tool_use_id: Some(tool_use_id.into()),
         }
     }
 }
@@ -35,6 +66,20 @@ impl Message {
 /// return canned data.
 pub trait ToolExecutor {
     fn execute_read(&self, action: &ToolAction) -> Result<String, crate::AgentError>;
+
+    /// Execute a read that MAY stream intermediate progress via `emit` — used by the
+    /// progressive search (S-AG.18/#643) to emit `SearchStage`/`PartialResult` between
+    /// the fast, full-text and deep passes — returning the same final JSON as
+    /// [`execute_read`]. The default is non-streaming (delegates), so the stub and other
+    /// executors are unaffected.
+    fn execute_read_streamed(
+        &self,
+        action: &ToolAction,
+        emit: &mut dyn FnMut(StreamEvent),
+    ) -> Result<String, crate::AgentError> {
+        let _ = emit;
+        self.execute_read(action)
+    }
 }
 
 /// How a turn ended.
@@ -66,86 +111,85 @@ pub fn run_turn(
 
     for _ in 0..MAX_STEPS {
         let blocks = provider.next(history, emit)?;
-        let mut any_tool = false;
-        let mut text_this = String::new();
 
+        // Collect the assistant turn: its text + the tool calls it made.
+        let mut text_this = String::new();
+        let mut tool_uses: Vec<ToolUseRef> = Vec::new();
         for block in blocks {
             match block {
                 AssistantBlock::Text(t) => text_this.push_str(&t),
-                AssistantBlock::ToolUse { id, input } => {
-                    any_tool = true;
-
-                    // Tool calls come ONLY from the provider's tool_use structure —
-                    // never parsed out of content — so retrieved (untrusted) text can
-                    // never become an action (REQ-AGENT-005).
-                    let action = match parse_action(&input) {
-                        Ok(a) => a,
-                        Err(help) => {
-                            // `--help`-on-error: feed the help back as a tool result.
-                            emit(StreamEvent::ToolResult {
-                                id: id.clone(),
-                                content: help.clone(),
-                                untrusted: false,
-                            });
-                            history.push(Message {
-                                role: Role::Tool,
-                                content: help,
-                            });
-                            continue;
-                        }
-                    };
-
-                    emit(StreamEvent::ToolCall {
-                        id: id.clone(),
-                        name: TOOL_NAME.to_string(),
-                        input,
-                    });
-
-                    match action.class() {
-                        ToolClass::Read => {
-                            let result = executor.execute_read(&action)?;
-                            // Results carrying archived content are untrusted input.
-                            emit(StreamEvent::ToolResult {
-                                id: id.clone(),
-                                content: result.clone(),
-                                untrusted: true,
-                            });
-                            history.push(Message {
-                                role: Role::Tool,
-                                content: result,
-                            });
-                        }
-                        ToolClass::Destructive => {
-                            // Never execute here — stop the turn for human confirmation.
-                            let preview =
-                                format!("Requires confirmation — {} {:?}", action.op(), action);
-                            emit(StreamEvent::ConfirmationRequired {
-                                id: id.clone(),
-                                action: action.clone(),
-                                preview: preview.clone(),
-                            });
-                            return Ok(TurnOutcome::PendingConfirmation {
-                                id,
-                                action,
-                                preview,
-                            });
-                        }
-                    }
-                }
+                AssistantBlock::ToolUse { id, input } => tool_uses.push(ToolUseRef { id, input }),
             }
         }
 
-        if !text_this.is_empty() {
-            history.push(Message {
-                role: Role::Assistant,
-                content: text_this.clone(),
-            });
-            final_text = text_this;
+        // Record the assistant message (text + its tool_use calls) so the NEXT request
+        // round-trips correctly (tool_use ↔ tool_result by id).
+        if !text_this.is_empty() || !tool_uses.is_empty() {
+            history.push(Message::assistant(text_this.clone(), tool_uses.clone()));
+            if !text_this.is_empty() {
+                final_text = text_this;
+            }
         }
 
-        if !any_tool {
+        // No tool calls → the turn is done.
+        if tool_uses.is_empty() {
             emit(StreamEvent::Done);
             return Ok(TurnOutcome::Final { text: final_text });
+        }
+
+        // Execute each tool call. Tool calls come ONLY from the provider's tool_use
+        // structure — never parsed out of content — so retrieved (untrusted) text can
+        // never become an action (REQ-AGENT-005).
+        for tu in tool_uses {
+            let action = match parse_action(&tu.input) {
+                Ok(a) => a,
+                Err(help) => {
+                    // `--help`-on-error: feed the help back as a tool result.
+                    emit(StreamEvent::ToolResult {
+                        id: tu.id.clone(),
+                        content: help.clone(),
+                        untrusted: false,
+                    });
+                    history.push(Message::tool(tu.id, help));
+                    continue;
+                }
+            };
+
+            emit(StreamEvent::ToolCall {
+                id: tu.id.clone(),
+                name: TOOL_NAME.to_string(),
+                input: tu.input.clone(),
+            });
+
+            match action.class() {
+                ToolClass::Read => {
+                    // Streamed read: a progressive search emits its stage/partial-result
+                    // events via `emit` before returning the final JSON (S-AG.18/#643);
+                    // all other reads delegate to the plain path (default impl).
+                    let result = executor.execute_read_streamed(&action, emit)?;
+                    // Results carrying archived content are untrusted input.
+                    emit(StreamEvent::ToolResult {
+                        id: tu.id.clone(),
+                        content: result.clone(),
+                        untrusted: true,
+                    });
+                    history.push(Message::tool(tu.id, result));
+                }
+                ToolClass::Destructive => {
+                    // Never execute here — stop the turn for human confirmation.
+                    let preview = format!("Requires confirmation — {} {:?}", action.op(), action);
+                    emit(StreamEvent::ConfirmationRequired {
+                        id: tu.id.clone(),
+                        action: action.clone(),
+                        preview: preview.clone(),
+                    });
+                    return Ok(TurnOutcome::PendingConfirmation {
+                        id: tu.id,
+                        action,
+                        preview,
+                    });
+                }
+            }
         }
     }
 
@@ -223,6 +267,20 @@ mod tests {
             }
         )));
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Done)));
+
+        // History must round-trip: the assistant turn records its tool_use, and the
+        // tool-result turn binds back to it by id (so a real provider can pair them).
+        let assistant = history
+            .iter()
+            .find(|m| m.role == Role::Assistant && !m.tool_uses.is_empty())
+            .expect("assistant turn with a tool call");
+        assert_eq!(assistant.tool_uses[0].id, "t1");
+        let tool = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool-result turn");
+        assert_eq!(tool.tool_use_id.as_deref(), Some("t1"));
+        assert!(tool.content.contains("item-42"));
     }
 
     #[test]

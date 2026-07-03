@@ -230,7 +230,7 @@ pub fn backup_contact_photos<F: BytesFetcher>(
                     std::fs::create_dir_all(parent)?;
                 }
                 let tmp = abs.with_extension("jpg.part");
-                std::fs::write(&tmp, &bytes)?;
+                std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
                 std::fs::rename(&tmp, &abs)?;
                 report.downloaded += 1;
                 report.bytes += bytes.len() as u64;

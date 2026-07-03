@@ -6,7 +6,12 @@
 
 pub mod config;
 pub mod conflict;
+pub mod envelope;
 pub mod guard;
+pub mod obs;
+pub mod onedrive_mode;
+pub mod pending;
+pub mod policy;
 pub mod recovery;
 pub mod sync_state;
 
@@ -16,5 +21,6 @@ pub use conflict::{
     Resolution, Versus,
 };
 pub use guard::{DeleteGuard, Direction, GuardVerdict};
+pub use onedrive_mode::{OneDriveMode, OneDriveModes};
 pub use recovery::{atomic_write, HealthStatus, Journal, JournalEntry, SelfCheck};
 pub use sync_state::{SyncEvent, SyncState};

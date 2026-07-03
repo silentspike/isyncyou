@@ -172,19 +172,22 @@ requirements:
   # in-process and serves the web UI over loopback — no desktop daemon. Supersedes the
   # daemon-less direct-Graph-JS direction (ADR-003); see ADR-005 for the chosen path.
   - id: REQ-AND-011
-    title: The standalone app embeds the engine and serves the UI over loopback
+    title: The standalone app embeds the engine and serves the UI in-process (no loopback port)
     statement: >
-      A native library (libisyncyou_mobile.so) runs the real iSyncYou engine in the
-      app process and serves the web UI on an OS-assigned loopback port; the WebView
-      loads http://127.0.0.1:<port>/. start is idempotent (Activity recreation reuses
-      the running port) and panic-isolated (a request panic cannot kill the app).
+      A native library (libisyncyou_mobile.so) runs the real iSyncYou engine in the app
+      process. Since #onedrive-mobile 0A the WebView reaches it fully in-process — an
+      origin-bound message bridge for the data API plus shouldInterceptRequest for GET
+      assets — so NO loopback TCP port is exposed in the default build (a loopback server
+      is bound only under the experimental agent-subscription feature). start is idempotent
+      (Activity recreation reuses the running engine + session token) and panic-isolated
+      (a request panic cannot kill the app).
     status: implemented
     acceptance:
-      - Starting the engine binds a real loopback port.
-      - A second start returns the same port (no double-bind).
-      - The session token is set before serving.
+      - Starting the engine is idempotent and mints a per-process session token.
+      - A second start reuses the running engine (no re-init, same token).
+      - No TCP listener is opened in the default build (in-process bridge transport).
     verified_by:
-      - test: start_engine_binds_a_port_and_is_idempotent
+      - test: start_engine_is_idempotent_and_mints_a_session_token
   - id: REQ-AND-012
     title: The mobile loopback data API is fully session-token gated
     statement: >
@@ -201,12 +204,14 @@ requirements:
       - test: session_token_gates_data_routes_over_http
       - test: session_gate_requires_token_on_data_routes
   - id: REQ-AND-013
-    title: The mobile profile is a cache, never a backup-of-record (restore off)
+    title: The mobile profile omits crash-unsafe restore-cloud; share is gated, not absent
     statement: >
-      The phone is a live companion; the laptop holds the backup. build_live_router
-      omits the restore and outbound-share handlers, so those routes 404 on mobile and
-      the UI hides every restore action (no restore capability token is injected). The
-      UI wording reads "cached on this device", not "backup".
+      The phone is a live companion; the laptop holds the backup. build_live_router omits
+      the restore-cloud handler, so /api/v1/restore 404s on mobile and the UI hides every
+      restore action (no restore capability token is injected); the UI wording reads
+      "cached on this device", not "backup". Since #onedrive-mobile 0.9 outbound SHARE is
+      wired into the shared router (so it is reachable, cap-gated) and, on mobile, is
+      additionally guarded by the biometric per-action token (0.6) — it is gated, not absent.
       NOTE: planned supersession — the in-app agent (Epic #614) makes the phone a full
       cloud-write node (REQ-AND-016, story S-AG.10/#625). This requirement holds and is
       enforced until that ships with its full Android security model; it is not dropped,
@@ -214,10 +219,12 @@ requirements:
     status: implemented
     superseded_by: REQ-AND-016
     acceptance:
-      - A POST to /api/v1/restore or /api/v1/share is 404 in the mobile router.
-      - A wired live-write route is reached (cap-gated 401), proving omission is selective.
+      - A POST to /api/v1/restore is 404 in the mobile router (restore-cloud omitted).
+      - Share is wired (cap-gated 401 without a token, not 404), proving omission is selective.
+      - On mobile, a gated destructive op requires the biometric per-action token (0.6).
     verified_by:
-      - test: mobile_live_router_omits_restore_and_share
+      - test: mobile_live_router_wires_share_but_omits_restore
+      - test: share_is_biometric_gated_on_mobile
   - id: REQ-AND-014
     title: A single device-code login fills the on-device cache
     statement: >

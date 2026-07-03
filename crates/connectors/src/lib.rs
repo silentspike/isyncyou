@@ -21,6 +21,7 @@ pub mod onedrive;
 pub mod onenote;
 pub mod quickxor;
 pub mod restore;
+pub mod scope;
 pub mod shared;
 pub mod todo;
 
@@ -60,6 +61,7 @@ pub use restore::{
     restore_task, sanitize_contact, sanitize_event, sanitize_task, MessageCreator,
     OneNoteResourcePart, PageCreator, Restorer,
 };
+pub use scope::{owning_scope, FolderScope, Mode};
 pub use shared::{sync_shared_with_me, SharedReport};
 pub use todo::{
     backup_task_subresources, backup_todo_list_flanks, extract_task_attachment,

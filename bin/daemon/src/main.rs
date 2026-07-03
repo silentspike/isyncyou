@@ -260,7 +260,6 @@ fn run(args: &Args) -> Result<(), String> {
     // Capability tokens for the daemon-only destructive actions; the live-handler
     // tokens are minted inside build_live_router (#89).
     let cap_token = isyncyou_app_host::mint_cap_token();
-    let share_cap_token = isyncyou_app_host::mint_cap_token();
     let push_cap_token = isyncyou_app_host::mint_cap_token();
     // Live cloud-poll interval (#559): seeded from config, adjusted live by the
     // settings POST, read by the sync loop each tick.
@@ -295,11 +294,8 @@ fn run(args: &Args) -> Result<(), String> {
             as Arc<dyn isyncyou_webui::RestoreHandler>,
         cap_token.clone(),
     )
-    .with_share(
-        Arc::new(isyncyou_app_host::DaemonShare::new(cfg.clone()))
-            as Arc<dyn isyncyou_webui::ShareHandler>,
-        share_cap_token,
-    )
+    // Outbound share is now wired inside build_live_router (#onedrive-mobile 0.9) so both
+    // desktop and mobile get it; no separate daemon wiring here.
     .with_push(
         push_notifier.clone() as Arc<dyn isyncyou_webui::PushHandler>,
         push_cap_token,

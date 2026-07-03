@@ -11,10 +11,38 @@ authors.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Session crypto: AES-256-GCM + HKDF (key from the cross-device pairing secret) + CSPRNG
+# for salts/nonces/ULID randomness. ring is already in the workspace (graph uses it).
+ring = "0.17"
+base64 = "0.22"
 # Live LLM HTTP transport (the agent's OWN client, not GraphClient). Off by default so
 # the pure-logic build (loop, tools, FakeProvider) stays fast and dependency-light;
 # the retry/backoff classification is pure and tested without this feature.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+# Real archive retrieval (Store + Config + export). Optional/off by default so the
+# pure core (loop, tools, FakeProvider, ArchiveSource logic) stays light; pulling the
+# store also pulls SQLCipher. The executor logic is generic over `ArchiveSource` and is
+# tested with an in-memory fake without this feature.
+isyncyou-store = { path = "../store", default-features = false, optional = true }
+isyncyou-core = { path = "../core", optional = true }
+isyncyou-connectors = { path = "../connectors", default-features = false, optional = true }
+# OneDrive session transport (real network). Optional/off by default so the pure session
+# model + crypto (tested over an in-memory transport) stay light. The caller passes a
+# pre-resolved Files.ReadWrite token, so no engine dependency is needed here.
+isyncyou-graph = { path = "../graph", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 http = ["dep:reqwest"]
+onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http"]
+# Match the desktop encrypted profile so store's rusqlite bundling resolves and unifies
+# with the rest of the workspace (everyone on encrypted-store → no bundling conflict).
+retrieval = ["dep:isyncyou-store", "dep:isyncyou-core", "dep:isyncyou-connectors", "isyncyou-store/encrypted-store"]
+# EXPERIMENTAL, UNSUPPORTED, personal-build only (S-AG.12/#627). Off by default; never in
+# CI/release artifacts or the README. The operator logs in via the official OAuth
+# device-code flow first; this harness then uses that legitimately-obtained token. The
+# wire details (endpoint, identity/billing headers, system prefix) come from a local,
+# uncommitted config — no reproducible recipe lives in the repo.
+agent-subscription-experimental = ["http"]
