@@ -8,11 +8,14 @@
 //! changes) layers on top using the same crates.
 
 use crate::common::shard_path;
-use isyncyou_graph::{run_delta, DeltaCursor, DeltaError, Transport};
+use crate::scope::{owning_scope, FolderScope};
+use isyncyou_graph::{
+    classify, run_delta, DeltaCursor, DeltaError, GraphAction, Outcome, Pacer, Transport,
+};
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store, StoreError};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const ROOT_DELTA: &str = "https://graph.microsoft.com/v1.0/me/drive/root/delta";
@@ -190,6 +193,287 @@ fn write_item_json(archive_root: &Path, id: &str, item: &Value) -> Result<(), Sy
 /// Drop the archived metadata sidecar when its item is tombstoned.
 fn remove_item_json(archive_root: &Path, id: &str) {
     let _ = std::fs::remove_file(shard_path(archive_root, SERVICE, id, "json"));
+}
+
+// ---- Scoped per-folder delta (Mode 2/3, S-OM.7) --------------------------------
+//
+// Additive to `incremental_sync` (the global-root desktop/FUSE path). Mode 2/3 sync
+// only the configured folders: for each `FolderScope` we walk that folder's own
+// `driveItem` delta — which Graph reports **recursively over the subtree** — with a
+// per-folder cursor. Because a configured parent and child overlap (the parent delta
+// reports the child's items too), `owning_scope` assigns each item to the deepest
+// active ancestor, so an item belongs to exactly one active scope.
+
+/// The per-folder recursive delta endpoint (analogue of `ROOT_DELTA`).
+fn item_delta_url(folder_id: &str) -> String {
+    format!("https://graph.microsoft.com/v1.0/me/drive/items/{folder_id}/delta")
+}
+
+/// Build an item's ancestry `[id, parent, grandparent, …]` (deepest first) by walking
+/// `parent_remote_id` through the store. Follows **tombstoned** intermediate folders
+/// too (`get_item` does not filter deleted rows), so a whole-subtree delete still
+/// resolves ownership. Bounded against cycles / pathological depth.
+fn store_ancestry(store: &Store, account: &str, id: &str) -> Result<Vec<String>, SyncError> {
+    let mut chain = vec![id.to_string()];
+    let mut seen: HashSet<String> = std::iter::once(id.to_string()).collect();
+    let mut cur = id.to_string();
+    while chain.len() < 256 {
+        match store
+            .get_item(account, SERVICE, &cur)?
+            .and_then(|it| it.parent_remote_id)
+        {
+            Some(p) if seen.insert(p.clone()) => {
+                chain.push(p.clone());
+                cur = p;
+            }
+            _ => break,
+        }
+    }
+    Ok(chain)
+}
+
+/// Number of active scope roots on a folder's ancestry — its "depth" for deepest-first
+/// scope ordering. A scope root owns at least itself, so this is ≥1 once its hierarchy
+/// is in the store; unknown ancestors just yield a shallower (safe) estimate.
+fn scope_depth(store: &Store, account: &str, folder_id: &str, active: &BTreeSet<&str>) -> usize {
+    store_ancestry(store, account, folder_id)
+        .map(|chain| {
+            chain
+                .iter()
+                .filter(|id| active.contains(id.as_str()))
+                .count()
+        })
+        .unwrap_or(1)
+}
+
+/// Walk one folder-scoped delta **page by page**, persisting the cursor after every
+/// page. On each 2xx page: ingest it (`on_page`) *then* persist — a `@odata.nextLink`
+/// is stored as the cursor so a crash resumes from the last completed page; the
+/// `@odata.deltaLink` is adopted only at the very end. The stored cursor is polymorph
+/// (a `nextLink` mid-enumeration or a `deltaLink` once caught up) and is followed
+/// uniformly as "the next url". Retry/backoff and `410 Gone` resync mirror
+/// [`isyncyou_graph::run_delta`], reusing its public building blocks so this does not
+/// touch the graph crate. Returns whether a `410` resync happened.
+fn walk_scope_delta<T, F>(
+    transport: &mut T,
+    store: &Store,
+    account: &str,
+    scope_id: &str,
+    base_url: &str,
+    max_retries: u32,
+    mut on_page: F,
+) -> Result<bool, SyncError>
+where
+    T: Transport,
+    F: FnMut(&[Value]) -> Result<(), SyncError>,
+{
+    let mut url = store
+        .get_delta_cursor(account, SERVICE, scope_id)?
+        .unwrap_or_else(|| base_url.to_string());
+    let mut resynced = false;
+    let mut retries = 0u32;
+    let mut pacer = Pacer::new();
+
+    loop {
+        let resp = transport.get(&url);
+        match classify(resp.status, resp.retry_after) {
+            GraphAction::Ok => {
+                retries = 0;
+                pacer.update(Outcome::Ok);
+                let body = resp.body.ok_or(SyncError::Delta(DeltaError::MissingBody))?;
+                if let Some(arr) = body.get("value").and_then(|v| v.as_array()) {
+                    // Ingest the page BEFORE advancing the cursor, so a crash resumes
+                    // at this page and re-ingest is idempotent (upsert by id,
+                    // deterministic name mapping, mark_deleted set-once).
+                    on_page(arr)?;
+                }
+                if let Some(next) = body.get("@odata.nextLink").and_then(|v| v.as_str()) {
+                    store.set_delta_cursor(account, SERVICE, scope_id, next)?;
+                    url = next.to_string();
+                    continue;
+                }
+                if let Some(delta) = body.get("@odata.deltaLink").and_then(|v| v.as_str()) {
+                    store.set_delta_cursor(account, SERVICE, scope_id, delta)?;
+                    return Ok(resynced);
+                }
+                return Err(SyncError::Delta(DeltaError::NoCursor));
+            }
+            GraphAction::Retry { after } => {
+                retries += 1;
+                if retries > max_retries {
+                    return Err(SyncError::Delta(DeltaError::TooManyRetries));
+                }
+                transport.backoff(pacer.update(Outcome::Retry { after }));
+                continue;
+            }
+            GraphAction::Resync => {
+                // 410 Gone: the stored token is stale. Drop it so a crash mid-resync
+                // restarts cleanly from base_url, then re-walk the whole subtree.
+                store.clear_delta_cursor(account, SERVICE, scope_id)?;
+                resynced = true;
+                retries = 0;
+                url = base_url.to_string();
+                continue;
+            }
+            GraphAction::RefreshAuth => return Err(SyncError::Delta(DeltaError::AuthExpired)),
+            _ => return Err(SyncError::Delta(DeltaError::Fatal(resp.status))),
+        }
+    }
+}
+
+/// The ownership context for a scoped ingest: the scope currently being walked plus
+/// the full set of active scope roots (for deepest-wins resolution).
+struct ScopeCtx<'a> {
+    scope_id: &'a str,
+    active: &'a BTreeSet<&'a str>,
+}
+
+/// Ingest one delta item under a specific scope, applying scope-ownership.
+///
+/// Tombstone rule (corrected for OneDrive's recursive/nested delta — the mail
+/// `parent_remote_id == folder_id` check would leak nested deletes): decide purely via
+/// `owning_scope` over the whole subtree. Tombstone **unless** the item provably lives
+/// in a *different* active scope (a move-in already applied by that scope's delta →
+/// don't clobber). Owned by this scope (incl. deeply nested) or unknown → tombstone
+/// (`mark_deleted` is a no-op if there is no row, and a real tombstone for an orphan).
+/// Non-removed items are upserted by id (idempotent, id-stable move); the return value
+/// counts the item under its **owning** scope (an item a deeper scope owns is reported
+/// `Skipped` here — one active scope per item).
+fn ingest_item_scoped(
+    store: &Store,
+    map: &mut MappingTable,
+    account: &str,
+    ctx: &ScopeCtx,
+    item: &Value,
+    now: &str,
+    archive_root: Option<&Path>,
+) -> Result<Ingest, SyncError> {
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SyncError::Malformed("item has no id".into()))?;
+
+    if item.get("deleted").is_some() || item.get("@removed").is_some() {
+        let ancestry = store_ancestry(store, account, id)?;
+        let refs: Vec<&str> = ancestry.iter().map(String::as_str).collect();
+        if let Some(owner) = owning_scope(&refs, ctx.active) {
+            if owner != ctx.scope_id {
+                // Moved into a different active scope — that scope's delta already
+                // reparented the id; removing it here would clobber the move.
+                return Ok(Ingest::Skipped);
+            }
+        }
+        store.mark_deleted(account, SERVICE, id, now)?;
+        if let Some(root) = archive_root {
+            remove_item_json(root, id);
+        }
+        return Ok(Ingest::Deleted);
+    }
+
+    // The drive root has a `root` facet and no usable parent/name — skip it.
+    if item.get("root").is_some() {
+        return Ok(Ingest::Skipped);
+    }
+
+    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    let parent = item
+        .get("parentReference")
+        .and_then(|p| p.get("id"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let is_folder = item.get("folder").is_some();
+    let local_name = match &parent {
+        Some(p) => map.assign_local_name(p, name),
+        None => name.to_string(),
+    };
+
+    let mut it = Item::new(
+        account,
+        SERVICE,
+        id,
+        name,
+        if is_folder { "folder" } else { "file" },
+    );
+    it.parent_remote_id = parent;
+    it.local_path = Some(local_name);
+    it.etag = item.get("eTag").and_then(Value::as_str).map(String::from);
+    it.ctag = item.get("cTag").and_then(Value::as_str).map(String::from);
+    it.quickxorhash = item
+        .pointer("/file/hashes/quickXorHash")
+        .and_then(Value::as_str)
+        .map(String::from);
+    it.size = item.get("size").and_then(Value::as_i64);
+    it.remote_mtime = item
+        .pointer("/fileSystemInfo/lastModifiedDateTime")
+        .and_then(Value::as_str)
+        .map(String::from);
+    it.sync_state = "remote_dirty".into();
+    store.upsert_item(&it)?;
+    if let Some(root) = archive_root {
+        write_item_json(root, id, item)?;
+    }
+
+    // Ownership for reporting: an item a deeper active scope owns is reported Skipped
+    // (counted by that scope). The row is upserted regardless (idempotent, id-stable).
+    let ancestry = store_ancestry(store, account, id)?;
+    let refs: Vec<&str> = ancestry.iter().map(String::as_str).collect();
+    match owning_scope(&refs, ctx.active) {
+        Some(owner) if owner != ctx.scope_id => Ok(Ingest::Skipped),
+        _ => Ok(Ingest::Upserted),
+    }
+}
+
+/// Run one scoped incremental sync (Mode 2/3): walk each configured folder's own
+/// `driveItem` delta with a per-folder cursor + scope-ownership. Additive to
+/// [`incremental_sync`] (the global-root path). `scopes` is injected by the caller (a
+/// later wiring story builds it from the config mode map); this function is fully
+/// self-contained and unit-tested in isolation.
+pub fn incremental_sync_scoped<T: Transport>(
+    transport: &mut T,
+    store: &Store,
+    map: &mut MappingTable,
+    account: &str,
+    now: &str,
+    archive_root: &Path,
+    scopes: &[FolderScope],
+) -> Result<SyncReport, SyncError> {
+    let active: BTreeSet<&str> = scopes.iter().map(|s| s.folder_id.as_str()).collect();
+    // Deepest-first so a cross-scope move-in (written by the deeper scope) precedes the
+    // shallower scope's removal report — ownership then resolves to the deeper scope and
+    // the move is skipped, never tombstoned. (A move implies the item pre-existed, so
+    // its folder hierarchy is already in the store and the depth is known.)
+    let mut ordered: Vec<&FolderScope> = scopes.iter().collect();
+    ordered.sort_by_key(|s| std::cmp::Reverse(scope_depth(store, account, &s.folder_id, &active)));
+
+    let mut report = SyncReport::default();
+    for scope in ordered {
+        let base = item_delta_url(&scope.folder_id);
+        let ctx = ScopeCtx {
+            scope_id: scope.folder_id.as_str(),
+            active: &active,
+        };
+        let resynced =
+            walk_scope_delta(transport, store, account, ctx.scope_id, &base, 5, |arr| {
+                for item in arr {
+                    match ingest_item_scoped(
+                        store,
+                        map,
+                        account,
+                        &ctx,
+                        item,
+                        now,
+                        Some(archive_root),
+                    )? {
+                        Ingest::Upserted => report.upserted += 1,
+                        Ingest::Deleted => report.deleted += 1,
+                        Ingest::Skipped => report.skipped += 1,
+                    }
+                }
+                Ok(())
+            })?;
+        report.resynced |= resynced;
+    }
+    Ok(report)
 }
 
 /// Abstraction over the remote write operations, so the local→remote push driver
@@ -1179,6 +1463,344 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("C2")
+        );
+    }
+
+    // ---- Scoped per-folder delta tests (S-OM.7) ----
+
+    use crate::scope::Mode;
+    use std::collections::VecDeque;
+
+    /// URL-sensitive mock: routes a request to the first key that is a substring of the
+    /// requested url, popping that route's queued responses in order. (The plain
+    /// `MockTransport` ignores the url and cannot drive multiple scopes or a resume.)
+    struct MockScopedTransport {
+        routes: Vec<(String, VecDeque<Response>)>,
+    }
+    impl MockScopedTransport {
+        fn new(routes: Vec<(&str, Vec<Response>)>) -> Self {
+            MockScopedTransport {
+                routes: routes
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.into_iter().collect()))
+                    .collect(),
+            }
+        }
+    }
+    impl Transport for MockScopedTransport {
+        fn get(&mut self, url: &str) -> Response {
+            for (key, q) in self.routes.iter_mut() {
+                if url.contains(key.as_str()) {
+                    if let Some(r) = q.pop_front() {
+                        return r;
+                    }
+                }
+            }
+            panic!("MockScopedTransport: no queued response for url {url}");
+        }
+    }
+
+    fn seed_folder(store: &Store, id: &str, parent: Option<&str>) {
+        let mut it = Item::new("acc", SERVICE, id, id, "folder");
+        it.parent_remote_id = parent.map(String::from);
+        store.upsert_item(&it).unwrap();
+    }
+    fn removed(id: &str) -> Value {
+        json!({ "id": id, "@removed": { "reason": "deleted" } })
+    }
+    fn sync_scope(id: &str) -> FolderScope {
+        FolderScope {
+            folder_id: id.to_string(),
+            mode: Mode::Sync,
+        }
+    }
+    fn offline_scope(id: &str) -> FolderScope {
+        FolderScope {
+            folder_id: id.to_string(),
+            mode: Mode::Offline,
+        }
+    }
+
+    /// AC1 (a): a real delete deep inside a scope's subtree is tombstoned. The old mail
+    /// rule (`parent_remote_id == folder_id`) would have skipped it — the nested item's
+    /// parent is the subfolder, not the scope root — leaking the delete. `owning_scope`
+    /// over the whole subtree fixes it. This is the regression guard for that leak.
+    #[test]
+    fn ac1_nested_delete_inside_scope_is_tombstoned() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut map = MappingTable::new();
+        // S (scope root) / U (nested subfolder) / X (file, parent = U, NOT S)
+        seed_folder(&store, "S", Some("root1"));
+        seed_folder(&store, "U", Some("S"));
+        let mut x = Item::new("acc", SERVICE, "X", "x.txt", "file");
+        x.parent_remote_id = Some("U".into());
+        store.upsert_item(&x).unwrap();
+
+        let mut t = MockScopedTransport::new(vec![(
+            "items/S/delta",
+            vec![Response::ok(json!({
+                "value": [ removed("X") ],
+                "@odata.deltaLink": "CS"
+            }))],
+        )]);
+        let report = incremental_sync_scoped(
+            &mut t,
+            &store,
+            &mut map,
+            "acc",
+            "2026-06-02T00:00:00Z",
+            arch.path(),
+            &[sync_scope("S")],
+        )
+        .unwrap();
+
+        assert_eq!(report.deleted, 1, "nested delete must tombstone, not leak");
+        assert!(store
+            .get_item("acc", SERVICE, "X")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_some());
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
+            Some("CS")
+        );
+    }
+
+    /// AC1 (b): a cross-scope move (out of the shallower scope P, into the deeper scope
+    /// C) is not clobbered. Deepest-first processing writes the move-in first; P's later
+    /// `@removed` resolves ownership to C and is skipped. The item stays alive, id-stable.
+    #[test]
+    fn ac1_cross_scope_move_is_not_clobbered() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut map = MappingTable::new();
+        seed_folder(&store, "P", Some("root1"));
+        seed_folder(&store, "C", Some("P"));
+        let mut x = Item::new("acc", SERVICE, "X", "x.txt", "file");
+        x.parent_remote_id = Some("P".into());
+        store.upsert_item(&x).unwrap();
+
+        let mut t = MockScopedTransport::new(vec![
+            (
+                "items/C/delta",
+                vec![Response::ok(json!({
+                    "value": [ file_item("X", "x.txt", "C") ],
+                    "@odata.deltaLink": "CC"
+                }))],
+            ),
+            (
+                "items/P/delta",
+                vec![Response::ok(json!({
+                    "value": [ removed("X") ],
+                    "@odata.deltaLink": "CP"
+                }))],
+            ),
+        ]);
+        let report = incremental_sync_scoped(
+            &mut t,
+            &store,
+            &mut map,
+            "acc",
+            "t",
+            arch.path(),
+            &[sync_scope("P"), offline_scope("C")],
+        )
+        .unwrap();
+
+        let x = store.get_item("acc", SERVICE, "X").unwrap().unwrap();
+        assert!(x.deleted_at.is_none(), "moved item must stay alive");
+        assert_eq!(
+            x.parent_remote_id.as_deref(),
+            Some("C"),
+            "id-stable reparent"
+        );
+        assert_eq!(report.deleted, 0);
+        assert_eq!(
+            report.skipped, 1,
+            "P's @removed skipped (owned by deeper C)"
+        );
+        assert_eq!(report.upserted, 1, "C claimed the move-in");
+    }
+
+    /// AC2 (part 1): the cursor is persisted after *every* page (a `nextLink` becomes
+    /// the resume point) and the walk resumes from it. Walk 1 ingests page 1 then hits a
+    /// fatal on page 2 → the stored cursor is the page-1 `nextLink`. Walk 2 resumes there
+    /// and finishes at the `deltaLink`.
+    #[test]
+    fn ac2_persists_nextlink_per_page_and_resumes() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut map = MappingTable::new();
+        seed_folder(&store, "S", Some("root1"));
+
+        let mut t1 = MockScopedTransport::new(vec![
+            (
+                "items/S/delta",
+                vec![Response::ok(json!({
+                    "value": [ file_item("A", "a.txt", "S") ],
+                    "@odata.nextLink": "https://graph/next/u2"
+                }))],
+            ),
+            ("next/u2", vec![Response::status(400)]),
+        ]);
+        let err = incremental_sync_scoped(
+            &mut t1,
+            &store,
+            &mut map,
+            "acc",
+            "t",
+            arch.path(),
+            &[sync_scope("S")],
+        );
+        assert!(err.is_err(), "fatal on page 2 aborts the walk");
+        // page 1 was ingested and its nextLink persisted as the resume point
+        assert!(store.get_item("acc", SERVICE, "A").unwrap().is_some());
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
+            Some("https://graph/next/u2")
+        );
+
+        let mut t2 = MockScopedTransport::new(vec![(
+            "next/u2",
+            vec![Response::ok(json!({
+                "value": [ file_item("B", "b.txt", "S") ],
+                "@odata.deltaLink": "CS"
+            }))],
+        )]);
+        let report = incremental_sync_scoped(
+            &mut t2,
+            &store,
+            &mut map,
+            "acc",
+            "t",
+            arch.path(),
+            &[sync_scope("S")],
+        )
+        .unwrap();
+        assert!(store.get_item("acc", SERVICE, "B").unwrap().is_some());
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
+            Some("CS")
+        );
+        assert_eq!(report.upserted, 1);
+    }
+
+    /// AC2 (part 2): a repeated id across pages ends with the last value (last-write-wins
+    /// via `upsert_item`), and the `deltaLink` is adopted only at the end.
+    #[test]
+    fn ac2_last_write_wins_on_repeated_id_across_pages() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut map = MappingTable::new();
+        seed_folder(&store, "S", Some("root1"));
+
+        let mut t = MockScopedTransport::new(vec![
+            (
+                "items/S/delta",
+                vec![Response::ok(json!({
+                    "value": [ file_item("X", "old.txt", "S") ],
+                    "@odata.nextLink": "https://graph/next/p2"
+                }))],
+            ),
+            (
+                "next/p2",
+                vec![Response::ok(json!({
+                    "value": [ file_item("X", "new.txt", "S") ],
+                    "@odata.deltaLink": "CS"
+                }))],
+            ),
+        ]);
+        incremental_sync_scoped(
+            &mut t,
+            &store,
+            &mut map,
+            "acc",
+            "t",
+            arch.path(),
+            &[sync_scope("S")],
+        )
+        .unwrap();
+        let x = store.get_item("acc", SERVICE, "X").unwrap().unwrap();
+        assert_eq!(x.name, "new.txt", "last write wins");
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "S")
+                .unwrap()
+                .as_deref(),
+            Some("CS")
+        );
+    }
+
+    /// AC3: overlapping parent (P, sync) and nested child (C, offline) scopes — a file X
+    /// under C is owned by the deepest scope C. P's recursive delta also reports C and X,
+    /// but both resolve to the deeper C and are skipped by P.
+    #[test]
+    fn ac3_overlapping_scopes_item_owned_by_deepest() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut map = MappingTable::new();
+        seed_folder(&store, "P", Some("root1"));
+        seed_folder(&store, "C", Some("P"));
+
+        let mut t = MockScopedTransport::new(vec![
+            (
+                "items/C/delta",
+                vec![Response::ok(json!({
+                    "value": [ file_item("X", "x.txt", "C") ],
+                    "@odata.deltaLink": "CC"
+                }))],
+            ),
+            (
+                "items/P/delta",
+                vec![Response::ok(json!({
+                    "value": [
+                        { "id": "C", "name": "C", "parentReference": {"id": "P"}, "folder": {} },
+                        file_item("X", "x.txt", "C")
+                    ],
+                    "@odata.deltaLink": "CP"
+                }))],
+            ),
+        ]);
+        let report = incremental_sync_scoped(
+            &mut t,
+            &store,
+            &mut map,
+            "acc",
+            "t",
+            arch.path(),
+            &[sync_scope("P"), offline_scope("C")],
+        )
+        .unwrap();
+
+        let x = store.get_item("acc", SERVICE, "X").unwrap().unwrap();
+        assert_eq!(x.parent_remote_id.as_deref(), Some("C"));
+        assert_eq!(report.upserted, 1, "only the deepest scope C claims X");
+        // P's page: folder C (owned by C) + X (owned by C) → both skipped by P.
+        assert_eq!(report.skipped, 2, "P skips items owned by deeper C");
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "C")
+                .unwrap()
+                .as_deref(),
+            Some("CC")
+        );
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "P")
+                .unwrap()
+                .as_deref(),
+            Some("CP")
         );
     }
 
