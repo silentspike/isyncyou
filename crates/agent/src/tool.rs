@@ -23,6 +23,21 @@ pub enum ToolAction {
         #[serde(default)]
         limit: Option<u32>,
     },
+    /// Agentic deep read (S-AG.18/#643): scan metadata and read candidate bodies the
+    /// keyword passes (search) missed, budgeted + resumable via `cursor`, so a match whose
+    /// wording never contains the query can still be found. Read-class.
+    DeepSearch {
+        account: String,
+        #[serde(default)]
+        services: Vec<String>,
+        query: String,
+        /// Resume offset into the unmatched-candidate list (from a prior call's `next_cursor`).
+        #[serde(default)]
+        cursor: Option<u32>,
+        /// Max candidate bodies to read this call (budget); server-capped.
+        #[serde(default)]
+        max_reads: Option<u32>,
+    },
     /// Read one archived item's content (byte-budgeted).
     Read {
         account: String,
@@ -92,6 +107,7 @@ impl ToolAction {
     pub fn class(&self) -> ToolClass {
         match self {
             ToolAction::Search { .. }
+            | ToolAction::DeepSearch { .. }
             | ToolAction::Read { .. }
             | ToolAction::List { .. }
             | ToolAction::Export { .. }
@@ -107,6 +123,7 @@ impl ToolAction {
     pub fn op(&self) -> &'static str {
         match self {
             ToolAction::Search { .. } => "search",
+            ToolAction::DeepSearch { .. } => "deep-search",
             ToolAction::Read { .. } => "read",
             ToolAction::List { .. } => "list",
             ToolAction::Export { .. } => "export",
@@ -123,6 +140,7 @@ impl ToolAction {
 pub fn help_text() -> String {
     "isyncyou tool — ops (M365 domain only): \
      search {account, services?, query, limit?} · \
+     deep-search {account, services?, query, cursor?, max_reads?} · \
      read {account, service, id, max_bytes?} · \
      list {account, service, parent?} · \
      export {account, service, id} · \
@@ -163,7 +181,7 @@ pub fn tool_schema() -> serde_json::Value {
                 "op": {
                     "type": "string",
                     "enum": [
-                        "search", "read", "list", "export",
+                        "search", "deep-search", "read", "list", "export",
                         "restore-local", "backup", "restore-cloud", "live-write", "share"
                     ]
                 },
@@ -173,6 +191,8 @@ pub fn tool_schema() -> serde_json::Value {
                 "query": { "type": "string" },
                 "services": { "type": "array", "items": { "type": "string" } },
                 "limit": { "type": "integer" },
+                "cursor": { "type": "integer" },
+                "max_reads": { "type": "integer" },
                 "max_bytes": { "type": "integer" },
                 "parent": { "type": "string" },
                 "target": { "type": "string" },

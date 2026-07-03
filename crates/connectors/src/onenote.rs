@@ -42,7 +42,7 @@ fn write_page_meta(archive_root: &Path, id: &str, page: &Value) -> Result<(), Sy
     }
     let bytes = serde_json::to_vec(page).map_err(|e| SyncError::Malformed(e.to_string()))?;
     let tmp = abs.with_extension("json.part");
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
     std::fs::rename(&tmp, &abs)?;
     Ok(())
 }
@@ -165,7 +165,7 @@ fn archive_hierarchy_item(
     }
     let bytes = serde_json::to_vec(value).map_err(|e| SyncError::Malformed(e.to_string()))?;
     let tmp = abs.with_extension("json.part");
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
     std::fs::rename(&tmp, &abs)?;
     let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
     store.set_local_path(account, SERVICE, id, Some(&rel.to_string_lossy()))?;
