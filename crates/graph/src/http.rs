@@ -730,6 +730,24 @@ impl GraphClient {
         self.get_bytes(&format!("{}/me/drive/items/{item_id}/content", self.base))
     }
 
+    /// List a drive folder's children **live** from Graph, following
+    /// `@odata.nextLink` to completion over the central retry policy (#0.4) — the
+    /// Mode-1 (online) browse primitive. An empty `parent_id` = the drive root.
+    /// `$select`s only the fields the browser UI needs (id/name/size/folder/file/
+    /// lastModifiedDateTime); no store write happens here (this crate has no store
+    /// dep). Returns every child across all pages.
+    pub fn list_children(&self, parent_id: &str) -> Result<Vec<serde_json::Value>, UploadError> {
+        // The `$select` query is appended as a literal — it must NOT go through
+        // `encode_id`/`encode_seg`, which would percent-escape `$`, `=`, `,`.
+        const SELECT: &str = "$select=id,name,size,folder,file,lastModifiedDateTime";
+        let path = if parent_id.is_empty() {
+            format!("/me/drive/root/children?{SELECT}")
+        } else {
+            format!("/me/drive/items/{}/children?{SELECT}", encode_id(parent_id))
+        };
+        self.get_json_paged(&path)
+    }
+
     /// Download a mail message's full MIME (`.eml`) by id.
     pub fn download_message_mime(&self, message_id: &str) -> Result<Vec<u8>, UploadError> {
         self.get_bytes(&format!("{}/me/messages/{message_id}/$value", self.base))
@@ -2081,6 +2099,117 @@ mod tests {
             .create_folder("PARENT", "Sub")
             .unwrap();
         assert!(server2.join().unwrap()[0].starts_with("POST /me/drive/items/PARENT/children"));
+    }
+
+    #[test]
+    fn list_children_targets_children_with_select() {
+        // root → GET /me/drive/root/children?$select=...
+        let (base, server) = serve(vec![http_response(200, "OK", "", r#"{"value":[]}"#)]);
+        GraphClient::new("tok")
+            .with_base_url(&base)
+            .list_children("")
+            .unwrap();
+        let seen = server.join().unwrap();
+        assert!(
+            seen[0].starts_with(
+                "GET /me/drive/root/children?$select=id,name,size,folder,file,lastModifiedDateTime"
+            ),
+            "root listing must GET /children with the $select, got: {}",
+            seen[0]
+        );
+
+        // by parent id → GET /me/drive/items/PARENT/children?$select=...
+        let (base2, server2) = serve(vec![http_response(200, "OK", "", r#"{"value":[]}"#)]);
+        GraphClient::new("tok")
+            .with_base_url(&base2)
+            .list_children("PARENT")
+            .unwrap();
+        assert!(server2.join().unwrap()[0].starts_with(
+            "GET /me/drive/items/PARENT/children?$select=id,name,size,folder,file,lastModifiedDateTime"
+        ));
+    }
+
+    #[test]
+    fn list_children_pages_over_200_items() {
+        // AC1 (#647): a folder with >200 children returns the full set across all
+        // `@odata.nextLink` pages. 5 pages × 60 = 300 items; pages 1..=4 link on.
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let mut pages: Vec<String> = Vec::new();
+        for p in 0..5 {
+            let vals: Vec<String> = (0..60).map(|i| format!(r#"{{"id":"it-{p}-{i}"}}"#)).collect();
+            let body = if p < 4 {
+                format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"{base}/p{}"}}"#,
+                    vals.join(","),
+                    p + 1
+                )
+            } else {
+                format!(r#"{{"value":[{}]}}"#, vals.join(","))
+            };
+            pages.push(http_response(200, "OK", "", &body));
+        }
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for resp in pages {
+                let (mut sock, _) = listener.accept().unwrap();
+                read_request(&mut sock);
+                sock.write_all(resp.as_bytes()).unwrap();
+                served += 1;
+            }
+            served
+        });
+        let items = GraphClient::new("tok")
+            .with_base_url(&base)
+            .list_children("BIG")
+            .unwrap();
+        assert_eq!(items.len(), 300, "all pages' children must be concatenated");
+        assert_eq!(
+            handle.join().unwrap(),
+            5,
+            "every page was fetched (paged to completion)"
+        );
+    }
+
+    #[test]
+    fn list_children_retries_via_central_policy_then_pages() {
+        // AC2 (#647): every request — including a throttled retry — goes through the
+        // central retry policy (`get_with_retry`): the 429 is honored (Retry-After: 0)
+        // and retried, then paging completes. Proves list_children never bypasses it.
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let throttled = http_response(429, "Too Many Requests", "Retry-After: 0\r\n", "{}");
+        let page1 = http_response(
+            200,
+            "OK",
+            "",
+            &format!(r#"{{"value":[{{"id":"a"}}],"@odata.nextLink":"{base}/p2"}}"#),
+        );
+        let page2 = http_response(200, "OK", "", r#"{"value":[{"id":"b"}]}"#);
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for resp in [throttled, page1, page2] {
+                let (mut sock, _) = listener.accept().unwrap();
+                read_request(&mut sock);
+                sock.write_all(resp.as_bytes()).unwrap();
+                served += 1;
+            }
+            served
+        });
+        let items = GraphClient::new("tok")
+            .with_base_url(&base)
+            .list_children("F")
+            .unwrap();
+        assert_eq!(items.len(), 2, "children from both pages after the retry");
+        assert_eq!(
+            handle.join().unwrap(),
+            3,
+            "429 retried once, then both pages fetched"
+        );
     }
 
     #[test]
