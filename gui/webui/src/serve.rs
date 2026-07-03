@@ -21,11 +21,17 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Hard cap on concurrent connection threads (safety against runaway opens on a
 /// loopback-only server). SSE streams count against this, so it is generous.
 const MAX_CONNS: usize = 128;
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Upper bound on an in-memory request body (#0A). Generous enough for a document
+/// upload yet bounded so a bogus `Content-Length` can't make the server allocate without
+/// limit; an oversized body is refused (413) rather than buffered.
+const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 /// Decrements the live-connection counter when a connection thread ends.
 struct ConnGuard;
@@ -40,16 +46,25 @@ impl Drop for ConnGuard {
 /// stream, so the trait yields a cloned reader. Implemented for TCP + Unix.
 trait Conn: Read + Write {
     fn clone_reader(&self) -> std::io::Result<Box<dyn Read>>;
+    /// Bound how long a persistent (keep-alive) connection waits for the next request
+    /// before it's closed, so an idle connection releases its slot instead of lingering.
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()>;
 }
 impl Conn for TcpStream {
     fn clone_reader(&self) -> std::io::Result<Box<dyn Read>> {
         Ok(Box::new(self.try_clone()?))
+    }
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, dur)
     }
 }
 #[cfg(unix)]
 impl Conn for std::os::unix::net::UnixStream {
     fn clone_reader(&self) -> std::io::Result<Box<dyn Read>> {
         Ok(Box::new(self.try_clone()?))
+    }
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        std::os::unix::net::UnixStream::set_read_timeout(self, dur)
     }
 }
 
@@ -86,8 +101,130 @@ pub fn parse_request_line(line: &str) -> Option<(String, String)> {
     Some((method, target))
 }
 
+/// Build the routed [`ApiRequest`] from a transport-agnostic set of inputs: resolve the
+/// effective session token (explicit `X-Session-Token`, else the `isy_session` loopback
+/// cookie) and attach the cap-token + body. Shared by the HTTP [`handle`] loop and the
+/// in-process [`dispatch_message`] bridge so both transports route **identically** (#0A).
+fn build_request(
+    method: &str,
+    target: &str,
+    cap_token: Option<String>,
+    session_token: Option<String>,
+    cookie: Option<String>,
+    body: Vec<u8>,
+) -> ApiRequest {
+    let session_token = session_token.or_else(|| {
+        cookie
+            .as_deref()
+            .and_then(|c| cookie_value(c, "isy_session"))
+    });
+    ApiRequest::new(method, target)
+        .with_cap_token(cap_token)
+        .with_session_token(session_token)
+        .with_body(body)
+}
+
+/// Dispatch one request that arrived over the Android in-process `WebMessage` bridge
+/// (#0A) — **no TCP port is involved**. Applies the same session-token resolution and
+/// routing as the HTTP path; host/origin checks don't apply because the bridge is bound
+/// to the app origin natively by `WebMessageListener`'s `allowedOriginRules`. SSE routes
+/// (`/api/v1/events`, `/api/v1/agent/stream`) are NOT served here — the bridge carries
+/// those streams over its own native push channel. Returns the response for the native
+/// side to post back on the message port.
+pub fn dispatch_message(
+    router: &Router,
+    method: &str,
+    target: &str,
+    cap_token: Option<String>,
+    session_token: Option<String>,
+    cookie: Option<String>,
+    body: Vec<u8>,
+) -> ApiResponse {
+    router.route(&build_request(
+        method,
+        target,
+        cap_token,
+        session_token,
+        cookie,
+        body,
+    ))
+}
+
+/// Handle one JSON-framed unary request from the Android in-process bridge (#0A) and
+/// return the **complete reply message** the native side posts back verbatim — the Kotlin
+/// side is a truly dumb forwarder, so all parsing and framing live here (host-testable).
+/// Request shape: `{"t":"req","id":<str>,"method","path","headers":{..},"body":<str|null>}`.
+/// Reply shape: `{"t":"res","id":<str>,"status":<u16>,"body":<string>}` (the response bytes
+/// as UTF-8; today's API is JSON/text — binary GET subresources use the asset path). SSE
+/// routes are not handled here — the bridge streams them over its own push channel. Header
+/// lookup is case-insensitive; `id` is echoed so the JS promise resolves.
+pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
+    use serde_json::Value;
+    let v: Value = match serde_json::from_str(request_json) {
+        Ok(v) => v,
+        Err(_) => return bridge_error_envelope(None, 400, "bad bridge request"),
+    };
+    let id = v.get("id").and_then(Value::as_str);
+    let path = match v.get("path").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return bridge_error_envelope(id, 400, "missing path"),
+    };
+    let method = v.get("method").and_then(Value::as_str).unwrap_or("GET");
+    let headers = v.get("headers").and_then(Value::as_object);
+    let header = |name: &str| {
+        headers.and_then(|obj| {
+            obj.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .and_then(|(_, val)| val.as_str())
+                .map(str::to_string)
+        })
+    };
+    let body = v
+        .get("body")
+        .and_then(Value::as_str)
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_default();
+    let resp = dispatch_message(
+        router,
+        method,
+        path,
+        header("X-Capability-Token"),
+        header("X-Session-Token"),
+        header("Cookie"),
+        body,
+    );
+    serde_json::json!({
+        "t": "res",
+        "id": id,
+        "status": resp.status,
+        "body": String::from_utf8_lossy(&resp.body),
+    })
+    .to_string()
+}
+
+/// A bridge reply carrying an error, echoing `id` so the JS promise still resolves.
+fn bridge_error_envelope(id: Option<&str>, status: u16, message: &str) -> String {
+    serde_json::json!({
+        "t": "res",
+        "id": id,
+        "status": status,
+        "body": serde_json::json!({ "error": message }).to_string(),
+    })
+    .to_string()
+}
+
 /// Serialize a response as an HTTP/1.1 message with `Connection: close`.
 pub fn format_http(resp: &ApiResponse) -> Vec<u8> {
+    format_http_conn(resp, false)
+}
+
+/// Serialize a response, choosing the `Connection` header. `keep_alive` keeps the
+/// socket open for the next request on the same connection (HTTP/1.1 persistent) — the
+/// WebView then reuses a handful of connections instead of opening a fresh TCP socket
+/// per `fetch()`, which stops a burst of requests from churning/exhausting the browser's
+/// small per-origin connection pool. `Content-Length` frames every body, so the client
+/// knows where each response ends. Error/handshake paths pass `false` and close.
+fn format_http_conn(resp: &ApiResponse, keep_alive: bool) -> Vec<u8> {
     let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
@@ -98,12 +235,14 @@ pub fn format_http(resp: &ApiResponse) -> Vec<u8> {
         500 => "Internal Server Error",
         _ => "Status",
     };
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\nX-Content-Type-Options: nosniff\r\n",
         resp.status,
         reason,
         resp.content_type,
-        resp.body.len()
+        resp.body.len(),
+        conn
     );
     for (k, v) in &resp.headers {
         // header values are crafted in-process (constants); guard against any
@@ -197,91 +336,176 @@ fn validate_request_headers(
 
 fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.clone_reader()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(()); // client closed
-    }
-    // Read headers up to the blank line; capture the small set the local security
-    // policy needs. Unknown headers are ignored.
-    let mut headers = RequestHeaders::default();
+    // Keep-alive: an idle persistent connection closes after this timeout so it releases
+    // its slot instead of pinning one of the WebView's few per-origin connections.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+    // One iteration per request; the connection is reused (HTTP/1.1 persistent) until the
+    // client closes it, it idles out, or a request can't be served cleanly.
     loop {
-        let mut h = String::new();
-        let n = reader.read_line(&mut h)?;
-        if n == 0 || h == "\r\n" || h == "\n" {
-            break;
+        let mut request_line = String::new();
+        match reader.read_line(&mut request_line) {
+            Ok(0) => return Ok(()), // client closed the connection
+            Ok(_) => {}
+            // idle keep-alive timeout / reset: close quietly, don't surface as an error
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(e) => return Err(e),
         }
-        if let Some((k, v)) = h.split_once(':') {
-            let k = k.trim();
-            let v = v.trim().to_string();
-            if k.eq_ignore_ascii_case("x-capability-token") {
-                headers.cap_token = Some(v);
-            } else if k.eq_ignore_ascii_case("x-session-token") {
-                headers.session_token = Some(v);
-            } else if k.eq_ignore_ascii_case("cookie") {
-                headers.cookie = Some(v);
-            } else if k.eq_ignore_ascii_case("host") {
-                headers.host = Some(v);
-            } else if k.eq_ignore_ascii_case("origin") {
-                headers.origin = Some(v);
+        // Read headers up to the blank line; capture the small set the local security
+        // policy needs plus the body length. Unknown headers are ignored.
+        let mut headers = RequestHeaders::default();
+        let mut content_length = 0usize;
+        loop {
+            let mut h = String::new();
+            let n = reader.read_line(&mut h)?;
+            if n == 0 || h == "\r\n" || h == "\n" {
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                let k = k.trim();
+                let v = v.trim().to_string();
+                if k.eq_ignore_ascii_case("x-capability-token") {
+                    headers.cap_token = Some(v);
+                } else if k.eq_ignore_ascii_case("x-session-token") {
+                    headers.session_token = Some(v);
+                } else if k.eq_ignore_ascii_case("cookie") {
+                    headers.cookie = Some(v);
+                } else if k.eq_ignore_ascii_case("host") {
+                    headers.host = Some(v);
+                } else if k.eq_ignore_ascii_case("origin") {
+                    headers.origin = Some(v);
+                } else if k.eq_ignore_ascii_case("content-length") {
+                    content_length = v.parse().unwrap_or(0);
+                }
             }
         }
-    }
-    let (method, target) = match parse_request_line(request_line.trim_end()) {
-        Some(mt) => mt,
-        None => {
-            let resp = ApiResponse {
-                status: 400,
-                content_type: "text/plain".into(),
-                body: b"bad request line".to_vec(),
-                headers: Vec::new(),
+        let (method, target) = match parse_request_line(request_line.trim_end()) {
+            Some(mt) => mt,
+            None => {
+                let resp = ApiResponse {
+                    status: 400,
+                    content_type: "text/plain".into(),
+                    body: b"bad request line".to_vec(),
+                    headers: Vec::new(),
+                };
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(()); // malformed → close
+            }
+        };
+        // Local-access policy (loopback host / local origin) runs first, for every path.
+        if let Some(resp) = validate_request_headers(policy, &method, &headers) {
+            stream.write_all(&format_http(&resp))?;
+            stream.flush()?;
+            return Ok(()); // rejected → close
+        }
+        // Read any request body into memory (bounded) so a body-bearing request works
+        // over HTTP too (#0A); the query-string GETs that dominate today carry none. An
+        // oversized body is refused (413) rather than buffered — it can't be reframed
+        // safely on a keep-alive connection, so that path also closes.
+        let body = if content_length > MAX_REQUEST_BODY {
+            let resp = ApiResponse::error(413, "request body too large");
+            stream.write_all(&format_http(&resp))?;
+            stream.flush()?;
+            return Ok(());
+        } else if content_length > 0 {
+            let mut buf = vec![0u8; content_length];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => buf,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        } else {
+            Vec::new()
+        };
+        // Build the routed request from the same transport-agnostic path the in-process
+        // bridge uses (#0A): explicit `X-Session-Token`, else the `isy_session` loopback
+        // cookie that auto-rides iframe/img/EventSource subresource requests.
+        let req = build_request(
+            &method,
+            &target,
+            headers.cap_token.clone(),
+            headers.session_token.clone(),
+            headers.cookie.clone(),
+            body,
+        );
+        // SSE change stream: a long-lived connection that bypasses the one-shot
+        // response model. Reached only after header validation, so the same
+        // loopback/origin rules apply; needs the injected EventBus (daemon only).
+        if method == "GET" && req.path == "/api/v1/events" {
+            // Mobile profile (#89): SSE is a data route, so it is session-gated too.
+            // EventSource can't send headers, so the token rides the `_st` query param
+            // (the header is honored as well). No-op on the desktop daemon.
+            let st_query = req
+                .query
+                .iter()
+                .find(|(k, _)| k == "_st")
+                .map(|(_, v)| v.as_str());
+            let provided = req.session_token.as_deref().or(st_query);
+            if !router.session_authorized(provided) {
+                let resp = ApiResponse::error(401, "missing or invalid session token");
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(());
+            }
+            if let Some(bus) = router.events_bus() {
+                // A read timeout on the socket would abort the SSE heartbeat loop; clear
+                // it before handing the connection over to the long-lived stream.
+                let _ = stream.set_read_timeout(None);
+                return handle_sse(stream, bus);
+            }
+        }
+        // Agent token stream (S-AG.6/#621): a long-lived per-turn SSE driven by the agent
+        // handler's `Receiver<String>` (pre-serialized JSON data lines). Same session gate;
+        // the turn id rides the `turn` query param (EventSource can't set headers).
+        if method == "GET" && req.path == "/api/v1/agent/stream" {
+            let st_query = req
+                .query
+                .iter()
+                .find(|(k, _)| k == "_st")
+                .map(|(_, v)| v.as_str());
+            let provided = req.session_token.as_deref().or(st_query);
+            if !router.session_authorized(provided) {
+                let resp = ApiResponse::error(401, "missing or invalid session token");
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(());
+            }
+            let turn = req
+                .query
+                .iter()
+                .find(|(k, _)| k == "turn")
+                .map(|(_, v)| v.as_str());
+            let rx = match (router.agent_handler(), turn) {
+                (Some(handler), Some(turn)) if !turn.is_empty() => handler.open_stream(turn),
+                _ => None,
             };
-            stream.write_all(&format_http(&resp))?;
-            return stream.flush();
+            match rx {
+                Some(rx) => {
+                    let _ = stream.set_read_timeout(None);
+                    return handle_agent_sse(stream, rx);
+                }
+                None => {
+                    let resp = ApiResponse::error(404, "unknown or missing turn");
+                    stream.write_all(&format_http(&resp))?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+            }
         }
-    };
-    // Local-access policy (loopback host / local origin) runs first, for every path.
-    if let Some(resp) = validate_request_headers(policy, &method, &headers) {
-        stream.write_all(&format_http(&resp))?;
-        return stream.flush();
+        let resp = router.route(&req);
+        stream.write_all(&format_http_conn(&resp, true))?;
+        stream.flush()?;
+        // loop: reuse this connection for the client's next request
     }
-    // Effective session token (#89): an explicit `X-Session-Token` header (used by
-    // the web UI's fetch() calls) OR a loopback `isy_session` cookie set natively by
-    // the Android shell — the cookie auto-rides iframe/img/EventSource subresource
-    // requests, so embedded resources are gated without per-URL `_st` threading.
-    let session_token = headers.session_token.clone().or_else(|| {
-        headers
-            .cookie
-            .as_deref()
-            .and_then(|c| cookie_value(c, "isy_session"))
-    });
-    let req = ApiRequest::new(&method, &target)
-        .with_cap_token(headers.cap_token.clone())
-        .with_session_token(session_token);
-    // SSE change stream: a long-lived connection that bypasses the one-shot
-    // response model. Reached only after header validation, so the same
-    // loopback/origin rules apply; needs the injected EventBus (daemon only).
-    if method == "GET" && req.path == "/api/v1/events" {
-        // Mobile profile (#89): SSE is a data route, so it is session-gated too.
-        // EventSource can't send headers, so the token rides the `_st` query param
-        // (the header is honored as well). No-op on the desktop daemon.
-        let st_query = req
-            .query
-            .iter()
-            .find(|(k, _)| k == "_st")
-            .map(|(_, v)| v.as_str());
-        let provided = req.session_token.as_deref().or(st_query);
-        if !router.session_authorized(provided) {
-            let resp = ApiResponse::error(401, "missing or invalid session token");
-            stream.write_all(&format_http(&resp))?;
-            return stream.flush();
-        }
-        if let Some(bus) = router.events_bus() {
-            return handle_sse(stream, bus);
-        }
-    }
-    let resp = router.route(&req);
-    stream.write_all(&format_http(&resp))?;
-    stream.flush()
 }
 
 /// Stream Server-Sent Events until the client disconnects. Writes the event-stream
@@ -311,6 +535,36 @@ fn handle_sse<S: Conn>(stream: &mut S, bus: &EventBus) -> std::io::Result<()> {
     }
 }
 
+/// Stream one agent turn's pre-serialized events as SSE until the turn ends or the peer
+/// disconnects. Each `Receiver<String>` item is a single-line JSON `data:` payload; a
+/// 15 s timeout emits a heartbeat; `Disconnected` (the turn closed its sender) ends the
+/// stream cleanly with a `done` event.
+fn handle_agent_sse<S: Conn>(
+    stream: &mut S,
+    rx: std::sync::mpsc::Receiver<String>,
+) -> std::io::Result<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let head = "HTTP/1.1 200 OK\r\n\
+        Content-Type: text/event-stream\r\n\
+        Cache-Control: no-store\r\n\
+        Connection: keep-alive\r\n\
+        X-Content-Type-Options: nosniff\r\n\r\n";
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(b": connected\n\n")?;
+    stream.flush()?;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(data) => stream.write_all(format!("data: {data}\n\n").as_bytes())?,
+            Err(RecvTimeoutError::Timeout) => stream.write_all(b": keep-alive\n\n")?,
+            Err(RecvTimeoutError::Disconnected) => {
+                stream.write_all(b"event: done\ndata: {}\n\n")?;
+                return stream.flush();
+            }
+        }
+        stream.flush()?; // Err when the peer closed -> end the stream
+    }
+}
+
 /// Bind a **loopback** TCP address, refusing any non-loopback host. Use `:0` for an
 /// OS-assigned free port and read it from `local_addr()` (the standalone mobile
 /// client does this, then hands the port to its WebView, #89).
@@ -324,14 +578,21 @@ pub fn bind_loopback(addr: &str) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr)
 }
 
-/// Serve `router` forever on an already-bound loopback `listener`. Returns only on a
-/// fatal accept error. Lets a caller read the bound port before serving (mobile).
-pub fn serve_listener(listener: TcpListener, router: Router) -> std::io::Result<()> {
-    let router = Arc::new(router);
+/// Serve a **shared** `router` forever on an already-bound loopback `listener`. The
+/// caller keeps its own `Arc<Router>` clone — the standalone mobile client needs one to
+/// answer in-process bridge requests ([`dispatch_message`]) against the same router that
+/// serves loopback (#0A). Returns only on a fatal accept error.
+pub fn serve_listener_shared(listener: TcpListener, router: Arc<Router>) -> std::io::Result<()> {
     for stream in listener.incoming() {
         spawn_conn(stream?, Arc::clone(&router), AccessPolicy::TcpLoopback);
     }
     Ok(())
+}
+
+/// Serve `router` forever on an already-bound loopback `listener`. Returns only on a
+/// fatal accept error. Lets a caller read the bound port before serving (mobile).
+pub fn serve_listener(listener: TcpListener, router: Router) -> std::io::Result<()> {
+    serve_listener_shared(listener, Arc::new(router))
 }
 
 /// Bind `addr` and serve `router` forever. Returns only on a fatal bind/accept error.
@@ -483,9 +744,37 @@ mod tests {
         );
     }
 
+    /// Read exactly one HTTP/1.1 response (status line + headers + Content-Length body)
+    /// without waiting for EOF — responses are keep-alive now, so the socket stays open.
+    fn read_http_response<R: std::io::Read>(r: &mut R) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let hdr_end = loop {
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p + 4;
+            }
+            match r.read(&mut tmp).unwrap() {
+                0 => return String::from_utf8_lossy(&buf).to_string(),
+                n => buf.extend_from_slice(&tmp[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..hdr_end]).to_ascii_lowercase();
+        let clen = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < hdr_end + clen {
+            match r.read(&mut tmp).unwrap() {
+                0 => break,
+                n => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
     fn one_tcp_response(request: &[u8]) -> String {
         use isyncyou_core::Config;
-        use std::io::Read as _;
         let router = Router::new(Config::default());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -496,9 +785,7 @@ mod tests {
         });
         let mut conn = TcpStream::connect(addr).unwrap();
         conn.write_all(request).unwrap();
-        let mut buf = String::new();
-        conn.read_to_string(&mut buf).unwrap();
-        buf
+        read_http_response(&mut conn)
     }
 
     #[test]
@@ -506,6 +793,41 @@ mod tests {
         let buf = one_tcp_response(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "got: {buf}");
         assert!(buf.contains("\"accounts\""), "body: {buf}");
+    }
+
+    #[test]
+    fn keep_alive_reuses_one_connection_for_several_requests() {
+        use isyncyou_core::Config;
+        let router = Arc::new(Router::new(Config::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
+            }
+        });
+        // A single TCP connection serves three sequential requests — proof the server
+        // does not close after each response (persistent HTTP/1.1).
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        for i in 0..3 {
+            c.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let r = read_http_response(&mut c);
+            assert!(
+                r.starts_with("HTTP/1.1 200 OK\r\n"),
+                "request {i} on the reused connection failed: {r}"
+            );
+            assert!(
+                r.to_ascii_lowercase().contains("connection: keep-alive"),
+                "request {i} must advertise keep-alive: {r}"
+            );
+        }
     }
 
     #[test]
@@ -555,8 +877,7 @@ mod tests {
         // browser-style Host header is not the security boundary here.
         conn.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
-        let mut buf = String::new();
-        conn.read_to_string(&mut buf).unwrap();
+        let buf = read_http_response(&mut conn);
         assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "got: {buf}");
         assert!(buf.contains("\"accounts\""), "body: {buf}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -584,9 +905,7 @@ mod tests {
         let req = |raw: &str| {
             let mut c = TcpStream::connect(addr).unwrap();
             c.write_all(raw.as_bytes()).unwrap();
-            let mut s = String::new();
-            c.read_to_string(&mut s).unwrap();
-            s
+            read_http_response(&mut c)
         };
         // No session token → 401 (the key Android-loopback exposure fix).
         let no_tok = req("GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
@@ -666,8 +985,12 @@ mod tests {
         c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         c2.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
-        let mut s2 = String::new();
-        c2.read_to_string(&mut s2).unwrap();
+        // Responses are keep-alive now, so the server won't close the socket — read the
+        // response (status line + body arrive together for this small payload) instead of
+        // waiting for EOF, which would only come on the idle timeout.
+        let mut buf2 = [0u8; 512];
+        let n2 = c2.read(&mut buf2).unwrap();
+        let s2 = String::from_utf8_lossy(&buf2[..n2]);
         assert!(
             s2.starts_with("HTTP/1.1 200 OK\r\n"),
             "concurrent request blocked by SSE: {s2}"
@@ -706,5 +1029,160 @@ mod tests {
             resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
             "got: {resp}"
         );
+    }
+
+    #[test]
+    fn build_request_resolves_cookie_session_and_carries_body() {
+        // #0A: the shared request builder carries the body and resolves the session from
+        // the loopback cookie when no explicit header is present.
+        let r = build_request(
+            "POST",
+            "/api/v1/x?a=1",
+            Some("cap-1".into()),
+            None,
+            Some("other=z; isy_session=cook-tok".into()),
+            b"hello-body".to_vec(),
+        );
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.path, "/api/v1/x");
+        assert_eq!(r.cap_token.as_deref(), Some("cap-1"));
+        assert_eq!(r.session_token.as_deref(), Some("cook-tok"));
+        assert_eq!(r.body, b"hello-body");
+        // An explicit X-Session-Token header wins over the cookie.
+        let r2 = build_request(
+            "GET",
+            "/api/v1/x",
+            None,
+            Some("hdr-tok".into()),
+            Some("isy_session=cook-tok".into()),
+            Vec::new(),
+        );
+        assert_eq!(r2.session_token.as_deref(), Some("hdr-tok"));
+        assert!(r2.body.is_empty());
+    }
+
+    #[test]
+    fn dispatch_message_routes_without_a_socket() {
+        // #0A: the in-process bridge path routes identically to HTTP — no TCP port bound.
+        use isyncyou_core::Config;
+        let open = Router::new(Config::default());
+        let ok = dispatch_message(
+            &open,
+            "GET",
+            "/api/v1/accounts",
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(ok.status, 200, "bridge GET should route");
+        assert!(
+            String::from_utf8_lossy(&ok.body).contains("accounts"),
+            "bridge body: {}",
+            String::from_utf8_lossy(&ok.body)
+        );
+        // The session gate applies through the bridge too (same Router::route).
+        let gated = Router::new(Config::default()).with_session_token("sess-bridge".into());
+        let denied = dispatch_message(
+            &gated,
+            "GET",
+            "/api/v1/status",
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(denied.status, 401, "bridge without token must 401");
+        let allowed = dispatch_message(
+            &gated,
+            "GET",
+            "/api/v1/status",
+            None,
+            Some("sess-bridge".into()),
+            None,
+            Vec::new(),
+        );
+        assert_ne!(allowed.status, 401, "bridge with token must pass the gate");
+    }
+
+    #[test]
+    fn handle_bridge_request_frames_json_response_and_enforces_session() {
+        // #0A: the bridge's JSON wire protocol — Kotlin forwards strings, all parsing is
+        // here. Request envelope in, response envelope out; the session gate applies.
+        use isyncyou_core::Config;
+        use serde_json::Value;
+        let open = Router::new(Config::default());
+        let out = handle_bridge_request(
+            &open,
+            r#"{"t":"req","id":"r7","method":"GET","path":"/api/v1/accounts","headers":{},"body":null}"#,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["t"], "res", "reply is framed for the JS onmessage router");
+        assert_eq!(v["id"], "r7", "id is echoed so the JS promise resolves");
+        assert_eq!(v["status"], 200);
+        assert!(
+            v["body"].as_str().unwrap().contains("accounts"),
+            "envelope body: {out}"
+        );
+
+        // A gated router refuses without a token, passes with the canonical header
+        // (case-insensitively matched).
+        let gated = Router::new(Config::default()).with_session_token("sess-br".into());
+        let denied = handle_bridge_request(
+            &gated,
+            r#"{"method":"GET","path":"/api/v1/status","headers":{}}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&denied).unwrap()["status"],
+            401
+        );
+        let ok = handle_bridge_request(
+            &gated,
+            r#"{"method":"GET","path":"/api/v1/status","headers":{"x-session-token":"sess-br"}}"#,
+        );
+        assert_ne!(serde_json::from_str::<Value>(&ok).unwrap()["status"], 401);
+
+        // Malformed JSON → a 400 envelope, never a panic.
+        let bad = handle_bridge_request(&open, "not json");
+        assert_eq!(serde_json::from_str::<Value>(&bad).unwrap()["status"], 400);
+    }
+
+    #[test]
+    fn http_reads_body_then_serves_next_request_on_same_connection() {
+        // #0A: a Content-Length body is read (not drained ad-hoc), so the next request on
+        // the same keep-alive connection is still framed correctly.
+        use isyncyou_core::Config;
+        let router = Arc::new(Router::new(Config::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
+            }
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // A POST with a 5-byte body to an unknown route: the body must be consumed.
+        c.write_all(
+            b"POST /api/v1/nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .unwrap();
+        let first = read_http_response(&mut c);
+        assert!(first.starts_with("HTTP/1.1 "), "first response: {first}");
+        // The follow-up GET on the SAME connection routes cleanly — proof the 5 body
+        // bytes did not bleed into this request's parse.
+        c.write_all(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let second = read_http_response(&mut c);
+        assert!(
+            second.starts_with("HTTP/1.1 200 OK\r\n"),
+            "follow-up after body must succeed: {second}"
+        );
+        assert!(second.contains("\"accounts\""), "body: {second}");
     }
 }

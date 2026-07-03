@@ -52,7 +52,7 @@ const ICONS = {
   "rotate-ccw": "M3 2v6h6M3.5 8a9 9 0 1 0 2.1-3.4L3 8",
   play: "M5 3l14 9-14 9z", pause: "M6 4h4v16H6zM14 4h4v16h-4z",
   "refresh-cw": "M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16",
-  x: "M18 6L6 18M6 6l12 12", "chevron-right": "M9 6l6 6-6 6", "chevron-left": "M15 6l-6 6 6 6",
+  x: "M18 6L6 18M6 6l12 12", "chevron-right": "M9 6l6 6-6 6", "chevron-left": "M15 6l-6 6 6 6", "chevron-down": "M6 9l6 6 6-6",
   plus: "M12 5v14M5 12h14",
   paperclip: "M21.4 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48",
   "external-link": "M15 3h6v6M10 14L21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
@@ -85,6 +85,7 @@ const ICONS = {
   "trash-2": "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6",
   tag: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82zM7 7h.01",
   "mail-open": "M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8M3 8l9-6 9 6M3 8l9 6 9-6",
+  sparkles: "M12 3l2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2z",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -133,6 +134,11 @@ const Net = (() => {
   let raf = 0, last = 0;
   const reduce = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const TWO_PI = Math.PI * 2;
+  // Frame throttle: the constellation drifts slowly, so 60 fps is wasted work — every redraw
+  // forces the glass layers' backdrop-filter blur to recompute (the measured CPU/GPU hotspot).
+  // Cap to ~20 fps: physics use the real elapsed time so the drift speed is identical, only the
+  // redraw (and thus blur-recompute) frequency drops ~3×. The animation itself is unchanged.
+  const FRAME_MS = 1000 / 20;
   function makeNodes(w, h, topWeighted) {
     const rnd = rng(0x51e3a17), N = Math.max(8, Math.round(w * h / 11000)), nodes = [];
     for (let i = 0; i < N; i++) {
@@ -145,7 +151,9 @@ const Net = (() => {
   function resize(layer) {
     const r = layer.canvas.getBoundingClientRect();
     layer.w = Math.max(1, r.width); layer.h = Math.max(1, r.height);
-    layer.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // The constellation sits behind blurred glass, so sub-native resolution is invisible; cap
+    // the DPR lower than the display's to cut canvas fill-rate (fewer pixels to paint + blur).
+    layer.dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     layer.canvas.width = Math.round(layer.w * layer.dpr); layer.canvas.height = Math.round(layer.h * layer.dpr);
     layer.ctx.setTransform(layer.dpr, 0, 0, layer.dpr, 0, 0);
     layer.nodes = makeNodes(layer.w, layer.h, layer.topWeighted);
@@ -170,8 +178,11 @@ const Net = (() => {
   }
   function tick(now) {
     if (!last) last = now;
-    const dt = Math.min(2, (now - last) / 16.67); last = now;
-    if (!document.hidden) {
+    const elapsed = now - last;
+    if (document.hidden) {
+      last = now;                                   // don't bank a huge dt while hidden
+    } else if (elapsed >= FRAME_MS) {               // throttle: skip frames under the fps cap
+      const dt = Math.min(4, elapsed / 16.67); last = now;
       for (const layer of layers) {
         if (!layer.canvas.isConnected) { layers.delete(layer); continue; }   // self-heal
         const m = 8;
@@ -299,6 +310,7 @@ const CAP = {
   onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
   account: "__ACCOUNT_CAP_TOKEN__",
   push: "__PUSH_CAP_TOKEN__",
+  agent: "__AGENT_CAP_TOKEN__",
 };
 
 /* ---------------------------------------------------------------- push registration (#576)
@@ -346,14 +358,120 @@ function sessionHeaders() { const t = sessionToken(); return t ? { "X-Session-To
    profile (no restore capability token is injected). */
 const MOBILE = typeof window !== "undefined" &&
   (!!window.AndroidSession || cookieVal("isy_session") !== "");
-async function api(path) { const r = await fetch(path, { headers: sessionHeaders() }); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status); return r.json(); }
-async function post(path, capToken) {
+/* Transport (#0A): the standalone phone may expose an in-process message bridge
+   (window.__isyBridge — an origin-bound WebMessageListener) so the data path needs no
+   loopback TCP port, unreachable from any other app. When it is absent (the desktop
+   daemon, or a phone build before the bridge) everything falls back to fetch() with
+   identical behaviour. The bridge also carries a request body natively — the query-string
+   API needs none today, but uploads will. The push/EventSource half is converted together
+   with the native bridge (on-device) so the two ends of the wire are tested as one. */
+const BRIDGE = (typeof window !== "undefined" && window.__isyBridge) || null;
+let _bridgeSeq = 0;
+const _bridgePending = new Map(); // request id -> { resolve }
+const _bridgeStreams = new Map(); // stream id -> onEvent handler
+const _bioPending = new Map();    // biometric request id -> { resolve } (#0.6)
+if (BRIDGE) {
+  BRIDGE.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+    if (m.t === "res") {
+      const p = _bridgePending.get(m.id);
+      if (p) { _bridgePending.delete(m.id); p.resolve({ status: m.status, body: m.body }); }
+    } else if (m.t === "bio") {
+      // Native BiometricPrompt result (#0.6): {ok} tells us whether the human confirmed.
+      const p = _bioPending.get(m.id);
+      if (p) { _bioPending.delete(m.id); p.resolve(!!m.ok); }
+    } else if (m.t === "evt") {
+      const h = _bridgeStreams.get(m.id);
+      if (h && m.ev) h.onEvent(m.ev.event || "message", m.ev.data || "");
+    } else if (m.t === "end") {
+      const h = _bridgeStreams.get(m.id);
+      if (h) { _bridgeStreams.delete(m.id); if (h.onError) h.onError(); }
+    }
+  };
+}
+function bridgeSend(method, path, headers, body) {
+  return new Promise((resolve) => {
+    const id = "r" + (++_bridgeSeq);
+    _bridgePending.set(id, { resolve });
+    BRIDGE.postMessage(JSON.stringify({ t: "req", id, method, path, headers, body: body ?? null }));
+  });
+}
+/* Ask the native side (#0.6) to run a BiometricPrompt and, on success, arm the server's
+   per-action token for `pat`. Resolves true only if the human authenticated. Without the
+   native bridge there is no biometric path, so a destructive op cannot be confirmed. */
+function runBiometricConfirm(pat, label) {
+  if (!BRIDGE) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const id = "b" + (++_bridgeSeq);
+    _bioPending.set(id, { resolve });
+    BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat, label }));
+  });
+}
+/* A short human label for the biometric sheet from the challenge payload (#0.6). */
+function biometricLabel(d) {
+  const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
+    : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
+  return `${verb} in ${d.service || "Microsoft 365"}`;
+}
+/* Open an SSE-style stream over the active transport (#0A): the native bridge push
+   channel when present, else EventSource. `onEvent(name, data)` fires per event (name is
+   the SSE `event:` field — "message" when unnamed); `onError()` on stream end/drop.
+   Returns a handle with close(). The two ends of the wire (this + Router::open_bridge_stream)
+   are verified together on-device. */
+function openEventStream(path, onEvent, onError) {
+  if (BRIDGE) {
+    const id = "s" + (++_bridgeSeq);
+    _bridgeStreams.set(id, { onEvent, onError });
+    BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path }));
+    return { close() { _bridgeStreams.delete(id); try { BRIDGE.postMessage(JSON.stringify({ t: "unsub", id })); } catch (_) {} } };
+  }
+  const es = new EventSource(path);
+  es.onmessage = (e) => onEvent("message", e.data);
+  es.addEventListener("change", () => onEvent("change", ""));
+  es.addEventListener("done", () => onEvent("done", ""));
+  es.onerror = () => { if (onError) onError(); };
+  return { close() { try { es.close(); } catch (_) {} } };
+}
+/* One request over the active transport; returns parsed JSON, throws on non-2xx. */
+async function request(method, path, opts) {
+  const o = opts || {};
   const headers = sessionHeaders();
-  if (capToken) headers["X-Capability-Token"] = capToken;
-  const r = await fetch(path, { method: "POST", headers });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || r.status);
+  if (o.capToken) headers["X-Capability-Token"] = o.capToken;
+  let status, d;
+  if (BRIDGE) {
+    const res = await bridgeSend(method, path, headers, o.body);
+    status = res.status;
+    d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
+  } else {
+    const init = { method, headers };
+    if (o.body !== undefined) init.body = o.body;
+    const r = await fetch(path, init);
+    status = r.status;
+    d = await r.json().catch(() => ({}));
+  }
+  // #onedrive-mobile 0.6: a destructive op the mobile router gated answers with a
+  // confirmation_required challenge instead of acting. Run the native biometric and, on a
+  // human confirm, re-issue exactly once with the per-action token. Guarded against loops:
+  // a request that already carries `_pat` is never re-challenged into another biometric.
+  if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
+      && d.pending_action_id && !/[?&]_pat=/.test(path)) {
+    const ok = await runBiometricConfirm(d.pending_action_id, biometricLabel(d));
+    if (!ok) throw new Error("Confirmation cancelled");
+    const sep = path.includes("?") ? "&" : "?";
+    return request(method, `${path}${sep}_pat=${encodeURIComponent(d.pending_action_id)}`, opts);
+  }
+  if (status < 200 || status >= 300) throw new Error(d.error || status);
   return d;
+}
+async function api(path) { return request("GET", path); }
+async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
+/* Confirm a destructive action before it is sent (#0.6). On the standalone phone the
+   native biometric per-action gate IS the confirmation — a strictly stronger one shown
+   right before the op — so the blocking window.confirm() is skipped there (the WebView
+   has no dialog handler for it anyway). Desktop keeps the classic confirm(). */
+function confirmDestructive(message) {
+  if (MOBILE) return true;
+  return confirm(message);
 }
 const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
 const initials = (s) => (s || "?").trim().split(/[\s@.]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join("") || "?";
@@ -864,6 +982,8 @@ function renderShell() {
         el("span", { class: "nav-meta" }, el("span", { id: "alerts-badge", class: "count", text: "·" }))),
       el("button", { id: "nav-settings", class: "nav-item" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") },
         icon("settings"), el("span", { class: "label", text: "Settings" })),
+      CAP.agent ? el("button", { id: "nav-assistant", class: "nav-item" + (App.route === "assistant" ? " active" : ""), title: "AI Assistant", onclick: () => go("assistant") },
+        icon("sparkles"), el("span", { class: "label", text: "Assistant" })) : null,
       eggOn() ? el("button", { id: "nav-ufo", class: "nav-item" + (App.route === "invaders" ? " active" : ""), title: "Invaders", onclick: () => go("invaders") },
         ufoGlyph(), el("span", { class: "label", text: "Invaders" })) : null),
     el("div", { id: "sync-widget", class: "sync-widget" }),
@@ -935,9 +1055,13 @@ function updateNavCounts() {
 
 /* ---------------------------------------------------------------- router */
 function go(route) { location.hash = "#/" + route; }
-const EXTRA_ROUTES = { search: "Search", settings: "Settings", invaders: "Invaders" };
+const EXTRA_ROUTES = { search: "Search", settings: "Settings", assistant: "Assistant", invaders: "Invaders" };
 const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
+  // Each navigation rebuilds the view from scratch; the view's render re-registers its
+  // own live-update handler (or leaves it null). Reset it here so a stale handler from
+  // the previous route can't run against the new DOM (#0A soft refresh).
+  App.liveUpdate = null;
   // Preserve the scroll position across a SAME-route re-render (e.g. an SSE
   // "change" tick / a live update) so the user isn't bounced back to the top of
   // a long page mid-scroll. Navigation to a different route starts at the top.
@@ -951,7 +1075,11 @@ function onRoute() {
   if (App.route === "invaders" && !eggOn()) App.route = "overview";   // egg-gated route
   // Close any open overlay (detail sheet / command palette) on a real navigation
   // so it can't leak across routes; a same-route refresh keeps it open.
-  if (App.route !== prevRoute) { closeSheet(); closePalette(); }
+  if (App.route !== prevRoute) {
+    closeSheet(); closePalette();
+    // Leaving the assistant: close any live token stream so it can't leak across routes.
+    if (prevRoute === "assistant" && AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
+  }
   renderShell();
   const view = $("#view");
   let p;
@@ -964,6 +1092,7 @@ function onRoute() {
   else if (App.route === "onenote") p = renderOnenoteView(view);
   else if (App.route === "search") p = renderSearchView(view);
   else if (App.route === "settings") p = renderSettingsView(view);
+  else if (App.route === "assistant") p = renderAssistantView(view);
   else if (App.route === "invaders") p = renderInvaders(view);
   else p = renderServiceView(view, App.route);
   if (prevScroll && App.route === prevRoute) {
@@ -1090,7 +1219,25 @@ async function renderOverview(view) {
         connItem("Body index", sync.body_index ? "On (full-text)" : "Off"),
         connItem("OneDrive delta", st.onedrive_cursor ? "Active" : "—"),
         connItem("Last successful", lastOk ? fmtFullDate(lastOk.finished_at) : "—")))));
+    // Live-refresh the dashboard when a sync tick actually changes the counts (fixes the
+    // stale "0 items" Overview on mobile, where the initial render happens before the first
+    // sync populates data). Repaints only on a real change — never per tick.
+    App._ovSig = overviewSignature(st);
+    App.liveUpdate = overviewLiveUpdate;
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
+}
+function overviewSignature(st) {
+  const svc = (st.services || []).map(s => s.service + ":" + s.items).join(",");
+  return (st.totals?.items ?? 0) + "/" + (st.totals?.archived ?? 0) + "/" + svc;
+}
+async function overviewLiveUpdate() {
+  let st;
+  try { st = await api("/api/v1/status?" + qs({ account: App.account })); }
+  catch (_) { return; }
+  if (overviewSignature(st) === App._ovSig) return; // counts unchanged → no repaint
+  const view = $("#view"), vsc = view ? view.scrollTop : 0;
+  await renderOverview($("#view")); // re-renders; re-arms App._ovSig + App.liveUpdate
+  const v2 = $("#view"); if (v2) v2.scrollTop = vsc;
 }
 function connItem(k, v) { return el("div", { class: "conn-item" }, el("dt", { text: k }), el("dd", { text: v == null ? "—" : String(v) })); }
 
@@ -1244,7 +1391,7 @@ async function renderMailView(view) {
     // toolbar
     el("div", { class: "mail-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
-        el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); } })),
+        el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { clearTimeout(Mail._qT); Mail._qT = setTimeout(() => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); }, 140); } })),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
         el("select", { class: "input", onchange: (e) => { Mail.sort = e.target.value; mailRender(); } },
@@ -1277,6 +1424,11 @@ async function renderMailView(view) {
     refreshMailSubnav(); // rebuild the sidebar now that the real categories are known
     fillSubnavCounts("mail", Mail.all);
     mailRenderMetrics(); mailRender();
+    // Register the soft live-update for background sync ticks (#0A): re-fetch + patch the
+    // list in place (no teardown, no filter/scroll reset), repainting only when the
+    // visible set actually changed.
+    Mail._sig = mailListSignature();
+    App.liveUpdate = mailLiveUpdate;
     // re-open the message that was selected before a live (SSE) refresh, if it survived
     if (Mail.pendingSelect) {
       const keep = Mail.all.find(x => x.remote_id === Mail.pendingSelect);
@@ -1284,6 +1436,31 @@ async function renderMailView(view) {
       if (keep) mailSelect(keep);
     }
   } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
+}
+
+// Signature of the currently *visible* mailbox (ids + read state, honouring the active
+// filter/search/sort) — lets a background refresh detect whether anything on screen
+// actually changed before repainting (#0A).
+function mailListSignature() {
+  return mailFiltered().map(it => it.remote_id + (((it.preview || {}).isRead) ? "1" : "0")).join(",");
+}
+// Soft background refresh for the mailbox (#0A): re-fetch, update counts, and repaint the
+// list ONLY when the visible set changed — preserving filter/search/sort/scroll/selection
+// so a sync tick never reloads the screen.
+async function mailLiveUpdate() {
+  let d;
+  try { d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 })); }
+  catch (_) { return; }
+  Mail.all = (d.items || []).filter(it => it.item_type === "message");
+  App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
+  const sig = mailListSignature();
+  if (sig === Mail._sig) { mailRenderMetrics(); return; } // nothing on screen changed → no repaint
+  Mail._sig = sig;
+  const list = $("#mail-list"), view = $("#view");
+  const lsc = list ? list.scrollTop : 0, vsc = view ? view.scrollTop : 0;
+  mailRenderMetrics(); mailRender();
+  const l2 = $("#mail-list"); if (l2) l2.scrollTop = lsc;
+  const v2 = $("#view"); if (v2) v2.scrollTop = vsc;
 }
 // fill an existing .con-metrics-row container in place from card specs
 function fillMetrics(row, cards) {
@@ -1326,6 +1503,10 @@ function mailRender() {
   const archived = Mail.all.filter(it => it.has_body).length;
   const m = $("#mail-metrics"); if (m) m.textContent = `${Mail.all.length} messages · ${archived} with content · ${withAtt} with attachments`;
   clear(list);
+  // Bump the render generation on every (re-)render so any in-flight progressive
+  // batch from a previous render — including one interrupted by an early return
+  // below — stops before touching this freshly cleared list.
+  const gen = (Mail._renderGen = (Mail._renderGen || 0) + 1);
   if (!Mail.all.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." }))); return; }
   if (!rows.length) { list.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "Adjust the filter or search." }))); return; }
   // Conversation grouping (#563): collapse messages sharing a conversationId into
@@ -1342,9 +1523,29 @@ function mailRender() {
   } else {
     display = rows.map(it => ({ it, n: 1 }));
   }
-  const frag = document.createDocumentFragment();
-  display.forEach(e => frag.append(mailRow(e.it, e.n)));
-  list.append(frag);
+  // Progressive render: fill the viewport instantly, then append the rest in
+  // requestAnimationFrame batches so building the (potentially hundreds of) rows
+  // never blocks the main thread — the mailbox appears immediately instead of the
+  // UI freezing on a synchronous full build. A generation token cancels an in-flight
+  // render when the list is re-rendered (search/filter/sort/thread/SSE refresh), so
+  // stale batches never leak into a newer list. Every row is still rendered, in order
+  // — no feature lost; only the *timing* of the off-screen rows changes.
+  const FIRST = 24, BATCH = 40;
+  const paint = (from, to) => {
+    const frag = document.createDocumentFragment();
+    for (let i = from; i < to && i < display.length; i++) frag.append(mailRow(display[i].it, display[i].n));
+    list.append(frag);
+  };
+  paint(0, FIRST);
+  if (display.length > FIRST) {
+    let i = FIRST;
+    const step = () => {
+      if (Mail._renderGen !== gen || !list.isConnected) return; // superseded by a newer render
+      paint(i, i + BATCH); i += BATCH;
+      if (i < display.length) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
 }
 function mailRow(it, threadCount = 1) {
   const p = it.preview || {};
@@ -2460,7 +2661,7 @@ function eventRespondInline(ev, response, host) {
   requestAnimationFrame(() => panel.classList.add("open"));
 }
 async function deleteEvent(ev) {
-  if (!confirm("Delete this event? This removes it from your calendar.")) return;
+  if (!confirmDestructive("Delete this event? This removes it from your calendar.")) return;
   try {
     await post("/api/v1/calendar/delete?" + qs({ account: App.account, id: ev.it.remote_id }), CAP.calendarwrite);
     toast("Event deleted"); closeSheet(); calLoad();
@@ -2609,7 +2810,7 @@ async function composeContactSubmit(btn, id) {
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function deleteContact(it) {
-  if (!confirm("Delete this contact? This removes it from your Microsoft 365 account.")) return;
+  if (!confirmDestructive("Delete this contact? This removes it from your Microsoft 365 account.")) return;
   try {
     await post("/api/v1/contact/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.contactwrite);
     toast("Contact deleted");
@@ -3223,7 +3424,7 @@ async function reopenTask(t) {
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function deleteTask(t) {
-  if (!confirm("Delete this task from your Microsoft 365 account?")) return;
+  if (!confirmDestructive("Delete this task from your Microsoft 365 account?")) return;
   try { await post("/api/v1/todo/delete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task deleted"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -3444,7 +3645,7 @@ async function composePageSubmit(btn) {
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function deletePage(it) {
-  if (!confirm("Delete this page from your Microsoft 365 account?")) return;
+  if (!confirmDestructive("Delete this page from your Microsoft 365 account?")) return;
   try {
     await post("/api/v1/onenote/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onenotewrite);
     toast("Page deleted"); Note.selected = null; renderNoteReader(null); noteReload();
@@ -3591,6 +3792,12 @@ async function renderSettingsView(view) {
     if (CAP.account) acctCard.append(el("button", { class: "btn", style: "margin-top:12px", onclick: openAccountSwitcher },
       icon("rotate-ccw", "icon-sm"), "Sign in / reconnect account"));
     body.append(acctCard);
+    // Diagnostics: a live perf overlay flag (CPU/RAM/disk-IO of the whole app process).
+    const perfLbl = el("span", { text: localStorage.getItem("isy_perf") === "1" ? "Hide performance overlay" : "Show performance overlay" });
+    body.append(el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Diagnostics" }),
+      el("p", { class: "dim", style: "font-size:13px;margin:.2rem 0 .7rem", text: "Live overlay of the app's whole-process load — CPU, RAM and disk IO — for performance testing." }),
+      el("button", { class: "btn", onclick: () => { const on = togglePerf(); perfLbl.textContent = on ? "Hide performance overlay" : "Show performance overlay"; } },
+        icon("clock", "icon-sm"), perfLbl)));
     const syncCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Sync" }),
       kvList([["Scheduled", st.enabled ? (st.paused ? "paused" : "running") : "off"], ["Trash retention", (sy.trash_retention_days ?? "—") + " days"], ["Body index (FTS)", sy.body_index ? "on" : "off"], ["Change source", sy.change_source || "—"]]));
     if (st.enabled && CAP.sync) syncCard.append(el("div", { style: "display:flex;gap:8px;margin-top:12px" },
@@ -3659,6 +3866,436 @@ function openAccountSwitcher() {
   document.body.append(accountMenu);
   renderAccountMenu(body);
 }
+/* ---------------------------------------------------------------- assistant (S-AG.12: connect) */
+// Begin the device OAuth login: ask the engine for an authorize URL, then navigate to
+// it. The WebView hands the external https URL to the system browser (shouldOverride-
+// UrlLoading), where the operator signs in to their own provider account; the browser
+// returns to our loopback callback, which exchanges the code and stores the token.
+// Loopback-primary login (matches the real claude client): the browser returns to the
+// engine's own /callback, which completes the exchange server-side; the UI polls status.
+
+// Open an external auth URL by handing the RAW string to the native bridge (→ ACTION_VIEW).
+// NOT location.href: that routes the URL through the WebView's own navigation, which re-parses/
+// normalises it — mangling the percent-encoded redirect_uri/scope and following the
+// claude.com/cai→claude.ai redirect in-WebView before hand-off — after which claude.ai rejects
+// the consent submit with "Invalid request format". Verified on-device 2026-07-01: a direct
+// browser open completes the consent, the WebView location.href fails. Desktop → location.href.
+function openExternalAuth(url) {
+  if (window.AndroidNav && window.AndroidNav.openExternal) window.AndroidNav.openExternal(url);
+  else location.href = url;
+}
+// Hold the app process foreground (via a short-lived FGS) across the OAuth browser
+// round-trip, so the loopback token exchange isn't killed by the APP_BACKGROUND network
+// restriction. No-op off-Android. Always paired with endNetworkGuard() on completion/
+// timeout/cancel (#640).
+function beginNetworkGuard() {
+  if (window.AndroidNav && window.AndroidNav.beginNetworkGuard) window.AndroidNav.beginNetworkGuard();
+}
+function endNetworkGuard() {
+  if (window.AndroidNav && window.AndroidNav.endNetworkGuard) window.AndroidNav.endNetworkGuard();
+}
+
+async function startAiLogin(provider) {
+  try {
+    // Loopback flow with a `localhost` redirect — matches the real `claude setup-token`, which
+    // uses `http://localhost:<port>/callback` and completes the consent. Controlled comparison
+    // (2026-07-01, same host `claude.com/cai` + scope `user:inference`): the loopback redirect
+    // is ACCEPTED, while the manual `platform.claude.com/oauth/code/callback` redirect is
+    // rejected on-device with "Invalid request format". Codex ignores this redirect (its engine
+    // binds its own 127.0.0.1:1455 listener). The engine's `/callback` completes the exchange.
+    const redirect = "http://localhost:" + location.port + "/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
+    if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
+    showWaitingStep();               // waiting UI + poll; completes when /callback fires
+    toast("Opening sign-in in your browser…");
+    beginNetworkGuard();             // keep the loopback exchange alive while backgrounded (#640)
+    openExternalAuth(d.authorize_url); // native bridge (raw URL) — NOT location.href (see below)
+  } catch (e) {
+    toast("Sign-in unavailable: " + (e.message || e));
+  }
+}
+
+// After the browser login the engine's /callback stores the token; poll status until
+// connected, then switch to the chat.
+let AGENT_POLL_ON = false;
+function showWaitingStep() {
+  const card = document.getElementById("asst-connect-card");
+  if (card) {
+    clear(card).append(
+      el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
+      el("h2", { style: "margin:.3rem 0 .5rem", text: "Finishing sign-in…" }),
+      el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.3rem;max-width:27rem", text: "Approve the login in your browser, then come back here — this connects automatically." }),
+      el("div", { class: "skel", style: "height:8px;width:60%;margin:0 auto;border-radius:4px" }),
+    );
+  }
+  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0); }
+}
+async function pollAgentStatus(n) {
+  if (App.route !== "assistant") { AGENT_POLL_ON = false; endNetworkGuard(); return; }
+  try {
+    const s = await api("/api/v1/agent/status");
+    if (s && s.connected) { AGENT_POLL_ON = false; endNetworkGuard(); toast("Connected!"); renderAssistantView($("#view")); return; }
+  } catch (_) {}
+  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1), 2000); }
+  else { AGENT_POLL_ON = false; endNetworkGuard(); }
+}
+
+// Swap the connect card to the "paste your code" step.
+function showCodeStep() {
+  const card = document.getElementById("asst-connect-card");
+  if (!card) return;
+  clear(card).append(
+    el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
+    el("h2", { style: "margin:.3rem 0 .5rem", text: "Paste your code" }),
+    el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.3rem;max-width:27rem", text: "After you approve in the browser, copy the code it shows and paste it here to finish connecting." }),
+    el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
+    el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
+      el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
+      el("button", { class: "btn", onclick: () => renderAssistantView($("#view")) }, "Cancel"),
+    ),
+  );
+}
+
+async function completeAiLogin() {
+  const inp = document.getElementById("asst-code");
+  const code = inp && inp.value.trim();
+  if (!code) { toast("Paste the code first"); return; }
+  try {
+    await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    toast("Connected!");
+    renderAssistantView($("#view"));   // re-fetch status -> switches to chat
+  } catch (e) {
+    toast("Couldn't connect: " + (e.message || e));
+  }
+}
+
+let AGENT_ES = null;     // the active per-turn token stream (EventSource)
+let ASST_LOG = [];       // in-view transcript: [{role:'user'|'assistant', text, chips:[]}]
+
+async function renderAssistantView(view) {
+  clear(view).append(
+    el("h1", { class: "view-title", text: "AI Assistant" }),
+    el("div", { id: "asst-body" }),
+  );
+  const body = $("#asst-body");
+  body.append(el("div", { class: "card", style: "max-width:36rem;margin:1.25rem auto;padding:1.4rem" },
+    el("div", { class: "skel", style: "height:20px;width:50%" })));
+  let st = {};
+  try { st = await api("/api/v1/agent/status"); } catch (_) { st = {}; }
+  clear(body);
+  if (st && st.connected) renderAssistantChat(body, st);
+  else renderAssistantConnect(body);
+}
+
+// The connect card (shown until an AI account is connected).
+function renderAssistantConnect(body) {
+  body.append(
+    el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
+    el("div", { id: "asst-connect-card", class: "card", style: "max-width:36rem;margin:1.25rem auto;text-align:center;padding:2.5rem 2rem" },
+      el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff;box-shadow:0 8px 24px rgba(99,102,241,.35)" }, icon("sparkles")),
+      el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
+      el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.6rem;max-width:27rem", text: "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login — your credentials go only to the provider — and this device is then authorized." }),
+      el("div", { style: "display:flex;flex-direction:column;gap:.6rem;max-width:21rem;margin:0 auto" },
+        el("button", { id: "asst-connect-anthropic", class: "btn primary", onclick: () => startAiLogin("anthropic") }, icon("sparkles", "icon-sm"), "Connect Claude (Anthropic)"),
+        el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai") }, icon("sparkles", "icon-sm"), "Connect ChatGPT (OpenAI)"),
+      ),
+      el("p", { class: "dim", style: "margin:1.3rem 0 0;font-size:.8rem", text: "Experimental — uses your own subscription. You can disconnect any time." }),
+    ),
+  );
+}
+
+// The chat surface (shown once connected). Streams tokens over the per-turn SSE.
+function renderAssistantChat(body, st) {
+  body.append(
+    el("div", { style: "display:flex;align-items:center;gap:.5rem;max-width:46rem;margin:.1rem auto .9rem" },
+      el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
+      agentModelSwitcher(st),
+    ),
+    el("div", { id: "asst-log", style: "display:flex;flex-direction:column;gap:.8rem;max-width:46rem;margin:0 auto;width:100%;padding-bottom:1rem" }),
+    el("div", { style: "position:sticky;bottom:0;max-width:46rem;margin:0 auto;width:100%" },
+      el("div", { style: "display:flex;gap:.5rem;padding:.5rem 0", class: "asst-inputrow" },
+        el("textarea", { id: "asst-input", class: "input", rows: "1", placeholder: "Ask about your mail, files, calendar…", style: "flex:1;resize:none;min-height:46px;max-height:160px", onkeydown: agentKeydown }),
+        el("button", { class: "btn primary", title: "Send", onclick: agentSendFromInput }, icon("send", "icon-sm")),
+      ),
+    ),
+  );
+  const log = $("#asst-log");
+  if (!ASST_LOG.length) {
+    log.append(el("div", { class: "dim", style: "text-align:center;padding:2.5rem 1rem", text: "Ask me anything about your Microsoft 365 — I'll read your archive and answer with sources." }));
+  } else {
+    ASST_LOG.forEach(m => log.append(renderAsstMsg(m)));
+    requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
+  }
+}
+
+// Model switcher: pick any available Claude/Codex model. The choice is persisted
+// server-side (agent-settings) and applies to the next turn.
+// Custom in-UI model picker (no native <select>): a glass panel that unfolds with a
+// spring animation, models grouped by provider, active one highlighted. Falls back to a
+// plain label when nothing is connected.
+function agentModelSwitcher(st) {
+  const models = st.models || {};
+  const cur = (st.provider || "") + "|" + (st.model || "");
+  const curLabel = () => {
+    for (const [prov, tag] of [["claude", "Claude"], ["codex", "ChatGPT"]]) {
+      const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
+      if (m) return tag + " · " + m.label;
+    }
+    return st.model || "Select model";
+  };
+  const rows = [];
+  const addGroup = (prov, connected, tag) => {
+    if (!connected) return;
+    rows.push(el("div", { class: "mdl-group" }, tag));
+    (models[prov] || []).forEach((m) => {
+      const val = prov + "|" + m.id;
+      rows.push(el("div",
+        { class: "mdl-item" + (val === cur ? " active" : ""), role: "option", onclick: () => pickModel(prov, m.id) },
+        el("span", { class: "mdl-dot" }),
+        el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
+    });
+  };
+  addGroup("claude", st.claude, "Claude");
+  addGroup("codex", st.codex, "ChatGPT");
+  if (!st.codex) {
+    rows.push(el("div", { class: "mdl-item mdl-connect", onclick: () => connectCodex() },
+      el("span", { class: "mdl-plus" }, "＋"),
+      el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
+  }
+  if (!rows.length) return el("span", { class: "dim", style: "font-size:.85rem", text: st.model || "" });
+
+  const wrap = el("div", { class: "mdl" });
+  const closeOutside = (ev) => { if (!wrap.contains(ev.target)) close(); };
+  const close = () => { wrap.classList.remove("open"); document.removeEventListener("pointerdown", closeOutside, true); };
+  const trigger = el("button",
+    { class: "mdl-trigger", type: "button", "aria-haspopup": "listbox", title: "Switch model",
+      onclick: (ev) => {
+        ev.stopPropagation();
+        if (wrap.classList.toggle("open")) document.addEventListener("pointerdown", closeOutside, true);
+        else document.removeEventListener("pointerdown", closeOutside, true);
+      } },
+    el("span", { class: "mdl-cur", text: curLabel() }), icon("chevron-down", "mdl-caret"));
+  wrap.append(trigger, el("div", { class: "mdl-panel", role: "listbox" }, ...rows));
+  return wrap;
+}
+async function pickModel(provider, model) {
+  try {
+    await post("/api/v1/agent/model?" + qs({ provider, model }), CAP.agent);
+    toast("Model: " + model);
+    renderAssistantView($("#view"));
+  } catch (err) {
+    toast("Could not switch model: " + (err.message || err));
+  }
+}
+// Start the real on-device ChatGPT/Codex OAuth (opens the system browser; the daemon's
+// loopback callback server catches the redirect). Then poll until codex connects.
+async function connectCodex() {
+  try {
+    // Codex ignores this redirect (its engine binds a fixed 127.0.0.1:1455 callback listener);
+    // we pass a loopback origin only for symmetry with the API.
+    const redirect = "http://127.0.0.1:" + location.port + "/callback";
+    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider: "codex", redirect }), CAP.agent);
+    if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
+    toast("Opening ChatGPT sign-in…");
+    beginNetworkGuard();             // keep the 1455 loopback exchange alive while backgrounded (#640)
+    openExternalAuth(d.authorize_url);
+    pollCodexStatus(0);
+  } catch (e) {
+    toast("ChatGPT sign-in unavailable: " + (e.message || e));
+  }
+}
+async function pollCodexStatus(n) {
+  try {
+    const s = await api("/api/v1/agent/status");
+    if (s && s.codex) { endNetworkGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
+  } catch (_) {}
+  if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
+  else endNetworkGuard();
+}
+
+// Progressive-search rendering (S-AG.18/#643, S-AG.19/#644). Module-level so BOTH the live
+// stream (agentSend) and a re-render from ASST_LOG (renderAsstMsg, after a view switch) build
+// identical cards — the transcript keeps its search stages + result cards, not just the text.
+const ASST_STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
+function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" })[s] || "file"; }
+// The app's canonical item viewer — the SAME sandboxed, same-origin iframe the Mail reader
+// uses (`/api/v1/view` renders sanitized-HTML mail / a rendered item; frame-src 'self' +
+// frame-ancestors 'self' allow the shell to embed it). Reused so search shows the real,
+// properly-formatted body — not a hand-rolled text extract.
+function asstViewerFrame(q) {
+  return el("iframe", { class: "asst-result-frame", src: `/api/v1/view?${qs(q)}`, title: "Item preview", sandbox: "allow-same-origin" });
+}
+// One typed result: header (name) + one-line preview; click → animated pull-down that
+// lazily embeds the real viewer for the body + a link to open it full-screen.
+function asstResultCard(it) {
+  const q = { account: App.account, service: it.service, id: it.id };
+  const snip = (it.snippet || "").trim();
+  const head = el("div", { class: "asst-result-head" },
+    el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
+    el("div", { class: "asst-result-main grow" },
+      el("div", { class: "asst-result-name truncate", text: it.name || "(no name)" }),
+      el("div", { class: "asst-result-sub truncate", text: snip || (it.item_type || it.service) })),
+    el("span", { class: "asst-result-type", text: it.item_type || it.service }),
+    el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
+  const panel = el("div", { class: "asst-result-panel" });
+  const row = el("div", { class: "asst-result" }, head, panel);
+  let loaded = false;
+  head.addEventListener("click", () => {
+    const opening = !row.classList.contains("open");
+    row.classList.toggle("open");
+    if (opening && !loaded) {   // lazy: only load the viewer when the user opens the card
+      loaded = true;
+      panel.append(
+        asstViewerFrame(q),
+        el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
+          icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+    }
+  });
+  return row;
+}
+function asstStageRowDone(stage, hits) {
+  return el("div", { class: "asst-stage done" },
+    el("span", { class: "asst-stage-ic", text: "✓" }),
+    el("span", { class: "grow", text: ASST_STAGE_LABEL[stage] || stage }),
+    el("span", { class: "asst-stage-n dim", text: hits + (hits === 1 ? " hit" : " hits") }));
+}
+// Rebuild a turn's search block (final stages + result cards) from stored data.
+function asstSearchBlock(stages, results) {
+  const frag = document.createDocumentFragment();
+  if (stages && stages.length) {
+    const sb = el("div", { class: "asst-search" });
+    stages.forEach(s => sb.append(asstStageRowDone(s.stage, s.hits)));
+    frag.append(sb);
+  }
+  if (results && results.length) {
+    const rb = el("div", { class: "asst-results" });
+    results.forEach(it => rb.append(asstResultCard(it)));
+    frag.append(rb);
+  }
+  return frag;
+}
+
+function renderAsstMsg(m) {
+  const isUser = m.role === "user";
+  const bubble = el("div", {
+    class: "card asst-bubble",
+    style: `max-width:82%;padding:.7rem .9rem;${isUser ? "background:linear-gradient(135deg,#6366f1,#7c5cff);color:#fff" : ""}`,
+  }, el("div", { class: "asst-text", style: "white-space:pre-wrap;line-height:1.5", text: m.text || (isUser ? "" : "…") }));
+  (m.chips || []).forEach(c => bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: c })));
+  // Re-render the turn's search stages + result cards (persisted in the message), so a view
+  // switch brings the whole conversation back — not just the text (#644).
+  if ((m.stages && m.stages.length) || (m.results && m.results.length)) bubble.append(asstSearchBlock(m.stages, m.results));
+  return el("div", { style: `display:flex;${isUser ? "justify-content:flex-end" : ""}` }, bubble);
+}
+
+function agentKeydown(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); agentSendFromInput(); }
+}
+function agentSendFromInput() {
+  const inp = $("#asst-input"); if (!inp) return;
+  const text = inp.value.trim(); if (!text) return;
+  inp.value = "";
+  agentSend(text);
+}
+
+// Start a turn and stream its tokens into a fresh assistant bubble.
+async function agentSend(text) {
+  const log = $("#asst-log"); if (!log) return;
+  if (!ASST_LOG.length) clear(log);   // drop the empty-state hint
+
+  ASST_LOG.push({ role: "user", text });
+  log.append(renderAsstMsg(ASST_LOG[ASST_LOG.length - 1]));
+  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [] };
+  ASST_LOG.push(asst);
+  const asstEl = renderAsstMsg(asst);
+  log.append(asstEl);
+  const textEl = asstEl.querySelector(".asst-text");
+  const bubble = asstEl.querySelector(".asst-bubble");
+  // Immediate animated "working" ack (#644) instead of a bare "…" while the model thinks
+  // before its first token / search stage. Removed on the first real content.
+  textEl.textContent = "";
+  const thinkingEl = el("div", { class: "asst-thinking" },
+    el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }),
+    el("span", { class: "asst-thinking-label dim", text: "Searching your Microsoft 365…" }));
+  bubble.insertBefore(thinkingEl, textEl);
+  let thinkingDone = false;
+  const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
+  log.scrollTop = log.scrollHeight;
+  const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; log.scrollTop = log.scrollHeight; };
+  const addChip = (label) => { asst.chips.push(label); bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: label })); log.scrollTop = log.scrollHeight; };
+
+  // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
+  // and a result list that grows as PartialResult events arrive.
+  const STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
+  let searchBox = null, resultsBox = null; const stageRow = {};
+  const ensureSearchUI = () => {
+    clearThinking();   // the search plan replaces the generic "working" indicator
+    if (searchBox) return;
+    searchBox = el("div", { class: "asst-search" });
+    resultsBox = el("div", { class: "asst-results" });
+    bubble.append(searchBox, resultsBox);
+    log.scrollTop = log.scrollHeight;
+  };
+  const onSearchStage = (d) => {
+    ensureSearchUI();
+    let row = stageRow[d.stage];
+    if (!row) {
+      row = el("div", { class: "asst-stage" }, el("span", { class: "asst-stage-ic" }), el("span", { class: "grow", text: STAGE_LABEL[d.stage] || d.stage }), el("span", { class: "asst-stage-n dim" }));
+      stageRow[d.stage] = row; searchBox.append(row);
+    }
+    const done = d.status === "done";
+    row.classList.toggle("done", done);
+    row.querySelector(".asst-stage-ic").textContent = done ? "✓" : "";
+    if (done) {
+      row.querySelector(".asst-stage-n").textContent = d.hits + (d.hits === 1 ? " hit" : " hits");
+      const e = asst.stages.find(s => s.stage === d.stage);   // persist final stage state
+      if (e) e.hits = d.hits; else asst.stages.push({ stage: d.stage, hits: d.hits });
+    }
+    log.scrollTop = log.scrollHeight;
+  };
+  const onPartialResult = (d) => {
+    ensureSearchUI();
+    (d.items || []).forEach((it) => {
+      asst.results.push(it);                 // persist so the cards survive a view switch
+      resultsBox.append(asstResultCard(it));  // module-level builder (shared with re-render)
+    });
+    log.scrollTop = log.scrollHeight;
+  };
+
+  if (AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
+  let turn;
+  try {
+    const r = await post("/api/v1/agent/turn?" + qs({ account: App.account, prompt: text }), CAP.agent);
+    turn = r && r.turn;
+  } catch (e) { setText("Error: " + (e.message || e)); return; }
+  if (!turn) { setText("Error: could not start the turn"); return; }
+
+  const tok = sessionToken();
+  const url = "/api/v1/agent/stream?" + qs({ turn }) + (tok ? "&_st=" + encodeURIComponent(tok) : "");
+  // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
+  // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
+  // event or a stream drop ends the turn.
+  let stream;
+  const finish = (msg) => { clearThinking(); try { stream.close(); } catch (_) {} if (AGENT_ES === stream) AGENT_ES = null; if (!asst.text && msg) setText(msg); };
+  stream = openEventStream(url, (name, data) => {
+    if (name === "done") { finish("(no response)"); return; }
+    if (name !== "message") return; // ignore ping heartbeats
+    let d; try { d = JSON.parse(data); } catch (_) { return; }
+    switch (d.event) {
+      case "token": setText(asst.text + (d.text || "")); break;
+      case "search_stage": onSearchStage(d); break;
+      case "partial_result": onPartialResult(d); break;
+      // Raw tool calls (search/read/…) are internal — the stage checkmarks + result cards
+      // already show what's happening, so we don't surface "→ isyncyou read" noise.
+      case "tool_call": break;
+      case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
+      case "error": clearThinking(); setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
+      case "done": finish("(no response)"); break;
+    }
+  }, () => finish("⚠ connection lost"));
+  AGENT_ES = stream;
+}
+
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
   clear(body);
@@ -3767,15 +4404,27 @@ let _bdT, _evtT;
 // Subscribe to the daemon's SSE change stream: on a cloud/sync change, refetch the
 // active view (near-real-time). EventSource auto-reconnects if the daemon restarts.
 function subscribeEvents() {
-  if (!window.EventSource) return;
-  const es = new EventSource("/api/v1/events");
-  es.addEventListener("change", () => {
+  if (!BRIDGE && !window.EventSource) return;
+  // Transport-abstracted (#0A): the native bridge push channel on the phone (which carries
+  // the session token itself), EventSource on desktop. `_st` covers the EventSource path.
+  const tok = sessionToken();
+  const path = "/api/v1/events" + (tok ? "?_st=" + encodeURIComponent(tok) : "");
+  openEventStream(path, (name) => {
+    if (name !== "change") return; // ignore ping heartbeats
     clearTimeout(_evtT);
-    // preserve the open message across a live refresh so an SSE tick (new mail /
-    // a reconciled write) doesn't kick the user out of what they're reading.
-    if (App.route === "mail" && Mail.selected) Mail.pendingSelect = Mail.selected.remote_id;
-    _evtT = setTimeout(onRoute, 150);
-  });
+    _evtT = setTimeout(() => {
+      // Soft, in-place refresh — NO shell/view teardown, no filter/search/scroll/selection
+      // reset, so a background sync tick never "reloads the whole screen". A view that
+      // supports live updates registers App.liveUpdate (mail does); it re-fetches and
+      // patches only what changed. Views without one keep the old full refresh on desktop
+      // and refresh on the next navigation on the phone (never a jarring full reload).
+      if (App.liveUpdate) { try { App.liveUpdate(); } catch (_) {} return; }
+      if (MOBILE) return;
+      onRoute();
+    }, 150);
+  // EventSource auto-reconnects natively; the bridge push channel doesn't, so re-subscribe
+  // after a short backoff when a bridge stream drops.
+  }, BRIDGE ? () => setTimeout(subscribeEvents, 3000) : undefined);
 }
 // Mobile touch navigation (#77): a horizontal swipe on the content navigates —
 // a right-swipe with an open detail goes back to the list; otherwise swipe
@@ -3816,8 +4465,71 @@ function setupSwipe() {
     else if (dx > 0 && i > 0) go(order[i - 1]);           // right → previous tab
   }, { passive: true });
 }
+// Performance overlay (test flag): a live HUD of the app's whole-process load — CPU%, the
+// GPU/render-thread cost, RAM, disk IO, disk-wait and the system IO-queue depth — from
+// /api/v1/debug/stats (embedded engine + WebView are one process, so it's the total the app
+// causes). Toggled from Settings → Diagnostics, or window.togglePerf().
+//
+// "GPU/Rend" is a proxy: Android exposes no per-process GPU%, so we surface the CPU spent by the
+// WebView render/compositor/GPU threads — the render work GPU-bound animation drives.
+let _perfTimer = null, _perfPrev = null;
+function perfRate(bps) {
+  if (!isFinite(bps) || bps < 1) return "0";
+  const u = ["B/s", "KB/s", "MB/s"]; let i = 0;
+  while (bps >= 1024 && i < 2) { bps /= 1024; i++; }
+  return bps.toFixed(i ? 1 : 0) + " " + u[i];
+}
+function startPerfOverlay() {
+  if (document.getElementById("perf-hud")) return;
+  const mk = (k, id) => el("div", { class: "perf-row" }, el("span", { class: "perf-k", text: k }), el("span", { id, class: "perf-v", text: "…" }));
+  document.body.append(el("div", { id: "perf-hud", class: "perf-hud" },
+    mk("CPU", "perf-cpu"), mk("GPU/Rend", "perf-gpu"), mk("RAM", "perf-ram"),
+    mk("Disk R", "perf-ior"), mk("Disk W", "perf-iow"),
+    mk("Disk wait", "perf-iowait"), mk("IO queue", "perf-ioq")));
+  _perfPrev = null;
+  const tick = async () => {
+    let s; try { s = await api("/api/v1/debug/stats"); } catch { return; }
+    const now = performance.now();
+    const cores = s.cores || 1;
+    if (_perfPrev) {
+      const dt = (now - _perfPrev.t) / 1000;
+      const pct = (cur, prev) => dt > 0 ? Math.max(0, (cur - prev) / (dt * 1000) * 100) : 0;
+      const cpu = pct(s.cpu_ms, _perfPrev.cpu_ms);
+      const cpuEl = $("#perf-cpu");
+      if (cpuEl) { cpuEl.textContent = cpu.toFixed(0) + "%"; cpuEl.classList.toggle("hot", cpu > cores * 55); }
+      const gpu = pct(s.render_ms || 0, _perfPrev.render_ms || 0);
+      const gpuEl = $("#perf-gpu");
+      if (gpuEl) { gpuEl.textContent = gpu.toFixed(0) + "%"; gpuEl.classList.toggle("hot", gpu > 60); }
+      if ($("#perf-ior")) $("#perf-ior").textContent = perfRate(dt > 0 ? (s.io_read - _perfPrev.io_read) / dt : 0);
+      if ($("#perf-iow")) $("#perf-iow").textContent = perfRate(dt > 0 ? (s.io_write - _perfPrev.io_write) / dt : 0);
+      const wait = pct(s.blkio_ms || 0, _perfPrev.blkio_ms || 0);
+      const waitEl = $("#perf-iowait");
+      if (waitEl) { waitEl.textContent = wait.toFixed(0) + "%"; waitEl.classList.toggle("hot", wait > 20); }
+    }
+    const q = s.io_inflight || 0;
+    const qEl = $("#perf-ioq");
+    if (qEl) { qEl.textContent = String(q); qEl.classList.toggle("hot", q >= 4); }
+    if ($("#perf-ram")) $("#perf-ram").textContent = (s.rss_kb / 1024).toFixed(0) + " MB";
+    _perfPrev = { t: now, cpu_ms: s.cpu_ms, render_ms: s.render_ms || 0, io_read: s.io_read, io_write: s.io_write, blkio_ms: s.blkio_ms || 0 };
+  };
+  tick();
+  _perfTimer = setInterval(tick, 1000);
+}
+function stopPerfOverlay() {
+  if (_perfTimer) { clearInterval(_perfTimer); _perfTimer = null; }
+  document.getElementById("perf-hud")?.remove();
+}
+function togglePerf() {
+  const on = localStorage.getItem("isy_perf") === "1";
+  if (on) { localStorage.removeItem("isy_perf"); stopPerfOverlay(); }
+  else { localStorage.setItem("isy_perf", "1"); startPerfOverlay(); }
+  return !on;
+}
+window.togglePerf = togglePerf;
+
 async function init() {
   document.body.append(el("div", { id: "toasts", class: "toasts" }));
+  if (localStorage.getItem("isy_perf") === "1") startPerfOverlay();
   paintBackdrop();
   window.addEventListener("resize", () => { clearTimeout(_bdT); _bdT = setTimeout(paintBackdrop, 200); });
   window.addEventListener("hashchange", onRoute);

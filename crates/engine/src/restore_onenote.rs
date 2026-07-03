@@ -651,6 +651,7 @@ mod tests {
                 username: "you@example.com".into(),
                 sync_root: dir.join("od"),
                 archive_root: arch.clone(),
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()

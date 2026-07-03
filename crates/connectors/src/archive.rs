@@ -105,7 +105,7 @@ where
             std::fs::create_dir_all(parent)?;
         }
         let tmp = abs.with_extension(format!("{ext}.part"));
-        std::fs::write(&tmp, &bytes)?;
+        std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
         std::fs::rename(&tmp, &abs)?;
         let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
         store.set_local_path(
@@ -326,7 +326,7 @@ pub fn backup_onenote_resources<F: BytesFetcher>(
                     .fetch_bytes(&resource.url)
                     .map_err(SyncError::Remote)?;
                 let tmp = abs.with_extension(format!("{ext}.part"));
-                std::fs::write(&tmp, &bytes)?;
+                std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
                 std::fs::rename(&tmp, &abs)?;
                 report.resources += 1;
                 report.bytes += bytes.len() as u64;
@@ -347,7 +347,7 @@ pub fn backup_onenote_resources<F: BytesFetcher>(
             let tmp = manifest_path.with_extension("resources.json.part");
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|e| SyncError::Malformed(e.to_string()))?;
-            std::fs::write(&tmp, bytes)?;
+            std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
             std::fs::rename(&tmp, &manifest_path)?;
             report.manifests += 1;
         }

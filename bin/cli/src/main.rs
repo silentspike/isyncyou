@@ -1222,6 +1222,7 @@ fn cmd_init(
                     username: user,
                     sync_root: sr,
                     archive_root: ar,
+                    cache_root: Default::default(),
                     mount_point: None,
                 }],
                 ..Default::default()
@@ -1329,6 +1330,7 @@ fn cmd_setup(
             username: user,
             sync_root: PathBuf::from(sr),
             archive_root: PathBuf::from(ar),
+            cache_root: Default::default(),
             mount_point: None,
         }],
         ..Default::default()
@@ -2812,6 +2814,7 @@ mod tests {
             username: "a@o".into(),
             sync_root: "/a/od".into(),
             archive_root: "/a/ar".into(),
+            cache_root: Default::default(),
             mount_point: None,
         });
         cfg.accounts.push(AccountConfig {
@@ -2819,6 +2822,7 @@ mod tests {
             username: "b@o".into(),
             sync_root: "/b/od".into(),
             archive_root: "/b/ar".into(),
+            cache_root: Default::default(),
             mount_point: None,
         });
         // single account
@@ -3199,6 +3203,7 @@ mod tests {
             username: "t@o".into(),
             sync_root: sync.clone(),
             archive_root: dir.join("arch"),
+            cache_root: Default::default(),
             mount_point: Some(mnt.clone()),
         });
         // a file under the mount resolves to (account, cloud-relative path)

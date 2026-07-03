@@ -154,6 +154,7 @@ mod tests {
                 username: "u@example.com".into(),
                 sync_root: arch.join("sync"),
                 archive_root: arch.to_path_buf(),
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()

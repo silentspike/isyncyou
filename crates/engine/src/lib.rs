@@ -22,6 +22,7 @@ mod calendar_live;
 mod contacts_live;
 mod mail_live;
 mod mail_restore;
+mod onedrive_live;
 mod onenote_live;
 mod restore_calendar;
 mod restore_contacts;
@@ -38,6 +39,7 @@ pub use mail_restore::{
     pending_mail_restore_count, recover_pending_mail_restores, recover_pending_mail_restores_with,
     restore_mail_via_ledger, MailApi, MailSink,
 };
+pub use onedrive_live::{onedrive_lister, OneDriveLister};
 pub use onenote_live::{page_writer, PageWriter};
 pub use restore_calendar::{
     pending_calendar_restore_count, recover_pending_calendar_restores,
@@ -301,6 +303,35 @@ pub struct RefreshCounts {
     pub onenote_containers: usize,
 }
 
+impl RefreshCounts {
+    /// Whether this pass actually changed anything (any item ingested, deleted, body
+    /// or resource fetched across any service). A refresh that touched nothing must NOT
+    /// wake the UI — otherwise every idle poll triggers a full view reload (the visible
+    /// periodic "screen flicker"); the SSE notify is gated on this.
+    pub fn changed(&self) -> bool {
+        self.mail_folders
+            + self.mail_upserted
+            + self.mail_deleted
+            + self.mail_bodies
+            + self.mail_flanks
+            + self.calendar_events
+            + self.calendar_bodies
+            + self.calendar_flanks
+            + self.contacts_upserted
+            + self.contacts_bodies
+            + self.contacts_photos
+            + self.todo_indexed
+            + self.todo_bodies
+            + self.todo_flanks
+            + self.todo_sub
+            + self.onenote_pages
+            + self.onenote_bodies
+            + self.onenote_resources
+            + self.onenote_containers
+            > 0
+    }
+}
+
 /// Refresh the local store for `account` from Microsoft Graph across mail, calendar,
 /// contacts, ToDo and OneNote — the read-only pass that both the daemon's scheduled
 /// backup and the standalone mobile client use. `read_access` is the primary token
@@ -504,7 +535,8 @@ fn read_archived_body(
         .local_path
         .clone()
         .ok_or_else(|| format!("item '{id}' has no archived body yet (run backup first)"))?;
-    let bytes = std::fs::read(acc.archive_root.join(&rel)).map_err(|e| e.to_string())?;
+    let bytes = isyncyou_core::envelope::read_body(&acc.archive_root.join(&rel))
+        .map_err(|e| e.to_string())?;
     Ok((item, bytes))
 }
 
@@ -762,6 +794,27 @@ mod tests {
     }
 
     #[test]
+    fn refresh_counts_changed_is_false_only_for_a_noop_pass() {
+        // The SSE-notify (and thus a full UI reload) is gated on this: a no-op refresh
+        // must report `changed() == false` so an idle poll never flickers the screen.
+        assert!(
+            !RefreshCounts::default().changed(),
+            "a no-op refresh must not count as changed"
+        );
+        // Any single non-zero count flips it to changed.
+        let c = RefreshCounts {
+            mail_upserted: 1,
+            ..Default::default()
+        };
+        assert!(c.changed(), "one upserted mail is a real change");
+        let c2 = RefreshCounts {
+            onenote_containers: 2,
+            ..Default::default()
+        };
+        assert!(c2.changed(), "a change in the last field must count too");
+    }
+
+    #[test]
     fn restore_cloud_refuses_when_disabled_by_default() {
         // Default config has restore.cloud_restore_enabled = false. The gate must
         // fire before any store access or network call, so even a missing account
@@ -924,6 +977,7 @@ mod tests {
                 username: "a@example.com".into(),
                 sync_root: dir.join("od"),
                 archive_root: arch.clone(),
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -952,6 +1006,7 @@ mod tests {
                 username: "a@example.com".into(),
                 sync_root: std::path::PathBuf::from("/nonexistent/sync"),
                 archive_root: std::path::PathBuf::from("/nonexistent/arch"),
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
