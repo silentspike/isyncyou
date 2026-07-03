@@ -5,6 +5,12 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <!-- FCM notifications (#575): Android 13+ requires a runtime grant. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Network guard during OAuth (#640): a short-lived foreground service keeps the app
+         process out of the APP_BACKGROUND network restriction while the system browser is in
+         front, so the loopback token exchange survives sign-in. Android 14 (targetSdk 34)
+         requires the typed FOREGROUND_SERVICE_DATA_SYNC permission alongside FOREGROUND_SERVICE. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
 
     <application
         android:label="@string/app_name"
@@ -39,5 +45,12 @@
                 <action android:name="com.google.firebase.MESSAGING_EVENT"/>
             </intent-filter>
         </service>
+
+        <!-- OAuth network guard (#640): holds the process foreground during the sign-in
+             browser round-trip so the loopback token exchange isn't blocked in the background. -->
+        <service
+            android:name=".OAuthGuardService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
     </application>
 </manifest>
