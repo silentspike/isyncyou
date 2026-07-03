@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+**OneDrive on Mobile (Phase 1 — Mode 1 Online)**
+- `graph`: `GraphClient::list_children` — live, fully paged (`@odata.nextLink` to
+  completion) folder listing over the central retry policy; no store write (#647).
+- `engine`: `OneDriveLister` trait + `onedrive_lister` constructor surfacing the
+  live listing for the daemon (read-capable, mobile-friendly token) (#647).
+
 ## [1.0.0] — 2026-06-26
 
 First stable release — the desktop/core product (CLI + daemon + web UI + native
