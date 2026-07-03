@@ -17,6 +17,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `default_mode` plus per-folder `folder_modes`) in the config, with a pure `effective_mode`
   resolver (the deepest explicit ancestor wins, else the account default) and a
   tombstoned-entry cleanup helper. Distinct axis from the per-item `content_state` (#650).
+- `store`+`connectors`: per-folder scoped OneDrive delta + scope ownership — `clear_delta_cursor`,
+  a pure `owning_scope` rule (deepest active scope wins, one owner per item, id-stable moves),
+  and `incremental_sync_scoped` with per-page `@odata.nextLink` cursor resume (crash-safe) and a
+  subtree-aware tombstone rule that does not leak nested deletes (#653).
 
 ## [1.0.0] — 2026-06-26
 
