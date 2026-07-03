@@ -88,14 +88,16 @@ requirements:
       AES-256-GCM encrypted with a key derived (Argon2id/HKDF) from a pairing secret —
       not the device-local token-cache key, which would block cross-device decryption.
       An active-turn lease prevents forks; fork detection is the fallback. (S-AG.4, #619)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - A turn encrypted on one paired device decrypts on another paired device.
       - A device-local-only key cannot decrypt the session.
       - Only ciphertext is written to OneDrive (no plaintext M365 content).
     verified_by:
-      - test: session_encrypts_with_pairing_key_not_device_local
+      - test: round_trips_with_the_pairing_secret
+      - test: a_different_device_local_key_cannot_decrypt
+      - test: only_ciphertext_is_stored_no_plaintext
   - id: REQ-AGENT-007
     title: Streaming is a typed AgentStreamHub with cancel and backpressure
     statement: >
