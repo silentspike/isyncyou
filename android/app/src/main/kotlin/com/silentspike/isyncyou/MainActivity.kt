@@ -68,6 +68,12 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Debuggable builds only: expose the WebView to chrome://inspect / CDP for
+        // on-device debugging and verification. The FLAG_DEBUGGABLE bit is unset in release
+        // builds, so this never fires there.
+        if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            WebView.setWebContentsDebuggingEnabled(true)
+        }
         web = WebView(this)
         web.settings.apply {
             javaScriptEnabled = true
