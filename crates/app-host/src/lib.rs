@@ -70,6 +70,1021 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
     }
 }
 
+/// A read-class tool executor placeholder until S-AG.8/#623 wires the real archive
+/// retrieval executor. A canned text turn never calls it.
+/// Fallback read executor for builds without the experimental agent (no store/SQLCipher
+/// pull): returns a placeholder so the turn loop still runs in CI/release shapes.
+#[cfg(not(feature = "agent-subscription-experimental"))]
+struct StubExecutor;
+#[cfg(not(feature = "agent-subscription-experimental"))]
+impl isyncyou_agent::ToolExecutor for StubExecutor {
+    fn execute_read(
+        &self,
+        _action: &isyncyou_agent::ToolAction,
+    ) -> Result<String, isyncyou_agent::AgentError> {
+        Ok("{\"note\":\"retrieval needs the agent-subscription-experimental build\"}".to_string())
+    }
+}
+
+/// Build the read-class tool executor for a turn. The experimental agent build binds the
+/// real `StoreArchive` retrieval executor (searches the encrypted store + on-disk body
+/// files for `account` under `archive_root`, S-AG.18/#643); other builds get the stub.
+#[cfg(feature = "agent-subscription-experimental")]
+fn make_executor(
+    account: &str,
+    archive_root: std::path::PathBuf,
+) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    Box::new(isyncyou_agent::retrieval::RetrievalExecutor::new(
+        isyncyou_agent::archive::StoreArchive::new(account, archive_root),
+    ))
+}
+#[cfg(not(feature = "agent-subscription-experimental"))]
+fn make_executor(
+    _account: &str,
+    _archive_root: std::path::PathBuf,
+) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    Box::new(StubExecutor)
+}
+
+/// Serialize one stream event to a single-line JSON SSE-data payload.
+fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
+    use isyncyou_agent::StreamEvent as E;
+    let v = match ev {
+        E::Token(t) => serde_json::json!({ "event": "token", "text": t }),
+        E::ToolCall { id, name, input } => {
+            serde_json::json!({ "event": "tool_call", "id": id, "name": name, "input": input })
+        }
+        E::ToolResult {
+            id,
+            content,
+            untrusted,
+        } => serde_json::json!({
+            "event": "tool_result", "id": id, "content": content, "untrusted": untrusted
+        }),
+        E::ConfirmationRequired { id, preview, .. } => {
+            serde_json::json!({ "event": "confirmation_required", "tool_id": id, "preview": preview })
+        }
+        E::SearchStage {
+            stage,
+            status,
+            hits,
+        } => serde_json::json!({
+            "event": "search_stage", "stage": stage, "status": status, "hits": hits
+        }),
+        E::PartialResult { stage, items } => {
+            serde_json::json!({ "event": "partial_result", "stage": stage, "items": items })
+        }
+        E::Error(e) => serde_json::json!({ "event": "error", "message": e }),
+        E::Done => serde_json::json!({ "event": "done" }),
+    };
+    v.to_string()
+}
+
+/// Default model for the in-app agent (override with `ISYNCYOU_AGENT_MODEL`). The
+/// subscription serves Sonnet/Opus; Sonnet is the cheaper default for general use.
+#[cfg(feature = "agent-subscription-experimental")]
+const DEFAULT_MODEL: &str = "claude-sonnet-5";
+
+/// The Claude subscription models the in-app switcher offers (id, human label). Each id is
+/// verified against the subscription messages API.
+#[cfg(feature = "agent-subscription-experimental")]
+const CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("claude-opus-4-8", "Opus 4.8"),
+    ("claude-sonnet-5", "Sonnet 5"),
+    ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+];
+/// The ChatGPT/Codex models the in-app switcher offers (id, human label).
+#[cfg(feature = "agent-subscription-experimental")]
+const CODEX_MODELS: &[(&str, &str)] = &[("gpt-5.5", "GPT-5.5"), ("gpt-5.4", "GPT-5.4")];
+
+/// A turn-provider builder (a `DaemonAgent` method): given the system prompt, return a
+/// boxed provider if its credentials are present.
+#[cfg(feature = "agent-subscription-experimental")]
+type ProviderBuilder =
+    fn(&DaemonAgent, &str) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>>;
+
+/// The agent's system prompt — app-/M365-scoped (the only tool is `isyncyou`).
+const AGENT_SYSTEM_PROMPT: &str = "You are the iSyncYou in-app assistant. You help the user with \
+their own Microsoft 365 data that iSyncYou manages — mail, OneDrive files and photos, calendar, \
+contacts, tasks and notes — plus iSyncYou's backup and restore. Your only tool is `isyncyou`; you \
+never touch anything outside the user's M365 domain. Read with the tool before answering. The app \
+already renders every search hit as a rich, typed, clickable card (header + body + a link to the \
+item), so DO NOT re-list the found items in your reply and DO NOT use markdown (no **bold**, no \
+bullet lists) — answer in one or two short plain-language sentences about what you found. \
+Destructive actions (backup, restore-cloud, live-write, share) are confirmed by \
+the user out of band — propose them, never assume they ran.";
+
+/// The in-app agent handler (S-AG.6/#621). Drives a real turn: the experimental
+/// subscription provider when the user has connected an account, otherwise a deterministic
+/// "not connected" message. Owns the stream hub + pending-action registry, so the model
+/// never holds a capability token.
+pub struct DaemonAgent {
+    /// Source of each account's `archive_root` for the retrieval executor
+    /// (`archive_root_for`); the restore path lands in #624.
+    cfg: Config,
+    hub: Arc<isyncyou_agent::AgentStreamHub>,
+    pending: Arc<isyncyou_agent::PendingRegistry>,
+    streams: Mutex<std::collections::HashMap<String, std::sync::mpsc::Receiver<String>>>,
+    seq: AtomicU64,
+    /// Directory holding the operator's local, uncommitted OAuth recipe
+    /// (`agent-oauth.json`) and the credential store — the parent of the config file.
+    /// Only read by the experimental subscription login (S-AG.12).
+    #[cfg_attr(not(feature = "agent-subscription-experimental"), allow(dead_code))]
+    oauth_dir: PathBuf,
+    /// Tracks in-flight device OAuth logins between start and the browser callback.
+    #[cfg(feature = "agent-subscription-experimental")]
+    oauth: isyncyou_agent::AgentOAuth,
+}
+
+impl DaemonAgent {
+    pub fn new(cfg: Config, oauth_dir: PathBuf) -> Self {
+        Self {
+            cfg,
+            hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
+            pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
+            streams: Mutex::new(std::collections::HashMap::new()),
+            seq: AtomicU64::new(0),
+            oauth_dir,
+            #[cfg(feature = "agent-subscription-experimental")]
+            oauth: isyncyou_agent::AgentOAuth::new(),
+        }
+    }
+
+    /// Resolve an account's archive root (holds `.isyncyou-store.db` + the on-disk body
+    /// files) for the retrieval executor. Matches by account id, else the first account,
+    /// else an empty path (an empty store simply yields no hits — never a panic).
+    fn archive_root_for(&self, account: &str) -> std::path::PathBuf {
+        self.cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .or_else(|| self.cfg.accounts.first())
+            .map(|a| a.archive_root.clone())
+            .unwrap_or_default()
+    }
+
+    /// Pick the turn provider: the connected subscription (experimental feature) when a
+    /// token is present, otherwise a deterministic "not connected" message so the UI still
+    /// streams a clear instruction instead of erroring.
+    fn build_turn_provider(&self, system: &str) -> Box<dyn isyncyou_agent::LlmProvider + Send> {
+        #[cfg(feature = "agent-subscription-experimental")]
+        {
+            // Provider preference comes from the in-app switcher (persisted), falling back
+            // to the env override; either falls back to the other if only one is connected.
+            let prefer_codex = self.agent_settings().0 == "codex";
+            let (first, second): (ProviderBuilder, ProviderBuilder) = if prefer_codex {
+                (Self::try_codex_provider, Self::try_subscription_provider)
+            } else {
+                (Self::try_subscription_provider, Self::try_codex_provider)
+            };
+            if let Some(p) = first(self, system).or_else(|| second(self, system)) {
+                return p;
+            }
+        }
+        #[cfg(not(feature = "agent-subscription-experimental"))]
+        let _ = system;
+        Box::new(isyncyou_agent::FakeProvider::new(vec![vec![
+            isyncyou_agent::AssistantBlock::Text(
+                "The AI assistant isn't connected yet — open the Assistant tab and connect your \
+                 Claude account, then try again."
+                    .to_string(),
+            ),
+        ]]))
+    }
+}
+
+/// The subscription credential we persist on mobile: the access token plus the refresh
+/// token and the access token's absolute expiry (ms since the Unix epoch), so the daemon
+/// can refresh the access token itself — the desktop `claude` CLI does this for its own
+/// `~/.claude/.credentials.json`, but on mobile we own the credential.
+#[cfg(feature = "agent-subscription-experimental")]
+struct StoredCredential {
+    access_token: String,
+    refresh_token: String,
+    /// Absolute expiry in ms since the Unix epoch; 0 = unknown.
+    expires_at_ms: u64,
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+impl StoredCredential {
+    /// Serialize to the JSON blob persisted in the credential store.
+    fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "expires_at_ms": self.expires_at_ms,
+        }))
+        .unwrap_or_default()
+    }
+
+    /// Parse a stored JSON blob; `None` if it is not our blob shape (e.g. a bare token).
+    fn from_json(raw: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        let access_token = v.get("access_token")?.as_str()?.to_string();
+        Some(Self {
+            access_token,
+            refresh_token: v
+                .get("refresh_token")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            expires_at_ms: v.get("expires_at_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+        })
+    }
+}
+
+/// Ms since the Unix epoch (0 on a clock error).
+#[cfg(feature = "agent-subscription-experimental")]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The Codex/ChatGPT credential we persist (access + refresh + ChatGPT account id + expiry).
+#[cfg(feature = "agent-subscription-experimental")]
+struct CodexStoredCredential {
+    access_token: String,
+    refresh_token: String,
+    account_id: String,
+    expires_at_ms: u64,
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+impl CodexStoredCredential {
+    fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "account_id": self.account_id,
+            "expires_at_ms": self.expires_at_ms,
+        }))
+        .unwrap_or_default()
+    }
+    fn from_json(raw: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        Some(Self {
+            access_token: v.get("access_token")?.as_str()?.to_string(),
+            refresh_token: v
+                .get("refresh_token")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            account_id: v
+                .get("account_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            expires_at_ms: v.get("expires_at_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+        })
+    }
+}
+
+/// Persist a Codex credential to the encrypted store under `oauth_dir` (id `codex`).
+#[cfg(feature = "agent-subscription-experimental")]
+fn store_codex_blob(
+    oauth_dir: &std::path::Path,
+    cred: &CodexStoredCredential,
+) -> Result<(), String> {
+    let dir = oauth_dir.join("agent-credentials");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let key = isyncyou_agent::LocalKey::new(oauth_dir.join("agent-credentials.key"));
+    let store = isyncyou_agent::CredentialStore::new(dir, key);
+    store
+        .put(
+            isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+            "codex",
+            &isyncyou_agent::Secret::new(cred.to_json()),
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Minimal percent-decode for the loopback callback query (`+`→space, `%XX`→byte).
+#[cfg(feature = "agent-subscription-experimental")]
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hi = (b[i + 1] as char).to_digit(16);
+                let lo = (b[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+const CODEX_OK_HTML: &str = "<!doctype html><meta charset=utf-8><title>ChatGPT connected</title>\
+<body style=\"font-family:system-ui;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;\
+align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Connected</h1>\
+<p style=color:#9aa3b2>ChatGPT is now linked. Close this tab and return to iSyncYou.</p></div>";
+
+#[cfg(feature = "agent-subscription-experimental")]
+const CODEX_ERR_HTML: &str = "<!doctype html><meta charset=utf-8><title>Sign-in failed</title>\
+<body style=\"font-family:system-ui;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;\
+align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Sign-in failed</h1>\
+<p style=color:#9aa3b2>Please return to iSyncYou and try connecting ChatGPT again.</p></div>";
+
+/// One-shot loopback callback server for the Codex OAuth (OpenAI registers the fixed
+/// `:1455` redirect). Waits for the browser to hit `/auth/callback?code=&state=`, verifies
+/// the CSRF `state`, exchanges the code, and persists the credential. Background thread;
+/// gives up after 5 minutes.
+#[cfg(feature = "agent-subscription-experimental")]
+fn codex_callback_serve(
+    listener: std::net::TcpListener,
+    oauth_dir: std::path::PathBuf,
+    cfg: isyncyou_agent::oauth::CodexOAuthConfig,
+    verifier: String,
+    want_state: String,
+) {
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    for stream in listener.incoming() {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let target = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("");
+        if !target.starts_with("/auth/callback") {
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            continue; // ignore favicon/others, keep waiting for the real callback
+        }
+        let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let (mut code, mut state) = (String::new(), String::new());
+        for pair in query.split('&') {
+            match pair.split_once('=') {
+                Some(("code", v)) => code = pct_decode(v),
+                Some(("state", v)) => state = pct_decode(v),
+                _ => {}
+            }
+        }
+        let mut dbg = format!(
+            "target={}\nstate_match={}\ncode_len={}\n",
+            &target[..target.len().min(120)],
+            state == want_state,
+            code.len()
+        );
+        // Diagnostic: raw TCP connect from THIS app process (uid) to key hosts, to separate a
+        // routing/connect block from a TLS/fingerprint stall.
+        for (label, addr) in [
+            ("cf_104", "104.18.41.241:443"),
+            ("cf_172", "172.64.146.15:443"),
+            ("google_8888", "8.8.8.8:443"),
+            ("anthropic", "160.79.104.10:443"),
+        ] {
+            if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+                let r =
+                    std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5));
+                dbg.push_str(&format!(
+                    "tcp {label} = {}\n",
+                    match r {
+                        Ok(_) => "OK".to_string(),
+                        Err(e) => e.to_string(),
+                    }
+                ));
+            }
+        }
+        let ok = if state == want_state && !code.is_empty() {
+            let doh = isyncyou_agent::http::doh_resolve("auth.openai.com");
+            match &doh {
+                Ok(ips) => dbg.push_str(&format!("doh_ips={ips:?}\n")),
+                Err(e) => dbg.push_str(&format!("doh_err={e}\n")),
+            }
+            let mut ips = doh.unwrap_or_default();
+            if ips.is_empty() {
+                // Stable Cloudflare anycast IPs for auth.openai.com — used when this network
+                // blocks the app from reaching any DoH resolver.
+                ips = vec![
+                    std::net::IpAddr::from([104, 18, 41, 241]),
+                    std::net::IpAddr::from([172, 64, 146, 15]),
+                ];
+                dbg.push_str("using hardcoded auth.openai.com IPs\n");
+            }
+            match isyncyou_agent::http::HttpTransport::new_resolving("auth.openai.com", &ips)
+                .map_err(|e| e.to_string())
+                .and_then(|http| {
+                    isyncyou_agent::oauth::codex_exchange(&http, &cfg, &code, &verifier)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(tok) => {
+                    dbg.push_str(&format!(
+                        "exchange=OK account_id={}\n",
+                        if tok.account_id.is_empty() {
+                            "EMPTY"
+                        } else {
+                            "present"
+                        }
+                    ));
+                    let expires_at_ms = if tok.expires_in > 0 {
+                        now_ms() + tok.expires_in * 1000
+                    } else {
+                        0
+                    };
+                    store_codex_blob(
+                        &oauth_dir,
+                        &CodexStoredCredential {
+                            access_token: tok.access_token,
+                            refresh_token: tok.refresh_token,
+                            account_id: tok.account_id,
+                            expires_at_ms,
+                        },
+                    )
+                    .is_ok()
+                }
+                Err(e) => {
+                    dbg.push_str(&format!("exchange=ERR {e}\n"));
+                    false
+                }
+            }
+        } else {
+            dbg.push_str("skipped: state/code check failed\n");
+            false
+        };
+        let _ = std::fs::write(oauth_dir.join("codex-debug.txt"), &dbg);
+        let body = if ok { CODEX_OK_HTML } else { CODEX_ERR_HTML };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
+}
+
+/// EXPERIMENTAL subscription device-OAuth (S-AG.12) — only compiled with
+/// `agent-subscription-experimental`. The operator's recipe (endpoints/client_id) and
+/// the obtained token both live locally; nothing provider-specific is hardcoded.
+#[cfg(feature = "agent-subscription-experimental")]
+impl DaemonAgent {
+    /// A human-facing success page shown in the **system browser** after the callback.
+    const OAUTH_SUCCESS_HTML: &'static str = "<!doctype html><html><head><meta charset=utf-8>\
+<meta name=viewport content=\"width=device-width,initial-scale=1\">\
+<title>iSyncYou connected</title><style>body{font-family:system-ui;background:#0b0d12;color:#e8eaf0;\
+display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}\
+.c{text-align:center;max-width:22rem;padding:2rem}h1{font-size:1.4rem;margin:.5rem 0}\
+p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
+<h1>Connected</h1><p>This device is now authorized. You can close this tab and return to iSyncYou.</p>\
+</div></body></html>";
+
+    /// The OAuth recipe: the in-repo Claude default, with optional local overrides from
+    /// `agent-oauth.json` next to the config (the recipe may now live in-repo, so no file
+    /// is required for the default Claude flow to work).
+    fn load_oauth_config(&self) -> Result<isyncyou_agent::OAuthConfig, String> {
+        let path = self.oauth_dir.join("agent-oauth.json");
+        if path.exists() {
+            let s = std::fs::read_to_string(&path).map_err(|e| format!("OAuth recipe: {e}"))?;
+            serde_json::from_str(&s).map_err(|e| format!("OAuth recipe is invalid JSON: {e}"))
+        } else {
+            Ok(isyncyou_agent::OAuthConfig::default())
+        }
+    }
+
+    /// Persist a subscription credential (access + refresh + expiry) at rest under a
+    /// device-local key, so the daemon can refresh the access token itself.
+    fn store_credential(&self, cred: &StoredCredential) -> Result<(), String> {
+        let dir = self.oauth_dir.join("agent-credentials");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
+        let store = isyncyou_agent::CredentialStore::new(dir, key);
+        store
+            .put(
+                isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+                "subscription",
+                &isyncyou_agent::Secret::new(cred.to_json()),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// Persist the FULL token set from the OAuth code exchange (access + refresh + expiry) so
+    /// `fresh_access_token` can self-refresh before the ~8h subscription token expires
+    /// (LIVE-verified 2026-07-01 — without the refresh token the client "connection-lost"s
+    /// every ~8h with no way to renew).
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn store_token(&self, token: &isyncyou_agent::oauth::RefreshedToken) -> Result<(), String> {
+        let expires_at_ms = if token.expires_in > 0 {
+            now_ms() + token.expires_in * 1000
+        } else {
+            0
+        };
+        self.store_credential(&StoredCredential {
+            access_token: token.access_token.clone(),
+            refresh_token: token.refresh_token.clone(),
+            expires_at_ms,
+        })
+    }
+
+    /// The persisted provider+model selection (the switcher), falling back to the env
+    /// override then the in-repo default. Stored next to the credential store.
+    fn agent_settings(&self) -> (String, String) {
+        let default_provider = if std::env::var("ISYNCYOU_AGENT_PROVIDER").as_deref() == Ok("codex")
+        {
+            "codex"
+        } else {
+            "claude"
+        };
+        if let Ok(s) = std::fs::read_to_string(self.oauth_dir.join("agent-settings.json")) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                let provider = v
+                    .get("provider")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(default_provider)
+                    .to_string();
+                let model = v
+                    .get("model")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return (provider, model);
+            }
+        }
+        (default_provider.to_string(), String::new())
+    }
+
+    /// The model to use for `provider`: the current selection if it names that provider,
+    /// else that provider's default (env override for Claude, in-repo default otherwise).
+    fn model_for(&self, provider: &str) -> String {
+        let (sel_provider, sel_model) = self.agent_settings();
+        if provider == sel_provider && !sel_model.is_empty() {
+            return sel_model;
+        }
+        match provider {
+            "codex" => isyncyou_agent::CodexConfig::default().model,
+            _ => {
+                std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+            }
+        }
+    }
+
+    /// Persist the switcher selection after validating it against the offered models.
+    fn set_agent_settings(&self, provider: &str, model: &str) -> Result<(), String> {
+        let known = match provider {
+            "claude" => CLAUDE_MODELS,
+            "codex" => CODEX_MODELS,
+            _ => return Err("unknown provider".into()),
+        };
+        if !known.iter().any(|(id, _)| *id == model) {
+            return Err("unknown model for provider".into());
+        }
+        std::fs::create_dir_all(&self.oauth_dir).map_err(|e| e.to_string())?;
+        let blob = serde_json::to_vec(&serde_json::json!({
+            "provider": provider,
+            "model": model,
+        }))
+        .map_err(|e| e.to_string())?;
+        std::fs::write(self.oauth_dir.join("agent-settings.json"), blob).map_err(|e| e.to_string())
+    }
+
+    /// The subscription access token: our stored token (mobile, from the device OAuth
+    /// callback) first, else the existing `claude` CLI login on desktop
+    /// (`~/.claude/.credentials.json` → `claudeAiOauth.accessToken`). Never logged.
+    fn subscription_token(&self) -> Option<String> {
+        let dir = self.oauth_dir.join("agent-credentials");
+        if dir.exists() {
+            let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
+            let store = isyncyou_agent::CredentialStore::new(dir, key);
+            if let Ok(Some(secret)) = store.get(
+                isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+                "subscription",
+            ) {
+                let raw = secret.expose();
+                // Newer format: a JSON credential blob (access + refresh + expiry). Older
+                // format (pre-refresh): the bare access token as UTF-8.
+                let cred = StoredCredential::from_json(raw).unwrap_or_else(|| StoredCredential {
+                    access_token: std::str::from_utf8(raw).unwrap_or("").to_string(),
+                    refresh_token: String::new(),
+                    expires_at_ms: 0,
+                });
+                return self.fresh_access_token(cred);
+            }
+        }
+        // Desktop: the existing `claude` CLI login, which the CLI keeps refreshed.
+        let home = std::env::var_os("HOME")?;
+        let data =
+            std::fs::read_to_string(PathBuf::from(home).join(".claude/.credentials.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+        v.get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// Return a usable access token from a stored credential, refreshing it first if it is
+    /// expired (or within a small margin) and we hold a refresh token. On a successful
+    /// refresh the rotated credential is persisted so the next call is cheap.
+    fn fresh_access_token(&self, cred: StoredCredential) -> Option<String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // 5-minute margin so a turn never starts on a token about to expire mid-flight.
+        let near_expiry = cred.expires_at_ms != 0 && cred.expires_at_ms <= now_ms + 5 * 60 * 1000;
+        if !cred.refresh_token.is_empty() && (near_expiry || cred.access_token.is_empty()) {
+            if let Ok(cfg) = self.load_oauth_config() {
+                if let Ok(http) = isyncyou_agent::http::HttpTransport::new() {
+                    if let Ok(t) = isyncyou_agent::oauth::refresh(&http, &cfg, &cred.refresh_token)
+                    {
+                        let expires_at_ms = if t.expires_in > 0 {
+                            now_ms + t.expires_in * 1000
+                        } else {
+                            0
+                        };
+                        let _ = self.store_credential(&StoredCredential {
+                            access_token: t.access_token.clone(),
+                            refresh_token: t.refresh_token,
+                            expires_at_ms,
+                        });
+                        return Some(t.access_token);
+                    }
+                }
+            }
+        }
+        if cred.access_token.is_empty() {
+            None
+        } else {
+            Some(cred.access_token)
+        }
+    }
+
+    /// The subscription config: the in-repo recipe + (on desktop) the account identity from
+    /// `~/.claude.json` for `metadata.user_id`.
+    fn subscription_config(&self) -> isyncyou_agent::SubscriptionConfig {
+        let mut cfg = isyncyou_agent::SubscriptionConfig::default();
+        if let Some(home) = std::env::var_os("HOME") {
+            if let Ok(data) = std::fs::read_to_string(PathBuf::from(home).join(".claude.json")) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if let Some(a) = v
+                        .get("oauthAccount")
+                        .and_then(|o| o.get("accountUuid"))
+                        .and_then(|x| x.as_str())
+                    {
+                        cfg.account_uuid = a.to_string();
+                    }
+                    if let Some(d) = v.get("userID").and_then(|x| x.as_str()) {
+                        cfg.device_id = d.to_string();
+                    }
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Build the subscription provider if a token is available (else None → fallback).
+    fn try_subscription_provider(
+        &self,
+        system: &str,
+    ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
+        let token = self.subscription_token()?;
+        let p = isyncyou_agent::SubscriptionProvider::new(
+            token,
+            self.model_for("claude"),
+            system,
+            self.subscription_config(),
+        )
+        .ok()?;
+        Some(Box::new(p))
+    }
+
+    /// ChatGPT/Codex credentials: the existing `codex` CLI login on desktop
+    /// (`~/.codex/auth.json` → tokens.access_token + account_id). Never logged.
+    fn codex_credentials(&self) -> Option<(String, String)> {
+        // Mobile: a device-logged-in Codex credential in the store, refreshed if expired.
+        let dir = self.oauth_dir.join("agent-credentials");
+        if dir.exists() {
+            let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
+            let store = isyncyou_agent::CredentialStore::new(dir, key);
+            if let Ok(Some(secret)) =
+                store.get(isyncyou_agent::SecretClass::ProviderOAuthRefresh, "codex")
+            {
+                if let Some(cred) = CodexStoredCredential::from_json(secret.expose()) {
+                    return self.fresh_codex_credential(cred);
+                }
+            }
+        }
+        // Desktop: the existing `codex` CLI login (`~/.codex/auth.json`).
+        let home = std::env::var_os("HOME")?;
+        let data = std::fs::read_to_string(PathBuf::from(home).join(".codex/auth.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+        let t = v.get("tokens")?;
+        let token = t.get("access_token")?.as_str()?.to_string();
+        let account = t
+            .get("account_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if token.is_empty() {
+            return None;
+        }
+        Some((token, account))
+    }
+
+    /// Usable Codex creds from a stored credential, refreshing first if expired (5-min
+    /// margin). The refresh response may omit the id_token → keep the stored account id.
+    fn fresh_codex_credential(&self, cred: CodexStoredCredential) -> Option<(String, String)> {
+        let now = now_ms();
+        let near_expiry = cred.expires_at_ms != 0 && cred.expires_at_ms <= now + 5 * 60 * 1000;
+        if !cred.refresh_token.is_empty() && (near_expiry || cred.access_token.is_empty()) {
+            let cfg = isyncyou_agent::oauth::CodexOAuthConfig::default();
+            let mut ips = isyncyou_agent::http::doh_resolve("auth.openai.com").unwrap_or_default();
+            if ips.is_empty() {
+                ips = vec![
+                    std::net::IpAddr::from([104, 18, 41, 241]),
+                    std::net::IpAddr::from([172, 64, 146, 15]),
+                ];
+            }
+            if let Ok(http) =
+                isyncyou_agent::http::HttpTransport::new_resolving("auth.openai.com", &ips)
+            {
+                if let Ok(tok) =
+                    isyncyou_agent::oauth::codex_refresh(&http, &cfg, &cred.refresh_token)
+                {
+                    let account_id = if tok.account_id.is_empty() {
+                        cred.account_id.clone()
+                    } else {
+                        tok.account_id.clone()
+                    };
+                    let expires_at_ms = if tok.expires_in > 0 {
+                        now + tok.expires_in * 1000
+                    } else {
+                        0
+                    };
+                    let _ = store_codex_blob(
+                        &self.oauth_dir,
+                        &CodexStoredCredential {
+                            access_token: tok.access_token.clone(),
+                            refresh_token: tok.refresh_token,
+                            account_id: account_id.clone(),
+                            expires_at_ms,
+                        },
+                    );
+                    return Some((tok.access_token, account_id));
+                }
+            }
+        }
+        if cred.access_token.is_empty() {
+            None
+        } else {
+            Some((cred.access_token, cred.account_id))
+        }
+    }
+
+    /// EXPERIMENTAL (S-AG.12). Start the Codex/ChatGPT device OAuth: bind OpenAI's fixed
+    /// loopback port, spawn a one-shot callback server (exchanges + stores on success),
+    /// and return the authorize URL for the system browser. The app polls
+    /// `/api/v1/agent/status` for `codex:true`.
+    fn codex_oauth_start(&self) -> Result<String, String> {
+        let cfg = isyncyou_agent::oauth::CodexOAuthConfig::default();
+        let (verifier, challenge) = isyncyou_agent::oauth::pkce().map_err(|e| e.to_string())?;
+        let state = isyncyou_agent::oauth::rand_state().map_err(|e| e.to_string())?;
+        let url = isyncyou_agent::oauth::codex_build_authorize_url(&cfg, &challenge, &state);
+        // Bind OpenAI's registered redirect port up front (fail early if busy).
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 1455)).map_err(|e| {
+            format!("could not open the ChatGPT sign-in port :1455 ({e}) — is another login already running?")
+        })?;
+        let oauth_dir = self.oauth_dir.clone();
+        std::thread::spawn(move || codex_callback_serve(listener, oauth_dir, cfg, verifier, state));
+        Ok(url)
+    }
+
+    /// Build the Codex (ChatGPT) provider if credentials are available.
+    fn try_codex_provider(
+        &self,
+        instructions: &str,
+    ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
+        let (token, account) = self.codex_credentials()?;
+        let cfg = isyncyou_agent::CodexConfig {
+            account_id: account,
+            model: self.model_for("codex"),
+            ..Default::default()
+        };
+        let p = isyncyou_agent::CodexProvider::new(token, instructions, cfg).ok()?;
+        Some(Box::new(p))
+    }
+}
+
+impl isyncyou_webui::AgentHandler for DaemonAgent {
+    fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String> {
+        let n = self.seq.fetch_add(1, Ordering::SeqCst);
+        let turn_id = format!("turn-{n}-{}", unix_now());
+        let rx_events = self.hub.open(&turn_id, 256);
+        let (tx_str, rx_str) = std::sync::mpsc::channel::<String>();
+        // Forward hub StreamEvents -> JSON strings until the turn closes.
+        std::thread::spawn(move || {
+            while let Ok(ev) = rx_events.recv() {
+                if tx_str.send(agent_event_json(&ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.streams.lock().unwrap().insert(turn_id.clone(), rx_str);
+        // Build the provider on this thread (it may read the local token), then run the
+        // turn on a background thread streaming events into the hub.
+        let hub = self.hub.clone();
+        let tid = turn_id.clone();
+        let system = format!("{AGENT_SYSTEM_PROMPT}\n\nActive account: {account}.");
+        let prompt = prompt.to_string();
+        // Resolve the account's archive root now (reads config on this thread), so the
+        // turn thread can build the real store-backed retrieval executor for it.
+        let account_id = account.to_string();
+        let archive_root = self.archive_root_for(&account_id);
+        let mut provider = self.build_turn_provider(&system);
+        std::thread::spawn(move || {
+            let exec = make_executor(&account_id, archive_root);
+            let mut history = vec![isyncyou_agent::Message::user(prompt)];
+            let _ = isyncyou_agent::run_turn(
+                provider.as_mut(),
+                exec.as_ref(),
+                &mut history,
+                &mut |ev| {
+                    hub.emit(&tid, ev);
+                },
+            );
+            hub.close(&tid);
+        });
+        Ok(turn_id)
+    }
+
+    fn confirm(&self, pending_id: &str, token: &str) -> Result<String, String> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        match self.pending.confirm(pending_id, token, now_ms) {
+            Ok(action) => Ok(format!(
+                "confirmed {} (execution lands in S-AG.9/#624)",
+                action.op()
+            )),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    }
+
+    fn cancel(&self, turn_id: &str) {
+        self.hub.cancel(turn_id);
+    }
+
+    fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+        self.streams.lock().unwrap().remove(turn_id)
+    }
+
+    /// EXPERIMENTAL (S-AG.12). Begin the MANUAL device OAuth login: PKCE + state, with the
+    /// manual (copy-paste) redirect — claude.ai shows a code instead of redirecting to a
+    /// loopback server. The app opens the returned URL in the system browser. Robust on
+    /// mobile (no loopback host/port/IPv6 fragility).
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn oauth_start(&self, provider: &str, redirect_uri: &str) -> Result<String, String> {
+        if provider == "codex" {
+            return self.codex_oauth_start();
+        }
+        let cfg = self.load_oauth_config()?;
+        // Loopback-primary (matches the real claude client): use the client's loopback
+        // redirect when supplied; fall back to the manual (copy-paste) redirect otherwise.
+        let redirect = if redirect_uri.is_empty() {
+            cfg.manual_redirect_url.as_str()
+        } else {
+            redirect_uri
+        };
+        let started = self
+            .oauth
+            .start(&cfg, redirect)
+            .map_err(|e| e.to_string())?;
+        Ok(started.authorize_url)
+    }
+
+    /// EXPERIMENTAL (S-AG.12). Complete the MANUAL login: the operator pastes the
+    /// `code#state` shown by claude.ai. Look up the PKCE verifier by state, exchange, and
+    /// persist the token.
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn oauth_complete(&self, pasted: &str) -> Result<String, String> {
+        let (code, state_opt) = isyncyou_agent::oauth::parse_pasted_code(pasted);
+        let state = state_opt.ok_or("the pasted code is missing its #state part")?;
+        let (verifier, redirect_uri) = self
+            .oauth
+            .take(&state)
+            .ok_or("unknown or expired login — start the login again")?;
+        let cfg = self.load_oauth_config()?;
+        let http = isyncyou_agent::http::HttpTransport::new().map_err(|e| e.to_string())?;
+        let token =
+            isyncyou_agent::oauth::exchange(&http, &cfg, &code, &verifier, &redirect_uri, &state)
+                .map_err(|e| e.to_string())?;
+        self.store_token(&token)?;
+        Ok("connected".to_string())
+    }
+
+    /// EXPERIMENTAL (S-AG.12). Import a subscription credential obtained on another device
+    /// (e.g. the desktop `claude` login, where the OAuth consent works) so this device can
+    /// run + self-refresh it. Session/cap gated at the router; the credential is stored
+    /// encrypted at rest exactly like a device-OAuth result.
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn subscription_import(
+        &self,
+        access: &str,
+        refresh: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), String> {
+        if access.is_empty() {
+            return Err("access token is required".into());
+        }
+        self.store_credential(&StoredCredential {
+            access_token: access.to_string(),
+            refresh_token: refresh.to_string(),
+            expires_at_ms,
+        })
+    }
+
+    /// EXPERIMENTAL (S-AG.12). The loopback callback path (kept for the auto flow); exchange
+    /// the code with the stored verifier + state and persist the token, then show a page.
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
+        let (verifier, redirect_uri) = self
+            .oauth
+            .take(state)
+            .ok_or("unknown or expired login state")?;
+        let cfg = self.load_oauth_config()?;
+        let http = isyncyou_agent::http::HttpTransport::new().map_err(|e| e.to_string())?;
+        let token =
+            isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri, state)
+                .map_err(|e| e.to_string())?;
+        self.store_token(&token)?;
+        Ok(Self::OAUTH_SUCCESS_HTML.to_string())
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn status_json(&self) -> String {
+        let claude = self.subscription_token().is_some();
+        let codex = self.codex_credentials().is_some();
+        let (sel_provider, _) = self.agent_settings();
+        // Effective provider: the selection if it is connected, else whichever is
+        // (Claude preferred). A selected+connected Claude is already covered by the
+        // `else if claude` arm, so it needs no separate branch.
+        let provider = if sel_provider == "codex" && codex {
+            "codex"
+        } else if claude {
+            "claude"
+        } else if codex {
+            "codex"
+        } else {
+            ""
+        };
+        let model = if provider.is_empty() {
+            String::new()
+        } else {
+            self.model_for(provider)
+        };
+        let list = |models: &[(&str, &str)]| -> serde_json::Value {
+            models
+                .iter()
+                .map(|(id, label)| serde_json::json!({ "id": id, "label": label }))
+                .collect()
+        };
+        serde_json::json!({
+            "connected": claude || codex,
+            "enabled": true,
+            "provider": provider,
+            "model": model,
+            "claude": claude,
+            "codex": codex,
+            "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
+        })
+        .to_string()
+    }
+
+    /// Persist the switcher's provider+model selection (validated against the offered lists).
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn set_model(&self, provider: &str, model: &str) -> Result<(), String> {
+        self.set_agent_settings(provider, model)
+    }
+}
+
 /// Web-UI archive integrity verify (#528): re-hash every archived body and
 /// persist per-item status. Local-only (reads on-disk bodies, writes the store),
 /// so it needs no token/network and is always available.
@@ -656,6 +1671,12 @@ pub fn build_live_router(
     config_path: PathBuf,
     live_interval: Arc<AtomicU64>,
 ) -> isyncyou_webui::Router {
+    // The experimental subscription login reads its local recipe + stores its token
+    // next to the config file (on mobile that is the app-private filesDir).
+    let oauth_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     let base = match gate {
         Some(g) => isyncyou_webui::Router::with_gate(cfg.clone(), g),
         None => isyncyou_webui::Router::new(cfg.clone()),
@@ -697,6 +1718,19 @@ pub fn build_live_router(
                 cfg: cfg.clone(),
                 logins: Mutex::new(std::collections::HashMap::new()),
             }),
+            mint_cap_token(),
+        )
+        .with_agent(
+            Arc::new(DaemonAgent::new(cfg.clone(), oauth_dir))
+                as Arc<dyn isyncyou_webui::AgentHandler>,
+            mint_cap_token(),
+        )
+        // #onedrive-mobile 0.9: outbound sharing is wired here (was daemon-only) so the
+        // mobile profile gets it too. On mobile it is additionally biometric-gated (op
+        // "share" is in the per-action-token catalogue); the cap token is the CSRF gate.
+        // restore-cloud stays daemon-only (excluded on mobile).
+        .with_share(
+            Arc::new(DaemonShare::new(cfg.clone())) as Arc<dyn isyncyou_webui::ShareHandler>,
             mint_cap_token(),
         )
         .with_events(events)
@@ -741,10 +1775,12 @@ mod tests {
     }
 
     #[test]
-    fn mobile_live_router_omits_restore_and_share() {
-        // #89 profile contract: build_live_router wires the live handlers but NOT the
-        // daemon-only restore/share. POSTs to those routes are refused 404 (handler
-        // absent); a wired live-write route is reached and cap-gated (401, not 404).
+    fn mobile_live_router_wires_share_but_omits_restore() {
+        // #89 + #onedrive-mobile 0.9 profile contract: build_live_router wires the live
+        // handlers AND (now) share, but NOT the daemon-only restore-cloud. restore POSTs
+        // are refused 404 (absent); share + a live-write route are reached and cap-gated
+        // (401, not 404). On mobile share is additionally biometric-gated by the app's
+        // with_biometric_gate (not exercised here — this builds the base router only).
         let events = Arc::new(isyncyou_webui::EventBus::new());
         let router = build_live_router(
             Config::default(),
@@ -761,14 +1797,14 @@ mod tests {
                 ))
                 .status,
             404,
-            "restore must be absent in the mobile profile"
+            "restore-cloud must be absent in the mobile profile"
         );
         assert_eq!(
             router
                 .route(&ApiRequest::new("POST", "/api/v1/share"))
                 .status,
-            404,
-            "share must be absent in the mobile profile"
+            401,
+            "share must be wired (cap-gated, not absent)"
         );
         assert_eq!(
             router

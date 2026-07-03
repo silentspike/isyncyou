@@ -29,7 +29,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod serve;
 mod view;
-pub use serve::{bind_loopback, format_http, parse_request_line, serve, serve_listener};
+pub use serve::{
+    bind_loopback, dispatch_message, format_http, handle_bridge_request, parse_request_line, serve,
+    serve_listener, serve_listener_shared,
+};
 #[cfg(unix)]
 pub use serve::{default_unix_socket_path, serve_unix};
 
@@ -89,6 +92,11 @@ pub struct ApiRequest {
     /// The `X-Session-Token` header value (#89 mobile profile): required on every
     /// `/api/v1/*` route when the Router runs with a session token.
     pub session_token: Option<String>,
+    /// The request body bytes (#0A transport). Empty for the query-string GETs that
+    /// make up today's API; carried so a body-bearing request survives **both**
+    /// transports — HTTP (`serve.rs` reads it instead of draining) and the Android
+    /// in-process message bridge (which has no query-string ergonomics for uploads).
+    pub body: Vec<u8>,
 }
 
 impl ApiRequest {
@@ -112,6 +120,7 @@ impl ApiRequest {
             query,
             cap_token: None,
             session_token: None,
+            body: Vec::new(),
         }
     }
 
@@ -124,6 +133,13 @@ impl ApiRequest {
     /// Attach the captured `X-Session-Token` header (builder style, #89).
     pub fn with_session_token(mut self, token: Option<String>) -> Self {
         self.session_token = token;
+        self
+    }
+
+    /// Attach the request body (builder style, #0A) — the HTTP adapter reads it from
+    /// the socket, the Android bridge passes it straight from the `WebMessage`.
+    pub fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
         self
     }
 
@@ -222,6 +238,67 @@ pub trait RestoreHandler: Send + Sync {
     fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String>;
 }
 
+/// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
+/// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
+/// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
+/// `Receiver<String>`) so the webui crate stays decoupled from `isyncyou-agent`.
+/// The model never receives a capability token; destructive actions become a pending
+/// action confirmed out-of-band via `confirm` (REQ-AGENT-003/004).
+pub trait AgentHandler: Send + Sync {
+    /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
+    fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
+    /// Confirm a pending destructive action with its one-time token; returns a summary.
+    fn confirm(&self, pending_id: &str, token: &str) -> Result<String, String>;
+    /// Cancel an in-flight turn.
+    fn cancel(&self, turn_id: &str);
+    /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
+    fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
+
+    /// EXPERIMENTAL subscription login (S-AG.12). Begin a device OAuth login for
+    /// `provider`; `redirect_uri` is the loopback callback the browser returns to
+    /// (the client supplies its own origin). Returns the authorize URL the UI opens
+    /// in the **system browser**. Default: not available (handler opted out).
+    fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
+    /// EXPERIMENTAL subscription login callback. The system browser returns here with
+    /// the authorization `code` and the CSRF `state`; the handler exchanges the code
+    /// and stores the token, then returns a human-facing success page (HTML).
+    fn oauth_callback(&self, _code: &str, _state: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
+
+    /// EXPERIMENTAL manual-login completion (S-AG.12): the operator pastes the `code#state`
+    /// that claude.ai showed; the handler exchanges it and stores the token.
+    fn oauth_complete(&self, _pasted: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
+
+    /// Connection status as a JSON string — the Assistant UI reads it to decide between
+    /// the connect card and the chat. Default: not connected.
+    fn status_json(&self) -> String {
+        "{\"connected\":false}".to_string()
+    }
+
+    /// EXPERIMENTAL subscription credential import (S-AG.12): store an access token +
+    /// refresh token obtained on another device (where the OAuth consent works), so this
+    /// device can run + self-refresh the subscription. Default: not available.
+    fn subscription_import(
+        &self,
+        _access: &str,
+        _refresh: &str,
+        _expires_at_ms: u64,
+    ) -> Result<(), String> {
+        Err("subscription import is not enabled on this server".into())
+    }
+
+    /// Set the active provider + model (the in-app model switcher). The offered models are
+    /// reported in `status_json`'s `models` field. Default: not available.
+    fn set_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
+        Err("model selection is not enabled on this server".into())
+    }
+}
+
 /// Creates an outbound sharing link for a OneDrive item on behalf of a POST
 /// request (#494). Injected by the daemon (which owns the Graph stack). Returns
 /// the link's `webUrl`.
@@ -275,6 +352,27 @@ pub trait SyncControl: Send + Sync {
 pub trait HydrationStatus: Send + Sync {
     /// Display names of files currently materializing.
     fn active(&self) -> Vec<String>;
+}
+
+/// One in-flight transfer's progress (#onedrive-mobile 0.8). `bytes_total == 0` means
+/// the size is not yet known; `retry_after_secs > 0` means it is backing off on a 429.
+pub struct TransferState {
+    pub id: String,
+    pub name: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub retry_after_secs: u64,
+}
+
+/// Progress + cancellation for in-flight downloads/materializations (#onedrive-mobile
+/// 0.8 foundation). The real transfer engine (Phase 3/4) implements it; until then the
+/// endpoints report an idle state. Mirrors [`HydrationStatus`]; the cancel side is a
+/// cap-gated POST.
+pub trait TransferProgress: Send + Sync {
+    /// In-flight transfers with per-file progress.
+    fn transfers(&self) -> Vec<TransferState>;
+    /// Request cancellation of one transfer by id. Returns true if it was known.
+    fn cancel(&self, id: &str) -> bool;
 }
 
 /// Runs an archive integrity verify pass for an account on behalf of a POST
@@ -617,12 +715,30 @@ pub struct Router {
     push: Option<std::sync::Arc<dyn PushHandler>>,
     /// Separate capability token for push register/test POSTs.
     push_cap_token: Option<String>,
+    /// In-app agent (S-AG.6/#621). `None` => `/api/v1/agent/*` is refused (read-only).
+    agent: Option<std::sync::Arc<dyn AgentHandler>>,
+    /// Separate capability token for agent POSTs (chat/confirm/cancel).
+    agent_cap_token: Option<String>,
     /// Mobile/standalone profile (#89): an unguessable per-process token required on
     /// EVERY `/api/v1/*` route. On Android `127.0.0.1` is reachable by any app on the
     /// device, so unlike the desktop daemon (GET open, POST cap-gated) the data API
     /// must be fully gated. `None` => desktop daemon behaviour (no extra gate). The
     /// token reaches the WebView via the native bridge, never in a static asset.
     session_token: Option<String>,
+    /// Mobile biometric gate (#onedrive-mobile 0.6). `true` only when the standalone
+    /// Android app builds the router (via `with_biometric_gate`). When set, destructive
+    /// ops in the gate catalogue require a per-action token that is only valid after a
+    /// native `BiometricPrompt` — a defense the WebView/agent cannot satisfy on its own
+    /// even though it holds the cap-tokens. `false` (desktop) => unchanged behaviour.
+    biometric_gate: bool,
+    /// Registry of destructive actions awaiting/holding a biometric confirmation. Used
+    /// only when `biometric_gate` is set; the native side confirms entries over JNI.
+    pending: isyncyou_core::pending::PendingActionRegistry,
+    /// Optional in-flight transfer progress/cancel handler (#onedrive-mobile 0.8). `None`
+    /// => the transfers endpoint reports idle and cancel 404s (the read-only CLI `serve`).
+    transfers: Option<std::sync::Arc<dyn TransferProgress>>,
+    /// Capability token for the cancel POST (distinct blast radius).
+    transfer_cap_token: Option<String>,
 }
 
 /// Constant-time byte-equality (no early return on first mismatch) so token checks
@@ -671,7 +787,13 @@ impl Router {
             account_cap_token: None,
             push: None,
             push_cap_token: None,
+            agent: None,
+            agent_cap_token: None,
             session_token: None,
+            biometric_gate: false,
+            pending: isyncyou_core::pending::PendingActionRegistry::new(),
+            transfers: None,
+            transfer_cap_token: None,
         }
     }
 
@@ -708,7 +830,13 @@ impl Router {
             account_cap_token: None,
             push: None,
             push_cap_token: None,
+            agent: None,
+            agent_cap_token: None,
             session_token: None,
+            biometric_gate: false,
+            pending: isyncyou_core::pending::PendingActionRegistry::new(),
+            transfers: None,
+            transfer_cap_token: None,
         }
     }
 
@@ -721,6 +849,88 @@ impl Router {
         self.restore = Some(handler);
         self.restore_cap_token = Some(cap_token);
         self
+    }
+
+    /// Enable the in-app agent (S-AG.6/#621), guarded by `cap_token` (builder style).
+    pub fn with_agent(
+        mut self,
+        handler: std::sync::Arc<dyn AgentHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.agent = Some(handler);
+        self.agent_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Crate-internal accessor for the agent handler (used by the SSE stream in serve.rs).
+    pub(crate) fn agent_handler(&self) -> Option<&std::sync::Arc<dyn AgentHandler>> {
+        self.agent.as_ref()
+    }
+
+    /// Enable the mobile biometric gate (#onedrive-mobile 0.6, builder style). Only the
+    /// standalone Android app calls this; the desktop daemon leaves it off.
+    pub fn with_biometric_gate(mut self) -> Self {
+        self.biometric_gate = true;
+        self
+    }
+
+    /// Record a successful native `BiometricPrompt` for a pending destructive action.
+    /// Called ONLY from the native JNI path — the WebView has no route to it, which is
+    /// exactly what makes the per-action token a real second factor even though the UI
+    /// holds every cap-token. Returns `false` for an unknown or expired id.
+    pub fn confirm_biometric(&self, pending_id: &str) -> bool {
+        self.pending
+            .confirm_biometric(pending_id, isyncyou_core::pending::now_ms())
+    }
+
+    /// The mobile biometric gate for one destructive op. Returns:
+    /// - `None` — proceed (desktop profile, op not in the gate catalogue, or a valid
+    ///   single-use token rode in on `_pat` and was consumed);
+    /// - `Some(confirmation_required)` — mobile + gated + no token yet: a pending action
+    ///   was registered; the UI must run the native biometric and re-issue with `_pat`;
+    /// - `Some(403)` — a token was presented but was bad/expired/replayed/mismatched.
+    fn biometric_challenge(
+        &self,
+        op: &str,
+        account: &str,
+        service: &str,
+        item: &str,
+        req: &ApiRequest,
+    ) -> Option<ApiResponse> {
+        if !self.biometric_gate || !isyncyou_core::pending::requires_confirmation(op) {
+            return None;
+        }
+        let now = isyncyou_core::pending::now_ms();
+        match req.q("_pat").filter(|s| !s.is_empty()) {
+            Some(pat) => match self.pending.consume(pat, op, account, service, item, now) {
+                Ok(()) => None,
+                Err(e) => Some(ApiResponse::error(
+                    403,
+                    &format!("biometric confirmation invalid: {e:?}"),
+                )),
+            },
+            None => match self.pending.register(
+                op,
+                account,
+                service,
+                item,
+                now,
+                isyncyou_core::pending::DEFAULT_TTL_MS,
+            ) {
+                Some(id) => Some(ApiResponse::ok_json(&json!({
+                    "status": "confirmation_required",
+                    "pending_action_id": id,
+                    "op": op,
+                    "account": account,
+                    "service": service,
+                    "item": item,
+                }))),
+                None => Some(ApiResponse::error(
+                    500,
+                    "could not create confirmation token",
+                )),
+            },
+        }
     }
 
     /// Enable the outbound-sharing POST, guarded by `cap_token` (builder style).
@@ -760,6 +970,18 @@ impl Router {
     /// Enable the read-only FUSE hydration status GET (builder style).
     pub fn with_hydrations(mut self, hydrations: std::sync::Arc<dyn HydrationStatus>) -> Self {
         self.hydrations = Some(hydrations);
+        self
+    }
+
+    /// Enable the transfer progress GET + cancel POST (#onedrive-mobile 0.8), the cancel
+    /// guarded by `cap_token` (builder style).
+    pub fn with_transfers(
+        mut self,
+        transfers: std::sync::Arc<dyn TransferProgress>,
+        cap_token: String,
+    ) -> Self {
+        self.transfers = Some(transfers);
+        self.transfer_cap_token = Some(cap_token);
         self
     }
 
@@ -887,6 +1109,79 @@ impl Router {
         }
     }
 
+    /// Open a push stream for the Android in-process bridge (#0A) — the replacement for the
+    /// two `EventSource` endpoints on the phone, where no loopback port exists to hold an
+    /// SSE socket open. Items are ready-to-embed JSON event objects
+    /// `{"event":<name>,"data":<string>}`; the native side wraps each in a bridge push
+    /// message. Session-gated exactly like the HTTP SSE paths (header or `_st` query).
+    /// `None` when unauthorized or the stream is unknown/absent. Dropping the returned
+    /// receiver ends the source thread (the next `send` fails).
+    pub fn open_bridge_stream(
+        &self,
+        target: &str,
+        session_token: Option<&str>,
+    ) -> Option<std::sync::mpsc::Receiver<String>> {
+        let req =
+            ApiRequest::new("GET", target).with_session_token(session_token.map(str::to_string));
+        let st_query = req
+            .query
+            .iter()
+            .find(|(k, _)| k == "_st")
+            .map(|(_, v)| v.as_str());
+        if !self.session_authorized(req.session_token.as_deref().or(st_query)) {
+            return None;
+        }
+        match req.path.as_str() {
+            "/api/v1/events" => {
+                let bus = self.events_bus()?.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut last = bus.generation();
+                    loop {
+                        let g = bus.wait_change(last, std::time::Duration::from_secs(15));
+                        // A `change` on a real generation bump, else a `ping` heartbeat —
+                        // both double as the dropped-receiver check (send fails → exit).
+                        let msg = if g != last {
+                            last = g;
+                            r#"{"event":"change","data":""}"#
+                        } else {
+                            r#"{"event":"ping","data":""}"#
+                        };
+                        if tx.send(msg.to_string()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Some(rx)
+            }
+            "/api/v1/agent/stream" => {
+                let turn = req
+                    .query
+                    .iter()
+                    .find(|(k, _)| k == "turn")
+                    .map(|(_, v)| v.as_str())
+                    .filter(|t| !t.is_empty())?;
+                let inner = self.agent_handler()?.open_stream(turn)?;
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    // Each inner item is one pre-serialized agent event (a JSON string);
+                    // carry it as the `data` field so app.js JSON-parses it as it does the
+                    // EventSource `data:` line. Terminate with a `done` event.
+                    for line in inner.iter() {
+                        let msg =
+                            serde_json::json!({ "event": "message", "data": line }).to_string();
+                        if tx.send(msg).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(r#"{"event":"done","data":""}"#.to_string());
+                });
+                Some(rx)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the request carries the configured capability token. The token is
     /// compared in **constant time** so a timing side-channel can't reveal it byte
     /// by byte (the length check only leaks length, which is fixed for our tokens).
@@ -934,10 +1229,41 @@ impl Router {
         }
         // Hold the store-access gate (if any) for the whole request so a concurrent
         // sync pass and this request never both hold the store's single-instance lock.
-        let _gate = self
-            .gate
-            .as_ref()
-            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        //
+        // EXCEPTION — every GET that either (a) reads the store read-only (a WAL reader
+        // takes no instance lock, safe concurrent with the writer) or (b) touches no store
+        // at all skips the gate. Otherwise a long sync pass that holds the gate stalls
+        // these requests, and — because responses are `Connection: close`, so each is its
+        // own TCP connection — the blocked ones exhaust the WebView's small per-origin
+        // connection pool, queueing even the exempt reads *browser-side* (the measured
+        // cold-start hang). `sync_state`/`accounts`/`settings`/`debug_stats` read config or
+        // `/proc` only; the static shell touches nothing. Writable-store GETs (item,
+        // search, drive, …) and all POSTs still take the gate. Preview back-fill on the
+        // read path uses its own short writable open, best-effort.
+        const GATE_EXEMPT_GET: &[&str] = &[
+            "/api/v1/items",
+            "/api/v1/activity",
+            "/api/v1/status",
+            "/api/v1/sync/state",
+            "/api/v1/accounts",
+            "/api/v1/settings",
+            "/api/v1/debug/stats",
+        ];
+        let static_get = req.method == "GET"
+            && (matches!(
+                req.path.as_str(),
+                "/" | "/app.js" | "/app.css" | "/callback"
+            ) || req.path.ends_with(".woff2")
+                || req.path.starts_with("/sfx/"));
+        let gate_exempt =
+            static_get || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()));
+        let _gate = if gate_exempt {
+            None
+        } else {
+            self.gate
+                .as_ref()
+                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
+        };
         if req.method == "POST" {
             return match req.path.as_str() {
                 "/api/v1/restore" => self.restore(req),
@@ -974,11 +1300,19 @@ impl Router {
                 "/api/v1/onenote/create" => self.onenote_create(req),
                 "/api/v1/onenote/delete" => self.onenote_delete(req),
                 "/api/v1/onenote/append" => self.onenote_append(req),
+                "/api/v1/onedrive/transfers/cancel" => self.transfers_cancel(req),
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
                 "/api/v1/account/signout" => self.account_signout(req),
                 "/api/v1/push/register" => self.push_register(req),
                 "/api/v1/push/test" => self.push_test(req),
+                "/api/v1/agent/turn" => self.agent_turn(req),
+                "/api/v1/agent/confirm" => self.agent_confirm(req),
+                "/api/v1/agent/cancel" => self.agent_cancel(req),
+                "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
+                "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
+                "/api/v1/agent/subscription/import" => self.agent_subscription_import(req),
+                "/api/v1/agent/model" => self.agent_set_model(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
         }
@@ -988,6 +1322,16 @@ impl Router {
         match req.path.as_str() {
             // The shell is static; the strict app CSP header locks it to our assets.
             "/" => ApiResponse::html_with_csp(INDEX_HTML, APP_SHELL_CSP),
+            // EXPERIMENTAL subscription OAuth callback (S-AG.12). The **system browser**
+            // returns here after the operator's login; deliberately NOT under `/api/v1/`
+            // so it is exempt from the session-token gate (the browser has no token).
+            // CSRF-protected by the `state` minted at oauth/start (single-use). The path
+            // is exactly `/callback` because provider OAuth clients register the loopback
+            // redirect as http://127.0.0.1:<port>/callback (RFC 8252).
+            "/callback" => self.agent_oauth_callback(req),
+            // Agent connection status (session-gated by the /api/v1/ gate above; read-only,
+            // so no capability token). The Assistant UI reads it to switch connect⇄chat.
+            "/api/v1/agent/status" => self.agent_status(req),
             // app.js carries the (same-origin) capability tokens so the UI can POST
             // restore/share/sync; empty when an action is disabled, hiding its UI.
             "/app.js" => ApiResponse {
@@ -1042,6 +1386,10 @@ impl Router {
                         "__PUSH_CAP_TOKEN__",
                         self.push_cap_token.as_deref().unwrap_or(""),
                     )
+                    .replace(
+                        "__AGENT_CAP_TOKEN__",
+                        self.agent_cap_token.as_deref().unwrap_or(""),
+                    )
                     .into_bytes(),
                 // embedded assets change only on a binary upgrade; never let the
                 // browser serve a stale copy across versions.
@@ -1079,9 +1427,12 @@ impl Router {
             "/api/v1/search" => self.search(req),
             "/api/v1/sync/state" => self.sync_state(),
             "/api/v1/hydrations" => self.hydrations_state(),
+            "/api/v1/onedrive/transfers" => self.transfers_state(),
+            "/api/v1/onedrive/policy" => self.policy_state(),
             "/api/v1/drive" => self.drive_info(req),
             "/api/v1/permissions" => self.item_permissions(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
+            "/api/v1/debug/stats" => self.debug_stats(),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -1287,6 +1638,9 @@ impl Router {
             (Some(a), Some(i)) => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "calendar", id, req) {
+            return r;
+        }
         self.cal_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
@@ -1472,6 +1826,9 @@ impl Router {
             (Some(a), Some(i)) => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "contacts", id, req) {
+            return r;
+        }
         self.contact_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
@@ -1648,6 +2005,9 @@ impl Router {
             Some(i) => i,
             None => return ApiResponse::error(400, "id is required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "todo", id, req) {
+            return r;
+        }
         self.todo_result(
             account,
             &format!("delete id={id}"),
@@ -1874,6 +2234,9 @@ impl Router {
             (Some(a), Some(i)) => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
         };
+        if let Some(r) = self.biometric_challenge("delete", account, "onenote", id, req) {
+            return r;
+        }
         self.onenote_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
@@ -2212,6 +2575,12 @@ impl Router {
             }
             _ => return ApiResponse::error(400, "account, service and id are required"),
         };
+        // #onedrive-mobile 0.9: sharing is external/destructive — on the mobile profile it
+        // requires a biometric per-action token bound to exactly this (share, account,
+        // service, id). Covers both invite and anonymous-link modes. Desktop is unaffected.
+        if let Some(r) = self.biometric_challenge("share", account, service, id, req) {
+            return r;
+        }
         // Invite mode (#504): an `email` param (comma/space-separated) invites named
         // people instead of creating an anonymous link. `role` = read|write.
         if let Some(emails_raw) = req.q("email").filter(|e| !e.is_empty()) {
@@ -2318,6 +2687,102 @@ impl Router {
         }
     }
 
+    /// `GET /api/v1/debug/stats` — the app's whole-process load. The embedded engine and the
+    /// WebView share ONE OS process, so `/proc/self` is the total load the app causes (CPU +
+    /// GPU/render threads + RAM + disk IO + disk wait), which powers the perf overlay.
+    /// Linux/Android; each field defaults to 0 when unreadable. Self-stats only (plus the
+    /// world-readable system IO-queue depth) — not sensitive.
+    fn debug_stats(&self) -> ApiResponse {
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        // Fields after the final ')' in /proc/<pid>/stat: index i = field (i+3). We read
+        // utime (idx 11), stime (idx 12) → CPU, and delayacct_blkio_ticks (idx 39) → the time
+        // the process spent *blocked on disk IO*. All at 100 Hz (Android/Linux) → 10 ms/tick.
+        // The client turns the cumulative ms counters into live %/rates across polls.
+        let (cpu_ms, blkio_ms) = read("/proc/self/stat")
+            .rsplit_once(')')
+            .map(|(_, rest)| {
+                let f: Vec<&str> = rest.split_whitespace().collect();
+                let g = |i: usize| f.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                ((g(11) + g(12)) * 10, g(39) * 10)
+            })
+            .unwrap_or((0, 0));
+        // RSS: resident pages (field 2 of /proc/self/statm) × 4 KiB.
+        let rss_kb = read("/proc/self/statm")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|pages| pages * 4)
+            .unwrap_or(0);
+        // Disk IO (/proc/self/io): rchar/wchar = all read/write activity incl. the page cache
+        // (what the app actually moves — usually non-zero); read_bytes/write_bytes = bytes that
+        // truly hit the block device (often 0 when served from cache). We expose both.
+        let io = read("/proc/self/io");
+        let io_field = |k: &str| {
+            io.lines()
+                .find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))
+                .unwrap_or(0)
+        };
+        // GPU proxy: Android exposes no per-process GPU%, and the WebView's heavy renderer runs
+        // in an ISOLATED child process this app can't read (different uid). So we sum the CPU of
+        // the render/compositor/GPU threads that DO live in-process — RenderThread, VizWebView,
+        // the in-process GPU thread (comm is capped at 15 chars → "Chrome_InProcGp", so match the
+        // truncated "InProcGp" too), and the mali driver threads. Same tick→ms scale as cpu_ms.
+        // This tracks the in-app render load; the out-of-process WebView renderer is not included.
+        let mut render_ms = 0u64;
+        if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+            for e in entries.flatten() {
+                let p = e.path();
+                let comm = std::fs::read_to_string(p.join("comm")).unwrap_or_default();
+                let c = comm.trim();
+                if c.contains("RenderThread")
+                    || c.contains("InProcGp")
+                    || c.contains("Gpu")
+                    || c.contains("GPU")
+                    || c.contains("Viz")
+                    || c.contains("mali")
+                {
+                    if let Some((_, rest)) = std::fs::read_to_string(p.join("stat"))
+                        .unwrap_or_default()
+                        .rsplit_once(')')
+                    {
+                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let g =
+                            |i: usize| f.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                        render_ms += (g(11) + g(12)) * 10;
+                    }
+                }
+            }
+        }
+        // IO queue depth (system-wide, /proc/diskstats): "I/Os currently in progress" is field 9
+        // (token index 11) per device. Report the busiest real block device (skip loop/ram/zram)
+        // — an instantaneous indicator of disk saturation the per-process counters can't show.
+        let mut io_inflight = 0u64;
+        for line in read("/proc/diskstats").lines() {
+            let t: Vec<&str> = line.split_whitespace().collect();
+            let name = match t.get(2) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
+                continue;
+            }
+            let inflight = t.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            io_inflight = io_inflight.max(inflight);
+        }
+        ApiResponse::ok_json(&json!({
+            "cpu_ms": cpu_ms,
+            "render_ms": render_ms,
+            "rss_kb": rss_kb,
+            "io_read": io_field("rchar:"),
+            "io_write": io_field("wchar:"),
+            "io_disk_read": io_field("read_bytes:"),
+            "io_disk_write": io_field("write_bytes:"),
+            "blkio_ms": blkio_ms,
+            "io_inflight": io_inflight,
+            "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        }))
+    }
+
     /// In-flight FUSE placeholder hydrations (on-demand downloads). `active` is the
     /// list of file names currently materializing; `count` its length.
     fn hydrations_state(&self) -> ApiResponse {
@@ -2327,6 +2792,63 @@ impl Router {
             .map(|h| h.active())
             .unwrap_or_default();
         ApiResponse::ok_json(&json!({ "count": active.len(), "active": active }))
+    }
+
+    /// `GET /api/v1/onedrive/transfers` — in-flight download/materialization progress
+    /// (#onedrive-mobile 0.8). Idle (`[]`) when no transfer engine is wired yet.
+    fn transfers_state(&self) -> ApiResponse {
+        let list = self
+            .transfers
+            .as_ref()
+            .map(|t| t.transfers())
+            .unwrap_or_default();
+        let items: Vec<Value> = list
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "name": t.name,
+                    "bytes_done": t.bytes_done,
+                    "bytes_total": t.bytes_total,
+                    "retry_after_secs": t.retry_after_secs,
+                })
+            })
+            .collect();
+        ApiResponse::ok_json(&json!({ "count": items.len(), "transfers": items }))
+    }
+
+    /// `POST /api/v1/onedrive/transfers/cancel?id=…` — cap-gated cancel of one in-flight
+    /// transfer (#onedrive-mobile 0.8). 404 when no transfer engine is wired.
+    fn transfers_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.transfers {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "transfers are not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.transfer_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let id = match req.q("id") {
+            Some(i) if !i.is_empty() => i,
+            _ => return ApiResponse::error(400, "id is required"),
+        };
+        ApiResponse::ok_json(&json!({ "cancelled": handler.cancel(id) }))
+    }
+
+    /// `GET /api/v1/onedrive/policy` — the effective mobile transfer policy plus the
+    /// mass-delete-guard status (#onedrive-mobile 0.8). Read-only; reads the config.
+    fn policy_state(&self) -> ApiResponse {
+        let s = &self.config.sync;
+        let g = &s.delete_guard;
+        ApiResponse::ok_json(&json!({
+            "wifi_only": s.wifi_only,
+            "charging_only": s.charging_only,
+            "min_free_bytes": s.min_free_bytes,
+            "delete_guard": {
+                "max_absolute": g.max_absolute,
+                "max_fraction": g.max_fraction,
+                "fraction_min_total": g.fraction_min_total,
+            },
+        }))
     }
 
     /// The OneDrive storage quota for an account — a live Graph call via the
@@ -2489,6 +3011,181 @@ impl Router {
         }
     }
 
+    /// Resolve the agent handler + check its cap token (shared by the agent POSTs).
+    fn agent_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn AgentHandler>, ApiResponse> {
+        let handler = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| ApiResponse::error(404, "the agent is not enabled on this server"))?;
+        if !Self::cap_ok(&self.agent_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(handler)
+    }
+
+    /// Start an agent turn; the client streams it from `/api/v1/agent/stream?turn=<id>`.
+    fn agent_turn(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, prompt) = match (req.q("account"), req.q("prompt")) {
+            (Some(a), Some(p)) if !a.is_empty() && !p.is_empty() => (a, p),
+            _ => return ApiResponse::error(400, "account and prompt are required"),
+        };
+        match handler.start_turn(account, prompt) {
+            Ok(turn_id) => ApiResponse::ok_json(&json!({ "turn": turn_id })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Confirm a pending destructive action with its one-time token (REQ-AGENT-003).
+    fn agent_confirm(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (pending, token) = match (req.q("pending"), req.q("token")) {
+            (Some(i), Some(t)) if !i.is_empty() && !t.is_empty() => (i, t),
+            _ => return ApiResponse::error(400, "pending and token are required"),
+        };
+        match handler.confirm(pending, token) {
+            Ok(summary) => {
+                ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary }))
+            }
+            Err(e) => ApiResponse::error(409, &e),
+        }
+    }
+
+    /// Cancel an in-flight agent turn.
+    fn agent_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let turn = match req.q("turn") {
+            Some(t) if !t.is_empty() => t,
+            _ => return ApiResponse::error(400, "turn is required"),
+        };
+        handler.cancel(turn);
+        ApiResponse::ok_json(&json!({ "cancelled": turn }))
+    }
+
+    /// Agent connection status as JSON (`{connected, model?}`). Read-only; returns
+    /// `enabled:false` when no agent is wired so the UI can hide the assistant entirely.
+    fn agent_status(&self, _req: &ApiRequest) -> ApiResponse {
+        let body = match self.agent.as_ref() {
+            Some(h) => h.status_json(),
+            None => "{\"connected\":false,\"enabled\":false}".to_string(),
+        };
+        ApiResponse {
+            status: 200,
+            content_type: "application/json".into(),
+            body: body.into_bytes(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// Begin the EXPERIMENTAL subscription OAuth login (S-AG.12). Cap+session gated
+    /// (the app initiates it); returns the authorize URL the UI opens in the system
+    /// browser. `redirect` is the loopback callback the client supplies (its origin).
+    fn agent_oauth_start(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        // redirect is optional: the manual (copy-paste) flow uses the provider's manual
+        // redirect, so the client need not supply a loopback origin.
+        let redirect = req.q("redirect").unwrap_or("");
+        let provider = req.q("provider").unwrap_or("default");
+        match handler.oauth_start(provider, redirect) {
+            Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Complete the manual login (S-AG.12): the app POSTs the pasted `code#state`. Cap+
+    /// session gated (the app initiates it). Exchanges + stores the token.
+    fn agent_oauth_complete(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let code = match req.q("code") {
+            Some(c) if !c.is_empty() => c,
+            _ => return ApiResponse::error(400, "code is required"),
+        };
+        match handler.oauth_complete(code) {
+            Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
+            Err(e) => ApiResponse::error(400, &e),
+        }
+    }
+
+    /// Import a subscription credential obtained on another device (S-AG.12). Cap + session
+    /// gated (the app initiates it). `access_token`, `refresh_token` and `expires_at_ms`
+    /// come as query params (the router parses no body); the handler stores it encrypted.
+    fn agent_subscription_import(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let access = req.q("access_token").unwrap_or("");
+        if access.is_empty() {
+            return ApiResponse::error(400, "access_token is required");
+        }
+        let refresh = req.q("refresh_token").unwrap_or("");
+        let expires_at_ms = req
+            .q("expires_at_ms")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        match handler.subscription_import(access, refresh, expires_at_ms) {
+            Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
+            Err(e) => ApiResponse::error(400, &e),
+        }
+    }
+
+    /// Set the active provider + model from the in-app switcher (S-AG.6). Cap + session
+    /// gated; `provider` and `model` come as query params.
+    fn agent_set_model(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let provider = req.q("provider").unwrap_or("");
+        let model = req.q("model").unwrap_or("");
+        if provider.is_empty() || model.is_empty() {
+            return ApiResponse::error(400, "provider and model are required");
+        }
+        match handler.set_model(provider, model) {
+            Ok(_) => ApiResponse::ok_json(&json!({ "provider": provider, "model": model })),
+            Err(e) => ApiResponse::error(400, &e),
+        }
+    }
+
+    /// The system-browser OAuth callback (S-AG.12). NOT cap/session gated — the browser
+    /// holds no token; the `state` minted at start is the CSRF defence. Exchanges the
+    /// code, stores the token, and returns a human-facing success page.
+    fn agent_oauth_callback(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent.as_ref() {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "the agent is not enabled on this server"),
+        };
+        let (code, state) = match (req.q("code"), req.q("state")) {
+            (Some(c), Some(s)) if !c.is_empty() && !s.is_empty() => (c, s),
+            _ => return ApiResponse::error(400, "code and state are required"),
+        };
+        match handler.oauth_callback(code, state) {
+            Ok(html) => ApiResponse::html(&html),
+            Err(e) => ApiResponse::error(400, &e),
+        }
+    }
+
     /// The effective configuration the UI's settings view reads: engine-wide sync
     /// settings + each account's id/username/roots. Fields are **explicitly
     /// whitelisted** (not a blanket serialize of `Config`) so a future secret-
@@ -2524,7 +3221,7 @@ impl Router {
             .filter(|n| *n > 0)
             .unwrap_or(50)
             .min(500);
-        let store = match self.open(Some(account)) {
+        let store = match self.open_readonly(Some(account)) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -2557,7 +3254,7 @@ impl Router {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
         };
-        let store = match self.open(Some(account)) {
+        let store = match self.open_readonly(Some(account)) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -2606,12 +3303,34 @@ impl Router {
         Store::open(path).map_err(|e| ApiResponse::error(500, &format!("store: {e}")))
     }
 
+    /// Read-only store open for GET endpoints: a WAL reader that takes no instance
+    /// lock, so a list load never waits out an in-flight sync holding the writer lock
+    /// (the measured cause of multi-second mailbox loads). Falls back to a writable
+    /// open only if the DB isn't there yet (fresh account, pre-migration).
+    fn open_readonly(&self, account: Option<&str>) -> Result<Store, ApiResponse> {
+        let account = account.ok_or_else(|| ApiResponse::error(400, "missing 'account'"))?;
+        let path = self
+            .store_path(account)
+            .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
+        match Store::open_readonly(&path) {
+            Ok(s) => Ok(s),
+            // No migrated DB yet (first run): fall back to a writable open, which
+            // creates + migrates it, so the endpoint still works before the first sync.
+            Err(_) => {
+                Store::open(&path).map_err(|e| ApiResponse::error(500, &format!("store: {e}")))
+            }
+        }
+    }
+
     fn items(&self, req: &ApiRequest) -> ApiResponse {
         let service = match req.q("service") {
             Some(s) => s,
             None => return ApiResponse::error(400, "missing 'service'"),
         };
-        let store = match self.open(req.q("account")) {
+        // GETs use a read-only WAL connection so a list load is never serialized behind
+        // an in-flight sync holding the writer lock (the measured cause of slow mailbox
+        // loads). Any preview back-fill happens afterwards on a brief writable open.
+        let store = match self.open_readonly(req.q("account")) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -2691,6 +3410,10 @@ impl Router {
                 // readable body simply carry no `preview`. Bounded by the page size.
                 // mail = sender/snippet/date/has-html (.eml); the rest parse the
                 // archived JSON (calendar/contacts/todo).
+                // Mail previews parsed on the fly (no cached row yet) are collected here
+                // and persisted once, after the response is built, on a brief writable
+                // open — so the read above never takes the writer lock.
+                let mut backfill: Vec<(String, String)> = Vec::new();
                 let arr: Vec<Value> = if matches!(
                     service,
                     "mail" | "calendar" | "contacts" | "todo" | "onenote"
@@ -2705,59 +3428,88 @@ impl Router {
                         .iter()
                         .map(|it| {
                             let mut v = item_json(it);
-                            if let (Some(root), Some(rel)) =
-                                (archive_root.as_ref(), it.local_path.as_ref())
-                            {
-                                if let Some(bytes) = read_under_root(root, rel) {
-                                    if service == "mail" {
-                                        mail_preview_enrichment(&mut v, it, root, rel, &bytes);
-                                    } else if service == "onenote" {
-                                        // a page's local_path is the .html body, not JSON —
-                                        // onenote_preview reads the _pagemeta_ / flank sidecar.
-                                        v["preview"] = onenote_preview(it, root);
-                                    } else if let Ok(o) = serde_json::from_slice::<Value>(&bytes) {
-                                        v["preview"] = match service {
-                                            "calendar" => calendar_preview(it, &o),
-                                            "contacts" => contact_preview(it, &o, root),
-                                            "todo" => todo_preview(it, &o, root),
-                                            _ => json!({
-                                                "status": o["status"],
-                                                "importance": o["importance"],
-                                                "due": o["dueDateTime"]["dateTime"],
-                                                "has_note": o["body"]["content"]
-                                                    .as_str()
-                                                    .map(|s| !s.trim().is_empty())
-                                                    .unwrap_or(false),
-                                            }),
-                                        };
+                            // Fast path (schema v12): a mail row whose `preview` was
+                            // already computed is served straight from the DB column —
+                            // no `.eml`/`.json` read, no MIME parse, no attachment decode.
+                            // This is the hot mailbox-load path once bodies are warmed.
+                            let cached = service == "mail"
+                                && it
+                                    .preview_json
+                                    .as_deref()
+                                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                    .map(|pv| v["preview"] = pv)
+                                    .is_some();
+                            if !cached {
+                                if let (Some(root), Some(rel)) =
+                                    (archive_root.as_ref(), it.local_path.as_ref())
+                                {
+                                    if let Some(bytes) = read_under_root(root, rel) {
+                                        if service == "mail" {
+                                            mail_preview_enrichment(&mut v, it, root, rel, &bytes);
+                                        } else if service == "onenote" {
+                                            // a page's local_path is the .html body, not JSON —
+                                            // onenote_preview reads the _pagemeta_ / flank sidecar.
+                                            v["preview"] = onenote_preview(it, root);
+                                        } else if let Ok(o) =
+                                            serde_json::from_slice::<Value>(&bytes)
+                                        {
+                                            v["preview"] = match service {
+                                                "calendar" => calendar_preview(it, &o),
+                                                "contacts" => contact_preview(it, &o, root),
+                                                "todo" => todo_preview(it, &o, root),
+                                                _ => json!({
+                                                    "status": o["status"],
+                                                    "importance": o["importance"],
+                                                    "due": o["dueDateTime"]["dateTime"],
+                                                    "has_note": o["body"]["content"]
+                                                        .as_str()
+                                                        .map(|s| !s.trim().is_empty())
+                                                        .unwrap_or(false),
+                                                }),
+                                            };
+                                        }
                                     }
                                 }
-                            }
-                            // #89: show a mail's sender from the indexed `sender`
-                            // (captured at ingest — read with the item, NO extra
-                            // file I/O) whenever the .eml body isn't cached, so a row
-                            // never reads "(unknown sender)". The .eml enrichment
-                            // above wins when the body is present.
-                            if service == "mail" {
-                                if let Some(sender) = it.sender.as_deref() {
-                                    let has_from = v
-                                        .get("preview")
-                                        .and_then(|p| p.get("from"))
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|s| !s.is_empty());
-                                    if !has_from {
-                                        let mut p =
-                                            v.get("preview").cloned().unwrap_or_else(|| json!({}));
-                                        p["from"] = json!(sender);
-                                        if p.get("subject").and_then(Value::as_str).is_none() {
-                                            p["subject"] = json!(it.name);
-                                        }
-                                        if p.get("date").and_then(Value::as_str).is_none() {
-                                            if let Some(d) = it.remote_mtime.as_deref() {
-                                                p["date"] = json!(d);
+                                // #89: show a mail's sender from the indexed `sender`
+                                // (captured at ingest — read with the item, NO extra
+                                // file I/O) whenever the .eml body isn't cached, so a row
+                                // never reads "(unknown sender)". The .eml enrichment
+                                // above wins when the body is present.
+                                if service == "mail" {
+                                    if let Some(sender) = it.sender.as_deref() {
+                                        let has_from = v
+                                            .get("preview")
+                                            .and_then(|p| p.get("from"))
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|s| !s.is_empty());
+                                        if !has_from {
+                                            let mut p = v
+                                                .get("preview")
+                                                .cloned()
+                                                .unwrap_or_else(|| json!({}));
+                                            p["from"] = json!(sender);
+                                            if p.get("subject").and_then(Value::as_str).is_none() {
+                                                p["subject"] = json!(it.name);
                                             }
+                                            if p.get("date").and_then(Value::as_str).is_none() {
+                                                if let Some(d) = it.remote_mtime.as_deref() {
+                                                    p["date"] = json!(d);
+                                                }
+                                            }
+                                            v["preview"] = p;
                                         }
-                                        v["preview"] = p;
+                                    }
+                                }
+                                // Collect the freshly computed mail preview for a
+                                // post-response write-through so every later load takes the
+                                // fast path. Only for a mail with an archived body (the
+                                // expensive case); `set_local_path` clears it when the body
+                                // is re-archived.
+                                if service == "mail" && it.local_path.is_some() {
+                                    if let Some(pv) = v.get("preview") {
+                                        if let Ok(s) = serde_json::to_string(pv) {
+                                            backfill.push((it.remote_id.clone(), s));
+                                        }
                                     }
                                 }
                             }
@@ -2767,6 +3519,16 @@ impl Router {
                 } else {
                     items.iter().map(item_json).collect()
                 };
+                // Persist freshly parsed previews so later loads hit the DB fast path.
+                // Brief writable open; if the writer lock is busy (a sync is running) this
+                // simply no-ops and the next load retries — it never blocks the read above.
+                if !backfill.is_empty() {
+                    if let Ok(w) = self.open(Some(account)) {
+                        for (id, s) in &backfill {
+                            let _ = w.set_preview_json(account, "mail", id, s);
+                        }
+                    }
+                }
                 ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
@@ -2814,30 +3576,40 @@ impl Router {
             .iter()
             .find(|a| a.id == account)
             .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
-        // OneDrive `local_path` is relative to the synced folder; every archived
-        // service stores its body under the archive root.
-        let body_root = if service == "onedrive" {
-            acc.sync_root.clone()
-        } else {
-            acc.archive_root.clone()
-        };
         let store = self.open(Some(account))?;
-        let (rel, name) = match store.get_item(account, service, id) {
-            Ok(Some(it)) => {
-                let rel = it
-                    .local_path
-                    .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?;
-                (rel, it.name)
-            }
+        let it = match store.get_item(account, service, id) {
+            Ok(Some(it)) => it,
             Ok(None) => return Err(ApiResponse::error(404, "item not found")),
             Err(e) => return Err(ApiResponse::error(500, &format!("query: {e}"))),
         };
+        let rel = it
+            .local_path
+            .clone()
+            .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?;
+        let name = it.name.clone();
+        // Root-aware body location (#onedrive-mobile 0C): a OneDrive body lives in the
+        // offline working copy (`sync_root`) when `body_location=="sync"`, else the
+        // lazy-preview cache (`cache_root`); legacy rows without a location fall back to
+        // `sync_root`. Every other archived service reads from the archive root. The
+        // OneDrive `local_path` is relative to the chosen root.
+        let body_root = if service == "onedrive" {
+            match it.body_location.as_deref() {
+                Some("cache") => acc.effective_cache_root(),
+                _ => acc.sync_root.clone(),
+            }
+        } else {
+            acc.archive_root.clone()
+        };
         let path = body_root.join(&rel);
         match (path.canonicalize(), body_root.canonicalize()) {
-            (Ok(p), Ok(root)) if p.starts_with(&root) => match std::fs::read(&p) {
-                Ok(bytes) => Ok((rel, bytes, name)),
-                Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
-            },
+            (Ok(p), Ok(root)) if p.starts_with(&root) => {
+                // Decrypt the sealed body envelope on read (#0B); a plaintext file (desktop)
+                // passes through unchanged.
+                match isyncyou_core::envelope::read_body(&p) {
+                    Ok(bytes) => Ok((rel, bytes, name)),
+                    Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
+                }
+            }
             (Ok(_), Ok(_)) => Err(ApiResponse::error(400, "body path escapes its root")),
             _ => Err(ApiResponse::error(404, "body file missing")),
         }
@@ -3187,7 +3959,18 @@ fn backup_state(it: &Item) -> &'static str {
 }
 
 fn item_json(it: &Item) -> Value {
-    json!({
+    // `has_body`: for OneDrive (mobile modes, schema v14) a body is only "present" when
+    // it is materialized AND valid — `body_state == "available"`; a filesystem probe
+    // (`local_path`) would falsely mark a metadata-only Mode-2 row as openable. Every
+    // other service keeps the `local_path`-based meaning (its body is a plain archived
+    // file). OneDrive rows also carry their content-state fields so the UI can render
+    // online / syncing / offline / conflict without a second request.
+    let has_body = if it.service == "onedrive" {
+        it.body_state.as_deref() == Some("available")
+    } else {
+        it.local_path.is_some()
+    };
+    let mut v = json!({
         "service": it.service,
         "remote_id": it.remote_id,
         "name": it.name,
@@ -3197,12 +3980,19 @@ fn item_json(it: &Item) -> Value {
         "remote_mtime": it.remote_mtime,
         "size": it.size,
         "etag": it.etag,
-        "has_body": it.local_path.is_some(),
+        "has_body": has_body,
         "deleted": it.deleted_at.is_some(),
         "state": backup_state(it),
         "verify_status": it.verify_status,
         "verified_at": it.verified_at,
-    })
+    });
+    if it.service == "onedrive" {
+        v["content_state"] = json!(it.content_state);
+        v["body_location"] = json!(it.body_location);
+        v["body_state"] = json!(it.body_state);
+        v["conflict_state"] = json!(it.conflict_state);
+    }
+    v
 }
 
 /// Best-effort read of an archived body file that must stay under `archive_root`
@@ -3215,7 +4005,8 @@ fn read_under_root(archive_root: &std::path::Path, rel: &str) -> Option<Vec<u8>>
     if !p.starts_with(&root) {
         return None;
     }
-    std::fs::read(&p).ok()
+    // Decrypt the sealed body envelope on read (#0B); plaintext (desktop) passes through.
+    isyncyou_core::envelope::read_body(&p).ok()
 }
 
 /// Build a calendar item's `preview` from its archived JSON sidecar (#565 B4).
@@ -3595,6 +4386,7 @@ mod tests {
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -3715,6 +4507,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -3897,6 +4690,207 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
             .with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&bad).status, 400);
+    }
+
+    struct FakeAgent;
+    impl AgentHandler for FakeAgent {
+        fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
+            Ok("turn-123".into())
+        }
+        fn confirm(&self, pending: &str, token: &str) -> Result<String, String> {
+            if token == "right" {
+                Ok(format!("ran {pending}"))
+            } else {
+                Err("bad token".into())
+            }
+        }
+        fn cancel(&self, _t: &str) {}
+        fn open_stream(&self, turn: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            if turn != "turn-123" {
+                return None;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send("{\"event\":\"token\",\"text\":\"hi\"}".into()).ok();
+            Some(rx)
+        }
+        fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
+            Ok(format!(
+                "https://auth.example/authorize?redirect_uri={redirect_uri}&state=st-1"
+            ))
+        }
+        fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
+            Ok(format!("<html>connected code={code} state={state}</html>"))
+        }
+        fn status_json(&self) -> String {
+            "{\"connected\":true,\"enabled\":true,\"model\":\"fake-1\"}".to_string()
+        }
+    }
+
+    #[test]
+    fn agent_routes_require_cap_token_and_validate_params() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let q = "/api/v1/agent/turn?account=a&prompt=hi";
+        // no / wrong cap token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .status,
+            401
+        );
+        // correct token -> 200 + the turn id
+        let ok =
+            router.route(&ApiRequest::new("POST", q).with_cap_token(Some("agentsecret".into())));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("turn-123"));
+        // missing params -> 400
+        let bad = ApiRequest::new("POST", "/api/v1/agent/turn?account=a")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&bad).status, 400);
+        // confirm: wrong one-time token -> 409, right -> 200
+        let cwrong = ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=wrong")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&cwrong).status, 409);
+        let cok = ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=right")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&cok).status, 200);
+        // cancel -> 200
+        let cancel = ApiRequest::new("POST", "/api/v1/agent/cancel?turn=turn-123")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&cancel).status, 200);
+    }
+
+    #[test]
+    fn open_bridge_stream_gates_events_and_agent() {
+        // #0A: the bridge push channel replaces both EventSource endpoints, with the same
+        // session gate. Change stream pushes on notify; agent stream wraps each line.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let bus = std::sync::Arc::new(EventBus::new());
+        let (_d, router) = setup();
+        let router = router
+            .with_events(bus.clone())
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("s".into());
+        // Unauthorized → None (identical gate to the HTTP SSE path).
+        assert!(router.open_bridge_stream("/api/v1/events", None).is_none());
+        // Authorized change stream (token via _st) → a change follows a notify. A
+        // background notifier removes the capture-vs-notify race (mirrors the SSE test).
+        let rx = router
+            .open_bridge_stream("/api/v1/events?_st=s", None)
+            .expect("events stream");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (n, s2) = (bus.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !s2.load(Ordering::SeqCst) {
+                n.notify();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let mut got_change = false;
+        for _ in 0..40 {
+            if let Ok(m) = rx.recv_timeout(Duration::from_millis(500)) {
+                if m.contains("\"change\"") {
+                    got_change = true;
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(got_change, "change stream must push a change after notify");
+        // Agent stream (session + turn) → the pre-serialized line wrapped as `data`.
+        let arx = router
+            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123&_st=s", None)
+            .expect("agent stream");
+        let first = arx.recv_timeout(Duration::from_secs(2)).expect("an event");
+        assert!(
+            first.contains("\"message\"") && first.contains("token"),
+            "agent line wrapped as data: {first}"
+        );
+        // Unknown path → None.
+        assert!(router
+            .open_bridge_stream("/api/v1/nope", Some("s"))
+            .is_none());
+    }
+
+    #[test]
+    fn agent_routes_are_404_when_not_enabled() {
+        let (_d, router) = setup();
+        let r = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
+                .with_cap_token(Some("x".into())),
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn agent_status_route_reports_enabled_and_connected() {
+        let (_d, router) = setup();
+        // No agent wired -> enabled:false (UI hides the assistant).
+        let off = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
+        assert_eq!(off.status, 200);
+        assert!(String::from_utf8_lossy(&off.body).contains("\"enabled\":false"));
+        // Agent wired -> the handler's status (read-only, no cap token needed).
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let on = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
+        assert_eq!(on.status, 200);
+        assert!(String::from_utf8_lossy(&on.body).contains("\"connected\":true"));
+    }
+
+    #[test]
+    fn agent_oauth_start_is_cap_gated_and_returns_authorize_url() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let redir = "http%3A%2F%2F127.0.0.1%3A5000%2Fagent%2Foauth%2Fcallback";
+        let q = format!("/api/v1/agent/oauth/start?provider=anthropic&redirect={redir}");
+        // no cap token -> 401
+        assert_eq!(router.route(&ApiRequest::new("POST", &q)).status, 401);
+        // with cap token -> 200 + an authorize URL the UI opens in the system browser
+        let ok =
+            router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
+        // redirect is optional now (manual flow) -> still 200 without it
+        let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=anthropic")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&noredir).status, 200);
+    }
+
+    #[test]
+    fn agent_oauth_callback_is_session_gate_exempt_for_the_browser() {
+        let (_d, router) = setup();
+        // Mobile profile: the data API is session-token gated...
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("sess".into());
+        // /api/v1/* without the session token is refused (sanity: the gate is on)...
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/agent/cancel?turn=t")
+                        .with_cap_token(Some("agentsecret".into()))
+                )
+                .status,
+            401
+        );
+        // ...but the browser callback (not under /api/v1/) reaches the handler with NO
+        // session token and NO cap token — only the `state` protects it.
+        let cb = ApiRequest::new("GET", "/callback?code=abc&state=st-1");
+        let r = router.route(&cb);
+        assert_eq!(r.status, 200);
+        assert!(String::from_utf8_lossy(&r.body).contains("connected code=abc"));
+        // missing code/state -> 400
+        let bad = ApiRequest::new("GET", "/callback?code=abc");
+        assert_eq!(router.route(&bad).status, 400);
+    }
+
+    #[test]
+    fn agent_handler_open_stream_yields_a_receiver() {
+        let h = FakeAgent;
+        let rx = h.open_stream("turn-123").expect("stream");
+        assert!(rx.recv().unwrap().contains("token"));
+        assert!(h.open_stream("other").is_none());
     }
 
     struct OkSettings(std::sync::Arc<std::sync::atomic::AtomicU64>);
@@ -4164,6 +5158,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -4211,6 +5206,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -4321,6 +5317,110 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             200
         );
         assert_eq!(rec.last(), "send_draft id=d1");
+    }
+
+    #[derive(Default)]
+    struct FakeCalendarWrite {
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+    impl CalendarWriteHandler for FakeCalendarWrite {
+        fn create(&self, _a: &str, _e: &Value) -> Result<String, String> {
+            Ok("new".into())
+        }
+        fn update(&self, _a: &str, _id: &str, _e: &Value) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.deletes.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn respond(&self, _a: &str, _id: &str, _r: &str, _c: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    // #onedrive-mobile 0.6: the mobile biometric gate wired through a real route.
+    #[test]
+    fn biometric_gate_challenges_and_consumes_a_per_action_token() {
+        let del = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+
+        // Desktop profile (gate off): a delete with the cap token goes straight through.
+        let (_d0, r0) = setup();
+        let f0 = std::sync::Arc::new(FakeCalendarWrite::default());
+        let desktop = r0.with_calendar_write(f0.clone(), "cap".into());
+        assert_eq!(
+            desktop
+                .route(&del("/api/v1/calendar/delete?account=a&id=e1"))
+                .status,
+            200
+        );
+        assert_eq!(*f0.deletes.lock().unwrap(), vec!["e1"]);
+
+        // Mobile profile (gate on): the same delete is challenged; handler NOT called.
+        let (_d1, r1) = setup();
+        let f1 = std::sync::Arc::new(FakeCalendarWrite::default());
+        let mobile = r1
+            .with_calendar_write(f1.clone(), "cap".into())
+            .with_biometric_gate();
+        let ch = mobile.route(&del("/api/v1/calendar/delete?account=a&id=e1"));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(
+            f1.deletes.lock().unwrap().is_empty(),
+            "handler must not run before biometric"
+        );
+
+        // Re-issue with the token but NO biometric yet -> 403 (not confirmed).
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert!(f1.deletes.lock().unwrap().is_empty());
+
+        // Native biometric confirms over the JNI-only path -> re-issue proceeds once.
+        assert!(mobile.confirm_biometric(&pat));
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
+                )))
+                .status,
+            200
+        );
+        assert_eq!(*f1.deletes.lock().unwrap(), vec!["e1"]);
+
+        // Replay of the consumed token -> 403 (single-use); handler not called again.
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert_eq!(f1.deletes.lock().unwrap().len(), 1);
+
+        // A token minted+confirmed for e2 cannot authorize deleting e1 (hash immutable).
+        let ch2 = mobile.route(&del("/api/v1/calendar/delete?account=a&id=e2"));
+        let pat2 = body_json(&ch2)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(mobile.confirm_biometric(&pat2));
+        assert_eq!(
+            mobile
+                .route(&del(&format!(
+                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat2}"
+                )))
+                .status,
+            403
+        );
     }
 
     #[test]
@@ -4710,6 +5810,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_has_agent_cap_token_placeholder() {
+        assert!(APP_JS.contains("__AGENT_CAP_TOKEN__"));
+    }
+
+    #[test]
     fn account_routes_refused_without_a_handler() {
         // The read-only `serve` wires no account-auth handler → every account
         // login/sign-out POST is refused 404, never reaching the (absent) gate (#68).
@@ -4876,6 +5981,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -4978,6 +6084,34 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             404
         );
+    }
+
+    // #onedrive-mobile 0.9: on the mobile profile share is additionally biometric-gated —
+    // the cap token alone (which the WebView holds) is not enough to produce a link.
+    #[test]
+    fn share_is_biometric_gated_on_mobile() {
+        let (_d, router) = setup();
+        let mobile = router
+            .with_share(std::sync::Arc::new(OkShare), "secret".into())
+            .with_biometric_gate();
+        let cap = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        let q = "/api/v1/share?account=a&service=onedrive&id=x";
+        // cap token alone → a confirmation challenge, NOT a link
+        let ch = mobile.route(&cap(q));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(!String::from_utf8_lossy(&ch.body).contains("1drv.ms"));
+        // token but no biometric yet → 403
+        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        // native biometric confirms → share proceeds and returns the link
+        assert!(mobile.confirm_biometric(&pat));
+        let ok = mobile.route(&cap(&format!("{q}&_pat={pat}")));
+        assert_eq!(ok.status, 200);
+        assert!(String::from_utf8_lossy(&ok.body).contains("https://1drv.ms/x/abc"));
+        // replay of the consumed token → 403 (single-use)
+        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
     }
 
     #[test]
@@ -5318,6 +6452,83 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(s.contains("a.pdf") && s.contains("b.docx"), "got {s}");
     }
 
+    // #onedrive-mobile 0.8: transfer progress/cancel scaffold + policy/delete-guard status.
+    #[test]
+    fn transfers_progress_cancel_and_policy_endpoints() {
+        // policy GET reads the config (no handler) — reports the mobile transfer policy
+        // AND the mass-delete-guard status.
+        let bare = Router::new(Config::default());
+        let p = bare.route(&ApiRequest::get("/api/v1/onedrive/policy"));
+        assert_eq!(p.status, 200);
+        let pj = body_json(&p);
+        assert_eq!(pj["wifi_only"], false);
+        assert_eq!(pj["charging_only"], false);
+        assert_eq!(pj["min_free_bytes"].as_u64(), Some(268_435_456));
+        assert_eq!(pj["delete_guard"]["max_absolute"].as_u64(), Some(1000));
+
+        // transfers GET is idle without a handler; cancel 404s without one.
+        let idle = bare.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
+        assert_eq!(idle.status, 200);
+        assert_eq!(body_json(&idle)["count"].as_u64(), Some(0));
+        assert_eq!(
+            bare.route(&ApiRequest::new(
+                "POST",
+                "/api/v1/onedrive/transfers/cancel?id=x"
+            ))
+            .status,
+            404
+        );
+
+        // with a handler: progress is reported and cancel is cap-gated.
+        struct MockTransfers {
+            cancelled: std::sync::Mutex<Vec<String>>,
+        }
+        impl TransferProgress for MockTransfers {
+            fn transfers(&self) -> Vec<TransferState> {
+                vec![TransferState {
+                    id: "t1".into(),
+                    name: "big.zip".into(),
+                    bytes_done: 50,
+                    bytes_total: 100,
+                    retry_after_secs: 0,
+                }]
+            }
+            fn cancel(&self, id: &str) -> bool {
+                self.cancelled.lock().unwrap().push(id.into());
+                id == "t1"
+            }
+        }
+        let mock = std::sync::Arc::new(MockTransfers {
+            cancelled: std::sync::Mutex::new(vec![]),
+        });
+        let router = Router::new(Config::default()).with_transfers(mock.clone(), "cap".into());
+        let t = router.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
+        let tj = body_json(&t);
+        assert_eq!(tj["count"].as_u64(), Some(1));
+        assert_eq!(tj["transfers"][0]["name"], "big.zip");
+        assert_eq!(tj["transfers"][0]["bytes_done"].as_u64(), Some(50));
+
+        // cancel without the cap token → 401, handler not called.
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/onedrive/transfers/cancel?id=t1"
+                ))
+                .status,
+            401
+        );
+        assert!(mock.cancelled.lock().unwrap().is_empty());
+        // with the cap token → 200 and the handler ran once.
+        let ok = router.route(
+            &ApiRequest::new("POST", "/api/v1/onedrive/transfers/cancel?id=t1")
+                .with_cap_token(Some("cap".into())),
+        );
+        assert_eq!(ok.status, 200);
+        assert_eq!(body_json(&ok)["cancelled"], true);
+        assert_eq!(*mock.cancelled.lock().unwrap(), vec!["t1"]);
+    }
+
     #[test]
     fn destructive_capability_tokens_are_action_scoped() {
         let (_d, router) = setup();
@@ -5518,6 +6729,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5565,6 +6777,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5674,6 +6887,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5689,6 +6903,46 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(it["preview"]["from"], "Grace Hopper <grace@example.com>");
         assert_eq!(it["preview"]["subject"], "Indexed-sender subject");
         assert_eq!(it["preview"]["date"], "2026-06-25T10:00:00Z");
+    }
+
+    #[test]
+    fn item_json_has_body_derives_per_service() {
+        // OneDrive (schema v14): has_body from body_state=='available', NOT local_path —
+        // a Mode-2 row can know its sync path without a downloaded body.
+        let mut od = Item::new("a", "onedrive", "f1", "file.txt", "file");
+        od.local_path = Some("onedrive/aa/f1".into()); // path known…
+        od.body_state = Some("missing".into()); // …but body not materialized
+        let j = item_json(&od);
+        assert_eq!(
+            j["has_body"],
+            serde_json::json!(false),
+            "OneDrive body 'missing' must not be has_body despite local_path"
+        );
+        assert_eq!(j["body_state"], serde_json::json!("missing")); // state surfaced for the UI
+        od.body_state = Some("available".into());
+        assert_eq!(
+            item_json(&od)["has_body"],
+            serde_json::json!(true),
+            "an available OneDrive body IS has_body"
+        );
+        // Non-OneDrive is unchanged: has_body from local_path, body_state ignored.
+        let mut mail = Item::new("a", "mail", "m1", "Subject", "message");
+        mail.body_state = Some("missing".into()); // irrelevant for mail
+        assert_eq!(
+            item_json(&mail)["has_body"],
+            serde_json::json!(false),
+            "mail without local_path = no body"
+        );
+        assert!(
+            item_json(&mail).get("body_state").is_none(),
+            "state fields are OneDrive-only"
+        );
+        mail.local_path = Some("mail/aa/m1.eml".into());
+        assert_eq!(
+            item_json(&mail)["has_body"],
+            serde_json::json!(true),
+            "mail with local_path = has_body (unchanged semantics)"
+        );
     }
 
     #[test]
@@ -5730,6 +6984,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5787,6 +7042,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5835,6 +7091,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5916,6 +7173,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -5993,6 +7251,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6037,6 +7296,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6089,6 +7349,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6176,6 +7437,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6221,6 +7483,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6285,6 +7548,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: sync,
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()
@@ -6303,6 +7567,59 @@ Content-Type: text/html; charset=utf-8\r\n\
         ));
         assert_eq!(i.status, 200);
         assert_eq!(i.content_type, "image/png");
+    }
+
+    #[test]
+    fn body_serves_onedrive_cache_mode_file_from_cache_root() {
+        // Root-aware serving (#onedrive-mobile 0C): a `body_location=="cache"` OneDrive
+        // item must be read from cache_root, NOT sync_root. Same relative name exists in
+        // both roots with different content to prove the correct root is chosen.
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        let sync = dir.path().join("od");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(sync.join("doc.txt"), b"OFFLINE COPY").unwrap();
+        std::fs::write(cache.join("doc.txt"), b"CACHED PREVIEW").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut f = Item::new("a", "onedrive", "c1", "doc.txt", "file");
+            f.local_path = Some("doc.txt".into());
+            store.upsert_item(&f).unwrap();
+            store
+                .set_content_state(
+                    "a",
+                    "onedrive",
+                    "c1",
+                    Some("cached"),
+                    Some("cache"),
+                    Some("available"),
+                    None,
+                )
+                .unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: sync,
+                archive_root: arch,
+                cache_root: cache,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let r = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=onedrive&id=c1",
+        ));
+        assert_eq!(r.status, 200);
+        assert_eq!(
+            r.body, b"CACHED PREVIEW",
+            "cache-mode body must be served from cache_root, not sync_root"
+        );
     }
 
     #[test]
@@ -6337,6 +7654,7 @@ Content-Type: text/html; charset=utf-8\r\n\
                 username: "a@outlook.com".into(),
                 sync_root: dir.path().join("od"),
                 archive_root: arch,
+                cache_root: Default::default(),
                 mount_point: None,
             }],
             ..Default::default()

@@ -1,0 +1,49 @@
+name: Advisory review reminder
+
+# cargo-deny 0.19 has no native ignore-expiry, so each risk-acceptance in deny.toml
+# carries a `REVIEW-BY: YYYY-MM-DD` marker. This job runs weekly and, once a date has
+# passed, opens (or refreshes) a tracking issue so an accepted advisory is never
+# silently forgotten — the auto-reminder that replaces a real expiry.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  review-dates:
+    name: advisory review dates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+      - name: Find overdue REVIEW-BY markers
+        id: scan
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, datetime
+          today = datetime.date.today()
+          text = open("deny.toml", encoding="utf-8").read()
+          overdue = sorted({
+              d for d in re.findall(r"REVIEW-BY:?\s*(\d{4}-\d{2}-\d{2})", text)
+              if datetime.date.fromisoformat(d) <= today
+          })
+          print(f"overdue={'yes' if overdue else 'no'}")
+          print(f"dates={','.join(overdue)}")
+          PY
+      - name: Open / refresh a tracking issue
+        if: steps.scan.outputs.overdue == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="chore(security): re-assess accepted advisories (REVIEW-BY passed)"
+          body="One or more cargo-deny advisory risk-acceptances in \`deny.toml\` are past their \`REVIEW-BY\` date (${{ steps.scan.outputs.dates }}). Re-assess: fix the advisory (e.g. bump winit to a stable 0.31), or consciously extend the REVIEW-BY date with a fresh rationale."
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body" --label "type:security,priority:high"
+          fi
