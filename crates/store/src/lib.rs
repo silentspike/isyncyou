@@ -1144,6 +1144,19 @@ impl Store {
             .optional()?)
     }
 
+    /// Drop the delta cursor for one `(account, service, scope)`. Returns whether a
+    /// row was removed. Used on a `410 Gone` resync (discard the stale token so a
+    /// crash mid-resync restarts cleanly from the base delta URL) and to GC the
+    /// cursor of a folder that is no longer scoped (sync/offline). Sibling scopes
+    /// are untouched — the primary key is `(account_id, service, scope)`.
+    pub fn clear_delta_cursor(&self, account: &str, service: &str, scope: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM delta_state WHERE account_id=?1 AND service=?2 AND scope=?3",
+            params![account, service, scope],
+        )?;
+        Ok(n > 0)
+    }
+
     /// All non-deleted items of a service (any type), ordered by type then name.
     /// Drives the web UI's per-service listing.
     pub fn items_by_service(&self, account: &str, service: &str) -> Result<Vec<Item>> {
@@ -2483,6 +2496,48 @@ mod tests {
             Some("TOKEN2")
         );
         assert_eq!(s.delta_generation("a", "onedrive", "").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn per_folder_delta_scopes_are_isolated() {
+        // Two folder scopes under the same (account, service) keep independent
+        // cursors + generations — the delta_state PK is (account, service, scope).
+        let s = Store::open_in_memory().unwrap();
+        s.set_delta_cursor("a", "onedrive", "F1", "T1").unwrap();
+        s.set_delta_cursor("a", "onedrive", "F2", "T2").unwrap();
+        assert_eq!(
+            s.get_delta_cursor("a", "onedrive", "F1").unwrap().as_deref(),
+            Some("T1")
+        );
+        assert_eq!(
+            s.get_delta_cursor("a", "onedrive", "F2").unwrap().as_deref(),
+            Some("T2")
+        );
+        // Bumping F1 does not touch F2's generation.
+        s.set_delta_cursor("a", "onedrive", "F1", "T1b").unwrap();
+        assert_eq!(s.delta_generation("a", "onedrive", "F1").unwrap(), Some(2));
+        assert_eq!(s.delta_generation("a", "onedrive", "F2").unwrap(), Some(1));
+        assert_eq!(
+            s.get_delta_cursor("a", "onedrive", "F2").unwrap().as_deref(),
+            Some("T2")
+        );
+    }
+
+    #[test]
+    fn clear_delta_cursor_removes_only_the_target_scope() {
+        let s = Store::open_in_memory().unwrap();
+        s.set_delta_cursor("a", "onedrive", "F1", "T1").unwrap();
+        s.set_delta_cursor("a", "onedrive", "F2", "T2").unwrap();
+        // Clearing a present scope returns true and removes just that row.
+        assert!(s.clear_delta_cursor("a", "onedrive", "F1").unwrap());
+        assert_eq!(s.get_delta_cursor("a", "onedrive", "F1").unwrap(), None);
+        // Sibling scope untouched.
+        assert_eq!(
+            s.get_delta_cursor("a", "onedrive", "F2").unwrap().as_deref(),
+            Some("T2")
+        );
+        // Clearing an absent scope returns false, no error.
+        assert!(!s.clear_delta_cursor("a", "onedrive", "F1").unwrap());
     }
 
     #[test]
