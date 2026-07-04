@@ -346,6 +346,13 @@ pub trait OneDriveListHandler: Send + Sync {
     fn children(&self, account: &str, folder: &str) -> Result<Vec<serde_json::Value>, String>;
 }
 
+/// Downloads a OneDrive item's content live by id for on-demand open (#649, Mode 1
+/// online). No store write — the bytes are served inertly and not persisted as a
+/// tracked item. Injected by the daemon/mobile engine; `None` => the endpoint 404s.
+pub trait OneDriveOpenHandler: Send + Sync {
+    fn download(&self, account: &str, id: &str) -> Result<Vec<u8>, String>;
+}
+
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
 /// scheduler and trigger an immediate pass. Injected by the daemon.
 pub trait SyncControl: Send + Sync {
@@ -705,6 +712,9 @@ pub struct Router {
     /// Optional live OneDrive folder-listing handler (the daemon's/mobile's).
     /// Enables the online-browse children GET; `None` => it 404s (read-only CLI).
     onedrive_list: Option<std::sync::Arc<dyn OneDriveListHandler>>,
+    /// Optional live OneDrive on-demand open handler (the daemon's/mobile's). Enables
+    /// the online content-fetch GET; `None` => it 404s (the read-only CLI `serve`).
+    onedrive_open: Option<std::sync::Arc<dyn OneDriveOpenHandler>>,
     /// Optional integrity-verify handler (the daemon's). `None` => the verify
     /// POST is refused (the read-only CLI `serve`).
     verify: Option<std::sync::Arc<dyn VerifyHandler>>,
@@ -811,6 +821,7 @@ impl Router {
             hydrations: None,
             onedrive_info: None,
             onedrive_list: None,
+            onedrive_open: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -857,6 +868,7 @@ impl Router {
             hydrations: None,
             onedrive_info: None,
             onedrive_list: None,
+            onedrive_open: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -1041,6 +1053,12 @@ impl Router {
     /// Enable the live OneDrive folder-listing GET (online browse) (builder style).
     pub fn with_onedrive_list(mut self, list: std::sync::Arc<dyn OneDriveListHandler>) -> Self {
         self.onedrive_list = Some(list);
+        self
+    }
+
+    /// Enable the live OneDrive on-demand open (content fetch) GET (builder style).
+    pub fn with_onedrive_open(mut self, open: std::sync::Arc<dyn OneDriveOpenHandler>) -> Self {
+        self.onedrive_open = Some(open);
         self
     }
 
@@ -1500,6 +1518,7 @@ impl Router {
             "/api/v1/drive" => self.drive_info(req),
             "/api/v1/permissions" => self.item_permissions(req),
             "/api/v1/onedrive/children" => self.onedrive_children(req),
+            "/api/v1/onedrive/open" => self.onedrive_open(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
             "/api/v1/debug/stats" => self.debug_stats(),
             _ => ApiResponse::error(404, "not found"),
@@ -3098,6 +3117,30 @@ impl Router {
         let folder = req.q("folder").unwrap_or("");
         match handler.children(account, folder) {
             Ok(children) => ApiResponse::ok_json(&json!({ "children": children })),
+            Err(e) => ApiResponse::error(502, &e),
+        }
+    }
+
+    /// On-demand OneDrive content by id (#649, Mode 1 online): a live Graph download,
+    /// served inertly (safe content-type from `name`). 404 when no handler; 400 without
+    /// account/id. No store row is written (Mode 1 keeps no metadata).
+    fn onedrive_open(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_open {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "OneDrive open is not enabled on this server"),
+        };
+        let (account, id) = match (req.q("account"), req.q("id")) {
+            (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let name = req.q("name").unwrap_or("");
+        match handler.download(account, id) {
+            Ok(bytes) => ApiResponse {
+                status: 200,
+                content_type: safe_content_type(name).into(),
+                body: bytes,
+                headers: Vec::new(),
+            },
             Err(e) => ApiResponse::error(502, &e),
         }
     }
@@ -5404,6 +5447,65 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let ok = ApiRequest::get("/api/v1/onedrive/children?account=a&folder=F")
             .with_session_token(Some("sess-tok-0001".into()));
         assert_ne!(router.route(&ok).status, 401); // correct token passes the gate -> 200
+    }
+
+    struct FakeOneDriveOpen;
+    impl OneDriveOpenHandler for FakeOneDriveOpen {
+        fn download(&self, _account: &str, _id: &str) -> Result<Vec<u8>, String> {
+            Ok(b"PNGDATA".to_vec())
+        }
+    }
+
+    #[test]
+    fn onedrive_open_route_returns_bytes_or_404() {
+        let (_d, router) = setup();
+        // no handler -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/onedrive/open?account=a&id=x&name=p.png"
+                ))
+                .status,
+            404
+        );
+        let router = router.with_onedrive_open(std::sync::Arc::new(FakeOneDriveOpen));
+        // missing id -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/onedrive/open?account=a"))
+                .status,
+            400
+        );
+        // handler + account + id -> 200 + raw bytes + content-type from `name`
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/onedrive/open?account=a&id=x&name=p.png",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"PNGDATA".to_vec());
+        assert_eq!(resp.content_type, "image/png");
+        // a non-image name is served inertly as text/plain
+        let txt = router.route(&ApiRequest::get(
+            "/api/v1/onedrive/open?account=a&id=x&name=notes.pdf",
+        ));
+        assert_eq!(txt.content_type, "text/plain; charset=utf-8");
+    }
+
+    #[test]
+    fn onedrive_open_is_session_gated() {
+        // The open GET is 401 without a token on the mobile profile — exactly 401 (not
+        // 404/200), proving the /api/v1/* gate catches this new path.
+        let router = Router::new(Config::default())
+            .with_onedrive_open(std::sync::Arc::new(FakeOneDriveOpen))
+            .with_session_token("sess-tok-0001".into());
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/onedrive/open?account=a&id=x"))
+                .status,
+            401
+        );
+        let ok = ApiRequest::get("/api/v1/onedrive/open?account=a&id=x")
+            .with_session_token(Some("sess-tok-0001".into()));
+        assert_ne!(router.route(&ok).status, 401);
     }
 
     #[test]
