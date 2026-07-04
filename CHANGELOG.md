@@ -24,6 +24,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `webui`+`app-host`: session-gated `GET /api/v1/onedrive/children?account&folder` — an
   `OneDriveListHandler` (Router builder + Fake) returning a folder's live children as JSON,
   wired via `DaemonOneDriveList` into the shared desktop+mobile router; absent handler → 404 (#648).
+- `engine`+`webui`: OneDrive cloud-write endpoints — `POST /api/v1/onedrive/{create,rename,move,delete}`
+  over the crash-safe operation ledger. An idempotent intent is recorded **before** the Graph call, then
+  advanced `inflight`→`applied`; per-kind crash recovery probes so a folder create is never duplicated and
+  a delete/rename/move re-issues safely (no double effect). `delete` is biometric-gated on mobile; the
+  handler is wired into the shared live router for both desktop and mobile (#654).
+  - Note: `move-out-of-protected` biometric-gating is **deferred to #655/#656** — the offline-scope work
+    owns the "protected" semantics; the `delete` gate covers the destructive case today.
 
 ## [1.0.0] — 2026-06-26
 
