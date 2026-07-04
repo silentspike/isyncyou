@@ -86,6 +86,9 @@ const ICONS = {
   tag: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82zM7 7h.01",
   "mail-open": "M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8M3 8l9-6 9 6M3 8l9 6 9-6",
   sparkles: "M12 3l2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2z",
+  upload: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12",
+  pencil: "M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z",
+  "folder-input": "M2 9V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H2M2 13h10M9 16l3-3-3-3",
 };
 function icon(name, cls = "icon") {
   const ns = "http://www.w3.org/2000/svg";
@@ -308,6 +311,7 @@ const CAP = {
   contactwrite: "__CONTACTWRITE_CAP_TOKEN__",
   todowrite: "__TASKWRITE_CAP_TOKEN__",
   onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
+  onedrivewrite: "__ONEDRIVEWRITE_CAP_TOKEN__",
   account: "__ACCOUNT_CAP_TOKEN__",
   push: "__PUSH_CAP_TOKEN__",
   agent: "__AGENT_CAP_TOKEN__",
@@ -438,6 +442,7 @@ async function request(method, path, opts) {
   const o = opts || {};
   const headers = sessionHeaders();
   if (o.capToken) headers["X-Capability-Token"] = o.capToken;
+  if (o.headers) Object.assign(headers, o.headers); // #657: e.g. X-Body-Encoding: base64
   let status, d;
   if (BRIDGE) {
     const res = await bridgeSend(method, path, headers, o.body);
@@ -466,6 +471,19 @@ async function request(method, path, opts) {
 }
 async function api(path) { return request("GET", path); }
 async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
+/* Base64-encode raw bytes (Uint8Array) in fromCharCode-safe chunks (#657). The mobile bridge
+   body is text-only, so a binary upload rides base64; serve.rs decodes on X-Body-Encoding. */
+function bytesToBase64(bytes) {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return btoa(bin);
+}
+/* POST a binary body base64-encoded, flagged X-Body-Encoding: base64 for serve.rs to decode.
+   Uniform across the native bridge and the desktop HTTP path (#657). */
+async function postBinary(path, capToken, bytes) {
+  return request("POST", path, { capToken, body: bytesToBase64(bytes), headers: { "X-Body-Encoding": "base64" } });
+}
 /* Confirm a destructive action before it is sent (#0.6). On the standalone phone the
    native biometric per-action gate IS the confirmation — a strictly stronger one shown
    right before the op — so the blocking window.confirm() is skipped there (the WebView
@@ -1999,6 +2017,7 @@ async function renderOnedriveView(view) {
       el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"), driveSortSelect()),
+      CAP.onedrivewrite ? el("button", { class: "btn ghost sm", title: "Upload a file into this folder", onclick: driveUpload }, icon("upload", "icon-sm"), "Upload") : null,
       verifyButton(() => renderOnedriveView(view)),
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
@@ -2143,6 +2162,7 @@ function driveMapChild(c) {
     name: c.name,
     size: c.size,
     remote_mtime: c.lastModifiedDateTime,
+    etag: c.eTag, // #657: If-Match token for in-place replace
     has_body: false,
     preview: c.folder ? { child_count: c.folder && c.folder.childCount } : undefined,
   };
@@ -2247,13 +2267,110 @@ async function setFolderMode(folderId, mode) {
   } catch (e) { toast("Could not change mode: " + e.message, "err"); }
 }
 function driveActions(it) {
-  if (it.item_type === "folder") return null;
+  const folder = it.item_type === "folder";
   const q = { account: App.account, service: "onedrive", id: it.remote_id };
   const box = el("div", { class: "drive-actions" });
   box.append(el("button", { class: "act", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
-  if (it.has_body) box.append(el("a", { class: "act", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
-  if (CAP.share) box.append(el("button", { class: "act", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
+  if (!folder && it.has_body) box.append(el("a", { class: "act", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
+  if (!folder && CAP.share) box.append(el("button", { class: "act", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
+  // #657: in-app write actions (cap-gated; destructive ops are biometric-gated on mobile).
+  if (!folder && CAP.onedrivewrite) box.append(el("button", { class: "act", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
+  if (CAP.onedrivewrite) {
+    box.append(el("button", { class: "act", title: "Rename", onclick: (e) => { e.stopPropagation(); driveRename(it); } }, icon("pencil", "icon-sm")));
+    box.append(el("button", { class: "act", title: "Move to folder", onclick: (e) => { e.stopPropagation(); driveMovePicker(it); } }, icon("folder-input", "icon-sm")));
+    box.append(el("button", { class: "act", title: "Delete", onclick: (e) => { e.stopPropagation(); driveDelete(it); } }, icon("trash-2", "icon-sm")));
+  }
   return box;
+}
+// #657 in-app upload: pick a file and upload it into the CURRENT folder (read live at click
+// time). Bytes → base64 → POST /onedrive/upload; execution lands with #655 (placeholder Err
+// surfaces honestly until then). Cap-gated; biometric-gated on mobile.
+function driveUpload() {
+  if (!CAP.onedrivewrite) return;
+  const cur = Drive.stack[Drive.stack.length - 1].id;
+  const inp = el("input", { type: "file" });
+  inp.addEventListener("change", async () => {
+    const file = inp.files && inp.files[0]; if (!file) return;
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      await postBinary("/api/v1/onedrive/upload?" + qs({ account: App.account, parent: cur === "root" ? "" : cur, name: file.name }), CAP.onedrivewrite, bytes);
+      toast(`Uploaded ${file.name}`); driveLoad(); driveLoadMetrics();
+    } catch (e) { toast("Upload failed: " + e.message, "err"); }
+  });
+  inp.click();
+}
+// #657 in-app replace: overwrite a file's content in place (If-Match its eTag; a 412 conflict
+// is surfaced, never clobbered). Bytes → base64 → POST /onedrive/replace.
+function driveReplace(it) {
+  if (!CAP.onedrivewrite) return;
+  const inp = el("input", { type: "file" });
+  inp.addEventListener("change", async () => {
+    const file = inp.files && inp.files[0]; if (!file) return;
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      await postBinary("/api/v1/onedrive/replace?" + qs({ account: App.account, id: it.remote_id, etag: it.etag || "" }), CAP.onedrivewrite, bytes);
+      toast(`Replaced ${it.name || "file"}`); driveLoad(); driveLoadMetrics();
+    } catch (e) { toast("Replace failed: " + e.message, "err"); }
+  });
+  inp.click();
+}
+// #657 rename: a small text sheet → POST /onedrive/rename (#654 ledger). Cap-gated.
+function driveRename(it) {
+  if (!CAP.onedrivewrite) return;
+  const inp = el("input", { class: "input", value: it.name || "" });
+  const submit = async () => {
+    const name = inp.value.trim(); if (!name || name === it.name) { closeSheet(); return; }
+    closeSheet();
+    try { await post("/api/v1/onedrive/rename?" + qs({ account: App.account, id: it.remote_id, name }), CAP.onedrivewrite); toast(`Renamed to ${name}`); driveLoad(); }
+    catch (e) { toast("Rename failed: " + e.message, "err"); }
+  };
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  const content = el("div", { class: "compose" }, inp,
+    el("div", { class: "cmp-footer" }, el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: submit }, "Rename")));
+  openSheet(it.item_type === "folder" ? "Rename folder" : "Rename file", content);
+  setTimeout(() => { inp.focus(); inp.select(); }, 0);
+}
+// #657 move: pick a destination folder from the live tree, then POST /onedrive/move (#654).
+// Its own drill stack; skips the item itself as a target; the drive root is "".
+function driveMovePicker(it) {
+  if (!CAP.onedrivewrite) return;
+  const stack = [{ id: "root", name: "OneDrive" }];
+  const list = el("div", { class: "pick-list" });
+  const foot = el("div", { class: "cmp-footer" });
+  const crumb = el("div", { class: "dim", style: "margin-bottom:8px" });
+  const content = el("div", { class: "compose" }, crumb, list, foot);
+  async function load() {
+    const cur = stack[stack.length - 1];
+    crumb.textContent = "Into: " + stack.map(s => s.name).join(" / ");
+    clear(list).append(el("div", { class: "dim", text: "Loading…" }));
+    let folders = [];
+    try {
+      const d = await api("/api/v1/onedrive/children?" + qs({ account: App.account, folder: cur.id === "root" ? "" : cur.id }));
+      folders = (d.children || []).filter(c => c.folder && c.id !== it.remote_id);
+    } catch (e) { clear(list).append(el("div", { class: "dim", text: "Could not load: " + e.message })); return; }
+    clear(list);
+    if (stack.length > 1) list.append(el("button", { class: "pick-row pick-btn", type: "button", onclick: () => { stack.pop(); load(); } }, icon("corner-up-left", "icon-sm"), el("span", { class: "grow", text: "Up one level" })));
+    if (!folders.length) list.append(el("div", { class: "dim", text: "No subfolders here." }));
+    folders.forEach(c => list.append(el("button", { class: "pick-row pick-btn", type: "button", onclick: () => { stack.push({ id: c.id, name: c.name }); load(); } },
+      icon("folder", "icon-sm"), el("span", { class: "grow truncate", text: c.name }))));
+    clear(foot).append(el("div", { class: "spacer", style: "flex:1" }),
+      el("button", { class: "btn primary", type: "button", onclick: () => { closeSheet(); driveMove(it, cur.id === "root" ? "" : cur.id, cur.name); } }, `Move here`));
+  }
+  openSheet("Move to folder", content);
+  load();
+}
+async function driveMove(it, parent, parentName) {
+  try { await post("/api/v1/onedrive/move?" + qs({ account: App.account, id: it.remote_id, parent, name: it.name || "" }), CAP.onedrivewrite); toast(`Moved to ${parentName}`); driveLoad(); driveLoadMetrics(); }
+  catch (e) { toast("Move failed: " + e.message, "err"); }
+}
+// #657 delete: confirmDestructive (desktop confirm(); on mobile the biometric gate IS the
+// confirmation) → POST /onedrive/delete (#654 ledger).
+async function driveDelete(it) {
+  if (!CAP.onedrivewrite) return;
+  if (!confirmDestructive(`Delete "${it.name || "this item"}"? This removes it from OneDrive.`)) return;
+  try { await post("/api/v1/onedrive/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onedrivewrite); toast(`Deleted ${it.name || "item"}`); driveLoad(); driveLoadMetrics(); }
+  catch (e) { toast("Delete failed: " + e.message, "err"); }
 }
 // Item detail sheet (#564): facts + lazily-fetched "who has access" (one Graph
 // call per item, only on open). #564 A5 enriches the facts with the rich
@@ -2383,10 +2500,17 @@ function driveRow(it) {
     syncBadge(it),
     el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(it.remote_mtime) }));
   const acts = el("div", { style: "display:flex;gap:4px" });
-  if (!folder) acts.append(el("button", { class: "btn ghost sm", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
+  acts.append(el("button", { class: "btn ghost sm", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
   if (!folder && it.has_body) acts.append(el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
   if (folder && MOBILE && CAP.onedriveMode) acts.append(driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name));
+  // #657: in-app write actions (cap-gated; destructive ops biometric-gated on mobile).
+  if (!folder && CAP.onedrivewrite) acts.append(el("button", { class: "btn ghost sm", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
+  if (CAP.onedrivewrite) {
+    acts.append(el("button", { class: "btn ghost sm", title: "Rename", onclick: (e) => { e.stopPropagation(); driveRename(it); } }, icon("pencil", "icon-sm")));
+    acts.append(el("button", { class: "btn ghost sm", title: "Move to folder", onclick: (e) => { e.stopPropagation(); driveMovePicker(it); } }, icon("folder-input", "icon-sm")));
+    acts.append(el("button", { class: "btn ghost sm", title: "Delete", onclick: (e) => { e.stopPropagation(); driveDelete(it); } }, icon("trash-2", "icon-sm")));
+  }
   row.append(acts);
   return row;
 }
