@@ -2366,14 +2366,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let (account, parent, name) = match (
+        let (account, name) = match (
             req.q("account").filter(|a| !a.is_empty()),
-            req.q("parent").filter(|p| !p.is_empty()),
             req.q("name").filter(|n| !n.is_empty()),
         ) {
-            (Some(a), Some(p), Some(n)) => (a, p, n),
-            _ => return ApiResponse::error(400, "account, parent and name are required"),
+            (Some(a), Some(n)) => (a, n),
+            _ => return ApiResponse::error(400, "account and name are required"),
         };
+        // An empty/absent parent means the drive root (Graph `create_folder` addresses it).
+        let parent = req.q("parent").unwrap_or("");
         match h.create_folder(account, parent, name) {
             Ok(id) => {
                 let _ = self.audit_account(account, "audit:onedrive", "ok", "create");
@@ -5723,10 +5724,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             200
         );
         assert_eq!(*f.deletes.lock().unwrap(), vec!["i3".to_string()]);
-        // missing required params -> 400.
+        // an absent parent means the drive root -> still a valid create (parent = "").
         assert_eq!(
             router
-                .route(&post("/api/v1/onedrive/create?account=a&name=Docs"))
+                .route(&post("/api/v1/onedrive/create?account=a&name=Root"))
+                .status,
+            200
+        );
+        assert_eq!(
+            *f.creates.lock().unwrap().last().unwrap(),
+            ("".to_string(), "Root".to_string())
+        );
+        // missing name -> 400.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/create?account=a&parent=P"))
                 .status,
             400
         );
