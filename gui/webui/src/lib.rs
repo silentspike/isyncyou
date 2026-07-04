@@ -1505,6 +1505,14 @@ impl Router {
                         "__ONEDRIVE_MODE_CAP_TOKEN__",
                         self.onedrive_mode_cap_token.as_deref().unwrap_or(""),
                     )
+                    // #656 server-side half of the transfers cap bridge; app.js grows the
+                    // `__TRANSFER_CAP_TOKEN__` placeholder + `CAP.transfers` for the cancel
+                    // button on the live-transfer panel. A no-op until the transfers handler
+                    // is wired (`with_transfers`).
+                    .replace(
+                        "__TRANSFER_CAP_TOKEN__",
+                        self.transfer_cap_token.as_deref().unwrap_or(""),
+                    )
                     .replace(
                         "__MAILWRITE_CAP_TOKEN__",
                         self.mail_write_cap_token.as_deref().unwrap_or(""),
@@ -7007,6 +7015,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn app_js_has_account_cap_token_placeholder() {
         assert!(APP_JS.contains("__ACCOUNT_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_transfer_cap_token_placeholder() {
+        // app.js side of the #656 bridge: the raw placeholder is present.
+        assert!(APP_JS.contains("__TRANSFER_CAP_TOKEN__"));
+        // read-only router (no transfers handler wired): the placeholder is blanked.
+        let ro = Router::new(Config::default()).route(&ApiRequest::get("/app.js"));
+        let ro_body = String::from_utf8_lossy(&ro.body);
+        assert!(
+            !ro_body.contains("__TRANSFER_CAP_TOKEN__"),
+            "placeholder must be replaced"
+        );
+        assert!(
+            ro_body.contains("transfers: \"\""),
+            "no token when transfers are disabled"
+        );
+        // with a transfers handler wired, the real cap token is injected.
+        struct NoopTransfers;
+        impl TransferProgress for NoopTransfers {
+            fn transfers(&self) -> Vec<TransferState> {
+                vec![]
+            }
+            fn cancel(&self, _id: &str) -> bool {
+                false
+            }
+        }
+        let rw = Router::new(Config::default())
+            .with_transfers(std::sync::Arc::new(NoopTransfers), "xfer123".into())
+            .route(&ApiRequest::get("/app.js"));
+        let rw_body = String::from_utf8_lossy(&rw.body);
+        assert!(rw_body.contains("transfers: \"xfer123\""));
     }
 
     #[test]

@@ -316,6 +316,7 @@ const CAP = {
   push: "__PUSH_CAP_TOKEN__",
   agent: "__AGENT_CAP_TOKEN__",
   onedriveMode: "__ONEDRIVE_MODE_CAP_TOKEN__",
+  transfers: "__TRANSFER_CAP_TOKEN__",
 };
 
 /* ---------------------------------------------------------------- push registration (#576)
