@@ -23,6 +23,7 @@ mod contacts_live;
 mod mail_live;
 mod mail_restore;
 mod onedrive_live;
+mod onedrive_write;
 mod onenote_live;
 mod restore_calendar;
 mod restore_contacts;
@@ -40,6 +41,11 @@ pub use mail_restore::{
     restore_mail_via_ledger, MailApi, MailSink,
 };
 pub use onedrive_live::{onedrive_lister, OneDriveLister};
+pub use onedrive_write::{
+    create_folder_via_ledger, delete_via_ledger, move_via_ledger, recover_cloud_write_op,
+    recover_pending_cloud_writes, rename_via_ledger, run_cloud_write, CloudWrite,
+    OneDriveWriteSink,
+};
 pub use onenote_live::{page_writer, PageWriter};
 pub use restore_calendar::{
     pending_calendar_restore_count, recover_pending_calendar_restores,
