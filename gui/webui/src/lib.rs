@@ -630,6 +630,16 @@ pub trait OneDriveWriteHandler: Send + Sync {
     ) -> Result<(), String>;
     /// Delete an item.
     fn delete(&self, account: &str, id: &str) -> Result<(), String>;
+    /// Upload a new file `name` under `parent_id` (empty = the drive root) with `bytes`; returns its new id (#657).
+    fn upload(
+        &self,
+        account: &str,
+        parent_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<String, String>;
+    /// Replace an existing item's content (If-Match `etag`; a 412/conflict must never clobber) with `bytes` (#657).
+    fn replace(&self, account: &str, id: &str, etag: &str, bytes: &[u8]) -> Result<(), String>;
 }
 
 /// Live account-auth handler (#68): the daemon's device-code sign-in + sign-out.
@@ -1429,6 +1439,8 @@ impl Router {
                 "/api/v1/onedrive/move" => self.onedrive_move(req),
                 "/api/v1/onedrive/delete" => self.onedrive_delete(req),
                 "/api/v1/onedrive/mode" => self.onedrive_set_mode(req),
+                "/api/v1/onedrive/upload" => self.onedrive_upload(req),
+                "/api/v1/onedrive/replace" => self.onedrive_replace(req),
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
                 "/api/v1/account/signout" => self.account_signout(req),
@@ -1512,6 +1524,10 @@ impl Router {
                     .replace(
                         "__ONENOTEWRITE_CAP_TOKEN__",
                         self.onenote_write_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__ONEDRIVEWRITE_CAP_TOKEN__",
+                        self.onedrive_write_cap_token.as_deref().unwrap_or(""),
                     )
                     .replace(
                         "__ACCOUNT_CAP_TOKEN__",
@@ -2519,6 +2535,63 @@ impl Router {
             return r;
         }
         self.onedrive_result(account, &format!("delete id={id}"), h.delete(account, id))
+    }
+
+    /// #657: upload a new file into a folder. The picked bytes ride in the request body
+    /// (base64 over the mobile bridge, decoded in serve.rs). Cap-gated; biometric-gated on
+    /// mobile (large external write). An empty/absent parent = the drive root.
+    fn onedrive_upload(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onedrive_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, name) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("name").filter(|n| !n.is_empty()),
+        ) {
+            (Some(a), Some(n)) => (a, n),
+            _ => return ApiResponse::error(400, "account and name are required"),
+        };
+        let parent = req.q("parent").unwrap_or("");
+        if let Some(r) = self.biometric_challenge("upload", account, "onedrive", name, req) {
+            return r;
+        }
+        match h.upload(account, parent, name, &req.body) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:onedrive", "ok", "upload");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:onedrive", "error", &format!("upload: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// #657: replace an existing file's content (If-Match `etag` from the listing; a 412 conflict
+    /// must never clobber). The bytes ride in the request body. Cap-gated; biometric-gated on mobile.
+    fn onedrive_replace(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onedrive_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, etag) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("etag").filter(|e| !e.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(e)) => (a, i, e),
+            _ => return ApiResponse::error(400, "account, id and etag are required"),
+        };
+        if let Some(r) = self.biometric_challenge("replace", account, "onedrive", id, req) {
+            return r;
+        }
+        self.onedrive_result(
+            account,
+            &format!("replace id={id}"),
+            h.replace(account, id, etag, &req.body),
+        )
     }
 
     fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
@@ -6159,6 +6232,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         renames: std::sync::Mutex<Vec<(String, String)>>, // (id, name)
         moves: std::sync::Mutex<Vec<(String, Option<String>, String)>>, // (id, new_parent, name)
         deletes: std::sync::Mutex<Vec<String>>,
+        uploads: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>, // (parent, name, bytes)
+        replaces: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>, // (id, etag, bytes)
     }
     impl OneDriveWriteHandler for FakeOneDriveWrite {
         fn create_folder(&self, _a: &str, parent: &str, name: &str) -> Result<String, String> {
@@ -6188,6 +6263,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
         fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
             self.deletes.lock().unwrap().push(id.into());
+            Ok(())
+        }
+        fn upload(
+            &self,
+            _a: &str,
+            parent: &str,
+            name: &str,
+            bytes: &[u8],
+        ) -> Result<String, String> {
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((parent.into(), name.into(), bytes.to_vec()));
+            Ok("file-new".into())
+        }
+        fn replace(&self, _a: &str, id: &str, etag: &str, bytes: &[u8]) -> Result<(), String> {
+            self.replaces
+                .lock()
+                .unwrap()
+                .push((id.into(), etag.into(), bytes.to_vec()));
             Ok(())
         }
     }
@@ -6273,6 +6368,116 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             400
         );
+    }
+
+    // #657 (webui part): the upload/replace POST arms — cap-gate + verb dispatch with the bytes
+    // riding in the request body; missing params -> 400.
+    #[test]
+    fn onedrive_upload_replace_dispatch_and_gates() {
+        let post = |t: &str, body: &[u8]| {
+            ApiRequest::new("POST", t)
+                .with_cap_token(Some("cap".into()))
+                .with_body(body.to_vec())
+        };
+        // No handler wired -> 404.
+        let (_d0, r0) = setup();
+        assert_eq!(
+            r0.route(&post(
+                "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
+                b"DATA"
+            ))
+            .status,
+            404
+        );
+        // Handler wired but no cap token -> 401; handler not called.
+        let (_d1, r1) = setup();
+        let f = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let router = r1.with_onedrive_write(f.clone(), "cap".into());
+        let no_cap = ApiRequest::new(
+            "POST",
+            "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
+        )
+        .with_body(b"DATA".to_vec());
+        assert_eq!(router.route(&no_cap).status, 401);
+        assert!(f.uploads.lock().unwrap().is_empty());
+        // upload with cap + body -> 200 + new id; the bytes reach the handler intact.
+        let resp = router.route(&post(
+            "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
+            b"DATA",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_json(&resp)["id"], "file-new");
+        assert_eq!(
+            *f.uploads.lock().unwrap(),
+            vec![("P".into(), "f.txt".into(), b"DATA".to_vec())]
+        );
+        // an absent parent means the drive root (parent = "").
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/upload?account=a&name=r.txt", b"R"))
+                .status,
+            200
+        );
+        assert_eq!(f.uploads.lock().unwrap().last().unwrap().0, "".to_string());
+        // missing name -> 400.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/upload?account=a&parent=P", b"D"))
+                .status,
+            400
+        );
+        // replace with id + etag + body -> 200; bytes + etag reach the handler.
+        assert_eq!(
+            router
+                .route(&post(
+                    "/api/v1/onedrive/replace?account=a&id=i9&etag=E1",
+                    b"NEW"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            *f.replaces.lock().unwrap(),
+            vec![("i9".into(), "E1".into(), b"NEW".to_vec())]
+        );
+        // replace missing etag -> 400.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/replace?account=a&id=i9", b"N"))
+                .status,
+            400
+        );
+    }
+
+    // #657: on mobile, upload + replace both raise the biometric gate (in the confirm catalogue).
+    #[test]
+    fn onedrive_upload_replace_are_biometric_gated_on_mobile() {
+        let post = |t: &str, body: &[u8]| {
+            ApiRequest::new("POST", t)
+                .with_cap_token(Some("cap".into()))
+                .with_body(body.to_vec())
+        };
+        let (_d, r) = setup();
+        let f = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let mobile = r
+            .with_onedrive_write(f.clone(), "cap".into())
+            .with_biometric_gate();
+        // upload without a token -> challenged; handler NOT called.
+        let up = mobile.route(&post(
+            "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
+            b"D",
+        ));
+        assert_eq!(up.status, 200);
+        assert_eq!(body_json(&up)["status"], "confirmation_required");
+        assert!(f.uploads.lock().unwrap().is_empty());
+        // replace likewise raises the gate.
+        let rp = mobile.route(&post(
+            "/api/v1/onedrive/replace?account=a&id=i9&etag=E1",
+            b"D",
+        ));
+        assert_eq!(rp.status, 200);
+        assert_eq!(body_json(&rp)["status"], "confirmation_required");
+        assert!(f.replaces.lock().unwrap().is_empty());
     }
 
     // #654 (AC3): on mobile, `delete` raises the biometric gate; `create` does not.
@@ -6780,6 +6985,23 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn app_js_has_onenote_write_cap_token_placeholder() {
         assert!(APP_JS.contains("__ONENOTEWRITE_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_onedrive_write_cap_token_placeholder() {
+        assert!(APP_JS.contains("__ONEDRIVEWRITE_CAP_TOKEN__"));
+        // #657: a router wired with the OneDrive write handler injects the real token
+        // into the served /app.js, leaving no placeholder behind.
+        let f = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let resp = Router::new(Config::default())
+            .with_onedrive_write(f, "odw123".into())
+            .route(&ApiRequest::get("/app.js"));
+        let js = String::from_utf8_lossy(&resp.body);
+        assert!(js.contains("onedrivewrite: \"odw123\""));
+        assert!(
+            !js.contains("__ONEDRIVEWRITE_CAP_TOKEN__"),
+            "placeholder must be replaced"
+        );
     }
 
     #[test]
