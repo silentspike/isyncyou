@@ -3152,9 +3152,7 @@ impl Router {
     fn onedrive_set_mode(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match &self.onedrive_mode {
             Some(h) => h,
-            None => {
-                return ApiResponse::error(404, "OneDrive mode is not editable on this server")
-            }
+            None => return ApiResponse::error(404, "OneDrive mode is not editable on this server"),
         };
         if !Self::cap_ok(&self.onedrive_mode_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
@@ -5678,8 +5676,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // No mode handler wired -> POST 404 (read-only serve); GET still 200 (static config).
         let (_d0, r0) = setup();
         assert_eq!(
-            r0.route(&post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=sync"))
-                .status,
+            r0.route(&post(
+                "/api/v1/onedrive/mode?account=a&folder=Photos&mode=sync"
+            ))
+            .status,
             404
         );
         assert_eq!(
@@ -5689,8 +5689,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
 
         let (_d, r1) = setup();
-        let router =
-            r1.with_onedrive_mode(std::sync::Arc::new(FakeOneDriveMode::default()), "modecap".into());
+        let router = r1.with_onedrive_mode(
+            std::sync::Arc::new(FakeOneDriveMode::default()),
+            "modecap".into(),
+        );
         // POST without a cap token -> 401.
         assert_eq!(
             router
@@ -5704,7 +5706,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // Invalid mode -> 400.
         assert_eq!(
             router
-                .route(&post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=bogus"))
+                .route(&post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=bogus"
+                ))
                 .status,
             400
         );
@@ -5718,7 +5722,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // Set Photos=sync -> 200; GET reflects it.
         assert_eq!(
             router
-                .route(&post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=sync"))
+                .route(&post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=sync"
+                ))
                 .status,
             200
         );
@@ -5735,8 +5741,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             200
         );
-        let cleared =
-            body_json(&router.route(&ApiRequest::get("/api/v1/onedrive/mode?account=a")));
+        let cleared = body_json(&router.route(&ApiRequest::get("/api/v1/onedrive/mode?account=a")));
         assert!(cleared.pointer("/folder_modes/Photos").is_none());
     }
 
@@ -5752,7 +5757,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ] {
             let parsed: OneDriveMode =
                 serde_json::from_str(&format!("\"{s}\"")).expect("valid mode parses");
-            assert_eq!(parsed, want, "\"{s}\" must deserialize to the matching variant");
+            assert_eq!(
+                parsed, want,
+                "\"{s}\" must deserialize to the matching variant"
+            );
             // as_str -> from_str round-trips to the same variant, and as_str == the token.
             let back: OneDriveMode =
                 serde_json::from_str(&format!("\"{}\"", want.as_str())).unwrap();
@@ -5771,7 +5779,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let mode = std::sync::Arc::new(FakeOneDriveMode::default());
         mode.set_folder("a", "Photos", Some(OneDriveMode::Offline))
             .unwrap();
-        mode.set_folder("a", "sub", Some(OneDriveMode::Sync)).unwrap();
+        mode.set_folder("a", "sub", Some(OneDriveMode::Sync))
+            .unwrap();
         let (_d, r) = setup();
         let router = r
             .with_onedrive_list(std::sync::Arc::new(ModeFakeList))
@@ -5787,12 +5796,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         // file inherits Photos=Offline through the ancestry
         assert_eq!(
-            v.pointer("/children/0/effective_mode").and_then(Value::as_str),
+            v.pointer("/children/0/effective_mode")
+                .and_then(Value::as_str),
             Some("offline")
         );
         // subfolder's own override wins
         assert_eq!(
-            v.pointer("/children/1/effective_mode").and_then(Value::as_str),
+            v.pointer("/children/1/effective_mode")
+                .and_then(Value::as_str),
             Some("sync")
         );
 
@@ -5802,11 +5813,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/onedrive/children?account=a&folder=2024",
         )));
         assert_eq!(
-            v2.pointer("/children/0/effective_mode").and_then(Value::as_str),
+            v2.pointer("/children/0/effective_mode")
+                .and_then(Value::as_str),
             Some("online")
         );
         assert_eq!(
-            v2.pointer("/children/1/effective_mode").and_then(Value::as_str),
+            v2.pointer("/children/1/effective_mode")
+                .and_then(Value::as_str),
             Some("sync")
         );
     }
@@ -5816,14 +5829,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn onedrive_mode_post_is_audited() {
         let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
         let (_d, r) = setup();
-        let store_path = r.config.accounts[0]
-            .archive_root
-            .join(".isyncyou-store.db");
-        let router =
-            r.with_onedrive_mode(std::sync::Arc::new(FakeOneDriveMode::default()), "modecap".into());
+        let store_path = r.config.accounts[0].archive_root.join(".isyncyou-store.db");
+        let router = r.with_onedrive_mode(
+            std::sync::Arc::new(FakeOneDriveMode::default()),
+            "modecap".into(),
+        );
         assert_eq!(
             router
-                .route(&post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline"))
+                .route(&post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline"
+                ))
                 .status,
             200
         );
