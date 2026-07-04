@@ -259,6 +259,9 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
             events.clone(),
             config_path,
             live_interval.clone(),
+            // Wired to the offline pass in the refresh loop (S-OM.9): the same SharedProgress
+            // the materialize step writes is read by GET /onedrive/transfers.
+            isyncyou_app_host::SharedProgress::new(),
         )
         .with_session_token(session_token.clone())
         // #onedrive-mobile 0.6: only the standalone Android app arms the biometric gate.

@@ -44,9 +44,10 @@ pub use mail_restore::{
 };
 pub use onedrive_live::{onedrive_lister, OneDriveLister};
 pub use onedrive_write::{
-    create_folder_via_ledger, delete_via_ledger, move_via_ledger, recover_cloud_write_op,
-    recover_pending_cloud_writes, rename_via_ledger, replace_via_ledger, run_cloud_write,
-    upload_via_ledger, CloudWrite, OneDriveWriteSink, ReplaceOutcome, WriteOutcome,
+    create_folder_via_ledger, delete_via_ledger, move_via_ledger, pending_cloud_write_count,
+    recover_cloud_write_op, recover_pending_cloud_writes, recover_pending_cloud_writes_for,
+    rename_via_ledger, replace_via_ledger, run_cloud_write, upload_via_ledger, CloudWrite,
+    OneDriveWriteSink, ReplaceOutcome, WriteOutcome,
 };
 pub use onenote_live::{page_writer, PageWriter};
 pub use restore_calendar::{

@@ -476,6 +476,36 @@ pub fn recover_pending_cloud_writes<S: OneDriveWriteSink>(
     Ok(pending.len())
 }
 
+/// Number of not-yet-terminal cloud-writes for an account — a cheap boot-time probe so the
+/// daemon only resolves a token + reconciles when there is actually pending work. `0` when the
+/// account's store does not exist yet.
+pub fn pending_cloud_write_count(cfg: &Config, account: &str) -> Result<usize, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+    let db = acc.archive_root.join(".isyncyou-store.db");
+    if !db.exists() {
+        return Ok(0);
+    }
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    Ok(store
+        .pending_cloud_writes(account)
+        .map_err(|e| e.to_string())?
+        .len())
+}
+
+/// Boot-recovery entry for the daemon/CLI: resolve the account's store + write client, then
+/// reconcile every pending cloud-write (the #654 metadata ops a desktop WebUI may leave
+/// mid-flight; the mobile offline pass runs its own recovery inline). Returns the count
+/// reconciled.
+pub fn recover_pending_cloud_writes_for(cfg: &Config, account: &str) -> Result<usize, String> {
+    with_ledger(cfg, account, |store, sink, _secret| {
+        recover_pending_cloud_writes(store, account, sink, now_secs())
+    })
+}
+
 // ---- public per-verb entries (the daemon/mobile handler calls these) ----------------------
 
 /// Resolve the account's store + write token + a live Graph sink, then run one cloud-write
