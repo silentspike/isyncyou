@@ -2152,6 +2152,51 @@ function syncBadge(it) {
   const kind = it.sync_state === "deleted" ? "err" : "warn";
   return el("span", { class: "pill " + kind + " sync-badge", title: "Sync state: " + it.sync_state }, el("span", { class: "dot" }));
 }
+// #652: per-folder mode pill + picker sheet. The pill shows a folder's effective OneDrive mode
+// (solid border+fill = explicit own override, dimmed = inherited); tap opens a sheet to set or
+// clear it. Online = live/nothing stored, Sync = metadata cached, Offline = fully downloaded.
+const MODE_LABEL = { online: "Online", sync: "Sync", offline: "Offline" };
+const MODE_ICON = { online: "cloud", sync: "refresh-cw", offline: "hard-drive" };
+const MODE_COLOR = { online: "var(--dim,#94a3b8)", sync: "var(--svc-onedrive,#0a84ff)", offline: "var(--ok,#34d399)" };
+function driveModePill(folderId, effMode, explicit, name) {
+  const m = effMode || "online", c = MODE_COLOR[m];
+  return el("button", {
+    class: "mode-pill" + (explicit ? " explicit" : " inherited"),
+    type: "button",
+    title: (explicit ? "Mode: " : "Inherited: ") + MODE_LABEL[m] + " — tap to change",
+    style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;"
+      + "font-size:11px;font-weight:600;line-height:1.4;white-space:nowrap;cursor:pointer;"
+      + `border:1px solid ${c};color:${c};background:${explicit ? c + "22" : "transparent"};`
+      + (explicit ? "" : "opacity:0.72;"),
+    onclick: (e) => { e.stopPropagation(); openModeSheet(folderId, name, effMode, explicit); },
+  }, icon(MODE_ICON[m], "icon-sm"), el("span", { text: MODE_LABEL[m] + (explicit ? "" : " · inherited") }));
+}
+function openModeSheet(folderId, name, effMode, explicit) {
+  const choose = (mode, label, desc) => el("button", { class: "pick-row pick-btn", type: "button",
+    onclick: () => { closeSheet(); setFolderMode(folderId, mode); } },
+    icon(MODE_ICON[mode], "icon-sm"),
+    el("div", { class: "grow" },
+      el("div", { style: "font-weight:600", text: label }),
+      el("div", { class: "dim", style: "font-size:12px", text: desc })),
+    effMode === mode ? icon("check", "icon-sm") : null);
+  const content = el("div", { class: "compose" }, el("div", { class: "pick-list" },
+    choose("online", "Online", "Live — nothing stored on the device"),
+    choose("sync", "Sync", "Metadata cached, files downloaded on demand"),
+    choose("offline", "Offline", "Fully downloaded — works offline")));
+  if (explicit) content.append(el("button", { class: "btn ghost sm", type: "button", style: "margin-top:10px",
+    onclick: () => { closeSheet(); setFolderMode(folderId, null); } },
+    icon("rotate-ccw", "icon-sm"), "Reset to inherited"));
+  openSheet(name ? "Mode — " + name : "Folder mode", content);
+}
+// POST the folder mode (omit `mode` to clear → inherited); re-load so pills + the partial
+// indicator reflect the fresh server state (Drive.modes SSOT). Mirrors doShare's template.
+async function setFolderMode(folderId, mode) {
+  try {
+    await post("/api/v1/onedrive/mode?" + qs({ account: App.account, folder: folderId, ...(mode ? { mode } : {}) }), CAP.onedriveMode);
+    toast(mode ? "Folder set to " + MODE_LABEL[mode] : "Folder reset to inherited");
+    await driveLoad();
+  } catch (e) { toast("Could not change mode: " + e.message, "err"); }
+}
 function driveActions(it) {
   if (it.item_type === "folder") return null;
   const q = { account: App.account, service: "onedrive", id: it.remote_id };
@@ -2269,7 +2314,9 @@ function driveTile(it) {
     (!folder && pv.malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
     (!folder && pv.shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
     folder ? null : coverageBadge(it),
-    syncBadge(it), driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
+    syncBadge(it),
+    (folder && CAP.onedriveMode) ? driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name) : null,
+    driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
   return tile;
 }
 function driveRow(it) {
@@ -2290,6 +2337,7 @@ function driveRow(it) {
   if (!folder) acts.append(el("button", { class: "btn ghost sm", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
   if (!folder && it.has_body) acts.append(el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
+  if (folder && CAP.onedriveMode) acts.append(driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name));
   row.append(acts);
   return row;
 }
