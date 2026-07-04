@@ -21,6 +21,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   a pure `owning_scope` rule (deepest active scope wins, one owner per item, id-stable moves),
   and `incremental_sync_scoped` with per-page `@odata.nextLink` cursor resume (crash-safe) and a
   subtree-aware tombstone rule that does not leak nested deletes (#653).
+- `webui`+`app-host`: session-gated `GET /api/v1/onedrive/children?account&folder` — an
+  `OneDriveListHandler` (Router builder + Fake) returning a folder's live children as JSON,
+  wired via `DaemonOneDriveList` into the shared desktop+mobile router; absent handler → 404 (#648).
 
 ## [1.0.0] — 2026-06-26
 
