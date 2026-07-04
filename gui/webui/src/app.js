@@ -2003,6 +2003,7 @@ async function renderOnedriveView(view) {
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
         el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
+    el("div", { id: "drive-modebar", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 2px 8px" }),
     el("div", { id: "drive-body" }),
   );
   driveLoadMetrics();
@@ -2011,6 +2012,26 @@ async function renderOnedriveView(view) {
 // account-wide OneDrive KPIs (flat item list, independent of the current folder)
 async function driveLoadMetrics() {
   try {
+    if (MOBILE) {
+      // #652: online browse keeps no store, so file/archived counts are meaningless here. Show a
+      // single storage line — used bytes, plus the total when the drive reports one (personal
+      // OneDrive), else "unlimited". Always visible when a quota resolves; quiet if it doesn't.
+      const drv = await api("/api/v1/drive?" + qs({ account: App.account })).catch(() => null);
+      Drive.quota = (drv && drv.quota) || null;
+      const q = Drive.quota;
+      let card;
+      if (q && typeof q.used === "number") {
+        const hasTotal = typeof q.total === "number" && q.total > 0;
+        const usedPct = hasTotal ? Math.round((q.used || 0) / q.total * 100) : 0;
+        card = { icon: "hard-drive", value: fmtSize(q.used || 0), label: "Storage used",
+          sub: hasTotal ? `${usedPct}% of ${fmtSize(q.total)} · ${fmtSize(q.remaining || 0)} free` : "unlimited",
+          tone: hasTotal && usedPct >= 90 ? "warn" : "" };
+      } else {
+        card = { icon: "hard-drive", value: "—", label: "Storage", sub: "unavailable" };
+      }
+      fillMetrics($("#drive-metrics-row"), [card]);
+      return;
+    }
     const [d, act, drv] = await Promise.all([
       api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", limit: 2000 })),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
@@ -2082,7 +2103,35 @@ async function driveLoad() {
       Drive.items = d.items || [];
     }
     driveRender();
+    renderDriveModeBar();
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load folder" }), el("p", { text: e.message }))); }
+}
+// #652: the current-folder mode control + a "partial" indicator. The current folder is not in its
+// own child list, so its effective mode is resolved from Drive.modes (SSOT) + the breadcrumb.
+// "Partial" = at least one listed subfolder resolves to a different mode than this folder → the
+// folder's contents are not uniformly one mode (some sync/offline below). Mobile-only.
+function renderDriveModeBar() {
+  const bar = $("#drive-modebar"); if (!bar) return; clear(bar);
+  if (!MOBILE || !CAP.onedriveMode) return;
+  const cur = Drive.stack[Drive.stack.length - 1] || { id: "root", name: "OneDrive" };
+  const isRoot = cur.id === "root";
+  const curMode = isRoot ? (Drive.modes.default_mode || "online") : driveEffMode(cur.id, driveAncestryIds());
+  bar.append(el("span", { class: "dim", style: "font-size:12px", text: "This folder:" }));
+  if (isRoot) {
+    // the drive root has no per-folder id to POST — show the account default, read-only.
+    const c = MODE_COLOR[curMode];
+    bar.append(el("span", { title: "Account default mode",
+      style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;"
+        + `font-weight:600;border:1px solid ${c};color:${c};opacity:0.72` },
+      icon(MODE_ICON[curMode], "icon-sm"), el("span", { text: MODE_LABEL[curMode] + " · default" })));
+  } else {
+    bar.append(driveModePill(cur.id, curMode, driveExplicit(cur.id), cur.name));
+  }
+  const partial = Drive.items.some(it => it.item_type === "folder" && it.effective_mode && it.effective_mode !== curMode);
+  if (partial) bar.append(el("span", { title: "Some subfolders have a different mode",
+    style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;"
+      + "border:1px solid var(--warn,#f59e0b);color:var(--warn,#f59e0b);background:#f59e0b1a" },
+    icon("info", "icon-sm"), el("span", { text: "Partial — mixed modes below" })));
 }
 // #649 Mode-1 online: normalize a live Graph child (from /api/v1/onedrive/children) onto the
 // store-item shape driveRender/driveTile/driveRow expect. No local body/preview in online mode.
@@ -2315,7 +2364,7 @@ function driveTile(it) {
     (!folder && pv.shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
     folder ? null : coverageBadge(it),
     syncBadge(it),
-    (folder && CAP.onedriveMode) ? driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name) : null,
+    (folder && MOBILE && CAP.onedriveMode) ? driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name) : null,
     driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
   return tile;
 }
@@ -2337,7 +2386,7 @@ function driveRow(it) {
   if (!folder) acts.append(el("button", { class: "btn ghost sm", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
   if (!folder && it.has_body) acts.append(el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
-  if (folder && CAP.onedriveMode) acts.append(driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name));
+  if (folder && MOBILE && CAP.onedriveMode) acts.append(driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name));
   row.append(acts);
   return row;
 }
