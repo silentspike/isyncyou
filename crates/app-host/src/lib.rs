@@ -1661,6 +1661,40 @@ impl isyncyou_webui::OneDriveListHandler for DaemonOneDriveList {
     }
 }
 
+/// Live OneDrive cloud-write handler (#654): create / rename / move / delete over the
+/// crash-safe operation ledger. Delegates to the engine ledger drivers (each opens the
+/// account store, resolves the write token, and records the idempotent intent BEFORE the
+/// Graph call, so a crash mid-op is recovered without a double effect). On mobile `delete`
+/// is additionally biometric-gated by the router; the cap token is the CSRF gate.
+pub struct DaemonOneDriveWrite {
+    cfg: Config,
+}
+impl DaemonOneDriveWrite {
+    pub fn new(cfg: Config) -> Self {
+        Self { cfg }
+    }
+}
+impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
+    fn create_folder(&self, account: &str, parent_id: &str, name: &str) -> Result<String, String> {
+        isyncyou_engine::create_folder_via_ledger(&self.cfg, account, parent_id, name)
+    }
+    fn rename(&self, account: &str, id: &str, new_name: &str) -> Result<(), String> {
+        isyncyou_engine::rename_via_ledger(&self.cfg, account, id, new_name)
+    }
+    fn move_item(
+        &self,
+        account: &str,
+        id: &str,
+        new_parent_id: Option<&str>,
+        new_name: &str,
+    ) -> Result<(), String> {
+        isyncyou_engine::move_via_ledger(&self.cfg, account, id, new_parent_id, new_name)
+    }
+    fn delete(&self, account: &str, id: &str) -> Result<(), String> {
+        isyncyou_engine::delete_via_ledger(&self.cfg, account, id)
+    }
+}
+
 impl DaemonRestore {
     /// Construct the restore handler (daemon-only; the mobile profile never wires it).
     pub fn new(cfg: Config) -> Self {
@@ -1746,6 +1780,13 @@ pub fn build_live_router(
         // restore-cloud stays daemon-only (excluded on mobile).
         .with_share(
             Arc::new(DaemonShare::new(cfg.clone())) as Arc<dyn isyncyou_webui::ShareHandler>,
+            mint_cap_token(),
+        )
+        // #654: OneDrive cloud-write (create/rename/move/delete) over the operation ledger,
+        // wired here so both desktop and mobile get it; on mobile `delete` is biometric-gated.
+        .with_onedrive_write(
+            Arc::new(DaemonOneDriveWrite::new(cfg.clone()))
+                as Arc<dyn isyncyou_webui::OneDriveWriteHandler>,
             mint_cap_token(),
         )
         .with_events(events)
