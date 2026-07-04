@@ -52,5 +52,20 @@
             android:name=".OAuthGuardService"
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
+
+        <!-- Storage Access Framework: expose OneDrive in the system Documents UI (S-OM.12, #658).
+             android:permission="MANAGE_DOCUMENTS" is required OF the caller — a signature|privileged
+             permission only the system DocumentsUI holds — so only the system can bind this provider.
+             It is deliberately NOT a <uses-permission> (a normal app cannot hold it). -->
+        <provider
+            android:name=".OneDriveDocumentsProvider"
+            android:authorities="${applicationId}.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER"/>
+            </intent-filter>
+        </provider>
     </application>
 </manifest>
