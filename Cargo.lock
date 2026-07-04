@@ -1768,6 +1768,7 @@ name = "isyncyou-webui"
 version = "1.0.0"
 dependencies = [
  "ammonia",
+ "base64",
  "isyncyou-connectors",
  "isyncyou-core",
  "isyncyou-store",

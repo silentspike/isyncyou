@@ -57,6 +57,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   actually runs; a materialized body's size is compared by its envelope plaintext length (not the sealed
   on-disk size) so files are not spuriously re-uploaded; and the store-backed OneDrive body path resolves
   a nested materialized file via its parent chain (#655).
+- `graph`+`webui`+`app.js`: in-app OneDrive upload/replace + the full write UI (#657). `list_children`
+  now selects `eTag` (the If-Match token for in-place replace); `serve.rs` decodes a base64 request body
+  on `X-Body-Encoding: base64` (uniform across the desktop HTTP path and the text-only mobile bridge)
+  with a size cap → 413. New biometric-gated `POST /api/v1/onedrive/{upload,replace}` arms
+  (`OneDriveWriteHandler::upload/replace`, cap-gated, its cap token injected into `/app.js`), and the
+  app.js write surface — an **Upload** toolbar button, per-file **Replace**, and **Rename/Move/Delete**.
+  All five route through the crash-safe cloud-write ledger: rename/move/delete via #654's, and
+  upload/replace via #655's `upload_via_ledger`/`replace_via_ledger` — a WebUI upload's request-body
+  bytes are materialized to a temp file the ledger reads, so an in-app write gets the same intent-first
+  crash safety as the offline writeback, and a replace is etag-guarded (a 412 is a keep-both conflict,
+  never a blind clobber). Also fixes `graph::upload_to_parent` for the drive-root case (an empty parent
+  id, which the online-root upload path is the first to exercise): it now targets `/me/drive/root:/…:/
+  content` instead of the malformed `/me/drive/items/:/…` that Graph 400s.
 
 ## [1.0.0] — 2026-06-26
 
