@@ -583,6 +583,29 @@ pub trait OneNoteWriteHandler: Send + Sync {
     fn append(&self, account: &str, page_id: &str, text: &str) -> Result<(), String>;
 }
 
+/// Performs the live-OneDrive **cloud-write** verbs on behalf of a cap-token POST (#654):
+/// create a folder, rename, move, or delete a drive item. Injected by the daemon / mobile
+/// engine (which owns the operation ledger + the write token); the read-only CLI `serve`
+/// does not set it, so every `/api/v1/onedrive/{create,rename,move,delete}` POST is refused
+/// there. Each verb is ledger-backed and crash-recoverable in the engine; `delete` is
+/// additionally biometric-gated on mobile.
+pub trait OneDriveWriteHandler: Send + Sync {
+    /// Create a child folder under `parent_id` (empty = the drive root); returns its new id.
+    fn create_folder(&self, account: &str, parent_id: &str, name: &str) -> Result<String, String>;
+    /// Rename an item in place.
+    fn rename(&self, account: &str, id: &str, new_name: &str) -> Result<(), String>;
+    /// Move an item to `new_parent_id` (`Some("")` = the drive root), optionally renaming it.
+    fn move_item(
+        &self,
+        account: &str,
+        id: &str,
+        new_parent_id: Option<&str>,
+        new_name: &str,
+    ) -> Result<(), String>;
+    /// Delete an item.
+    fn delete(&self, account: &str, id: &str) -> Result<(), String>;
+}
+
 /// Live account-auth handler (#68): the daemon's device-code sign-in + sign-out.
 /// `None` => the account menu offers only switching (the read-only CLI `serve`).
 pub trait AccountAuthHandler: Send + Sync {
@@ -718,6 +741,11 @@ pub struct Router {
     onenote_write: Option<std::sync::Arc<dyn OneNoteWriteHandler>>,
     /// Separate capability token for OneNote-write POSTs.
     onenote_write_cap_token: Option<String>,
+    /// Optional live-OneDrive cloud-write handler (create/rename/move/delete). `None` =>
+    /// every `/api/v1/onedrive/{create,rename,move,delete}` POST is refused (#654).
+    onedrive_write: Option<std::sync::Arc<dyn OneDriveWriteHandler>>,
+    /// Separate capability token for OneDrive cloud-write POSTs.
+    onedrive_write_cap_token: Option<String>,
     /// Optional account-auth handler (#68): device-code sign-in + sign-out. `None`
     /// => the account menu only switches between already-configured accounts.
     account_auth: Option<std::sync::Arc<dyn AccountAuthHandler>>,
@@ -797,6 +825,8 @@ impl Router {
             task_write_cap_token: None,
             onenote_write: None,
             onenote_write_cap_token: None,
+            onedrive_write: None,
+            onedrive_write_cap_token: None,
             account_auth: None,
             account_cap_token: None,
             push: None,
@@ -841,6 +871,8 @@ impl Router {
             task_write_cap_token: None,
             onenote_write: None,
             onenote_write_cap_token: None,
+            onedrive_write: None,
+            onedrive_write_cap_token: None,
             account_auth: None,
             account_cap_token: None,
             push: None,
@@ -1091,6 +1123,17 @@ impl Router {
         self
     }
 
+    /// Enable the live-OneDrive cloud-write POSTs (builder style, #654).
+    pub fn with_onedrive_write(
+        mut self,
+        handler: std::sync::Arc<dyn OneDriveWriteHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.onedrive_write = Some(handler);
+        self.onedrive_write_cap_token = Some(cap_token);
+        self
+    }
+
     /// Wire the account-auth handler (device-code sign-in + sign-out, #68).
     pub fn with_account_auth(
         mut self,
@@ -1322,6 +1365,10 @@ impl Router {
                 "/api/v1/onenote/delete" => self.onenote_delete(req),
                 "/api/v1/onenote/append" => self.onenote_append(req),
                 "/api/v1/onedrive/transfers/cancel" => self.transfers_cancel(req),
+                "/api/v1/onedrive/create" => self.onedrive_create(req),
+                "/api/v1/onedrive/rename" => self.onedrive_rename(req),
+                "/api/v1/onedrive/move" => self.onedrive_move(req),
+                "/api/v1/onedrive/delete" => self.onedrive_delete(req),
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
                 "/api/v1/account/signout" => self.account_signout(req),
@@ -2280,6 +2327,129 @@ impl Router {
             &format!("append id={id}"),
             h.append(account, id, text),
         )
+    }
+
+    /// Gate a OneDrive cloud-write POST: handler present + valid capability token (#654).
+    fn onedrive_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn OneDriveWriteHandler>, ApiResponse> {
+        let h = self.onedrive_write.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "onedrive write is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.onedrive_write_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// Audit + map a unit OneDrive cloud-write result.
+    fn onedrive_result(&self, account: &str, what: &str, r: Result<(), String>) -> ApiResponse {
+        match r {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:onedrive", "ok", what);
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:onedrive", "error", &format!("{what}: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn onedrive_create(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onedrive_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, name) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("name").filter(|n| !n.is_empty()),
+        ) {
+            (Some(a), Some(n)) => (a, n),
+            _ => return ApiResponse::error(400, "account and name are required"),
+        };
+        // An empty/absent parent means the drive root (Graph `create_folder` addresses it).
+        let parent = req.q("parent").unwrap_or("");
+        match h.create_folder(account, parent, name) {
+            Ok(id) => {
+                let _ = self.audit_account(account, "audit:onedrive", "ok", "create");
+                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
+            }
+            Err(e) => {
+                let _ =
+                    self.audit_account(account, "audit:onedrive", "error", &format!("create: {e}"));
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    fn onedrive_rename(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onedrive_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, name) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("name").filter(|n| !n.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(n)) => (a, i, n),
+            _ => return ApiResponse::error(400, "account, id and name are required"),
+        };
+        self.onedrive_result(
+            account,
+            &format!("rename id={id}"),
+            h.rename(account, id, name),
+        )
+    }
+
+    fn onedrive_move(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onedrive_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, name) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("name").filter(|n| !n.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(n)) => (a, i, n),
+            _ => return ApiResponse::error(400, "account, id and name are required"),
+        };
+        // Destination parent ("" = the drive root). Absent => not a move.
+        let new_parent = match req.q("parent") {
+            Some(p) => p,
+            None => return ApiResponse::error(400, "parent (destination) is required"),
+        };
+        self.onedrive_result(
+            account,
+            &format!("move id={id}"),
+            h.move_item(account, id, Some(new_parent), name),
+        )
+    }
+
+    fn onedrive_delete(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.onedrive_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        // #654: delete is destructive -> a biometric per-action token on mobile (no-op desktop).
+        if let Some(r) = self.biometric_challenge("delete", account, "onedrive", id, req) {
+            return r;
+        }
+        self.onedrive_result(account, &format!("delete id={id}"), h.delete(account, id))
     }
 
     fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
@@ -5450,6 +5620,175 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn respond(&self, _a: &str, _id: &str, _r: &str, _c: &str) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct FakeOneDriveWrite {
+        creates: std::sync::Mutex<Vec<(String, String)>>, // (parent, name)
+        renames: std::sync::Mutex<Vec<(String, String)>>, // (id, name)
+        moves: std::sync::Mutex<Vec<(String, Option<String>, String)>>, // (id, new_parent, name)
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+    impl OneDriveWriteHandler for FakeOneDriveWrite {
+        fn create_folder(&self, _a: &str, parent: &str, name: &str) -> Result<String, String> {
+            self.creates
+                .lock()
+                .unwrap()
+                .push((parent.into(), name.into()));
+            Ok("folder-new".into())
+        }
+        fn rename(&self, _a: &str, id: &str, name: &str) -> Result<(), String> {
+            self.renames.lock().unwrap().push((id.into(), name.into()));
+            Ok(())
+        }
+        fn move_item(
+            &self,
+            _a: &str,
+            id: &str,
+            new_parent: Option<&str>,
+            name: &str,
+        ) -> Result<(), String> {
+            self.moves.lock().unwrap().push((
+                id.into(),
+                new_parent.map(str::to_string),
+                name.into(),
+            ));
+            Ok(())
+        }
+        fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
+            self.deletes.lock().unwrap().push(id.into());
+            Ok(())
+        }
+    }
+
+    // #654 (AC1, webui part): the OneDrive cloud-write POST arms — cap-gate + verb dispatch.
+    #[test]
+    fn onedrive_write_cap_gate_and_dispatch() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        // No handler wired -> 404.
+        let (_d0, r0) = setup();
+        assert_eq!(
+            r0.route(&post(
+                "/api/v1/onedrive/create?account=a&parent=P&name=Docs"
+            ))
+            .status,
+            404
+        );
+        // Handler wired but no cap token -> 401; handler not called.
+        let (_d1, r1) = setup();
+        let f = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let router = r1.with_onedrive_write(f.clone(), "cap".into());
+        let no_cap = ApiRequest::new(
+            "POST",
+            "/api/v1/onedrive/create?account=a&parent=P&name=Docs",
+        );
+        assert_eq!(router.route(&no_cap).status, 401);
+        assert!(f.creates.lock().unwrap().is_empty());
+        // create with cap -> 200 + new id; handler called with (parent, name).
+        let resp = router.route(&post(
+            "/api/v1/onedrive/create?account=a&parent=P&name=Docs",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_json(&resp)["id"], "folder-new");
+        assert_eq!(
+            *f.creates.lock().unwrap(),
+            vec![("P".into(), "Docs".into())]
+        );
+        // rename / move / delete dispatch to the right verb with the right args.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/rename?account=a&id=i1&name=New"))
+                .status,
+            200
+        );
+        assert_eq!(
+            *f.renames.lock().unwrap(),
+            vec![("i1".into(), "New".into())]
+        );
+        assert_eq!(
+            router
+                .route(&post(
+                    "/api/v1/onedrive/move?account=a&id=i2&parent=P2&name=N"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            *f.moves.lock().unwrap(),
+            vec![("i2".into(), Some("P2".into()), "N".into())]
+        );
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/delete?account=a&id=i3"))
+                .status,
+            200
+        );
+        assert_eq!(*f.deletes.lock().unwrap(), vec!["i3".to_string()]);
+        // an absent parent means the drive root -> still a valid create (parent = "").
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/create?account=a&name=Root"))
+                .status,
+            200
+        );
+        assert_eq!(
+            *f.creates.lock().unwrap().last().unwrap(),
+            ("".to_string(), "Root".to_string())
+        );
+        // missing name -> 400.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/create?account=a&parent=P"))
+                .status,
+            400
+        );
+    }
+
+    // #654 (AC3): on mobile, `delete` raises the biometric gate; `create` does not.
+    #[test]
+    fn onedrive_delete_is_biometric_gated_on_mobile() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let (_d, r) = setup();
+        let f = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let mobile = r
+            .with_onedrive_write(f.clone(), "cap".into())
+            .with_biometric_gate();
+        // delete without a token -> challenged; handler NOT called.
+        let ch = mobile.route(&post("/api/v1/onedrive/delete?account=a&id=i1"));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(f.deletes.lock().unwrap().is_empty());
+        // re-issue with the token but no biometric yet -> 403.
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/onedrive/delete?account=a&id=i1&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert!(f.deletes.lock().unwrap().is_empty());
+        // native biometric confirms -> re-issue proceeds once.
+        assert!(mobile.confirm_biometric(&pat));
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/onedrive/delete?account=a&id=i1&_pat={pat}"
+                )))
+                .status,
+            200
+        );
+        assert_eq!(*f.deletes.lock().unwrap(), vec!["i1".to_string()]);
+        // create is NOT in the gate catalogue -> straight through on mobile.
+        assert_eq!(
+            mobile
+                .route(&post("/api/v1/onedrive/create?account=a&parent=P&name=D"))
+                .status,
+            200
+        );
+        assert_eq!(f.creates.lock().unwrap().len(), 1);
     }
 
     // #onedrive-mobile 0.6: the mobile biometric gate wired through a real route.
