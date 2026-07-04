@@ -259,17 +259,27 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     std::fs::create_dir_all(&cache_root).map_err(|e| e.to_string())?;
     let config_path = base.join("isyncyou.toml");
 
-    let mut cfg = Config {
-        accounts: vec![AccountConfig {
+    // Load the persisted config so user settings — notably the per-folder `onedrive_modes` the
+    // Mode-3 offline pass (#655) acts on — survive restarts; fall back to a fresh default on
+    // first run or a parse error. The account's storage roots (and the companion poll interval)
+    // are ALWAYS re-derived from `files_dir` below, so a persisted config can never point the
+    // engine at a stale device path.
+    let mut cfg = Config::load(&config_path).unwrap_or_default();
+    if let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == ACCOUNT) {
+        acc.sync_root = sync_root;
+        acc.archive_root = archive_root;
+        acc.cache_root = cache_root;
+        acc.mount_point = None;
+    } else {
+        cfg.accounts.push(AccountConfig {
             id: ACCOUNT.into(),
             username: ACCOUNT.into(),
             sync_root,
             archive_root,
             cache_root,
             mount_point: None,
-        }],
-        ..Default::default()
-    };
+        });
+    }
     // A phone is a cache/live companion, not the desktop's 5 s near-real-time loop:
     // poll every 30 s to spare battery/mobile-data and cut the periodic view refresh
     // frequency (the live-refresh is otherwise driven every poll a change lands).
