@@ -83,6 +83,31 @@ struct RequestHeaders {
     cookie: Option<String>,
     host: Option<String>,
     origin: Option<String>,
+    body_encoding: Option<String>,
+}
+
+/// Decode a request body per the `X-Body-Encoding` header (#657 in-app upload/replace):
+/// `base64` → the raw bytes, bounded by `max`; any other/absent value passes the bytes
+/// through. Uploads ride base64 over the JSON bridge (which can't carry raw bytes) and,
+/// uniformly, over HTTP. Returns `(status, message)` on a 400 (bad base64) / 413 (oversize).
+fn decode_body(
+    encoding: Option<&str>,
+    raw: Vec<u8>,
+    max: usize,
+) -> Result<Vec<u8>, (u16, &'static str)> {
+    match encoding {
+        Some(e) if e.eq_ignore_ascii_case("base64") => {
+            use base64::Engine as _;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&raw)
+                .map_err(|_| (400u16, "invalid base64 request body"))?;
+            if decoded.len() > max {
+                return Err((413, "request body too large"));
+            }
+            Ok(decoded)
+        }
+        _ => Ok(raw),
+    }
 }
 
 /// Extract a cookie value by name from a raw `Cookie:` header (`a=1; b=2`).
@@ -179,11 +204,16 @@ pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
                 .map(str::to_string)
         })
     };
-    let body = v
+    let raw = v
         .get("body")
         .and_then(Value::as_str)
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
+    // #657: a binary upload rides base64 over this JSON bridge; decode it (+ size-cap).
+    let body = match decode_body(header("X-Body-Encoding").as_deref(), raw, MAX_REQUEST_BODY) {
+        Ok(b) => b,
+        Err((status, message)) => return bridge_error_envelope(id, status, message),
+    };
     let resp = dispatch_message(
         router,
         method,
@@ -384,6 +414,8 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
                     headers.origin = Some(v);
                 } else if k.eq_ignore_ascii_case("content-length") {
                     content_length = v.parse().unwrap_or(0);
+                } else if k.eq_ignore_ascii_case("x-body-encoding") {
+                    headers.body_encoding = Some(v);
                 }
             }
         }
@@ -425,6 +457,16 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             }
         } else {
             Vec::new()
+        };
+        // #657: an upload may ride base64 (uniform with the JSON bridge); decode it here.
+        let body = match decode_body(headers.body_encoding.as_deref(), body, MAX_REQUEST_BODY) {
+            Ok(b) => b,
+            Err((status, message)) => {
+                let resp = ApiResponse::error(status, message);
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(());
+            }
         };
         // Build the routed request from the same transport-agnostic path the in-process
         // bridge uses (#0A): explicit `X-Session-Token`, else the `isy_session` loopback
@@ -671,6 +713,43 @@ mod tests {
         );
         assert_eq!(parse_request_line(""), None);
         assert_eq!(parse_request_line("GET"), None);
+    }
+
+    #[test]
+    fn decode_body_base64_roundtrips_and_bounds() {
+        let m = MAX_REQUEST_BODY;
+        // base64 (case-insensitive header value) -> raw bytes
+        assert_eq!(
+            decode_body(Some("base64"), b"aGVsbG8=".to_vec(), m).unwrap(),
+            b"hello".to_vec()
+        );
+        assert_eq!(
+            decode_body(Some("BASE64"), b"aGk=".to_vec(), m).unwrap(),
+            b"hi".to_vec()
+        );
+        // absent / other encoding -> passthrough
+        assert_eq!(
+            decode_body(None, b"raw".to_vec(), m).unwrap(),
+            b"raw".to_vec()
+        );
+        assert_eq!(
+            decode_body(Some("identity"), b"raw".to_vec(), m).unwrap(),
+            b"raw".to_vec()
+        );
+        // bad base64 -> 400
+        assert_eq!(
+            decode_body(Some("base64"), b"@@@".to_vec(), m)
+                .unwrap_err()
+                .0,
+            400
+        );
+        // decoded "hello" (5 bytes) over a max of 4 -> 413
+        assert_eq!(
+            decode_body(Some("base64"), b"aGVsbG8=".to_vec(), 4)
+                .unwrap_err()
+                .0,
+            413
+        );
     }
 
     #[test]
