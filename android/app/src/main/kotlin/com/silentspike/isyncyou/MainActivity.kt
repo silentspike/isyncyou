@@ -436,25 +436,28 @@ class MainActivity : FragmentActivity() {
     }
 
     /**
-     * Show a `BiometricPrompt` (#onedrive-mobile 0.6, #WP-8). On success, run a crypto op with
-     * the biometric-unlocked Keystore key ([bioConfirmCipher]) — proof of a real strong-biometric
-     * auth — then arm the server-side per-action token over the JNI-only
-     * [NativeEngine.nativeConfirmAction] path (the WebView cannot reach it) and reply
-     * `{t:"bio",id,ok}`. Requires STRONG biometric: a CryptoObject cannot ride a device-credential
-     * unlock below API 30, and destructive M365 ops warrant a hardware-bound gate. Must be called
-     * on the UI thread.
+     * Show a `BiometricPrompt` (#onedrive-mobile 0.6, #WP-8). Prefer a **crypto-bound
+     * strong-biometric** confirmation: on success, run a crypto op with the biometric-unlocked
+     * Keystore key ([bioConfirmCipher]) — proof of a real strong-biometric auth. When **no strong
+     * biometric is enrolled**, fall back to a **device-credential (PIN/pattern)** confirmation:
+     * a CryptoObject cannot ride a device credential (Android restriction on all API levels), so
+     * the fallback is a plain user-presence gate — far better than denying a legitimate destructive
+     * op (requiring STRONG only regressed PIN-only devices). Either way, arm the server-side
+     * per-action token over the JNI-only [NativeEngine.nativeConfirmAction] path (the WebView
+     * cannot reach it) and reply `{t:"bio",id,ok}`. Must be called on the UI thread.
      */
     private fun runBiometric(reqId: String, pat: String, label: String, reply: JavaScriptReplyProxy) {
         fun done(ok: Boolean) = reply.postMessage("{\"t\":\"bio\",\"id\":\"$reqId\",\"ok\":$ok}")
         val mgr = BiometricManager.from(this)
-        val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG
+        val strong = BiometricManager.Authenticators.BIOMETRIC_STRONG
+        // Crypto-bound path only when a strong biometric is actually enrolled; otherwise fall back
+        // to a device-credential confirmation (no CryptoObject — the successful auth is the proof).
+        val cipher =
+            if (mgr.canAuthenticate(strong) == BiometricManager.BIOMETRIC_SUCCESS) bioConfirmCipher() else null
+        val authenticators =
+            if (cipher != null) strong else strong or BiometricManager.Authenticators.DEVICE_CREDENTIAL
         if (mgr.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
-            android.util.Log.w(TAG, "strong biometric unavailable; destructive op denied")
-            done(false)
-            return
-        }
-        val cipher = bioConfirmCipher()
-        if (cipher == null) {
+            android.util.Log.w(TAG, "no biometric or device credential available; destructive op denied")
             done(false)
             return
         }
@@ -464,10 +467,14 @@ class MainActivity : FragmentActivity() {
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                     val armed = try {
-                        // Crypto op under the biometric-unlocked key: only succeeds after a real
-                        // strong-biometric auth, so it proves presence before arming the token.
-                        result.cryptoObject?.cipher?.doFinal(pat.toByteArray(Charsets.UTF_8))
-                            ?: throw IllegalStateException("no crypto object in auth result")
+                        if (cipher != null) {
+                            // Crypto path: the op must succeed under the biometric-unlocked key —
+                            // fail-closed if the result carries no crypto object.
+                            result.cryptoObject?.cipher?.doFinal(pat.toByteArray(Charsets.UTF_8))
+                                ?: throw IllegalStateException("no crypto object in auth result")
+                        }
+                        // Device-credential fallback has no crypto object; the successful auth is
+                        // itself the user-presence proof.
                         NativeEngine.nativeConfirmAction(pat)
                     } catch (e: Exception) {
                         android.util.Log.w(TAG, "confirm crypto/arming failed", e)
@@ -485,7 +492,11 @@ class MainActivity : FragmentActivity() {
             .setSubtitle(label)
             .setAllowedAuthenticators(authenticators)
             .build()
-        prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+        if (cipher != null) {
+            prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+        } else {
+            prompt.authenticate(info)
+        }
     }
 
     /** Drain one push stream, forwarding each event to the WebView until it ends (#0A). */
