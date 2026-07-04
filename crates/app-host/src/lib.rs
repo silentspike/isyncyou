@@ -1695,6 +1695,19 @@ impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
     }
 }
 
+/// Live on-demand OneDrive content fetch for the web UI (#649, Mode 1 online):
+/// download an item's bytes straight from Graph by id. No store write, no cache row —
+/// the bytes are served inertly by the router. Read-only — no capability token.
+pub struct DaemonOneDriveOpen {
+    cfg: Config,
+}
+impl isyncyou_webui::OneDriveOpenHandler for DaemonOneDriveOpen {
+    fn download(&self, account: &str, id: &str) -> Result<Vec<u8>, String> {
+        let client = isyncyou_engine::onedrive_lister(&self.cfg, account)?;
+        isyncyou_graph::GraphClient::download_content(&client, id).map_err(|e| e.to_string())
+    }
+}
+
 impl DaemonRestore {
     /// Construct the restore handler (daemon-only; the mobile profile never wires it).
     pub fn new(cfg: Config) -> Self {
@@ -1731,6 +1744,7 @@ pub fn build_live_router(
     };
     base.with_onedrive_info(Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() }))
         .with_onedrive_list(Arc::new(DaemonOneDriveList { cfg: cfg.clone() }))
+        .with_onedrive_open(Arc::new(DaemonOneDriveOpen { cfg: cfg.clone() }))
         .with_verify(
             Arc::new(DaemonVerify { cfg: cfg.clone() }),
             mint_cap_token(),
