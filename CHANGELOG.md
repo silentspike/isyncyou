@@ -35,6 +35,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `/api/v1/onedrive/children` tree (folders/files, drill-down, breadcrumb up-nav) instead of the empty store,
   and tapping a file opens it on-demand via a new session-gated `GET /api/v1/onedrive/open?account&id&name`
   (`OneDriveOpenHandler` + `DaemonOneDriveOpen`, live `download_content`, served inertly, no store write) (#649).
+- `webui`+`app-host`: session-gated OneDrive per-folder **mode** API — `GET /api/v1/onedrive/mode?account`
+  returns the account's mode map (`default_mode` + `folder_modes`); `POST …&folder&mode=online|sync|offline`
+  sets, or an empty `mode` clears, a folder override (cap-token-gated + audited `audit:onedrive-mode`),
+  persisted via a new `OneDriveModeHandler`/`DaemonOneDriveMode` (reload-on-read, so the GET reflects a POST)
+  wired into the shared desktop+mobile router. `GET /api/v1/onedrive/children` now carries a per-item
+  `effective_mode`, resolved against an optional deepest-first `&ancestry=` (folder-level fallback without it).
+  Rust-only; the app.js toggle UI + breadcrumb `ancestry` send land in #652/#656 (#651).
 
 ## [1.0.0] — 2026-06-26
 
