@@ -8588,7 +8588,10 @@ Content-Type: text/html; charset=utf-8\r\n\
         let r = router.route(&ApiRequest::get(
             "/api/v1/body?account=a&service=onedrive&id=n1",
         ));
-        assert_eq!(r.status, 200, "nested materialized file must resolve via parent chain");
+        assert_eq!(
+            r.status, 200,
+            "nested materialized file must resolve via parent chain"
+        );
         assert_eq!(r.body, b"nested body");
     }
 

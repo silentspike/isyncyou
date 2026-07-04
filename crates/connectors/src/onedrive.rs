@@ -916,7 +916,11 @@ fn local_file_matches(path: &Path, it: &Item) -> bool {
         Ok(m) => m,
         Err(_) => return false,
     };
-    if it.size != Some(meta.len() as i64) {
+    // Compare the item's stored (cloud/plaintext) size to the file's *plaintext* size — on
+    // mobile the on-disk file is a sealed envelope larger than the plaintext, so `meta.len()`
+    // would never match. `on_disk_plaintext_len` reads the envelope header (or the raw length
+    // for a desktop plaintext file), so this holds for both.
+    if it.size != Some(isyncyou_core::envelope::on_disk_plaintext_len(path) as i64) {
         return false;
     }
     match (&it.remote_mtime, meta.modified().ok()) {
@@ -1602,14 +1606,14 @@ pub fn scan_local_modifies(
 ///    modify. Without a stored hash this falls back to the size verdict
 ///    (unchanged), so it never regresses on synthetic items.
 fn is_local_modified(full: &Path, it: &Item) -> bool {
-    let meta = match std::fs::metadata(full) {
-        Ok(m) => m,
-        Err(_) => return false, // not on disk → not a modify (delete is handled elsewhere)
-    };
+    if std::fs::metadata(full).is_err() {
+        return false; // not on disk → not a modify (delete is handled elsewhere)
+    }
     if local_file_matches(full, it) {
         return false;
     }
-    if it.size != Some(meta.len() as i64) {
+    // Plaintext size (mobile bodies are sealed envelopes larger than the plaintext).
+    if it.size != Some(isyncyou_core::envelope::on_disk_plaintext_len(full) as i64) {
         return true;
     }
     // size matches but mtime differs: only a content hash can decide.
