@@ -3,7 +3,7 @@
 //! calls [`build_live_router`] for the shared base and adds its daemon-only
 //! restore/share/push on top; the mobile client uses the base as-is.
 
-use isyncyou_core::Config;
+use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1115,6 +1115,42 @@ impl isyncyou_webui::SettingsHandler for DaemonSettings {
     }
 }
 
+/// Web-UI OneDrive per-folder mode (#651): reads the account's mode policy **fresh** from
+/// the config file (so a prior POST is reflected — the Router holds `config` by value) and
+/// persists a folder set/clear back to it (`load → mutate → validate → save`, like
+/// `DaemonSettings`).
+pub struct DaemonOneDriveMode {
+    config_path: PathBuf,
+}
+impl isyncyou_webui::OneDriveModeHandler for DaemonOneDriveMode {
+    fn modes(&self, account: &str) -> Result<OneDriveModes, String> {
+        Ok(Config::load(&self.config_path)?
+            .onedrive_modes
+            .get(account)
+            .cloned()
+            .unwrap_or_default())
+    }
+    fn set_folder(
+        &self,
+        account: &str,
+        folder_id: &str,
+        mode: Option<OneDriveMode>,
+    ) -> Result<(), String> {
+        let mut cfg = Config::load(&self.config_path)?;
+        let modes = cfg.onedrive_modes.entry(account.to_string()).or_default();
+        match mode {
+            Some(m) => {
+                modes.folder_modes.insert(folder_id.to_string(), m);
+            }
+            None => {
+                modes.folder_modes.remove(folder_id);
+            }
+        }
+        cfg.validate().map_err(|errs| errs.join("; "))?;
+        cfg.save(&self.config_path)
+    }
+}
+
 /// Web-UI live-mail write (#561): each verb resolves the full write token
 /// (`Mail.ReadWrite` + `Mail.Send`) from the cached `login --write` and pushes the
 /// change to Microsoft 365 via the engine `MailWriter`. Trait calls are fully
@@ -1695,6 +1731,19 @@ impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
     }
 }
 
+/// Live on-demand OneDrive content fetch for the web UI (#649, Mode 1 online):
+/// download an item's bytes straight from Graph by id. No store write, no cache row —
+/// the bytes are served inertly by the router. Read-only — no capability token.
+pub struct DaemonOneDriveOpen {
+    cfg: Config,
+}
+impl isyncyou_webui::OneDriveOpenHandler for DaemonOneDriveOpen {
+    fn download(&self, account: &str, id: &str) -> Result<Vec<u8>, String> {
+        let client = isyncyou_engine::onedrive_lister(&self.cfg, account)?;
+        isyncyou_graph::GraphClient::download_content(&client, id).map_err(|e| e.to_string())
+    }
+}
+
 impl DaemonRestore {
     /// Construct the restore handler (daemon-only; the mobile profile never wires it).
     pub fn new(cfg: Config) -> Self {
@@ -1731,15 +1780,22 @@ pub fn build_live_router(
     };
     base.with_onedrive_info(Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() }))
         .with_onedrive_list(Arc::new(DaemonOneDriveList { cfg: cfg.clone() }))
+        .with_onedrive_open(Arc::new(DaemonOneDriveOpen { cfg: cfg.clone() }))
         .with_verify(
             Arc::new(DaemonVerify { cfg: cfg.clone() }),
             mint_cap_token(),
         )
         .with_settings(
             Arc::new(DaemonSettings {
-                config_path,
+                config_path: config_path.clone(),
                 live_interval,
             }),
+            mint_cap_token(),
+        )
+        // #651: OneDrive per-folder mode read/set, wired in the shared builder so both
+        // desktop and mobile get it (like with_onedrive_write below).
+        .with_onedrive_mode(
+            Arc::new(DaemonOneDriveMode { config_path }),
             mint_cap_token(),
         )
         .with_mail_write(
