@@ -2003,7 +2003,8 @@ async function renderOnedriveView(view) {
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
         el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
-    el("div", { id: "drive-modebar", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 2px 8px" }),
+    el("div", { id: "drive-modebar", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 2px 4px" }),
+    el("div", { id: "drive-storage", style: "display:flex;align-items:center;gap:6px;padding:0 2px 8px;font-size:12px" }),
     el("div", { id: "drive-body" }),
   );
   driveLoadMetrics();
@@ -2014,22 +2015,21 @@ async function driveLoadMetrics() {
   try {
     if (MOBILE) {
       // #652: online browse keeps no store, so file/archived counts are meaningless here. Show a
-      // single storage line — used bytes, plus the total when the drive reports one (personal
-      // OneDrive), else "unlimited". Always visible when a quota resolves; quiet if it doesn't.
+      // single storage line (used bytes + total-or-"unlimited") in its own visible header row —
+      // the desktop #drive-metrics-row is display:none on mobile, so render into #drive-storage.
       const drv = await api("/api/v1/drive?" + qs({ account: App.account })).catch(() => null);
       Drive.quota = (drv && drv.quota) || null;
+      const box = $("#drive-storage"); if (!box) return; clear(box);
       const q = Drive.quota;
-      let card;
       if (q && typeof q.used === "number") {
         const hasTotal = typeof q.total === "number" && q.total > 0;
-        const usedPct = hasTotal ? Math.round((q.used || 0) / q.total * 100) : 0;
-        card = { icon: "hard-drive", value: fmtSize(q.used || 0), label: "Storage used",
-          sub: hasTotal ? `${usedPct}% of ${fmtSize(q.total)} · ${fmtSize(q.remaining || 0)} free` : "unlimited",
-          tone: hasTotal && usedPct >= 90 ? "warn" : "" };
+        const sub = hasTotal ? `${Math.round((q.used || 0) / q.total * 100)}% of ${fmtSize(q.total)} · ${fmtSize(q.remaining || 0)} free` : "unlimited";
+        box.append(icon("hard-drive", "icon-sm"),
+          el("span", { style: "font-weight:700", text: fmtSize(q.used || 0) }),
+          el("span", { class: "dim", text: "used · " + sub }));
       } else {
-        card = { icon: "hard-drive", value: "—", label: "Storage", sub: "unavailable" };
+        box.append(icon("hard-drive", "icon-sm"), el("span", { class: "dim", text: "Storage unavailable" }));
       }
-      fillMetrics($("#drive-metrics-row"), [card]);
       return;
     }
     const [d, act, drv] = await Promise.all([
