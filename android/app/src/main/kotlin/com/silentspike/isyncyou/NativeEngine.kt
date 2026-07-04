@@ -63,4 +63,12 @@ object NativeEngine {
      * when the pending id was found and armed for consumption.
      */
     external fun nativeConfirmAction(pendingId: String): Boolean
+
+    /**
+     * Push the current device transfer conditions (#onedrive-mobile 0.9 / S-OM.9): whether the
+     * active network is [metered], the device is [charging], and the [freeBytes] free on the
+     * sync volume. Read by the offline pass's policy gate (storage floor / Wi-Fi-only /
+     * charging-only). May be called any time; the latest value wins.
+     */
+    external fun nativeDeviceState(metered: Boolean, charging: Boolean, freeBytes: Long)
 }

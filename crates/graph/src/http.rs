@@ -392,6 +392,50 @@ impl GraphClient {
         }
     }
 
+    /// Upload `data` as a NEW child named `name` under folder `parent_id`, addressing the
+    /// target by **parent id + name** (not a root-relative path). This is the create-upload
+    /// primitive the ledger-backed writeback uses (#655 / S-OM.9) and that #657 needs for a
+    /// WebUI upload into an Online folder, which has no local store row to derive a path from.
+    ///
+    /// Uses `@microsoft.graph.conflictBehavior=fail`, so an existing child of the same name is
+    /// **never** clobbered or auto-renamed: a `409` returns `Ok(None)` — a conflict the ledger
+    /// resolves by probe-and-adopt on recovery — mirroring [`replace_content_if_match`]'s
+    /// `412 → None`. `Ok(Some(item))` on success.
+    ///
+    /// [`replace_content_if_match`]: Self::replace_content_if_match
+    pub fn upload_to_parent(
+        &self,
+        parent_id: &str,
+        name: &str,
+        data: &[u8],
+    ) -> Result<Option<serde_json::Value>, UploadError> {
+        let url = format!(
+            "{}/me/drive/items/{}:/{}:/content?@microsoft.graph.conflictBehavior=fail",
+            self.base,
+            parent_id,
+            enc(name),
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 201 => Ok(Some(
+                resp.json::<serde_json::Value>()
+                    .map_err(|e| UploadError::Parse(e.to_string()))?,
+            )),
+            409 => Ok(None), // name already exists → conflict (recovery probe-adopts)
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            }),
+        }
+    }
+
     /// Replace a drive item's content unconditionally (no `If-Match`). Used by the
     /// FUSE write-back, where the mounted filesystem owns the file for its session.
     pub fn put_content(

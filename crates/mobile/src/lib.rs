@@ -41,6 +41,39 @@ fn cell() -> &'static Mutex<Option<EngineState>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
+/// Host label for keep-both conflict copies (`*-<host>-safeBackup-NNNN`) written by the
+/// offline pass on this device.
+const HOST: &str = "phone";
+
+/// Process-global device transfer conditions (metered / charging / free bytes), pushed from
+/// Kotlin via `nativeDeviceState` and read by the offline pass's policy gate (#655). Defaults
+/// to the fail-open baseline (unmetered, charging, ample space) until the first push, so the
+/// first materialize is never blocked before a real reading arrives.
+static DEVICE_STATE: OnceLock<Mutex<isyncyou_core::policy::DeviceState>> = OnceLock::new();
+
+fn device_state_cell() -> &'static Mutex<isyncyou_core::policy::DeviceState> {
+    DEVICE_STATE.get_or_init(|| Mutex::new(isyncyou_core::policy::DeviceState::always_on(u64::MAX)))
+}
+
+/// Update the cached device state (called from the Android platform layer via JNI). Host-
+/// testable (no JNI); the JNI entry is a thin wrapper.
+pub fn set_device_state(metered: bool, charging: bool, free_bytes: u64) {
+    let mut g = device_state_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *g = isyncyou_core::policy::DeviceState {
+        metered,
+        charging,
+        free_bytes,
+    };
+}
+
+fn current_device_state() -> isyncyou_core::policy::DeviceState {
+    *device_state_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Start the embedded engine if not already running. Idempotent. Host-testable (no JNI):
 /// the JNI entry is a thin wrapper. No loopback port is bound in the default build (#0A);
 /// the UI reaches the engine only in-process (bridge + asset path).
@@ -226,17 +259,27 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     std::fs::create_dir_all(&cache_root).map_err(|e| e.to_string())?;
     let config_path = base.join("isyncyou.toml");
 
-    let mut cfg = Config {
-        accounts: vec![AccountConfig {
+    // Load the persisted config so user settings — notably the per-folder `onedrive_modes` the
+    // Mode-3 offline pass (#655) acts on — survive restarts; fall back to a fresh default on
+    // first run or a parse error. The account's storage roots (and the companion poll interval)
+    // are ALWAYS re-derived from `files_dir` below, so a persisted config can never point the
+    // engine at a stale device path.
+    let mut cfg = Config::load(&config_path).unwrap_or_default();
+    if let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == ACCOUNT) {
+        acc.sync_root = sync_root;
+        acc.archive_root = archive_root;
+        acc.cache_root = cache_root;
+        acc.mount_point = None;
+    } else {
+        cfg.accounts.push(AccountConfig {
             id: ACCOUNT.into(),
             username: ACCOUNT.into(),
             sync_root,
             archive_root,
             cache_root,
             mount_point: None,
-        }],
-        ..Default::default()
-    };
+        });
+    }
     // A phone is a cache/live companion, not the desktop's 5 s near-real-time loop:
     // poll every 30 s to spare battery/mobile-data and cut the periodic view refresh
     // frequency (the live-refresh is otherwise driven every poll a change lands).
@@ -251,6 +294,9 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     let gate = Arc::new(Mutex::new(()));
     let events = Arc::new(isyncyou_webui::EventBus::new());
     let live_interval = Arc::new(AtomicU64::new(cfg.sync.poll_interval_secs.max(1)));
+    // The Mode-3 offline pass (refresh loop) writes per-file progress here; the router reads
+    // the same handle at GET /api/v1/onedrive/transfers (#655). One shared instance, cloned.
+    let transfer_progress = isyncyou_app_host::SharedProgress::new();
 
     let router = Arc::new(
         isyncyou_app_host::build_live_router(
@@ -259,6 +305,7 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
             events.clone(),
             config_path,
             live_interval.clone(),
+            transfer_progress.clone(),
         )
         .with_session_token(session_token.clone())
         // #onedrive-mobile 0.6: only the standalone Android app arms the biometric gate.
@@ -289,9 +336,50 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     // mail/calendar/contacts/todo/onenote from Graph into the local cache store
     // (read-only — never writes back to the cloud) and wake SSE subscribers so the
     // UI refreshes. Skips silently until a token is cached.
-    std::thread::spawn(move || refresh_loop(cfg, gate, events, live_interval));
+    std::thread::spawn(move || refresh_loop(cfg, gate, events, live_interval, transfer_progress));
 
     Ok((session_token, router))
+}
+
+/// One Mode-3 offline pass under the store-access gate (#655): materialize the offline scopes
+/// and mirror local edits back over the ledger. Returns whether anything changed (the UI is
+/// woken only on real work). Skips quietly with no offline folders configured or no cached
+/// write token (not signed in). `progress` is the shared tracker the router surfaces.
+fn run_offline_pass(
+    cfg: &Config,
+    gate: &Arc<Mutex<()>>,
+    progress: &isyncyou_app_host::SharedProgress,
+) -> bool {
+    let has_offline = cfg
+        .onedrive_modes
+        .get(ACCOUNT)
+        .map(|m| {
+            m.folder_modes
+                .values()
+                .any(|md| *md == isyncyou_core::OneDriveMode::Offline)
+        })
+        .unwrap_or(false);
+    if !has_offline {
+        return false;
+    }
+    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let token = match isyncyou_engine::auth::resolve_cached_sync_token(cfg, ACCOUNT) {
+        Ok(t) => t,
+        Err(_) => return false, // no write token cached → skip quietly
+    };
+    let dev = current_device_state();
+    match isyncyou_engine::offline_sync_once_for(cfg, ACCOUNT, HOST, token, dev, progress) {
+        Ok(r) => {
+            r.downloaded
+                + r.dirs_created
+                + r.uploaded_creates
+                + r.modified_uploaded
+                + r.cloud_deleted
+                + r.local_trashed
+                > 0
+        }
+        Err(_) => false,
+    }
 }
 
 fn refresh_loop(
@@ -299,6 +387,7 @@ fn refresh_loop(
     gate: Arc<Mutex<()>>,
     events: Arc<isyncyou_webui::EventBus>,
     interval: Arc<AtomicU64>,
+    progress: isyncyou_app_host::SharedProgress,
 ) {
     loop {
         let secs = interval.load(Ordering::Relaxed).max(5);
@@ -322,7 +411,10 @@ fn refresh_loop(
                     Err(_) => false, // not signed in yet — skip quietly
                 }
             };
-            if refreshed {
+            // #655: after the read-only cache refresh, run the Mode-3 offline pass (materialize +
+            // ledger writeback) for any offline folders, then wake SSE if either changed anything.
+            let offline_changed = run_offline_pass(&cfg, &gate, &progress);
+            if refreshed || offline_changed {
                 events.notify(); // wake SSE subscribers so the UI refetches
             }
         }));
@@ -363,6 +455,20 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSessionT
     env.new_string(tok)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// JNI: push the current device transfer conditions from the Android platform layer — the
+/// active network is metered, the device is charging, and the free bytes on the sync volume —
+/// read by the offline pass's policy gate (#655). May be called any time; the latest wins.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDeviceState(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    metered: jni::sys::jboolean,
+    charging: jni::sys::jboolean,
+    free_bytes: jni::sys::jlong,
+) {
+    set_device_state(metered != 0, charging != 0, free_bytes.max(0) as u64);
 }
 
 /// JNI: answer one in-process bridge request (#0A). Kotlin passes the JSON request
@@ -526,6 +632,17 @@ mod tests {
         start_engine(path).expect("idempotent restart");
         let tok2 = session_token().expect("token present");
         assert_eq!(tok1, tok2, "second start must reuse the running engine");
+    }
+
+    #[test]
+    fn device_state_push_updates_the_global() {
+        // Kotlin pushes the device transfer conditions over nativeDeviceState → the offline
+        // pass's policy gate reads them here. (Process-global — assert on the values we set.)
+        set_device_state(true, false, 4096);
+        let d = current_device_state();
+        assert!(d.metered);
+        assert!(!d.charging);
+        assert_eq!(d.free_bytes, 4096);
     }
 
     #[test]

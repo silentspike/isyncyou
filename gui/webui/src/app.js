@@ -311,6 +311,7 @@ const CAP = {
   account: "__ACCOUNT_CAP_TOKEN__",
   push: "__PUSH_CAP_TOKEN__",
   agent: "__AGENT_CAP_TOKEN__",
+  onedriveMode: "__ONEDRIVE_MODE_CAP_TOKEN__",
 };
 
 /* ---------------------------------------------------------------- push registration (#576)
@@ -1949,7 +1950,21 @@ function metricCard(icn, val, label) {
 }
 
 /* ---------------------------------------------------------------- onedrive (file explorer) */
-const Drive = { stack: [], layout: "grid", items: [] };
+const Drive = { stack: [], layout: "grid", items: [], modes: { default_mode: "online", folder_modes: {} }, quota: null };
+// #652: per-folder mode resolvers — PURE reads of Drive.modes (the server folder-mode map is the
+// single source of truth, re-fetched every driveLoad; no local override cache / optimistic state).
+// Used only for the CURRENT folder (absent from its own child list); subfolder pills use the
+// server-computed child.effective_mode directly.
+function driveEffMode(folderId, ancestryIds) {          // mirrors OneDriveModes::effective_mode (deepest-first)
+  const fm = Drive.modes.folder_modes || {};
+  if (fm[folderId]) return fm[folderId];
+  for (const pid of ancestryIds) if (fm[pid]) return fm[pid];
+  return Drive.modes.default_mode || "online";
+}
+function driveExplicit(folderId) { return !!(Drive.modes.folder_modes || {})[folderId]; }
+// F's ancestor folder ids deepest-first (immediate parent → toward root), excluding the root
+// sentinel and F itself — exactly the `&ancestry=` the #651 children endpoint expects.
+function driveAncestryIds() { return Drive.stack.slice(1, -1).map(s => s.id).reverse(); }
 // extension → {icon, color} category for file glyphs
 const FILE_KINDS = [
   { icon: "image", color: "#38bdf8", ext: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "heic", "tiff"] },
@@ -1988,6 +2003,8 @@ async function renderOnedriveView(view) {
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
         el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
+    el("div", { id: "drive-modebar", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 2px 4px" }),
+    el("div", { id: "drive-storage", style: "display:flex;align-items:center;gap:6px;padding:0 2px 8px;font-size:12px" }),
     el("div", { id: "drive-body" }),
   );
   driveLoadMetrics();
@@ -1996,6 +2013,25 @@ async function renderOnedriveView(view) {
 // account-wide OneDrive KPIs (flat item list, independent of the current folder)
 async function driveLoadMetrics() {
   try {
+    if (MOBILE) {
+      // #652: online browse keeps no store, so file/archived counts are meaningless here. Show a
+      // single storage line (used bytes + total-or-"unlimited") in its own visible header row —
+      // the desktop #drive-metrics-row is display:none on mobile, so render into #drive-storage.
+      const drv = await api("/api/v1/drive?" + qs({ account: App.account })).catch(() => null);
+      Drive.quota = (drv && drv.quota) || null;
+      const box = $("#drive-storage"); if (!box) return; clear(box);
+      const q = Drive.quota;
+      if (q && typeof q.used === "number") {
+        const hasTotal = typeof q.total === "number" && q.total > 0;
+        const sub = hasTotal ? `${Math.round((q.used || 0) / q.total * 100)}% of ${fmtSize(q.total)} · ${fmtSize(q.remaining || 0)} free` : "unlimited";
+        box.append(icon("hard-drive", "icon-sm"),
+          el("span", { style: "font-weight:700", text: fmtSize(q.used || 0) }),
+          el("span", { class: "dim", text: "used · " + sub }));
+      } else {
+        box.append(icon("hard-drive", "icon-sm"), el("span", { class: "dim", text: "Storage unavailable" }));
+      }
+      return;
+    }
     const [d, act, drv] = await Promise.all([
       api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", limit: 2000 })),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
@@ -2052,14 +2088,50 @@ async function driveLoad() {
     if (MOBILE) {
       // Mode-1 online (#649): browse live from Graph — the phone store is a cache and is
       // empty for OneDrive, so the store-based listing would show the empty placeholder.
-      const d = await api("/api/v1/onedrive/children?" + qs({ account: App.account, folder: cur === "root" ? "" : cur }));
+      // #652: send the breadcrumb as `&ancestry=` (deepest-first) so children carry a correct
+      // effective_mode, and fetch the folder-mode map alongside (explicit-vs-inherited + the
+      // current folder). Drive.modes is the SSOT — re-read on every navigation.
+      const anc = driveAncestryIds().join(",");
+      const [d, modes] = await Promise.all([
+        api("/api/v1/onedrive/children?" + qs({ account: App.account, folder: cur === "root" ? "" : cur, ancestry: anc })),
+        api("/api/v1/onedrive/mode?" + qs({ account: App.account })).catch(() => Drive.modes),
+      ]);
+      Drive.modes = modes || Drive.modes;
       Drive.items = (d.children || []).map(driveMapChild);
     } else {
       const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", parent: cur }));
       Drive.items = d.items || [];
     }
     driveRender();
+    renderDriveModeBar();
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load folder" }), el("p", { text: e.message }))); }
+}
+// #652: the current-folder mode control + a "partial" indicator. The current folder is not in its
+// own child list, so its effective mode is resolved from Drive.modes (SSOT) + the breadcrumb.
+// "Partial" = at least one listed subfolder resolves to a different mode than this folder → the
+// folder's contents are not uniformly one mode (some sync/offline below). Mobile-only.
+function renderDriveModeBar() {
+  const bar = $("#drive-modebar"); if (!bar) return; clear(bar);
+  if (!MOBILE || !CAP.onedriveMode) return;
+  const cur = Drive.stack[Drive.stack.length - 1] || { id: "root", name: "OneDrive" };
+  const isRoot = cur.id === "root";
+  const curMode = isRoot ? (Drive.modes.default_mode || "online") : driveEffMode(cur.id, driveAncestryIds());
+  bar.append(el("span", { class: "dim", style: "font-size:12px", text: "This folder:" }));
+  if (isRoot) {
+    // the drive root has no per-folder id to POST — show the account default, read-only.
+    const c = MODE_COLOR[curMode];
+    bar.append(el("span", { title: "Account default mode",
+      style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;"
+        + `font-weight:600;border:1px solid ${c};color:${c};opacity:0.72` },
+      icon(MODE_ICON[curMode], "icon-sm"), el("span", { text: MODE_LABEL[curMode] + " · default" })));
+  } else {
+    bar.append(driveModePill(cur.id, curMode, driveExplicit(cur.id), cur.name));
+  }
+  const partial = Drive.items.some(it => it.item_type === "folder" && it.effective_mode && it.effective_mode !== curMode);
+  if (partial) bar.append(el("span", { title: "Some subfolders have a different mode",
+    style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;"
+      + "border:1px solid var(--warn,#f59e0b);color:var(--warn,#f59e0b);background:#f59e0b1a" },
+    icon("info", "icon-sm"), el("span", { text: "Partial — mixed modes below" })));
 }
 // #649 Mode-1 online: normalize a live Graph child (from /api/v1/onedrive/children) onto the
 // store-item shape driveRender/driveTile/driveRow expect. No local body/preview in online mode.
@@ -2067,6 +2139,7 @@ function driveMapChild(c) {
   return {
     item_type: c.folder ? "folder" : "file",
     remote_id: c.id,
+    effective_mode: c.effective_mode,   // #652: per-item mode from the #651 children enrichment
     name: c.name,
     size: c.size,
     remote_mtime: c.lastModifiedDateTime,
@@ -2127,6 +2200,51 @@ function syncBadge(it) {
   if (!it.sync_state || it.sync_state === "clean") return null;
   const kind = it.sync_state === "deleted" ? "err" : "warn";
   return el("span", { class: "pill " + kind + " sync-badge", title: "Sync state: " + it.sync_state }, el("span", { class: "dot" }));
+}
+// #652: per-folder mode pill + picker sheet. The pill shows a folder's effective OneDrive mode
+// (solid border+fill = explicit own override, dimmed = inherited); tap opens a sheet to set or
+// clear it. Online = live/nothing stored, Sync = metadata cached, Offline = fully downloaded.
+const MODE_LABEL = { online: "Online", sync: "Sync", offline: "Offline" };
+const MODE_ICON = { online: "cloud", sync: "refresh-cw", offline: "hard-drive" };
+const MODE_COLOR = { online: "var(--dim,#94a3b8)", sync: "var(--svc-onedrive,#0a84ff)", offline: "var(--ok,#34d399)" };
+function driveModePill(folderId, effMode, explicit, name) {
+  const m = effMode || "online", c = MODE_COLOR[m];
+  return el("button", {
+    class: "mode-pill" + (explicit ? " explicit" : " inherited"),
+    type: "button",
+    title: (explicit ? "Mode: " : "Inherited: ") + MODE_LABEL[m] + " — tap to change",
+    style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;"
+      + "font-size:11px;font-weight:600;line-height:1.4;white-space:nowrap;cursor:pointer;"
+      + `border:1px solid ${c};color:${c};background:${explicit ? c + "22" : "transparent"};`
+      + (explicit ? "" : "opacity:0.72;"),
+    onclick: (e) => { e.stopPropagation(); openModeSheet(folderId, name, effMode, explicit); },
+  }, icon(MODE_ICON[m], "icon-sm"), el("span", { text: MODE_LABEL[m] + (explicit ? "" : " · inherited") }));
+}
+function openModeSheet(folderId, name, effMode, explicit) {
+  const choose = (mode, label, desc) => el("button", { class: "pick-row pick-btn", type: "button",
+    onclick: () => { closeSheet(); setFolderMode(folderId, mode); } },
+    icon(MODE_ICON[mode], "icon-sm"),
+    el("div", { class: "grow" },
+      el("div", { style: "font-weight:600", text: label }),
+      el("div", { class: "dim", style: "font-size:12px", text: desc })),
+    effMode === mode ? icon("check", "icon-sm") : null);
+  const content = el("div", { class: "compose" }, el("div", { class: "pick-list" },
+    choose("online", "Online", "Live — nothing stored on the device"),
+    choose("sync", "Sync", "Metadata cached, files downloaded on demand"),
+    choose("offline", "Offline", "Fully downloaded — works offline")));
+  if (explicit) content.append(el("button", { class: "btn ghost sm", type: "button", style: "margin-top:10px",
+    onclick: () => { closeSheet(); setFolderMode(folderId, null); } },
+    icon("rotate-ccw", "icon-sm"), "Reset to inherited"));
+  openSheet(name ? "Mode — " + name : "Folder mode", content);
+}
+// POST the folder mode (omit `mode` to clear → inherited); re-load so pills + the partial
+// indicator reflect the fresh server state (Drive.modes SSOT). Mirrors doShare's template.
+async function setFolderMode(folderId, mode) {
+  try {
+    await post("/api/v1/onedrive/mode?" + qs({ account: App.account, folder: folderId, ...(mode ? { mode } : {}) }), CAP.onedriveMode);
+    toast(mode ? "Folder set to " + MODE_LABEL[mode] : "Folder reset to inherited");
+    await driveLoad();
+  } catch (e) { toast("Could not change mode: " + e.message, "err"); }
 }
 function driveActions(it) {
   if (it.item_type === "folder") return null;
@@ -2245,7 +2363,9 @@ function driveTile(it) {
     (!folder && pv.malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
     (!folder && pv.shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
     folder ? null : coverageBadge(it),
-    syncBadge(it), driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
+    syncBadge(it),
+    (folder && MOBILE && CAP.onedriveMode) ? driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name) : null,
+    driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
   return tile;
 }
 function driveRow(it) {
@@ -2266,6 +2386,7 @@ function driveRow(it) {
   if (!folder) acts.append(el("button", { class: "btn ghost sm", title: "Details & access", onclick: (e) => { e.stopPropagation(); openDriveItem(it); } }, icon("info", "icon-sm")));
   if (!folder && it.has_body) acts.append(el("a", { class: "btn ghost sm", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
+  if (folder && MOBILE && CAP.onedriveMode) acts.append(driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name));
   row.append(acts);
   return row;
 }
