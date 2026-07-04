@@ -2025,9 +2025,13 @@ async function renderOnedriveView(view) {
         el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
     el("div", { id: "drive-modebar", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 2px 4px" }),
     el("div", { id: "drive-storage", style: "display:flex;align-items:center;gap:6px;padding:0 2px 8px;font-size:12px" }),
+    // #656: live transfer-progress panel (own visible element — the desktop #drive-metrics-row
+    // is display:none on mobile). Hidden until the poll finds an in-flight transfer.
+    el("div", { id: "drive-transfers", style: "display:none;flex-direction:column;gap:8px;padding:0 2px 8px" }),
     el("div", { id: "drive-body" }),
   );
   driveLoadMetrics();
+  startDriveTransfersPoll();
   await driveOpen(null, "OneDrive", true);
 }
 // account-wide OneDrive KPIs (flat item list, independent of the current folder)
@@ -2267,6 +2271,64 @@ function driveModeFilterBar(items, current, onPick) {
   const mk = (key, label) => el("button", { class: "state-chip" + (key === current ? " active" : ""), onclick: () => onPick(key) },
     key === "all" ? null : icon(MODE_ICON[key], "icon-sm"), el("span", { text: label }), el("span", { class: "sc-count", text: String(counts[key] || 0) }));
   return el("div", { class: "state-chips" }, mk("all", "All"), mk("online", MODE_LABEL.online), mk("sync", MODE_LABEL.sync), mk("offline", MODE_LABEL.offline));
+}
+// #656: live transfer-progress panel. There is no SSE hook for transfers, so poll
+// GET /api/v1/onedrive/transfers (bytes/file/retry-after) while the OneDrive view is open.
+// Self-clearing: the timer stops when #drive-transfers leaves the DOM (view switched).
+let driveTransfersTimer = null, driveTransferIdKey = "";
+function startDriveTransfersPoll() {
+  if (driveTransfersTimer) { clearInterval(driveTransfersTimer); driveTransfersTimer = null; }
+  driveTransferIdKey = "";
+  pollDriveTransfers();
+  driveTransfersTimer = setInterval(pollDriveTransfers, 1500);
+}
+async function pollDriveTransfers() {
+  const box = $("#drive-transfers");
+  if (!box) { if (driveTransfersTimer) { clearInterval(driveTransfersTimer); driveTransfersTimer = null; } return; }
+  try {
+    const d = await api("/api/v1/onedrive/transfers");
+    Drive.transfers = (d && d.transfers) || [];
+  } catch { Drive.transfers = []; }
+  renderTransfersPanel();
+  // Re-render the item list only when the SET of transferring ids changes (not every byte
+  // tick), so the per-file "Downloading" chip toggles without fighting the user mid-scroll.
+  const idKey = Drive.transfers.map(t => t.id).sort().join(",");
+  if (idKey !== driveTransferIdKey) { driveTransferIdKey = idKey; if ($("#drive-body")) driveRender(); }
+}
+function renderTransfersPanel() {
+  const box = $("#drive-transfers"); if (!box) return;
+  const list = Drive.transfers || [];
+  clear(box);
+  if (!list.length) { box.style.display = "none"; return; }
+  box.style.display = "flex";
+  box.append(el("div", { style: "display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700" },
+    icon("download", "icon-sm"), el("span", { text: "Transferring " + list.length + (list.length === 1 ? " file" : " files") })));
+  list.forEach(t => box.append(transferRow(t)));
+}
+function transferRow(t) {
+  const total = t.bytes_total || 0, done = t.bytes_done || 0;
+  const pct = total > 0 ? Math.min(100, Math.round(done / total * 100)) : null;
+  const fill = el("div", { style: "position:absolute;top:0;bottom:0;left:0;border-radius:999px;background:var(--svc-onedrive,#0a84ff);"
+    + (pct != null ? `width:${pct}%;` : "width:40%;opacity:0.5;") });
+  const bar = el("div", { style: "position:relative;height:6px;border-radius:999px;overflow:hidden;background:var(--bg-3,#1e293b)" }, fill);
+  const meta = pct != null ? fmtSize(done) + " / " + fmtSize(total) + " · " + pct + "%" : fmtSize(done) + " transferred";
+  const retry = (t.retry_after_secs && t.retry_after_secs > 0) ? el("span", { class: "dim", style: "font-size:11px", text: "· retry in " + t.retry_after_secs + "s" }) : null;
+  const cancelBtn = CAP.transfers ? el("button", { class: "btn ghost sm", title: "Cancel transfer", onclick: () => cancelTransfer(t) }, icon("x", "icon-sm")) : null;
+  return el("div", { style: "display:flex;align-items:center;gap:8px" },
+    el("div", { class: "grow", style: "min-width:0" },
+      el("div", { class: "truncate", style: "font-size:12px;font-weight:600", text: t.name || t.id }),
+      bar,
+      el("div", { style: "display:flex;gap:6px;align-items:center" }, el("span", { class: "dim", style: "font-size:11px", text: meta }), retry)),
+    cancelBtn);
+}
+async function cancelTransfer(t) {
+  try {
+    await post("/api/v1/onedrive/transfers/cancel?" + qs({ id: t.id }), CAP.transfers);
+    // Optimistic: drop it from the panel now; the next poll confirms the engine skipped it.
+    Drive.transfers = (Drive.transfers || []).filter(x => x.id !== t.id);
+    renderTransfersPanel();
+    toast("Cancelling " + (t.name || "transfer"));
+  } catch (e) { toast("Could not cancel: " + e.message, "err"); }
 }
 function driveModePill(folderId, effMode, explicit, name) {
   const m = effMode || "online", c = MODE_COLOR[m];
