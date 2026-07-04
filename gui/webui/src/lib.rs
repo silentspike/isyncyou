@@ -336,6 +336,16 @@ pub trait OneDriveInfoHandler: Send + Sync {
     fn permissions(&self, account: &str, id: &str) -> Result<serde_json::Value, String>;
 }
 
+/// Reports a OneDrive folder's **live** children (a paged Graph call, not held in
+/// the store) for Mode-1 online browsing (#648). Injected by the daemon/mobile
+/// engine (which owns the Graph stack + token); the read-only CLI `serve` doesn't
+/// set it, so `/api/v1/onedrive/children` 404s there. A read, so no cap token.
+pub trait OneDriveListHandler: Send + Sync {
+    /// A folder's children as a JSON array (`id`/`name`/`size`/`folder`/`file`/
+    /// `lastModifiedDateTime` per child). An empty `folder` = the drive root.
+    fn children(&self, account: &str, folder: &str) -> Result<Vec<serde_json::Value>, String>;
+}
+
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
 /// scheduler and trigger an immediate pass. Injected by the daemon.
 pub trait SyncControl: Send + Sync {
@@ -669,6 +679,9 @@ pub struct Router {
     /// Optional live OneDrive info handler (the daemon's). Enables the quota /
     /// permissions GETs; `None` => those 404 (the read-only CLI `serve`).
     onedrive_info: Option<std::sync::Arc<dyn OneDriveInfoHandler>>,
+    /// Optional live OneDrive folder-listing handler (the daemon's/mobile's).
+    /// Enables the online-browse children GET; `None` => it 404s (read-only CLI).
+    onedrive_list: Option<std::sync::Arc<dyn OneDriveListHandler>>,
     /// Optional integrity-verify handler (the daemon's). `None` => the verify
     /// POST is refused (the read-only CLI `serve`).
     verify: Option<std::sync::Arc<dyn VerifyHandler>>,
@@ -769,6 +782,7 @@ impl Router {
             sync_control: None,
             hydrations: None,
             onedrive_info: None,
+            onedrive_list: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -812,6 +826,7 @@ impl Router {
             sync_control: None,
             hydrations: None,
             onedrive_info: None,
+            onedrive_list: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -988,6 +1003,12 @@ impl Router {
     /// Enable the live OneDrive info GETs (quota/permissions) (builder style).
     pub fn with_onedrive_info(mut self, info: std::sync::Arc<dyn OneDriveInfoHandler>) -> Self {
         self.onedrive_info = Some(info);
+        self
+    }
+
+    /// Enable the live OneDrive folder-listing GET (online browse) (builder style).
+    pub fn with_onedrive_list(mut self, list: std::sync::Arc<dyn OneDriveListHandler>) -> Self {
+        self.onedrive_list = Some(list);
         self
     }
 
@@ -1431,6 +1452,7 @@ impl Router {
             "/api/v1/onedrive/policy" => self.policy_state(),
             "/api/v1/drive" => self.drive_info(req),
             "/api/v1/permissions" => self.item_permissions(req),
+            "/api/v1/onedrive/children" => self.onedrive_children(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
             "/api/v1/debug/stats" => self.debug_stats(),
             _ => ApiResponse::error(404, "not found"),
@@ -2885,6 +2907,27 @@ impl Router {
         };
         match handler.permissions(account, id) {
             Ok(p) => ApiResponse::ok_json(&json!({ "permissions": p })),
+            Err(e) => ApiResponse::error(502, &e),
+        }
+    }
+
+    /// A OneDrive folder's children — a live, fully paged Graph call via the
+    /// daemon's handler (#648, Mode 1 online). 404 when no handler; 400 without an
+    /// account; an empty/absent `folder` = the drive root. No store write.
+    fn onedrive_children(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_list {
+            Some(h) => h,
+            None => {
+                return ApiResponse::error(404, "OneDrive listing is not enabled on this server")
+            }
+        };
+        let account = match req.q("account") {
+            Some(a) if !a.is_empty() => a,
+            _ => return ApiResponse::error(400, "account is required"),
+        };
+        let folder = req.q("folder").unwrap_or("");
+        match handler.children(account, folder) {
+            Ok(children) => ApiResponse::ok_json(&json!({ "children": children })),
             Err(e) => ApiResponse::error(502, &e),
         }
     }
@@ -5121,6 +5164,76 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             v.pointer("/permissions/0/roles/0").and_then(Value::as_str),
             Some("read")
         );
+    }
+
+    struct FakeOneDriveList;
+    impl OneDriveListHandler for FakeOneDriveList {
+        fn children(&self, _account: &str, folder: &str) -> Result<Vec<serde_json::Value>, String> {
+            Ok(vec![
+                json!({ "id": "c1", "name": format!("{folder}-child.txt"), "size": 12 }),
+            ])
+        }
+    }
+
+    #[test]
+    fn onedrive_children_route_returns_handler_json_or_404() {
+        let (_d, router) = setup();
+        // AC3: read-only server (no handler) -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/onedrive/children?account=a&folder=F"
+                ))
+                .status,
+            404
+        );
+        let router = router.with_onedrive_list(std::sync::Arc::new(FakeOneDriveList));
+        // missing account -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/onedrive/children?folder=F"))
+                .status,
+            400
+        );
+        // AC1: handler + account -> 200 + children array
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/onedrive/children?account=a&folder=F",
+        ));
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(
+            v.pointer("/children/0/name").and_then(Value::as_str),
+            Some("F-child.txt")
+        );
+        // root case: an absent `folder` is passed through as "" (the drive root).
+        let root = router.route(&ApiRequest::get("/api/v1/onedrive/children?account=a"));
+        assert_eq!(root.status, 200);
+        let rv: Value = serde_json::from_slice(&root.body).unwrap();
+        assert_eq!(
+            rv.pointer("/children/0/name").and_then(Value::as_str),
+            Some("-child.txt")
+        );
+    }
+
+    #[test]
+    fn onedrive_children_is_session_gated() {
+        // AC2: on the mobile profile (session token set) the children GET 401s without a
+        // token. The assertion is EXACTLY 401 (not 404/200): a 404/200 here would mean the
+        // /api/v1/* session gate did not catch this new path. Green == AC2 hard-proven.
+        let router = Router::new(Config::default())
+            .with_onedrive_list(std::sync::Arc::new(FakeOneDriveList))
+            .with_session_token("sess-tok-0001".into());
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/onedrive/children?account=a&folder=F"
+                ))
+                .status,
+            401
+        );
+        let ok = ApiRequest::get("/api/v1/onedrive/children?account=a&folder=F")
+            .with_session_token(Some("sess-tok-0001".into()));
+        assert_ne!(router.route(&ok).status, 401); // correct token passes the gate -> 200
     }
 
     #[test]

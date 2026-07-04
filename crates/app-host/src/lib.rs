@@ -1647,6 +1647,20 @@ impl isyncyou_webui::OneDriveInfoHandler for DaemonOneDriveInfo {
     }
 }
 
+/// Live OneDrive folder listing for the web UI (#648, Mode 1 online): a folder's
+/// children read straight from Graph (fully paged, no store write) via the engine's
+/// `OneDriveLister`. Resolves the read-capable (mobile-friendly) token. Read-only —
+/// no capability token.
+pub struct DaemonOneDriveList {
+    cfg: Config,
+}
+impl isyncyou_webui::OneDriveListHandler for DaemonOneDriveList {
+    fn children(&self, account: &str, folder: &str) -> Result<Vec<serde_json::Value>, String> {
+        let client = isyncyou_engine::onedrive_lister(&self.cfg, account)?;
+        isyncyou_engine::OneDriveLister::list_children(&client, folder)
+    }
+}
+
 impl DaemonRestore {
     /// Construct the restore handler (daemon-only; the mobile profile never wires it).
     pub fn new(cfg: Config) -> Self {
@@ -1682,6 +1696,7 @@ pub fn build_live_router(
         None => isyncyou_webui::Router::new(cfg.clone()),
     };
     base.with_onedrive_info(Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() }))
+        .with_onedrive_list(Arc::new(DaemonOneDriveList { cfg: cfg.clone() }))
         .with_verify(
             Arc::new(DaemonVerify { cfg: cfg.clone() }),
             mint_cap_token(),
