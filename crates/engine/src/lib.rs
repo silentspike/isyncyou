@@ -823,7 +823,10 @@ fn ensure_parent_folder(
         if p.as_os_str().is_empty() {
             break;
         }
-        cur = p.parent().filter(|pp| !pp.as_os_str().is_empty()).map(Path::to_path_buf);
+        cur = p
+            .parent()
+            .filter(|pp| !pp.as_os_str().is_empty())
+            .map(Path::to_path_buf);
         chain.push(p);
     }
     chain.reverse();
@@ -921,9 +924,8 @@ pub fn offline_sync_once(
         .map(|s| s.folder_id.as_str())
         .collect();
 
-    let secret = restore_key::load_or_create_secret(
-        &acc.archive_root.join(".isyncyou-cloudwrite-secret"),
-    )?;
+    let secret =
+        restore_key::load_or_create_secret(&acc.archive_root.join(".isyncyou-cloudwrite-secret"))?;
 
     // 1) Boot recovery FIRST: reconcile any half-finished cloud-writes before new work (AC3).
     onedrive_write::recover_pending_cloud_writes(store, account, client, now_secs)?;
@@ -980,7 +982,11 @@ pub fn offline_sync_once(
         let remaining = store
             .count_by_service(account, ONEDRIVE)
             .map_err(|e| e.to_string())? as usize;
-        match guard.evaluate(pending.len(), remaining + pending.len(), Direction::CloudToLocal) {
+        match guard.evaluate(
+            pending.len(),
+            remaining + pending.len(),
+            Direction::CloudToLocal,
+        ) {
             GuardVerdict::Block { reason } => out.local_delete_blocked = Some(reason),
             GuardVerdict::Proceed => {
                 out.local_trashed =
@@ -1012,7 +1018,11 @@ pub fn offline_sync_once(
                     continue;
                 }
             };
-            let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let name = rel
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
             let w = onedrive_write::CloudWrite {
                 kind: isyncyou_store::CloudOpKind::Upload,
                 target_id: parent_id,
@@ -1088,8 +1098,10 @@ pub fn offline_sync_once(
                         content_tag: None,
                     };
                     // A transient error just leaves the op recoverable; the next pass reconciles.
-                    if onedrive_write::run_cloud_write(store, account, &w, client, &secret, now_secs)
-                        .is_ok()
+                    if onedrive_write::run_cloud_write(
+                        store, account, &w, client, &secret, now_secs,
+                    )
+                    .is_ok()
                     {
                         // tombstone locally (the ledger driver is cloud-only by design).
                         let _ = store.mark_deleted(account, ONEDRIVE, id, &now);
@@ -1121,7 +1133,8 @@ pub fn offline_sync_once_for(
         .iter()
         .find(|a| a.id == account)
         .ok_or_else(|| format!("no account '{account}'"))?;
-    let store = Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
     let mut client = GraphClient::new(sync_token);
     offline_sync_once(cfg, account, &store, &mut client, host, dev, progress)
 }
@@ -1148,8 +1161,7 @@ mod tests {
         };
         let mut client = GraphClient::new("dummy-token".to_string());
         let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
-        let report =
-            offline_sync_once(&cfg, "me", &store, &mut client, "host", dev, &()).unwrap();
+        let report = offline_sync_once(&cfg, "me", &store, &mut client, "host", dev, &()).unwrap();
         assert_eq!(report.upserted, 0);
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.uploaded_creates, 0);

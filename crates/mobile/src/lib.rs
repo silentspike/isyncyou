@@ -52,14 +52,15 @@ const HOST: &str = "phone";
 static DEVICE_STATE: OnceLock<Mutex<isyncyou_core::policy::DeviceState>> = OnceLock::new();
 
 fn device_state_cell() -> &'static Mutex<isyncyou_core::policy::DeviceState> {
-    DEVICE_STATE
-        .get_or_init(|| Mutex::new(isyncyou_core::policy::DeviceState::always_on(u64::MAX)))
+    DEVICE_STATE.get_or_init(|| Mutex::new(isyncyou_core::policy::DeviceState::always_on(u64::MAX)))
 }
 
 /// Update the cached device state (called from the Android platform layer via JNI). Host-
 /// testable (no JNI); the JNI entry is a thin wrapper.
 pub fn set_device_state(metered: bool, charging: bool, free_bytes: u64) {
-    let mut g = device_state_cell().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = device_state_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     *g = isyncyou_core::policy::DeviceState {
         metered,
         charging,
@@ -68,7 +69,9 @@ pub fn set_device_state(metered: bool, charging: bool, free_bytes: u64) {
 }
 
 fn current_device_state() -> isyncyou_core::policy::DeviceState {
-    *device_state_cell().lock().unwrap_or_else(|e| e.into_inner())
+    *device_state_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Start the embedded engine if not already running. Idempotent. Host-testable (no JNI):

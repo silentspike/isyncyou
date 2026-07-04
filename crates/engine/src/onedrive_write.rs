@@ -280,14 +280,20 @@ fn issue<S: OneDriveWriteSink>(sink: &S, w: &CloudWrite) -> Result<Issued, Strin
         CloudOpKind::Move => sink
             .rename_or_move(&w.target_id, w.new_parent_id.as_deref(), &w.name)
             .map(|_| Issued::Done(String::new())),
-        CloudOpKind::Delete => sink.delete(&w.target_id).map(|_| Issued::Done(String::new())),
+        CloudOpKind::Delete => sink
+            .delete(&w.target_id)
+            .map(|_| Issued::Done(String::new())),
         CloudOpKind::Upload => {
             let bytes = read_local_body(&w.local_path)?;
             sink.upload(&w.target_id, &w.name, &bytes).map(Issued::Done)
         }
         CloudOpKind::Replace => {
             let bytes = read_local_body(&w.local_path)?;
-            match sink.replace_if_match(&w.target_id, &bytes, w.if_match.as_deref().unwrap_or(""))? {
+            match sink.replace_if_match(
+                &w.target_id,
+                &bytes,
+                w.if_match.as_deref().unwrap_or(""),
+            )? {
                 ReplaceOutcome::Replaced(id) => Ok(Issued::Done(id)),
                 ReplaceOutcome::Conflict => Ok(Issued::Conflict),
             }
@@ -374,7 +380,9 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink>(
     now: i64,
 ) -> Result<WriteOutcome, String> {
     if op.state == "applied" {
-        return Ok(WriteOutcome::Applied(op.result_id.clone().unwrap_or_default()));
+        return Ok(WriteOutcome::Applied(
+            op.result_id.clone().unwrap_or_default(),
+        ));
     }
     if op.state == "conflict" {
         return Ok(WriteOutcome::Conflict); // terminal keep-both — nothing to re-issue
@@ -435,8 +443,11 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink>(
             // Etag-guarded re-send from the current on-disk body; a 412 (the cloud changed
             // meanwhile) is a terminal conflict — never a blind overwrite.
             let bytes = read_local_body(&local_path)?;
-            match sink.replace_if_match(&target, &bytes, op.if_match_etag.as_deref().unwrap_or(""))?
-            {
+            match sink.replace_if_match(
+                &target,
+                &bytes,
+                op.if_match_etag.as_deref().unwrap_or(""),
+            )? {
                 ReplaceOutcome::Replaced(id) => WriteOutcome::Applied(id),
                 ReplaceOutcome::Conflict => WriteOutcome::Conflict,
             }
@@ -682,7 +693,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCloud {
         folders: RefCell<Vec<(String, String, String)>>, // (id, parent, name)
-        files: RefCell<Vec<FakeFile>>,                    // (id, parent, name, bytes)
+        files: RefCell<Vec<FakeFile>>,
         etags: RefCell<std::collections::HashMap<String, String>>, // item_id -> current etag
         seq: RefCell<u32>,
         create_calls: RefCell<u32>,
@@ -760,7 +771,9 @@ mod tests {
                 .iter()
                 .any(|(_, p, n, _)| p == parent_id && n == name)
             {
-                return Err(format!("upload conflict: '{name}' exists under {parent_id}"));
+                return Err(format!(
+                    "upload conflict: '{name}' exists under {parent_id}"
+                ));
             }
             let id = {
                 let mut seq = self.seq.borrow_mut();
@@ -794,7 +807,9 @@ mod tests {
                 *seq += 1;
                 format!("etag-{item_id}-{seq}")
             };
-            self.etags.borrow_mut().insert(item_id.to_string(), new_etag);
+            self.etags
+                .borrow_mut()
+                .insert(item_id.to_string(), new_etag);
             if let Some(f) = self
                 .files
                 .borrow_mut()

@@ -693,10 +693,7 @@ impl SharedProgress {
 
     /// A snapshot of the current in-flight transfers (for the read-only endpoint).
     pub fn snapshot(&self) -> Vec<TransferSlot> {
-        self.slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Vec<TransferSlot>) -> R) -> R {
@@ -1146,7 +1143,13 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                 // Already on disk with the same size + mtime — skip the download but still
                 // mark the content-state so `has_body` is true for the mobile body endpoint.
                 store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
-                record_synced_state(store, account, &it.remote_id, &full, it.quickxorhash.clone());
+                record_synced_state(
+                    store,
+                    account,
+                    &it.remote_id,
+                    &full,
+                    it.quickxorhash.clone(),
+                );
                 store.set_content_state(
                     account,
                     SERVICE,
@@ -2493,9 +2496,15 @@ mod tests {
             &(),
         )
         .unwrap();
-        assert_eq!(report.downloaded, 1, "only the offline-scope file is fetched");
+        assert_eq!(
+            report.downloaded, 1,
+            "only the offline-scope file is fetched"
+        );
         // The offline file is materialized to sync_root with the content-state marked.
-        assert_eq!(std::fs::read(dir.path().join("Photos/a.txt")).unwrap(), b"AAAA");
+        assert_eq!(
+            std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
+            b"AAAA"
+        );
         let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
         assert_eq!(a.content_state.as_deref(), Some("materialized"));
         assert_eq!(a.body_location.as_deref(), Some("sync"));
@@ -2516,8 +2525,8 @@ mod tests {
         seed_offline_and_nonscope(&store);
         let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
         let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
-        let cfg = isyncyou_core::SyncConfig::default(); // min_free_bytes = 256 MiB
-        // Zero free bytes < the storage floor → StorageFloor blocks the new download.
+        // Zero free bytes < the storage floor (min_free_bytes = 256 MiB) → StorageFloor blocks it.
+        let cfg = isyncyou_core::SyncConfig::default();
         let low = isyncyou_core::policy::DeviceState::always_on(0);
         let report = materialize_downloads_scoped(
             &store,
