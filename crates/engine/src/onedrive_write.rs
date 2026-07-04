@@ -141,7 +141,9 @@ fn non_empty(s: &str) -> Option<&str> {
 fn issue<S: OneDriveWriteSink>(sink: &S, w: &CloudWrite) -> Result<String, String> {
     match w.kind {
         CloudOpKind::Create => sink.create_folder(&w.target_id, &w.name),
-        CloudOpKind::Rename => sink.rename_or_move(&w.target_id, None, &w.name).map(|_| String::new()),
+        CloudOpKind::Rename => sink
+            .rename_or_move(&w.target_id, None, &w.name)
+            .map(|_| String::new()),
         CloudOpKind::Move => sink
             .rename_or_move(&w.target_id, w.new_parent_id.as_deref(), &w.name)
             .map(|_| String::new()),
@@ -178,7 +180,10 @@ pub fn run_cloud_write<S: OneDriveWriteSink>(
     };
     // Record the intent first. A `false` return means this exact intent was already issued
     // (crash/retry) — recover that row instead of re-issuing blindly.
-    if !store.record_cloud_write(&op, now).map_err(|e| e.to_string())? {
+    if !store
+        .record_cloud_write(&op, now)
+        .map_err(|e| e.to_string())?
+    {
         let existing = store
             .cloud_write_by_key(account, &key)
             .map_err(|e| e.to_string())?
@@ -254,10 +259,15 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink>(
         }
         // The dangerous kind: probe the parent for the name before re-creating.
         CloudOpKind::Create => match sink.find_child_folder(&target, &name)? {
-            Some(id) => id,                            // the interrupted create had landed
+            Some(id) => id,                              // the interrupted create had landed
             None => sink.create_folder(&target, &name)?, // it had not — safe to create
         },
-        other => return Err(format!("recovery unimplemented for kind '{}'", other.as_str())),
+        other => {
+            return Err(format!(
+                "recovery unimplemented for kind '{}'",
+                other.as_str()
+            ))
+        }
     };
     store
         .set_cloud_write_state(&op.op_id, "applied", non_empty(&result_id), None, now)
@@ -296,9 +306,11 @@ fn with_ledger<R>(
         .iter()
         .find(|a| a.id == account)
         .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let secret =
-        crate::restore_key::load_or_create_secret(&acc.archive_root.join(".isyncyou-cloudwrite-secret"))?;
-    let store = Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let secret = crate::restore_key::load_or_create_secret(
+        &acc.archive_root.join(".isyncyou-cloudwrite-secret"),
+    )?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
     let token = crate::auth::resolve_cached_sync_token(cfg, account)?;
     let client = isyncyou_graph::GraphClient::new(token);
     run(&store, &client, &secret)
@@ -454,7 +466,10 @@ mod tests {
         assert_eq!(*cloud.create_calls.borrow(), 1);
         assert_eq!(cloud.count(), 1);
         let (_op_id, key) = create("parent", "Docs").keys(SECRET, ACCT);
-        let row = s.cloud_write_by_key(ACCT, &key).unwrap().expect("ledger row exists");
+        let row = s
+            .cloud_write_by_key(ACCT, &key)
+            .unwrap()
+            .expect("ledger row exists");
         assert_eq!(row.state, "applied");
         assert_eq!(row.op_kind, "create");
         assert_eq!(row.result_id.as_deref(), Some("folder-1"));
@@ -465,13 +480,34 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         let cloud = FakeCloud::default();
         for w in [
-            CloudWrite { kind: CloudOpKind::Rename, target_id: "i1".into(), name: "New".into(), new_parent_id: None, if_match: None },
-            CloudWrite { kind: CloudOpKind::Move, target_id: "i2".into(), name: "N".into(), new_parent_id: Some("p2".into()), if_match: None },
-            CloudWrite { kind: CloudOpKind::Delete, target_id: "i3".into(), name: String::new(), new_parent_id: None, if_match: None },
+            CloudWrite {
+                kind: CloudOpKind::Rename,
+                target_id: "i1".into(),
+                name: "New".into(),
+                new_parent_id: None,
+                if_match: None,
+            },
+            CloudWrite {
+                kind: CloudOpKind::Move,
+                target_id: "i2".into(),
+                name: "N".into(),
+                new_parent_id: Some("p2".into()),
+                if_match: None,
+            },
+            CloudWrite {
+                kind: CloudOpKind::Delete,
+                target_id: "i3".into(),
+                name: String::new(),
+                new_parent_id: None,
+                if_match: None,
+            },
         ] {
             run_cloud_write(&s, ACCT, &w, &cloud, SECRET, 10).unwrap();
             let (_id, key) = w.keys(SECRET, ACCT);
-            assert_eq!(s.cloud_write_by_key(ACCT, &key).unwrap().unwrap().state, "applied");
+            assert_eq!(
+                s.cloud_write_by_key(ACCT, &key).unwrap().unwrap().state,
+                "applied"
+            );
         }
         assert_eq!(*cloud.move_calls.borrow(), 2); // rename + move
         assert_eq!(*cloud.delete_calls.borrow(), 1);
@@ -486,11 +522,18 @@ mod tests {
         let (op_id, _key) = w.keys(SECRET, ACCT);
         // Record intent + go inflight, then the POST LANDS out-of-band...
         let op = CloudWriteOp {
-            op_id: op_id.clone(), account_id: ACCT.into(), service: SERVICE.into(),
-            op_kind: "create".into(), target_id: Some("parent".into()),
-            idempotency_key: w.keys(SECRET, ACCT).1, if_match_etag: None,
-            state: "inflight".into(), result_id: None, intent_json: Some(w.intent_json()),
-            attempts: 1, last_error: None,
+            op_id: op_id.clone(),
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: "create".into(),
+            target_id: Some("parent".into()),
+            idempotency_key: w.keys(SECRET, ACCT).1,
+            if_match_etag: None,
+            state: "inflight".into(),
+            result_id: None,
+            intent_json: Some(w.intent_json()),
+            attempts: 1,
+            last_error: None,
         };
         s.record_cloud_write(&op, 10).unwrap();
         let _landed = cloud.create_folder("parent", "Docs").unwrap(); // the create that landed
@@ -498,9 +541,19 @@ mod tests {
         // [CRASH] before the ledger was set to applied. Boot recovery runs:
         let n = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(*cloud.create_calls.borrow(), 1, "recovery must NOT create a duplicate");
+        assert_eq!(
+            *cloud.create_calls.borrow(),
+            1,
+            "recovery must NOT create a duplicate"
+        );
         assert_eq!(cloud.count(), 1);
-        assert_eq!(s.cloud_write_by_key(ACCT, &w.keys(SECRET, ACCT).1).unwrap().unwrap().state, "applied");
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &w.keys(SECRET, ACCT).1)
+                .unwrap()
+                .unwrap()
+                .state,
+            "applied"
+        );
     }
 
     #[test]
@@ -510,10 +563,18 @@ mod tests {
         let w = create("parent", "Docs");
         let (op_id, key) = w.keys(SECRET, ACCT);
         let op = CloudWriteOp {
-            op_id, account_id: ACCT.into(), service: SERVICE.into(), op_kind: "create".into(),
-            target_id: Some("parent".into()), idempotency_key: key, if_match_etag: None,
-            state: "inflight".into(), result_id: None, intent_json: Some(w.intent_json()),
-            attempts: 1, last_error: None,
+            op_id,
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: "create".into(),
+            target_id: Some("parent".into()),
+            idempotency_key: key,
+            if_match_etag: None,
+            state: "inflight".into(),
+            result_id: None,
+            intent_json: Some(w.intent_json()),
+            attempts: 1,
+            last_error: None,
         };
         s.record_cloud_write(&op, 10).unwrap();
         // [CRASH] the POST never happened → the folder is not in the cloud.
@@ -540,9 +601,21 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         let cloud = FakeCloud::default();
         // Nothing in the cloud (already deleted). A delete op re-issued on recovery succeeds.
-        let w = CloudWrite { kind: CloudOpKind::Delete, target_id: "gone".into(), name: String::new(), new_parent_id: None, if_match: None };
+        let w = CloudWrite {
+            kind: CloudOpKind::Delete,
+            target_id: "gone".into(),
+            name: String::new(),
+            new_parent_id: None,
+            if_match: None,
+        };
         run_cloud_write(&s, ACCT, &w, &cloud, SECRET, 10).unwrap();
         assert_eq!(*cloud.delete_calls.borrow(), 1);
-        assert_eq!(s.cloud_write_by_key(ACCT, &w.keys(SECRET, ACCT).1).unwrap().unwrap().state, "applied");
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &w.keys(SECRET, ACCT).1)
+                .unwrap()
+                .unwrap()
+                .state,
+            "applied"
+        );
     }
 }

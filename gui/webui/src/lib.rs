@@ -2400,7 +2400,11 @@ impl Router {
             (Some(a), Some(i), Some(n)) => (a, i, n),
             _ => return ApiResponse::error(400, "account, id and name are required"),
         };
-        self.onedrive_result(account, &format!("rename id={id}"), h.rename(account, id, name))
+        self.onedrive_result(
+            account,
+            &format!("rename id={id}"),
+            h.rename(account, id, name),
+        )
     }
 
     fn onedrive_move(&self, req: &ApiRequest) -> ApiResponse {
@@ -5643,10 +5647,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             new_parent: Option<&str>,
             name: &str,
         ) -> Result<(), String> {
-            self.moves
-                .lock()
-                .unwrap()
-                .push((id.into(), new_parent.map(str::to_string), name.into()));
+            self.moves.lock().unwrap().push((
+                id.into(),
+                new_parent.map(str::to_string),
+                name.into(),
+            ));
             Ok(())
         }
         fn delete(&self, _a: &str, id: &str) -> Result<(), String> {
@@ -5662,22 +5667,32 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // No handler wired -> 404.
         let (_d0, r0) = setup();
         assert_eq!(
-            r0.route(&post("/api/v1/onedrive/create?account=a&parent=P&name=Docs"))
-                .status,
+            r0.route(&post(
+                "/api/v1/onedrive/create?account=a&parent=P&name=Docs"
+            ))
+            .status,
             404
         );
         // Handler wired but no cap token -> 401; handler not called.
         let (_d1, r1) = setup();
         let f = std::sync::Arc::new(FakeOneDriveWrite::default());
         let router = r1.with_onedrive_write(f.clone(), "cap".into());
-        let no_cap = ApiRequest::new("POST", "/api/v1/onedrive/create?account=a&parent=P&name=Docs");
+        let no_cap = ApiRequest::new(
+            "POST",
+            "/api/v1/onedrive/create?account=a&parent=P&name=Docs",
+        );
         assert_eq!(router.route(&no_cap).status, 401);
         assert!(f.creates.lock().unwrap().is_empty());
         // create with cap -> 200 + new id; handler called with (parent, name).
-        let resp = router.route(&post("/api/v1/onedrive/create?account=a&parent=P&name=Docs"));
+        let resp = router.route(&post(
+            "/api/v1/onedrive/create?account=a&parent=P&name=Docs",
+        ));
         assert_eq!(resp.status, 200);
         assert_eq!(body_json(&resp)["id"], "folder-new");
-        assert_eq!(*f.creates.lock().unwrap(), vec![("P".into(), "Docs".into())]);
+        assert_eq!(
+            *f.creates.lock().unwrap(),
+            vec![("P".into(), "Docs".into())]
+        );
         // rename / move / delete dispatch to the right verb with the right args.
         assert_eq!(
             router
@@ -5685,10 +5700,15 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             200
         );
-        assert_eq!(*f.renames.lock().unwrap(), vec![("i1".into(), "New".into())]);
+        assert_eq!(
+            *f.renames.lock().unwrap(),
+            vec![("i1".into(), "New".into())]
+        );
         assert_eq!(
             router
-                .route(&post("/api/v1/onedrive/move?account=a&id=i2&parent=P2&name=N"))
+                .route(&post(
+                    "/api/v1/onedrive/move?account=a&id=i2&parent=P2&name=N"
+                ))
                 .status,
             200
         );
