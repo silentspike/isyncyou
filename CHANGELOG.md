@@ -31,6 +31,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   handler is wired into the shared live router for both desktop and mobile (#654).
   - Note: `move-out-of-protected` biometric-gating is **deferred to #655/#656** — the offline-scope work
     owns the "protected" semantics; the `delete` gate covers the destructive case today.
+- `webui`+`app-host`+`app.js`: Mode-1 online OneDrive browsing on mobile — `driveLoad` renders the live
+  `/api/v1/onedrive/children` tree (folders/files, drill-down, breadcrumb up-nav) instead of the empty store,
+  and tapping a file opens it on-demand via a new session-gated `GET /api/v1/onedrive/open?account&id&name`
+  (`OneDriveOpenHandler` + `DaemonOneDriveOpen`, live `download_content`, served inertly, no store write) (#649).
 
 ## [1.0.0] — 2026-06-26
 
