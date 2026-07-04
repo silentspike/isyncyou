@@ -89,6 +89,32 @@ pub fn blob_key_id(blob: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes([blob[8], blob[9], blob[10], blob[11]]))
 }
 
+/// The **plaintext** byte length a sealed blob encodes in its header — lets a caller compare
+/// an on-disk sealed file's *logical* size against a stored (cloud/plaintext) size without
+/// decrypting. `None` if the blob is not a sealed envelope (e.g. a desktop plaintext file).
+pub fn blob_plaintext_len(blob: &[u8]) -> Option<u64> {
+    if blob.len() < HEADER_LEN || &blob[0..4] != MAGIC {
+        return None;
+    }
+    Some(u64::from_be_bytes([
+        blob[16], blob[17], blob[18], blob[19], blob[20], blob[21], blob[22], blob[23],
+    ]))
+}
+
+/// The plaintext size of the (possibly sealed) file at `path`: the envelope header's
+/// `plaintext_len` for a sealed file, or the raw file length for a plaintext file (desktop) /
+/// on any read error. Reads only the 32-byte header, never the whole body. Use this to compare
+/// a materialized file's logical size to a stored plaintext size regardless of sealing.
+pub fn on_disk_plaintext_len(path: &Path) -> u64 {
+    use std::io::Read;
+    let raw_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut hdr = [0u8; HEADER_LEN];
+    match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut hdr).map(|_| ())) {
+        Ok(()) => blob_plaintext_len(&hdr).unwrap_or(raw_len),
+        Err(_) => raw_len,
+    }
+}
+
 /// Seal `plaintext` into a versioned, authenticated envelope with `key` (identified by
 /// `key_id`). The output contains no plaintext bytes.
 pub fn seal(plaintext: &[u8], key: &BodyKey, key_id: u32) -> Vec<u8> {
@@ -280,6 +306,36 @@ mod tests {
     use super::*;
 
     const KEY: BodyKey = [7u8; 32];
+
+    #[test]
+    fn on_disk_plaintext_len_reads_the_header_not_the_sealed_size() {
+        // A sealed blob is larger than its plaintext; the header encodes the plaintext length so
+        // a caller can compare a materialized file's logical size without decrypting (#655).
+        let sealed = seal(b"hello world", &KEY, 1);
+        assert!(
+            sealed.len() > 11,
+            "sealed blob carries header + tag overhead"
+        );
+        assert_eq!(blob_plaintext_len(&sealed), Some(11));
+        assert_eq!(blob_plaintext_len(b"not an envelope"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir.path().join("sealed.bin");
+        std::fs::write(&sp, &sealed).unwrap();
+        assert_eq!(
+            on_disk_plaintext_len(&sp),
+            11,
+            "sealed file → plaintext length"
+        );
+        let pp = dir.path().join("plain.bin");
+        std::fs::write(&pp, b"raw plaintext here").unwrap();
+        assert_eq!(
+            on_disk_plaintext_len(&pp),
+            18,
+            "plaintext file → raw length"
+        );
+        assert_eq!(on_disk_plaintext_len(&dir.path().join("missing")), 0);
+    }
 
     #[test]
     fn roundtrips_empty_small_and_multichunk() {

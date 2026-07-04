@@ -1761,12 +1761,47 @@ impl DaemonShare {
 /// handlers + account-auth + settings + the SSE bus. The desktop daemon extends the
 /// result with restore/share/push/sync-control; the standalone mobile client uses it
 /// as-is. `gate` serializes store access against an external syncer (daemon only).
+/// Re-export so callers of [`build_live_router`] can name the progress-tracker type without a
+/// direct `isyncyou-connectors` dependency (the mobile crate has none).
+pub use isyncyou_connectors::SharedProgress;
+
+/// Bridges the engine's in-flight transfer tracker (the connectors [`SharedProgress`] the
+/// offline pass writes) to the WebUI [`TransferProgress`] endpoint (#655 / S-OM.9). Read-only:
+/// `transfers()` snapshots the shared set. `cancel` is a no-op in #655 (the offline pass is
+/// synchronous per-file); true cancellation is #656.
+///
+/// [`SharedProgress`]: isyncyou_connectors::SharedProgress
+/// [`TransferProgress`]: isyncyou_webui::TransferProgress
+pub struct DaemonTransfer {
+    progress: isyncyou_connectors::SharedProgress,
+}
+
+impl isyncyou_webui::TransferProgress for DaemonTransfer {
+    fn transfers(&self) -> Vec<isyncyou_webui::TransferState> {
+        self.progress
+            .snapshot()
+            .into_iter()
+            .map(|s| isyncyou_webui::TransferState {
+                id: s.id,
+                name: s.name,
+                bytes_done: s.bytes_done,
+                bytes_total: s.bytes_total,
+                retry_after_secs: s.retry_after_secs,
+            })
+            .collect()
+    }
+    fn cancel(&self, _id: &str) -> bool {
+        false // #655 has no cancellable channel; true cancellation is #656.
+    }
+}
+
 pub fn build_live_router(
     cfg: Config,
     gate: Option<Arc<Mutex<()>>>,
     events: Arc<isyncyou_webui::EventBus>,
     config_path: PathBuf,
     live_interval: Arc<AtomicU64>,
+    progress: isyncyou_connectors::SharedProgress,
 ) -> isyncyou_webui::Router {
     // The experimental subscription login reads its local recipe + stores its token
     // next to the config file (on mobile that is the app-private filesDir).
@@ -1845,6 +1880,12 @@ pub fn build_live_router(
                 as Arc<dyn isyncyou_webui::OneDriveWriteHandler>,
             mint_cap_token(),
         )
+        // #655: in-flight offline-transfer progress (the engine's SharedProgress) surfaced at
+        // GET /api/v1/onedrive/transfers. Empty on desktop (the offline pass is mobile-only).
+        .with_transfers(
+            Arc::new(DaemonTransfer { progress }) as Arc<dyn isyncyou_webui::TransferProgress>,
+            mint_cap_token(),
+        )
         .with_events(events)
 }
 
@@ -1887,6 +1928,32 @@ mod tests {
     }
 
     #[test]
+    fn daemon_transfer_surfaces_shared_progress_at_endpoint() {
+        // The engine's SharedProgress (what the offline pass writes) is read back through
+        // DaemonTransfer at GET /api/v1/onedrive/transfers (#655).
+        use isyncyou_connectors::ProgressSink;
+        let progress = SharedProgress::new();
+        progress.begin("i1", "photo.jpg", 1000);
+        progress.advance("i1", 400);
+        let events = Arc::new(isyncyou_webui::EventBus::new());
+        let router = build_live_router(
+            Config::default(),
+            None,
+            events,
+            PathBuf::from("/x/isyncyou.toml"),
+            Arc::new(AtomicU64::new(5)),
+            progress.clone(),
+        );
+        let resp = router.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["count"].as_u64(), Some(1));
+        assert_eq!(v["transfers"][0]["name"].as_str(), Some("photo.jpg"));
+        assert_eq!(v["transfers"][0]["bytes_done"].as_u64(), Some(400));
+        assert_eq!(v["transfers"][0]["bytes_total"].as_u64(), Some(1000));
+    }
+
+    #[test]
     fn mobile_live_router_wires_share_but_omits_restore() {
         // #89 + #onedrive-mobile 0.9 profile contract: build_live_router wires the live
         // handlers AND (now) share, but NOT the daemon-only restore-cloud. restore POSTs
@@ -1900,6 +1967,7 @@ mod tests {
             events,
             PathBuf::from("/x/isyncyou.toml"),
             Arc::new(AtomicU64::new(5)),
+            SharedProgress::new(),
         );
         assert_eq!(
             router
