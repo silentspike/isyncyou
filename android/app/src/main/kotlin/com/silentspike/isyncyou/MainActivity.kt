@@ -3,8 +3,11 @@ package com.silentspike.isyncyou
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.StatFs
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
@@ -235,7 +238,34 @@ class MainActivity : FragmentActivity() {
         }
         // nativeStart is idempotent, so on Activity recreation the same engine reloads.
         android.util.Log.i(TAG, "engine ready (in-process), loading $APP_ORIGIN")
+        pushDeviceState()
         web.loadUrl("$APP_ORIGIN/")
+    }
+
+    /**
+     * Push the current device transfer conditions to the engine (#onedrive-mobile 0.9 / S-OM.9):
+     * whether the active network is metered, the device is charging, and the free bytes on the
+     * sync volume. The offline pass's policy gate reads these (storage floor / Wi-Fi-only /
+     * charging-only). Best-effort — a read failure leaves the engine's last value (the fail-open
+     * default at start), never crashing the UI.
+     */
+    private fun pushDeviceState() {
+        try {
+            val metered =
+                getSystemService(ConnectivityManager::class.java)?.isActiveNetworkMetered ?: false
+            val charging = getSystemService(BatteryManager::class.java)?.isCharging ?: true
+            val freeBytes = StatFs(filesDir.absolutePath).availableBytes
+            NativeEngine.nativeDeviceState(metered, charging, freeBytes)
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "pushDeviceState failed", t)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh the device conditions on return to the foreground (cheap; the engine's offline
+        // pass reads the latest each cycle). Safe before the engine is up — it only sets a global.
+        pushDeviceState()
     }
 
     /** JS bridge: the web UI reads the session token to gate its loopback API calls. */

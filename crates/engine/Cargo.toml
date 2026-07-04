@@ -22,6 +22,10 @@ serde_json = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 
+[dev-dependencies]
+# Temp files for the ledger Upload/Replace body-source tests (#655).
+tempfile = "3"
+
 [features]
 # Desktop/CLI/daemon keep both defaults; the Android mobile crate depends on the
 # engine with `default-features = false` (no D-Bus keyring, plain sqlite store).
