@@ -1,10 +1,13 @@
 name: Release
 
-# Fast RCs: every merge to main builds binaries and publishes an RC prerelease.
-# A semver tag (vX.Y.Z) publishes a full release.
+# RCs are cut deliberately — NOT on every main merge. Run this workflow manually
+# (workflow_dispatch from `main`) to build binaries and publish a v1.0.0-rc.<run>
+# prerelease from the current main commit. A semver tag (vX.Y.Z) then publishes a full
+# release, reusing that RC's byte-identical APK (build-once / promote-many, REQ-AND-005).
+# main can advance freely without publishing anything; cutting a release is a two-step
+# deliberate act: dispatch an RC from the target commit, then tag that same commit.
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
@@ -247,7 +250,9 @@ jobs:
             dist/*.cosign.bundle
             dist/isyncyou/
 
-      - name: Publish RC prerelease (on push to main)
+      - name: Publish RC prerelease (manual dispatch from main)
+        # workflow_dispatch from `main` sets github.ref to refs/heads/main; a tag push is
+        # handled by the stable-release step below, so the two never both fire.
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
