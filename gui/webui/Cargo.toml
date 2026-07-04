@@ -15,6 +15,8 @@ isyncyou-store = { path = "../../crates/store", default-features = false }
 isyncyou-connectors = { path = "../../crates/connectors", default-features = false }
 # Battle-tested allowlist HTML sanitizer for the mail viewer (MIT).
 ammonia = "4"
+# Decode base64 request bodies over the JSON bridge (#657 in-app upload/replace).
+base64 = "0.22"
 
 [features]
 # Forward the store at-rest-encryption profile (default-on for desktop). The
