@@ -21,7 +21,7 @@
 //! - `POST /api/v1/restore?account&service&id` → capability-token cloud restore
 //! - `POST /api/v1/sync/{pause,resume,now}`  → capability-token sync control
 
-use isyncyou_core::Config;
+use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -346,6 +346,13 @@ pub trait OneDriveListHandler: Send + Sync {
     fn children(&self, account: &str, folder: &str) -> Result<Vec<serde_json::Value>, String>;
 }
 
+/// Downloads a OneDrive item's content live by id for on-demand open (#649, Mode 1
+/// online). No store write — the bytes are served inertly and not persisted as a
+/// tracked item. Injected by the daemon/mobile engine; `None` => the endpoint 404s.
+pub trait OneDriveOpenHandler: Send + Sync {
+    fn download(&self, account: &str, id: &str) -> Result<Vec<u8>, String>;
+}
+
 /// Controls the daemon's background scheduled sync from the UI: pause/resume the
 /// scheduler and trigger an immediate pass. Injected by the daemon.
 pub trait SyncControl: Send + Sync {
@@ -400,6 +407,25 @@ pub trait SettingsHandler: Send + Sync {
     /// Set the active cloud-poll interval (seconds); the impl clamps to a sane
     /// range, updates the live value, and persists it to the config file.
     fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String>;
+}
+
+/// Reads and persists a OneDrive account's per-folder mode policy (#651) on behalf of
+/// the mode GET/POST. `modes` reloads from the config on each call so a prior POST is
+/// reflected immediately — the `Router` holds `config` by value (a build-time snapshot),
+/// so a GET served from that snapshot would go stale. `set_folder` loads → mutates →
+/// validates → saves the config file. Injected by the daemon/mobile engine; the read-only
+/// CLI `serve` does not set it, so the mode POST is refused there (the GET then falls back
+/// to the static config).
+pub trait OneDriveModeHandler: Send + Sync {
+    /// One account's current mode policy (default + per-folder overrides), read fresh.
+    fn modes(&self, account: &str) -> Result<OneDriveModes, String>;
+    /// Set (`Some`) or clear (`None`) one folder's explicit mode override, then persist.
+    fn set_folder(
+        &self,
+        account: &str,
+        folder_id: &str,
+        mode: Option<OneDriveMode>,
+    ) -> Result<(), String>;
 }
 
 /// Performs the live-mail **write** verbs on behalf of a cap-token POST (#561).
@@ -705,6 +731,9 @@ pub struct Router {
     /// Optional live OneDrive folder-listing handler (the daemon's/mobile's).
     /// Enables the online-browse children GET; `None` => it 404s (read-only CLI).
     onedrive_list: Option<std::sync::Arc<dyn OneDriveListHandler>>,
+    /// Optional live OneDrive on-demand open handler (the daemon's/mobile's). Enables
+    /// the online content-fetch GET; `None` => it 404s (the read-only CLI `serve`).
+    onedrive_open: Option<std::sync::Arc<dyn OneDriveOpenHandler>>,
     /// Optional integrity-verify handler (the daemon's). `None` => the verify
     /// POST is refused (the read-only CLI `serve`).
     verify: Option<std::sync::Arc<dyn VerifyHandler>>,
@@ -746,6 +775,12 @@ pub struct Router {
     onedrive_write: Option<std::sync::Arc<dyn OneDriveWriteHandler>>,
     /// Separate capability token for OneDrive cloud-write POSTs.
     onedrive_write_cap_token: Option<String>,
+    /// Optional OneDrive per-folder mode handler (#651): fresh mode reads + persisted
+    /// set/clear. `None` => the mode POST is refused (read-only CLI `serve`); the GET
+    /// then falls back to the static config.
+    onedrive_mode: Option<std::sync::Arc<dyn OneDriveModeHandler>>,
+    /// Separate capability token for the mode POST (distinct blast radius).
+    onedrive_mode_cap_token: Option<String>,
     /// Optional account-auth handler (#68): device-code sign-in + sign-out. `None`
     /// => the account menu only switches between already-configured accounts.
     account_auth: Option<std::sync::Arc<dyn AccountAuthHandler>>,
@@ -811,6 +846,7 @@ impl Router {
             hydrations: None,
             onedrive_info: None,
             onedrive_list: None,
+            onedrive_open: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -827,6 +863,8 @@ impl Router {
             onenote_write_cap_token: None,
             onedrive_write: None,
             onedrive_write_cap_token: None,
+            onedrive_mode: None,
+            onedrive_mode_cap_token: None,
             account_auth: None,
             account_cap_token: None,
             push: None,
@@ -857,6 +895,7 @@ impl Router {
             hydrations: None,
             onedrive_info: None,
             onedrive_list: None,
+            onedrive_open: None,
             verify: None,
             verify_cap_token: None,
             settings_handler: None,
@@ -873,6 +912,8 @@ impl Router {
             onenote_write_cap_token: None,
             onedrive_write: None,
             onedrive_write_cap_token: None,
+            onedrive_mode: None,
+            onedrive_mode_cap_token: None,
             account_auth: None,
             account_cap_token: None,
             push: None,
@@ -1044,6 +1085,12 @@ impl Router {
         self
     }
 
+    /// Enable the live OneDrive on-demand open (content fetch) GET (builder style).
+    pub fn with_onedrive_open(mut self, open: std::sync::Arc<dyn OneDriveOpenHandler>) -> Self {
+        self.onedrive_open = Some(open);
+        self
+    }
+
     /// Enable the SSE `/api/v1/events` change stream (builder style).
     pub fn with_events(mut self, events: std::sync::Arc<EventBus>) -> Self {
         self.events = Some(events);
@@ -1063,6 +1110,18 @@ impl Router {
     ) -> Self {
         self.settings_handler = Some(handler);
         self.settings_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable the OneDrive per-folder mode POST + fresh mode reads, guarded by
+    /// `cap_token` (builder style) (#651).
+    pub fn with_onedrive_mode(
+        mut self,
+        handler: std::sync::Arc<dyn OneDriveModeHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.onedrive_mode = Some(handler);
+        self.onedrive_mode_cap_token = Some(cap_token);
         self
     }
 
@@ -1369,6 +1428,7 @@ impl Router {
                 "/api/v1/onedrive/rename" => self.onedrive_rename(req),
                 "/api/v1/onedrive/move" => self.onedrive_move(req),
                 "/api/v1/onedrive/delete" => self.onedrive_delete(req),
+                "/api/v1/onedrive/mode" => self.onedrive_set_mode(req),
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
                 "/api/v1/account/signout" => self.account_signout(req),
@@ -1425,6 +1485,13 @@ impl Router {
                     .replace(
                         "__SETTINGS_CAP_TOKEN__",
                         self.settings_cap_token.as_deref().unwrap_or(""),
+                    )
+                    // #651 server-side half of the cap bridge; app.js grows the
+                    // `__ONEDRIVE_MODE_CAP_TOKEN__` placeholder + `CAP.onedriveMode` in
+                    // #652. A no-op until then (the placeholder isn't in APP_JS yet).
+                    .replace(
+                        "__ONEDRIVE_MODE_CAP_TOKEN__",
+                        self.onedrive_mode_cap_token.as_deref().unwrap_or(""),
                     )
                     .replace(
                         "__MAILWRITE_CAP_TOKEN__",
@@ -1497,9 +1564,11 @@ impl Router {
             "/api/v1/hydrations" => self.hydrations_state(),
             "/api/v1/onedrive/transfers" => self.transfers_state(),
             "/api/v1/onedrive/policy" => self.policy_state(),
+            "/api/v1/onedrive/mode" => self.onedrive_mode(req),
             "/api/v1/drive" => self.drive_info(req),
             "/api/v1/permissions" => self.item_permissions(req),
             "/api/v1/onedrive/children" => self.onedrive_children(req),
+            "/api/v1/onedrive/open" => self.onedrive_open(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
             "/api/v1/debug/stats" => self.debug_stats(),
             _ => ApiResponse::error(404, "not found"),
@@ -3043,6 +3112,92 @@ impl Router {
         }))
     }
 
+    /// `GET /api/v1/onedrive/mode?account=…` — the account's OneDrive mode policy
+    /// (default + per-folder overrides) (#651). Read-only. With the mode handler wired the
+    /// read is **fresh** (reflects a prior POST); without it (read-only `serve`) it falls
+    /// back to the static in-memory config.
+    fn onedrive_mode(&self, req: &ApiRequest) -> ApiResponse {
+        let account = match req.q("account") {
+            Some(a) if !a.is_empty() => a,
+            _ => return ApiResponse::error(400, "account is required"),
+        };
+        let modes = match &self.onedrive_mode {
+            Some(h) => match h.modes(account) {
+                Ok(m) => m,
+                Err(e) => return ApiResponse::error(500, &format!("mode: {e}")),
+            },
+            None => self
+                .config
+                .onedrive_modes
+                .get(account)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let folder_modes: serde_json::Map<String, Value> = modes
+            .folder_modes
+            .iter()
+            .map(|(id, m)| (id.clone(), Value::from(m.as_str())))
+            .collect();
+        ApiResponse::ok_json(&json!({
+            "account": account,
+            "default_mode": modes.default_mode.as_str(),
+            "folder_modes": folder_modes,
+        }))
+    }
+
+    /// `POST /api/v1/onedrive/mode?account=…&folder=…&mode=online|sync|offline` — set a
+    /// folder's explicit OneDrive mode override; an empty/absent `mode` **clears** it
+    /// (#651). Cap-token-gated and audited (`audit:onedrive-mode`). Persists via the
+    /// injected mode handler (`Config::load → mutate → validate → save`).
+    fn onedrive_set_mode(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_mode {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "OneDrive mode is not editable on this server"),
+        };
+        if !Self::cap_ok(&self.onedrive_mode_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let (account, folder) = match (req.q("account"), req.q("folder")) {
+            (Some(a), Some(f)) if !a.is_empty() && !f.is_empty() => (a, f),
+            _ => return ApiResponse::error(400, "account and folder are required"),
+        };
+        // `mode` present + non-empty => set; empty/absent => clear the override. Parsed
+        // via serde so it stays symmetric with `OneDriveMode::as_str` (online/sync/offline).
+        let mode: Option<OneDriveMode> = match req.q("mode").filter(|m| !m.is_empty()) {
+            Some(m) => match serde_json::from_str::<OneDriveMode>(&format!("\"{m}\"")) {
+                Ok(parsed) => Some(parsed),
+                Err(_) => return ApiResponse::error(400, "mode must be online, sync or offline"),
+            },
+            None => None,
+        };
+        let summary = format!(
+            "mode-set account={account} folder={folder} mode={}",
+            mode.map(|m| m.as_str()).unwrap_or("clear")
+        );
+        if let Err(e) = self.audit_account(account, "audit:onedrive-mode", "started", &summary) {
+            return ApiResponse::error(500, &format!("audit: {e}"));
+        }
+        match handler.set_folder(account, folder, mode) {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:onedrive-mode", "ok", &summary);
+                ApiResponse::ok_json(&json!({
+                    "account": account,
+                    "folder": folder,
+                    "mode": mode.map(|m| m.as_str()),
+                }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:onedrive-mode",
+                    "error",
+                    &format!("{summary}: {e}"),
+                );
+                ApiResponse::error(500, &format!("mode: {e}"))
+            }
+        }
+    }
+
     /// The OneDrive storage quota for an account — a live Graph call via the
     /// daemon's handler (#564). 404 when no handler (read-only CLI `serve`).
     fn drive_info(&self, req: &ApiRequest) -> ApiResponse {
@@ -3097,7 +3252,61 @@ impl Router {
         };
         let folder = req.q("folder").unwrap_or("");
         match handler.children(account, folder) {
-            Ok(children) => ApiResponse::ok_json(&json!({ "children": children })),
+            Ok(mut children) => {
+                // #651: annotate each child with its effective OneDrive mode. Live Graph
+                // children carry no parent chain, so F's ancestry (deepest-first, F's
+                // parents up toward the root) is supplied by the caller via `&ancestry=`
+                // (comma-separated ids); absent => folder-level resolution. `folder` (F) is
+                // always the immediate parent of every child, so it heads each child's
+                // ancestry; a child's own id (a subfolder's override) wins over inheritance.
+                let ancestry_param = req.q("ancestry").unwrap_or("");
+                let mut child_ancestry: Vec<&str> = Vec::new();
+                if !folder.is_empty() {
+                    child_ancestry.push(folder);
+                }
+                child_ancestry.extend(ancestry_param.split(',').filter(|s| !s.is_empty()));
+                let modes = match &self.onedrive_mode {
+                    Some(h) => h.modes(account).unwrap_or_default(),
+                    None => self
+                        .config
+                        .onedrive_modes
+                        .get(account)
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                for child in &mut children {
+                    let id = child.get("id").and_then(Value::as_str).map(str::to_string);
+                    if let (Some(id), Some(obj)) = (id, child.as_object_mut()) {
+                        let em = modes.effective_mode(&id, &child_ancestry).as_str();
+                        obj.insert("effective_mode".to_string(), Value::from(em));
+                    }
+                }
+                ApiResponse::ok_json(&json!({ "children": children }))
+            }
+            Err(e) => ApiResponse::error(502, &e),
+        }
+    }
+
+    /// On-demand OneDrive content by id (#649, Mode 1 online): a live Graph download,
+    /// served inertly (safe content-type from `name`). 404 when no handler; 400 without
+    /// account/id. No store row is written (Mode 1 keeps no metadata).
+    fn onedrive_open(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.onedrive_open {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "OneDrive open is not enabled on this server"),
+        };
+        let (account, id) = match (req.q("account"), req.q("id")) {
+            (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        let name = req.q("name").unwrap_or("");
+        match handler.download(account, id) {
+            Ok(bytes) => ApiResponse {
+                status: 200,
+                content_type: safe_content_type(name).into(),
+                body: bytes,
+                headers: Vec::new(),
+            },
             Err(e) => ApiResponse::error(502, &e),
         }
     }
@@ -5404,6 +5613,312 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let ok = ApiRequest::get("/api/v1/onedrive/children?account=a&folder=F")
             .with_session_token(Some("sess-tok-0001".into()));
         assert_ne!(router.route(&ok).status, 401); // correct token passes the gate -> 200
+    }
+
+    // ---- #651: OneDrive per-folder mode endpoint + per-item effective_mode ----
+
+    /// In-memory mode handler for the webui unit tests: `set_folder` mutates and `modes`
+    /// reads back, exercising the Router's persist/read-fresh delegation without a config
+    /// file (the real file persistence lives in app-host's `DaemonOneDriveMode`).
+    #[derive(Default)]
+    struct FakeOneDriveMode(std::sync::Mutex<std::collections::BTreeMap<String, OneDriveModes>>);
+    impl OneDriveModeHandler for FakeOneDriveMode {
+        fn modes(&self, account: &str) -> Result<OneDriveModes, String> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(account)
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn set_folder(
+            &self,
+            account: &str,
+            folder_id: &str,
+            mode: Option<OneDriveMode>,
+        ) -> Result<(), String> {
+            let mut g = self.0.lock().unwrap();
+            let m = g.entry(account.to_string()).or_default();
+            match mode {
+                Some(md) => {
+                    m.folder_modes.insert(folder_id.to_string(), md);
+                }
+                None => {
+                    m.folder_modes.remove(folder_id);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A list handler returning one file child + one subfolder child, so the
+    /// `effective_mode` enrichment can be checked for inheritance and own-override.
+    struct ModeFakeList;
+    impl OneDriveListHandler for ModeFakeList {
+        fn children(
+            &self,
+            _account: &str,
+            _folder: &str,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Ok(vec![
+                json!({ "id": "f.txt", "name": "f.txt", "size": 3, "file": {} }),
+                json!({ "id": "sub", "name": "sub", "folder": { "childCount": 0 } }),
+            ])
+        }
+    }
+
+    // AC1: POST persists + GET reflects; cap-gated (401); no handler (404 POST / static GET);
+    // invalid mode (400); missing folder (400).
+    #[test]
+    fn onedrive_mode_post_persists_and_get_reflects() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        // No mode handler wired -> POST 404 (read-only serve); GET still 200 (static config).
+        let (_d0, r0) = setup();
+        assert_eq!(
+            r0.route(&post(
+                "/api/v1/onedrive/mode?account=a&folder=Photos&mode=sync"
+            ))
+            .status,
+            404
+        );
+        assert_eq!(
+            r0.route(&ApiRequest::get("/api/v1/onedrive/mode?account=a"))
+                .status,
+            200
+        );
+
+        let (_d, r1) = setup();
+        let router = r1.with_onedrive_mode(
+            std::sync::Arc::new(FakeOneDriveMode::default()),
+            "modecap".into(),
+        );
+        // POST without a cap token -> 401.
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=sync"
+                ))
+                .status,
+            401
+        );
+        // Invalid mode -> 400.
+        assert_eq!(
+            router
+                .route(&post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=bogus"
+                ))
+                .status,
+            400
+        );
+        // Missing folder -> 400.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/mode?account=a&mode=sync"))
+                .status,
+            400
+        );
+        // Set Photos=sync -> 200; GET reflects it.
+        assert_eq!(
+            router
+                .route(&post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=sync"
+                ))
+                .status,
+            200
+        );
+        let got = body_json(&router.route(&ApiRequest::get("/api/v1/onedrive/mode?account=a")));
+        assert_eq!(got["default_mode"], "online");
+        assert_eq!(
+            got.pointer("/folder_modes/Photos").and_then(Value::as_str),
+            Some("sync")
+        );
+        // Clear (empty mode) -> the override is gone.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/mode?account=a&folder=Photos&mode="))
+                .status,
+            200
+        );
+        let cleared = body_json(&router.route(&ApiRequest::get("/api/v1/onedrive/mode?account=a")));
+        assert!(cleared.pointer("/folder_modes/Photos").is_none());
+    }
+
+    // AC1b: the POST parse path is serde, symmetric with `OneDriveMode::as_str`. Proves
+    // "valid -> the exact variant" (a #[serde(rename)]<->as_str mismatch would fail here),
+    // not merely "invalid -> 400".
+    #[test]
+    fn onedrive_mode_serde_round_trips_with_as_str() {
+        for (s, want) in [
+            ("online", OneDriveMode::Online),
+            ("sync", OneDriveMode::Sync),
+            ("offline", OneDriveMode::Offline),
+        ] {
+            let parsed: OneDriveMode =
+                serde_json::from_str(&format!("\"{s}\"")).expect("valid mode parses");
+            assert_eq!(
+                parsed, want,
+                "\"{s}\" must deserialize to the matching variant"
+            );
+            // as_str -> from_str round-trips to the same variant, and as_str == the token.
+            let back: OneDriveMode =
+                serde_json::from_str(&format!("\"{}\"", want.as_str())).unwrap();
+            assert_eq!(back, want);
+            assert_eq!(want.as_str(), s);
+        }
+        assert!(serde_json::from_str::<OneDriveMode>("\"bogus\"").is_err());
+    }
+
+    // AC2: children carry the correct effective_mode. Photos=Offline (an ancestor of the
+    // browsed folder) + sub=Sync (a child's own override). WITH ancestry the file inherits
+    // Offline from Photos; WITHOUT ancestry it falls back to the account default; the
+    // subfolder's own override wins in both.
+    #[test]
+    fn onedrive_children_carry_effective_mode() {
+        let mode = std::sync::Arc::new(FakeOneDriveMode::default());
+        mode.set_folder("a", "Photos", Some(OneDriveMode::Offline))
+            .unwrap();
+        mode.set_folder("a", "sub", Some(OneDriveMode::Sync))
+            .unwrap();
+        let (_d, r) = setup();
+        let router = r
+            .with_onedrive_list(std::sync::Arc::new(ModeFakeList))
+            .with_onedrive_mode(mode, "modecap".into());
+
+        // WITH ancestry: browsing "2024" whose parent chain is Photos -> root.
+        let v = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/onedrive/children?account=a&folder=2024&ancestry=Photos,root",
+        )));
+        assert_eq!(
+            v.pointer("/children/0/id").and_then(Value::as_str),
+            Some("f.txt")
+        );
+        // file inherits Photos=Offline through the ancestry
+        assert_eq!(
+            v.pointer("/children/0/effective_mode")
+                .and_then(Value::as_str),
+            Some("offline")
+        );
+        // subfolder's own override wins
+        assert_eq!(
+            v.pointer("/children/1/effective_mode")
+                .and_then(Value::as_str),
+            Some("sync")
+        );
+
+        // WITHOUT ancestry: the file resolves at folder-level (2024 has no override) -> the
+        // account default (online); the subfolder's own override still wins.
+        let v2 = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/onedrive/children?account=a&folder=2024",
+        )));
+        assert_eq!(
+            v2.pointer("/children/0/effective_mode")
+                .and_then(Value::as_str),
+            Some("online")
+        );
+        assert_eq!(
+            v2.pointer("/children/1/effective_mode")
+                .and_then(Value::as_str),
+            Some("sync")
+        );
+    }
+
+    // AC3: a mode POST writes a durable audit run (audit:onedrive-mode, started + ok).
+    #[test]
+    fn onedrive_mode_post_is_audited() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let (_d, r) = setup();
+        let store_path = r.config.accounts[0].archive_root.join(".isyncyou-store.db");
+        let router = r.with_onedrive_mode(
+            std::sync::Arc::new(FakeOneDriveMode::default()),
+            "modecap".into(),
+        );
+        assert_eq!(
+            router
+                .route(&post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline"
+                ))
+                .status,
+            200
+        );
+        let store = Store::open(&store_path).unwrap();
+        let runs = store.recent_runs("a", 50).unwrap();
+        let audit: Vec<&str> = runs
+            .iter()
+            .filter(|r| r.kind == "audit:onedrive-mode")
+            .map(|r| r.status.as_str())
+            .collect();
+        assert!(
+            audit.contains(&"started"),
+            "expected a started audit row, got {audit:?}"
+        );
+        assert!(
+            audit.contains(&"ok"),
+            "expected an ok audit row, got {audit:?}"
+        );
+        assert!(runs.iter().any(|r| r.kind == "audit:onedrive-mode"
+            && r.summary.contains("folder=Photos")
+            && r.summary.contains("mode=offline")));
+    }
+
+    struct FakeOneDriveOpen;
+    impl OneDriveOpenHandler for FakeOneDriveOpen {
+        fn download(&self, _account: &str, _id: &str) -> Result<Vec<u8>, String> {
+            Ok(b"PNGDATA".to_vec())
+        }
+    }
+
+    #[test]
+    fn onedrive_open_route_returns_bytes_or_404() {
+        let (_d, router) = setup();
+        // no handler -> 404
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/onedrive/open?account=a&id=x&name=p.png"
+                ))
+                .status,
+            404
+        );
+        let router = router.with_onedrive_open(std::sync::Arc::new(FakeOneDriveOpen));
+        // missing id -> 400
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/onedrive/open?account=a"))
+                .status,
+            400
+        );
+        // handler + account + id -> 200 + raw bytes + content-type from `name`
+        let resp = router.route(&ApiRequest::get(
+            "/api/v1/onedrive/open?account=a&id=x&name=p.png",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"PNGDATA".to_vec());
+        assert_eq!(resp.content_type, "image/png");
+        // a non-image name is served inertly as text/plain
+        let txt = router.route(&ApiRequest::get(
+            "/api/v1/onedrive/open?account=a&id=x&name=notes.pdf",
+        ));
+        assert_eq!(txt.content_type, "text/plain; charset=utf-8");
+    }
+
+    #[test]
+    fn onedrive_open_is_session_gated() {
+        // The open GET is 401 without a token on the mobile profile — exactly 401 (not
+        // 404/200), proving the /api/v1/* gate catches this new path.
+        let router = Router::new(Config::default())
+            .with_onedrive_open(std::sync::Arc::new(FakeOneDriveOpen))
+            .with_session_token("sess-tok-0001".into());
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/onedrive/open?account=a&id=x"))
+                .status,
+            401
+        );
+        let ok = ApiRequest::get("/api/v1/onedrive/open?account=a&id=x")
+            .with_session_token(Some("sess-tok-0001".into()));
+        assert_ne!(router.route(&ok).status, 401);
     }
 
     #[test]
