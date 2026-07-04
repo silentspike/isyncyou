@@ -47,10 +47,13 @@ pub use mime::{
     InlineImage, MailPreview,
 };
 pub use onedrive::{
-    apply_local_deletes, apply_local_modifies, incremental_sync, local_rel_path,
-    materialize_downloads, pending_local_deletes, push_delete, push_local_creates, push_upload,
-    scan_local_creates, scan_local_deletes, scan_local_modifies, ContentReplacer, Downloader,
-    MaterializeReport, ModifyReport, PendingLocalDelete, RemoteWriter, SyncError, SyncReport,
+    apply_local_deletes, apply_local_modifies, cloud_dest_path, incremental_sync,
+    incremental_sync_scoped, local_rel_path, materialize_downloads, materialize_downloads_scoped,
+    pending_local_deletes, push_delete, push_local_creates, push_upload, scan_local_creates,
+    scan_local_creates_scoped, scan_local_deletes, scan_local_deletes_scoped, scan_local_modifies,
+    scan_local_modifies_scoped, ContentReplacer, Downloader, MaterializeReport, ModifyReport,
+    PendingLocalDelete, ProgressSink, RemoteWriter, SharedProgress, SyncError, SyncReport,
+    TransferSlot,
 };
 pub use onenote::{
     backup_onenote_hierarchy, incremental_sync_onenote, OneNoteHierarchyReport, OneNoteReport,
@@ -61,7 +64,7 @@ pub use restore::{
     restore_task, sanitize_contact, sanitize_event, sanitize_task, MessageCreator,
     OneNoteResourcePart, PageCreator, Restorer,
 };
-pub use scope::{owning_scope, FolderScope, Mode};
+pub use scope::{owning_scope, scopes_from_modes, FolderScope, Mode};
 pub use shared::{sync_shared_with_me, SharedReport};
 pub use todo::{
     backup_task_subresources, backup_todo_list_flanks, extract_task_attachment,

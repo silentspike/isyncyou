@@ -640,6 +640,108 @@ pub struct MaterializeReport {
     pub conflicts: usize,
 }
 
+/// One in-flight transfer's progress — the connectors-layer producer type, mirror of
+/// `webui::TransferState` (#655 / S-OM.9). `app-host`'s `DaemonTransfer` maps it onto the
+/// webui type for `GET /api/v1/onedrive/transfers`. `bytes_total == 0` means the size is
+/// not yet known; `retry_after_secs > 0` means it is backing off on a 429.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferSlot {
+    pub id: String,
+    pub name: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub retry_after_secs: u64,
+}
+
+/// Where the offline materialize/writeback pass reports per-file progress, so the UI
+/// (`/onedrive/transfers`) can show live download/upload progress (#655 / S-OM.9). The
+/// no-op `()` impl lets the desktop path and host tests ignore progress entirely.
+pub trait ProgressSink: Send + Sync {
+    /// A transfer started: `id` (the item's remote id), a display `name`, and the total
+    /// byte count (`0` when unknown).
+    fn begin(&self, id: &str, name: &str, bytes_total: u64);
+    /// Bytes transferred so far for `id`.
+    fn advance(&self, id: &str, bytes_done: u64);
+    /// `id` is backing off on a 429 for `secs` seconds.
+    fn retry_after(&self, id: &str, secs: u64);
+    /// `id` finished (success or failure) — drop it from the in-flight set.
+    fn finish(&self, id: &str);
+}
+
+impl ProgressSink for () {
+    fn begin(&self, _: &str, _: &str, _: u64) {}
+    fn advance(&self, _: &str, _: u64) {}
+    fn retry_after(&self, _: &str, _: u64) {}
+    fn finish(&self, _: &str) {}
+}
+
+/// A shared, thread-safe in-flight transfer set: the offline pass writes it (as a
+/// [`ProgressSink`]) and the `/onedrive/transfers` endpoint reads a [`snapshot`] of it.
+/// Cheaply cloneable (one shared `Arc<Mutex<…>>`), so the engine and the router hold the
+/// same handle.
+///
+/// [`snapshot`]: SharedProgress::snapshot
+#[derive(Clone, Default)]
+pub struct SharedProgress {
+    slots: std::sync::Arc<std::sync::Mutex<Vec<TransferSlot>>>,
+}
+
+impl SharedProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A snapshot of the current in-flight transfers (for the read-only endpoint).
+    pub fn snapshot(&self) -> Vec<TransferSlot> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<TransferSlot>) -> R) -> R {
+        let mut g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+}
+
+impl ProgressSink for SharedProgress {
+    fn begin(&self, id: &str, name: &str, bytes_total: u64) {
+        self.with(|v| match v.iter_mut().find(|s| s.id == id) {
+            Some(s) => {
+                s.name = name.to_string();
+                s.bytes_total = bytes_total;
+                s.bytes_done = 0;
+                s.retry_after_secs = 0;
+            }
+            None => v.push(TransferSlot {
+                id: id.to_string(),
+                name: name.to_string(),
+                bytes_done: 0,
+                bytes_total,
+                retry_after_secs: 0,
+            }),
+        });
+    }
+    fn advance(&self, id: &str, bytes_done: u64) {
+        self.with(|v| {
+            if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                s.bytes_done = bytes_done;
+            }
+        });
+    }
+    fn retry_after(&self, id: &str, secs: u64) {
+        self.with(|v| {
+            if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                s.retry_after_secs = secs;
+            }
+        });
+    }
+    fn finish(&self, id: &str) {
+        self.with(|v| v.retain(|s| s.id != id));
+    }
+}
+
 /// Guard against a malformed parent cycle when walking to the drive root.
 const MAX_PATH_DEPTH: usize = 256;
 
@@ -951,6 +1053,215 @@ pub fn materialize_downloads<D: Downloader>(
     Ok(report)
 }
 
+/// True if the offline scope set owns `remote_id` — its deepest active ancestor is one
+/// of `offline_ids` ([`owning_scope`] over the store ancestry). The scope-ownership
+/// filter for Mode-3 offline materialize + writeback (#655 / S-OM.9).
+fn item_in_offline(
+    store: &Store,
+    account: &str,
+    remote_id: &str,
+    offline_ids: &BTreeSet<&str>,
+) -> Result<bool, SyncError> {
+    let ancestry = store_ancestry(store, account, remote_id)?;
+    let refs: Vec<&str> = ancestry.iter().map(String::as_str).collect();
+    Ok(owning_scope(&refs, offline_ids).is_some())
+}
+
+/// The sync-root-relative local paths of the offline scope-root folders, so an untracked
+/// local **create** can be attributed to an offline scope by path prefix (a create has no
+/// store row, so [`item_in_offline`] can't be used on it).
+fn offline_scope_prefixes(
+    store: &Store,
+    account: &str,
+    offline_ids: &BTreeSet<&str>,
+) -> Result<Vec<PathBuf>, SyncError> {
+    let items = store.all_items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut prefixes = Vec::new();
+    for id in offline_ids {
+        if let Some(it) = by_id.get(*id) {
+            if let Some(rel) = local_rel_path(&by_id, it) {
+                prefixes.push(rel);
+            }
+        }
+    }
+    Ok(prefixes)
+}
+
+/// Scoped, policy-gated, progress-reported materialize for Mode-3 **offline** folders
+/// (#655 / S-OM.9). Like [`materialize_downloads`], but: (1) only items an `offline`
+/// scope owns are written (deepest-active-ancestor rule, [`owning_scope`]); (2)
+/// [`isyncyou_core::policy::evaluate`] gates each NEW download on the storage floor /
+/// network / power policy — a `Blocked` verdict stops new downloads and leaves existing
+/// files untouched; (3) per-file progress is reported to `progress`; (4) each item's v14
+/// content-state columns are marked `materialized`/`sync`/`available` (+ `materialized_at
+/// = now`) so the mobile body endpoint (`has_body == body_state=='available'`) serves it,
+/// with a `downloading` checkpoint before the body write for crash recovery (AC3). The
+/// desktop [`materialize_downloads`] is intentionally left unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_downloads_scoped<D: Downloader>(
+    store: &Store,
+    downloader: &D,
+    account: &str,
+    sync_root: &Path,
+    host: &str,
+    now: &str,
+    offline_ids: &BTreeSet<&str>,
+    cfg_sync: &isyncyou_core::SyncConfig,
+    dev: &isyncyou_core::policy::DeviceState,
+    progress: &dyn ProgressSink,
+) -> Result<MaterializeReport, SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut report = MaterializeReport::default();
+
+    // Folders first (create the tree), then files, so a file's parent exists.
+    for pass_folders in [true, false] {
+        for it in &items {
+            let is_folder = it.item_type == "folder";
+            if is_folder != pass_folders || it.sync_state != "remote_dirty" {
+                continue;
+            }
+            // Scope filter: only items an offline scope owns (deepest active ancestor).
+            if !item_in_offline(store, account, &it.remote_id, offline_ids)? {
+                continue;
+            }
+            let rel = match local_rel_path(&by_id, it) {
+                Some(p) => p,
+                None => {
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            let full = sync_root.join(&rel);
+            if is_folder {
+                match std::fs::create_dir_all(&full) {
+                    Ok(()) => {
+                        store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                        report.dirs_created += 1;
+                    }
+                    Err(_) => report.failed += 1,
+                }
+            } else if local_file_matches(&full, it) {
+                // Already on disk with the same size + mtime — skip the download but still
+                // mark the content-state so `has_body` is true for the mobile body endpoint.
+                store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                record_synced_state(store, account, &it.remote_id, &full, it.quickxorhash.clone());
+                store.set_content_state(
+                    account,
+                    SERVICE,
+                    &it.remote_id,
+                    Some("materialized"),
+                    Some("sync"),
+                    Some("available"),
+                    Some(now),
+                )?;
+                report.skipped += 1;
+            } else {
+                // Policy gate: a Blocked verdict stops NEW downloads (existing files stay).
+                // The body is left `missing` (not `failed`) — it is simply not fetched yet.
+                if !isyncyou_core::policy::evaluate(cfg_sync, dev).is_allowed() {
+                    store.set_content_state(
+                        account,
+                        SERVICE,
+                        &it.remote_id,
+                        None,
+                        Some("sync"),
+                        Some("missing"),
+                        None,
+                    )?;
+                    report.failed += 1;
+                    continue;
+                }
+                // Download-path keep-both (plan §10): a locally-edited file must never be
+                // clobbered by a newer cloud version. Same reference ladder as the desktop
+                // path; items without a reference keep the plain overwrite.
+                if let Some((ssize, smtime, shash)) =
+                    store.get_synced_state(account, SERVICE, &it.remote_id)?
+                {
+                    if locally_edited_since_sync(&full, ssize, smtime, shash.as_deref()) {
+                        let dir = full
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| sync_root.to_path_buf());
+                        let fname = full.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                        let copy = unique_conflict_copy(&dir, fname, host);
+                        if std::fs::rename(&full, dir.join(&copy)).is_ok() {
+                            report.conflicts += 1;
+                        }
+                    }
+                }
+                if let Some(parent) = full.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                let total = it.size.unwrap_or(0).max(0) as u64;
+                progress.begin(&it.remote_id, name, total);
+                // Checkpoint the body as `downloading` before the write, so a crash
+                // mid-materialize is recoverable and a re-run is idempotent (AC3).
+                store.set_content_state(
+                    account,
+                    SERVICE,
+                    &it.remote_id,
+                    None,
+                    Some("sync"),
+                    Some("downloading"),
+                    None,
+                )?;
+                match downloader.download(&it.remote_id) {
+                    Ok(bytes) => match atomic_write(&full, &bytes) {
+                        Ok(()) => {
+                            if let Some(mt) = &it.remote_mtime {
+                                set_file_mtime(&full, mt);
+                            }
+                            store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
+                            let hash = Some(crate::quickxor::quickxor_base64(&bytes));
+                            record_synced_state(store, account, &it.remote_id, &full, hash);
+                            store.set_content_state(
+                                account,
+                                SERVICE,
+                                &it.remote_id,
+                                Some("materialized"),
+                                Some("sync"),
+                                Some("available"),
+                                Some(now),
+                            )?;
+                            progress.advance(&it.remote_id, bytes.len() as u64);
+                            report.downloaded += 1;
+                        }
+                        Err(_) => {
+                            store.set_content_state(
+                                account,
+                                SERVICE,
+                                &it.remote_id,
+                                None,
+                                Some("sync"),
+                                Some("failed"),
+                                None,
+                            )?;
+                            report.failed += 1;
+                        }
+                    },
+                    Err(_) => {
+                        store.set_content_state(
+                            account,
+                            SERVICE,
+                            &it.remote_id,
+                            None,
+                            Some("sync"),
+                            Some("failed"),
+                            None,
+                        )?;
+                        report.failed += 1;
+                    }
+                }
+                progress.finish(&it.remote_id);
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// A tombstoned item whose local file/dir still exists and should be removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingLocalDelete {
@@ -1045,7 +1356,10 @@ fn walk_local_files(root: &Path) -> Vec<PathBuf> {
 
 /// Build a cloud destination path from a sync-root-relative local path, encoding
 /// each segment to a OneDrive-safe name (reverse of the cloud→local mapping).
-fn cloud_dest_path(rel: &Path) -> String {
+///
+/// Public so the ledger-backed offline writeback (S-OM.9 / #655) can record a stable
+/// upload target (the dest path) in the operation ledger and recover it after a crash.
+pub fn cloud_dest_path(rel: &Path) -> String {
     let mut s = String::new();
     for comp in rel.components() {
         if let std::path::Component::Normal(os) = comp {
@@ -1087,6 +1401,58 @@ pub fn scan_local_creates(
         }
     }
     Ok(creates)
+}
+
+/// Local **creates** restricted to Mode-3 **offline** scopes (#655 / S-OM.9): an
+/// untracked file counts only if it lives under an offline scope-root folder's local
+/// path. A create has no store row, so it is attributed by path prefix rather than
+/// [`item_in_offline`].
+pub fn scan_local_creates_scoped(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+    offline_ids: &BTreeSet<&str>,
+) -> Result<Vec<PathBuf>, SyncError> {
+    let prefixes = offline_scope_prefixes(store, account, offline_ids)?;
+    let all = scan_local_creates(store, account, sync_root)?;
+    Ok(all
+        .into_iter()
+        .filter(|rel| prefixes.iter().any(|p| rel.starts_with(p)))
+        .collect())
+}
+
+/// Local **modifies** restricted to offline scopes (#655): like [`scan_local_modifies`]
+/// but only for items an offline scope owns.
+pub fn scan_local_modifies_scoped(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+    offline_ids: &BTreeSet<&str>,
+) -> Result<Vec<(String, PathBuf, String)>, SyncError> {
+    let mut out = Vec::new();
+    for m in scan_local_modifies(store, account, sync_root)? {
+        if item_in_offline(store, account, &m.0, offline_ids)? {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+/// Local **deletes** restricted to offline scopes (#655): like [`scan_local_deletes`]
+/// but only for items an offline scope owns.
+pub fn scan_local_deletes_scoped(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+    offline_ids: &BTreeSet<&str>,
+) -> Result<Vec<String>, SyncError> {
+    let mut out = Vec::new();
+    for id in scan_local_deletes(store, account, sync_root)? {
+        if item_in_offline(store, account, &id, offline_ids)? {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// Push local-create files up to the cloud: read each, upload to its encoded
@@ -2066,6 +2432,203 @@ mod tests {
         assert_eq!(report.conflicts, 0);
         assert_eq!(std::fs::read(&full).unwrap(), b"v2 REMOTE");
         assert!(!dir.path().join("doc-host-safeBackup-0001.txt").exists());
+    }
+
+    // ---- #655 / S-OM.9: scoped offline materialize + progress + scoped writeback ------
+
+    const NOW: &str = "2026-07-04T00:00:00Z";
+
+    /// Seed an offline scope root folder + a `remote_dirty` file under it, plus a
+    /// non-scope folder + file. Returns nothing; ids are `F1`/`a1` (offline) and
+    /// `G1`/`b1` (out of scope).
+    fn seed_offline_and_nonscope(store: &Store) {
+        let mut f1 = Item::new("acc", SERVICE, "F1", "Photos", "folder");
+        f1.local_path = Some("Photos".into());
+        f1.sync_state = "remote_dirty".into();
+        store.upsert_item(&f1).unwrap();
+        let mut a1 = Item::new("acc", SERVICE, "a1", "a.txt", "file");
+        a1.local_path = Some("a.txt".into());
+        a1.parent_remote_id = Some("F1".into());
+        a1.sync_state = "remote_dirty".into();
+        a1.size = Some(4);
+        store.upsert_item(&a1).unwrap();
+        let mut g1 = Item::new("acc", SERVICE, "G1", "Other", "folder");
+        g1.local_path = Some("Other".into());
+        g1.sync_state = "remote_dirty".into();
+        store.upsert_item(&g1).unwrap();
+        let mut b1 = Item::new("acc", SERVICE, "b1", "b.txt", "file");
+        b1.local_path = Some("b.txt".into());
+        b1.parent_remote_id = Some("G1".into());
+        b1.sync_state = "remote_dirty".into();
+        b1.size = Some(4);
+        store.upsert_item(&b1).unwrap();
+    }
+
+    #[test]
+    fn materialize_scoped_writes_only_offline_items_and_marks_content_state() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader(
+            [
+                ("a1".to_string(), b"AAAA".to_vec()),
+                ("b1".to_string(), b"BBBB".to_vec()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &(),
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 1, "only the offline-scope file is fetched");
+        // The offline file is materialized to sync_root with the content-state marked.
+        assert_eq!(std::fs::read(dir.path().join("Photos/a.txt")).unwrap(), b"AAAA");
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(a.content_state.as_deref(), Some("materialized"));
+        assert_eq!(a.body_location.as_deref(), Some("sync"));
+        assert_eq!(a.body_state.as_deref(), Some("available"));
+        assert_eq!(a.materialized_at.as_deref(), Some(NOW));
+        assert_eq!(a.sync_state, "clean");
+        // The non-scope file is skipped: not on disk, content-state untouched.
+        assert!(!dir.path().join("Other/b.txt").exists());
+        let b = store.get_item("acc", SERVICE, "b1").unwrap().unwrap();
+        assert_eq!(b.body_state, None, "non-offline item is left untouched");
+        assert_eq!(b.sync_state, "remote_dirty");
+    }
+
+    #[test]
+    fn materialize_scoped_storage_floor_stops_new_downloads() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default(); // min_free_bytes = 256 MiB
+        // Zero free bytes < the storage floor → StorageFloor blocks the new download.
+        let low = isyncyou_core::policy::DeviceState::always_on(0);
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &low,
+            &(),
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 0, "no new download under the floor");
+        assert!(!dir.path().join("Photos/a.txt").exists());
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(a.body_state.as_deref(), Some("missing"));
+        assert_eq!(a.content_state, None);
+    }
+
+    #[test]
+    fn materialize_scoped_reports_and_clears_progress() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = SharedProgress::new();
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 1);
+        // A finished transfer is dropped from the in-flight snapshot.
+        assert!(progress.snapshot().is_empty());
+    }
+
+    #[test]
+    fn shared_progress_tracks_and_clears_slots() {
+        let p = SharedProgress::new();
+        p.begin("id1", "f.txt", 100);
+        p.advance("id1", 40);
+        p.retry_after("id1", 7);
+        let snap = p.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].bytes_done, 40);
+        assert_eq!(snap[0].bytes_total, 100);
+        assert_eq!(snap[0].retry_after_secs, 7);
+        p.finish("id1");
+        assert!(p.snapshot().is_empty());
+    }
+
+    #[test]
+    fn scan_creates_scoped_keeps_only_offline_prefix() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Tracked scope-root folders (so their local paths become the offline prefix).
+        let mut f1 = Item::new("acc", SERVICE, "F1", "Photos", "folder");
+        f1.local_path = Some("Photos".into());
+        store.upsert_item(&f1).unwrap();
+        let mut g1 = Item::new("acc", SERVICE, "G1", "Other", "folder");
+        g1.local_path = Some("Other".into());
+        store.upsert_item(&g1).unwrap();
+        std::fs::create_dir_all(dir.path().join("Photos")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Other")).unwrap();
+        std::fs::write(dir.path().join("Photos/new.jpg"), b"x").unwrap();
+        std::fs::write(dir.path().join("Other/x.jpg"), b"y").unwrap();
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let creates = scan_local_creates_scoped(&store, "acc", dir.path(), &offline).unwrap();
+        assert_eq!(creates, vec![PathBuf::from("Photos/new.jpg")]);
+    }
+
+    #[test]
+    fn scan_modifies_scoped_keeps_only_offline_items() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Two clean tracked files, one under an offline scope, one not.
+        let mut f1 = Item::new("acc", SERVICE, "F1", "Photos", "folder");
+        f1.local_path = Some("Photos".into());
+        store.upsert_item(&f1).unwrap();
+        let mut g1 = Item::new("acc", SERVICE, "G1", "Other", "folder");
+        g1.local_path = Some("Other".into());
+        store.upsert_item(&g1).unwrap();
+        for (id, parent, name) in [("a1", "F1", "Photos"), ("b1", "G1", "Other")] {
+            let mut it = Item::new("acc", SERVICE, id, "f.txt", "file");
+            it.local_path = Some("f.txt".into());
+            it.parent_remote_id = Some(parent.into());
+            it.sync_state = "clean".into();
+            it.size = Some(4);
+            it.etag = Some("e1".into());
+            store.upsert_item(&it).unwrap();
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            // Write a differently-sized body so is_local_modified fires.
+            std::fs::write(dir.path().join(name).join("f.txt"), b"MODIFIED").unwrap();
+        }
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let mods = scan_local_modifies_scoped(&store, "acc", dir.path(), &offline).unwrap();
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].0, "a1");
     }
 
     #[test]
