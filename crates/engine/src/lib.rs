@@ -1103,6 +1103,29 @@ pub fn offline_sync_once(
     Ok(out)
 }
 
+/// Mobile entry: open the account store + a write-capable client from `sync_token`, then run
+/// [`offline_sync_once`]. Mirrors [`refresh_cache_account`]'s store/client construction so the
+/// mobile crate need not depend on `store`/`graph` directly. The caller holds any store-access
+/// gate; the store's single-instance lock guards concurrent opens.
+#[allow(clippy::too_many_arguments)]
+pub fn offline_sync_once_for(
+    cfg: &Config,
+    account: &str,
+    host: &str,
+    sync_token: String,
+    dev: isyncyou_core::policy::DeviceState,
+    progress: &dyn isyncyou_connectors::ProgressSink,
+) -> Result<SyncReport, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store = Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let mut client = GraphClient::new(sync_token);
+    offline_sync_once(cfg, account, &store, &mut client, host, dev, progress)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
