@@ -1838,8 +1838,12 @@ impl isyncyou_webui::TransferProgress for DaemonTransfer {
             })
             .collect()
     }
-    fn cancel(&self, _id: &str) -> bool {
-        false // #655 has no cancellable channel; true cancellation is #656.
+    fn cancel(&self, id: &str) -> bool {
+        // Best-effort, queue-deep cancel (#656): flag the id so the materialize pass skips it
+        // before its next file boundary. Always accepted (a download already in flight still
+        // completes; the skip applies to the not-yet-started queue).
+        self.progress.request_cancel(id);
+        true
     }
 }
 
@@ -1999,6 +2003,28 @@ mod tests {
         assert_eq!(v["transfers"][0]["name"].as_str(), Some("photo.jpg"));
         assert_eq!(v["transfers"][0]["bytes_done"].as_u64(), Some(400));
         assert_eq!(v["transfers"][0]["bytes_total"].as_u64(), Some(1000));
+    }
+
+    #[test]
+    fn daemon_transfer_cancel_requests_cancellation() {
+        // DaemonTransfer::cancel (#656) is best-effort: it always accepts and flags the id on
+        // the shared progress so the materialize pass skips it before its next file boundary.
+        use isyncyou_connectors::ProgressSink;
+        use isyncyou_webui::TransferProgress;
+        let progress = SharedProgress::new();
+        progress.begin("i1", "photo.jpg", 1000);
+        let dt = DaemonTransfer {
+            progress: progress.clone(),
+        };
+        assert!(dt.cancel("i1"), "cancel is always accepted (best-effort)");
+        assert!(
+            progress.is_cancelled("i1"),
+            "the cancel is recorded on the shared progress for the pass to observe"
+        );
+        assert!(
+            !progress.is_cancelled("other"),
+            "an unrelated id is unaffected"
+        );
     }
 
     #[test]
