@@ -409,12 +409,24 @@ impl GraphClient {
         name: &str,
         data: &[u8],
     ) -> Result<Option<serde_json::Value>, UploadError> {
-        let url = format!(
-            "{}/me/drive/items/{}:/{}:/content?@microsoft.graph.conflictBehavior=fail",
-            self.base,
-            parent_id,
-            enc(name),
-        );
+        // An empty parent id addresses the drive root (a WebUI upload into an Online root, #657):
+        // `/items/:/…:/content` would be malformed and Graph rejects it ("Entity only allows writes
+        // with a JSON Content-Type header"), so target `/root:/…:/content` there. A real parent id
+        // keeps the path-relative-to-item form the offline writeback already uses.
+        let url = if parent_id.is_empty() {
+            format!(
+                "{}/me/drive/root:/{}:/content?@microsoft.graph.conflictBehavior=fail",
+                self.base,
+                enc(name),
+            )
+        } else {
+            format!(
+                "{}/me/drive/items/{}:/{}:/content?@microsoft.graph.conflictBehavior=fail",
+                self.base,
+                parent_id,
+                enc(name),
+            )
+        };
         let resp = self
             .client
             .put(&url)
@@ -783,7 +795,7 @@ impl GraphClient {
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<serde_json::Value>, UploadError> {
         // The `$select` query is appended as a literal — it must NOT go through
         // `encode_id`/`encode_seg`, which would percent-escape `$`, `=`, `,`.
-        const SELECT: &str = "$select=id,name,size,folder,file,lastModifiedDateTime";
+        const SELECT: &str = "$select=id,name,size,folder,file,lastModifiedDateTime,eTag";
         let path = if parent_id.is_empty() {
             format!("/me/drive/root/children?{SELECT}")
         } else {
@@ -2167,7 +2179,7 @@ mod tests {
         let seen = server.join().unwrap();
         assert!(
             seen[0].starts_with(
-                "GET /me/drive/root/children?$select=id,name,size,folder,file,lastModifiedDateTime"
+                "GET /me/drive/root/children?$select=id,name,size,folder,file,lastModifiedDateTime,eTag"
             ),
             "root listing must GET /children with the $select, got: {}",
             seen[0]
@@ -2180,8 +2192,38 @@ mod tests {
             .list_children("PARENT")
             .unwrap();
         assert!(server2.join().unwrap()[0].starts_with(
-            "GET /me/drive/items/PARENT/children?$select=id,name,size,folder,file,lastModifiedDateTime"
+            "GET /me/drive/items/PARENT/children?$select=id,name,size,folder,file,lastModifiedDateTime,eTag"
         ));
+    }
+
+    #[test]
+    fn upload_to_parent_targets_root_or_item_content() {
+        // #657 regression: an empty parent (drive root) must PUT /me/drive/root:/…:/content,
+        // NOT the malformed /me/drive/items/:/… that Graph rejects.
+        let (base, server) = serve(vec![http_response(201, "Created", "", r#"{"id":"new"}"#)]);
+        GraphClient::new("tok")
+            .with_base_url(&base)
+            .upload_to_parent("", "a b.txt", b"data")
+            .unwrap();
+        assert!(
+            server.join().unwrap()[0].starts_with(
+                "PUT /me/drive/root:/a%20b.txt:/content?@microsoft.graph.conflictBehavior=fail"
+            ),
+            "root upload must PUT /root:/…:/content"
+        );
+
+        // by parent id → PUT /me/drive/items/PARENT:/{name}:/content (unchanged path form).
+        let (base2, server2) = serve(vec![http_response(201, "Created", "", r#"{"id":"new"}"#)]);
+        GraphClient::new("tok")
+            .with_base_url(&base2)
+            .upload_to_parent("PARENT", "f.bin", b"x")
+            .unwrap();
+        assert!(
+            server2.join().unwrap()[0].starts_with(
+                "PUT /me/drive/items/PARENT:/f.bin:/content?@microsoft.graph.conflictBehavior=fail"
+            ),
+            "by-id upload must PUT /items/ID:/…:/content"
+        );
     }
 
     #[test]

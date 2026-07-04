@@ -1729,6 +1729,54 @@ impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
     fn delete(&self, account: &str, id: &str) -> Result<(), String> {
         isyncyou_engine::delete_via_ledger(&self.cfg, account, id)
     }
+    // #657: an in-app upload/replace carries its bytes in the request body, but the crash-safe
+    // cloud-write ledger reads the body from a local path (like the offline writeback). Stage the
+    // bytes to a short-lived plaintext temp file (`read_body` returns a non-sealed file verbatim),
+    // then route through #655's ledger so an in-app write gets the same intent-first crash safety.
+    fn upload(
+        &self,
+        account: &str,
+        parent_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<String, String> {
+        let tmp = TempBody::write(bytes)?;
+        isyncyou_engine::upload_via_ledger(&self.cfg, account, parent_id, name, tmp.path())
+    }
+    fn replace(&self, account: &str, id: &str, etag: &str, bytes: &[u8]) -> Result<(), String> {
+        let tmp = TempBody::write(bytes)?;
+        // Replace is etag-guarded: a 412 is a terminal keep-both conflict, never a blind clobber.
+        match isyncyou_engine::replace_via_ledger(&self.cfg, account, id, etag, tmp.path())? {
+            isyncyou_engine::WriteOutcome::Applied(_) => Ok(()),
+            isyncyou_engine::WriteOutcome::Conflict => Err(
+                "replace conflict: the file changed in OneDrive since it was listed — kept both, not overwritten"
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// A short-lived plaintext temp file holding an in-app upload/replace body (#657). The cloud-write
+/// ledger reads the body from a local path (fresh, and on crash recovery), so a WebUI request's
+/// in-memory bytes are staged here and removed on drop — even on an error path.
+struct TempBody(PathBuf);
+impl TempBody {
+    fn write(bytes: &[u8]) -> Result<Self, String> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("isyncyou-upload-{}-{n}.bin", std::process::id()));
+        std::fs::write(&path, bytes).map_err(|e| format!("stage upload body: {e}"))?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &std::path::Path {
+        self.0.as_path()
+    }
+}
+impl Drop for TempBody {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Live on-demand OneDrive content fetch for the web UI (#649, Mode 1 online):
