@@ -16,6 +16,8 @@ use isyncyou_core::Config;
 use isyncyou_graph::GraphClient;
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod calendar_live;
@@ -767,9 +769,368 @@ pub fn sync_once(
     Ok(out)
 }
 
+// ---- #655 / S-OM.9: the mobile Mode-3 offline pass ----------------------------------------
+
+const ONEDRIVE: &str = "onedrive";
+
+/// Unix seconds now, for the ledger (`run_cloud_write` takes an `i64`).
+fn unix_secs_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Map every tracked (non-deleted) folder's sync-root-relative path to its remote id, so a
+/// local-create upload can address its parent folder by id.
+fn build_folder_id_map(store: &Store, account: &str) -> Result<HashMap<PathBuf, String>, String> {
+    let items = store
+        .all_items_by_service(account, ONEDRIVE)
+        .map_err(|e| e.to_string())?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut out = HashMap::new();
+    for it in &items {
+        if it.item_type == "folder" && it.deleted_at.is_none() {
+            if let Some(rel) = isyncyou_connectors::local_rel_path(&by_id, it) {
+                out.insert(rel, it.remote_id.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the cloud parent id for a local create at `rel`, creating any missing folder in the
+/// chain (ledger-backed `Create`) from the deepest tracked ancestor down. `None` if `rel` is at
+/// the drive root (no offline create there) or the chain has no tracked cloud anchor.
+fn ensure_parent_folder(
+    rel: &Path,
+    folder_ids: &mut HashMap<PathBuf, String>,
+    store: &Store,
+    account: &str,
+    sink: &GraphClient,
+    secret: &[u8],
+    now: i64,
+) -> Result<Option<String>, String> {
+    let parent_rel = match rel.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => return Ok(None), // a file at the drive root — not an offline-scope create
+    };
+    // Ancestor chain of parent_rel, top-down (the offline scope root leads it and is tracked).
+    let mut chain: Vec<PathBuf> = Vec::new();
+    let mut cur = Some(parent_rel);
+    while let Some(p) = cur {
+        if p.as_os_str().is_empty() {
+            break;
+        }
+        cur = p.parent().filter(|pp| !pp.as_os_str().is_empty()).map(Path::to_path_buf);
+        chain.push(p);
+    }
+    chain.reverse();
+    let mut last_id: Option<String> = None;
+    for dir in &chain {
+        if let Some(id) = folder_ids.get(dir) {
+            last_id = Some(id.clone());
+            continue;
+        }
+        // Untracked dir → create it under its (already-resolved) parent. Without a tracked
+        // cloud anchor above it we cannot place it — bail (the delta will reconcile).
+        let Some(parent_id) = last_id.clone() else {
+            return Ok(None);
+        };
+        let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let w = onedrive_write::CloudWrite {
+            kind: isyncyou_store::CloudOpKind::Create,
+            target_id: parent_id,
+            name: name.to_string(),
+            new_parent_id: None,
+            if_match: None,
+            local_path: None,
+            content_tag: None,
+        };
+        let id = match onedrive_write::run_cloud_write(store, account, &w, sink, secret, now)? {
+            onedrive_write::WriteOutcome::Applied(id) => id,
+            onedrive_write::WriteOutcome::Conflict => return Ok(None),
+        };
+        folder_ids.insert(dir.clone(), id.clone());
+        last_id = Some(id);
+    }
+    Ok(last_id)
+}
+
+/// Keep-both for a local edit whose cloud version changed under it (`Replace` 412): move the
+/// local edit aside as a `*-<host>-safeBackup-NNNN` copy so it is never lost (it re-uploads as
+/// a new file next pass). Replicates `connectors`' download-path keep-both naming.
+fn keep_both_local(sync_root: &Path, rel: &Path, host: &str) -> Result<(), String> {
+    let src = sync_root.join(rel);
+    let dir = src
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| sync_root.to_path_buf());
+    let fname = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let (stem, ext) = match fname.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (fname, String::new()),
+    };
+    for n in 1..=9999u32 {
+        let dst = dir.join(format!("{stem}-{host}-safeBackup-{n:04}{ext}"));
+        if !dst.exists() {
+            return std::fs::rename(&src, &dst).map_err(|e| e.to_string());
+        }
+    }
+    Err("keep-both: no free safeBackup name".into())
+}
+
+/// Run one **Mode-3 offline** sync pass for `account` (S-OM.9): boot-recover any half-finished
+/// cloud-writes, pull the scoped delta (#653), materialize the offline scopes to `sync_root`
+/// (policy-gated, progress-reported), then mirror local creates / modifies (If-Match, keep-both)
+/// / deletes back to the cloud **over the operation ledger** — each destructive batch guarded by
+/// the mass-delete guard. A no-op (empty report) when the account has no configured scopes.
+///
+/// This is the **mobile** offline feature: the desktop [`sync_once`] is unchanged and never
+/// calls it (desktop syncs the whole `sync_root`). Per-file failures are counted, not fatal.
+#[allow(clippy::too_many_arguments)]
+pub fn offline_sync_once(
+    cfg: &Config,
+    account: &str,
+    store: &Store,
+    client: &mut GraphClient,
+    host: &str,
+    dev: isyncyou_core::policy::DeviceState,
+    progress: &dyn isyncyou_connectors::ProgressSink,
+) -> Result<SyncReport, String> {
+    use isyncyou_connectors as connectors;
+    let mut out = SyncReport::default();
+    let now = unix_now();
+    let now_secs = unix_secs_now();
+
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}' in config"))?;
+
+    // Which folders are Sync/Offline scopes for this account? (Online folders → no scope.)
+    let scopes = connectors::scopes_from_modes(cfg.onedrive_modes.get(account));
+    if scopes.is_empty() {
+        return Ok(out); // nothing configured → the offline pass is a no-op
+    }
+    let offline_ids: std::collections::BTreeSet<&str> = scopes
+        .iter()
+        .filter(|s| s.mode == connectors::Mode::Offline)
+        .map(|s| s.folder_id.as_str())
+        .collect();
+
+    let secret = restore_key::load_or_create_secret(
+        &acc.archive_root.join(".isyncyou-cloudwrite-secret"),
+    )?;
+
+    // 1) Boot recovery FIRST: reconcile any half-finished cloud-writes before new work (AC3).
+    onedrive_write::recover_pending_cloud_writes(store, account, client, now_secs)?;
+
+    // 2) Scoped delta ingest (#653): pull only the configured folders into the store.
+    let mut map = MappingTable::new();
+    let ingest = connectors::incremental_sync_scoped(
+        client,
+        store,
+        &mut map,
+        account,
+        &now,
+        &acc.archive_root,
+        &scopes,
+    )
+    .map_err(|e| e.to_string())?;
+    out.upserted = ingest.upserted;
+    out.deleted = ingest.deleted;
+    out.skipped = ingest.skipped;
+    out.resynced = ingest.resynced;
+
+    let sync_root = acc.sync_root.clone();
+    let trash_root = acc.archive_root.join(".isyncyou-trash");
+    let dg = cfg.sync.delete_guard.clone();
+    let guard = DeleteGuard {
+        max_absolute: dg.max_absolute,
+        max_fraction: dg.max_fraction,
+        fraction_min_total: dg.fraction_min_total,
+    };
+
+    // 3) Scoped, policy-gated, progress-reported materialize of the offline scopes (AC1).
+    let mat = connectors::materialize_downloads_scoped(
+        store,
+        client,
+        account,
+        &sync_root,
+        host,
+        &now,
+        &offline_ids,
+        &cfg.sync,
+        &dev,
+        progress,
+    )
+    .map_err(|e| e.to_string())?;
+    out.downloaded = mat.downloaded;
+    out.dirs_created = mat.dirs_created;
+    out.materialize_failed = mat.failed;
+    out.modified_conflicts = mat.conflicts;
+
+    // 4) remote -> local deletions (only offline files live in sync_root), guarded.
+    let pending =
+        connectors::pending_local_deletes(store, account, &sync_root).map_err(|e| e.to_string())?;
+    if !pending.is_empty() {
+        let remaining = store
+            .count_by_service(account, ONEDRIVE)
+            .map_err(|e| e.to_string())? as usize;
+        match guard.evaluate(pending.len(), remaining + pending.len(), Direction::CloudToLocal) {
+            GuardVerdict::Block { reason } => out.local_delete_blocked = Some(reason),
+            GuardVerdict::Proceed => {
+                out.local_trashed =
+                    connectors::apply_local_deletes(&sync_root, &trash_root, &pending)
+                        .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    // 5) local -> remote writeback over the ledger (AC2), scoped to offline folders.
+    // 5a) creates -> Upload (addressing the parent by id; create the folder chain if needed).
+    let creates = connectors::scan_local_creates_scoped(store, account, &sync_root, &offline_ids)
+        .map_err(|e| e.to_string())?;
+    if !creates.is_empty() {
+        let mut folder_ids = build_folder_id_map(store, account)?;
+        for rel in &creates {
+            let parent_id = match ensure_parent_folder(
+                rel,
+                &mut folder_ids,
+                store,
+                account,
+                client,
+                &secret,
+                now_secs,
+            ) {
+                Ok(Some(id)) => id,
+                Ok(None) | Err(_) => {
+                    out.modified_failed += 1; // unresolvable parent — retry next pass
+                    continue;
+                }
+            };
+            let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let w = onedrive_write::CloudWrite {
+                kind: isyncyou_store::CloudOpKind::Upload,
+                target_id: parent_id,
+                name,
+                new_parent_id: None,
+                if_match: None,
+                local_path: Some(sync_root.join(rel)),
+                content_tag: None,
+            };
+            match onedrive_write::run_cloud_write(store, account, &w, client, &secret, now_secs) {
+                Ok(_) => out.uploaded_creates += 1,
+                Err(_) => out.modified_failed += 1, // 409 collision / transient — retry next pass
+            }
+        }
+    }
+
+    // 5b) modifies -> Replace (If-Match; keep-both on a 412 conflict).
+    let modifies = connectors::scan_local_modifies_scoped(store, account, &sync_root, &offline_ids)
+        .map_err(|e| e.to_string())?;
+    for (id, rel, etag) in &modifies {
+        let full = sync_root.join(rel);
+        let bytes = match isyncyou_core::envelope::read_body(&full) {
+            Ok(b) => b,
+            Err(_) => {
+                out.modified_failed += 1;
+                continue;
+            }
+        };
+        let w = onedrive_write::CloudWrite {
+            kind: isyncyou_store::CloudOpKind::Replace,
+            target_id: id.clone(),
+            name: String::new(),
+            new_parent_id: None,
+            if_match: Some(etag.clone()),
+            local_path: Some(full),
+            content_tag: Some(connectors::quickxor_base64(&bytes)),
+        };
+        match onedrive_write::run_cloud_write(store, account, &w, client, &secret, now_secs) {
+            Ok(onedrive_write::WriteOutcome::Applied(_)) => out.modified_uploaded += 1,
+            Ok(onedrive_write::WriteOutcome::Conflict) => {
+                // Keep both: move the local edit aside and re-mark the item so the newer cloud
+                // version re-downloads to the original path next materialize.
+                if keep_both_local(&sync_root, rel, host).is_ok() {
+                    let _ = store.set_sync_state(account, ONEDRIVE, id, "remote_dirty");
+                    out.modified_conflicts += 1;
+                } else {
+                    out.modified_failed += 1;
+                }
+            }
+            Err(_) => out.modified_failed += 1,
+        }
+    }
+
+    // 5c) deletes -> Delete (guarded).
+    let local_deletes =
+        connectors::scan_local_deletes_scoped(store, account, &sync_root, &offline_ids)
+            .map_err(|e| e.to_string())?;
+    if !local_deletes.is_empty() {
+        let remaining = store
+            .count_by_service(account, ONEDRIVE)
+            .map_err(|e| e.to_string())? as usize;
+        match guard.evaluate(local_deletes.len(), remaining, Direction::LocalToCloud) {
+            GuardVerdict::Block { reason } => out.cloud_delete_blocked = Some(reason),
+            GuardVerdict::Proceed => {
+                for id in &local_deletes {
+                    let w = onedrive_write::CloudWrite {
+                        kind: isyncyou_store::CloudOpKind::Delete,
+                        target_id: id.clone(),
+                        name: String::new(),
+                        new_parent_id: None,
+                        if_match: None,
+                        local_path: None,
+                        content_tag: None,
+                    };
+                    // A transient error just leaves the op recoverable; the next pass reconciles.
+                    if onedrive_write::run_cloud_write(store, account, &w, client, &secret, now_secs)
+                        .is_ok()
+                    {
+                        // tombstone locally (the ledger driver is cloud-only by design).
+                        let _ = store.mark_deleted(account, ONEDRIVE, id, &now);
+                        out.cloud_deleted += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_sync_once_is_noop_without_offline_scopes() {
+        // An account with no `onedrive_modes` → `scopes_from_modes` is empty → the pass returns
+        // early, before it ever touches the (dummy-token) client. Proves the no-op guard.
+        let store = Store::open_in_memory().unwrap();
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "me".into(),
+                username: "me".into(),
+                sync_root: PathBuf::from("/nonexistent/sync"),
+                archive_root: PathBuf::from("/nonexistent/archive"),
+                cache_root: PathBuf::from("/nonexistent/cache"),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let mut client = GraphClient::new("dummy-token".to_string());
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let report =
+            offline_sync_once(&cfg, "me", &store, &mut client, "host", dev, &()).unwrap();
+        assert_eq!(report.upserted, 0);
+        assert_eq!(report.downloaded, 0);
+        assert_eq!(report.uploaded_creates, 0);
+        assert_eq!(report.cloud_deleted, 0);
+    }
 
     #[test]
     fn summary_mentions_each_direction_and_conflicts() {
