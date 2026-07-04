@@ -288,6 +288,9 @@ fn run(args: &Args) -> Result<(), String> {
         events.clone(),
         args.config.clone(),
         live_interval.clone(),
+        // Desktop runs the whole-tree sync_once, not the mobile offline pass, so this stays
+        // idle (GET /onedrive/transfers reports empty) — the wiring is for the mobile profile.
+        isyncyou_connectors::SharedProgress::new(),
     )
     .with_restore(
         Arc::new(isyncyou_app_host::DaemonRestore::new(cfg.clone()))
@@ -528,6 +531,22 @@ impl isyncyou_webui::SyncControl for Scheduler {
 /// and never fatal — a recovery failure must not stop the daemon.
 fn recover_pending_restores(cfg: &Config) {
     for acc in &cfg.accounts {
+        // #654/#655: reconcile any OneDrive cloud-write left mid-flight (create/rename/move/
+        // delete/upload/replace) before serving — probe-adopt / etag-guarded, never blind.
+        // Runs regardless of the restore-pending count below.
+        if isyncyou_engine::pending_cloud_write_count(cfg, &acc.id).unwrap_or(0) > 0 {
+            match isyncyou_engine::recover_pending_cloud_writes_for(cfg, &acc.id) {
+                Ok(n) => eprintln!(
+                    "isyncyoud: onedrive cloud-write recovery [{}]: {n} reconciled",
+                    acc.id
+                ),
+                Err(e) => eprintln!(
+                    "isyncyoud: onedrive cloud-write recovery [{}] failed: {e}",
+                    acc.id
+                ),
+            }
+        }
+
         let mail_pending = isyncyou_engine::pending_mail_restore_count(cfg, &acc.id).unwrap_or(0);
         let cal_pending =
             isyncyou_engine::pending_calendar_restore_count(cfg, &acc.id).unwrap_or(0);
