@@ -42,6 +42,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   wired into the shared desktop+mobile router. `GET /api/v1/onedrive/children` now carries a per-item
   `effective_mode`, resolved against an optional deepest-first `&ancestry=` (folder-level fallback without it).
   Rust-only; the app.js toggle UI + breadcrumb `ancestry` send land in #652/#656 (#651).
+- `connectors`+`engine`+`app-host`+`mobile`+`android`: Mode-3 **offline** OneDrive on the phone — an
+  `offline_sync_once` pass (run from the mobile refresh loop) that materializes the configured offline
+  folders to the editable `sync_root` (scoped delta + `materialize_downloads_scoped`, marking the v14
+  content-state so the body endpoint serves them), then mirrors local creates / modifies / deletes back to
+  the cloud **over the operation ledger**. The ledger now covers `CloudOpKind::Upload`/`Replace` on a
+  unified parent-id sink (`graph::upload_to_parent` with `conflictBehavior=fail`), with probe-adopt (Upload)
+  and etag-guarded (Replace, keep-both on a 412) crash recovery. Each new download is policy-gated
+  (`core::policy::evaluate` — storage floor / Wi-Fi-only / charging-only, fed from Android via a
+  `nativeDeviceState` JNI) and each destructive batch is guarded by the `core::guard` mass-delete guard.
+  Per-file progress flows through a `SharedProgress` tracker surfaced at `GET /api/v1/onedrive/transfers`
+  (`DaemonTransfer`); pending cloud-writes are also boot-recovered by the desktop daemon (#655). Loading the
+  persisted config on mobile (`start_inner`) makes `onedrive_modes` survive restarts so the offline pass
+  actually runs; a materialized body's size is compared by its envelope plaintext length (not the sealed
+  on-disk size) so files are not spuriously re-uploaded; and the store-backed OneDrive body path resolves
+  a nested materialized file via its parent chain (#655).
 
 ## [1.0.0] — 2026-06-26
 
