@@ -2049,10 +2049,50 @@ async function driveLoad() {
   body.append(sk);
   const cur = Drive.stack[Drive.stack.length - 1].id;
   try {
-    const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", parent: cur }));
-    Drive.items = d.items || [];
+    if (MOBILE) {
+      // Mode-1 online (#649): browse live from Graph — the phone store is a cache and is
+      // empty for OneDrive, so the store-based listing would show the empty placeholder.
+      const d = await api("/api/v1/onedrive/children?" + qs({ account: App.account, folder: cur === "root" ? "" : cur }));
+      Drive.items = (d.children || []).map(driveMapChild);
+    } else {
+      const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", parent: cur }));
+      Drive.items = d.items || [];
+    }
     driveRender();
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load folder" }), el("p", { text: e.message }))); }
+}
+// #649 Mode-1 online: normalize a live Graph child (from /api/v1/onedrive/children) onto the
+// store-item shape driveRender/driveTile/driveRow expect. No local body/preview in online mode.
+function driveMapChild(c) {
+  return {
+    item_type: c.folder ? "folder" : "file",
+    remote_id: c.id,
+    name: c.name,
+    size: c.size,
+    remote_mtime: c.lastModifiedDateTime,
+    has_body: false,
+    preview: c.folder ? { child_count: c.folder && c.folder.childCount } : undefined,
+  };
+}
+// File-open URL: online (mobile) fetches the content on-demand via the open endpoint; desktop
+// opens the archived copy via /view. Folders never reach here (they navigate).
+function driveFileUrl(it) {
+  return MOBILE
+    ? `/api/v1/onedrive/open?${qs({ account: App.account, id: it.remote_id, name: it.name || "" })}`
+    : `/api/v1/view?${qs({ account: App.account, service: "onedrive", id: it.remote_id })}`;
+}
+// Open a file's content. Desktop opens the archived copy in a new browser tab. The mobile
+// WebView has no WebChromeClient (window.open is a no-op), so show the on-demand content in an
+// in-app full-screen viewer whose iframe authenticates via the isy_session cookie (#649).
+function driveOpenFile(it) {
+  const url = driveFileUrl(it);
+  if (!MOBILE) { window.open(url, "_blank", "noopener"); return; }
+  const ov = el("div", { style: "position:fixed;inset:0;z-index:200;background:#0b0f17;display:flex;flex-direction:column" },
+    el("div", { style: "display:flex;align-items:center;gap:8px;padding:12px 14px" },
+      el("button", { class: "btn ghost sm", onclick: () => ov.remove() }, icon("arrow-left", "icon-sm"), "Back"),
+      el("span", { class: "truncate", style: "flex:1;font-weight:600", text: it.name || "" })),
+    el("iframe", { style: "flex:1;border:0;background:#fff", src: url, sandbox: "allow-same-origin", title: it.name || "File" }));
+  document.body.append(ov);
 }
 function mtimeMs(it) { const t = Date.parse(it.remote_mtime || ""); return isNaN(t) ? 0 : t; }
 function driveSort(items) {
@@ -2191,7 +2231,7 @@ function driveTile(it) {
   const folder = it.item_type === "folder";
   const ext = fileExt(it.name);
   const q = { account: App.account, service: "onedrive", id: it.remote_id };
-  const tile = el("div", { class: "card drive-tile rise" + (folder ? " is-folder" : ""), onclick: () => folder ? driveOpen(it.remote_id, it.name) : window.open(`/api/v1/view?${qs(q)}`, "_blank", "noopener") });
+  const tile = el("div", { class: "card drive-tile rise" + (folder ? " is-folder" : ""), onclick: () => folder ? driveOpen(it.remote_id, it.name) : driveOpenFile(it) });
   let thumb;
   if (!folder && it.has_body && IMAGE_EXT.has(ext))
     thumb = el("img", { class: "drive-thumb-img", src: `/api/v1/body?${qs(q)}`, alt: "", loading: "lazy" });
@@ -2212,7 +2252,7 @@ function driveRow(it) {
   const folder = it.item_type === "folder";
   const ext = fileExt(it.name);
   const q = { account: App.account, service: "onedrive", id: it.remote_id };
-  const row = el("div", { class: "list-row", onclick: () => folder ? driveOpen(it.remote_id, it.name) : window.open(`/api/v1/view?${qs(q)}`, "_blank", "noopener") },
+  const row = el("div", { class: "list-row", onclick: () => folder ? driveOpen(it.remote_id, it.name) : driveOpenFile(it) },
     el("span", { class: "drive-row-ico", style: folder ? "color:var(--svc-onedrive)" : `color:${fileColor(ext)}` }, icon(folder ? "folder" : fileIcon(ext))),
     el("div", { class: "grow" },
       el("div", { class: "truncate", text: it.name || "(no name)" }),
