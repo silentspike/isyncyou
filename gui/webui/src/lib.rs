@@ -4004,10 +4004,26 @@ impl Router {
             Ok(None) => return Err(ApiResponse::error(404, "item not found")),
             Err(e) => return Err(ApiResponse::error(500, &format!("query: {e}"))),
         };
-        let rel = it
-            .local_path
-            .clone()
-            .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?;
+        // A OneDrive item's stored `local_path` is only the NAME segment; the on-disk body path
+        // walks the parent-folder chain (materialize writes `sync_root/<folder>/…/<name>`).
+        // Resolve the full sync-root-relative path the same way materialize does, else a nested
+        // materialized file is read from the wrong path (#655). Other services keep the flat
+        // archive-relative `local_path`.
+        let rel = if service == "onedrive" {
+            let items = store
+                .items_by_service(account, service)
+                .map_err(|e| ApiResponse::error(500, &format!("query: {e}")))?;
+            let by_id: std::collections::HashMap<&str, &Item> =
+                items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+            isyncyou_connectors::local_rel_path(&by_id, &it)
+                .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            it.local_path
+                .clone()
+                .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?
+        };
         let name = it.name.clone();
         // Root-aware body location (#onedrive-mobile 0C): a OneDrive body lives in the
         // offline working copy (`sync_root`) when `body_location=="sync"`, else the
@@ -8534,6 +8550,46 @@ Content-Type: text/html; charset=utf-8\r\n\
         ));
         assert_eq!(i.status, 200);
         assert_eq!(i.content_type, "image/png");
+    }
+
+    #[test]
+    fn body_resolves_nested_onedrive_path_via_parent_chain() {
+        // Real ingest stores `local_path` as the NAME segment only; the body path must walk the
+        // parent folder chain (materialize writes `sync_root/<folder>/<name>`). Regression for
+        // the mobile materialized-nested-file read surfaced on-device (#655).
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        let sync = dir.path().join("od");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(sync.join("Docs")).unwrap();
+        std::fs::write(sync.join("Docs/note.txt"), b"nested body").unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut folder = Item::new("a", "onedrive", "F1", "Docs", "folder");
+            folder.local_path = Some("Docs".into());
+            store.upsert_item(&folder).unwrap();
+            let mut f = Item::new("a", "onedrive", "n1", "note.txt", "file");
+            f.local_path = Some("note.txt".into()); // NAME segment, as real ingest stores it
+            f.parent_remote_id = Some("F1".into());
+            store.upsert_item(&f).unwrap();
+        }
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: sync,
+                archive_root: arch,
+                cache_root: Default::default(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+        let r = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=onedrive&id=n1",
+        ));
+        assert_eq!(r.status, 200, "nested materialized file must resolve via parent chain");
+        assert_eq!(r.body, b"nested body");
     }
 
     #[test]
