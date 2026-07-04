@@ -311,6 +311,7 @@ const CAP = {
   account: "__ACCOUNT_CAP_TOKEN__",
   push: "__PUSH_CAP_TOKEN__",
   agent: "__AGENT_CAP_TOKEN__",
+  onedriveMode: "__ONEDRIVE_MODE_CAP_TOKEN__",
 };
 
 /* ---------------------------------------------------------------- push registration (#576)
@@ -1949,7 +1950,21 @@ function metricCard(icn, val, label) {
 }
 
 /* ---------------------------------------------------------------- onedrive (file explorer) */
-const Drive = { stack: [], layout: "grid", items: [] };
+const Drive = { stack: [], layout: "grid", items: [], modes: { default_mode: "online", folder_modes: {} }, quota: null };
+// #652: per-folder mode resolvers — PURE reads of Drive.modes (the server folder-mode map is the
+// single source of truth, re-fetched every driveLoad; no local override cache / optimistic state).
+// Used only for the CURRENT folder (absent from its own child list); subfolder pills use the
+// server-computed child.effective_mode directly.
+function driveEffMode(folderId, ancestryIds) {          // mirrors OneDriveModes::effective_mode (deepest-first)
+  const fm = Drive.modes.folder_modes || {};
+  if (fm[folderId]) return fm[folderId];
+  for (const pid of ancestryIds) if (fm[pid]) return fm[pid];
+  return Drive.modes.default_mode || "online";
+}
+function driveExplicit(folderId) { return !!(Drive.modes.folder_modes || {})[folderId]; }
+// F's ancestor folder ids deepest-first (immediate parent → toward root), excluding the root
+// sentinel and F itself — exactly the `&ancestry=` the #651 children endpoint expects.
+function driveAncestryIds() { return Drive.stack.slice(1, -1).map(s => s.id).reverse(); }
 // extension → {icon, color} category for file glyphs
 const FILE_KINDS = [
   { icon: "image", color: "#38bdf8", ext: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "heic", "tiff"] },
@@ -2052,7 +2067,15 @@ async function driveLoad() {
     if (MOBILE) {
       // Mode-1 online (#649): browse live from Graph — the phone store is a cache and is
       // empty for OneDrive, so the store-based listing would show the empty placeholder.
-      const d = await api("/api/v1/onedrive/children?" + qs({ account: App.account, folder: cur === "root" ? "" : cur }));
+      // #652: send the breadcrumb as `&ancestry=` (deepest-first) so children carry a correct
+      // effective_mode, and fetch the folder-mode map alongside (explicit-vs-inherited + the
+      // current folder). Drive.modes is the SSOT — re-read on every navigation.
+      const anc = driveAncestryIds().join(",");
+      const [d, modes] = await Promise.all([
+        api("/api/v1/onedrive/children?" + qs({ account: App.account, folder: cur === "root" ? "" : cur, ancestry: anc })),
+        api("/api/v1/onedrive/mode?" + qs({ account: App.account })).catch(() => Drive.modes),
+      ]);
+      Drive.modes = modes || Drive.modes;
       Drive.items = (d.children || []).map(driveMapChild);
     } else {
       const d = await api("/api/v1/items?" + qs({ account: App.account, service: "onedrive", parent: cur }));
@@ -2067,6 +2090,7 @@ function driveMapChild(c) {
   return {
     item_type: c.folder ? "folder" : "file",
     remote_id: c.id,
+    effective_mode: c.effective_mode,   // #652: per-item mode from the #651 children enrichment
     name: c.name,
     size: c.size,
     remote_mtime: c.lastModifiedDateTime,
