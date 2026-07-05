@@ -934,6 +934,25 @@ impl Store {
         Ok(())
     }
 
+    /// Set/clear the OneDrive `conflict_state` column (schema v14) — non-null while a
+    /// local↔cloud keep-both conflict is pending; the value carries the conflict-copy file
+    /// name so the Conflict Center can act on the local artifact (#659). `None` clears it.
+    /// No-op if the item doesn't exist. Written by the keep-both sites; cleared on resolve.
+    pub fn set_conflict_state(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+        conflict_state: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET conflict_state=?4 \
+             WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id, conflict_state],
+        )?;
+        Ok(())
+    }
+
     // ---- Cloud-write operation ledger (#onedrive-mobile 0D) -----------------
 
     /// Record a cloud-write intent BEFORE issuing it to Graph. Idempotent by
@@ -1076,6 +1095,19 @@ impl Store {
              ORDER BY name"
         ))?;
         let rows = stmt.query_map(params![account, service], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// OneDrive items with a pending keep-both conflict (`conflict_state` non-null), for the
+    /// Conflict Center (#659). Excludes tombstones; ordered by name.
+    pub fn conflicts(&self, account: &str) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM items
+             WHERE account_id=?1 AND service='onedrive' AND conflict_state IS NOT NULL
+               AND deleted_at IS NULL
+             ORDER BY name"
+        ))?;
+        let rows = stmt.query_map(params![account], row_to_item)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -2257,6 +2289,62 @@ mod tests {
                 .as_deref(),
             Some("available"),
             "backfill must mark an existing OneDrive body as available"
+        );
+    }
+
+    #[test]
+    fn conflict_state_set_clear_and_conflicts_query() {
+        // #659: the Conflict Center's persistence — set_conflict_state writes/clears the v14
+        // write-orphan column, and conflicts() lists only OneDrive rows with it set.
+        let s = Store::open_in_memory().unwrap();
+        for id in ["f1", "f2", "f3"] {
+            s.upsert_item(&Item::new("a", "onedrive", id, id, "file"))
+                .unwrap();
+        }
+        // a non-onedrive row must never appear in conflicts()
+        s.upsert_item(&Item::new("a", "mail", "m1", "m1", "message"))
+            .unwrap();
+        assert!(s.conflicts("a").unwrap().is_empty(), "no conflicts initially");
+
+        s.set_conflict_state("a", "onedrive", "f1", Some("f1-host-safeBackup-0001.txt"))
+            .unwrap();
+        s.set_conflict_state("a", "onedrive", "f3", Some("f3-host-safeBackup-0001.txt"))
+            .unwrap();
+        let ids: Vec<String> = s
+            .conflicts("a")
+            .unwrap()
+            .iter()
+            .map(|i| i.remote_id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["f1", "f3"],
+            "only the two flagged onedrive rows, ordered by name"
+        );
+        assert_eq!(
+            s.get_item("a", "onedrive", "f1")
+                .unwrap()
+                .unwrap()
+                .conflict_state
+                .as_deref(),
+            Some("f1-host-safeBackup-0001.txt")
+        );
+
+        // clearing (resolve) removes it from the list
+        s.set_conflict_state("a", "onedrive", "f1", None).unwrap();
+        let ids: Vec<String> = s
+            .conflicts("a")
+            .unwrap()
+            .iter()
+            .map(|i| i.remote_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["f3"]);
+        assert_eq!(
+            s.get_item("a", "onedrive", "f1")
+                .unwrap()
+                .unwrap()
+                .conflict_state,
+            None
         );
     }
 
