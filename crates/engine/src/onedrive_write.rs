@@ -481,10 +481,53 @@ pub fn recover_pending_cloud_writes<S: OneDriveWriteSink>(
     let pending = store
         .pending_cloud_writes(account)
         .map_err(|e| e.to_string())?;
+    let mut recovered = 0usize;
     for op in &pending {
-        recover_cloud_write_op(store, op, sink, now)?;
+        // One un-reconcilable op must never abort the whole batch: boot recovery runs *before*
+        // the offline materialize, so a single `?` here would block every download behind it
+        // (observed: a stale Upload whose local body was deleted poisoned every offline pass).
+        // An Upload/Replace whose local source is gone can never succeed → mark it terminally
+        // `failed` so it leaves the pending set; any other (e.g. transient network) error stays
+        // pending and is retried on the next pass.
+        match recover_cloud_write_op(store, op, sink, now) {
+            Ok(_) => recovered += 1,
+            Err(e) => {
+                eprintln!(
+                    "isyncyou: cloud-write recovery for {} skipped: {e}",
+                    op.op_id
+                );
+                if cloud_write_body_source_missing(op) {
+                    let _ = store.set_cloud_write_state(&op.op_id, "failed", None, Some(&e), now);
+                }
+            }
+        }
     }
-    Ok(pending.len())
+    Ok(recovered)
+}
+
+/// True if `op` is a body op (Upload/Replace) whose local source file is gone, so it can never
+/// be re-read and re-sent — a terminal failure rather than something to keep retrying (#656 F-A).
+fn cloud_write_body_source_missing(op: &CloudWriteOp) -> bool {
+    if !matches!(
+        CloudOpKind::parse(&op.op_kind),
+        Some(CloudOpKind::Upload) | Some(CloudOpKind::Replace)
+    ) {
+        return false;
+    }
+    match op
+        .intent_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("local_path")
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from)
+        }) {
+        // a body op with no local_path can never re-read its body → treat as gone
+        None => true,
+        // the local source file was deleted
+        Some(p) => !p.exists(),
+    }
 }
 
 /// Number of not-yet-terminal cloud-writes for an account — a cheap boot-time probe so the
@@ -1086,6 +1129,84 @@ mod tests {
                 .unwrap()
                 .state,
             "applied"
+        );
+    }
+
+    #[test]
+    fn recovery_skips_a_missing_local_body_op_without_aborting_the_batch() {
+        // #656 F-A: an Upload whose local source file is gone can never be re-sent. It must be
+        // marked terminally `failed` (leaving the pending set) and MUST NOT abort recovery of the
+        // later ops — otherwise one stale write blocks every offline materialize behind it.
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let gone = std::path::PathBuf::from("/nonexistent/isyncyou-om656-f-a-missing.txt");
+        assert!(!gone.exists());
+
+        // op1 (earlier): an Upload whose local body is gone → unrecoverable.
+        let w1 = upload("parent", "gone.txt", &gone);
+        let (op1_id, key1) = w1.keys(SECRET, ACCT);
+        let op1 = CloudWriteOp {
+            op_id: op1_id,
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: "upload".into(),
+            target_id: Some("parent".into()),
+            idempotency_key: key1.clone(),
+            if_match_etag: None,
+            state: "pending".into(),
+            result_id: None,
+            intent_json: Some(w1.intent_json()),
+            attempts: 1,
+            last_error: None,
+        };
+        s.record_cloud_write(&op1, 10).unwrap();
+
+        // op2 (later): a Delete → recoverable. Without per-op tolerance, op1's error would abort
+        // the loop and op2 would never be reconciled.
+        let w2 = CloudWrite {
+            kind: CloudOpKind::Delete,
+            target_id: "item-2".into(),
+            name: String::new(),
+            new_parent_id: None,
+            if_match: None,
+            local_path: None,
+            content_tag: None,
+        };
+        let (op2_id, key2) = w2.keys(SECRET, ACCT);
+        let op2 = CloudWriteOp {
+            op_id: op2_id,
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: "delete".into(),
+            target_id: Some("item-2".into()),
+            idempotency_key: key2.clone(),
+            if_match_etag: None,
+            state: "pending".into(),
+            result_id: None,
+            intent_json: Some(w2.intent_json()),
+            attempts: 1,
+            last_error: None,
+        };
+        s.record_cloud_write(&op2, 11).unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        assert_eq!(
+            recovered, 1,
+            "the recoverable delete is reconciled despite the failing upload"
+        );
+        assert_eq!(
+            *cloud.delete_calls.borrow(),
+            1,
+            "the op after the un-reconcilable one still ran"
+        );
+        // The missing-body op is terminally failed → out of the pending set, no longer blocking.
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &key1).unwrap().unwrap().state,
+            "failed"
+        );
+        assert!(
+            s.pending_cloud_writes(ACCT).unwrap().is_empty(),
+            "no ops remain pending after recovery"
         );
     }
 
