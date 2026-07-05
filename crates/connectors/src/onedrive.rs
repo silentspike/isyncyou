@@ -638,6 +638,9 @@ pub struct MaterializeReport {
     /// Locally-edited files moved aside as `safeBackup` conflict copies before
     /// the newer cloud version was written (download-path keep-both).
     pub conflicts: usize,
+    /// Files skipped because the user cancelled the transfer before it started.
+    /// Distinct from `failed` — a user-requested cancel is not an error (#656).
+    pub cancelled: usize,
 }
 
 /// One in-flight transfer's progress — the connectors-layer producer type, mirror of
@@ -666,6 +669,15 @@ pub trait ProgressSink: Send + Sync {
     fn retry_after(&self, id: &str, secs: u64);
     /// `id` finished (success or failure) — drop it from the in-flight set.
     fn finish(&self, id: &str);
+    /// True if a cancel was requested for `id`. The materialize pass checks this before
+    /// starting each queued file and skips a cancelled one (best-effort, queue-deep — a
+    /// download already in flight still runs to completion). Default: never cancelled (#656).
+    fn is_cancelled(&self, _id: &str) -> bool {
+        false
+    }
+    /// Consume the one-shot cancel for `id` (called on skip) so a later pass re-materializes
+    /// the file instead of skipping it forever. Default: no-op (#656).
+    fn consume_cancel(&self, _id: &str) {}
 }
 
 impl ProgressSink for () {
@@ -684,6 +696,9 @@ impl ProgressSink for () {
 #[derive(Clone, Default)]
 pub struct SharedProgress {
     slots: std::sync::Arc<std::sync::Mutex<Vec<TransferSlot>>>,
+    /// Remote ids with a pending one-shot cancel request (#656). The materialize pass reads
+    /// this via [`ProgressSink::is_cancelled`] before each file and consumes it on skip.
+    cancels: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SharedProgress {
@@ -694,6 +709,16 @@ impl SharedProgress {
     /// A snapshot of the current in-flight transfers (for the read-only endpoint).
     pub fn snapshot(&self) -> Vec<TransferSlot> {
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Request cancellation of transfer `id` (the item's remote id). The materialize pass
+    /// skips it at its next file boundary; a download already in flight still completes
+    /// (best-effort, queue-deep) (#656).
+    pub fn request_cancel(&self, id: &str) {
+        self.cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Vec<TransferSlot>) -> R) -> R {
@@ -736,6 +761,24 @@ impl ProgressSink for SharedProgress {
     }
     fn finish(&self, id: &str) {
         self.with(|v| v.retain(|s| s.id != id));
+        // Clear any pending cancel for a finished transfer so a stale request can't affect a
+        // future transfer that reuses the same remote id.
+        self.cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+    fn is_cancelled(&self, id: &str) -> bool {
+        self.cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+    fn consume_cancel(&self, id: &str) {
+        self.cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 }
 
@@ -1165,6 +1208,14 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                 )?;
                 report.skipped += 1;
             } else {
+                // User cancelled this transfer before it started (best-effort, queue-deep):
+                // consume the one-shot request and skip it. The body stays `missing` (not
+                // touched), and a later pass re-materializes it since the cancel is consumed.
+                if progress.is_cancelled(&it.remote_id) {
+                    progress.consume_cancel(&it.remote_id);
+                    report.cancelled += 1;
+                    continue;
+                }
                 // Policy gate: a Blocked verdict stops NEW downloads (existing files stay).
                 // The body is left `missing` (not `failed`) — it is simply not fetched yet.
                 if !isyncyou_core::policy::evaluate(cfg_sync, dev).is_allowed() {
@@ -2593,6 +2644,82 @@ mod tests {
         assert_eq!(snap[0].retry_after_secs, 7);
         p.finish("id1");
         assert!(p.snapshot().is_empty());
+    }
+
+    #[test]
+    fn shared_progress_cancel_is_one_shot() {
+        let p = SharedProgress::new();
+        assert!(!p.is_cancelled("rid"));
+        p.request_cancel("rid");
+        assert!(p.is_cancelled("rid"));
+        // consume_cancel is one-shot: after the pass consumes it, a later pass is no longer
+        // cancelled (so a cancelled folder re-materializes next time, not skipped forever).
+        p.consume_cancel("rid");
+        assert!(!p.is_cancelled("rid"));
+        // finish() also clears a stale cancel so it can't leak onto a reused remote id.
+        p.request_cancel("rid2");
+        p.finish("rid2");
+        assert!(!p.is_cancelled("rid2"));
+    }
+
+    #[test]
+    fn materialize_scoped_skips_cancelled_transfer_then_retries_next_pass() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = SharedProgress::new();
+        // The user cancels the offline file before the pass reaches it.
+        progress.request_cancel("a1");
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(
+            report.cancelled, 1,
+            "the cancelled file counts as cancelled"
+        );
+        assert_eq!(report.downloaded, 0, "nothing is downloaded");
+        assert_eq!(report.failed, 0, "a user-requested cancel is not a failure");
+        assert!(
+            !dir.path().join("Photos/a.txt").exists(),
+            "no body is written for the cancelled file"
+        );
+        // One-shot: the cancel was consumed, so a second pass materializes the file normally.
+        assert!(!progress.is_cancelled("a1"));
+        let report2 = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(
+            report2.downloaded, 1,
+            "the previously-cancelled file materializes on the next pass"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
+            b"AAAA"
+        );
     }
 
     #[test]
