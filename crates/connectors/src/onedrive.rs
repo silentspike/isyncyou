@@ -619,12 +619,32 @@ pub fn push_delete<W: RemoteWriter>(
 /// unit-testable with a mock and live-tested with the real client.
 pub trait Downloader {
     fn download(&self, remote_id: &str) -> Result<Vec<u8>, String>;
+    /// Download reporting the cumulative bytes read through `on_progress` as they arrive, so the
+    /// materialize can show a moving download bar (#656 F-C). The default buffers via
+    /// [`download`](Self::download) and reports once at the end — mocks need no change.
+    fn download_with_progress(
+        &self,
+        remote_id: &str,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, String> {
+        let bytes = self.download(remote_id)?;
+        on_progress(bytes.len() as u64);
+        Ok(bytes)
+    }
 }
 
 #[cfg(feature = "http")]
 impl Downloader for isyncyou_graph::GraphClient {
     fn download(&self, remote_id: &str) -> Result<Vec<u8>, String> {
         self.download_content(remote_id).map_err(|e| e.to_string())
+    }
+    fn download_with_progress(
+        &self,
+        remote_id: &str,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, String> {
+        self.download_content_with_progress(remote_id, on_progress)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1266,7 +1286,12 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                     Some("downloading"),
                     None,
                 )?;
-                match downloader.download(&it.remote_id) {
+                // Stream the body and report cumulative bytes as they arrive (#656 F-C), so the
+                // transfer panel shows a moving bar instead of sitting at 0% until the file lands.
+                let dl = downloader.download_with_progress(&it.remote_id, &mut |done| {
+                    progress.advance(&it.remote_id, done);
+                });
+                match dl {
                     Ok(bytes) => match atomic_write(&full, &bytes) {
                         Ok(()) => {
                             if let Some(mt) = &it.remote_mtime {
@@ -1284,7 +1309,6 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                                 Some("available"),
                                 Some(now),
                             )?;
-                            progress.advance(&it.remote_id, bytes.len() as u64);
                             report.downloaded += 1;
                         }
                         Err(_) => {
@@ -2719,6 +2743,73 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
             b"AAAA"
+        );
+    }
+
+    #[test]
+    fn materialize_scoped_reports_incremental_download_progress() {
+        // #656 F-C: the materialize streams the body and reports cumulative bytes as they arrive,
+        // so the transfer panel shows a moving bar instead of jumping 0% -> gone.
+        struct ChunkedDownloader;
+        impl Downloader for ChunkedDownloader {
+            fn download(&self, _id: &str) -> Result<Vec<u8>, String> {
+                Ok(b"AAAA".to_vec())
+            }
+            fn download_with_progress(
+                &self,
+                _id: &str,
+                on: &mut dyn FnMut(u64),
+            ) -> Result<Vec<u8>, String> {
+                on(2); // 2 of 4 bytes
+                on(4); // all 4 bytes
+                Ok(b"AAAA".to_vec())
+            }
+        }
+        #[derive(Default)]
+        struct RecordingProgress {
+            advances: std::sync::Mutex<Vec<(String, u64)>>,
+        }
+        impl ProgressSink for RecordingProgress {
+            fn begin(&self, _: &str, _: &str, _: u64) {}
+            fn advance(&self, id: &str, done: u64) {
+                self.advances.lock().unwrap().push((id.to_string(), done));
+            }
+            fn retry_after(&self, _: &str, _: u64) {}
+            fn finish(&self, _: &str) {}
+        }
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = RecordingProgress::default();
+        let report = materialize_downloads_scoped(
+            &store,
+            &ChunkedDownloader,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 1);
+        let a1: Vec<u64> = progress
+            .advances
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "a1")
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(
+            a1,
+            vec![2, 4],
+            "cumulative byte progress is reported incrementally, not just once at the end"
         );
     }
 
