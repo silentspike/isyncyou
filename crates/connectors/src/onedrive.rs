@@ -1152,6 +1152,109 @@ fn offline_scope_prefixes(
     Ok(prefixes)
 }
 
+/// #659 free-up-space: drop a materialized OneDrive body from disk but keep the item listable
+/// (metadata only). Removes the on-disk envelope and flips the v14 content-state to
+/// `cached`/`missing` (so `has_body == body_state=='available'` is false while the row still
+/// lists — `deleted_at` untouched). Local-only and reversible via [`download_one`]. Returns
+/// whether a body file was actually removed. Errors only on an unknown item id.
+pub fn dematerialize_one(
+    store: &Store,
+    account: &str,
+    id: &str,
+    sync_root: &Path,
+    cache_root: &Path,
+) -> Result<bool, SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let it = *by_id
+        .get(id)
+        .ok_or_else(|| SyncError::Malformed(format!("free-up: unknown item {id}")))?;
+    let removed = match local_rel_path(&by_id, it) {
+        Some(rel) => {
+            let body_root = if it.body_location.as_deref() == Some("cache") {
+                cache_root
+            } else {
+                sync_root
+            };
+            std::fs::remove_file(body_root.join(&rel)).is_ok()
+        }
+        None => false,
+    };
+    // Keep the row (metadata + deleted_at untouched); the body is gone → cached/missing.
+    store.set_content_state(
+        account,
+        SERVICE,
+        id,
+        Some("cached"),
+        Some("none"),
+        Some("missing"),
+        None,
+    )?;
+    Ok(removed)
+}
+
+/// #659 download-now: materialize a single OneDrive item on demand — the inverse of
+/// [`dematerialize_one`]. Runs the offline-pass success path for one id: policy gate →
+/// `downloading` checkpoint → streamed download → `atomic_write` → `materialized`/`available`.
+/// Returns `Ok(true)` on a fresh download, `Ok(false)` if the storage/network/power policy
+/// blocked it (the body stays `missing`). Errors on an unknown / non-file item.
+#[allow(clippy::too_many_arguments)]
+pub fn download_one<D: Downloader>(
+    store: &Store,
+    downloader: &D,
+    account: &str,
+    id: &str,
+    sync_root: &Path,
+    now: &str,
+    cfg_sync: &isyncyou_core::SyncConfig,
+    dev: &isyncyou_core::policy::DeviceState,
+    progress: &dyn ProgressSink,
+) -> Result<bool, SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let it = *by_id
+        .get(id)
+        .ok_or_else(|| SyncError::Malformed(format!("download-now: unknown item {id}")))?;
+    if it.item_type == "folder" {
+        return Err(SyncError::Malformed("download-now: not a file".into()));
+    }
+    let rel = local_rel_path(&by_id, it)
+        .ok_or_else(|| SyncError::Malformed("download-now: no local path".into()))?;
+    let full = sync_root.join(&rel);
+    // Storage-floor / Wi-Fi-only / charging gate: a Blocked verdict leaves the body `missing`.
+    if !isyncyou_core::policy::evaluate(cfg_sync, dev).is_allowed() {
+        store.set_content_state(account, SERVICE, id, None, Some("sync"), Some("missing"), None)?;
+        return Ok(false);
+    }
+    if let Some(parent) = full.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let total = it.size.unwrap_or(0).max(0) as u64;
+    progress.begin(id, name, total);
+    store.set_content_state(account, SERVICE, id, None, Some("sync"), Some("downloading"), None)?;
+    let bytes = downloader
+        .download_with_progress(id, &mut |done| progress.advance(id, done))
+        .map_err(SyncError::Malformed)?;
+    atomic_write(&full, &bytes).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    if let Some(mt) = &it.remote_mtime {
+        set_file_mtime(&full, mt);
+    }
+    store.set_sync_state(account, SERVICE, id, "clean")?;
+    let hash = Some(crate::quickxor::quickxor_base64(&bytes));
+    record_synced_state(store, account, id, &full, hash);
+    store.set_content_state(
+        account,
+        SERVICE,
+        id,
+        Some("materialized"),
+        Some("sync"),
+        Some("available"),
+        Some(now),
+    )?;
+    Ok(true)
+}
+
 /// Scoped, policy-gated, progress-reported materialize for Mode-3 **offline** folders
 /// (#655 / S-OM.9). Like [`materialize_downloads`], but: (1) only items an `offline`
 /// scope owns are written (deepest-active-ancestor rule, [`owning_scope`]); (2)
@@ -2595,6 +2698,58 @@ mod tests {
         let b = store.get_item("acc", SERVICE, "b1").unwrap().unwrap();
         assert_eq!(b.body_state, None, "non-offline item is left untouched");
         assert_eq!(b.sync_state, "remote_dirty");
+    }
+
+    #[test]
+    fn free_up_and_download_now_roundtrip() {
+        // #659: download_one materializes one item on demand (inverse of the offline pass);
+        // dematerialize_one drops the body but keeps the row listable (metadata).
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+
+        // download-now materializes just a1.
+        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert_eq!(
+            std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
+            b"AAAA"
+        );
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(a.body_state.as_deref(), Some("available"));
+        assert_eq!(a.content_state.as_deref(), Some("materialized"));
+
+        // free-up drops the body but keeps the row listable.
+        assert!(dematerialize_one(&store, "acc", "a1", dir.path(), dir.path()).unwrap());
+        assert!(
+            !dir.path().join("Photos/a.txt").exists(),
+            "body gone from disk"
+        );
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(
+            a.body_state.as_deref(),
+            Some("missing"),
+            "no body -> has_body false"
+        );
+        assert_eq!(a.content_state.as_deref(), Some("cached"));
+        assert!(a.deleted_at.is_none(), "row not tombstoned");
+        assert!(
+            store
+                .items_by_service("acc", SERVICE)
+                .unwrap()
+                .iter()
+                .any(|i| i.remote_id == "a1"),
+            "the item still lists after free-up"
+        );
+
+        // download-now again re-materializes (reversible).
+        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert!(
+            dir.path().join("Photos/a.txt").exists(),
+            "re-materialized after free-up"
+        );
     }
 
     #[test]
