@@ -698,6 +698,12 @@ pub trait ProgressSink: Send + Sync {
     /// Consume the one-shot cancel for `id` (called on skip) so a later pass re-materializes
     /// the file instead of skipping it forever. Default: no-op (#656).
     fn consume_cancel(&self, _id: &str) {}
+    /// True if `id` is PAUSED (#659). Unlike a cancel, a pause is **persistent** (never
+    /// consumed): the materialize pass skips a paused file between files and re-checks each pass
+    /// until it is resumed (best-effort, queue-deep — no mid-file interruption). Default: never.
+    fn is_paused(&self, _id: &str) -> bool {
+        false
+    }
 }
 
 impl ProgressSink for () {
@@ -719,6 +725,9 @@ pub struct SharedProgress {
     /// Remote ids with a pending one-shot cancel request (#656). The materialize pass reads
     /// this via [`ProgressSink::is_cancelled`] before each file and consumes it on skip.
     cancels: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Remote ids with a **persistent** pause (#659). Unlike `cancels`, a pause is NOT consumed
+    /// on skip — the materialize pass re-checks it each pass until [`resume`](SharedProgress::resume).
+    pauses: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SharedProgress {
@@ -739,6 +748,31 @@ impl SharedProgress {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.to_string());
+    }
+
+    /// Pause transfer `id` (#659): the materialize pass skips it at each file boundary until
+    /// [`resume`](Self::resume). Persistent (queue-deep) — an in-flight download still completes.
+    pub fn request_pause(&self, id: &str) {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
+    }
+
+    /// Resume a paused transfer `id` (#659) so the next materialize pass fetches it.
+    pub fn resume(&self, id: &str) {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// Whether `id` is currently paused (for the transfer panel's paused badge).
+    pub fn is_paused_id(&self, id: &str) -> bool {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Vec<TransferSlot>) -> R) -> R {
@@ -781,9 +815,13 @@ impl ProgressSink for SharedProgress {
     }
     fn finish(&self, id: &str) {
         self.with(|v| v.retain(|s| s.id != id));
-        // Clear any pending cancel for a finished transfer so a stale request can't affect a
-        // future transfer that reuses the same remote id.
+        // Clear any pending cancel/pause for a finished transfer so a stale request can't affect
+        // a future transfer that reuses the same remote id.
         self.cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.pauses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
@@ -799,6 +837,12 @@ impl ProgressSink for SharedProgress {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+    }
+    fn is_paused(&self, id: &str) -> bool {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
     }
 }
 
@@ -1337,6 +1381,12 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                 if progress.is_cancelled(&it.remote_id) {
                     progress.consume_cancel(&it.remote_id);
                     report.cancelled += 1;
+                    continue;
+                }
+                // #659: a PAUSED transfer is skipped (persistent — NOT consumed, queue-deep). The
+                // body stays `missing` and remote_dirty; the next pass re-checks and fetches it once
+                // resumed. An in-flight download already past this point still runs to completion.
+                if progress.is_paused(&it.remote_id) {
                     continue;
                 }
                 // Policy gate: a Blocked verdict stops NEW downloads (existing files stay).
@@ -2917,6 +2967,63 @@ mod tests {
             dir.path().join("Photos/a.txt").exists(),
             "re-materialized after free-up"
         );
+    }
+
+    #[test]
+    fn materialize_skips_paused_and_resumes() {
+        // #659 pause/retry: a paused transfer is skipped (queue-deep, persistent) until resumed.
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = SharedProgress::new();
+        progress.request_pause("a1");
+
+        // paused -> a1 is skipped (not fetched, stays remote_dirty).
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 0, "paused file is skipped");
+        assert!(!dir.path().join("Photos/a.txt").exists());
+        assert_eq!(
+            store.get_item("acc", SERVICE, "a1").unwrap().unwrap().sync_state,
+            "remote_dirty"
+        );
+        assert!(
+            progress.is_paused_id("a1"),
+            "pause is persistent (not consumed like cancel)"
+        );
+
+        // resume -> the next pass fetches it.
+        progress.resume("a1");
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 1, "resumed file is fetched");
+        assert!(dir.path().join("Photos/a.txt").exists());
     }
 
     #[test]
