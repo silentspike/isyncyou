@@ -1381,6 +1381,11 @@ impl Router {
             "/api/v1/accounts",
             "/api/v1/settings",
             "/api/v1/debug/stats",
+            // #656: the live transfer-progress poll reads only the in-memory SharedProgress
+            // snapshot (no store). It MUST be gate-exempt: the mobile offline pass holds the
+            // store gate for the whole blocking materialize, so a gated poll would block until
+            // the pass finishes — leaving the panel unable to show progress while it downloads.
+            "/api/v1/onedrive/transfers",
         ];
         let static_get = req.method == "GET"
             && (matches!(
@@ -1504,6 +1509,14 @@ impl Router {
                     .replace(
                         "__ONEDRIVE_MODE_CAP_TOKEN__",
                         self.onedrive_mode_cap_token.as_deref().unwrap_or(""),
+                    )
+                    // #656 server-side half of the transfers cap bridge; app.js grows the
+                    // `__TRANSFER_CAP_TOKEN__` placeholder + `CAP.transfers` for the cancel
+                    // button on the live-transfer panel. A no-op until the transfers handler
+                    // is wired (`with_transfers`).
+                    .replace(
+                        "__TRANSFER_CAP_TOKEN__",
+                        self.transfer_cap_token.as_deref().unwrap_or(""),
                     )
                     .replace(
                         "__MAILWRITE_CAP_TOKEN__",
@@ -5166,6 +5179,32 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
     }
 
+    #[test]
+    fn transfers_poll_is_gate_exempt_for_the_live_panel() {
+        // #656: the mobile offline pass holds the store gate for the whole blocking
+        // materialize, so the live transfer poll MUST NOT take the gate — otherwise the panel
+        // can't show progress while a folder downloads. With the gate held on this thread, a
+        // non-exempt route would re-lock it (same-thread deadlock); the exempt poll is served.
+        struct NoopTransfers;
+        impl TransferProgress for NoopTransfers {
+            fn transfers(&self) -> Vec<TransferState> {
+                vec![]
+            }
+            fn cancel(&self, _id: &str) -> bool {
+                false
+            }
+        }
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router = Router::with_gate(Config::default(), gate.clone())
+            .with_transfers(std::sync::Arc::new(NoopTransfers), "cap".into());
+        let _held = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let resp = router.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
+        assert_eq!(
+            resp.status, 200,
+            "the live transfer poll must be served while the offline pass holds the gate"
+        );
+    }
+
     struct OkRestore;
     impl RestoreHandler for OkRestore {
         fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
@@ -7007,6 +7046,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn app_js_has_account_cap_token_placeholder() {
         assert!(APP_JS.contains("__ACCOUNT_CAP_TOKEN__"));
+    }
+
+    #[test]
+    fn app_js_has_transfer_cap_token_placeholder() {
+        // app.js side of the #656 bridge: the raw placeholder is present.
+        assert!(APP_JS.contains("__TRANSFER_CAP_TOKEN__"));
+        // read-only router (no transfers handler wired): the placeholder is blanked.
+        let ro = Router::new(Config::default()).route(&ApiRequest::get("/app.js"));
+        let ro_body = String::from_utf8_lossy(&ro.body);
+        assert!(
+            !ro_body.contains("__TRANSFER_CAP_TOKEN__"),
+            "placeholder must be replaced"
+        );
+        assert!(
+            ro_body.contains("transfers: \"\""),
+            "no token when transfers are disabled"
+        );
+        // with a transfers handler wired, the real cap token is injected.
+        struct NoopTransfers;
+        impl TransferProgress for NoopTransfers {
+            fn transfers(&self) -> Vec<TransferState> {
+                vec![]
+            }
+            fn cancel(&self, _id: &str) -> bool {
+                false
+            }
+        }
+        let rw = Router::new(Config::default())
+            .with_transfers(std::sync::Arc::new(NoopTransfers), "xfer123".into())
+            .route(&ApiRequest::get("/app.js"));
+        let rw_body = String::from_utf8_lossy(&rw.body);
+        assert!(rw_body.contains("transfers: \"xfer123\""));
     }
 
     #[test]
