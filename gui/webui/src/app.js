@@ -316,6 +316,7 @@ const CAP = {
   push: "__PUSH_CAP_TOKEN__",
   agent: "__AGENT_CAP_TOKEN__",
   onedriveMode: "__ONEDRIVE_MODE_CAP_TOKEN__",
+  transfers: "__TRANSFER_CAP_TOKEN__",
 };
 
 /* ---------------------------------------------------------------- push registration (#576)
@@ -1968,7 +1969,7 @@ function metricCard(icn, val, label) {
 }
 
 /* ---------------------------------------------------------------- onedrive (file explorer) */
-const Drive = { stack: [], layout: "grid", items: [], modes: { default_mode: "online", folder_modes: {} }, quota: null };
+const Drive = { stack: [], layout: "grid", items: [], modes: { default_mode: "online", folder_modes: {} }, quota: null, modeFilter: "all", transfers: [] };
 // #652: per-folder mode resolvers — PURE reads of Drive.modes (the server folder-mode map is the
 // single source of truth, re-fetched every driveLoad; no local override cache / optimistic state).
 // Used only for the CURRENT folder (absent from its own child list); subfolder pills use the
@@ -2010,7 +2011,7 @@ function driveSortSelect() {
   return sel;
 }
 async function renderOnedriveView(view) {
-  Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = []; Drive.stateFilter = "all"; Drive.sort = Drive.sort || "name";
+  Drive.stack = []; Drive.layout = Drive.layout || "grid"; Drive.items = []; Drive.stateFilter = "all"; Drive.modeFilter = "all"; Drive.sort = Drive.sort || "name";
   clear(view).append(
     el("div", { id: "drive-metrics-row", class: "con-metrics-row inset" }),
     el("div", { class: "drive-bar" },
@@ -2024,9 +2025,13 @@ async function renderOnedriveView(view) {
         el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
     el("div", { id: "drive-modebar", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 2px 4px" }),
     el("div", { id: "drive-storage", style: "display:flex;align-items:center;gap:6px;padding:0 2px 8px;font-size:12px" }),
+    // #656: live transfer-progress panel (own visible element — the desktop #drive-metrics-row
+    // is display:none on mobile). Hidden until the poll finds an in-flight transfer.
+    el("div", { id: "drive-transfers", style: "display:none;flex-direction:column;gap:8px;padding:0 2px 8px" }),
     el("div", { id: "drive-body" }),
   );
   driveLoadMetrics();
+  startDriveTransfersPoll();
   await driveOpen(null, "OneDrive", true);
 }
 // account-wide OneDrive KPIs (flat item list, independent of the current folder)
@@ -2201,11 +2206,16 @@ function driveSort(items) {
 function driveRender() {
   const body = $("#drive-body"); if (!body) return; clear(body);
   if (!Drive.items.length) { body.append(el("div", { class: "empty" }, emptyArt("empty-files"), el("h3", { text: "Empty folder" }), el("p", { text: MOBILE ? "OneDrive isn't cached on this device — it stays in your backup on your computer." : "Nothing is archived here." }))); return; }
-  // folders always navigate; the 4-state filter applies to files only.
+  // folders always navigate; the filter applies to files only. Mobile OneDrive filters by the
+  // MODE axis (online/sync/offline, #656); desktop keeps the backup-coverage axis.
   const files = Drive.items.filter(it => it.item_type !== "folder");
-  body.append(stateFilterBar(files, Drive.stateFilter, k => { Drive.stateFilter = k; driveRender(); }));
-  const items = driveSort(Drive.items.filter(it => it.item_type === "folder" || stateMatch(it, Drive.stateFilter)));
-  if (!items.length) { body.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "No files here have this backup status." }))); return; }
+  if (MOBILE) {
+    body.append(driveModeFilterBar(files, Drive.modeFilter || "all", k => { Drive.modeFilter = k; driveRender(); }));
+  } else {
+    body.append(stateFilterBar(files, Drive.stateFilter, k => { Drive.stateFilter = k; driveRender(); }));
+  }
+  const items = driveSort(Drive.items.filter(it => it.item_type === "folder" || (MOBILE ? modeMatch(it, Drive.modeFilter || "all") : stateMatch(it, Drive.stateFilter))));
+  if (!items.length) { body.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: MOBILE ? "No files here are in this mode." : "No files here have this backup status." }))); return; }
   if (Drive.layout === "grid") {
     const grid = el("div", { class: "drive-grid stagger" });
     items.forEach(it => grid.append(driveTile(it)));
@@ -2227,6 +2237,99 @@ function syncBadge(it) {
 const MODE_LABEL = { online: "Online", sync: "Sync", offline: "Offline" };
 const MODE_ICON = { online: "cloud", sync: "refresh-cw", offline: "hard-drive" };
 const MODE_COLOR = { online: "var(--dim,#94a3b8)", sync: "var(--svc-onedrive,#0a84ff)", offline: "var(--ok,#34d399)" };
+// #656: mobile OneDrive renders the per-item MODE axis (online/sync/offline), not the
+// desktop backup-coverage badge — online browsing keeps no store, so `has_body` is always
+// false there and coverage would read "Live only" for everything. A file inherits its
+// folder's effective mode; the chip is read-only (folders keep the interactive driveModePill).
+const MODE_KEYS = ["online", "sync", "offline"];
+const modeOf = (it) => (MODE_KEYS.includes(it.effective_mode) ? it.effective_mode : "online");
+const modeMatch = (it, f) => f === "all" || modeOf(it) === f;
+// Read-only per-file mode chip. If the file is in the live transfers set (a materialization
+// in flight), show a "Downloading N%" chip instead — ties the mode view to the progress panel.
+function driveModeChip(it) {
+  const dl = (Drive.transfers || []).find(t => t.id === it.remote_id);
+  if (dl) {
+    const pct = dl.bytes_total > 0 ? Math.round((dl.bytes_done || 0) / dl.bytes_total * 100) : null;
+    const c = "var(--svc-onedrive,#0a84ff)";
+    return el("span", { class: "mode-chip downloading", title: "Downloading" + (pct != null ? " " + pct + "%" : ""),
+      style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;"
+        + "font-weight:600;line-height:1.4;white-space:nowrap;" + `border:1px solid ${c};color:${c};background:${c}22;` },
+      icon("download", "icon-sm"), el("span", { text: pct != null ? "Downloading " + pct + "%" : "Downloading" }));
+  }
+  const m = modeOf(it), c = MODE_COLOR[m];
+  return el("span", { class: "mode-chip", title: "Mode: " + MODE_LABEL[m] + " (inherited from folder)",
+    style: "display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;"
+      + "font-weight:600;line-height:1.4;white-space:nowrap;opacity:0.85;" + `border:1px solid ${c};color:${c};background:transparent;` },
+    icon(MODE_ICON[m], "icon-sm"), el("span", { text: MODE_LABEL[m] }));
+}
+// Mode filter chips (mobile) — replaces the coverage stateFilterBar. Same look (.state-chips),
+// counts + filters over effective_mode. `onPick(key)` re-renders the view.
+function driveModeFilterBar(items, current, onPick) {
+  const counts = { all: items.length };
+  for (const k of MODE_KEYS) counts[k] = 0;
+  items.forEach(it => { counts[modeOf(it)]++; });
+  const mk = (key, label) => el("button", { class: "state-chip" + (key === current ? " active" : ""), onclick: () => onPick(key) },
+    key === "all" ? null : icon(MODE_ICON[key], "icon-sm"), el("span", { text: label }), el("span", { class: "sc-count", text: String(counts[key] || 0) }));
+  return el("div", { class: "state-chips" }, mk("all", "All"), mk("online", MODE_LABEL.online), mk("sync", MODE_LABEL.sync), mk("offline", MODE_LABEL.offline));
+}
+// #656: live transfer-progress panel. There is no SSE hook for transfers, so poll
+// GET /api/v1/onedrive/transfers (bytes/file/retry-after) while the OneDrive view is open.
+// Self-clearing: the timer stops when #drive-transfers leaves the DOM (view switched).
+let driveTransfersTimer = null, driveTransferIdKey = "";
+function startDriveTransfersPoll() {
+  if (driveTransfersTimer) { clearInterval(driveTransfersTimer); driveTransfersTimer = null; }
+  driveTransferIdKey = "";
+  pollDriveTransfers();
+  driveTransfersTimer = setInterval(pollDriveTransfers, 1500);
+}
+async function pollDriveTransfers() {
+  const box = $("#drive-transfers");
+  if (!box) { if (driveTransfersTimer) { clearInterval(driveTransfersTimer); driveTransfersTimer = null; } return; }
+  try {
+    const d = await api("/api/v1/onedrive/transfers");
+    Drive.transfers = (d && d.transfers) || [];
+  } catch { Drive.transfers = []; }
+  renderTransfersPanel();
+  // Re-render the item list only when the SET of transferring ids changes (not every byte
+  // tick), so the per-file "Downloading" chip toggles without fighting the user mid-scroll.
+  const idKey = Drive.transfers.map(t => t.id).sort().join(",");
+  if (idKey !== driveTransferIdKey) { driveTransferIdKey = idKey; if ($("#drive-body")) driveRender(); }
+}
+function renderTransfersPanel() {
+  const box = $("#drive-transfers"); if (!box) return;
+  const list = Drive.transfers || [];
+  clear(box);
+  if (!list.length) { box.style.display = "none"; return; }
+  box.style.display = "flex";
+  box.append(el("div", { style: "display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700" },
+    icon("download", "icon-sm"), el("span", { text: "Transferring " + list.length + (list.length === 1 ? " file" : " files") })));
+  list.forEach(t => box.append(transferRow(t)));
+}
+function transferRow(t) {
+  const total = t.bytes_total || 0, done = t.bytes_done || 0;
+  const pct = total > 0 ? Math.min(100, Math.round(done / total * 100)) : null;
+  const fill = el("div", { style: "position:absolute;top:0;bottom:0;left:0;border-radius:999px;background:var(--svc-onedrive,#0a84ff);"
+    + (pct != null ? `width:${pct}%;` : "width:40%;opacity:0.5;") });
+  const bar = el("div", { style: "position:relative;height:6px;border-radius:999px;overflow:hidden;background:var(--bg-3,#1e293b)" }, fill);
+  const meta = pct != null ? fmtSize(done) + " / " + fmtSize(total) + " · " + pct + "%" : fmtSize(done) + " transferred";
+  const retry = (t.retry_after_secs && t.retry_after_secs > 0) ? el("span", { class: "dim", style: "font-size:11px", text: "· retry in " + t.retry_after_secs + "s" }) : null;
+  const cancelBtn = CAP.transfers ? el("button", { class: "btn ghost sm", title: "Cancel transfer", onclick: () => cancelTransfer(t) }, icon("x", "icon-sm")) : null;
+  return el("div", { style: "display:flex;align-items:center;gap:8px" },
+    el("div", { class: "grow", style: "min-width:0" },
+      el("div", { class: "truncate", style: "font-size:12px;font-weight:600", text: t.name || t.id }),
+      bar,
+      el("div", { style: "display:flex;gap:6px;align-items:center" }, el("span", { class: "dim", style: "font-size:11px", text: meta }), retry)),
+    cancelBtn);
+}
+async function cancelTransfer(t) {
+  try {
+    await post("/api/v1/onedrive/transfers/cancel?" + qs({ id: t.id }), CAP.transfers);
+    // Optimistic: drop it from the panel now; the next poll confirms the engine skipped it.
+    Drive.transfers = (Drive.transfers || []).filter(x => x.id !== t.id);
+    renderTransfersPanel();
+    toast("Cancelling " + (t.name || "transfer"));
+  } catch (e) { toast("Could not cancel: " + e.message, "err"); }
+}
 function driveModePill(folderId, effMode, explicit, name) {
   const m = effMode || "online", c = MODE_COLOR[m];
   return el("button", {
@@ -2479,7 +2582,7 @@ function driveTile(it) {
     el("div", { class: "drive-meta dim", text: folder ? folderMeta : [fmtSize(it.size), it.remote_mtime ? fmtDate(it.remote_mtime) : ""].filter(Boolean).join(" · ") }),
     (!folder && pv.malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
     (!folder && pv.shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
-    folder ? null : coverageBadge(it),
+    folder ? null : (MOBILE ? driveModeChip(it) : coverageBadge(it)),
     syncBadge(it),
     (folder && MOBILE && CAP.onedriveMode) ? driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name) : null,
     driveActions(it)].filter(Boolean)); // native append stringifies null → drop nulls
@@ -2496,7 +2599,7 @@ function driveRow(it) {
       el("div", { class: "dim", style: "font-size:12px", text: folder ? ((it.preview || {}).child_count != null ? `${it.preview.child_count} ${it.preview.child_count === 1 ? "item" : "items"}` : "Folder") : (fmtSize(it.size) || "—") })),
     (!folder && (it.preview || {}).malware) ? el("span", { class: "drive-flag", title: "Malware flagged by Microsoft", style: "color:var(--danger,#f87171)" }, icon("shield", "icon-sm")) : null,
     (!folder && (it.preview || {}).shared) ? el("span", { class: "drive-flag dim", title: "Shared with others" }, icon("share2", "icon-sm")) : null,
-    folder ? null : coverageBadge(it),
+    folder ? null : (MOBILE ? driveModeChip(it) : coverageBadge(it)),
     syncBadge(it),
     el("span", { class: "dim tnum", style: "font-size:12px", text: fmtDate(it.remote_mtime) }));
   const acts = el("div", { style: "display:flex;gap:4px" });
