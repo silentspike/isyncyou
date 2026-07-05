@@ -775,6 +775,23 @@ impl SharedProgress {
             .contains(id)
     }
 
+    /// Retry transfer `id` **now** (#659): clear any pause AND its 429 backoff timer so the next
+    /// materialize pass re-attempts it immediately. Distinct from [`resume`](Self::resume), which
+    /// only un-pauses: `retry_now` also zeroes a backing-off slot's `retry_after_secs` so the panel
+    /// shows it retrying rather than waiting. Queue-deep — a failed/backed-off item is re-downloaded
+    /// on the next pass (the loop re-attempts any non-materialized item), no mid-file interruption.
+    pub fn retry_now(&self, id: &str) {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.with(|v| {
+            if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                s.retry_after_secs = 0;
+            }
+        });
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut Vec<TransferSlot>) -> R) -> R {
         let mut g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut g)
@@ -3113,6 +3130,25 @@ mod tests {
         p.request_cancel("rid2");
         p.finish("rid2");
         assert!(!p.is_cancelled("rid2"));
+    }
+
+    #[test]
+    fn shared_progress_retry_now_unpauses_and_clears_backoff() {
+        // #659 retry_now: distinct from resume — it un-pauses AND zeroes a backing-off slot's
+        // retry_after_secs so the panel shows the transfer retrying immediately.
+        let p = SharedProgress::new();
+        p.begin("rid", "f.txt", 100);
+        p.retry_after("rid", 30);
+        p.request_pause("rid");
+        assert!(p.is_paused_id("rid"));
+        assert_eq!(p.snapshot()[0].retry_after_secs, 30);
+
+        p.retry_now("rid");
+        assert!(!p.is_paused_id("rid"), "retry_now un-pauses");
+        assert_eq!(
+            p.snapshot()[0].retry_after_secs, 0,
+            "retry_now clears the 429 backoff timer"
+        );
     }
 
     #[test]

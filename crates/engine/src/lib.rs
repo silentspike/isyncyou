@@ -1227,6 +1227,19 @@ pub fn cleanup_offline_to_online_for(
         .map_err(|e| e.to_string())
 }
 
+/// #659 Conflict Center (engine wrapper): the account's unresolved keep-both conflicts (the
+/// write-orphan `conflict_state` rows), for the caller to surface. Read-only.
+pub fn list_conflicts_for(cfg: &Config, account: &str) -> Result<Vec<Item>, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    store.conflicts(account).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

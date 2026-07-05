@@ -41,11 +41,13 @@ pub fn now_ms() -> u64 {
 /// The destructive / external op classes that require a biometric per-action
 /// confirmation on mobile (risk-based gate catalogue, #onedrive-mobile 0.6):
 /// delete, external share, upload/replace, move OUT of a protected scope, a
-/// mode-switch that would pull a large folder offline, and bulk operations.
+/// mode-switch that would pull a large folder offline, a conflict resolve that
+/// deletes the cloud copy (keep-mine), and bulk operations.
 ///
 /// `restore-cloud` is deliberately ABSENT: it is excluded on mobile (no backup/restore
 /// there), so it never even reaches this gate. Read-only ops (search/read/list/export)
-/// are never gated.
+/// are never gated. Free-up / download-now are NOT gated (local-only, reversible: free-up
+/// just drops a re-downloadable copy) — only the cloud-deleting keep-mine resolve is (#659).
 pub fn requires_confirmation(op: &str) -> bool {
     matches!(
         op,
@@ -56,6 +58,7 @@ pub fn requires_confirmation(op: &str) -> bool {
             | "replace"
             | "move-out-of-protected"
             | "mode-switch-offline-large"
+            | "conflict-keep-mine"
             | "bulk"
     )
 }
@@ -232,12 +235,23 @@ mod tests {
             "replace",
             "move-out-of-protected",
             "mode-switch-offline-large",
+            "conflict-keep-mine",
             "bulk",
         ] {
             assert!(requires_confirmation(op), "{op} must be gated");
         }
-        // restore-cloud is excluded on mobile; read-only ops are never gated.
-        for op in ["restore-cloud", "read", "list", "search", "export", "move"] {
+        // restore-cloud is excluded on mobile; read-only ops are never gated. free-up /
+        // download-now are local-only, reversible → never gated (#659).
+        for op in [
+            "restore-cloud",
+            "read",
+            "list",
+            "search",
+            "export",
+            "move",
+            "free-up",
+            "download-now",
+        ] {
             assert!(!requires_confirmation(op), "{op} must NOT be gated");
         }
     }
