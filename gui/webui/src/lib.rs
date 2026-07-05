@@ -7437,6 +7437,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_has_onedrive_manage_cap_token_placeholder() {
+        // app.js side of the #659 manage bridge: the raw placeholder is present.
+        assert!(APP_JS.contains("__ONEDRIVE_MANAGE_CAP_TOKEN__"));
+        // read-only router (no manage handler wired): the placeholder is blanked.
+        let ro = Router::new(Config::default()).route(&ApiRequest::get("/app.js"));
+        let ro_body = String::from_utf8_lossy(&ro.body);
+        assert!(
+            !ro_body.contains("__ONEDRIVE_MANAGE_CAP_TOKEN__"),
+            "placeholder must be replaced"
+        );
+        assert!(
+            ro_body.contains("onedriveManage: \"\""),
+            "no token when management is disabled"
+        );
+        // with a manage handler wired, the real cap token is injected.
+        let m = std::sync::Arc::new(MockManage::default());
+        let rw = Router::new(Config::default())
+            .with_onedrive_manage(m, "odm123".into())
+            .route(&ApiRequest::get("/app.js"));
+        let rw_body = String::from_utf8_lossy(&rw.body);
+        assert!(rw_body.contains("onedriveManage: \"odm123\""));
+    }
+
+    #[test]
     fn app_js_has_push_cap_token_placeholder() {
         assert!(APP_JS.contains("__PUSH_CAP_TOKEN__"));
     }
