@@ -1964,6 +1964,98 @@ pub fn resolve_conflict<W: RemoteWriter>(
     Ok(())
 }
 
+/// Result of an offline→online cleanup pass (#659).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Materialized bodies dropped (provably safe in the cloud) — local space reclaimed.
+    pub freed: usize,
+    /// Materialized items KEPT because they were not provably safe (unsynced local edit,
+    /// `remote_dirty`, or an open cloud-write) — no data loss.
+    pub kept: usize,
+}
+
+/// #659 offline→online cleanup/rollback: when a folder is no longer offline, drop its
+/// materialized bodies from `sync_root` to reclaim space — but ONLY those provably safe in the
+/// cloud (`sync_state=="clean"`, no local edit vs the synced reference, no open cloud-write op).
+/// Anything unsynced is KEPT (no data loss). Dropped bodies are moved to `trash_root`
+/// (reversible), and the row stays listable with `content_state=cached`/`body_state=missing`.
+pub fn cleanup_offline_to_online(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+    trash_root: &Path,
+    cfg: &isyncyou_core::Config,
+) -> Result<CleanupReport, SyncError> {
+    let scopes = crate::scope::scopes_from_modes(cfg.onedrive_modes.get(account));
+    let offline_ids: BTreeSet<&str> = scopes
+        .iter()
+        .filter(|s| s.mode == crate::scope::Mode::Offline)
+        .map(|s| s.folder_id.as_str())
+        .collect();
+    let open: std::collections::HashSet<String> = store
+        .pending_cloud_writes(account)?
+        .into_iter()
+        .filter_map(|op| op.target_id)
+        .collect();
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut report = CleanupReport::default();
+    for it in &items {
+        // Only materialized (Mode-3 offline) bodies are candidates.
+        if it.content_state.as_deref() != Some("materialized")
+            || it.body_location.as_deref() != Some("sync")
+        {
+            continue;
+        }
+        // Still owned by an offline scope? then leave it materialized.
+        if item_in_offline(store, account, &it.remote_id, &offline_ids)? {
+            continue;
+        }
+        let rel = match local_rel_path(&by_id, it) {
+            Some(p) => p,
+            None => continue,
+        };
+        let full = sync_root.join(&rel);
+        // Safety gate — never drop a body that is not provably current in the cloud.
+        let safe = it.sync_state == "clean"
+            && !open.contains(&it.remote_id)
+            && match store.get_synced_state(account, SERVICE, &it.remote_id)? {
+                Some((ssize, smtime, shash)) => {
+                    !locally_edited_since_sync(&full, ssize, smtime, shash.as_deref())
+                }
+                None => false, // no reference → cannot prove safety → keep
+            };
+        if !safe {
+            report.kept += 1;
+            continue;
+        }
+        // Move the body aside (reversible) before flipping the state. If the move fails, keep it.
+        if full.exists() {
+            let dst = trash_root.join(&rel);
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let moved = std::fs::rename(&full, &dst).is_ok()
+                || (std::fs::copy(&full, &dst).is_ok() && std::fs::remove_file(&full).is_ok());
+            if !moved {
+                report.kept += 1;
+                continue;
+            }
+        }
+        store.set_content_state(
+            account,
+            SERVICE,
+            &it.remote_id,
+            Some("cached"),
+            Some("none"),
+            Some("missing"),
+            None,
+        )?;
+        report.freed += 1;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3662,6 +3754,76 @@ mod tests {
         assert_eq!(
             store.get_item("acc", SERVICE, "a1").unwrap().unwrap().conflict_state,
             None
+        );
+    }
+
+    #[test]
+    fn cleanup_offline_to_online_drops_safe_keeps_unsynced() {
+        // #659 AC3: after offline->online, cleanup drops SAFE materialized bodies (clean, in
+        // cloud) to trash but KEEPS anything unsynced (no data loss). Empty modes -> all "online".
+        let store = Store::open_in_memory().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let trash = tempfile::tempdir().unwrap();
+        for (id, name, content) in [
+            ("clean1", "clean.txt", b"CLEAN" as &[u8]),
+            ("dirty1", "dirty.txt", b"DIRTY"),
+        ] {
+            let mut it = Item::new("acc", SERVICE, id, name, "file");
+            it.local_path = Some(name.into());
+            store.upsert_item(&it).unwrap();
+            std::fs::write(sync.path().join(name), content).unwrap();
+            store
+                .set_content_state(
+                    "acc",
+                    SERVICE,
+                    id,
+                    Some("materialized"),
+                    Some("sync"),
+                    Some("available"),
+                    Some(NOW),
+                )
+                .unwrap();
+        }
+        // clean1: clean + a synced reference matching disk -> provably safe.
+        store.set_sync_state("acc", SERVICE, "clean1", "clean").unwrap();
+        record_synced_state(
+            &store,
+            "acc",
+            "clean1",
+            &sync.path().join("clean.txt"),
+            Some(crate::quickxor::quickxor_base64(b"CLEAN")),
+        );
+        // dirty1: an unsynced local edit -> remote_dirty -> must be KEPT.
+        store
+            .set_sync_state("acc", SERVICE, "dirty1", "remote_dirty")
+            .unwrap();
+
+        let cfg = isyncyou_core::Config::default(); // empty onedrive_modes -> both now online
+        let report =
+            cleanup_offline_to_online(&store, "acc", sync.path(), trash.path(), &cfg).unwrap();
+        assert_eq!(report.freed, 1, "only the safe body is dropped");
+        assert_eq!(report.kept, 1, "the unsynced body is kept (no data loss)");
+
+        // clean1 dropped: body moved to trash (reversible), row still lists (cached/missing).
+        assert!(!sync.path().join("clean.txt").exists());
+        assert!(
+            trash.path().join("clean.txt").exists(),
+            "moved to trash, not deleted"
+        );
+        let c = store.get_item("acc", SERVICE, "clean1").unwrap().unwrap();
+        assert_eq!(c.body_state.as_deref(), Some("missing"));
+        assert_eq!(c.content_state.as_deref(), Some("cached"));
+        assert!(c.deleted_at.is_none(), "row stays listable");
+        // dirty1 KEPT: body still on disk, still materialized (no data loss).
+        assert!(sync.path().join("dirty.txt").exists());
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "dirty1")
+                .unwrap()
+                .unwrap()
+                .body_state
+                .as_deref(),
+            Some("available")
         );
     }
 

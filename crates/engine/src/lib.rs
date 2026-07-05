@@ -1208,6 +1208,25 @@ pub fn resolve_conflict_for(
         .map_err(|e| e.to_string())
 }
 
+/// #659 offline→online cleanup (engine wrapper): drop the now-online folders' materialized
+/// bodies that are provably safe in the cloud (to `trash`); keep anything unsynced. No Graph
+/// client needed — it only reads the store + touches local files. Returns `{freed, kept}`.
+pub fn cleanup_offline_to_online_for(
+    cfg: &Config,
+    account: &str,
+) -> Result<isyncyou_connectors::CleanupReport, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let trash = acc.archive_root.join(".isyncyou-trash");
+    isyncyou_connectors::cleanup_offline_to_online(&store, account, &acc.sync_root, &trash, cfg)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
