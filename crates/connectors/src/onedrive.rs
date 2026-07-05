@@ -1369,6 +1369,10 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                         let copy = unique_conflict_copy(&dir, fname, host);
                         if std::fs::rename(&full, dir.join(&copy)).is_ok() {
                             report.conflicts += 1;
+                            // #659: persist the conflict (best-effort) so the Conflict Center can
+                            // surface it; the value is the safeBackup copy name for resolve.
+                            let _ =
+                                store.set_conflict_state(account, SERVICE, &it.remote_id, Some(&copy));
                         }
                     }
                 }
@@ -1879,6 +1883,8 @@ pub fn apply_local_modifies<R: ContentReplacer>(
                     Ok(()) => {
                         store.set_sync_state(account, SERVICE, id, "remote_dirty")?;
                         report.conflicts += 1;
+                        // #659: persist the conflict so the Conflict Center can surface it.
+                        let _ = store.set_conflict_state(account, SERVICE, id, Some(&copy));
                     }
                     Err(_) => report.failed += 1,
                 }
@@ -1887,6 +1893,75 @@ pub fn apply_local_modifies<R: ContentReplacer>(
         }
     }
     Ok(report)
+}
+
+/// #659 Conflict Center user-facing resolution of a persisted keep-both conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// Keep both — the cloud version at the original name + the local edit as its safeBackup
+    /// copy; just clear the conflict marker.
+    KeepBoth,
+    /// Local edit wins: delete the cloud version and restore the local copy to the original name.
+    KeepMine,
+    /// Cloud version wins: discard the local safeBackup copy.
+    KeepCloud,
+}
+
+impl ConflictResolution {
+    /// Parse the wire string used by the `/onedrive/conflict/resolve` endpoint.
+    pub fn parse(s: &str) -> Option<ConflictResolution> {
+        match s {
+            "keep-both" => Some(ConflictResolution::KeepBoth),
+            "keep-mine" => Some(ConflictResolution::KeepMine),
+            "keep-cloud" => Some(ConflictResolution::KeepCloud),
+            _ => None,
+        }
+    }
+}
+
+/// #659 Conflict Center: resolve a persisted keep-both conflict. `conflict_state` carries the
+/// safeBackup copy file name (the user's local edit); the original path holds the cloud version.
+/// `KeepBoth` leaves both and clears the marker; `KeepMine` deletes the cloud item and restores
+/// the local copy to the original name; `KeepCloud` discards the local copy. Clears
+/// `conflict_state` on success.
+pub fn resolve_conflict<W: RemoteWriter>(
+    store: &Store,
+    account: &str,
+    id: &str,
+    resolution: ConflictResolution,
+    sync_root: &Path,
+    writer: &W,
+) -> Result<(), SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let it = *by_id
+        .get(id)
+        .ok_or_else(|| SyncError::Malformed(format!("resolve: unknown item {id}")))?;
+    let copy = it
+        .conflict_state
+        .clone()
+        .ok_or_else(|| SyncError::Malformed(format!("resolve: no conflict on {id}")))?;
+    let rel = local_rel_path(&by_id, it)
+        .ok_or_else(|| SyncError::Malformed("resolve: no local path".into()))?;
+    let full = sync_root.join(&rel);
+    let dir = full
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| sync_root.to_path_buf());
+    let copy_path = dir.join(&copy);
+    match resolution {
+        ConflictResolution::KeepBoth => {}
+        ConflictResolution::KeepMine => {
+            writer.delete(id).map_err(SyncError::Malformed)?;
+            let _ = std::fs::remove_file(&full);
+            std::fs::rename(&copy_path, &full).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        }
+        ConflictResolution::KeepCloud => {
+            let _ = std::fs::remove_file(&copy_path);
+        }
+    }
+    store.set_conflict_state(account, SERVICE, id, None)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3488,6 +3563,106 @@ mod tests {
         let copy = docs.join("note-host-safeBackup-0001.txt");
         assert!(copy.exists(), "conflict copy must exist");
         assert_eq!(std::fs::read(&copy).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn keep_both_persists_conflict_state_and_keep_cloud_resolves() {
+        // #659: the keep-both site now PERSISTS conflict_state (was a write-orphan); the
+        // Conflict Center lists it; keep-cloud drops the local edit copy + clears the marker.
+        let (store, dir) = store_with_tracked_file(2);
+        std::fs::write(dir.path().join("Docs").join("note.txt"), b"changed").unwrap();
+        let mut map = MappingTable::new();
+        let r = MockReplacer {
+            conflict: true,
+            calls: Default::default(),
+        };
+        let modifies = vec![("a1".into(), PathBuf::from("Docs/note.txt"), "etag-old".into())];
+        apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), "host", &modifies).unwrap();
+
+        let it = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(
+            it.conflict_state.as_deref(),
+            Some("note-host-safeBackup-0001.txt"),
+            "the keep-both is now persisted"
+        );
+        assert_eq!(store.conflicts("acc").unwrap().len(), 1);
+        let copy = dir.path().join("Docs").join("note-host-safeBackup-0001.txt");
+        assert!(copy.exists());
+
+        struct NoWriter;
+        impl RemoteWriter for NoWriter {
+            fn upload(&self, _: &str, _: &[u8]) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        resolve_conflict(
+            &store,
+            "acc",
+            "a1",
+            ConflictResolution::KeepCloud,
+            dir.path(),
+            &NoWriter,
+        )
+        .unwrap();
+        assert!(!copy.exists(), "keep-cloud drops the local edit copy");
+        assert_eq!(
+            store.get_item("acc", SERVICE, "a1").unwrap().unwrap().conflict_state,
+            None
+        );
+        assert!(store.conflicts("acc").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_keep_mine_deletes_cloud_and_restores_local() {
+        // #659: keep-mine — delete the cloud item + restore the local edit to the original name.
+        let (store, dir) = store_with_tracked_file(2);
+        let docs = dir.path().join("Docs");
+        std::fs::write(docs.join("note-host-safeBackup-0001.txt"), b"my edit").unwrap();
+        std::fs::write(docs.join("note.txt"), b"cloud version").unwrap();
+        store
+            .set_conflict_state("acc", SERVICE, "a1", Some("note-host-safeBackup-0001.txt"))
+            .unwrap();
+
+        use std::sync::{Arc, Mutex};
+        struct RecWriter(Arc<Mutex<Vec<String>>>);
+        impl RemoteWriter for RecWriter {
+            fn upload(&self, _: &str, _: &[u8]) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn delete(&self, id: &str) -> Result<(), String> {
+                self.0.lock().unwrap().push(id.into());
+                Ok(())
+            }
+        }
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        resolve_conflict(
+            &store,
+            "acc",
+            "a1",
+            ConflictResolution::KeepMine,
+            dir.path(),
+            &RecWriter(deleted.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["a1"],
+            "keep-mine deletes the cloud item"
+        );
+        assert_eq!(
+            std::fs::read(docs.join("note.txt")).unwrap(),
+            b"my edit",
+            "local edit restored to the original name"
+        );
+        assert!(!docs.join("note-host-safeBackup-0001.txt").exists());
+        assert_eq!(
+            store.get_item("acc", SERVICE, "a1").unwrap().unwrap().conflict_state,
+            None
+        );
     }
 
     #[test]

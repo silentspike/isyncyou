@@ -1187,6 +1187,27 @@ pub fn download_now_for(
     .map_err(|e| e.to_string())
 }
 
+/// #659 Conflict Center (engine wrapper): resolve one item's keep-both conflict
+/// (keep-both / keep-mine / keep-cloud); a keep-mine cloud delete uses the Graph client.
+pub fn resolve_conflict_for(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    resolution: isyncyou_connectors::ConflictResolution,
+    sync_token: String,
+) -> Result<(), String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let client = GraphClient::new(sync_token);
+    isyncyou_connectors::resolve_conflict(&store, account, id, resolution, &acc.sync_root, &client)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
