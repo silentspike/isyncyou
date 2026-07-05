@@ -87,6 +87,9 @@ pub struct SyncReport {
     pub downloaded: usize,
     pub dirs_created: usize,
     pub materialize_failed: usize,
+    /// Files skipped because the user cancelled the transfer (distinct from `materialize_failed`;
+    /// a user-cancel is not an error) (#656).
+    pub materialize_cancelled: usize,
     pub local_trashed: usize,
     pub local_delete_blocked: Option<String>,
     // local -> remote
@@ -116,6 +119,9 @@ impl SyncReport {
         );
         if self.modified_conflicts > 0 {
             s.push_str(&format!(" ({} conflict copies)", self.modified_conflicts));
+        }
+        if self.materialize_cancelled > 0 {
+            s.push_str(&format!(" ({} cancelled)", self.materialize_cancelled));
         }
         if let Some(r) = &self.local_delete_blocked {
             s.push_str(&format!(" [local deletes held: {r}]"));
@@ -702,6 +708,7 @@ pub fn sync_once(
     out.downloaded = mat.downloaded;
     out.dirs_created = mat.dirs_created;
     out.materialize_failed = mat.failed;
+    out.materialize_cancelled = mat.cancelled;
     // download-path keep-both: locally-edited files moved aside before overwrite
     out.modified_conflicts = mat.conflicts;
 
@@ -973,6 +980,7 @@ pub fn offline_sync_once(
     out.downloaded = mat.downloaded;
     out.dirs_created = mat.dirs_created;
     out.materialize_failed = mat.failed;
+    out.materialize_cancelled = mat.cancelled;
     out.modified_conflicts = mat.conflicts;
 
     // 4) remote -> local deletions (only offline files live in sync_root), guarded.
@@ -1186,6 +1194,16 @@ mod tests {
         assert!(s.contains("1 created"));
         assert!(s.contains("2 conflict copies"));
         assert!(s.contains("local deletes held: 60% > 50%"));
+    }
+
+    #[test]
+    fn summary_mentions_cancelled_transfers() {
+        // #656: a user-cancelled materialize is surfaced distinctly from failures.
+        let r = SyncReport {
+            materialize_cancelled: 2,
+            ..Default::default()
+        };
+        assert!(r.summary().contains("2 cancelled"), "{}", r.summary());
     }
 
     #[test]
