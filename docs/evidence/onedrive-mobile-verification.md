@@ -89,7 +89,7 @@ contain on-device evidence plus Graph/store cross-checks. Tokens must never be p
 
 | Row | Scenario | Required proof | Status |
 |---|---|---|---|
-| AC2.1 | Mode 1 online live root/subfolder browse; on-demand open; no store write | screenshot/CDP, Graph child ids, store `count_by_service` check | PENDING |
+| AC2.1 | Mode 1 online live root/subfolder browse; on-demand open; no store write | screenshot/CDP, Graph child ids, store `count_by_service` check | PASS - `task5-mode1-online.json`, `task5-graph-crosscheck.json`, `task5-mode1-open.png` |
 | AC2.2 | Mode config toggle and effective-mode inheritance; restart persistence | screenshot/CDP, config/store read after restart | PENDING |
 | AC2.3 | Mode 2 sync metadata cache and lazy body into `cache_root`; transfer panel | CDP/store/file-system proof, transfer JSON | PENDING |
 | AC2.4 | Mode 3 offline materialization, airplane read, writeback, restart recovery, free-up cloud survival | screenshots/CDP, airplane command proof, Graph version proof, revert proof | PENDING |
@@ -98,6 +98,29 @@ contain on-device evidence plus Graph/store cross-checks. Tokens must never be p
 | AC2.7 | Share link with biometric gate and permission delete | BiometricPrompt dumpsys, Graph permission JSON, DELETE permission proof | PENDING |
 | AC2.8 | SAF DocumentsProvider | system picker screenshot/dumpsys, live children, proxy-fd open proof | PENDING |
 | AC2.9 | Rest features: free-up, download-now, pause/retry/cancel, conflict center, rollback, cleanup | screenshots/CDP, Graph survival proof, store/file-system proof | PENDING |
+
+### AC2.1 Mode 1 Online Evidence
+
+On-device CDP drove the mobile WebView through the actual OneDrive explorer:
+
+- `go("onedrive")` rendered the live root; `Drive.items` included fixture root
+  `isy-om660-20260706-135511` with `effective_mode=online`.
+- `driveOpen(root)` browsed into the fixture root and listed `mode-online`, `mode-sync`,
+  `mode-offline`, `ops-source`, and `ops-dest`, all from live Graph `/children`.
+- `driveOpen(mode-online)` listed `online-open.txt`; `driveOpenFile()` opened it in the
+  mobile in-app iframe through `/api/v1/onedrive/open`.
+- Iframe text was `OM660 online open fixture`, matching the Graph fixture file
+  `892B68CBF4A7C544!se0748f2fe81c4973899c57a520cef5fc`.
+- Store proof: `/api/v1/items?account=me&service=onedrive&limit=1` returned `total=7`
+  before and `total=7` after the live browse/open; `storeDelta=0`.
+- Graph cross-check: `task5-graph-crosscheck.json` records the same fixture root,
+  child folder IDs, and opened file size (`26` bytes) without committing account metadata.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task5-mode1-online.json`
+- `artifacts/onedrive-mobile-660/task5-graph-crosscheck.json`
+- `artifacts/onedrive-mobile-660/task5-mode1-open.png`
 
 ## Host / Desktop Regression Matrix
 
