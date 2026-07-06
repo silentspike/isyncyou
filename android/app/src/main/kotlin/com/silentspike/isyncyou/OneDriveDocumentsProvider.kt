@@ -154,7 +154,11 @@ class OneDriveDocumentsProvider : DocumentsProvider() {
 
     // -------------------------------------------------- engine bridge helpers (live Mode-1)
 
-    private fun token(): String = EngineBootstrap.ensureStarted(context!!.filesDir)
+    private fun token(): String {
+        val t = EngineBootstrap.ensureStarted(context!!.filesDir)
+        if (t.isEmpty()) throw IllegalStateException("encrypted local engine unavailable")
+        return t
+    }
 
     /** `GET /api/v1/onedrive/children?folder=` → the live Graph child list (empty on any failure). */
     private fun liveChildren(folder: String): JSONArray {
