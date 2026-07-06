@@ -1,0 +1,88 @@
+{
+  "apk_sha256": "d3267c2fd7eae862d001cbd6a0bf8058232ad74d3ff78986640e8665072bf96e",
+  "created_at_utc": "2026-07-06T12:37:01Z",
+  "layout": {
+    "barRect": {
+      "bottom": 91.3602933883667,
+      "height": 75.36151885986328,
+      "top": 15.998774528503418,
+      "width": 495.061279296875,
+      "x": 15.998774528503418,
+      "y": 15.998774528503418
+    },
+    "bodyText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-sync\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nSync\n1.9 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1029.0 GB free\nAll\n4\nOnline\n0\nSync\n4\nOffline\n0\nsync-lazy-2.txt\n31 B \u00b7 06.07.2026 14:21:41\nSync\nsync-lazy.txt\n24 B \u00b7 06.07.2026 13:55:20\nSync\nsync-progress-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:14:32\nSync\nsync-transfer-fetch-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:25:13\nSync",
+    "bodyTop": 153.7193603515625,
+    "crumbsRect": {
+      "bottom": 41.79534435272217,
+      "clientWidth": 495,
+      "height": 25.79656982421875,
+      "scrollWidth": 495,
+      "top": 15.998774528503418,
+      "width": 495.061279296875,
+      "x": 15.998774528503418,
+      "y": 15.998774528503418
+    },
+    "crumbsText": "OneDrive\nisy-om660-20260706-135511\nmode-sync",
+    "hash": "#/onedrive",
+    "items": [
+      "sync-lazy-2.txt\n31 B \u00b7 06.07.2026 14:21:41\nSync",
+      "sync-lazy.txt\n24 B \u00b7 06.07.2026 13:55:20\nSync",
+      "sync-progress-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:14:32\nSync",
+      "sync-transfer-fetch-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:25:13\nSync"
+    ],
+    "modeBarText": "This folder:\nSync",
+    "route": "onedrive",
+    "segRect": {
+      "bottom": 91.36029434204102,
+      "height": 41.568626403808594,
+      "top": 49.79166793823242,
+      "width": 79.55882263183594,
+      "x": 431.501220703125,
+      "y": 49.79166793823242
+    },
+    "sortRect": {
+      "bottom": 75.0367660522461,
+      "height": 25.245098114013672,
+      "top": 49.79166793823242,
+      "width": 230.625,
+      "x": 15.998774528503418,
+      "y": 49.79166793823242
+    },
+    "stack": [
+      {
+        "id": "root",
+        "name": "OneDrive"
+      },
+      {
+        "id": "892B68CBF4A7C544!s243029df950d49938d6a3e7199c5873b",
+        "name": "isy-om660-20260706-135511"
+      },
+      {
+        "id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+        "name": "mode-sync"
+      }
+    ],
+    "storageText": "1.9 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1029.0 GB free",
+    "title": null,
+    "uploadRect": {
+      "bottom": 89.79166793823242,
+      "height": 40,
+      "top": 49.79166793823242,
+      "width": 83.33333587646484,
+      "x": 254.62010192871094,
+      "y": 49.79166793823242
+    },
+    "verifyRect": {
+      "bottom": 89.79166793823242,
+      "height": 40,
+      "top": 49.79166793823242,
+      "width": 77.55514526367188,
+      "x": 345.94976806640625,
+      "y": 49.79166793823242
+    },
+    "viewport": {
+      "h": 1066,
+      "w": 527
+    }
+  }
+}

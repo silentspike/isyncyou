@@ -3,7 +3,10 @@
 //! calls [`build_live_router`] for the shared base and adds its daemon-only
 //! restore/share/push on top; the mobile client uses the base as-is.
 
+use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
+use isyncyou_store::Item;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1779,15 +1782,162 @@ impl Drop for TempBody {
     }
 }
 
-/// Live on-demand OneDrive content fetch for the web UI (#649, Mode 1 online):
-/// download an item's bytes straight from Graph by id. No store write, no cache row —
-/// the bytes are served inertly by the router. Read-only — no capability token.
+fn onedrive_ancestry<'a>(by_id: &HashMap<&'a str, &'a Item>, it: &'a Item) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut cur = it;
+    for _ in 0..256 {
+        let Some(parent) = cur.parent_remote_id.as_deref() else {
+            break;
+        };
+        out.push(parent);
+        match by_id.get(parent) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    out
+}
+
+fn onedrive_effective_mode(
+    cfg: &Config,
+    account: &str,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) -> OneDriveMode {
+    let modes = cfg.onedrive_modes.get(account).cloned().unwrap_or_default();
+    let ancestry = onedrive_ancestry(by_id, it);
+    modes.effective_mode(&it.remote_id, &ancestry)
+}
+
+fn onedrive_body_bytes(
+    acc: &isyncyou_core::AccountConfig,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) -> Result<Option<Vec<u8>>, String> {
+    if it.body_state.as_deref() != Some("available") {
+        return Ok(None);
+    }
+    let Some(rel) = isyncyou_connectors::local_rel_path(by_id, it) else {
+        return Ok(None);
+    };
+    let root = if it.body_location.as_deref() == Some("cache") {
+        acc.effective_cache_root()
+    } else {
+        acc.sync_root.clone()
+    };
+    let path = root.join(rel);
+    match isyncyou_core::envelope::read_body(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read cached OneDrive body: {e}")),
+    }
+}
+
+/// Live on-demand OneDrive content fetch for the web UI (#649, Mode 1 online), plus
+/// Mode-2 lazy body caching (#660): local bodies win first, sync-mode misses download into
+/// `cache_root`, and online-mode misses stay live/no-store.
 pub struct DaemonOneDriveOpen {
-    cfg: Config,
+    config_path: PathBuf,
+    progress: isyncyou_connectors::SharedProgress,
+}
+impl DaemonOneDriveOpen {
+    fn cfg(&self) -> Result<Config, String> {
+        Config::load(&self.config_path).map_err(|e| format!("load config: {e}"))
+    }
 }
 impl isyncyou_webui::OneDriveOpenHandler for DaemonOneDriveOpen {
     fn download(&self, account: &str, id: &str) -> Result<Vec<u8>, String> {
-        let client = isyncyou_engine::onedrive_lister(&self.cfg, account)?;
+        let cfg = self.cfg()?;
+        let acc = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .ok_or_else(|| format!("no account '{account}'"))?;
+        let store = isyncyou_store::Store::open(acc.archive_root.join(".isyncyou-store.db")).ok();
+        if let Some(store) = store.as_ref() {
+            let items = store
+                .items_by_service(account, "onedrive")
+                .map_err(|e| format!("query OneDrive store: {e}"))?;
+            let by_id: HashMap<&str, &Item> =
+                items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+            if let Some(it) = by_id.get(id) {
+                if let Some(bytes) = onedrive_body_bytes(acc, &by_id, it)? {
+                    return Ok(bytes);
+                }
+                if it.item_type == "file"
+                    && onedrive_effective_mode(&cfg, account, &by_id, it) == OneDriveMode::Sync
+                {
+                    let Some(rel) = isyncyou_connectors::local_rel_path(&by_id, it) else {
+                        return Err("sync-mode open: no local path".into());
+                    };
+                    let full = acc.effective_cache_root().join(&rel);
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("create cache parent: {e}"))?;
+                    }
+                    let client = isyncyou_engine::onedrive_lister(&cfg, account)?;
+                    store
+                        .set_content_state(
+                            account,
+                            "onedrive",
+                            id,
+                            Some("cached"),
+                            Some("cache"),
+                            Some("downloading"),
+                            None,
+                        )
+                        .map_err(|e| format!("mark sync download: {e}"))?;
+                    let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                    let total = it.size.unwrap_or(0).max(0) as u64;
+                    self.progress.begin(id, name, total);
+                    let downloaded = client
+                        .download_content_with_progress(id, &mut |done| {
+                            self.progress.advance(id, done);
+                        })
+                        .map_err(|e| e.to_string());
+                    match downloaded {
+                        Ok(bytes) => {
+                            let result = (|| {
+                                isyncyou_core::envelope::write_body_atomic(&full, &bytes)
+                                    .map_err(|e| format!("write cache body: {e}"))?;
+                                store
+                                    .set_sync_state(account, "onedrive", id, "clean")
+                                    .map_err(|e| format!("mark sync clean: {e}"))?;
+                                store
+                                    .set_content_state(
+                                        account,
+                                        "onedrive",
+                                        id,
+                                        Some("cached"),
+                                        Some("cache"),
+                                        Some("available"),
+                                        Some(&unix_now()),
+                                    )
+                                    .map_err(|e| format!("mark cache available: {e}"))?;
+                                Ok::<(), String>(())
+                            })();
+                            self.progress.finish(id);
+                            result?;
+                            return Ok(bytes);
+                        }
+                        Err(e) => {
+                            let _ = store.set_content_state(
+                                account,
+                                "onedrive",
+                                id,
+                                Some("cached"),
+                                Some("cache"),
+                                Some("failed"),
+                                None,
+                            );
+                            self.progress.finish(id);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+        let client = isyncyou_engine::onedrive_lister(&cfg, account)?;
         isyncyou_graph::GraphClient::download_content(&client, id).map_err(|e| e.to_string())
     }
 }
@@ -1829,12 +1979,17 @@ impl isyncyou_webui::TransferProgress for DaemonTransfer {
         self.progress
             .snapshot()
             .into_iter()
-            .map(|s| isyncyou_webui::TransferState {
-                id: s.id,
-                name: s.name,
-                bytes_done: s.bytes_done,
-                bytes_total: s.bytes_total,
-                retry_after_secs: s.retry_after_secs,
+            .map(|s| {
+                // #659: a paused transfer lives in the pause-set (not the slot), so derive the flag.
+                let paused = self.progress.is_paused_id(&s.id);
+                isyncyou_webui::TransferState {
+                    id: s.id,
+                    name: s.name,
+                    bytes_done: s.bytes_done,
+                    bytes_total: s.bytes_total,
+                    retry_after_secs: s.retry_after_secs,
+                    paused,
+                }
             })
             .collect()
     }
@@ -1844,6 +1999,85 @@ impl isyncyou_webui::TransferProgress for DaemonTransfer {
         // completes; the skip applies to the not-yet-started queue).
         self.progress.request_cancel(id);
         true
+    }
+    fn pause(&self, id: &str) -> bool {
+        // #659 queue-deep pause: a persistent skip (unlike cancel, not auto-consumed) the
+        // materialize pass re-checks before each file until resumed. An in-flight download
+        // still completes; the skip applies to the not-yet-started queue.
+        self.progress.request_pause(id);
+        true
+    }
+    fn resume(&self, id: &str) -> bool {
+        self.progress.resume(id);
+        true
+    }
+    fn retry(&self, id: &str) -> bool {
+        // #659: re-queue a paused/backed-off/failed transfer — clear any pause + 429 backoff so
+        // the next materialize pass re-attempts it (queue-deep; a failed item is re-downloaded next
+        // pass because the loop re-attempts any non-materialized item).
+        self.progress.retry_now(id);
+        true
+    }
+}
+
+/// Live OneDrive **local-body management** for the web UI (#659): free-up / download-now / conflict
+/// list+resolve / offline→online cleanup, over the engine wrappers (each opens the account store).
+/// Reloads the config fresh from disk on each call so the cleanup enumerates the *just-persisted*
+/// folder modes (the mode POST saves before this runs); free-up/download-now/resolve address one
+/// item by id. Shares the engine's [`SharedProgress`] so a download-now surfaces in the transfers
+/// panel. On mobile keep-mine + cleanup are additionally biometric-gated by the router.
+pub struct DaemonOneDriveManage {
+    config_path: PathBuf,
+    progress: isyncyou_connectors::SharedProgress,
+}
+impl DaemonOneDriveManage {
+    fn cfg(&self) -> Result<Config, String> {
+        Config::load(&self.config_path).map_err(|e| format!("load config: {e}"))
+    }
+}
+impl isyncyou_webui::OneDriveManageHandler for DaemonOneDriveManage {
+    fn free_up(&self, account: &str, id: &str) -> Result<(), String> {
+        isyncyou_engine::free_up_for(&self.cfg()?, account, id).map(|_| ())
+    }
+    fn download_now(&self, account: &str, id: &str) -> Result<bool, String> {
+        let cfg = self.cfg()?;
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&cfg, account)?;
+        // An explicit user "download now" is a deliberate single-item action → bypass the
+        // background wifi/charging/storage-floor policy the bulk offline pass throttles on.
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let now = unix_now();
+        isyncyou_engine::download_now_for(&cfg, account, id, token, dev, &now, &self.progress)
+    }
+    fn list_conflicts(&self, account: &str) -> Result<serde_json::Value, String> {
+        let items = isyncyou_engine::list_conflicts_for(&self.cfg()?, account)?;
+        Ok(serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|it| {
+                    serde_json::json!({
+                        "id": it.remote_id,
+                        "name": it.name,
+                        // The write-orphan column stores the keep-both copy's file name.
+                        "conflict_copy": it.conflict_state,
+                        "content_state": it.content_state,
+                        "body_state": it.body_state,
+                    })
+                })
+                .collect(),
+        ))
+    }
+    fn resolve_conflict(&self, account: &str, id: &str, resolution: &str) -> Result<(), String> {
+        let cfg = self.cfg()?;
+        let res = isyncyou_connectors::ConflictResolution::parse(resolution)
+            .ok_or_else(|| format!("unknown resolution '{resolution}'"))?;
+        // A keep-mine resolve deletes the cloud copy → needs the write token; keep-both / keep-cloud
+        // are local-only but resolve_conflict_for takes the client uniformly (unused for those).
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&cfg, account)?;
+        isyncyou_engine::resolve_conflict_for(&cfg, account, id, res, token)
+    }
+    fn cleanup_offline_to_online(&self, account: &str) -> Result<serde_json::Value, String> {
+        let report = isyncyou_engine::cleanup_offline_to_online_for(&self.cfg()?, account)?;
+        Ok(serde_json::json!({ "freed": report.freed, "kept": report.kept }))
     }
 }
 
@@ -1867,7 +2101,10 @@ pub fn build_live_router(
     };
     base.with_onedrive_info(Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() }))
         .with_onedrive_list(Arc::new(DaemonOneDriveList { cfg: cfg.clone() }))
-        .with_onedrive_open(Arc::new(DaemonOneDriveOpen { cfg: cfg.clone() }))
+        .with_onedrive_open(Arc::new(DaemonOneDriveOpen {
+            config_path: config_path.clone(),
+            progress: progress.clone(),
+        }))
         .with_verify(
             Arc::new(DaemonVerify { cfg: cfg.clone() }),
             mint_cap_token(),
@@ -1882,7 +2119,9 @@ pub fn build_live_router(
         // #651: OneDrive per-folder mode read/set, wired in the shared builder so both
         // desktop and mobile get it (like with_onedrive_write below).
         .with_onedrive_mode(
-            Arc::new(DaemonOneDriveMode { config_path }),
+            Arc::new(DaemonOneDriveMode {
+                config_path: config_path.clone(),
+            }),
             mint_cap_token(),
         )
         .with_mail_write(
@@ -1930,6 +2169,16 @@ pub fn build_live_router(
         .with_onedrive_write(
             Arc::new(DaemonOneDriveWrite::new(cfg.clone()))
                 as Arc<dyn isyncyou_webui::OneDriveWriteHandler>,
+            mint_cap_token(),
+        )
+        // #659: OneDrive local-body management (free-up / download-now / conflict list+resolve /
+        // offline→online cleanup), wired here so both desktop and mobile get it; on mobile keep-mine
+        // + cleanup are biometric-gated. Reloads the config fresh per call (fresh modes for cleanup).
+        .with_onedrive_manage(
+            Arc::new(DaemonOneDriveManage {
+                config_path: config_path.clone(),
+                progress: progress.clone(),
+            }) as Arc<dyn isyncyou_webui::OneDriveManageHandler>,
             mint_cap_token(),
         )
         // #655: in-flight offline-transfer progress (the engine's SharedProgress) surfaced at
@@ -2006,6 +2255,59 @@ mod tests {
     }
 
     #[test]
+    fn onedrive_open_serves_cached_sync_body_before_graph_lookup() {
+        let dir =
+            std::env::temp_dir().join(format!("isy-apphost-open-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let arch = dir.join("archive");
+        let sync = dir.join("sync");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let config_path = dir.join("isyncyou.toml");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a".into(),
+                sync_root: sync,
+                archive_root: arch.clone(),
+                cache_root: cache.clone(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.save(&config_path).unwrap();
+        {
+            let store = isyncyou_store::Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut item = Item::new("a", "onedrive", "file-id", "doc.txt", "file");
+            item.local_path = Some("doc.txt".into());
+            store.upsert_item(&item).unwrap();
+            store
+                .set_content_state(
+                    "a",
+                    "onedrive",
+                    "file-id",
+                    Some("cached"),
+                    Some("cache"),
+                    Some("available"),
+                    None,
+                )
+                .unwrap();
+        }
+        isyncyou_core::envelope::write_body_atomic(&cache.join("doc.txt"), b"cached bytes")
+            .unwrap();
+
+        let h = DaemonOneDriveOpen {
+            config_path,
+            progress: SharedProgress::new(),
+        };
+        let got = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap();
+        assert_eq!(got, b"cached bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn daemon_transfer_cancel_requests_cancellation() {
         // DaemonTransfer::cancel (#656) is best-effort: it always accepts and flags the id on
         // the shared progress so the materialize pass skips it before its next file boundary.
@@ -2025,6 +2327,71 @@ mod tests {
             !progress.is_cancelled("other"),
             "an unrelated id is unaffected"
         );
+    }
+
+    #[test]
+    fn daemon_transfer_pause_resume_retry_and_paused_flag() {
+        // #659: pause/resume/retry map onto the shared progress; the endpoint surfaces `paused`.
+        use isyncyou_connectors::ProgressSink;
+        use isyncyou_webui::TransferProgress;
+        let progress = SharedProgress::new();
+        progress.begin("i1", "photo.jpg", 1000);
+        progress.retry_after("i1", 30);
+        let dt = DaemonTransfer {
+            progress: progress.clone(),
+        };
+        assert!(dt.pause("i1"));
+        assert!(
+            progress.is_paused_id("i1"),
+            "pause is recorded (persistent)"
+        );
+        // The endpoint mapping derives `paused` from the pause-set.
+        assert!(
+            dt.transfers()[0].paused,
+            "transfers() surfaces the paused flag"
+        );
+
+        assert!(dt.resume("i1"));
+        assert!(!progress.is_paused_id("i1"), "resume clears the pause");
+
+        // retry un-pauses AND clears the 429 backoff so the panel shows it retrying now.
+        dt.pause("i1");
+        assert!(dt.retry("i1"));
+        assert!(!progress.is_paused_id("i1"), "retry un-pauses");
+        assert_eq!(
+            progress.snapshot()[0].retry_after_secs,
+            0,
+            "retry clears the backoff timer"
+        );
+    }
+
+    #[test]
+    fn build_live_router_wires_manage_and_transfer_controls() {
+        // #659: build_live_router wires the management handler + the pause/retry transfer controls.
+        // A cap-gated POST with NO cap token returns 401 (not 404) → proves the handler is wired.
+        let events = Arc::new(isyncyou_webui::EventBus::new());
+        let router = build_live_router(
+            Config::default(),
+            None,
+            events,
+            PathBuf::from("/x/isyncyou.toml"),
+            Arc::new(AtomicU64::new(5)),
+            SharedProgress::new(),
+        );
+        for path in [
+            "/api/v1/onedrive/free-up?account=a&id=i1",
+            "/api/v1/onedrive/download-now?account=a&id=i1",
+            "/api/v1/onedrive/conflict/resolve?account=a&id=i1&resolution=keep-both",
+            "/api/v1/onedrive/cleanup?account=a",
+            "/api/v1/onedrive/transfers/pause?id=i1",
+            "/api/v1/onedrive/transfers/retry?id=i1",
+        ] {
+            let resp = router.route(&ApiRequest::new("POST", path));
+            assert_eq!(resp.status, 401, "wired + cap-gated (not 404): {path}");
+        }
+        // The conflicts GET read is wired too (404 would mean no handler).
+        let c = router.route(&ApiRequest::get("/api/v1/onedrive/conflicts?account=a"));
+        assert_ne!(c.status, 404, "conflicts GET is wired");
     }
 
     #[test]

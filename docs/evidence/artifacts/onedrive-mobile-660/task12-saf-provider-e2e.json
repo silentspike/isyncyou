@@ -1,0 +1,45 @@
+{
+  "authority_expected": "com.silentspike.isyncyou.debug.documents",
+  "kind": "task12-saf-provider-e2e",
+  "pass": true,
+  "probe_result": {
+    "ok": true,
+    "sha256": "56945136c18aed28306883c3e873e818b62356a203c6c55e8ec7b154ef298f49",
+    "size": 26,
+    "text": "OM660 online open fixture\n",
+    "uri": "content://com.silentspike.isyncyou.debug.documents/document/892B68CBF4A7C544%2521se0748f2fe81c4973899c57a520cef5fc%7C0%7Conline-open.txt",
+    "uri_authority": "com.silentspike.isyncyou.debug.documents"
+  },
+  "provider_log_summary": {
+    "fixture_count_seen": true,
+    "lines": [
+      "SAF queryChildDocuments parent=root",
+      "SAF children folder= count=17",
+      "SAF queryChildDocuments parent=892B68CBF4A7C544%21s243029df950d49938d6a3e7199c5",
+      "SAF children folder=892B68CBF4A7C544 count=7",
+      "SAF queryChildDocuments parent=892B68CBF4A7C544%21scd5fef1091da4b119a6c1e89ec8c",
+      "SAF children folder=892B68CBF4A7C544 count=1",
+      "SAF openDocument id=892B68CBF4A7C544 mode=r bytes=26",
+      "SAF queryChildDocuments parent=892B68CBF4A7C544%21scd5fef1091da4b119a6c1e89ec8c",
+      "SAF children folder=892B68CBF4A7C544 count=1",
+      "SAF queryChildDocuments parent=892B68CBF4A7C544%21scd5fef1091da4b119a6c1e89ec8c",
+      "SAF children folder=892B68CBF4A7C544 count=1"
+    ],
+    "mode_online_count_seen": true,
+    "open_document_bytes_seen": true,
+    "root_count_seen": true
+  },
+  "screenshots": [
+    "task12-saf-picker-loaded.png",
+    "task12-saf-provider-open.png",
+    "task12-saf-probe-mode-online.png",
+    "task12-saf-file-tapped.png"
+  ],
+  "system_picker_package": "com.android.documentsui",
+  "ui_proof": {
+    "fixture_root_visible": true,
+    "mode_online_visible": true,
+    "online_open_visible": true,
+    "provider_root_visible": true
+  }
+}
