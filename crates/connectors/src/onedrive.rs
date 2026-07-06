@@ -1757,6 +1757,18 @@ pub fn scan_local_deletes(
         if it.deleted_at.is_some() || it.item_type != "file" || it.sync_state != "clean" {
             continue;
         }
+        // #659 DATA-LOSS GUARD: only a file whose body is *supposed* to be on disk can be "locally
+        // deleted" — a missing local copy then means the user deleted it. A body that is
+        // intentionally absent must NOT be pushed as a cloud delete. That is the whole point of
+        // free-up ([`dematerialize_one`] sets content_state=`cached`): it drops the local copy but
+        // keeps the cloud file. Without this guard the next offline pass sees the freed-up file
+        // missing, treats it as a local delete, and deletes it from OneDrive (data loss). We flag a
+        // delete only when the item is materialized (mobile Mode-3) or has no content-state at all
+        // (the desktop always-download model, where every synced file has a local body); `cached` /
+        // `online` / `not_applicable` bodies are intentionally absent and are skipped.
+        if !matches!(it.content_state.as_deref(), None | Some("materialized")) {
+            continue;
+        }
         let rel = match local_rel_path(&by_id, it) {
             Some(p) => p,
             None => continue,
@@ -2976,6 +2988,16 @@ mod tests {
                 .iter()
                 .any(|i| i.remote_id == "a1"),
             "the item still lists after free-up"
+        );
+        // #659 DATA-LOSS GUARD (found on-device: free-up deleted the file from OneDrive): a freed-up
+        // file (content_state=`cached`, body gone from disk) must NOT be seen as a LOCAL DELETE by the
+        // next offline pass — otherwise `apply_local_deletes` pushes a cloud delete and the file is
+        // lost. It is intentionally absent, not user-deleted.
+        assert!(
+            !scan_local_deletes(&store, "acc", dir.path())
+                .unwrap()
+                .contains(&"a1".to_string()),
+            "free-up must not make the file look locally deleted (would push a cloud delete)"
         );
 
         // download-now again re-materializes (reversible).
