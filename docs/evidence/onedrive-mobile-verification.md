@@ -90,7 +90,7 @@ contain on-device evidence plus Graph/store cross-checks. Tokens must never be p
 | Row | Scenario | Required proof | Status |
 |---|---|---|---|
 | AC2.1 | Mode 1 online live root/subfolder browse; on-demand open; no store write | screenshot/CDP, Graph child ids, store `count_by_service` check | PASS - `task5-mode1-online.json`, `task5-graph-crosscheck.json`, `task5-mode1-open.png` |
-| AC2.2 | Mode config toggle and effective-mode inheritance; restart persistence | screenshot/CDP, config/store read after restart | PENDING |
+| AC2.2 | Mode config toggle and effective-mode inheritance; restart persistence | screenshot/CDP, config/store read after restart | PASS - `task6-mode-config-before-restart.json`, `task6-mode-config-after-restart.json`, screenshots |
 | AC2.3 | Mode 2 sync metadata cache and lazy body into `cache_root`; transfer panel | CDP/store/file-system proof, transfer JSON | PENDING |
 | AC2.4 | Mode 3 offline materialization, airplane read, writeback, restart recovery, free-up cloud survival | screenshots/CDP, airplane command proof, Graph version proof, revert proof | PENDING |
 | AC2.5 | Cloud create/rename/move/delete with biometric delete | CDP, BiometricPrompt dumpsys, Graph verify/revert | PENDING |
@@ -121,6 +121,30 @@ Artifacts:
 - `artifacts/onedrive-mobile-660/task5-mode1-online.json`
 - `artifacts/onedrive-mobile-660/task5-graph-crosscheck.json`
 - `artifacts/onedrive-mobile-660/task5-mode1-open.png`
+
+### AC2.2 Mode Config Evidence
+
+On-device CDP used the mobile WebView's own mode setter (`setFolderMode`) with
+`CAP.onedriveMode`:
+
+- Set `mode-sync` (`892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6`) to `sync`.
+- Set `mode-offline` (`892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e`) to `offline`.
+- Before restart, the root fixture listing rendered `mode-sync` as explicit `sync`,
+  `mode-offline` as explicit `offline`, and the unconfigured siblings as inherited/default
+  `online`.
+- Opening `mode-sync` showed `sync-lazy.txt` with `effective_mode=sync`, proving child/file
+  effective-mode inheritance from the folder mode.
+- After `adb shell am force-stop com.silentspike.isyncyou.debug` and relaunch, the WebView was
+  reattached to live socket `webview_devtools_remote_7906`; `/api/v1/onedrive/mode` still
+  returned the same folder-mode map and `sync-lazy.txt` still rendered with
+  `effective_mode=sync`.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task6-mode-config-before-restart.json`
+- `artifacts/onedrive-mobile-660/task6-mode-config-before-restart.png`
+- `artifacts/onedrive-mobile-660/task6-mode-config-after-restart.json`
+- `artifacts/onedrive-mobile-660/task6-mode-config-after-restart.png`
 
 ## Host / Desktop Regression Matrix
 
