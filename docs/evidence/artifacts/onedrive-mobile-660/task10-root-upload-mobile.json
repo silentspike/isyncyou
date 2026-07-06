@@ -1,0 +1,26 @@
+{
+  "account": "me",
+  "errors": [],
+  "finished_at": "2026-07-06T14:09:49.571Z",
+  "graph_verify_upload": {
+    "etag": "\"{C7CC57BB-48CB-44BF-81BE-E6CE82C1042F},1\"",
+    "id": "892B68CBF4A7C544!sc7cc57bb48cb44bf81bee6ce82c1042f",
+    "name": "om660-root-upload-140858.txt",
+    "parent_id": "892B68CBF4A7C544!sea8cc6beffdb43d7976fbc7da445c639",
+    "sha256": "48e49a06318ad11de7d6991dfddf91ac027fdfe496123785df036cabd9c8063e",
+    "size": 68,
+    "status": 200,
+    "text": "OM660 root upload regression proof 2026-07-06T14:08:58.048350+00:00\n"
+  },
+  "id": "892B68CBF4A7C544!sc7cc57bb48cb44bf81bee6ce82c1042f",
+  "kind": "task10-root-upload-mobile",
+  "name": "om660-root-upload-140858.txt",
+  "parent": "",
+  "pass": false,
+  "started_at": "2026-07-06T14:08:58.252Z",
+  "text": "OM660 root upload regression proof 2026-07-06T14:08:58.048350+00:00\n",
+  "upload": {
+    "id": "892B68CBF4A7C544!sc7cc57bb48cb44bf81bee6ce82c1042f",
+    "ok": true
+  }
+}

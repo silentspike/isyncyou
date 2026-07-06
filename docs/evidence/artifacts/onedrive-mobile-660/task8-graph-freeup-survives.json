@@ -1,0 +1,26 @@
+{
+  "check": "Graph GET after mobile free-up and offline-poll window",
+  "remote_id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+  "status": 200,
+  "body": {
+    "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+    "name": "freeup-guard.txt",
+    "size": 37,
+    "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},1\"",
+    "lastModifiedDateTime": "2026-07-06T11:55:22Z",
+    "file": {
+      "mimeType": "text/plain",
+      "hashes": {
+        "quickXorHash": "/cHsqhux2jzV28akAyq7qRjfEI4="
+      }
+    },
+    "parentReference": {
+      "driveType": "personal",
+      "driveId": "892B68CBF4A7C544",
+      "id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+      "name": "mode-offline",
+      "path": "/drive/root:/isy-om660-20260706-135511/mode-offline",
+      "siteId": "ff51467a-aef1-4c3d-9d94-ec38e02bd41f"
+    }
+  }
+}

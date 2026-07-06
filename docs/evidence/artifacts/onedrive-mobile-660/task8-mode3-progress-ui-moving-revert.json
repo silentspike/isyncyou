@@ -1,0 +1,10 @@
+{
+  "after_status": 404,
+  "delete_status": 204,
+  "errors": [],
+  "finished_at": "2026-07-06T15:29:37.012624Z",
+  "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+  "kind": "task8-mode3-progress-ui-moving-revert",
+  "pass": true,
+  "started_at": "2026-07-06T15:29:34.272498Z"
+}

@@ -1,0 +1,35 @@
+{
+  "account": "me",
+  "create": {
+    "id": "892B68CBF4A7C544!s64ed3c5df8324c99bbe6c93b8fdda9cd",
+    "ok": true
+  },
+  "created_id": "892B68CBF4A7C544!s64ed3c5df8324c99bbe6c93b8fdda9cd",
+  "delete": null,
+  "errors": [
+    "delete: Confirmation cancelled"
+  ],
+  "finished_at": "2026-07-06T14:02:57.338Z",
+  "graph_after_cancelled_delete": {
+    "etag": "\"{64ED3C5D-F832-4C99-BBE6-C93B8FDDA9CD},4\"",
+    "id": "892B68CBF4A7C544!s64ed3c5df8324c99bbe6c93b8fdda9cd",
+    "name": "om660-crud-135928-renamed",
+    "parent_id": "892B68CBF4A7C544!sdc2b6daf39b54607b4e960f4d6f46ac3",
+    "size": 0,
+    "status": 200
+  },
+  "kind": "task9-cloud-crud-biometric-delete",
+  "move": {
+    "ok": true
+  },
+  "name": "om660-crud-135928",
+  "note": "First delete attempt deliberately recorded the biometric gate but ended with Confirmation cancelled before the user entered the code.",
+  "ops_dest": "892B68CBF4A7C544!sdc2b6daf39b54607b4e960f4d6f46ac3",
+  "ops_src": "892B68CBF4A7C544!s4bc4efad3f8540d19d297a78048eb222",
+  "pass": false,
+  "rename": {
+    "ok": true
+  },
+  "renamed": "om660-crud-135928-renamed",
+  "started_at": "2026-07-06T13:59:28.183Z"
+}

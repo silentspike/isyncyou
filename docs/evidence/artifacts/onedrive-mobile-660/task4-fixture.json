@@ -1,0 +1,79 @@
+{
+  "created_at_utc": "2026-07-06T11:55:25Z",
+  "files": {
+    "freeup_guard": {
+      "cTag": "\"c:{CF1B808A-9250-40AA-81F5-220913177BE5},1\"",
+      "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},1\"",
+      "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "name": "freeup-guard.txt",
+      "size": 37
+    },
+    "offline_read": {
+      "cTag": "\"c:{BEB430A8-B5A7-4122-859F-AB06145EC8EA},1\"",
+      "eTag": "\"{BEB430A8-B5A7-4122-859F-AB06145EC8EA},1\"",
+      "id": "892B68CBF4A7C544!sbeb430a8b5a74122859fab06145ec8ea",
+      "name": "offline-read.txt",
+      "size": 30
+    },
+    "online_open": {
+      "cTag": "\"c:{E0748F2F-E81C-4973-899C-57A520CEF5FC},1\"",
+      "eTag": "\"{E0748F2F-E81C-4973-899C-57A520CEF5FC},1\"",
+      "id": "892B68CBF4A7C544!se0748f2fe81c4973899c57a520cef5fc",
+      "name": "online-open.txt",
+      "size": 26
+    },
+    "progress_large": {
+      "cTag": "\"c:{9DA8F871-B263-4523-9DEB-033269C231A4},1\"",
+      "eTag": "\"{9DA8F871-B263-4523-9DEB-033269C231A4},1\"",
+      "id": "892B68CBF4A7C544!s9da8f871b26345239deb033269c231a4",
+      "name": "progress-24mb.bin",
+      "size": 25165824
+    },
+    "sync_lazy": {
+      "cTag": "\"c:{185B8203-5348-4CD0-ACB6-EB835CEAA2E4},1\"",
+      "eTag": "\"{185B8203-5348-4CD0-ACB6-EB835CEAA2E4},1\"",
+      "id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+      "name": "sync-lazy.txt",
+      "size": 24
+    }
+  },
+  "folders": {
+    "mode_offline": {
+      "cTag": "\"c:{0EEFA6BD-1331-4BD5-9A1D-48F84A86BB8E},0\"",
+      "eTag": "\"{0EEFA6BD-1331-4BD5-9A1D-48F84A86BB8E},1\"",
+      "id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+      "name": "mode-offline"
+    },
+    "mode_online": {
+      "cTag": "\"c:{CD5FEF10-91DA-4B11-9A6C-1E89EC8C2A8B},0\"",
+      "eTag": "\"{CD5FEF10-91DA-4B11-9A6C-1E89EC8C2A8B},1\"",
+      "id": "892B68CBF4A7C544!scd5fef1091da4b119a6c1e89ec8c2a8b",
+      "name": "mode-online"
+    },
+    "mode_sync": {
+      "cTag": "\"c:{52AC141D-4B63-421E-B758-6D07D884AEE6},0\"",
+      "eTag": "\"{52AC141D-4B63-421E-B758-6D07D884AEE6},1\"",
+      "id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "name": "mode-sync"
+    },
+    "ops_dest": {
+      "cTag": "\"c:{DC2B6DAF-39B5-4607-B4E9-60F4D6F46AC3},0\"",
+      "eTag": "\"{DC2B6DAF-39B5-4607-B4E9-60F4D6F46AC3},1\"",
+      "id": "892B68CBF4A7C544!sdc2b6daf39b54607b4e960f4d6f46ac3",
+      "name": "ops-dest"
+    },
+    "ops_src": {
+      "cTag": "\"c:{4BC4EFAD-3F85-40D1-9D29-7A78048EB222},0\"",
+      "eTag": "\"{4BC4EFAD-3F85-40D1-9D29-7A78048EB222},1\"",
+      "id": "892B68CBF4A7C544!s4bc4efad3f8540d19d297a78048eb222",
+      "name": "ops-source"
+    }
+  },
+  "large_sha256": "3bbb171e9101245cf763bba6146cc317bc9c681182f7afd5a94e33ea3f3ff5f0",
+  "root": {
+    "cTag": "\"c:{243029DF-950D-4993-8D6A-3E7199C5873B},0\"",
+    "eTag": "\"{243029DF-950D-4993-8D6A-3E7199C5873B},1\"",
+    "id": "892B68CBF4A7C544!s243029df950d49938d6a3e7199c5873b",
+    "name": "isy-om660-20260706-135511"
+  }
+}
