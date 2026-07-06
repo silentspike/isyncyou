@@ -1,0 +1,16 @@
+{
+  "deleted": [
+    {
+      "id": "892B68CBF4A7C544!sa43c2b38d7ce4ebb8dc9b984e520cb68",
+      "name": "om660-pause-hold-142905.txt",
+      "status": 204
+    },
+    {
+      "id": "892B68CBF4A7C544!s749f2f8f24e64b449297802e8fdb4e6d",
+      "name": "om660-cancel-once-142905.txt",
+      "status": 204
+    }
+  ],
+  "kind": "task13-transfer-fixture-revert",
+  "pass": true
+}

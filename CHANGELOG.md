@@ -70,6 +70,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   never a blind clobber). Also fixes `graph::upload_to_parent` for the drive-root case (an empty parent
   id, which the online-root upload path is the first to exercise): it now targets `/me/drive/root:/…:/
   content` instead of the malformed `/me/drive/items/:/…` that Graph 400s.
+- `docs`: OneDrive on Mobile close-out verification (#660) now records the REV-4 plan diff and Pixel
+  8 Pro end-to-end evidence for all three folder modes, upload/replace/root upload, sharing, SAF,
+  transfer controls, conflict resolution, cleanup, and the No-RC main-promotion directive.
+
+### Fixed
+
+- `onedrive`: Mode-2 mobile opens now cache sync-mode bodies into `cache_root` before serving them.
+- `webui`: Mobile OneDrive breadcrumbs no longer collapse the action toolbar on narrow phone layouts.
+- `onedrive`: Mode-3 offline materialization re-downloads remote-dirty bodies when the remote hash
+  changed, instead of trusting a stale local body.
+- `onedrive`: `download-now` now always finishes its transfer slot after the body is written, so the
+  transfer panel clears correctly.
 
 ## [1.0.0] — 2026-06-26
 
