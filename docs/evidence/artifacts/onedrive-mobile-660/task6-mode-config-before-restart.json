@@ -1,0 +1,67 @@
+{
+  "account": "me",
+  "default_mode": "online",
+  "domModeText": "This folder:\nSync",
+  "folder_modes": {
+    "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e": "offline",
+    "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6": "sync"
+  },
+  "phase": "before-restart",
+  "rootItems": [
+    {
+      "effective_mode": "offline",
+      "explicit": true,
+      "id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+      "name": "mode-offline",
+      "type": "folder"
+    },
+    {
+      "effective_mode": "online",
+      "explicit": false,
+      "id": "892B68CBF4A7C544!scd5fef1091da4b119a6c1e89ec8c2a8b",
+      "name": "mode-online",
+      "type": "folder"
+    },
+    {
+      "effective_mode": "sync",
+      "explicit": true,
+      "id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "name": "mode-sync",
+      "type": "folder"
+    },
+    {
+      "effective_mode": "online",
+      "explicit": false,
+      "id": "892B68CBF4A7C544!sdc2b6daf39b54607b4e960f4d6f46ac3",
+      "name": "ops-dest",
+      "type": "folder"
+    },
+    {
+      "effective_mode": "online",
+      "explicit": false,
+      "id": "892B68CBF4A7C544!s4bc4efad3f8540d19d297a78048eb222",
+      "name": "ops-source",
+      "type": "folder"
+    }
+  ],
+  "stack": [
+    {
+      "id": "root",
+      "name": "OneDrive"
+    },
+    {
+      "id": "892B68CBF4A7C544!s243029df950d49938d6a3e7199c5873b",
+      "name": "isy-om660-20260706-135511"
+    },
+    {
+      "id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "name": "mode-sync"
+    }
+  ],
+  "syncFile": {
+    "effective_mode": "sync",
+    "has_body": false,
+    "id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+    "name": "sync-lazy.txt"
+  }
+}

@@ -1,0 +1,90 @@
+{
+  "device_local_after_write": {
+    "wc": "113 files/sync/mode-offline/freeup-guard.txt"
+  },
+  "errors": [],
+  "finished_at": "2026-07-06T13:56:27.025984+00:00",
+  "graph_after_revert": {
+    "matches_baseline": true,
+    "meta": {
+      "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+      "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "lastModifiedDateTime": "2026-07-06T13:56:25Z",
+      "name": "freeup-guard.txt",
+      "size": 37
+    },
+    "sha256": "0daa67715cc53428476e72f775c411b92c14d80f77a938e40759d92c2174815a",
+    "size": 37,
+    "text": "OM660 free-up cloud-survival fixture\n"
+  },
+  "graph_before": {
+    "meta": {
+      "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},1\"",
+      "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "lastModifiedDateTime": "2026-07-06T11:55:22Z",
+      "name": "freeup-guard.txt",
+      "size": 37
+    },
+    "sha256": "0daa67715cc53428476e72f775c411b92c14d80f77a938e40759d92c2174815a",
+    "size": 37,
+    "text": "OM660 free-up cloud-survival fixture\n"
+  },
+  "graph_revert": {
+    "meta": {
+      "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+      "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "lastModifiedDateTime": "2026-07-06T13:56:25Z",
+      "name": "freeup-guard.txt",
+      "size": 37
+    },
+    "status": 200
+  },
+  "graph_writeback": {
+    "meta": {
+      "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},2\"",
+      "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "lastModifiedDateTime": "2026-07-06T13:56:22Z",
+      "name": "freeup-guard.txt",
+      "size": 113
+    },
+    "sha256": "794f1060e874c3fbe900ed93c802049b266d017d85bcbdf0eb21d46da03001e7",
+    "size": 113,
+    "text": "OM660 device writeback proof 2026-07-06T13:56:05Z\nlocal edit from Pixel sync_root; length differs from baseline.\n"
+  },
+  "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+  "kind": "task8-mode3-writeback-freeup-guard",
+  "local_edit": {
+    "sha256": "794f1060e874c3fbe900ed93c802049b266d017d85bcbdf0eb21d46da03001e7",
+    "size": 113,
+    "text": "OM660 device writeback proof 2026-07-06T13:56:05Z\nlocal edit from Pixel sync_root; length differs from baseline.\n"
+  },
+  "local_rel": "files/sync/mode-offline/freeup-guard.txt",
+  "pass": true,
+  "samples": [
+    {
+      "at": "2026-07-06T13:56:10.583811+00:00",
+      "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},1\"",
+      "lastModifiedDateTime": "2026-07-06T11:55:22Z",
+      "matched_edit": false,
+      "sha256": "0daa67715cc53428476e72f775c411b92c14d80f77a938e40759d92c2174815a",
+      "size": 37
+    },
+    {
+      "at": "2026-07-06T13:56:17.320738+00:00",
+      "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},1\"",
+      "lastModifiedDateTime": "2026-07-06T11:55:22Z",
+      "matched_edit": false,
+      "sha256": "0daa67715cc53428476e72f775c411b92c14d80f77a938e40759d92c2174815a",
+      "size": 37
+    },
+    {
+      "at": "2026-07-06T13:56:23.458326+00:00",
+      "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},2\"",
+      "lastModifiedDateTime": "2026-07-06T13:56:22Z",
+      "matched_edit": true,
+      "sha256": "794f1060e874c3fbe900ed93c802049b266d017d85bcbdf0eb21d46da03001e7",
+      "size": 113
+    }
+  ],
+  "started_at": "2026-07-06T13:56:03.956842+00:00"
+}

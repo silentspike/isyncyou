@@ -1,0 +1,292 @@
+{
+  "account": "me",
+  "active_before_force_stop": [
+    {
+      "at": "2026-07-06T15:40:54.082Z",
+      "count": 1,
+      "panelText": "",
+      "transfers": [
+        {
+          "bytes_done": 0,
+          "bytes_total": 125829120,
+          "id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+          "name": "om660-mode3-restart-154005.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    }
+  ],
+  "errors": [],
+  "evaluation": {
+    "active_transfer_interrupted": true,
+    "graph_item_existed_until_revert": true,
+    "graph_upload_ok": true,
+    "relaunch_recovered_materialized": true
+  },
+  "final_item_after_relaunch": {
+    "body_location": "sync",
+    "body_state": "available",
+    "conflict_state": null,
+    "content_state": "materialized",
+    "deleted": false,
+    "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+    "has_body": true,
+    "item_type": "file",
+    "last_download_error": null,
+    "name": "om660-mode3-restart-154005.bin",
+    "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+    "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+    "remote_mtime": "2026-07-06T15:40:15Z",
+    "service": "onedrive",
+    "size": 125829120,
+    "state": "live_backup",
+    "sync_state": "clean",
+    "verified_at": null,
+    "verify_status": null
+  },
+  "finished_at": "2026-07-06T15:42:11.003458Z",
+  "folder": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+  "force_stopped_at": "2026-07-06T15:40:55.416395Z",
+  "graph_before_revert": {
+    "id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+    "size": 125829120,
+    "status": 200
+  },
+  "kind": "task8-mode3-restart-recovery",
+  "local_file": {
+    "sha256": "56b736750f6c715f579bf998a00b1b03028a03f40d89b4117d146481f0dfcf5a",
+    "size": 125829120
+  },
+  "pass": true,
+  "pid_after_relaunch": "21404",
+  "pid_initial": "20603",
+  "recovery_samples": [
+    {
+      "at": "2026-07-06T15:41:02.294136Z",
+      "item": {
+        "body_location": "sync",
+        "body_state": "downloading",
+        "conflict_state": null,
+        "content_state": null,
+        "deleted": false,
+        "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+        "has_body": false,
+        "item_type": "file",
+        "last_download_error": null,
+        "name": "om660-mode3-restart-154005.bin",
+        "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+        "remote_mtime": "2026-07-06T15:40:15Z",
+        "service": "onedrive",
+        "size": 125829120,
+        "state": "live_backup",
+        "sync_state": "remote_dirty",
+        "verified_at": null,
+        "verify_status": null
+      },
+      "transfers": {
+        "count": 0,
+        "transfers": []
+      }
+    },
+    {
+      "at": "2026-07-06T15:41:07.736933Z",
+      "item": {
+        "body_location": "sync",
+        "body_state": "downloading",
+        "conflict_state": null,
+        "content_state": null,
+        "deleted": false,
+        "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+        "has_body": false,
+        "item_type": "file",
+        "last_download_error": null,
+        "name": "om660-mode3-restart-154005.bin",
+        "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+        "remote_mtime": "2026-07-06T15:40:15Z",
+        "service": "onedrive",
+        "size": 125829120,
+        "state": "live_backup",
+        "sync_state": "remote_dirty",
+        "verified_at": null,
+        "verify_status": null
+      },
+      "transfers": {
+        "count": 0,
+        "transfers": []
+      }
+    },
+    {
+      "at": "2026-07-06T15:41:13.225033Z",
+      "item": {
+        "body_location": "sync",
+        "body_state": "downloading",
+        "conflict_state": null,
+        "content_state": null,
+        "deleted": false,
+        "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+        "has_body": false,
+        "item_type": "file",
+        "last_download_error": null,
+        "name": "om660-mode3-restart-154005.bin",
+        "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+        "remote_mtime": "2026-07-06T15:40:15Z",
+        "service": "onedrive",
+        "size": 125829120,
+        "state": "live_backup",
+        "sync_state": "remote_dirty",
+        "verified_at": null,
+        "verify_status": null
+      },
+      "transfers": {
+        "count": 0,
+        "transfers": []
+      }
+    },
+    {
+      "at": "2026-07-06T15:41:18.597433Z",
+      "item": {
+        "body_location": "sync",
+        "body_state": "downloading",
+        "conflict_state": null,
+        "content_state": null,
+        "deleted": false,
+        "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+        "has_body": false,
+        "item_type": "file",
+        "last_download_error": null,
+        "name": "om660-mode3-restart-154005.bin",
+        "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+        "remote_mtime": "2026-07-06T15:40:15Z",
+        "service": "onedrive",
+        "size": 125829120,
+        "state": "live_backup",
+        "sync_state": "remote_dirty",
+        "verified_at": null,
+        "verify_status": null
+      },
+      "transfers": {
+        "count": 0,
+        "transfers": []
+      }
+    },
+    {
+      "at": "2026-07-06T15:41:24.039719Z",
+      "item": {
+        "body_location": "sync",
+        "body_state": "downloading",
+        "conflict_state": null,
+        "content_state": null,
+        "deleted": false,
+        "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+        "has_body": false,
+        "item_type": "file",
+        "last_download_error": null,
+        "name": "om660-mode3-restart-154005.bin",
+        "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+        "remote_mtime": "2026-07-06T15:40:15Z",
+        "service": "onedrive",
+        "size": 125829120,
+        "state": "live_backup",
+        "sync_state": "remote_dirty",
+        "verified_at": null,
+        "verify_status": null
+      },
+      "transfers": {
+        "count": 0,
+        "transfers": []
+      }
+    },
+    {
+      "at": "2026-07-06T15:41:29.545353Z",
+      "item": {
+        "body_location": "sync",
+        "body_state": "downloading",
+        "conflict_state": null,
+        "content_state": null,
+        "deleted": false,
+        "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+        "has_body": false,
+        "item_type": "file",
+        "last_download_error": null,
+        "name": "om660-mode3-restart-154005.bin",
+        "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+        "remote_mtime": "2026-07-06T15:40:15Z",
+        "service": "onedrive",
+        "size": 125829120,
+        "state": "live_backup",
+        "sync_state": "remote_dirty",
+        "verified_at": null,
+        "verify_status": null
+      },
+      "transfers": {
+        "count": 0,
+        "transfers": []
+      }
+    },
+    {
+      "at": "2026-07-06T15:42:04.744859Z",
+      "item": {
+        "error": "Connection timed out"
+      },
+      "transfers": {
+        "count": 1,
+        "transfers": [
+          {
+            "bytes_done": 118190080,
+            "bytes_total": 125829120,
+            "id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+            "name": "om660-mode3-restart-154005.bin",
+            "paused": false,
+            "retry_after_secs": 0
+          }
+        ]
+      }
+    },
+    {
+      "at": "2026-07-06T15:42:10.210600Z",
+      "item": {
+        "body_location": "sync",
+        "body_state": "available",
+        "conflict_state": null,
+        "content_state": "materialized",
+        "deleted": false,
+        "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+        "has_body": true,
+        "item_type": "file",
+        "last_download_error": null,
+        "name": "om660-mode3-restart-154005.bin",
+        "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "remote_id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+        "remote_mtime": "2026-07-06T15:40:15Z",
+        "service": "onedrive",
+        "size": 125829120,
+        "state": "live_backup",
+        "sync_state": "clean",
+        "verified_at": null,
+        "verify_status": null
+      },
+      "transfers": {
+        "count": 0,
+        "transfers": []
+      }
+    }
+  ],
+  "size": 125829120,
+  "started_at": "2026-07-06T15:39:59.010511Z",
+  "upload": {
+    "etag": "\"{55DBDAD3-6C62-4F37-B4D3-983A5742A0BF},1\"",
+    "finished_at": "2026-07-06T15:40:15.099279Z",
+    "id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+    "name": "om660-mode3-restart-154005.bin",
+    "size": 125829120,
+    "started_at": "2026-07-06T15:40:05.029678Z",
+    "status": 201
+  }
+}

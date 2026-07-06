@@ -1,0 +1,45 @@
+{
+  "action": "Graph PUT /me/drive/items/{id}/content reinduced stale-body scenario",
+  "remote_id": "892B68CBF4A7C544!sd4492cc4abaa4a9da780f6f4b69d62f3",
+  "status": 200,
+  "duration_secs": 7.47,
+  "expected_plaintext_sha256": "f9c46a617f710f053e6458fdace27661fbb653138056b70c3b74d3c417315459",
+  "expected_size": 67108864,
+  "put_response": {
+    "id": "892B68CBF4A7C544!sd4492cc4abaa4a9da780f6f4b69d62f3",
+    "name": "offline-progress-endpoint-200mb.bin",
+    "size": 67108864,
+    "eTag": "\"{D4492CC4-ABAA-4A9D-A780-F6F4B69D62F3},3\"",
+    "cTag": "\"c:{D4492CC4-ABAA-4A9D-A780-F6F4B69D62F3},3\"",
+    "lastModifiedDateTime": "2026-07-06T13:22:17Z",
+    "file": {
+      "mimeType": "application/octet-stream",
+      "hashes": {
+        "quickXorHash": "veUaWEVxwbWrlH743UjhIY5IRDA="
+      }
+    }
+  },
+  "metadata_status": 200,
+  "metadata": {
+    "id": "892B68CBF4A7C544!sd4492cc4abaa4a9da780f6f4b69d62f3",
+    "name": "offline-progress-endpoint-200mb.bin",
+    "size": 67108864,
+    "eTag": "\"{D4492CC4-ABAA-4A9D-A780-F6F4B69D62F3},3\"",
+    "cTag": "\"c:{D4492CC4-ABAA-4A9D-A780-F6F4B69D62F3},3\"",
+    "lastModifiedDateTime": "2026-07-06T13:22:17Z",
+    "file": {
+      "mimeType": "application/octet-stream",
+      "hashes": {
+        "quickXorHash": "veUaWEVxwbWrlH743UjhIY5IRDA="
+      }
+    },
+    "parentReference": {
+      "driveType": "personal",
+      "driveId": "892B68CBF4A7C544",
+      "id": "892B68CBF4A7C544!sad502b7a0e624b7882e0b98fd3c54556",
+      "name": "mode-offline-progress-live",
+      "path": "/drive/root:/isy-om660-20260706-135511/mode-offline-progress-live",
+      "siteId": "ff51467a-aef1-4c3d-9d94-ec38e02bd41f"
+    }
+  }
+}

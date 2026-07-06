@@ -1,0 +1,12 @@
+{
+  "account": "me",
+  "errors": [
+    "share: Confirmation cancelled"
+  ],
+  "finished_at": "2026-07-06T14:14:03.707Z",
+  "id": "892B68CBF4A7C544!se0748f2fe81c4973899c57a520cef5fc",
+  "kind": "task11-share-biometric",
+  "pass": false,
+  "service": "onedrive",
+  "started_at": "2026-07-06T14:10:30.914Z"
+}

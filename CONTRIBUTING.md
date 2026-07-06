@@ -46,7 +46,7 @@ non-English (locale files, encoding/MIME test fixtures) is allowlisted in
 
 **Automation:**
 - Merging into `dev`/`staging` auto-opens **and auto-merges** the next-stage promotion PR (`promote.yml` — a PAT-driven tree-overlay so the promoted tree is byte-identical to its source) once the target's required checks pass, so `dev → staging → main` cascades hands-off.
-- Merging into `main` builds binaries and publishes an **RC prerelease** (`release.yml`); a `vX.Y.Z` tag publishes a full release.
+- Merging into `main` runs the release-grade branch gate and keeps `main` current; release artifacts are published only by an explicit release workflow/tag, not by the ordinary `dev → staging → main` promotion cascade.
 - Dependabot PRs auto-merge once the branch gate passes.
 
 CI runs entirely on **GitHub-hosted runners** — no self-hosted runner touches this repo (a self-hosted runner would live on private infra and be an attack surface on a public repo; see the note in `release.yml`).

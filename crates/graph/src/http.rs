@@ -750,6 +750,40 @@ impl GraphClient {
             .map_err(|e| UploadError::Transport(e.to_string()))
     }
 
+    /// Like [`get_bytes`](Self::get_bytes), but **streams** the body and reports the cumulative
+    /// bytes read through `on_progress` as they arrive (#656 F-C: a moving materialize progress
+    /// bar instead of 0%→100%). Redirect + retry handling is identical (`get_with_retry`); only
+    /// the body read differs — chunked via `Read` instead of buffered by `bytes()`.
+    pub fn get_bytes_with_progress(
+        &self,
+        url: &str,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, UploadError> {
+        use std::io::Read;
+        let url = self.abs(url);
+        let mut resp = self.get_with_retry(&url)?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(UploadError::Http {
+                status,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            });
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(resp.content_length().unwrap_or(0) as usize);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = resp
+                .read(&mut buf)
+                .map_err(|e| UploadError::Transport(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            on_progress(out.len() as u64);
+        }
+        Ok(out)
+    }
+
     /// GET a Graph resource as JSON (by-ref, unlike the `&mut self` [`Transport`]
     /// poll loop). `url` may be absolute or a `/me/...` path. Used to fetch a
     /// single item's canonical JSON for the content archive.
@@ -784,6 +818,19 @@ impl GraphClient {
     /// pre-signed download URL).
     pub fn download_content(&self, item_id: &str) -> Result<Vec<u8>, UploadError> {
         self.get_bytes(&format!("{}/me/drive/items/{item_id}/content", self.base))
+    }
+
+    /// [`download_content`](Self::download_content) with a cumulative-bytes progress callback,
+    /// so the offline materialize can report a moving download bar (#656 F-C).
+    pub fn download_content_with_progress(
+        &self,
+        item_id: &str,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, UploadError> {
+        self.get_bytes_with_progress(
+            &format!("{}/me/drive/items/{item_id}/content", self.base),
+            on_progress,
+        )
     }
 
     /// List a drive folder's children **live** from Graph, following
@@ -1924,6 +1971,28 @@ mod tests {
             UploadError::Http { status, .. } => assert_eq!(status, 503),
             other => panic!("expected Http error after retries, got {other}"),
         }
+    }
+
+    #[test]
+    fn get_bytes_with_progress_streams_body_and_reports_cumulative() {
+        // #656 F-C: the streamed variant returns the same bytes as `get_bytes`, and reports
+        // monotonic cumulative progress ending at the full length.
+        let (base, _s) = serve(vec![http_response(200, "OK", "", "raw-bytes-here")]);
+        let mut seen: Vec<u64> = Vec::new();
+        let out = GraphClient::new("tok")
+            .get_bytes_with_progress(&base, &mut |n| seen.push(n))
+            .unwrap();
+        assert_eq!(out, b"raw-bytes-here");
+        assert!(!seen.is_empty(), "progress must be reported");
+        assert_eq!(
+            *seen.last().unwrap(),
+            out.len() as u64,
+            "final progress equals the byte count"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "cumulative progress is non-decreasing"
+        );
     }
 
     #[test]

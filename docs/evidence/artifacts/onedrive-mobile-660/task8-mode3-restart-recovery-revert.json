@@ -1,0 +1,10 @@
+{
+  "after_status": 404,
+  "delete_status": 204,
+  "errors": [],
+  "finished_at": "2026-07-06T15:42:14.844087Z",
+  "id": "892B68CBF4A7C544!s55dbdad36c624f37b4d3983a5742a0bf",
+  "kind": "task8-mode3-restart-recovery-revert",
+  "pass": true,
+  "started_at": "2026-07-06T15:42:11.004187Z"
+}
