@@ -317,6 +317,7 @@ const CAP = {
   agent: "__AGENT_CAP_TOKEN__",
   onedriveMode: "__ONEDRIVE_MODE_CAP_TOKEN__",
   transfers: "__TRANSFER_CAP_TOKEN__",
+  onedriveManage: "__ONEDRIVE_MANAGE_CAP_TOKEN__",
 };
 
 /* ---------------------------------------------------------------- push registration (#576)
@@ -1969,7 +1970,7 @@ function metricCard(icn, val, label) {
 }
 
 /* ---------------------------------------------------------------- onedrive (file explorer) */
-const Drive = { stack: [], layout: "grid", items: [], modes: { default_mode: "online", folder_modes: {} }, quota: null, modeFilter: "all", transfers: [] };
+const Drive = { stack: [], layout: "grid", items: [], modes: { default_mode: "online", folder_modes: {} }, quota: null, modeFilter: "all", transfers: [], conflicts: [] };
 // #652: per-folder mode resolvers — PURE reads of Drive.modes (the server folder-mode map is the
 // single source of truth, re-fetched every driveLoad; no local override cache / optimistic state).
 // Used only for the CURRENT folder (absent from its own child list); subfolder pills use the
@@ -2024,6 +2025,9 @@ async function renderOnedriveView(view) {
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
         el("button", { id: "drive-list", class: "seg-btn" + (Drive.layout === "list" ? " active" : ""), title: "List view", onclick: () => setDriveLayout("list") }, icon("list", "icon-sm")))),
     el("div", { id: "drive-modebar", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 2px 4px" }),
+    // #659 Conflict Center: a review banner (own element) shown when the account has unresolved
+    // keep-both conflicts. Hidden until the store-driven conflicts poll finds any.
+    el("div", { id: "drive-conflicts", style: "display:none;padding:0 2px 8px" }),
     el("div", { id: "drive-storage", style: "display:flex;align-items:center;gap:6px;padding:0 2px 8px;font-size:12px" }),
     // #656: live transfer-progress panel (own visible element — the desktop #drive-metrics-row
     // is display:none on mobile). Hidden until the poll finds an in-flight transfer.
@@ -2128,6 +2132,7 @@ async function driveLoad() {
     }
     driveRender();
     renderDriveModeBar();
+    driveLoadConflicts(); // #659 store-driven conflict banner (independent of the live browse)
   } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load folder" }), el("p", { text: e.message }))); }
 }
 // #652: the current-folder mode control + a "partial" indicator. The current folder is not in its
@@ -2309,17 +2314,28 @@ function transferRow(t) {
   const total = t.bytes_total || 0, done = t.bytes_done || 0;
   const pct = total > 0 ? Math.min(100, Math.round(done / total * 100)) : null;
   const fill = el("div", { style: "position:absolute;top:0;bottom:0;left:0;border-radius:999px;background:var(--svc-onedrive,#0a84ff);"
-    + (pct != null ? `width:${pct}%;` : "width:40%;opacity:0.5;") });
+    + (pct != null ? `width:${pct}%;` : "width:40%;opacity:0.5;") + (t.paused ? "opacity:0.4;" : "") });
   const bar = el("div", { style: "position:relative;height:6px;border-radius:999px;overflow:hidden;background:var(--bg-3,#1e293b)" }, fill);
-  const meta = pct != null ? fmtSize(done) + " / " + fmtSize(total) + " · " + pct + "%" : fmtSize(done) + " transferred";
+  const meta = (pct != null ? fmtSize(done) + " / " + fmtSize(total) + " · " + pct + "%" : fmtSize(done) + " transferred") + (t.paused ? " · paused" : "");
   const retry = (t.retry_after_secs && t.retry_after_secs > 0) ? el("span", { class: "dim", style: "font-size:11px", text: "· retry in " + t.retry_after_secs + "s" }) : null;
+  // #659 pause/retry controls (queue-deep). Same cap as cancel (CAP.transfers). Paused → resume;
+  // running → pause; backing off → a "retry now". Resume + retry both hit /transfers/retry (which
+  // un-pauses + clears the 429 backoff); pause hits /transfers/pause.
+  let pauseCtl = null;
+  if (CAP.transfers) {
+    pauseCtl = t.paused
+      ? el("button", { class: "btn ghost sm", title: "Resume transfer", onclick: () => retryTransfer(t, "Resuming") }, icon("play", "icon-sm"))
+      : el("button", { class: "btn ghost sm", title: "Pause transfer", onclick: () => pauseTransfer(t) }, icon("pause", "icon-sm"));
+  }
+  const retryBtn = (CAP.transfers && !t.paused && t.retry_after_secs && t.retry_after_secs > 0)
+    ? el("button", { class: "btn ghost sm", title: "Retry now", onclick: () => retryTransfer(t, "Retrying") }, icon("rotate-ccw", "icon-sm")) : null;
   const cancelBtn = CAP.transfers ? el("button", { class: "btn ghost sm", title: "Cancel transfer", onclick: () => cancelTransfer(t) }, icon("x", "icon-sm")) : null;
   return el("div", { style: "display:flex;align-items:center;gap:8px" },
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "truncate", style: "font-size:12px;font-weight:600", text: t.name || t.id }),
       bar,
       el("div", { style: "display:flex;gap:6px;align-items:center" }, el("span", { class: "dim", style: "font-size:11px", text: meta }), retry)),
-    cancelBtn);
+    ...[pauseCtl, retryBtn, cancelBtn].filter(Boolean));
 }
 async function cancelTransfer(t) {
   try {
@@ -2329,6 +2345,23 @@ async function cancelTransfer(t) {
     renderTransfersPanel();
     toast("Cancelling " + (t.name || "transfer"));
   } catch (e) { toast("Could not cancel: " + e.message, "err"); }
+}
+async function pauseTransfer(t) {
+  try {
+    await post("/api/v1/onedrive/transfers/pause?" + qs({ id: t.id }), CAP.transfers);
+    // Optimistic: mark paused now; the next poll confirms it from the engine's pause-set.
+    const row = (Drive.transfers || []).find(x => x.id === t.id); if (row) row.paused = true;
+    renderTransfersPanel();
+    toast("Paused " + (t.name || "transfer"));
+  } catch (e) { toast("Could not pause: " + e.message, "err"); }
+}
+async function retryTransfer(t, verb) {
+  try {
+    await post("/api/v1/onedrive/transfers/retry?" + qs({ id: t.id }), CAP.transfers);
+    const row = (Drive.transfers || []).find(x => x.id === t.id); if (row) { row.paused = false; row.retry_after_secs = 0; }
+    renderTransfersPanel();
+    toast((verb || "Retrying") + " " + (t.name || "transfer"));
+  } catch (e) { toast("Could not retry: " + e.message, "err"); }
 }
 function driveModePill(folderId, effMode, explicit, name) {
   const m = effMode || "online", c = MODE_COLOR[m];
@@ -2364,10 +2397,73 @@ function openModeSheet(folderId, name, effMode, explicit) {
 // indicator reflect the fresh server state (Drive.modes SSOT). Mirrors doShare's template.
 async function setFolderMode(folderId, mode) {
   try {
-    await post("/api/v1/onedrive/mode?" + qs({ account: App.account, folder: folderId, ...(mode ? { mode } : {}) }), CAP.onedriveMode);
+    const resp = await post("/api/v1/onedrive/mode?" + qs({ account: App.account, folder: folderId, ...(mode ? { mode } : {}) }), CAP.onedriveMode);
     toast(mode ? "Folder set to " + MODE_LABEL[mode] : "Folder reset to inherited");
+    // #659 D1: switching a folder online runs the offline→online cleanup server-side; surface it.
+    const c = resp && resp.cleanup;
+    if (c && (c.freed || c.kept)) {
+      const parts = [];
+      if (c.freed) parts.push("freed " + c.freed + (c.freed === 1 ? " file" : " files"));
+      if (c.kept) parts.push("kept " + c.kept + " unsynced");
+      toast("Cleanup: " + parts.join(" · "));
+    }
     await driveLoad();
+    driveLoadConflicts(); // kept-unsynced items may include conflicts to review
   } catch (e) { toast("Could not change mode: " + e.message, "err"); }
+}
+// #659 Conflict Center. The conflicts are store-driven (the keep-both offline/upload sites persist
+// `conflict_state`), so this works regardless of the live-browse mode. Mobile-only + cap-gated.
+const RESOLUTION_LABEL = { "keep-both": "Kept both", "keep-mine": "Kept your version", "keep-cloud": "Kept cloud version" };
+async function driveLoadConflicts() {
+  if (!MOBILE || !CAP.onedriveManage) { Drive.conflicts = []; renderConflictBanner(); return; }
+  try {
+    const d = await api("/api/v1/onedrive/conflicts?" + qs({ account: App.account }));
+    Drive.conflicts = (d && d.conflicts) || [];
+  } catch { Drive.conflicts = []; }
+  renderConflictBanner();
+}
+function renderConflictBanner() {
+  const bar = $("#drive-conflicts"); if (!bar) return; clear(bar);
+  const list = Drive.conflicts || [];
+  if (!list.length) { bar.style.display = "none"; return; }
+  bar.style.display = "block";
+  bar.append(el("button", {
+    class: "btn sm", type: "button",
+    style: "display:flex;align-items:center;gap:8px;width:100%;justify-content:flex-start;"
+      + "border:1px solid var(--warn,#f59e0b);color:var(--warn,#f59e0b);background:#f59e0b1a",
+    onclick: () => openConflictCenter(),
+  }, icon("flag", "icon-sm"),
+    el("span", { class: "grow", style: "text-align:left;font-weight:600",
+      text: list.length + (list.length === 1 ? " conflict" : " conflicts") + " — Review" }),
+    icon("chevron-right", "icon-sm")));
+}
+function openConflictCenter() {
+  const content = el("div", { class: "compose" });
+  const list = Drive.conflicts || [];
+  if (!list.length) content.append(el("div", { class: "dim", text: "No conflicts to resolve." }));
+  list.forEach(cf => {
+    const btn = (res, label) => el("button", { class: "btn ghost sm", type: "button", onclick: () => resolveConflict(cf, res) }, label);
+    content.append(el("div", { class: "pick-row", style: "flex-direction:column;align-items:stretch;gap:8px" },
+      el("div", { style: "display:flex;align-items:center;gap:8px" },
+        icon("flag", "icon-sm"),
+        el("div", { class: "grow", style: "min-width:0" },
+          el("div", { class: "truncate", style: "font-weight:600", text: cf.name || cf.id }),
+          cf.conflict_copy ? el("div", { class: "dim", style: "font-size:12px", text: "Kept copy: " + cf.conflict_copy }) : null)),
+      el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" },
+        btn("keep-both", "Keep both"), btn("keep-mine", "Keep mine"), btn("keep-cloud", "Keep cloud"))));
+  });
+  openSheet("Conflicts", content);
+}
+async function resolveConflict(cf, resolution) {
+  try {
+    // keep-mine deletes the cloud copy → the mobile router raises the biometric gate, handled
+    // automatically by request()'s confirmation_required flow.
+    await post("/api/v1/onedrive/conflict/resolve?" + qs({ account: App.account, id: cf.id, resolution }), CAP.onedriveManage);
+    toast(RESOLUTION_LABEL[resolution] || "Resolved");
+    closeSheet();
+    await driveLoadConflicts();
+    driveLoad();
+  } catch (e) { toast("Could not resolve: " + e.message, "err"); }
 }
 function driveActions(it) {
   const folder = it.item_type === "folder";
@@ -2489,6 +2585,7 @@ function openDriveItem(it) {
     ["Modified", it.remote_mtime ? fmtFullDate(it.remote_mtime) : null],
   ]));
   driveItemMeta(content, it); // #564 A5 metadata rows (no-op until enrichment lands)
+  driveManageSection(content, it); // #659 free-up / download-now (mobile, cap-gated)
   content.append(el("h4", { class: "od-sec dim", text: "Who has access" }));
   const perm = el("div", { class: "od-perms" }, el("div", { class: "dim", text: "Loading access…" }));
   content.append(perm);
@@ -2501,6 +2598,49 @@ function openDriveItem(it) {
       el("span", { class: "grow truncate", text: p.grantee || (p.link ? "Shared link" : "(unknown)") }),
       el("span", { class: "dim", text: (p.roles || []).join(", ") || "—" }))));
   }).catch(e => { clear(perm); perm.append(el("div", { class: "dim", text: "Access unavailable (" + e.message + ")" })); });
+}
+// #659 per-item local-body management (free-up / download-now). The mobile browse is live Graph
+// (no store state per row), so read this id's store row to pick the right action; absent (never
+// materialized) → offer download-now. Mobile-only, cap-gated. Fills async (row already in the DOM).
+function driveManageSection(content, it) {
+  if (!MOBILE || !CAP.onedriveManage || it.item_type === "folder") return;
+  const box = el("div", { style: "margin-top:8px" });
+  content.append(box);
+  api("/api/v1/item?" + qs({ account: App.account, service: "onedrive", id: it.remote_id }))
+    .then(row => driveRenderManage(box, it, row))
+    .catch(() => driveRenderManage(box, it, null)); // not in the store yet → download-now
+}
+function driveRenderManage(box, it, row) {
+  clear(box);
+  const hasBody = !!(row && (row.has_body || row.body_state === "available" || row.content_state === "materialized"));
+  box.append(el("h4", { class: "od-sec dim", text: "On this device" }));
+  if (hasBody) {
+    box.append(el("button", { class: "btn ghost sm", type: "button", style: "width:100%;justify-content:flex-start",
+      onclick: () => freeUpItem(it) }, icon("hard-drive", "icon-sm"), "Free up space"));
+    box.append(el("div", { class: "dim", style: "font-size:12px;margin-top:4px",
+      text: "Removes the downloaded copy — the file stays listed and can be downloaded again." }));
+  } else {
+    box.append(el("button", { class: "btn ghost sm", type: "button", style: "width:100%;justify-content:flex-start",
+      onclick: () => downloadNowItem(it) }, icon("download", "icon-sm"), "Download now"));
+    if (row && row.last_download_error) box.append(el("div", { style: "font-size:12px;margin-top:4px;color:var(--danger,#f87171)",
+      text: "Last attempt failed: " + row.last_download_error }));
+  }
+}
+async function freeUpItem(it) {
+  try {
+    await post("/api/v1/onedrive/free-up?" + qs({ account: App.account, id: it.remote_id }), CAP.onedriveManage);
+    toast("Freed up " + (it.name || "file"));
+    closeSheet();
+    driveLoad();
+  } catch (e) { toast("Could not free up: " + e.message, "err"); }
+}
+async function downloadNowItem(it) {
+  try {
+    const d = await post("/api/v1/onedrive/download-now?" + qs({ account: App.account, id: it.remote_id }), CAP.onedriveManage);
+    toast(d && d.materialized === false ? "Not downloaded (blocked by policy)" : "Downloaded " + (it.name || "file"));
+    closeSheet();
+    driveLoad();
+  } catch (e) { toast("Could not download: " + e.message, "err"); }
 }
 // format a Graph media duration (milliseconds) → "m:ss" / "h:mm:ss".
 function fmtDur(ms) {

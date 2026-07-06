@@ -1,0 +1,16 @@
+{
+  "graph_status": 200,
+  "kind": "task10-root-upload-root-crosscheck",
+  "pass": true,
+  "root": {
+    "folder_present": true,
+    "id": "892B68CBF4A7C544!sea8cc6beffdb43d7976fbc7da445c639",
+    "name": "root"
+  },
+  "source": "task10-root-upload-mobile.json",
+  "token_expires_at": 1783349418,
+  "token_seconds_remaining_at_start": 378,
+  "upload_graph_status": 200,
+  "upload_ok": true,
+  "upload_parent_id": "892B68CBF4A7C544!sea8cc6beffdb43d7976fbc7da445c639"
+}
