@@ -619,12 +619,32 @@ pub fn push_delete<W: RemoteWriter>(
 /// unit-testable with a mock and live-tested with the real client.
 pub trait Downloader {
     fn download(&self, remote_id: &str) -> Result<Vec<u8>, String>;
+    /// Download reporting the cumulative bytes read through `on_progress` as they arrive, so the
+    /// materialize can show a moving download bar (#656 F-C). The default buffers via
+    /// [`download`](Self::download) and reports once at the end — mocks need no change.
+    fn download_with_progress(
+        &self,
+        remote_id: &str,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, String> {
+        let bytes = self.download(remote_id)?;
+        on_progress(bytes.len() as u64);
+        Ok(bytes)
+    }
 }
 
 #[cfg(feature = "http")]
 impl Downloader for isyncyou_graph::GraphClient {
     fn download(&self, remote_id: &str) -> Result<Vec<u8>, String> {
         self.download_content(remote_id).map_err(|e| e.to_string())
+    }
+    fn download_with_progress(
+        &self,
+        remote_id: &str,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, String> {
+        self.download_content_with_progress(remote_id, on_progress)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -678,6 +698,12 @@ pub trait ProgressSink: Send + Sync {
     /// Consume the one-shot cancel for `id` (called on skip) so a later pass re-materializes
     /// the file instead of skipping it forever. Default: no-op (#656).
     fn consume_cancel(&self, _id: &str) {}
+    /// True if `id` is PAUSED (#659). Unlike a cancel, a pause is **persistent** (never
+    /// consumed): the materialize pass skips a paused file between files and re-checks each pass
+    /// until it is resumed (best-effort, queue-deep — no mid-file interruption). Default: never.
+    fn is_paused(&self, _id: &str) -> bool {
+        false
+    }
 }
 
 impl ProgressSink for () {
@@ -699,6 +725,9 @@ pub struct SharedProgress {
     /// Remote ids with a pending one-shot cancel request (#656). The materialize pass reads
     /// this via [`ProgressSink::is_cancelled`] before each file and consumes it on skip.
     cancels: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Remote ids with a **persistent** pause (#659). Unlike `cancels`, a pause is NOT consumed
+    /// on skip — the materialize pass re-checks it each pass until [`resume`](SharedProgress::resume).
+    pauses: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SharedProgress {
@@ -719,6 +748,48 @@ impl SharedProgress {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.to_string());
+    }
+
+    /// Pause transfer `id` (#659): the materialize pass skips it at each file boundary until
+    /// [`resume`](Self::resume). Persistent (queue-deep) — an in-flight download still completes.
+    pub fn request_pause(&self, id: &str) {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
+    }
+
+    /// Resume a paused transfer `id` (#659) so the next materialize pass fetches it.
+    pub fn resume(&self, id: &str) {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// Whether `id` is currently paused (for the transfer panel's paused badge).
+    pub fn is_paused_id(&self, id: &str) -> bool {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
+    /// Retry transfer `id` **now** (#659): clear any pause AND its 429 backoff timer so the next
+    /// materialize pass re-attempts it immediately. Distinct from [`resume`](Self::resume), which
+    /// only un-pauses: `retry_now` also zeroes a backing-off slot's `retry_after_secs` so the panel
+    /// shows it retrying rather than waiting. Queue-deep — a failed/backed-off item is re-downloaded
+    /// on the next pass (the loop re-attempts any non-materialized item), no mid-file interruption.
+    pub fn retry_now(&self, id: &str) {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.with(|v| {
+            if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                s.retry_after_secs = 0;
+            }
+        });
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Vec<TransferSlot>) -> R) -> R {
@@ -761,9 +832,13 @@ impl ProgressSink for SharedProgress {
     }
     fn finish(&self, id: &str) {
         self.with(|v| v.retain(|s| s.id != id));
-        // Clear any pending cancel for a finished transfer so a stale request can't affect a
-        // future transfer that reuses the same remote id.
+        // Clear any pending cancel/pause for a finished transfer so a stale request can't affect
+        // a future transfer that reuses the same remote id.
         self.cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.pauses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
@@ -779,6 +854,12 @@ impl ProgressSink for SharedProgress {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+    }
+    fn is_paused(&self, id: &str) -> bool {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
     }
 }
 
@@ -1132,6 +1213,125 @@ fn offline_scope_prefixes(
     Ok(prefixes)
 }
 
+/// #659 free-up-space: drop a materialized OneDrive body from disk but keep the item listable
+/// (metadata only). Removes the on-disk envelope and flips the v14 content-state to
+/// `cached`/`missing` (so `has_body == body_state=='available'` is false while the row still
+/// lists — `deleted_at` untouched). Local-only and reversible via [`download_one`]. Returns
+/// whether a body file was actually removed. Errors only on an unknown item id.
+pub fn dematerialize_one(
+    store: &Store,
+    account: &str,
+    id: &str,
+    sync_root: &Path,
+    cache_root: &Path,
+) -> Result<bool, SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let it = *by_id
+        .get(id)
+        .ok_or_else(|| SyncError::Malformed(format!("free-up: unknown item {id}")))?;
+    let removed = match local_rel_path(&by_id, it) {
+        Some(rel) => {
+            let body_root = if it.body_location.as_deref() == Some("cache") {
+                cache_root
+            } else {
+                sync_root
+            };
+            std::fs::remove_file(body_root.join(&rel)).is_ok()
+        }
+        None => false,
+    };
+    // Keep the row (metadata + deleted_at untouched); the body is gone → cached/missing.
+    store.set_content_state(
+        account,
+        SERVICE,
+        id,
+        Some("cached"),
+        Some("none"),
+        Some("missing"),
+        None,
+    )?;
+    Ok(removed)
+}
+
+/// #659 download-now: materialize a single OneDrive item on demand — the inverse of
+/// [`dematerialize_one`]. Runs the offline-pass success path for one id: policy gate →
+/// `downloading` checkpoint → streamed download → `atomic_write` → `materialized`/`available`.
+/// Returns `Ok(true)` on a fresh download, `Ok(false)` if the storage/network/power policy
+/// blocked it (the body stays `missing`). Errors on an unknown / non-file item.
+#[allow(clippy::too_many_arguments)]
+pub fn download_one<D: Downloader>(
+    store: &Store,
+    downloader: &D,
+    account: &str,
+    id: &str,
+    sync_root: &Path,
+    now: &str,
+    cfg_sync: &isyncyou_core::SyncConfig,
+    dev: &isyncyou_core::policy::DeviceState,
+    progress: &dyn ProgressSink,
+) -> Result<bool, SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let it = *by_id
+        .get(id)
+        .ok_or_else(|| SyncError::Malformed(format!("download-now: unknown item {id}")))?;
+    if it.item_type == "folder" {
+        return Err(SyncError::Malformed("download-now: not a file".into()));
+    }
+    let rel = local_rel_path(&by_id, it)
+        .ok_or_else(|| SyncError::Malformed("download-now: no local path".into()))?;
+    let full = sync_root.join(&rel);
+    // Storage-floor / Wi-Fi-only / charging gate: a Blocked verdict leaves the body `missing`.
+    if !isyncyou_core::policy::evaluate(cfg_sync, dev).is_allowed() {
+        store.set_content_state(
+            account,
+            SERVICE,
+            id,
+            None,
+            Some("sync"),
+            Some("missing"),
+            None,
+        )?;
+        return Ok(false);
+    }
+    if let Some(parent) = full.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let total = it.size.unwrap_or(0).max(0) as u64;
+    progress.begin(id, name, total);
+    store.set_content_state(
+        account,
+        SERVICE,
+        id,
+        None,
+        Some("sync"),
+        Some("downloading"),
+        None,
+    )?;
+    let bytes = downloader
+        .download_with_progress(id, &mut |done| progress.advance(id, done))
+        .map_err(SyncError::Malformed)?;
+    atomic_write(&full, &bytes).map_err(|e| SyncError::Malformed(e.to_string()))?;
+    if let Some(mt) = &it.remote_mtime {
+        set_file_mtime(&full, mt);
+    }
+    store.set_sync_state(account, SERVICE, id, "clean")?;
+    let hash = Some(crate::quickxor::quickxor_base64(&bytes));
+    record_synced_state(store, account, id, &full, hash);
+    store.set_content_state(
+        account,
+        SERVICE,
+        id,
+        Some("materialized"),
+        Some("sync"),
+        Some("available"),
+        Some(now),
+    )?;
+    Ok(true)
+}
+
 /// Scoped, policy-gated, progress-reported materialize for Mode-3 **offline** folders
 /// (#655 / S-OM.9). Like [`materialize_downloads`], but: (1) only items an `offline`
 /// scope owns are written (deepest-active-ancestor rule, [`owning_scope`]); (2)
@@ -1216,6 +1416,12 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                     report.cancelled += 1;
                     continue;
                 }
+                // #659: a PAUSED transfer is skipped (persistent — NOT consumed, queue-deep). The
+                // body stays `missing` and remote_dirty; the next pass re-checks and fetches it once
+                // resumed. An in-flight download already past this point still runs to completion.
+                if progress.is_paused(&it.remote_id) {
+                    continue;
+                }
                 // Policy gate: a Blocked verdict stops NEW downloads (existing files stay).
                 // The body is left `missing` (not `failed`) — it is simply not fetched yet.
                 if !isyncyou_core::policy::evaluate(cfg_sync, dev).is_allowed() {
@@ -1246,6 +1452,14 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                         let copy = unique_conflict_copy(&dir, fname, host);
                         if std::fs::rename(&full, dir.join(&copy)).is_ok() {
                             report.conflicts += 1;
+                            // #659: persist the conflict (best-effort) so the Conflict Center can
+                            // surface it; the value is the safeBackup copy name for resolve.
+                            let _ = store.set_conflict_state(
+                                account,
+                                SERVICE,
+                                &it.remote_id,
+                                Some(&copy),
+                            );
                         }
                     }
                 }
@@ -1266,7 +1480,12 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                     Some("downloading"),
                     None,
                 )?;
-                match downloader.download(&it.remote_id) {
+                // Stream the body and report cumulative bytes as they arrive (#656 F-C), so the
+                // transfer panel shows a moving bar instead of sitting at 0% until the file lands.
+                let dl = downloader.download_with_progress(&it.remote_id, &mut |done| {
+                    progress.advance(&it.remote_id, done);
+                });
+                match dl {
                     Ok(bytes) => match atomic_write(&full, &bytes) {
                         Ok(()) => {
                             if let Some(mt) = &it.remote_mtime {
@@ -1284,7 +1503,6 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                                 Some("available"),
                                 Some(now),
                             )?;
-                            progress.advance(&it.remote_id, bytes.len() as u64);
                             report.downloaded += 1;
                         }
                         Err(_) => {
@@ -1559,6 +1777,18 @@ pub fn scan_local_deletes(
         if it.deleted_at.is_some() || it.item_type != "file" || it.sync_state != "clean" {
             continue;
         }
+        // #659 DATA-LOSS GUARD: only a file whose body is *supposed* to be on disk can be "locally
+        // deleted" — a missing local copy then means the user deleted it. A body that is
+        // intentionally absent must NOT be pushed as a cloud delete. That is the whole point of
+        // free-up ([`dematerialize_one`] sets content_state=`cached`): it drops the local copy but
+        // keeps the cloud file. Without this guard the next offline pass sees the freed-up file
+        // missing, treats it as a local delete, and deletes it from OneDrive (data loss). We flag a
+        // delete only when the item is materialized (mobile Mode-3) or has no content-state at all
+        // (the desktop always-download model, where every synced file has a local body); `cached` /
+        // `online` / `not_applicable` bodies are intentionally absent and are skipped.
+        if !matches!(it.content_state.as_deref(), None | Some("materialized")) {
+            continue;
+        }
         let rel = match local_rel_path(&by_id, it) {
             Some(p) => p,
             None => continue,
@@ -1752,12 +1982,175 @@ pub fn apply_local_modifies<R: ContentReplacer>(
                     Ok(()) => {
                         store.set_sync_state(account, SERVICE, id, "remote_dirty")?;
                         report.conflicts += 1;
+                        // #659: persist the conflict so the Conflict Center can surface it.
+                        let _ = store.set_conflict_state(account, SERVICE, id, Some(&copy));
                     }
                     Err(_) => report.failed += 1,
                 }
             }
             Err(_) => report.failed += 1,
         }
+    }
+    Ok(report)
+}
+
+/// #659 Conflict Center user-facing resolution of a persisted keep-both conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// Keep both — the cloud version at the original name + the local edit as its safeBackup
+    /// copy; just clear the conflict marker.
+    KeepBoth,
+    /// Local edit wins: delete the cloud version and restore the local copy to the original name.
+    KeepMine,
+    /// Cloud version wins: discard the local safeBackup copy.
+    KeepCloud,
+}
+
+impl ConflictResolution {
+    /// Parse the wire string used by the `/onedrive/conflict/resolve` endpoint.
+    pub fn parse(s: &str) -> Option<ConflictResolution> {
+        match s {
+            "keep-both" => Some(ConflictResolution::KeepBoth),
+            "keep-mine" => Some(ConflictResolution::KeepMine),
+            "keep-cloud" => Some(ConflictResolution::KeepCloud),
+            _ => None,
+        }
+    }
+}
+
+/// #659 Conflict Center: resolve a persisted keep-both conflict. `conflict_state` carries the
+/// safeBackup copy file name (the user's local edit); the original path holds the cloud version.
+/// `KeepBoth` leaves both and clears the marker; `KeepMine` deletes the cloud item and restores
+/// the local copy to the original name; `KeepCloud` discards the local copy. Clears
+/// `conflict_state` on success.
+pub fn resolve_conflict<W: RemoteWriter>(
+    store: &Store,
+    account: &str,
+    id: &str,
+    resolution: ConflictResolution,
+    sync_root: &Path,
+    writer: &W,
+) -> Result<(), SyncError> {
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let it = *by_id
+        .get(id)
+        .ok_or_else(|| SyncError::Malformed(format!("resolve: unknown item {id}")))?;
+    let copy = it
+        .conflict_state
+        .clone()
+        .ok_or_else(|| SyncError::Malformed(format!("resolve: no conflict on {id}")))?;
+    let rel = local_rel_path(&by_id, it)
+        .ok_or_else(|| SyncError::Malformed("resolve: no local path".into()))?;
+    let full = sync_root.join(&rel);
+    let dir = full
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| sync_root.to_path_buf());
+    let copy_path = dir.join(&copy);
+    match resolution {
+        ConflictResolution::KeepBoth => {}
+        ConflictResolution::KeepMine => {
+            writer.delete(id).map_err(SyncError::Malformed)?;
+            let _ = std::fs::remove_file(&full);
+            std::fs::rename(&copy_path, &full).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        }
+        ConflictResolution::KeepCloud => {
+            let _ = std::fs::remove_file(&copy_path);
+        }
+    }
+    store.set_conflict_state(account, SERVICE, id, None)?;
+    Ok(())
+}
+
+/// Result of an offline→online cleanup pass (#659).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Materialized bodies dropped (provably safe in the cloud) — local space reclaimed.
+    pub freed: usize,
+    /// Materialized items KEPT because they were not provably safe (unsynced local edit,
+    /// `remote_dirty`, or an open cloud-write) — no data loss.
+    pub kept: usize,
+}
+
+/// #659 offline→online cleanup/rollback: when a folder is no longer offline, drop its
+/// materialized bodies from `sync_root` to reclaim space — but ONLY those provably safe in the
+/// cloud (`sync_state=="clean"`, no local edit vs the synced reference, no open cloud-write op).
+/// Anything unsynced is KEPT (no data loss). Dropped bodies are moved to `trash_root`
+/// (reversible), and the row stays listable with `content_state=cached`/`body_state=missing`.
+pub fn cleanup_offline_to_online(
+    store: &Store,
+    account: &str,
+    sync_root: &Path,
+    trash_root: &Path,
+    cfg: &isyncyou_core::Config,
+) -> Result<CleanupReport, SyncError> {
+    let scopes = crate::scope::scopes_from_modes(cfg.onedrive_modes.get(account));
+    let offline_ids: BTreeSet<&str> = scopes
+        .iter()
+        .filter(|s| s.mode == crate::scope::Mode::Offline)
+        .map(|s| s.folder_id.as_str())
+        .collect();
+    let open: std::collections::HashSet<String> = store
+        .pending_cloud_writes(account)?
+        .into_iter()
+        .filter_map(|op| op.target_id)
+        .collect();
+    let items = store.items_by_service(account, SERVICE)?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
+    let mut report = CleanupReport::default();
+    for it in &items {
+        // Only materialized (Mode-3 offline) bodies are candidates.
+        if it.content_state.as_deref() != Some("materialized")
+            || it.body_location.as_deref() != Some("sync")
+        {
+            continue;
+        }
+        // Still owned by an offline scope? then leave it materialized.
+        if item_in_offline(store, account, &it.remote_id, &offline_ids)? {
+            continue;
+        }
+        let rel = match local_rel_path(&by_id, it) {
+            Some(p) => p,
+            None => continue,
+        };
+        let full = sync_root.join(&rel);
+        // Safety gate — never drop a body that is not provably current in the cloud.
+        let safe = it.sync_state == "clean"
+            && !open.contains(&it.remote_id)
+            && match store.get_synced_state(account, SERVICE, &it.remote_id)? {
+                Some((ssize, smtime, shash)) => {
+                    !locally_edited_since_sync(&full, ssize, smtime, shash.as_deref())
+                }
+                None => false, // no reference → cannot prove safety → keep
+            };
+        if !safe {
+            report.kept += 1;
+            continue;
+        }
+        // Move the body aside (reversible) before flipping the state. If the move fails, keep it.
+        if full.exists() {
+            let dst = trash_root.join(&rel);
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let moved = std::fs::rename(&full, &dst).is_ok()
+                || (std::fs::copy(&full, &dst).is_ok() && std::fs::remove_file(&full).is_ok());
+            if !moved {
+                report.kept += 1;
+                continue;
+            }
+        }
+        store.set_content_state(
+            account,
+            SERVICE,
+            &it.remote_id,
+            Some("cached"),
+            Some("none"),
+            Some("missing"),
+            None,
+        )?;
+        report.freed += 1;
     }
     Ok(report)
 }
@@ -2574,6 +2967,129 @@ mod tests {
     }
 
     #[test]
+    fn free_up_and_download_now_roundtrip() {
+        // #659: download_one materializes one item on demand (inverse of the offline pass);
+        // dematerialize_one drops the body but keeps the row listable (metadata).
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+
+        // download-now materializes just a1.
+        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert_eq!(
+            std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
+            b"AAAA"
+        );
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(a.body_state.as_deref(), Some("available"));
+        assert_eq!(a.content_state.as_deref(), Some("materialized"));
+
+        // free-up drops the body but keeps the row listable.
+        assert!(dematerialize_one(&store, "acc", "a1", dir.path(), dir.path()).unwrap());
+        assert!(
+            !dir.path().join("Photos/a.txt").exists(),
+            "body gone from disk"
+        );
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(
+            a.body_state.as_deref(),
+            Some("missing"),
+            "no body -> has_body false"
+        );
+        assert_eq!(a.content_state.as_deref(), Some("cached"));
+        assert!(a.deleted_at.is_none(), "row not tombstoned");
+        assert!(
+            store
+                .items_by_service("acc", SERVICE)
+                .unwrap()
+                .iter()
+                .any(|i| i.remote_id == "a1"),
+            "the item still lists after free-up"
+        );
+        // #659 DATA-LOSS GUARD (found on-device: free-up deleted the file from OneDrive): a freed-up
+        // file (content_state=`cached`, body gone from disk) must NOT be seen as a LOCAL DELETE by the
+        // next offline pass — otherwise `apply_local_deletes` pushes a cloud delete and the file is
+        // lost. It is intentionally absent, not user-deleted.
+        assert!(
+            !scan_local_deletes(&store, "acc", dir.path())
+                .unwrap()
+                .contains(&"a1".to_string()),
+            "free-up must not make the file look locally deleted (would push a cloud delete)"
+        );
+
+        // download-now again re-materializes (reversible).
+        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert!(
+            dir.path().join("Photos/a.txt").exists(),
+            "re-materialized after free-up"
+        );
+    }
+
+    #[test]
+    fn materialize_skips_paused_and_resumes() {
+        // #659 pause/retry: a paused transfer is skipped (queue-deep, persistent) until resumed.
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = SharedProgress::new();
+        progress.request_pause("a1");
+
+        // paused -> a1 is skipped (not fetched, stays remote_dirty).
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 0, "paused file is skipped");
+        assert!(!dir.path().join("Photos/a.txt").exists());
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "a1")
+                .unwrap()
+                .unwrap()
+                .sync_state,
+            "remote_dirty"
+        );
+        assert!(
+            progress.is_paused_id("a1"),
+            "pause is persistent (not consumed like cancel)"
+        );
+
+        // resume -> the next pass fetches it.
+        progress.resume("a1");
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 1, "resumed file is fetched");
+        assert!(dir.path().join("Photos/a.txt").exists());
+    }
+
+    #[test]
     fn materialize_scoped_storage_floor_stops_new_downloads() {
         let store = Store::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -2663,6 +3179,26 @@ mod tests {
     }
 
     #[test]
+    fn shared_progress_retry_now_unpauses_and_clears_backoff() {
+        // #659 retry_now: distinct from resume — it un-pauses AND zeroes a backing-off slot's
+        // retry_after_secs so the panel shows the transfer retrying immediately.
+        let p = SharedProgress::new();
+        p.begin("rid", "f.txt", 100);
+        p.retry_after("rid", 30);
+        p.request_pause("rid");
+        assert!(p.is_paused_id("rid"));
+        assert_eq!(p.snapshot()[0].retry_after_secs, 30);
+
+        p.retry_now("rid");
+        assert!(!p.is_paused_id("rid"), "retry_now un-pauses");
+        assert_eq!(
+            p.snapshot()[0].retry_after_secs,
+            0,
+            "retry_now clears the 429 backoff timer"
+        );
+    }
+
+    #[test]
     fn materialize_scoped_skips_cancelled_transfer_then_retries_next_pass() {
         let store = Store::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -2719,6 +3255,73 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
             b"AAAA"
+        );
+    }
+
+    #[test]
+    fn materialize_scoped_reports_incremental_download_progress() {
+        // #656 F-C: the materialize streams the body and reports cumulative bytes as they arrive,
+        // so the transfer panel shows a moving bar instead of jumping 0% -> gone.
+        struct ChunkedDownloader;
+        impl Downloader for ChunkedDownloader {
+            fn download(&self, _id: &str) -> Result<Vec<u8>, String> {
+                Ok(b"AAAA".to_vec())
+            }
+            fn download_with_progress(
+                &self,
+                _id: &str,
+                on: &mut dyn FnMut(u64),
+            ) -> Result<Vec<u8>, String> {
+                on(2); // 2 of 4 bytes
+                on(4); // all 4 bytes
+                Ok(b"AAAA".to_vec())
+            }
+        }
+        #[derive(Default)]
+        struct RecordingProgress {
+            advances: std::sync::Mutex<Vec<(String, u64)>>,
+        }
+        impl ProgressSink for RecordingProgress {
+            fn begin(&self, _: &str, _: &str, _: u64) {}
+            fn advance(&self, id: &str, done: u64) {
+                self.advances.lock().unwrap().push((id.to_string(), done));
+            }
+            fn retry_after(&self, _: &str, _: u64) {}
+            fn finish(&self, _: &str) {}
+        }
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = RecordingProgress::default();
+        let report = materialize_downloads_scoped(
+            &store,
+            &ChunkedDownloader,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.downloaded, 1);
+        let a1: Vec<u64> = progress
+            .advances
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "a1")
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(
+            a1,
+            vec![2, 4],
+            "cumulative byte progress is reported incrementally, not just once at the end"
         );
     }
 
@@ -3242,6 +3845,193 @@ mod tests {
         let copy = docs.join("note-host-safeBackup-0001.txt");
         assert!(copy.exists(), "conflict copy must exist");
         assert_eq!(std::fs::read(&copy).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn keep_both_persists_conflict_state_and_keep_cloud_resolves() {
+        // #659: the keep-both site now PERSISTS conflict_state (was a write-orphan); the
+        // Conflict Center lists it; keep-cloud drops the local edit copy + clears the marker.
+        let (store, dir) = store_with_tracked_file(2);
+        std::fs::write(dir.path().join("Docs").join("note.txt"), b"changed").unwrap();
+        let mut map = MappingTable::new();
+        let r = MockReplacer {
+            conflict: true,
+            calls: Default::default(),
+        };
+        let modifies = vec![(
+            "a1".into(),
+            PathBuf::from("Docs/note.txt"),
+            "etag-old".into(),
+        )];
+        apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), "host", &modifies).unwrap();
+
+        let it = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(
+            it.conflict_state.as_deref(),
+            Some("note-host-safeBackup-0001.txt"),
+            "the keep-both is now persisted"
+        );
+        assert_eq!(store.conflicts("acc").unwrap().len(), 1);
+        let copy = dir
+            .path()
+            .join("Docs")
+            .join("note-host-safeBackup-0001.txt");
+        assert!(copy.exists());
+
+        struct NoWriter;
+        impl RemoteWriter for NoWriter {
+            fn upload(&self, _: &str, _: &[u8]) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        resolve_conflict(
+            &store,
+            "acc",
+            "a1",
+            ConflictResolution::KeepCloud,
+            dir.path(),
+            &NoWriter,
+        )
+        .unwrap();
+        assert!(!copy.exists(), "keep-cloud drops the local edit copy");
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "a1")
+                .unwrap()
+                .unwrap()
+                .conflict_state,
+            None
+        );
+        assert!(store.conflicts("acc").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_keep_mine_deletes_cloud_and_restores_local() {
+        // #659: keep-mine — delete the cloud item + restore the local edit to the original name.
+        let (store, dir) = store_with_tracked_file(2);
+        let docs = dir.path().join("Docs");
+        std::fs::write(docs.join("note-host-safeBackup-0001.txt"), b"my edit").unwrap();
+        std::fs::write(docs.join("note.txt"), b"cloud version").unwrap();
+        store
+            .set_conflict_state("acc", SERVICE, "a1", Some("note-host-safeBackup-0001.txt"))
+            .unwrap();
+
+        use std::sync::{Arc, Mutex};
+        struct RecWriter(Arc<Mutex<Vec<String>>>);
+        impl RemoteWriter for RecWriter {
+            fn upload(&self, _: &str, _: &[u8]) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn delete(&self, id: &str) -> Result<(), String> {
+                self.0.lock().unwrap().push(id.into());
+                Ok(())
+            }
+        }
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        resolve_conflict(
+            &store,
+            "acc",
+            "a1",
+            ConflictResolution::KeepMine,
+            dir.path(),
+            &RecWriter(deleted.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["a1"],
+            "keep-mine deletes the cloud item"
+        );
+        assert_eq!(
+            std::fs::read(docs.join("note.txt")).unwrap(),
+            b"my edit",
+            "local edit restored to the original name"
+        );
+        assert!(!docs.join("note-host-safeBackup-0001.txt").exists());
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "a1")
+                .unwrap()
+                .unwrap()
+                .conflict_state,
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_offline_to_online_drops_safe_keeps_unsynced() {
+        // #659 AC3: after offline->online, cleanup drops SAFE materialized bodies (clean, in
+        // cloud) to trash but KEEPS anything unsynced (no data loss). Empty modes -> all "online".
+        let store = Store::open_in_memory().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let trash = tempfile::tempdir().unwrap();
+        for (id, name, content) in [
+            ("clean1", "clean.txt", b"CLEAN" as &[u8]),
+            ("dirty1", "dirty.txt", b"DIRTY"),
+        ] {
+            let mut it = Item::new("acc", SERVICE, id, name, "file");
+            it.local_path = Some(name.into());
+            store.upsert_item(&it).unwrap();
+            std::fs::write(sync.path().join(name), content).unwrap();
+            store
+                .set_content_state(
+                    "acc",
+                    SERVICE,
+                    id,
+                    Some("materialized"),
+                    Some("sync"),
+                    Some("available"),
+                    Some(NOW),
+                )
+                .unwrap();
+        }
+        // clean1: clean + a synced reference matching disk -> provably safe.
+        store
+            .set_sync_state("acc", SERVICE, "clean1", "clean")
+            .unwrap();
+        record_synced_state(
+            &store,
+            "acc",
+            "clean1",
+            &sync.path().join("clean.txt"),
+            Some(crate::quickxor::quickxor_base64(b"CLEAN")),
+        );
+        // dirty1: an unsynced local edit -> remote_dirty -> must be KEPT.
+        store
+            .set_sync_state("acc", SERVICE, "dirty1", "remote_dirty")
+            .unwrap();
+
+        let cfg = isyncyou_core::Config::default(); // empty onedrive_modes -> both now online
+        let report =
+            cleanup_offline_to_online(&store, "acc", sync.path(), trash.path(), &cfg).unwrap();
+        assert_eq!(report.freed, 1, "only the safe body is dropped");
+        assert_eq!(report.kept, 1, "the unsynced body is kept (no data loss)");
+
+        // clean1 dropped: body moved to trash (reversible), row still lists (cached/missing).
+        assert!(!sync.path().join("clean.txt").exists());
+        assert!(
+            trash.path().join("clean.txt").exists(),
+            "moved to trash, not deleted"
+        );
+        let c = store.get_item("acc", SERVICE, "clean1").unwrap().unwrap();
+        assert_eq!(c.body_state.as_deref(), Some("missing"));
+        assert_eq!(c.content_state.as_deref(), Some("cached"));
+        assert!(c.deleted_at.is_none(), "row stays listable");
+        // dirty1 KEPT: body still on disk, still materialized (no data loss).
+        assert!(sync.path().join("dirty.txt").exists());
+        assert_eq!(
+            store
+                .get_item("acc", SERVICE, "dirty1")
+                .unwrap()
+                .unwrap()
+                .body_state
+                .as_deref(),
+            Some("available")
+        );
     }
 
     #[test]

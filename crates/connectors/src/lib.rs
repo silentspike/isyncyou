@@ -47,13 +47,14 @@ pub use mime::{
     InlineImage, MailPreview,
 };
 pub use onedrive::{
-    apply_local_deletes, apply_local_modifies, cloud_dest_path, incremental_sync,
-    incremental_sync_scoped, local_rel_path, materialize_downloads, materialize_downloads_scoped,
-    pending_local_deletes, push_delete, push_local_creates, push_upload, scan_local_creates,
+    apply_local_deletes, apply_local_modifies, cleanup_offline_to_online, cloud_dest_path,
+    dematerialize_one, download_one, incremental_sync, incremental_sync_scoped, local_rel_path,
+    materialize_downloads, materialize_downloads_scoped, pending_local_deletes, push_delete,
+    push_local_creates, push_upload, resolve_conflict, scan_local_creates,
     scan_local_creates_scoped, scan_local_deletes, scan_local_deletes_scoped, scan_local_modifies,
-    scan_local_modifies_scoped, ContentReplacer, Downloader, MaterializeReport, ModifyReport,
-    PendingLocalDelete, ProgressSink, RemoteWriter, SharedProgress, SyncError, SyncReport,
-    TransferSlot,
+    scan_local_modifies_scoped, CleanupReport, ConflictResolution, ContentReplacer, Downloader,
+    MaterializeReport, ModifyReport, PendingLocalDelete, ProgressSink, RemoteWriter,
+    SharedProgress, SyncError, SyncReport, TransferSlot,
 };
 pub use onenote::{
     backup_onenote_hierarchy, incremental_sync_onenote, OneNoteHierarchyReport, OneNoteReport,

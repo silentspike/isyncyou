@@ -379,6 +379,8 @@ pub struct TransferState {
     pub bytes_done: u64,
     pub bytes_total: u64,
     pub retry_after_secs: u64,
+    /// #659: the transfer is paused (queue-deep) — skipped between files until resumed.
+    pub paused: bool,
 }
 
 /// Progress + cancellation for in-flight downloads/materializations (#onedrive-mobile
@@ -390,6 +392,20 @@ pub trait TransferProgress: Send + Sync {
     fn transfers(&self) -> Vec<TransferState>;
     /// Request cancellation of one transfer by id. Returns true if it was known.
     fn cancel(&self, id: &str) -> bool;
+    /// #659: pause one transfer by id (queue-deep — skipped between files until resumed).
+    /// Persistent (unlike cancel, never auto-consumed). Default no-op (desktop / #656 stub).
+    fn pause(&self, _id: &str) -> bool {
+        false
+    }
+    /// #659: resume a paused transfer so the next materialize pass fetches it. Default no-op.
+    fn resume(&self, _id: &str) -> bool {
+        false
+    }
+    /// #659: retry a failed/backed-off transfer — re-queue it for the next pass (clears any
+    /// pause + 429 backoff). Queue-deep; no mid-file interruption. Default no-op.
+    fn retry(&self, _id: &str) -> bool {
+        false
+    }
 }
 
 /// Runs an archive integrity verify pass for an account on behalf of a POST
@@ -642,6 +658,28 @@ pub trait OneDriveWriteHandler: Send + Sync {
     fn replace(&self, account: &str, id: &str, etag: &str, bytes: &[u8]) -> Result<(), String>;
 }
 
+/// Performs the OneDrive **local-body management** verbs on behalf of a cap-token POST (#659):
+/// free up a materialized body, download one on demand, list + resolve keep-both conflicts, and
+/// run the offline→online cleanup. Injected by the daemon / mobile engine (which owns the store +
+/// the write token); the read-only CLI `serve` does not set it, so every `/api/v1/onedrive/*`
+/// management route is refused there. free-up / download-now are local-only + reversible (not
+/// biometric-gated); a keep-mine resolve deletes the cloud copy (biometric-gated by the router);
+/// cleanup is a bulk op (biometric-gated).
+pub trait OneDriveManageHandler: Send + Sync {
+    /// Free up space: drop `id`'s materialized body but keep the item listable (metadata-only).
+    fn free_up(&self, account: &str, id: &str) -> Result<(), String>;
+    /// Download now: materialize `id` on demand. `Ok(false)` when the transfer policy blocked it.
+    fn download_now(&self, account: &str, id: &str) -> Result<bool, String>;
+    /// The account's unresolved conflicts (write-orphan `conflict_state` rows) for the Conflict
+    /// Center. Returns a JSON array of `{ id, name, conflict_copy, … }`.
+    fn list_conflicts(&self, account: &str) -> Result<serde_json::Value, String>;
+    /// Resolve one conflict: `resolution` is `keep-both` | `keep-mine` | `keep-cloud`.
+    fn resolve_conflict(&self, account: &str, id: &str, resolution: &str) -> Result<(), String>;
+    /// Offline→online cleanup: drop the now-online folders' provably-safe materialized bodies (to
+    /// trash), keep anything unsynced. Returns `{ freed, kept }`.
+    fn cleanup_offline_to_online(&self, account: &str) -> Result<serde_json::Value, String>;
+}
+
 /// Live account-auth handler (#68): the daemon's device-code sign-in + sign-out.
 /// `None` => the account menu offers only switching (the read-only CLI `serve`).
 pub trait AccountAuthHandler: Send + Sync {
@@ -823,8 +861,14 @@ pub struct Router {
     /// Optional in-flight transfer progress/cancel handler (#onedrive-mobile 0.8). `None`
     /// => the transfers endpoint reports idle and cancel 404s (the read-only CLI `serve`).
     transfers: Option<std::sync::Arc<dyn TransferProgress>>,
-    /// Capability token for the cancel POST (distinct blast radius).
+    /// Capability token for the cancel/pause/retry POSTs (distinct blast radius).
     transfer_cap_token: Option<String>,
+    /// Optional OneDrive local-body management handler (#659): free-up / download-now / conflict
+    /// list+resolve / offline→online cleanup. `None` => every management route is refused (the
+    /// read-only CLI `serve`).
+    onedrive_manage: Option<std::sync::Arc<dyn OneDriveManageHandler>>,
+    /// Separate capability token for the management POSTs (distinct blast radius).
+    onedrive_manage_cap_token: Option<String>,
 }
 
 /// Constant-time byte-equality (no early return on first mismatch) so token checks
@@ -886,6 +930,8 @@ impl Router {
             pending: isyncyou_core::pending::PendingActionRegistry::new(),
             transfers: None,
             transfer_cap_token: None,
+            onedrive_manage: None,
+            onedrive_manage_cap_token: None,
         }
     }
 
@@ -935,6 +981,8 @@ impl Router {
             pending: isyncyou_core::pending::PendingActionRegistry::new(),
             transfers: None,
             transfer_cap_token: None,
+            onedrive_manage: None,
+            onedrive_manage_cap_token: None,
         }
     }
 
@@ -1203,6 +1251,18 @@ impl Router {
         self
     }
 
+    /// Enable the OneDrive local-body management POSTs/GET (free-up / download-now / conflict
+    /// list+resolve / offline→online cleanup), guarded by `cap_token` (builder style, #659).
+    pub fn with_onedrive_manage(
+        mut self,
+        handler: std::sync::Arc<dyn OneDriveManageHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.onedrive_manage = Some(handler);
+        self.onedrive_manage_cap_token = Some(cap_token);
+        self
+    }
+
     /// Wire the account-auth handler (device-code sign-in + sign-out, #68).
     pub fn with_account_auth(
         mut self,
@@ -1387,14 +1447,27 @@ impl Router {
             // the pass finishes — leaving the panel unable to show progress while it downloads.
             "/api/v1/onedrive/transfers",
         ];
+        // #659: the transfer-CONTROL POSTs (cancel/pause/retry) touch ONLY the in-memory
+        // SharedProgress (the cancel/pause sets), never the store — so, like the transfers GET
+        // above, they MUST be gate-exempt. The mobile offline pass holds the store gate for the
+        // whole blocking materialize; a gated pause/retry/cancel would block until that pass
+        // finished, i.e. it could never interrupt the very transfer it targets (the pause/retry
+        // AC is exactly "pause a LIVE materialization"). They are still session-token-gated (checked
+        // above) and cap-token-gated in the handler; only the store gate is skipped.
+        const GATE_EXEMPT_POST: &[&str] = &[
+            "/api/v1/onedrive/transfers/cancel",
+            "/api/v1/onedrive/transfers/pause",
+            "/api/v1/onedrive/transfers/retry",
+        ];
         let static_get = req.method == "GET"
             && (matches!(
                 req.path.as_str(),
                 "/" | "/app.js" | "/app.css" | "/callback"
             ) || req.path.ends_with(".woff2")
                 || req.path.starts_with("/sfx/"));
-        let gate_exempt =
-            static_get || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()));
+        let gate_exempt = static_get
+            || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()))
+            || (req.method == "POST" && GATE_EXEMPT_POST.contains(&req.path.as_str()));
         let _gate = if gate_exempt {
             None
         } else {
@@ -1439,6 +1512,8 @@ impl Router {
                 "/api/v1/onenote/delete" => self.onenote_delete(req),
                 "/api/v1/onenote/append" => self.onenote_append(req),
                 "/api/v1/onedrive/transfers/cancel" => self.transfers_cancel(req),
+                "/api/v1/onedrive/transfers/pause" => self.transfers_pause(req),
+                "/api/v1/onedrive/transfers/retry" => self.transfers_retry(req),
                 "/api/v1/onedrive/create" => self.onedrive_create(req),
                 "/api/v1/onedrive/rename" => self.onedrive_rename(req),
                 "/api/v1/onedrive/move" => self.onedrive_move(req),
@@ -1446,6 +1521,10 @@ impl Router {
                 "/api/v1/onedrive/mode" => self.onedrive_set_mode(req),
                 "/api/v1/onedrive/upload" => self.onedrive_upload(req),
                 "/api/v1/onedrive/replace" => self.onedrive_replace(req),
+                "/api/v1/onedrive/free-up" => self.onedrive_free_up(req),
+                "/api/v1/onedrive/download-now" => self.onedrive_download_now(req),
+                "/api/v1/onedrive/conflict/resolve" => self.onedrive_conflict_resolve(req),
+                "/api/v1/onedrive/cleanup" => self.onedrive_cleanup(req),
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
                 "/api/v1/account/signout" => self.account_signout(req),
@@ -1517,6 +1596,13 @@ impl Router {
                     .replace(
                         "__TRANSFER_CAP_TOKEN__",
                         self.transfer_cap_token.as_deref().unwrap_or(""),
+                    )
+                    // #659 server-side half of the manage cap bridge; app.js grows the
+                    // `__ONEDRIVE_MANAGE_CAP_TOKEN__` placeholder + `CAP.onedriveManage` for the
+                    // free-up / download-now buttons, the Conflict Center and the cleanup toast.
+                    .replace(
+                        "__ONEDRIVE_MANAGE_CAP_TOKEN__",
+                        self.onedrive_manage_cap_token.as_deref().unwrap_or(""),
                     )
                     .replace(
                         "__MAILWRITE_CAP_TOKEN__",
@@ -1592,6 +1678,7 @@ impl Router {
             "/api/v1/sync/state" => self.sync_state(),
             "/api/v1/hydrations" => self.hydrations_state(),
             "/api/v1/onedrive/transfers" => self.transfers_state(),
+            "/api/v1/onedrive/conflicts" => self.onedrive_conflicts(req),
             "/api/v1/onedrive/policy" => self.policy_state(),
             "/api/v1/onedrive/mode" => self.onedrive_mode(req),
             "/api/v1/drive" => self.drive_info(req),
@@ -2607,6 +2694,174 @@ impl Router {
         )
     }
 
+    /// Cap-gate the OneDrive management handler (#659), like [`onedrive_gate`] for the write verbs.
+    fn manage_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<&std::sync::Arc<dyn OneDriveManageHandler>, ApiResponse> {
+        let h = self.onedrive_manage.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "onedrive management is not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.onedrive_manage_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        Ok(h)
+    }
+
+    /// `POST /api/v1/onedrive/free-up?account=…&id=…` — drop a materialized body but keep the item
+    /// listable (#659). Local-only + reversible → NOT biometric-gated. Cap-gated + audited.
+    fn onedrive_free_up(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.manage_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        match h.free_up(account, id) {
+            Ok(()) => {
+                let _ = self.audit_account(account, "audit:onedrive-manage", "ok", "free-up");
+                ApiResponse::ok_json(&json!({ "ok": true }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:onedrive-manage",
+                    "error",
+                    &format!("free-up id={id}: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// `POST /api/v1/onedrive/download-now?account=…&id=…` — materialize one item on demand (#659).
+    /// Local-only + reversible → NOT biometric-gated. `materialized:false` when policy blocked it.
+    fn onedrive_download_now(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.manage_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+        ) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        match h.download_now(account, id) {
+            Ok(materialized) => {
+                let _ = self.audit_account(account, "audit:onedrive-manage", "ok", "download-now");
+                ApiResponse::ok_json(&json!({ "ok": true, "materialized": materialized }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:onedrive-manage",
+                    "error",
+                    &format!("download-now id={id}: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
+    /// `GET /api/v1/onedrive/conflicts?account=…` — the account's unresolved keep-both conflicts for
+    /// the Conflict Center (#659). Read-only (session-gated on mobile; no cap). 404 without a handler.
+    fn onedrive_conflicts(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match &self.onedrive_manage {
+            Some(h) => h,
+            None => {
+                return ApiResponse::error(404, "onedrive management is not enabled on this server")
+            }
+        };
+        let account = match req.q("account") {
+            Some(a) if !a.is_empty() => a,
+            _ => return ApiResponse::error(400, "account is required"),
+        };
+        match h.list_conflicts(account) {
+            Ok(conflicts) => ApiResponse::ok_json(&json!({ "conflicts": conflicts })),
+            Err(e) => ApiResponse::error(500, &format!("conflicts: {e}")),
+        }
+    }
+
+    /// `POST /api/v1/onedrive/conflict/resolve?account=…&id=…&resolution=keep-both|keep-mine|keep-cloud`
+    /// — resolve one keep-both conflict (#659). keep-mine deletes the cloud copy → biometric-gated;
+    /// keep-both / keep-cloud are local-only. Cap-gated + audited.
+    fn onedrive_conflict_resolve(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.manage_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let (account, id, resolution) = match (
+            req.q("account").filter(|a| !a.is_empty()),
+            req.q("id").filter(|i| !i.is_empty()),
+            req.q("resolution").filter(|r| !r.is_empty()),
+        ) {
+            (Some(a), Some(i), Some(r)) => (a, i, r),
+            _ => return ApiResponse::error(400, "account, id and resolution are required"),
+        };
+        if !matches!(resolution, "keep-both" | "keep-mine" | "keep-cloud") {
+            return ApiResponse::error(
+                400,
+                "resolution must be keep-both, keep-mine or keep-cloud",
+            );
+        }
+        // keep-mine deletes the cloud version → the destructive per-action biometric gate on mobile.
+        if resolution == "keep-mine" {
+            if let Some(r) =
+                self.biometric_challenge("conflict-keep-mine", account, "onedrive", id, req)
+            {
+                return r;
+            }
+        }
+        self.onedrive_result(
+            account,
+            &format!("conflict-resolve id={id} resolution={resolution}"),
+            h.resolve_conflict(account, id, resolution),
+        )
+    }
+
+    /// `POST /api/v1/onedrive/cleanup?account=…` — the explicit offline→online cleanup (#659):
+    /// drop provably-safe now-online bodies (to trash), keep anything unsynced. Bulk op →
+    /// biometric-gated. Shares the same logic the mode-POST hook runs. Cap-gated + audited.
+    fn onedrive_cleanup(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.manage_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        // Cleanup can drop many bodies → the bulk per-action biometric gate on mobile.
+        if let Some(r) = self.biometric_challenge("bulk", account, "onedrive", account, req) {
+            return r;
+        }
+        match h.cleanup_offline_to_online(account) {
+            Ok(report) => {
+                let _ = self.audit_account(account, "audit:onedrive-manage", "ok", "cleanup");
+                ApiResponse::ok_json(&json!({ "ok": true, "cleanup": report }))
+            }
+            Err(e) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:onedrive-manage",
+                    "error",
+                    &format!("cleanup: {e}"),
+                );
+                ApiResponse::error(500, &e)
+            }
+        }
+    }
+
     fn mail_send(&self, req: &ApiRequest) -> ApiResponse {
         let h = match self.mail_gate(req) {
             Ok(h) => h,
@@ -3158,6 +3413,7 @@ impl Router {
                     "bytes_done": t.bytes_done,
                     "bytes_total": t.bytes_total,
                     "retry_after_secs": t.retry_after_secs,
+                    "paused": t.paused,
                 })
             })
             .collect();
@@ -3179,6 +3435,41 @@ impl Router {
             _ => return ApiResponse::error(400, "id is required"),
         };
         ApiResponse::ok_json(&json!({ "cancelled": handler.cancel(id) }))
+    }
+
+    /// `POST /api/v1/onedrive/transfers/pause?id=…` — cap-gated pause of one in-flight transfer
+    /// (#659, queue-deep). Persistent until resumed. 404 when no transfer engine is wired.
+    fn transfers_pause(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.transfers {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "transfers are not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.transfer_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let id = match req.q("id") {
+            Some(i) if !i.is_empty() => i,
+            _ => return ApiResponse::error(400, "id is required"),
+        };
+        ApiResponse::ok_json(&json!({ "paused": handler.pause(id) }))
+    }
+
+    /// `POST /api/v1/onedrive/transfers/retry?id=…` — cap-gated retry of a failed/backed-off or
+    /// paused transfer (#659): re-queue it (clears pause + 429 backoff) for the next pass. Also the
+    /// resume affordance (retry un-pauses). 404 when no transfer engine is wired.
+    fn transfers_retry(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.transfers {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "transfers are not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.transfer_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let id = match req.q("id") {
+            Some(i) if !i.is_empty() => i,
+            _ => return ApiResponse::error(400, "id is required"),
+        };
+        ApiResponse::ok_json(&json!({ "retried": handler.retry(id) }))
     }
 
     /// `GET /api/v1/onedrive/policy` — the effective mobile transfer policy plus the
@@ -3266,11 +3557,36 @@ impl Router {
         match handler.set_folder(account, folder, mode) {
             Ok(()) => {
                 let _ = self.audit_account(account, "audit:onedrive-mode", "ok", &summary);
-                ApiResponse::ok_json(&json!({
+                let mut resp = json!({
                     "account": account,
                     "folder": folder,
                     "mode": mode.map(|m| m.as_str()),
-                }))
+                });
+                // #659 D1: switching a folder to ONLINE triggers the offline→online cleanup (drop
+                // provably-safe now-online bodies to trash, keep unsynced), reported as an additive
+                // `cleanup: {freed, kept}` key. Runs ONLY when the manage handler is wired
+                // (daemon/mobile); the mode-only read-only router skips it, so #651/#652's
+                // mode-toggle tests are unaffected. The mode already persisted, so a cleanup error
+                // never fails the switch — it is reported as `cleanup_error` and audited.
+                if mode.map(|m| m.as_str()) == Some("online") {
+                    if let Some(mh) = &self.onedrive_manage {
+                        match mh.cleanup_offline_to_online(account) {
+                            Ok(report) => {
+                                resp["cleanup"] = report;
+                            }
+                            Err(e) => {
+                                let _ = self.audit_account(
+                                    account,
+                                    "audit:onedrive-manage",
+                                    "error",
+                                    &format!("cleanup-on-mode account={account}: {e}"),
+                                );
+                                resp["cleanup_error"] = json!(e);
+                            }
+                        }
+                    }
+                }
+                ApiResponse::ok_json(&resp)
             }
             Err(e) => {
                 let _ = self.audit_account(
@@ -4515,6 +4831,8 @@ fn item_json(it: &Item) -> Value {
         v["body_location"] = json!(it.body_location);
         v["body_state"] = json!(it.body_state);
         v["conflict_state"] = json!(it.conflict_state);
+        // #659: surface the last download failure so the UI can show a retry affordance.
+        v["last_download_error"] = json!(it.last_download_error);
     }
     v
 }
@@ -5205,6 +5523,46 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
     }
 
+    #[test]
+    fn transfer_control_posts_are_gate_exempt_during_a_pass() {
+        // #659: pause/retry/cancel touch ONLY the in-memory SharedProgress, never the store, so they
+        // MUST be gate-exempt — otherwise the mobile offline pass, which holds the store gate for the
+        // whole blocking materialize, would block the very pause/retry that targets it (the pause/retry
+        // AC is "pause a LIVE materialization"). With the gate held on this thread, a non-exempt route
+        // would re-lock it (same-thread deadlock); the exempt control POSTs are served.
+        struct NoopTransfers;
+        impl TransferProgress for NoopTransfers {
+            fn transfers(&self) -> Vec<TransferState> {
+                vec![]
+            }
+            fn cancel(&self, _id: &str) -> bool {
+                true
+            }
+            fn pause(&self, _id: &str) -> bool {
+                true
+            }
+            fn retry(&self, _id: &str) -> bool {
+                true
+            }
+        }
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router = Router::with_gate(Config::default(), gate.clone())
+            .with_transfers(std::sync::Arc::new(NoopTransfers), "cap".into());
+        let _held = gate.lock().unwrap_or_else(|e| e.into_inner());
+        for path in [
+            "/api/v1/onedrive/transfers/cancel?id=t1",
+            "/api/v1/onedrive/transfers/pause?id=t1",
+            "/api/v1/onedrive/transfers/retry?id=t1",
+        ] {
+            let resp =
+                router.route(&ApiRequest::new("POST", path).with_cap_token(Some("cap".into())));
+            assert_eq!(
+                resp.status, 200,
+                "control POST must be served while the pass holds the gate: {path}"
+            );
+        }
+    }
+
     struct OkRestore;
     impl RestoreHandler for OkRestore {
         fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
@@ -5871,6 +6229,62 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         let cleared = body_json(&router.route(&ApiRequest::get("/api/v1/onedrive/mode?account=a")));
         assert!(cleared.pointer("/folder_modes/Photos").is_none());
+    }
+
+    // #659 D1: setting a folder ONLINE with the manage handler wired triggers the offline→online
+    // cleanup, reported as an additive `cleanup` key. Without the manage handler (the #651/#652
+    // path) the response is unchanged (no cleanup key) → those mode-toggle tests stay green.
+    #[test]
+    fn mode_post_online_triggers_cleanup_only_when_manage_wired() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+
+        // Mode handler only (no manage) -> setting online has NO cleanup key (unchanged response).
+        let (_d0, r0) = setup();
+        let mode_only = r0.with_onedrive_mode(
+            std::sync::Arc::new(FakeOneDriveMode::default()),
+            "modecap".into(),
+        );
+        let resp = mode_only.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online",
+        ));
+        assert_eq!(resp.status, 200);
+        let j = body_json(&resp);
+        assert_eq!(j["mode"], "online");
+        assert!(
+            j.get("cleanup").is_none(),
+            "no cleanup without the manage handler (#651/#652 unchanged)"
+        );
+
+        // Mode + manage wired -> setting online runs cleanup + attaches {freed,kept}.
+        let (_d, r1) = setup();
+        let m = std::sync::Arc::new(MockManage::default());
+        let router = r1
+            .with_onedrive_mode(
+                std::sync::Arc::new(FakeOneDriveMode::default()),
+                "modecap".into(),
+            )
+            .with_onedrive_manage(m.clone(), "cap".into());
+        let online = router.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online",
+        ));
+        assert_eq!(online.status, 200);
+        assert_eq!(body_json(&online)["cleanup"]["freed"], 3);
+        assert_eq!(*m.cleaned.lock().unwrap(), vec!["a".to_string()]);
+
+        // Setting a folder to SYNC (not online) does NOT trigger cleanup.
+        let sync = router.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Docs&mode=sync",
+        ));
+        assert_eq!(sync.status, 200);
+        assert!(
+            body_json(&sync).get("cleanup").is_none(),
+            "cleanup runs only on the switch to online"
+        );
+        assert_eq!(
+            m.cleaned.lock().unwrap().len(),
+            1,
+            "cleanup not re-run for a non-online switch"
+        );
     }
 
     // AC1b: the POST parse path is serde, symmetric with `OneDriveMode::as_str`. Proves
@@ -7081,6 +7495,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_has_onedrive_manage_cap_token_placeholder() {
+        // app.js side of the #659 manage bridge: the raw placeholder is present.
+        assert!(APP_JS.contains("__ONEDRIVE_MANAGE_CAP_TOKEN__"));
+        // read-only router (no manage handler wired): the placeholder is blanked.
+        let ro = Router::new(Config::default()).route(&ApiRequest::get("/app.js"));
+        let ro_body = String::from_utf8_lossy(&ro.body);
+        assert!(
+            !ro_body.contains("__ONEDRIVE_MANAGE_CAP_TOKEN__"),
+            "placeholder must be replaced"
+        );
+        assert!(
+            ro_body.contains("onedriveManage: \"\""),
+            "no token when management is disabled"
+        );
+        // with a manage handler wired, the real cap token is injected.
+        let m = std::sync::Arc::new(MockManage::default());
+        let rw = Router::new(Config::default())
+            .with_onedrive_manage(m, "odm123".into())
+            .route(&ApiRequest::get("/app.js"));
+        let rw_body = String::from_utf8_lossy(&rw.body);
+        assert!(rw_body.contains("onedriveManage: \"odm123\""));
+    }
+
+    #[test]
     fn app_js_has_push_cap_token_placeholder() {
         assert!(APP_JS.contains("__PUSH_CAP_TOKEN__"));
     }
@@ -7755,9 +8193,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             404
         );
 
-        // with a handler: progress is reported and cancel is cap-gated.
+        // with a handler: progress is reported and cancel/pause/retry are cap-gated.
         struct MockTransfers {
             cancelled: std::sync::Mutex<Vec<String>>,
+            paused: std::sync::Mutex<Vec<String>>,
+            retried: std::sync::Mutex<Vec<String>>,
         }
         impl TransferProgress for MockTransfers {
             fn transfers(&self) -> Vec<TransferState> {
@@ -7767,15 +8207,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     bytes_done: 50,
                     bytes_total: 100,
                     retry_after_secs: 0,
+                    paused: true,
                 }]
             }
             fn cancel(&self, id: &str) -> bool {
                 self.cancelled.lock().unwrap().push(id.into());
                 id == "t1"
             }
+            fn pause(&self, id: &str) -> bool {
+                self.paused.lock().unwrap().push(id.into());
+                id == "t1"
+            }
+            fn retry(&self, id: &str) -> bool {
+                self.retried.lock().unwrap().push(id.into());
+                id == "t1"
+            }
         }
         let mock = std::sync::Arc::new(MockTransfers {
             cancelled: std::sync::Mutex::new(vec![]),
+            paused: std::sync::Mutex::new(vec![]),
+            retried: std::sync::Mutex::new(vec![]),
         });
         let router = Router::new(Config::default()).with_transfers(mock.clone(), "cap".into());
         let t = router.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
@@ -7783,6 +8234,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(tj["count"].as_u64(), Some(1));
         assert_eq!(tj["transfers"][0]["name"], "big.zip");
         assert_eq!(tj["transfers"][0]["bytes_done"].as_u64(), Some(50));
+        assert_eq!(tj["transfers"][0]["paused"], true);
 
         // cancel without the cap token → 401, handler not called.
         assert_eq!(
@@ -7803,6 +8255,214 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(ok.status, 200);
         assert_eq!(body_json(&ok)["cancelled"], true);
         assert_eq!(*mock.cancelled.lock().unwrap(), vec!["t1"]);
+
+        // #659: pause + retry are the same cap-gated shape. 401 without the token, 200 with it.
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/onedrive/transfers/pause?id=t1"
+                ))
+                .status,
+            401
+        );
+        let pok = router.route(
+            &ApiRequest::new("POST", "/api/v1/onedrive/transfers/pause?id=t1")
+                .with_cap_token(Some("cap".into())),
+        );
+        assert_eq!(pok.status, 200);
+        assert_eq!(body_json(&pok)["paused"], true);
+        assert_eq!(*mock.paused.lock().unwrap(), vec!["t1"]);
+        let rok = router.route(
+            &ApiRequest::new("POST", "/api/v1/onedrive/transfers/retry?id=t1")
+                .with_cap_token(Some("cap".into())),
+        );
+        assert_eq!(rok.status, 200);
+        assert_eq!(body_json(&rok)["retried"], true);
+        assert_eq!(*mock.retried.lock().unwrap(), vec!["t1"]);
+        // missing id → 400.
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/onedrive/transfers/pause")
+                        .with_cap_token(Some("cap".into()))
+                )
+                .status,
+            400
+        );
+    }
+
+    #[derive(Default)]
+    struct MockManage {
+        freed: std::sync::Mutex<Vec<String>>,
+        downloaded: std::sync::Mutex<Vec<String>>,
+        resolved: std::sync::Mutex<Vec<(String, String)>>,
+        cleaned: std::sync::Mutex<Vec<String>>,
+    }
+    impl OneDriveManageHandler for MockManage {
+        fn free_up(&self, _account: &str, id: &str) -> Result<(), String> {
+            self.freed.lock().unwrap().push(id.into());
+            Ok(())
+        }
+        fn download_now(&self, _account: &str, id: &str) -> Result<bool, String> {
+            self.downloaded.lock().unwrap().push(id.into());
+            Ok(true)
+        }
+        fn list_conflicts(&self, _account: &str) -> Result<serde_json::Value, String> {
+            Ok(json!([{
+                "id": "c1",
+                "name": "note.txt",
+                "conflict_copy": "note-host-safeBackup-0001.txt",
+            }]))
+        }
+        fn resolve_conflict(
+            &self,
+            _account: &str,
+            id: &str,
+            resolution: &str,
+        ) -> Result<(), String> {
+            self.resolved
+                .lock()
+                .unwrap()
+                .push((id.into(), resolution.into()));
+            Ok(())
+        }
+        fn cleanup_offline_to_online(&self, account: &str) -> Result<serde_json::Value, String> {
+            self.cleaned.lock().unwrap().push(account.into());
+            Ok(json!({ "freed": 3, "kept": 1 }))
+        }
+    }
+
+    // #659: the OneDrive management endpoints (free-up / download-now / conflicts / resolve /
+    // cleanup) — cap-gate (401) / no-handler (404) / param (400) / dispatch.
+    #[test]
+    fn onedrive_manage_endpoints_cap_gate_and_dispatch() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+
+        // No handler wired -> every management route 404 (POST + the conflicts GET).
+        let (_d0, r0) = setup();
+        assert_eq!(
+            r0.route(&post("/api/v1/onedrive/free-up?account=a&id=i1"))
+                .status,
+            404
+        );
+        assert_eq!(
+            r0.route(&ApiRequest::get("/api/v1/onedrive/conflicts?account=a"))
+                .status,
+            404
+        );
+
+        // Handler wired.
+        let (_d, r) = setup();
+        let m = std::sync::Arc::new(MockManage::default());
+        let router = r.with_onedrive_manage(m.clone(), "cap".into());
+
+        // free-up without the cap -> 401; handler not called.
+        assert_eq!(
+            router
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/onedrive/free-up?account=a&id=i1"
+                ))
+                .status,
+            401
+        );
+        assert!(m.freed.lock().unwrap().is_empty());
+        // with cap -> 200.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/free-up?account=a&id=i1"))
+                .status,
+            200
+        );
+        assert_eq!(*m.freed.lock().unwrap(), vec!["i1".to_string()]);
+        // missing id -> 400.
+        assert_eq!(
+            router
+                .route(&post("/api/v1/onedrive/free-up?account=a"))
+                .status,
+            400
+        );
+
+        // download-now -> 200, materialized reflects the return.
+        let dn = router.route(&post("/api/v1/onedrive/download-now?account=a&id=i2"));
+        assert_eq!(dn.status, 200);
+        assert_eq!(body_json(&dn)["materialized"], true);
+        assert_eq!(*m.downloaded.lock().unwrap(), vec!["i2".to_string()]);
+
+        // conflicts GET -> 200 + shape.
+        let cj = router.route(&ApiRequest::get("/api/v1/onedrive/conflicts?account=a"));
+        assert_eq!(cj.status, 200);
+        assert_eq!(body_json(&cj)["conflicts"][0]["id"], "c1");
+
+        // resolve keep-both -> 200; the handler saw the resolution.
+        let rb = router.route(&post(
+            "/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-both",
+        ));
+        assert_eq!(rb.status, 200);
+        assert_eq!(
+            *m.resolved.lock().unwrap(),
+            vec![("c1".to_string(), "keep-both".to_string())]
+        );
+        // invalid resolution -> 400.
+        assert_eq!(
+            router
+                .route(&post(
+                    "/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=nope"
+                ))
+                .status,
+            400
+        );
+
+        // cleanup -> 200 + report (desktop profile: no biometric gate).
+        let cl = router.route(&post("/api/v1/onedrive/cleanup?account=a"));
+        assert_eq!(cl.status, 200);
+        assert_eq!(body_json(&cl)["cleanup"]["freed"], 3);
+        assert_eq!(*m.cleaned.lock().unwrap(), vec!["a".to_string()]);
+    }
+
+    // #659: on mobile, keep-mine (cloud delete) + cleanup (bulk) raise the biometric gate; keep-both
+    // and free-up do not (local-only, reversible).
+    #[test]
+    fn onedrive_manage_biometric_gating_on_mobile() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let (_d, r) = setup();
+        let m = std::sync::Arc::new(MockManage::default());
+        let mobile = r
+            .with_onedrive_manage(m.clone(), "cap".into())
+            .with_biometric_gate();
+
+        // keep-mine deletes the cloud copy -> challenged; handler NOT called.
+        let km = mobile.route(&post(
+            "/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-mine",
+        ));
+        assert_eq!(km.status, 200);
+        assert_eq!(body_json(&km)["status"], "confirmation_required");
+        assert!(m.resolved.lock().unwrap().is_empty());
+
+        // cleanup is a bulk op -> challenged; handler NOT called.
+        let cl = mobile.route(&post("/api/v1/onedrive/cleanup?account=a"));
+        assert_eq!(cl.status, 200);
+        assert_eq!(body_json(&cl)["status"], "confirmation_required");
+        assert!(m.cleaned.lock().unwrap().is_empty());
+
+        // keep-both is local-only -> straight through (not gated).
+        let kb = mobile.route(&post(
+            "/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-both",
+        ));
+        assert_eq!(kb.status, 200);
+        assert_eq!(
+            *m.resolved.lock().unwrap(),
+            vec![("c1".to_string(), "keep-both".to_string())]
+        );
+        // free-up is local-only + reversible -> straight through (not gated).
+        assert_eq!(
+            mobile
+                .route(&post("/api/v1/onedrive/free-up?account=a&id=i1"))
+                .status,
+            200
+        );
+        assert_eq!(*m.freed.lock().unwrap(), vec!["i1".to_string()]);
     }
 
     #[test]
