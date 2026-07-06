@@ -1,0 +1,41 @@
+{
+  "child_count": 5,
+  "children": [
+    {
+      "id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+      "kind": "folder",
+      "name": "mode-offline",
+      "size": 0
+    },
+    {
+      "id": "892B68CBF4A7C544!scd5fef1091da4b119a6c1e89ec8c2a8b",
+      "kind": "folder",
+      "name": "mode-online",
+      "size": 0
+    },
+    {
+      "id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "kind": "folder",
+      "name": "mode-sync",
+      "size": 0
+    },
+    {
+      "id": "892B68CBF4A7C544!sdc2b6daf39b54607b4e960f4d6f46ac3",
+      "kind": "folder",
+      "name": "ops-dest",
+      "size": 0
+    },
+    {
+      "id": "892B68CBF4A7C544!s4bc4efad3f8540d19d297a78048eb222",
+      "kind": "folder",
+      "name": "ops-source",
+      "size": 0
+    }
+  ],
+  "fixture_root": {
+    "cTag": "\"c:{243029DF-950D-4993-8D6A-3E7199C5873B},0\"",
+    "eTag": "\"{243029DF-950D-4993-8D6A-3E7199C5873B},1\"",
+    "id": "892B68CBF4A7C544!s243029df950d49938d6a3e7199c5873b",
+    "name": "isy-om660-20260706-135511"
+  }
+}

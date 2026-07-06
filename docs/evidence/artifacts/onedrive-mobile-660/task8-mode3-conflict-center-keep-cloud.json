@@ -1,0 +1,47 @@
+{
+  "after": {
+    "conflicts": []
+  },
+  "before": {
+    "conflicts": [
+      {
+        "body_state": "available",
+        "conflict_copy": "freeup-guard-phone-safeBackup-0001.txt",
+        "content_state": "materialized",
+        "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+        "name": "freeup-guard.txt"
+      }
+    ]
+  },
+  "device_safe_backup_listing_after": "",
+  "errors": [],
+  "finished_at": "2026-07-06T13:58:20.183Z",
+  "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+  "item": {
+    "body_location": "sync",
+    "body_state": "available",
+    "conflict_state": null,
+    "content_state": "materialized",
+    "deleted": false,
+    "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+    "has_body": true,
+    "item_type": "file",
+    "last_download_error": null,
+    "name": "freeup-guard.txt",
+    "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+    "remote_id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+    "remote_mtime": "2026-07-06T13:56:25Z",
+    "service": "onedrive",
+    "size": 37,
+    "state": "live_backup",
+    "sync_state": "clean",
+    "verified_at": null,
+    "verify_status": null
+  },
+  "kind": "task8-mode3-conflict-center-keep-cloud",
+  "pass": true,
+  "resolve": {
+    "ok": true
+  },
+  "started_at": "2026-07-06T13:58:12.020Z"
+}

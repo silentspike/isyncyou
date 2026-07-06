@@ -1,0 +1,24 @@
+{
+  "account": "me",
+  "artifacts": [
+    "task9-cloud-crud-biometric-delete.json",
+    "task9-cloud-crud-biometric-delete-retry.json"
+  ],
+  "biometric_dumpsys_focus": "mCurrentFocus=Window{... u0 BiometricPrompt}",
+  "biometric_prompt_observed_via_dumpsys": true,
+  "create_ok": true,
+  "created_id": "892B68CBF4A7C544!s64ed3c5df8324c99bbe6c93b8fdda9cd",
+  "created_name": "om660-crud-135928",
+  "dest_parent_id": "892B68CBF4A7C544!sdc2b6daf39b54607b4e960f4d6f46ac3",
+  "first_delete_biometric_cancelled": true,
+  "graph_after_retry_delete": {
+    "status": 404
+  },
+  "kind": "task9-cloud-crud-combined",
+  "move_ok": true,
+  "pass": true,
+  "rename_ok": true,
+  "renamed_name": "om660-crud-135928-renamed",
+  "retry_delete_ok": true,
+  "source_parent_id": "892B68CBF4A7C544!s4bc4efad3f8540d19d297a78048eb222"
+}
