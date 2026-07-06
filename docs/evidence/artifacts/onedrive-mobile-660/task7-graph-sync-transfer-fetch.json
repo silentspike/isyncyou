@@ -1,0 +1,10 @@
+{
+  "cTag": "\"c:{D7DA2CBF-E8A9-4575-8BAF-1F7C8E97CD74},1\"",
+  "created_at_utc": "2026-07-06T12:25:14Z",
+  "eTag": "\"{D7DA2CBF-E8A9-4575-8BAF-1F7C8E97CD74},1\"",
+  "id": "892B68CBF4A7C544!sd7da2cbfe8a945758baf1f7c8e97cd74",
+  "name": "sync-transfer-fetch-24mb.bin",
+  "parent_id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+  "sha256": "98f846dc6f21ec0781e4033d643a96fda43818e8e79439008aaa5f57c003f354",
+  "size": 25165824
+}

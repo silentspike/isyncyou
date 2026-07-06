@@ -1,0 +1,97 @@
+{
+  "account": "me",
+  "afterStore": {
+    "count": 1,
+    "total": 7
+  },
+  "beforeStore": {
+    "count": 1,
+    "total": 7
+  },
+  "caps": {
+    "onedriveManage": true,
+    "onedriveMode": true,
+    "onedrivewrite": true
+  },
+  "fixtureChildSnapshot": {
+    "children": [
+      {
+        "effective_mode": "online",
+        "id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+        "name": "mode-offline",
+        "type": "folder"
+      },
+      {
+        "effective_mode": "online",
+        "id": "892B68CBF4A7C544!scd5fef1091da4b119a6c1e89ec8c2a8b",
+        "name": "mode-online",
+        "type": "folder"
+      },
+      {
+        "effective_mode": "online",
+        "id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+        "name": "mode-sync",
+        "type": "folder"
+      },
+      {
+        "effective_mode": "online",
+        "id": "892B68CBF4A7C544!sdc2b6daf39b54607b4e960f4d6f46ac3",
+        "name": "ops-dest",
+        "type": "folder"
+      },
+      {
+        "effective_mode": "online",
+        "id": "892B68CBF4A7C544!s4bc4efad3f8540d19d297a78048eb222",
+        "name": "ops-source",
+        "type": "folder"
+      }
+    ],
+    "stack": [
+      {
+        "id": "root",
+        "name": "OneDrive"
+      },
+      {
+        "id": "892B68CBF4A7C544!s243029df950d49938d6a3e7199c5873b",
+        "name": "isy-om660-20260706-135511"
+      }
+    ]
+  },
+  "href": "https://appassets.androidplatform.net/#/onedrive",
+  "mobile": true,
+  "modeOnlineStack": [
+    {
+      "id": "root",
+      "name": "OneDrive"
+    },
+    {
+      "id": "892B68CBF4A7C544!s243029df950d49938d6a3e7199c5873b",
+      "name": "isy-om660-20260706-135511"
+    },
+    {
+      "id": "892B68CBF4A7C544!scd5fef1091da4b119a6c1e89ec8c2a8b",
+      "name": "mode-online"
+    }
+  ],
+  "opened": {
+    "id": "892B68CBF4A7C544!se0748f2fe81c4973899c57a520cef5fc",
+    "name": "online-open.txt",
+    "size": 26,
+    "text": "OM660 online open fixture"
+  },
+  "rootSnapshot": {
+    "fixtureListed": true,
+    "fixtureMode": "online",
+    "fixtureName": "isy-om660-20260706-135511",
+    "rootVisibleNames": [
+      "isy-om660-20260706-135511"
+    ],
+    "stack": [
+      {
+        "id": "root",
+        "name": "OneDrive"
+      }
+    ]
+  },
+  "storeDelta": 0
+}

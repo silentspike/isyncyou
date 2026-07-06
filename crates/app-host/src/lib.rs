@@ -3,7 +3,10 @@
 //! calls [`build_live_router`] for the shared base and adds its daemon-only
 //! restore/share/push on top; the mobile client uses the base as-is.
 
+use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
+use isyncyou_store::Item;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1779,15 +1782,162 @@ impl Drop for TempBody {
     }
 }
 
-/// Live on-demand OneDrive content fetch for the web UI (#649, Mode 1 online):
-/// download an item's bytes straight from Graph by id. No store write, no cache row —
-/// the bytes are served inertly by the router. Read-only — no capability token.
+fn onedrive_ancestry<'a>(by_id: &HashMap<&'a str, &'a Item>, it: &'a Item) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut cur = it;
+    for _ in 0..256 {
+        let Some(parent) = cur.parent_remote_id.as_deref() else {
+            break;
+        };
+        out.push(parent);
+        match by_id.get(parent) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    out
+}
+
+fn onedrive_effective_mode(
+    cfg: &Config,
+    account: &str,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) -> OneDriveMode {
+    let modes = cfg.onedrive_modes.get(account).cloned().unwrap_or_default();
+    let ancestry = onedrive_ancestry(by_id, it);
+    modes.effective_mode(&it.remote_id, &ancestry)
+}
+
+fn onedrive_body_bytes(
+    acc: &isyncyou_core::AccountConfig,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) -> Result<Option<Vec<u8>>, String> {
+    if it.body_state.as_deref() != Some("available") {
+        return Ok(None);
+    }
+    let Some(rel) = isyncyou_connectors::local_rel_path(by_id, it) else {
+        return Ok(None);
+    };
+    let root = if it.body_location.as_deref() == Some("cache") {
+        acc.effective_cache_root()
+    } else {
+        acc.sync_root.clone()
+    };
+    let path = root.join(rel);
+    match isyncyou_core::envelope::read_body(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read cached OneDrive body: {e}")),
+    }
+}
+
+/// Live on-demand OneDrive content fetch for the web UI (#649, Mode 1 online), plus
+/// Mode-2 lazy body caching (#660): local bodies win first, sync-mode misses download into
+/// `cache_root`, and online-mode misses stay live/no-store.
 pub struct DaemonOneDriveOpen {
-    cfg: Config,
+    config_path: PathBuf,
+    progress: isyncyou_connectors::SharedProgress,
+}
+impl DaemonOneDriveOpen {
+    fn cfg(&self) -> Result<Config, String> {
+        Config::load(&self.config_path).map_err(|e| format!("load config: {e}"))
+    }
 }
 impl isyncyou_webui::OneDriveOpenHandler for DaemonOneDriveOpen {
     fn download(&self, account: &str, id: &str) -> Result<Vec<u8>, String> {
-        let client = isyncyou_engine::onedrive_lister(&self.cfg, account)?;
+        let cfg = self.cfg()?;
+        let acc = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .ok_or_else(|| format!("no account '{account}'"))?;
+        let store = isyncyou_store::Store::open(acc.archive_root.join(".isyncyou-store.db")).ok();
+        if let Some(store) = store.as_ref() {
+            let items = store
+                .items_by_service(account, "onedrive")
+                .map_err(|e| format!("query OneDrive store: {e}"))?;
+            let by_id: HashMap<&str, &Item> =
+                items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+            if let Some(it) = by_id.get(id) {
+                if let Some(bytes) = onedrive_body_bytes(acc, &by_id, it)? {
+                    return Ok(bytes);
+                }
+                if it.item_type == "file"
+                    && onedrive_effective_mode(&cfg, account, &by_id, it) == OneDriveMode::Sync
+                {
+                    let Some(rel) = isyncyou_connectors::local_rel_path(&by_id, it) else {
+                        return Err("sync-mode open: no local path".into());
+                    };
+                    let full = acc.effective_cache_root().join(&rel);
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("create cache parent: {e}"))?;
+                    }
+                    let client = isyncyou_engine::onedrive_lister(&cfg, account)?;
+                    store
+                        .set_content_state(
+                            account,
+                            "onedrive",
+                            id,
+                            Some("cached"),
+                            Some("cache"),
+                            Some("downloading"),
+                            None,
+                        )
+                        .map_err(|e| format!("mark sync download: {e}"))?;
+                    let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                    let total = it.size.unwrap_or(0).max(0) as u64;
+                    self.progress.begin(id, name, total);
+                    let downloaded = client
+                        .download_content_with_progress(id, &mut |done| {
+                            self.progress.advance(id, done);
+                        })
+                        .map_err(|e| e.to_string());
+                    match downloaded {
+                        Ok(bytes) => {
+                            let result = (|| {
+                                isyncyou_core::envelope::write_body_atomic(&full, &bytes)
+                                    .map_err(|e| format!("write cache body: {e}"))?;
+                                store
+                                    .set_sync_state(account, "onedrive", id, "clean")
+                                    .map_err(|e| format!("mark sync clean: {e}"))?;
+                                store
+                                    .set_content_state(
+                                        account,
+                                        "onedrive",
+                                        id,
+                                        Some("cached"),
+                                        Some("cache"),
+                                        Some("available"),
+                                        Some(&unix_now()),
+                                    )
+                                    .map_err(|e| format!("mark cache available: {e}"))?;
+                                Ok::<(), String>(())
+                            })();
+                            self.progress.finish(id);
+                            result?;
+                            return Ok(bytes);
+                        }
+                        Err(e) => {
+                            let _ = store.set_content_state(
+                                account,
+                                "onedrive",
+                                id,
+                                Some("cached"),
+                                Some("cache"),
+                                Some("failed"),
+                                None,
+                            );
+                            self.progress.finish(id);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+        let client = isyncyou_engine::onedrive_lister(&cfg, account)?;
         isyncyou_graph::GraphClient::download_content(&client, id).map_err(|e| e.to_string())
     }
 }
@@ -1951,7 +2101,10 @@ pub fn build_live_router(
     };
     base.with_onedrive_info(Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() }))
         .with_onedrive_list(Arc::new(DaemonOneDriveList { cfg: cfg.clone() }))
-        .with_onedrive_open(Arc::new(DaemonOneDriveOpen { cfg: cfg.clone() }))
+        .with_onedrive_open(Arc::new(DaemonOneDriveOpen {
+            config_path: config_path.clone(),
+            progress: progress.clone(),
+        }))
         .with_verify(
             Arc::new(DaemonVerify { cfg: cfg.clone() }),
             mint_cap_token(),
@@ -2099,6 +2252,59 @@ mod tests {
         assert_eq!(v["transfers"][0]["name"].as_str(), Some("photo.jpg"));
         assert_eq!(v["transfers"][0]["bytes_done"].as_u64(), Some(400));
         assert_eq!(v["transfers"][0]["bytes_total"].as_u64(), Some(1000));
+    }
+
+    #[test]
+    fn onedrive_open_serves_cached_sync_body_before_graph_lookup() {
+        let dir =
+            std::env::temp_dir().join(format!("isy-apphost-open-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let arch = dir.join("archive");
+        let sync = dir.join("sync");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let config_path = dir.join("isyncyou.toml");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a".into(),
+                sync_root: sync,
+                archive_root: arch.clone(),
+                cache_root: cache.clone(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.save(&config_path).unwrap();
+        {
+            let store = isyncyou_store::Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut item = Item::new("a", "onedrive", "file-id", "doc.txt", "file");
+            item.local_path = Some("doc.txt".into());
+            store.upsert_item(&item).unwrap();
+            store
+                .set_content_state(
+                    "a",
+                    "onedrive",
+                    "file-id",
+                    Some("cached"),
+                    Some("cache"),
+                    Some("available"),
+                    None,
+                )
+                .unwrap();
+        }
+        isyncyou_core::envelope::write_body_atomic(&cache.join("doc.txt"), b"cached bytes")
+            .unwrap();
+
+        let h = DaemonOneDriveOpen {
+            config_path,
+            progress: SharedProgress::new(),
+        };
+        let got = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap();
+        assert_eq!(got, b"cached bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

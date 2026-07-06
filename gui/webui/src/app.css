@@ -1082,6 +1082,26 @@ a.note-meta-chip:hover { color: var(--accent); }
      wrap: search fills the first row, the sort controls drop below. */
   .mail-toolbar { flex-wrap: wrap; }
   .tb-search { max-width: none; }
+  /* OneDrive mobile: long folder names and deep breadcrumbs must not squeeze the
+     action toolbar into a one-word-wide column. Keep breadcrumbs as one
+     horizontal scroll row, then let the tools wrap below it. */
+  .drive-bar { flex-wrap: wrap; align-items: flex-start; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+  .drive-bar > .spacer { display: none !important; }
+  .drive-crumbs {
+    flex: 1 0 100%; width: 100%; flex-wrap: nowrap; overflow-x: auto;
+    padding-bottom: 2px; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  }
+  .drive-crumbs::-webkit-scrollbar { display: none; }
+  .drive-crumbs > .icon { flex: 0 0 auto; }
+  .crumb {
+    flex: 0 0 auto; max-width: min(56vw, 240px);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: var(--fs-sm);
+  }
+  .crumb.cur { max-width: min(72vw, 320px); }
+  .drive-bar .tb-sort { flex: 1 1 160px; min-width: 0; }
+  .drive-bar .tb-sort select { min-width: 0; max-width: 100%; }
+  .drive-bar .seg { margin-left: auto; }
   /* content-first on a phone: hide the per-service stat dashboards so the list /
      files / events lead immediately (like a native mail/files app). The Overview
      tab keeps its dashboard — that one IS the dashboard. */

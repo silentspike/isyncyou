@@ -1,0 +1,26 @@
+{
+  "created_at": "2026-07-06T14:29:08.375652+00:00",
+  "items": [
+    {
+      "etag": "\"{A43C2B38-D7CE-4EBB-8DC9-B984E520CB68},1\"",
+      "id": "892B68CBF4A7C544!sa43c2b38d7ce4ebb8dc9b984e520cb68",
+      "kind": "pause-hold",
+      "name": "om660-pause-hold-142905.txt",
+      "sha256": "c98f87c56d40327a9ce31f1b1dab48f0a7cc78d6344c2d36f515411d77bbcca5",
+      "size": 47,
+      "text": "OM660 pause-hold transfer control proof 142905\n"
+    },
+    {
+      "etag": "\"{749F2F8F-24E6-4B44-9297-802E8FDB4E6D},1\"",
+      "id": "892B68CBF4A7C544!s749f2f8f24e64b449297802e8fdb4e6d",
+      "kind": "cancel-once",
+      "name": "om660-cancel-once-142905.txt",
+      "sha256": "8f9582dbd9e3b3fc6c92c439e35989ef885aa0715784ec54eb0075b7ae8515c6",
+      "size": 48,
+      "text": "OM660 cancel-once transfer control proof 142905\n"
+    }
+  ],
+  "kind": "task13-transfer-pause-cancel-fixtures",
+  "parent": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+  "pass": true
+}

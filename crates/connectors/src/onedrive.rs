@@ -976,8 +976,7 @@ fn local_mtime_secs(path: &Path) -> Option<i64> {
 
 /// True if the local file already matches the store record by **size + mtime**,
 /// so a re-download would be redundant (e.g. after a `410` resync re-marked
-/// everything `remote_dirty`). Cheap heuristic; a content hash would be
-/// definitive (a follow-up). A file without a stored size/mtime never matches.
+/// everything `remote_dirty`). A file without a stored size/mtime never matches.
 /// Persist the last-synced on-disk reference for an item from the file that was
 /// just written/uploaded: its actual disk size + mtime, plus the content hash.
 /// Best-effort — a metadata failure only means the next pass treats the item as
@@ -1059,6 +1058,27 @@ fn local_file_matches(path: &Path, it: &Item) -> bool {
     }
 }
 
+fn local_file_matches_synced_remote(
+    store: &Store,
+    account: &str,
+    path: &Path,
+    it: &Item,
+) -> Result<bool, SyncError> {
+    if !local_file_matches(path, it) {
+        return Ok(false);
+    }
+    let Some(remote_hash) = it.quickxorhash.as_deref() else {
+        return Ok(true);
+    };
+    match store.get_synced_state(account, SERVICE, &it.remote_id)? {
+        Some((_, _, Some(synced_hash))) => Ok(synced_hash == remote_hash),
+        // If Graph gives us a content hash but the local file has no recorded synced
+        // reference, size+mtime alone is not enough proof that this body is the
+        // current remote version.
+        _ => Ok(false),
+    }
+}
+
 /// Best-effort: set a just-materialized file's mtime to its cloud
 /// `lastModifiedDateTime`, so local timestamps mirror the cloud (plan §6) instead
 /// of showing the download time. Silently does nothing on a bad timestamp or a
@@ -1117,9 +1137,10 @@ pub fn materialize_downloads<D: Downloader>(
                     }
                     Err(_) => report.failed += 1,
                 }
-            } else if local_file_matches(&full, it) {
-                // already on disk with the same size + mtime — skip the download
-                // (e.g. a 410 resync re-marked everything remote_dirty).
+            } else if local_file_matches_synced_remote(store, account, &full, it)? {
+                // Already on disk with the same size + mtime and, when Graph supplies one, the
+                // same QuickXorHash as the last-synced reference — skip the download (e.g. a
+                // 410 resync re-marked everything remote_dirty).
                 store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
                 record_synced_state(
                     store,
@@ -1310,26 +1331,30 @@ pub fn download_one<D: Downloader>(
         Some("downloading"),
         None,
     )?;
-    let bytes = downloader
-        .download_with_progress(id, &mut |done| progress.advance(id, done))
-        .map_err(SyncError::Malformed)?;
-    atomic_write(&full, &bytes).map_err(|e| SyncError::Malformed(e.to_string()))?;
-    if let Some(mt) = &it.remote_mtime {
-        set_file_mtime(&full, mt);
-    }
-    store.set_sync_state(account, SERVICE, id, "clean")?;
-    let hash = Some(crate::quickxor::quickxor_base64(&bytes));
-    record_synced_state(store, account, id, &full, hash);
-    store.set_content_state(
-        account,
-        SERVICE,
-        id,
-        Some("materialized"),
-        Some("sync"),
-        Some("available"),
-        Some(now),
-    )?;
-    Ok(true)
+    let result = (|| {
+        let bytes = downloader
+            .download_with_progress(id, &mut |done| progress.advance(id, done))
+            .map_err(SyncError::Malformed)?;
+        atomic_write(&full, &bytes).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        if let Some(mt) = &it.remote_mtime {
+            set_file_mtime(&full, mt);
+        }
+        store.set_sync_state(account, SERVICE, id, "clean")?;
+        let hash = Some(crate::quickxor::quickxor_base64(&bytes));
+        record_synced_state(store, account, id, &full, hash);
+        store.set_content_state(
+            account,
+            SERVICE,
+            id,
+            Some("materialized"),
+            Some("sync"),
+            Some("available"),
+            Some(now),
+        )?;
+        Ok(true)
+    })();
+    progress.finish(id);
+    result
 }
 
 /// Scoped, policy-gated, progress-reported materialize for Mode-3 **offline** folders
@@ -1386,8 +1411,9 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                     }
                     Err(_) => report.failed += 1,
                 }
-            } else if local_file_matches(&full, it) {
-                // Already on disk with the same size + mtime — skip the download but still
+            } else if local_file_matches_synced_remote(store, account, &full, it)? {
+                // Already on disk with the same size + mtime and, when Graph supplies one, the
+                // same QuickXorHash as the last-synced reference — skip the download but still
                 // mark the content-state so `has_body` is true for the mobile body endpoint.
                 store.set_sync_state(account, SERVICE, &it.remote_id, "clean")?;
                 record_synced_state(
@@ -2967,18 +2993,109 @@ mod tests {
     }
 
     #[test]
+    fn materialize_scoped_redownloads_stale_body_when_remote_hash_changed() {
+        // Mode-3 regression: a cloud replace must not leave an old materialized body behind
+        // just because the local file still matches size+mtime. The synced reference must
+        // match the current Graph QuickXorHash before the skip is allowed.
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let mut a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        a.size = Some(5);
+        a.remote_mtime = Some("2024-01-02T03:04:05Z".into());
+        a.quickxorhash = Some(crate::quickxor::quickxor_base64(b"world"));
+        a.sync_state = "remote_dirty".into();
+        store.upsert_item(&a).unwrap();
+
+        let path = dir.path().join("Photos/a.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"hello").unwrap();
+        set_file_mtime(&path, "2024-01-02T03:04:05Z");
+        record_synced_state(
+            &store,
+            "acc",
+            "a1",
+            &path,
+            Some(crate::quickxor::quickxor_base64(b"hello")),
+        );
+
+        let dl = MockDownloader(
+            [("a1".to_string(), b"world".to_vec())]
+                .into_iter()
+                .collect(),
+        );
+        let offline: BTreeSet<&str> = ["F1"].into_iter().collect();
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let report = materialize_downloads_scoped(
+            &store,
+            &dl,
+            "acc",
+            dir.path(),
+            "host",
+            NOW,
+            &offline,
+            &cfg,
+            &dev,
+            &(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.skipped, 0,
+            "stale materialized body must not be skipped"
+        );
+        assert_eq!(
+            report.downloaded, 1,
+            "remote replacement must be downloaded"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"world");
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(a.body_state.as_deref(), Some("available"));
+        assert_eq!(a.content_state.as_deref(), Some("materialized"));
+        assert_eq!(a.sync_state, "clean");
+    }
+
+    #[test]
     fn free_up_and_download_now_roundtrip() {
         // #659: download_one materializes one item on demand (inverse of the offline pass);
         // dematerialize_one drops the body but keeps the row listable (metadata).
+        #[derive(Default)]
+        struct FinishProgress(std::sync::Mutex<Vec<String>>);
+        impl ProgressSink for FinishProgress {
+            fn begin(&self, _: &str, _: &str, _: u64) {}
+            fn advance(&self, _: &str, _: u64) {}
+            fn retry_after(&self, _: &str, _: u64) {}
+            fn finish(&self, id: &str) {
+                self.0.lock().unwrap().push(id.to_string());
+            }
+        }
+
         let store = Store::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         seed_offline_and_nonscope(&store);
         let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
         let cfg = isyncyou_core::SyncConfig::default();
         let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = FinishProgress::default();
 
         // download-now materializes just a1.
-        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert!(download_one(
+            &store,
+            &dl,
+            "acc",
+            "a1",
+            dir.path(),
+            NOW,
+            &cfg,
+            &dev,
+            &progress
+        )
+        .unwrap());
+        assert_eq!(
+            progress.0.lock().unwrap().as_slice(),
+            &["a1".to_string()],
+            "download-now must clear its transfer slot on completion"
+        );
         assert_eq!(
             std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
             b"AAAA"
@@ -3021,7 +3138,23 @@ mod tests {
         );
 
         // download-now again re-materializes (reversible).
-        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert!(download_one(
+            &store,
+            &dl,
+            "acc",
+            "a1",
+            dir.path(),
+            NOW,
+            &cfg,
+            &dev,
+            &progress
+        )
+        .unwrap());
+        assert_eq!(
+            progress.0.lock().unwrap().as_slice(),
+            &["a1".to_string(), "a1".to_string()],
+            "each download-now run must finish its transfer slot"
+        );
         assert!(
             dir.path().join("Photos/a.txt").exists(),
             "re-materialized after free-up"
@@ -3550,6 +3683,47 @@ mod tests {
             r2.failed, 1,
             "size mismatch must trigger a re-download attempt"
         );
+    }
+
+    #[test]
+    fn materialize_redownloads_remote_dirty_when_remote_hash_changed() {
+        // Size+mtime can make a stale body look current; when Graph has a QuickXorHash,
+        // the skip path must also prove the body belongs to that remote version.
+        let store = Store::open_in_memory().unwrap();
+        let mut file = Item::new("acc", SERVICE, "a1", "doc.txt", "file");
+        file.local_path = Some("doc.txt".into());
+        file.sync_state = "remote_dirty".into();
+        file.size = Some(5);
+        file.remote_mtime = Some("2024-01-02T03:04:05Z".into());
+        file.quickxorhash = Some(crate::quickxor::quickxor_base64(b"world"));
+        store.upsert_item(&file).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        set_file_mtime(&path, "2024-01-02T03:04:05Z");
+        record_synced_state(
+            &store,
+            "acc",
+            "a1",
+            &path,
+            Some(crate::quickxor::quickxor_base64(b"hello")),
+        );
+
+        let dl = MockDownloader(
+            [("a1".to_string(), b"world".to_vec())]
+                .into_iter()
+                .collect(),
+        );
+        let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
+        assert_eq!(report.skipped, 0, "stale body must not be skipped");
+        assert_eq!(report.downloaded, 1, "remote update must be downloaded");
+        assert_eq!(std::fs::read(&path).unwrap(), b"world");
+        let (_, _, hash) = store
+            .get_synced_state("acc", SERVICE, "a1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hash, Some(crate::quickxor::quickxor_base64(b"world")));
     }
 
     #[test]

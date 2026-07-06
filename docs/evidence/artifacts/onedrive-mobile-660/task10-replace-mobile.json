@@ -1,0 +1,23 @@
+{
+  "account": "me",
+  "errors": [],
+  "etag": "\"{620DD4A5-D82D-4AE7-9227-8E21B0F28EE4},1\"",
+  "finished_at": "2026-07-06T14:08:29.892Z",
+  "graph_verify_replace": {
+    "etag": "\"{620DD4A5-D82D-4AE7-9227-8E21B0F28EE4},2\"",
+    "etag_changed_from_upload": true,
+    "id": "892B68CBF4A7C544!s620dd4a5d82d4ae792278e21b0f28ee4",
+    "name": "om660-upload-140546.txt",
+    "sha256": "e8b265c34f59349b981b73747511850c7ae19c507c7f4cc416ff8f577ee66961",
+    "size": 81,
+    "text": "OM660 mobile replace proof 2026-07-06T14:07:44.250740+00:00\nnew version content.\n"
+  },
+  "id": "892B68CBF4A7C544!s620dd4a5d82d4ae792278e21b0f28ee4",
+  "kind": "task10-replace-mobile",
+  "pass": true,
+  "replace": {
+    "ok": true
+  },
+  "started_at": "2026-07-06T14:07:44.445Z",
+  "text": "OM660 mobile replace proof 2026-07-06T14:07:44.250740+00:00\nnew version content.\n"
+}
