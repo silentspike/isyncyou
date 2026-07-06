@@ -10,11 +10,11 @@
 //! over JNI (never served in a static asset), and required on every `/api/v1/*`
 //! route. Tokens are NEVER logged.
 
-use isyncyou_core::{AccountConfig, Config};
+use isyncyou_core::{AccountConfig, Config, OneDriveMode};
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -72,6 +72,101 @@ fn current_device_state() -> isyncyou_core::policy::DeviceState {
     *device_state_cell()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+}
+
+fn mobile_roots(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    (base.join("archive"), base.join("sync"), base.join("cache"))
+}
+
+fn prepare_mobile_config_for_files_dir(cfg: &mut Config, base: &Path) -> Result<(), String> {
+    let (archive_root, sync_root, cache_root) = mobile_roots(base);
+    if let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == ACCOUNT) {
+        acc.sync_root = sync_root;
+        acc.archive_root = archive_root;
+        acc.cache_root = cache_root;
+        acc.mount_point = None;
+    } else {
+        cfg.accounts.push(AccountConfig {
+            id: ACCOUNT.into(),
+            username: ACCOUNT.into(),
+            sync_root,
+            archive_root,
+            cache_root,
+            mount_point: None,
+        });
+    }
+    cfg.validate().map_err(|errs| errs.join("; "))
+}
+
+fn log_mobile_config_reload_failure(reason: &str, detail: &str, warned: &AtomicBool) {
+    if warned.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    isyncyou_core::obs::event(
+        "mobile-config-reload",
+        "failed",
+        &format!(
+            "reason={reason} error={}",
+            isyncyou_core::obs::redact(detail)
+        ),
+    );
+}
+
+fn load_mobile_loop_config(
+    config_path: &Path,
+    base: &Path,
+    last_good: &Config,
+    warned: &AtomicBool,
+) -> Config {
+    let mut next = match Config::load(config_path) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            log_mobile_config_reload_failure("parse", "load_or_parse_failed", warned);
+            return last_good.clone();
+        }
+    };
+    match prepare_mobile_config_for_files_dir(&mut next, base) {
+        Ok(()) => {
+            warned.store(false, Ordering::Relaxed);
+            next
+        }
+        Err(e) => {
+            let count = e.split("; ").filter(|s| !s.is_empty()).count().max(1);
+            log_mobile_config_reload_failure(
+                "validate",
+                &format!("validation_errors={count}"),
+                warned,
+            );
+            last_good.clone()
+        }
+    }
+}
+
+fn has_onedrive_explicit_scopes(cfg: &Config, account: &str) -> bool {
+    cfg.onedrive_modes
+        .get(account)
+        .map(|m| {
+            m.folder_modes
+                .values()
+                .any(|mode| matches!(mode, OneDriveMode::Sync | OneDriveMode::Offline))
+        })
+        .unwrap_or(false)
+}
+
+/// UI data-refresh signal for the mobile event bus. This deliberately ignores
+/// error/status-only counters; those belong in diagnostics/transfer status, not a full view reload.
+fn sync_report_changed(r: &isyncyou_engine::SyncReport) -> bool {
+    r.resynced
+        || r.upserted
+            + r.deleted
+            + r.downloaded
+            + r.dirs_created
+            + r.local_trashed
+            + r.uploaded_creates
+            + r.modified_uploaded
+            + r.modified_conflicts
+            + r.cloud_deleted
+            > 0
 }
 
 /// Start the embedded engine if not already running. Idempotent. Host-testable (no JNI):
@@ -249,11 +344,9 @@ pub fn confirm_action(pending_id: &str) -> bool {
 
 fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
     let base = PathBuf::from(files_dir);
-    let archive_root = base.join("archive");
-    let sync_root = base.join("sync");
+    let (archive_root, sync_root, cache_root) = mobile_roots(&base);
     // OneDrive online/sync-mode lazy previews live here, apart from the offline working
     // copy in sync_root (#onedrive-mobile 0C); the writeback scanner ignores it.
-    let cache_root = base.join("cache");
     std::fs::create_dir_all(&archive_root).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&sync_root).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&cache_root).map_err(|e| e.to_string())?;
@@ -265,21 +358,7 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     // are ALWAYS re-derived from `files_dir` below, so a persisted config can never point the
     // engine at a stale device path.
     let mut cfg = Config::load(&config_path).unwrap_or_default();
-    if let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == ACCOUNT) {
-        acc.sync_root = sync_root;
-        acc.archive_root = archive_root;
-        acc.cache_root = cache_root;
-        acc.mount_point = None;
-    } else {
-        cfg.accounts.push(AccountConfig {
-            id: ACCOUNT.into(),
-            username: ACCOUNT.into(),
-            sync_root,
-            archive_root,
-            cache_root,
-            mount_point: None,
-        });
-    }
+    prepare_mobile_config_for_files_dir(&mut cfg, &base)?;
     // A phone is a cache/live companion, not the desktop's 5 s near-real-time loop:
     // poll every 30 s to spare battery/mobile-data and cut the periodic view refresh
     // frequency (the live-refresh is otherwise driven every poll a change lands).
@@ -297,13 +376,15 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     // The Mode-3 offline pass (refresh loop) writes per-file progress here; the router reads
     // the same handle at GET /api/v1/onedrive/transfers (#655). One shared instance, cloned.
     let transfer_progress = isyncyou_app_host::SharedProgress::new();
+    let config_path_for_router = config_path.clone();
+    let config_path_for_loop = config_path.clone();
 
     let router = Arc::new(
         isyncyou_app_host::build_live_router(
             cfg.clone(),
             Some(gate.clone()),
             events.clone(),
-            config_path,
+            config_path_for_router,
             live_interval.clone(),
             transfer_progress.clone(),
         )
@@ -336,30 +417,32 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     // mail/calendar/contacts/todo/onenote from Graph into the local cache store
     // (read-only — never writes back to the cloud) and wake SSE subscribers so the
     // UI refreshes. Skips silently until a token is cached.
-    std::thread::spawn(move || refresh_loop(cfg, gate, events, live_interval, transfer_progress));
+    std::thread::spawn(move || {
+        refresh_loop(
+            cfg,
+            base,
+            config_path_for_loop,
+            gate,
+            events,
+            live_interval,
+            transfer_progress,
+        )
+    });
 
     Ok((session_token, router))
 }
 
-/// One Mode-3 offline pass under the store-access gate (#655): materialize the offline scopes
-/// and mirror local edits back over the ledger. Returns whether anything changed (the UI is
-/// woken only on real work). Skips quietly with no offline folders configured or no cached
-/// write token (not signed in). `progress` is the shared tracker the router surfaces.
-fn run_offline_pass(
+/// One mobile scoped OneDrive pass under the store-access gate (#655/#718): Sync scopes ingest
+/// metadata; Offline scopes additionally materialize and mirror local edits back over the ledger.
+/// Returns whether UI-visible data changed. Skips quietly with no explicit Sync/Offline scopes
+/// configured or no cached sync/write token (not signed in). `progress` is the shared tracker the
+/// router surfaces. Token policy is unchanged: the scoped pass still uses `resolve_cached_sync_token`.
+fn run_onedrive_scoped_pass(
     cfg: &Config,
     gate: &Arc<Mutex<()>>,
     progress: &isyncyou_app_host::SharedProgress,
 ) -> bool {
-    let has_offline = cfg
-        .onedrive_modes
-        .get(ACCOUNT)
-        .map(|m| {
-            m.folder_modes
-                .values()
-                .any(|md| *md == isyncyou_core::OneDriveMode::Offline)
-        })
-        .unwrap_or(false);
-    if !has_offline {
+    if !has_onedrive_explicit_scopes(cfg, ACCOUNT) {
         return false;
     }
     let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
@@ -369,31 +452,27 @@ fn run_offline_pass(
     };
     let dev = current_device_state();
     match isyncyou_engine::offline_sync_once_for(cfg, ACCOUNT, HOST, token, dev, progress) {
-        Ok(r) => {
-            r.downloaded
-                + r.dirs_created
-                + r.uploaded_creates
-                + r.modified_uploaded
-                + r.cloud_deleted
-                + r.local_trashed
-                > 0
-        }
+        Ok(r) => sync_report_changed(&r),
         Err(_) => false,
     }
 }
 
 fn refresh_loop(
-    cfg: Config,
+    mut cfg: Config,
+    base: PathBuf,
+    config_path: PathBuf,
     gate: Arc<Mutex<()>>,
     events: Arc<isyncyou_webui::EventBus>,
     interval: Arc<AtomicU64>,
     progress: isyncyou_app_host::SharedProgress,
 ) {
+    let reload_warned = AtomicBool::new(false);
     loop {
         let secs = interval.load(Ordering::Relaxed).max(5);
         std::thread::sleep(Duration::from_secs(secs));
         // Isolate a refresh panic so the loop (and the app) survives.
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            cfg = load_mobile_loop_config(&config_path, &base, &cfg, &reload_warned);
             let refreshed = {
                 let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
                 match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
@@ -411,10 +490,10 @@ fn refresh_loop(
                     Err(_) => false, // not signed in yet — skip quietly
                 }
             };
-            // #655: after the read-only cache refresh, run the Mode-3 offline pass (materialize +
-            // ledger writeback) for any offline folders, then wake SSE if either changed anything.
-            let offline_changed = run_offline_pass(&cfg, &gate, &progress);
-            if refreshed || offline_changed {
+            // #655/#718: after the read-only cache refresh, run the mobile scoped OneDrive pass
+            // for any explicit Sync/Offline folders, then wake SSE if either changed data.
+            let onedrive_changed = run_onedrive_scoped_pass(&cfg, &gate, &progress);
+            if refreshed || onedrive_changed {
                 events.notify(); // wake SSE subscribers so the UI refetches
             }
         }));
@@ -643,6 +722,326 @@ mod tests {
         assert!(d.metered);
         assert!(!d.charging);
         assert_eq!(d.free_bytes, 4096);
+    }
+
+    #[test]
+    fn mobile_config_prepare_canonicalizes_me_without_deleting_other_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_sync = PathBuf::from("/other/sync");
+        let other_archive = PathBuf::from("/other/archive");
+        let other_cache = PathBuf::from("/other/cache");
+        let mut cfg = Config {
+            accounts: vec![
+                AccountConfig {
+                    id: ACCOUNT.into(),
+                    username: "custom".into(),
+                    sync_root: PathBuf::from("/wrong/sync"),
+                    archive_root: PathBuf::from("/wrong/archive"),
+                    cache_root: PathBuf::from("/wrong/cache"),
+                    mount_point: Some(PathBuf::from("/mnt/old")),
+                },
+                AccountConfig {
+                    id: "other".into(),
+                    username: "other".into(),
+                    sync_root: other_sync.clone(),
+                    archive_root: other_archive.clone(),
+                    cache_root: other_cache.clone(),
+                    mount_point: Some(PathBuf::from("/mnt/other")),
+                },
+            ],
+            ..Default::default()
+        };
+        cfg.onedrive_modes
+            .insert("other".into(), isyncyou_core::OneDriveModes::default());
+
+        prepare_mobile_config_for_files_dir(&mut cfg, dir.path()).unwrap();
+
+        assert_eq!(cfg.accounts.len(), 2, "unrelated accounts stay present");
+        let me = cfg.accounts.iter().find(|a| a.id == ACCOUNT).unwrap();
+        assert_eq!(me.archive_root, dir.path().join("archive"));
+        assert_eq!(me.sync_root, dir.path().join("sync"));
+        assert_eq!(me.cache_root, dir.path().join("cache"));
+        assert!(me.mount_point.is_none());
+        let other = cfg.accounts.iter().find(|a| a.id == "other").unwrap();
+        assert_eq!(other.sync_root, other_sync);
+        assert_eq!(other.archive_root, other_archive);
+        assert_eq!(other.cache_root, other_cache);
+        assert_eq!(other.mount_point.as_deref(), Some(Path::new("/mnt/other")));
+    }
+
+    #[test]
+    fn mobile_config_prepare_rejects_invalid_foreign_onedrive_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.onedrive_modes
+            .insert("ghost".into(), isyncyou_core::OneDriveModes::default());
+
+        let err = prepare_mobile_config_for_files_dir(&mut cfg, dir.path()).unwrap_err();
+
+        assert!(
+            err.contains("unknown account id 'ghost'"),
+            "foreign invalid modes must still fail validation: {err}"
+        );
+        assert!(
+            cfg.onedrive_modes.contains_key("ghost"),
+            "preparation must not delete invalid foreign entries"
+        );
+    }
+
+    #[test]
+    fn mobile_config_reload_accepts_change_canonicalizes_and_does_not_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("isyncyou.toml");
+        let mut previous = Config::default();
+        prepare_mobile_config_for_files_dir(&mut previous, dir.path()).unwrap();
+
+        let mut on_disk = previous.clone();
+        let me = on_disk
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == ACCOUNT)
+            .unwrap();
+        me.sync_root = PathBuf::from("/wrong/sync");
+        me.archive_root = PathBuf::from("/wrong/archive");
+        me.cache_root = PathBuf::from("/wrong/cache");
+        on_disk
+            .onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("F_sync".into(), isyncyou_core::OneDriveMode::Sync);
+        on_disk.save(&config_path).unwrap();
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let warned = AtomicBool::new(true);
+
+        let loaded = load_mobile_loop_config(&config_path, dir.path(), &previous, &warned);
+        let after = std::fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(after, before, "loop reload must not rewrite TOML");
+        assert!(
+            !warned.load(Ordering::Relaxed),
+            "successful reload resets the failure-period warning"
+        );
+        let me = loaded.accounts.iter().find(|a| a.id == ACCOUNT).unwrap();
+        assert_eq!(me.archive_root, dir.path().join("archive"));
+        assert_eq!(me.sync_root, dir.path().join("sync"));
+        assert_eq!(me.cache_root, dir.path().join("cache"));
+        assert_eq!(
+            loaded.onedrive_modes[ACCOUNT].folder_modes["F_sync"],
+            isyncyou_core::OneDriveMode::Sync
+        );
+    }
+
+    #[test]
+    fn mobile_config_reload_rejects_invalid_toml_and_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("isyncyou.toml");
+        let mut previous = Config::default();
+        prepare_mobile_config_for_files_dir(&mut previous, dir.path()).unwrap();
+        previous
+            .onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("keep".into(), isyncyou_core::OneDriveMode::Offline);
+
+        std::fs::write(&config_path, "not = [").unwrap();
+        let warned = AtomicBool::new(false);
+        let parsed = load_mobile_loop_config(&config_path, dir.path(), &previous, &warned);
+        assert_eq!(parsed, previous, "parse failure keeps last-known-good");
+        assert!(
+            warned.load(Ordering::Relaxed),
+            "parse failure marks the warning period"
+        );
+
+        let mut invalid = previous.clone();
+        invalid
+            .onedrive_modes
+            .insert("ghost".into(), isyncyou_core::OneDriveModes::default());
+        invalid.save(&config_path).unwrap();
+        let warned = AtomicBool::new(false);
+        let validated = load_mobile_loop_config(&config_path, dir.path(), &previous, &warned);
+        assert_eq!(
+            validated, previous,
+            "validation failure keeps last-known-good"
+        );
+        assert!(
+            warned.load(Ordering::Relaxed),
+            "validation failure marks the warning period"
+        );
+    }
+
+    #[test]
+    fn mobile_config_start_inner_forces_poll_interval_and_persists_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("isyncyou.toml");
+        let mut cfg = Config::default();
+        prepare_mobile_config_for_files_dir(&mut cfg, dir.path()).unwrap();
+        cfg.sync.poll_interval_secs = 7;
+        cfg.save(&config_path).unwrap();
+
+        let _engine = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+        let saved = Config::load(&config_path).unwrap();
+
+        assert_eq!(saved.sync.poll_interval_secs, 30);
+        let me = saved.accounts.iter().find(|a| a.id == ACCOUNT).unwrap();
+        assert_eq!(me.archive_root, dir.path().join("archive"));
+        assert_eq!(me.sync_root, dir.path().join("sync"));
+        assert_eq!(me.cache_root, dir.path().join("cache"));
+    }
+
+    #[test]
+    fn onedrive_explicit_scopes_detect_sync_and_offline_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        prepare_mobile_config_for_files_dir(&mut cfg, dir.path()).unwrap();
+        assert!(!has_onedrive_explicit_scopes(&cfg, ACCOUNT));
+
+        cfg.onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .default_mode = OneDriveMode::Sync;
+        assert!(
+            !has_onedrive_explicit_scopes(&cfg, ACCOUNT),
+            "default_mode alone is intentionally not a mobile scoped root"
+        );
+
+        cfg.onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("A".into(), OneDriveMode::Online);
+        assert!(!has_onedrive_explicit_scopes(&cfg, ACCOUNT));
+
+        cfg.onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("B".into(), OneDriveMode::Sync);
+        assert!(
+            has_onedrive_explicit_scopes(&cfg, ACCOUNT),
+            "mixed Online + Sync still has scoped work"
+        );
+
+        cfg.onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("B".into(), OneDriveMode::Online);
+        cfg.onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("C".into(), OneDriveMode::Offline);
+        assert!(has_onedrive_explicit_scopes(&cfg, ACCOUNT));
+
+        cfg.onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("C".into(), OneDriveMode::Online);
+        assert!(
+            !has_onedrive_explicit_scopes(&cfg, ACCOUNT),
+            "switching every explicit folder back online stops scoped work"
+        );
+    }
+
+    #[test]
+    fn onedrive_sync_report_changed_is_ui_data_refresh_signal() {
+        assert!(
+            !sync_report_changed(&isyncyou_engine::SyncReport::default()),
+            "zero report must not refresh the UI"
+        );
+        assert!(sync_report_changed(&isyncyou_engine::SyncReport {
+            upserted: 1,
+            ..Default::default()
+        }));
+        assert!(sync_report_changed(&isyncyou_engine::SyncReport {
+            deleted: 1,
+            ..Default::default()
+        }));
+        assert!(sync_report_changed(&isyncyou_engine::SyncReport {
+            resynced: true,
+            ..Default::default()
+        }));
+        assert!(sync_report_changed(&isyncyou_engine::SyncReport {
+            downloaded: 1,
+            ..Default::default()
+        }));
+        assert!(sync_report_changed(&isyncyou_engine::SyncReport {
+            modified_conflicts: 1,
+            ..Default::default()
+        }));
+
+        for report in [
+            isyncyou_engine::SyncReport {
+                skipped: 1,
+                ..Default::default()
+            },
+            isyncyou_engine::SyncReport {
+                materialize_failed: 1,
+                ..Default::default()
+            },
+            isyncyou_engine::SyncReport {
+                materialize_cancelled: 1,
+                ..Default::default()
+            },
+            isyncyou_engine::SyncReport {
+                modified_failed: 1,
+                ..Default::default()
+            },
+            isyncyou_engine::SyncReport {
+                local_delete_blocked: Some("blocked".into()),
+                ..Default::default()
+            },
+            isyncyou_engine::SyncReport {
+                cloud_delete_blocked: Some("blocked".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !sync_report_changed(&report),
+                "status/error-only reports must not trigger full UI refresh: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn onedrive_scoped_pass_waits_for_store_gate_before_token_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        prepare_mobile_config_for_files_dir(&mut cfg, dir.path()).unwrap();
+        cfg.onedrive_modes
+            .entry(ACCOUNT.into())
+            .or_default()
+            .folder_modes
+            .insert("F_sync".into(), OneDriveMode::Sync);
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let progress = isyncyou_app_host::SharedProgress::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_cfg = cfg.clone();
+        let thread_gate = Arc::clone(&gate);
+        let thread_progress = progress.clone();
+
+        let handle = std::thread::spawn(move || {
+            let changed = run_onedrive_scoped_pass(&thread_cfg, &thread_gate, &thread_progress);
+            tx.send(changed).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "scoped pass must not pass token lookup while the store gate is held"
+        );
+        drop(held);
+        let changed = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scoped pass returns after gate release");
+        assert!(
+            !changed,
+            "without a cached sync/write token the pass returns false"
+        );
+        handle.join().unwrap();
     }
 
     #[test]
