@@ -1,0 +1,1575 @@
+{
+  "account": "me",
+  "active_samples": [
+    {
+      "at": "2026-07-06T15:29:02.957Z",
+      "done": 0,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:03.533Z",
+      "done": 0,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n0 B / 180.0 MB \u00b7 0%",
+      "screenshot": "task8-mode3-progress-ui-active-1.png",
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:05.830Z",
+      "done": 18411520,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n5.2 MB / 180.0 MB \u00b7 3%",
+      "screenshot": "task8-mode3-progress-ui-active-2.png",
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:08.016Z",
+      "done": 49721344,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:08.643Z",
+      "done": 55914496,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:09.204Z",
+      "done": 61779968,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:09.829Z",
+      "done": 68251648,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n60.3 MB / 180.0 MB \u00b7 33%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:10.478Z",
+      "done": 75526144,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n60.3 MB / 180.0 MB \u00b7 33%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:11.057Z",
+      "done": 81784832,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:11.645Z",
+      "done": 87453696,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:12.249Z",
+      "done": 91058176,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:12.886Z",
+      "done": 94908416,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n87.4 MB / 180.0 MB \u00b7 49%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:13.498Z",
+      "done": 98906112,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n87.4 MB / 180.0 MB \u00b7 49%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:14.068Z",
+      "done": 102641664,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:14.696Z",
+      "done": 106983424,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:15.288Z",
+      "done": 111374336,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:15.848Z",
+      "done": 114978816,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n106.6 MB / 180.0 MB \u00b7 59%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:16.486Z",
+      "done": 117583872,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n106.6 MB / 180.0 MB \u00b7 59%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:17.085Z",
+      "done": 119189504,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n113.2 MB / 180.0 MB \u00b7 63%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:17.664Z",
+      "done": 120516608,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n113.2 MB / 180.0 MB \u00b7 63%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:18.432Z",
+      "done": 121942016,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:19.072Z",
+      "done": 123482112,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:19.698Z",
+      "done": 125218816,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:20.319Z",
+      "done": 127381504,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n119.9 MB / 180.0 MB \u00b7 67%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:20.878Z",
+      "done": 129511424,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n119.9 MB / 180.0 MB \u00b7 67%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:21.424Z",
+      "done": 131739648,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:22.066Z",
+      "done": 134918144,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:22.624Z",
+      "done": 137687040,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:23.245Z",
+      "done": 141291520,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n132.5 MB / 180.0 MB \u00b7 74%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:23.862Z",
+      "done": 145158144,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n132.5 MB / 180.0 MB \u00b7 74%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:24.450Z",
+      "done": 149008384,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:25.104Z",
+      "done": 153333760,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:25.670Z",
+      "done": 157741056,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:26.269Z",
+      "done": 162557952,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n151.9 MB / 180.0 MB \u00b7 84%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:26.897Z",
+      "done": 168013824,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n151.9 MB / 180.0 MB \u00b7 84%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:27.473Z",
+      "done": 173191168,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:28.056Z",
+      "done": 177745920,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:28.654Z",
+      "done": 180678656,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:29.230Z",
+      "done": 183529472,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n173.2 MB / 180.0 MB \u00b7 96%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:29.830Z",
+      "done": 186658816,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n173.2 MB / 180.0 MB \u00b7 96%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:30.425Z",
+      "done": 188743680,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:31.010Z",
+      "done": 188743680,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:31.502Z",
+      "done": 188743680,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:32.067Z",
+      "done": 188743680,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:32.615Z",
+      "done": 188743680,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "screenshot": null,
+      "total": 188743680
+    },
+    {
+      "at": "2026-07-06T15:29:33.163Z",
+      "done": 188743680,
+      "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+      "name": "om660-mode3-progress-ui-152842.bin",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "screenshot": null,
+      "total": 188743680
+    }
+  ],
+  "errors": [],
+  "evaluation": {
+    "graph_upload_ok": true,
+    "panel_text_seen": true,
+    "saw_active_transfer_samples": true,
+    "saw_increasing_bytes": true,
+    "screenshots_with_panel_text": true
+  },
+  "finished_at": "2026-07-06T15:29:34.270793Z",
+  "folder": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+  "graph_after": {
+    "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+    "size": 188743680,
+    "status": 200
+  },
+  "kind": "task8-mode3-progress-ui-moving",
+  "local_file": {
+    "sha256": "d3ae9ba0ae7bbc236528498998f7b9b30fd8c3659566c2a4e35e4e918c857adc",
+    "size": 188743680
+  },
+  "msal": {
+    "expires_in": 2867,
+    "scope_has_files_readwrite": false
+  },
+  "navigation": {
+    "activeNav": [
+      [
+        "Overview",
+        "nav-item"
+      ],
+      [
+        "Mail",
+        "nav-item"
+      ],
+      [
+        "OneDrive",
+        "nav-item active"
+      ],
+      [
+        "Calendar",
+        "nav-item"
+      ],
+      [
+        "Contacts",
+        "nav-item"
+      ],
+      [
+        "To Do",
+        "nav-item"
+      ],
+      [
+        "OneNote",
+        "nav-item"
+      ],
+      [
+        "Audit log",
+        "nav-item"
+      ],
+      [
+        "Alerts0",
+        "nav-item"
+      ],
+      [
+        "Settings",
+        "nav-item"
+      ],
+      [
+        "Assistant",
+        "nav-item"
+      ]
+    ],
+    "stack": [
+      "OneDrive",
+      "isy-om660-20260706-135511",
+      "mode-offline"
+    ],
+    "text": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06"
+  },
+  "pass": true,
+  "samples": [
+    {
+      "at": "2026-07-06T15:28:42.954Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:43.548Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:44.113Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:44.891Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:45.660Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:46.254Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:46.845Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:47.396Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:47.955Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:48.585Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:49.184Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:49.794Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:50.367Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:50.958Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:51.534Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:52.095Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:52.652Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:53.224Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:53.796Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:54.371Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:54.997Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:55.575Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:56.176Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:56.739Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:57.366Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:57.883Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:58.380Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:58.938Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:28:59.450Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:29:00.057Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:29:00.595Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:29:01.285Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:29:01.865Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:29:02.422Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": []
+    },
+    {
+      "at": "2026-07-06T15:29:02.957Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "none",
+      "panelText": "",
+      "transfers": [
+        {
+          "bytes_done": 0,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:03.533Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n0 B / 180.0 MB \u00b7 0%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n0 B / 180.0 MB \u00b7 0%",
+      "screenshot": "task8-mode3-progress-ui-active-1.png",
+      "transfers": [
+        {
+          "bytes_done": 0,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:05.830Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n5.2 MB / 180.0 MB \u00b7 3%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n5.2 MB / 180.0 MB \u00b7 3%",
+      "screenshot": "task8-mode3-progress-ui-active-2.png",
+      "transfers": [
+        {
+          "bytes_done": 18411520,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:08.016Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%",
+      "transfers": [
+        {
+          "bytes_done": 49721344,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:08.643Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%",
+      "transfers": [
+        {
+          "bytes_done": 55914496,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:09.204Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n45.8 MB / 180.0 MB \u00b7 25%",
+      "transfers": [
+        {
+          "bytes_done": 61779968,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:09.829Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n60.3 MB / 180.0 MB \u00b7 33%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n60.3 MB / 180.0 MB \u00b7 33%",
+      "transfers": [
+        {
+          "bytes_done": 68251648,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:10.478Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n60.3 MB / 180.0 MB \u00b7 33%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n60.3 MB / 180.0 MB \u00b7 33%",
+      "transfers": [
+        {
+          "bytes_done": 75526144,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:11.057Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%",
+      "transfers": [
+        {
+          "bytes_done": 81784832,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:11.645Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%",
+      "transfers": [
+        {
+          "bytes_done": 87453696,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:12.249Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n75.9 MB / 180.0 MB \u00b7 42%",
+      "transfers": [
+        {
+          "bytes_done": 91058176,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:12.886Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n87.4 MB / 180.0 MB \u00b7 49%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n87.4 MB / 180.0 MB \u00b7 49%",
+      "transfers": [
+        {
+          "bytes_done": 94908416,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:13.498Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n87.4 MB / 180.0 MB \u00b7 49%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n87.4 MB / 180.0 MB \u00b7 49%",
+      "transfers": [
+        {
+          "bytes_done": 98906112,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:14.068Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%",
+      "transfers": [
+        {
+          "bytes_done": 102641664,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:14.696Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%",
+      "transfers": [
+        {
+          "bytes_done": 106983424,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:15.288Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n96.6 MB / 180.0 MB \u00b7 54%",
+      "transfers": [
+        {
+          "bytes_done": 111374336,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:15.848Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n106.6 MB / 180.0 MB \u00b7 59%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n106.6 MB / 180.0 MB \u00b7 59%",
+      "transfers": [
+        {
+          "bytes_done": 114978816,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:16.486Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n106.6 MB / 180.0 MB \u00b7 59%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n106.6 MB / 180.0 MB \u00b7 59%",
+      "transfers": [
+        {
+          "bytes_done": 117583872,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:17.085Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n113.2 MB / 180.0 MB \u00b7 63%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n113.2 MB / 180.0 MB \u00b7 63%",
+      "transfers": [
+        {
+          "bytes_done": 119189504,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:17.664Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n113.2 MB / 180.0 MB \u00b7 63%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n113.2 MB / 180.0 MB \u00b7 63%",
+      "transfers": [
+        {
+          "bytes_done": 120516608,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:18.432Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%",
+      "transfers": [
+        {
+          "bytes_done": 121942016,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:19.072Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%",
+      "transfers": [
+        {
+          "bytes_done": 123482112,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:19.698Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n116.1 MB / 180.0 MB \u00b7 65%",
+      "transfers": [
+        {
+          "bytes_done": 125218816,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:20.319Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n119.9 MB / 180.0 MB \u00b7 67%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n119.9 MB / 180.0 MB \u00b7 67%",
+      "transfers": [
+        {
+          "bytes_done": 127381504,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:20.878Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n119.9 MB / 180.0 MB \u00b7 67%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n119.9 MB / 180.0 MB \u00b7 67%",
+      "transfers": [
+        {
+          "bytes_done": 129511424,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:21.424Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%",
+      "transfers": [
+        {
+          "bytes_done": 131739648,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:22.066Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%",
+      "transfers": [
+        {
+          "bytes_done": 134918144,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:22.624Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n125.3 MB / 180.0 MB \u00b7 70%",
+      "transfers": [
+        {
+          "bytes_done": 137687040,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:23.245Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n132.5 MB / 180.0 MB \u00b7 74%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n132.5 MB / 180.0 MB \u00b7 74%",
+      "transfers": [
+        {
+          "bytes_done": 141291520,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:23.862Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n132.5 MB / 180.0 MB \u00b7 74%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n132.5 MB / 180.0 MB \u00b7 74%",
+      "transfers": [
+        {
+          "bytes_done": 145158144,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:24.450Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%",
+      "transfers": [
+        {
+          "bytes_done": 149008384,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:25.104Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%",
+      "transfers": [
+        {
+          "bytes_done": 153333760,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:25.670Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n141.5 MB / 180.0 MB \u00b7 79%",
+      "transfers": [
+        {
+          "bytes_done": 157741056,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:26.269Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n151.9 MB / 180.0 MB \u00b7 84%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n151.9 MB / 180.0 MB \u00b7 84%",
+      "transfers": [
+        {
+          "bytes_done": 162557952,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:26.897Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n151.9 MB / 180.0 MB \u00b7 84%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n151.9 MB / 180.0 MB \u00b7 84%",
+      "transfers": [
+        {
+          "bytes_done": 168013824,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:27.473Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%",
+      "transfers": [
+        {
+          "bytes_done": 173191168,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:28.056Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%",
+      "transfers": [
+        {
+          "bytes_done": 177745920,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:28.654Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n164.0 MB / 180.0 MB \u00b7 91%",
+      "transfers": [
+        {
+          "bytes_done": 180678656,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:29.230Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n173.2 MB / 180.0 MB \u00b7 96%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n173.2 MB / 180.0 MB \u00b7 96%",
+      "transfers": [
+        {
+          "bytes_done": 183529472,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:29.830Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n173.2 MB / 180.0 MB \u00b7 96%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n173.2 MB / 180.0 MB \u00b7 96%",
+      "transfers": [
+        {
+          "bytes_done": 186658816,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:30.425Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "transfers": [
+        {
+          "bytes_done": 188743680,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:31.010Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "transfers": [
+        {
+          "bytes_done": 188743680,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:31.502Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "transfers": [
+        {
+          "bytes_done": 188743680,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:32.067Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "transfers": [
+        {
+          "bytes_done": 188743680,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:32.615Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "transfers": [
+        {
+          "bytes_done": 188743680,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:33.163Z",
+      "count": 1,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "transfers": [
+        {
+          "bytes_done": 188743680,
+          "bytes_total": 188743680,
+          "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+          "name": "om660-mode3-progress-ui-152842.bin",
+          "paused": false,
+          "retry_after_secs": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-07-06T15:29:33.724Z",
+      "count": 0,
+      "pageText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nOneDrive\nisy-om660-20260706-135511\nmode-offline\nName A\u2013Z\nRecently modified\nLargest first\nUpload\nVerify\nThis folder:\nOffline\n409.6 MB\nused \u00b7 0% of 1029.0 GB \u00b7 1028.6 GB free\nTransferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%\nAll\n5\nOnline\n0\nSync\n0\nOffline\n5\nfreeup-guard.txt\n37 B \u00b7 06.07.2026 15:56:25\nOffline\noffline-delta-materialize-24mb.bin\n24.0 MB \u00b7 06.07.2026 14:50:46\nOffline\noffline-progress-panel-48mb.bin\n48.0 MB \u00b7 06.07.2026 14:53:09\nOffline\noffline-read.txt\n30 B \u00b7 06.07.2026 13:55:21\nOffline\nprogress-24mb.bin\n24.0 MB \u00b7 06.07.2026 13:55:26\nOffline",
+      "panelDisplay": "flex",
+      "panelText": "Transferring 1 file\nom660-mode3-progress-ui-152842.bin\n180.0 MB / 180.0 MB \u00b7 100%",
+      "transfers": []
+    }
+  ],
+  "size": 188743680,
+  "started_at": "2026-07-06T15:28:35.880912Z",
+  "upload": {
+    "etag": "\"{E1829B3A-596E-416E-9B25-F202F68261C7},1\"",
+    "finished_at": "2026-07-06T15:28:54.995834Z",
+    "id": "892B68CBF4A7C544!se1829b3a596e416e9b25f202f68261c7",
+    "name": "om660-mode3-progress-ui-152842.bin",
+    "size": 188743680,
+    "started_at": "2026-07-06T15:28:42.488792Z",
+    "status": 201
+  }
+}

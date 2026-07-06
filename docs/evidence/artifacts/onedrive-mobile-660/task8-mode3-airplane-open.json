@@ -1,0 +1,21 @@
+{
+  "rid": "892B68CBF4A7C544!sbeb430a8b5a74122859fab06145ec8ea",
+  "startedAt": "2026-07-06T13:31:49.049Z",
+  "row": {
+    "name": "offline-read.txt",
+    "size": 30,
+    "sync_state": "clean",
+    "content_state": "materialized",
+    "body_location": "sync",
+    "body_state": "available",
+    "has_body": true
+  },
+  "open": {
+    "status": 200,
+    "bytes": 30,
+    "text": "OM660 offline read fixture v1\n",
+    "works_offline": true
+  },
+  "errors": [],
+  "finishedAt": "2026-07-06T13:31:49.346Z"
+}

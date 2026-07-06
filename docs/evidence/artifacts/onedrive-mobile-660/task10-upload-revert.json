@@ -1,0 +1,26 @@
+{
+  "after": [
+    {
+      "id": "892B68CBF4A7C544!s620dd4a5d82d4ae792278e21b0f28ee4",
+      "status": 404
+    },
+    {
+      "id": "892B68CBF4A7C544!sc7cc57bb48cb44bf81bee6ce82c1042f",
+      "status": 404
+    }
+  ],
+  "deleted": [
+    {
+      "artifact": "task10-upload-mobile.json",
+      "id": "892B68CBF4A7C544!s620dd4a5d82d4ae792278e21b0f28ee4",
+      "status": 204
+    },
+    {
+      "artifact": "task10-root-upload-mobile.json",
+      "id": "892B68CBF4A7C544!sc7cc57bb48cb44bf81bee6ce82c1042f",
+      "status": 204
+    }
+  ],
+  "kind": "task10-upload-revert",
+  "pass": true
+}
