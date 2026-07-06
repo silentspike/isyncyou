@@ -1447,14 +1447,27 @@ impl Router {
             // the pass finishes — leaving the panel unable to show progress while it downloads.
             "/api/v1/onedrive/transfers",
         ];
+        // #659: the transfer-CONTROL POSTs (cancel/pause/retry) touch ONLY the in-memory
+        // SharedProgress (the cancel/pause sets), never the store — so, like the transfers GET
+        // above, they MUST be gate-exempt. The mobile offline pass holds the store gate for the
+        // whole blocking materialize; a gated pause/retry/cancel would block until that pass
+        // finished, i.e. it could never interrupt the very transfer it targets (the pause/retry
+        // AC is exactly "pause a LIVE materialization"). They are still session-token-gated (checked
+        // above) and cap-token-gated in the handler; only the store gate is skipped.
+        const GATE_EXEMPT_POST: &[&str] = &[
+            "/api/v1/onedrive/transfers/cancel",
+            "/api/v1/onedrive/transfers/pause",
+            "/api/v1/onedrive/transfers/retry",
+        ];
         let static_get = req.method == "GET"
             && (matches!(
                 req.path.as_str(),
                 "/" | "/app.js" | "/app.css" | "/callback"
             ) || req.path.ends_with(".woff2")
                 || req.path.starts_with("/sfx/"));
-        let gate_exempt =
-            static_get || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()));
+        let gate_exempt = static_get
+            || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()))
+            || (req.method == "POST" && GATE_EXEMPT_POST.contains(&req.path.as_str()));
         let _gate = if gate_exempt {
             None
         } else {
@@ -5507,6 +5520,46 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             resp.status, 200,
             "the live transfer poll must be served while the offline pass holds the gate"
         );
+    }
+
+    #[test]
+    fn transfer_control_posts_are_gate_exempt_during_a_pass() {
+        // #659: pause/retry/cancel touch ONLY the in-memory SharedProgress, never the store, so they
+        // MUST be gate-exempt — otherwise the mobile offline pass, which holds the store gate for the
+        // whole blocking materialize, would block the very pause/retry that targets it (the pause/retry
+        // AC is "pause a LIVE materialization"). With the gate held on this thread, a non-exempt route
+        // would re-lock it (same-thread deadlock); the exempt control POSTs are served.
+        struct NoopTransfers;
+        impl TransferProgress for NoopTransfers {
+            fn transfers(&self) -> Vec<TransferState> {
+                vec![]
+            }
+            fn cancel(&self, _id: &str) -> bool {
+                true
+            }
+            fn pause(&self, _id: &str) -> bool {
+                true
+            }
+            fn retry(&self, _id: &str) -> bool {
+                true
+            }
+        }
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router = Router::with_gate(Config::default(), gate.clone())
+            .with_transfers(std::sync::Arc::new(NoopTransfers), "cap".into());
+        let _held = gate.lock().unwrap_or_else(|e| e.into_inner());
+        for path in [
+            "/api/v1/onedrive/transfers/cancel?id=t1",
+            "/api/v1/onedrive/transfers/pause?id=t1",
+            "/api/v1/onedrive/transfers/retry?id=t1",
+        ] {
+            let resp =
+                router.route(&ApiRequest::new("POST", path).with_cap_token(Some("cap".into())));
+            assert_eq!(
+                resp.status, 200,
+                "control POST must be served while the pass holds the gate: {path}"
+            );
+        }
     }
 
     struct OkRestore;
