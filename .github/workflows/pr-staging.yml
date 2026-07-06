@@ -297,7 +297,7 @@ jobs:
           unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -q 'lib/x86_64/libisyncyou_mobile.so' \
             || { echo "::error::x86_64 engine .so missing from the APK"; exit 1; }
       - name: Boot the emulator and smoke-test the APK (install + launch + no crash)
-        uses: reactivecircus/android-emulator-runner@e89f39f1abbbd05b1113a29cf4db69e7540cae5a # v2.37.0
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 34
           target: google_apis
