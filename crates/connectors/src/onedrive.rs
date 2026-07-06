@@ -1331,26 +1331,30 @@ pub fn download_one<D: Downloader>(
         Some("downloading"),
         None,
     )?;
-    let bytes = downloader
-        .download_with_progress(id, &mut |done| progress.advance(id, done))
-        .map_err(SyncError::Malformed)?;
-    atomic_write(&full, &bytes).map_err(|e| SyncError::Malformed(e.to_string()))?;
-    if let Some(mt) = &it.remote_mtime {
-        set_file_mtime(&full, mt);
-    }
-    store.set_sync_state(account, SERVICE, id, "clean")?;
-    let hash = Some(crate::quickxor::quickxor_base64(&bytes));
-    record_synced_state(store, account, id, &full, hash);
-    store.set_content_state(
-        account,
-        SERVICE,
-        id,
-        Some("materialized"),
-        Some("sync"),
-        Some("available"),
-        Some(now),
-    )?;
-    Ok(true)
+    let result = (|| {
+        let bytes = downloader
+            .download_with_progress(id, &mut |done| progress.advance(id, done))
+            .map_err(SyncError::Malformed)?;
+        atomic_write(&full, &bytes).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        if let Some(mt) = &it.remote_mtime {
+            set_file_mtime(&full, mt);
+        }
+        store.set_sync_state(account, SERVICE, id, "clean")?;
+        let hash = Some(crate::quickxor::quickxor_base64(&bytes));
+        record_synced_state(store, account, id, &full, hash);
+        store.set_content_state(
+            account,
+            SERVICE,
+            id,
+            Some("materialized"),
+            Some("sync"),
+            Some("available"),
+            Some(now),
+        )?;
+        Ok(true)
+    })();
+    progress.finish(id);
+    result
 }
 
 /// Scoped, policy-gated, progress-reported materialize for Mode-3 **offline** folders
@@ -3055,15 +3059,43 @@ mod tests {
     fn free_up_and_download_now_roundtrip() {
         // #659: download_one materializes one item on demand (inverse of the offline pass);
         // dematerialize_one drops the body but keeps the row listable (metadata).
+        #[derive(Default)]
+        struct FinishProgress(std::sync::Mutex<Vec<String>>);
+        impl ProgressSink for FinishProgress {
+            fn begin(&self, _: &str, _: &str, _: u64) {}
+            fn advance(&self, _: &str, _: u64) {}
+            fn retry_after(&self, _: &str, _: u64) {}
+            fn finish(&self, id: &str) {
+                self.0.lock().unwrap().push(id.to_string());
+            }
+        }
+
         let store = Store::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         seed_offline_and_nonscope(&store);
         let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
         let cfg = isyncyou_core::SyncConfig::default();
         let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = FinishProgress::default();
 
         // download-now materializes just a1.
-        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert!(download_one(
+            &store,
+            &dl,
+            "acc",
+            "a1",
+            dir.path(),
+            NOW,
+            &cfg,
+            &dev,
+            &progress
+        )
+        .unwrap());
+        assert_eq!(
+            progress.0.lock().unwrap().as_slice(),
+            &["a1".to_string()],
+            "download-now must clear its transfer slot on completion"
+        );
         assert_eq!(
             std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
             b"AAAA"
@@ -3106,7 +3138,23 @@ mod tests {
         );
 
         // download-now again re-materializes (reversible).
-        assert!(download_one(&store, &dl, "acc", "a1", dir.path(), NOW, &cfg, &dev, &()).unwrap());
+        assert!(download_one(
+            &store,
+            &dl,
+            "acc",
+            "a1",
+            dir.path(),
+            NOW,
+            &cfg,
+            &dev,
+            &progress
+        )
+        .unwrap());
+        assert_eq!(
+            progress.0.lock().unwrap().as_slice(),
+            &["a1".to_string(), "a1".to_string()],
+            "each download-now run must finish its transfer slot"
+        );
         assert!(
             dir.path().join("Photos/a.txt").exists(),
             "re-materialized after free-up"
