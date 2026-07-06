@@ -1,0 +1,42 @@
+{
+  "account": "me",
+  "errors": [],
+  "finished_at": "2026-07-06T14:14:41.171Z",
+  "graph_permission_verify_and_revert": {
+    "after_delete": {
+      "permission_count": 1,
+      "permission_still_present": false,
+      "status": 200
+    },
+    "delete_permission": {
+      "id": "03de7d73-88af-461e-8add-66eee698a044",
+      "status": 204
+    },
+    "matched": true,
+    "permission": {
+      "id": "03de7d73-88af-461e-8add-66eee698a044",
+      "link": {
+        "scope": "anonymous",
+        "type": "view",
+        "webUrl_sha256": "e9ef12a7aa56e210cca552ef1223ec7a36a0f0de719e0bbc387d21a787d71d26"
+      },
+      "roles": [
+        "read"
+      ]
+    },
+    "permission_count": 2,
+    "status": 200
+  },
+  "id": "892B68CBF4A7C544!se0748f2fe81c4973899c57a520cef5fc",
+  "kind": "task11-share-biometric-retry",
+  "pass": true,
+  "service": "onedrive",
+  "share": {
+    "service": "onedrive",
+    "shared": "892B68CBF4A7C544!se0748f2fe81c4973899c57a520cef5fc",
+    "type": "view",
+    "webUrl_present": true,
+    "webUrl_sha256": "e9ef12a7aa56e210cca552ef1223ec7a36a0f0de719e0bbc387d21a787d71d26"
+  },
+  "started_at": "2026-07-06T14:14:17.091Z"
+}

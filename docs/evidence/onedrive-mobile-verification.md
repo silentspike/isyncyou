@@ -2,7 +2,8 @@
 
 This is the close-out evidence document for epic #646 and story #660. It maps the REV-4
 OneDrive-mobile modes plan (`~/.claude/plans/onedrive-mobile-modes.md`, Phases 1-6) to the
-code now shipped on `origin/dev`, then records the real Pixel 8 Pro end-to-end evidence.
+code built from `feature/om-660` on top of `origin/dev`, then records the real Pixel 8 Pro
+end-to-end evidence.
 
 Current execution branch: `feature/om-660` from `origin/dev` `62ebdc3`.
 
@@ -16,7 +17,8 @@ The older GitHub issue text still says "RC"; this document follows the user's bi
 - #656 is CLOSED (`2026-07-05T18:08:20Z`), verified with `gh issue view 656 --repo silentspike/isyncyou`.
 - #659 is CLOSED (`2026-07-06T10:10:47Z`), verified with `gh issue view 659 --repo silentspike/isyncyou`.
 - `origin/dev` tip at branch creation: `62ebdc3`.
-- On-device endpoint for this run: `10.0.0.115:35619` under `device-lock om-660`.
+- On-device endpoint for this run: initially `10.0.0.115:35619`, later USB debugging as
+  `3B301FDJG0020Z`, under `device-lock om-660`.
 
 ## Plan-Diff Matrix
 
@@ -25,9 +27,9 @@ The older GitHub issue text still says "RC"; this document follows the user's bi
 | Phase 1: Mode 1 online listing | #647/#648/#649; commits `bed4190`, `4b7396b`, `fd8b403` | `crates/graph/src/http.rs::list_children` uses paged Graph reads through `get_json_paged`; `crates/engine/src/onedrive_live.rs::OneDriveLister`; `gui/webui/src/lib.rs` routes `GET /api/v1/onedrive/children` and `GET /api/v1/onedrive/open`; `crates/app-host/src/lib.rs::DaemonOneDriveList` / `DaemonOneDriveOpen`; `gui/webui/src/app.js::driveLoad`, `driveMapChild`, `driveFileUrl`, `driveOpenFile` mobile branch. | Unit tests include `list_children_pages_over_200_items`, `list_children_retries_via_central_policy_then_pages`, `list_children_writes_no_store_row`; on-device proof is recorded in AC2.1. | Code mapped; AC2.1 on-device E2E PASS. |
 | Phase 2: mode config, effective mode, UI | #650/#651/#652; commits `bed4190`, `c5e1b23`, `534fcb2` | `crates/core/src/onedrive_mode.rs::OneDriveMode` / `OneDriveModes::effective_mode`; `crates/core/src/config.rs::onedrive_modes` and `Config::effective_mode`; `gui/webui/src/lib.rs` routes `GET/POST /api/v1/onedrive/mode` and enriches children with `effective_mode`; `crates/app-host/src/lib.rs::DaemonOneDriveMode` persists settings; `gui/webui/src/app.js::driveEffMode`, `renderDriveModeBar`, `driveModePill`, `setFolderMode`, and storage display. | Unit tests include `effective_mode_deepest_ancestor_wins`, `onedrive_modes_round_trip_and_default_when_omitted`, `onedrive_modes_validation_rejects_invalid_entries`, `onedrive_mode_post_persists_and_get_reflects`; on-device persistence proof is recorded in AC2.2. | Code mapped; AC2.2 on-device E2E PASS. |
 | Phase 3: Mode 2 scoped sync + ledger | #653/#654; commits `bed4190`, `1e900b3` | `crates/connectors/src/scope.rs::owning_scope` and `scopes_from_modes`; `crates/connectors/src/onedrive.rs::incremental_sync_scoped` persists per-folder delta cursors and resolves scope overlap; `crates/store/src/lib.rs` cloud-write ledger; `crates/engine/src/onedrive_write.rs` idempotent create/rename/move/delete/upload/replace ledger; `gui/webui/src/lib.rs` routes `/api/v1/onedrive/{create,rename,move,delete}`. | Unit tests include `deepest_active_ancestor_wins_on_overlap`, scoped-delta tests under `crates/connectors/src/onedrive.rs`, `onedrive_write_cap_gate_and_dispatch`, and ledger recovery tests in `onedrive_write.rs`; on-device Mode 2 proof is recorded in AC2.3. | Code mapped; AC2.3 on-device E2E PASS. |
-| Phase 4: Mode 3 offline + writeback | #655 plus #656 fixes; commits `b828a42`, `8c73107`, `793cbc9` | `crates/engine/src/lib.rs::offline_sync_once` runs boot recovery, scoped delta, `materialize_downloads_scoped`, and scoped local create/modify/delete writeback over the ledger; `crates/mobile/src/lib.rs::run_offline_pass` invokes it from the Android refresh loop; `crates/connectors/src/onedrive.rs::materialize_downloads_scoped` writes to `sync_root` with policy and progress; `/api/v1/onedrive/{transfers,policy}` is exposed by `gui/webui/src/lib.rs`. | Unit tests include materialization/progress/cancel tests, `recovery_skips_a_missing_local_body_op_without_aborting_the_batch`, `transfers_progress_cancel_and_policy_endpoints`; on-device airplane/writeback/restart proof is required in AC2.4. | Code mapped; on-device E2E pending. |
-| Phase 5: Android edit | 5a #657 / 5b #658; commits `84599ec`, `374788b` | Upload/replace: `gui/webui/src/serve.rs` decodes request bodies, `gui/webui/src/lib.rs` routes `/api/v1/onedrive/{upload,replace}`, `crates/app-host/src/lib.rs::DaemonOneDriveWrite::{upload,replace}` stages bytes and calls `upload_via_ledger` / `replace_via_ledger`, `crates/graph/src/http.rs::upload_to_parent` handles root upload. SAF: `android/app/src/main/kotlin/com/silentspike/isyncyou/OneDriveDocumentsProvider.kt` exposes live children and RAM/proxy-fd opens; manifest registers the provider. | Unit tests include `onedrive_upload_replace_dispatch_and_gates`, `onedrive_upload_replace_are_biometric_gated_on_mobile`, `upload_to_parent_targets_root_or_item_content`; on-device upload/replace/root and SAF proof is required in AC2.6/AC2.8. | Code mapped; on-device E2E pending. |
-| Phase 6: rest-features + E2E | #656/#659/#660; commits `8c73107`, `793cbc9`, `62ebdc3` | Transfer UI: `gui/webui/src/app.js::startDriveTransfersPoll`, `renderTransfersPanel`, `driveModeChip`; transfer controls are gate-exempt from the store gate but session/cap-gated. Management: `crates/connectors/src/onedrive.rs::{dematerialize_one,download_one,resolve_conflict,cleanup_offline_to_online}`; `crates/engine/src/lib.rs::{free_up_for,download_now_for,resolve_conflict_for,cleanup_offline_to_online_for,list_conflicts_for}`; `gui/webui/src/lib.rs` routes `/onedrive/{free-up,download-now,conflicts,conflict/resolve,cleanup}`; `gui/webui/src/app.js::driveManageSection` / conflict center. | Unit tests include `free_up_and_download_now_roundtrip`, `materialize_skips_paused_and_resumes`, `shared_progress_cancel_is_one_shot`, `shared_progress_retry_now_unpauses_and_clears_backoff`, `cleanup_offline_to_online_drops_safe_keeps_unsynced`, `onedrive_manage_endpoints_cap_gate_and_dispatch`, `onedrive_manage_biometric_gating_on_mobile`; on-device proof is required in AC2.9. | Code mapped; on-device E2E pending. |
+| Phase 4: Mode 3 offline + writeback | #655 plus #656 fixes; commits `b828a42`, `8c73107`, `793cbc9` | `crates/engine/src/lib.rs::offline_sync_once` runs boot recovery, scoped delta, `materialize_downloads_scoped`, and scoped local create/modify/delete writeback over the ledger; `crates/mobile/src/lib.rs::run_offline_pass` invokes it from the Android refresh loop; `crates/connectors/src/onedrive.rs::materialize_downloads_scoped` writes to `sync_root` with policy and progress; `/api/v1/onedrive/{transfers,policy}` is exposed by `gui/webui/src/lib.rs`. | Unit tests include materialization/progress/cancel tests, `recovery_skips_a_missing_local_body_op_without_aborting_the_batch`, `transfers_progress_cancel_and_policy_endpoints`; on-device proof is recorded in AC2.4. | Code mapped; AC2.4 on-device E2E PASS. |
+| Phase 5: Android edit | 5a #657 / 5b #658; commits `84599ec`, `374788b` | Upload/replace: `gui/webui/src/serve.rs` decodes request bodies, `gui/webui/src/lib.rs` routes `/api/v1/onedrive/{upload,replace}`, `crates/app-host/src/lib.rs::DaemonOneDriveWrite::{upload,replace}` stages bytes and calls `upload_via_ledger` / `replace_via_ledger`, `crates/graph/src/http.rs::upload_to_parent` handles root upload. SAF: `android/app/src/main/kotlin/com/silentspike/isyncyou/OneDriveDocumentsProvider.kt` exposes live children and RAM/proxy-fd opens; manifest registers the provider. | Unit tests include `onedrive_upload_replace_dispatch_and_gates`, `onedrive_upload_replace_are_biometric_gated_on_mobile`, `upload_to_parent_targets_root_or_item_content`; on-device proof is recorded in AC2.6/AC2.8. | Code mapped; AC2.6 and AC2.8 on-device E2E PASS. |
+| Phase 6: rest-features + E2E | #656/#659/#660; commits `8c73107`, `793cbc9`, `62ebdc3` | Transfer UI: `gui/webui/src/app.js::startDriveTransfersPoll`, `renderTransfersPanel`, `driveModeChip`; transfer controls are gate-exempt from the store gate but session/cap-gated. Management: `crates/connectors/src/onedrive.rs::{dematerialize_one,download_one,resolve_conflict,cleanup_offline_to_online}`; `crates/engine/src/lib.rs::{free_up_for,download_now_for,resolve_conflict_for,cleanup_offline_to_online_for,list_conflicts_for}`; `gui/webui/src/lib.rs` routes `/onedrive/{free-up,download-now,conflicts,conflict/resolve,cleanup}`; `gui/webui/src/app.js::driveManageSection` / conflict center. | Unit tests include `free_up_and_download_now_roundtrip`, `materialize_skips_paused_and_resumes`, `shared_progress_cancel_is_one_shot`, `shared_progress_retry_now_unpauses_and_clears_backoff`, `cleanup_offline_to_online_drops_safe_keeps_unsynced`, `onedrive_manage_endpoints_cap_gate_and_dispatch`, `onedrive_manage_biometric_gating_on_mobile`; on-device proof is recorded in AC2.9. | Code mapped; AC2.5-AC2.9 on-device E2E PASS. |
 
 ## Epic Findings To Re-Verify
 
@@ -36,14 +38,16 @@ device-level execution, not only happy paths:
 
 | Finding | Impact | Shipped mitigation | #660 re-check |
 |---|---|---|---|
-| F-A: stale pending body cloud-write aborted offline pass | A missing staged body could make recovery stop before later valid ops, blocking offline materialization. | `crates/engine/src/onedrive_write.rs::cloud_write_body_source_missing` and `recovery_skips_a_missing_local_body_op_without_aborting_the_batch` mark the missing body op terminally failed without aborting the batch. | Pending in AC2.4 restart/recovery row. |
+| F-A: stale pending body cloud-write aborted offline pass | A missing staged body could make recovery stop before later valid ops, blocking offline materialization. | `crates/engine/src/onedrive_write.rs::cloud_write_body_source_missing` and `recovery_skips_a_missing_local_body_op_without_aborting_the_batch` mark the missing body op terminally failed without aborting the batch. | PASS in AC2.4: `task8-mode3-restart-recovery.json` interrupted an active Mode-3 transfer with `am force-stop`; after relaunch and fresh CDP forward the same file recovered to `materialized/sync/available`. |
 | F-B / Bug2: transfer polling was store-gate blocked | Transfer UI could not update during a blocking offline pass. | `gui/webui/src/lib.rs` gate-exempts `GET /api/v1/onedrive/transfers` and transfer control POSTs from the store gate while keeping session/cap gates. | PASS in AC2.3: `task7-mode2-transfer-panel-fixed.json` shows `GET /onedrive/transfers` polling while `/onedrive/open` downloads a 24 MB file, with panel text moving from 0% to 100%. |
-| F-C: progress bar was one-shot | Materialization showed no moving byte progress until completion. | `crates/graph/src/http.rs::get_bytes_with_progress` / `download_content_with_progress`; `materialize_downloads_scoped` calls `download_with_progress` and advances `SharedProgress`. | Pending in AC2.4 live progress row. |
-| #659 free-up data-loss guard | Free-up must remove only the local materialized body, never create a local-delete signal that deletes the cloud copy. | `dematerialize_one` keeps the row listable and sets `content_state=cached`, `body_state=missing`; `free_up_and_download_now_roundtrip` asserts `scan_local_deletes` does not include the freed item. | Pending in AC2.4/AC2.9 Graph survival row. |
-| #655 / #657 root upload | Empty parent id used to build malformed Graph upload URL for drive root. | `GraphClient::upload_to_parent` branches empty parent to `/me/drive/root:/{name}:/content`; test `upload_to_parent_targets_root_or_item_content`. | Pending in AC2.6 root upload row. |
-| Stale RC wording | Issue #660 and `CONTRIBUTING.md` text can still imply RC-on-main despite No-RC directive. | This document records No-RC as binding; `CONTRIBUTING.md` must be fixed in AC3. | Pending in AC3. |
+| F-C: progress bar was one-shot | Materialization showed no moving byte progress until completion. | `crates/graph/src/http.rs::get_bytes_with_progress` / `download_content_with_progress`; `materialize_downloads_scoped` calls `download_with_progress` and advances `SharedProgress`. | PASS in AC2.4: `task8-mode3-progress-ui-moving.json` records 46 active Mode-3 transfer samples with increasing bytes and screenshots `task8-mode3-progress-ui-active-1/2.png`. |
+| #659 free-up data-loss guard | Free-up must remove only the local materialized body, never create a local-delete signal that deletes the cloud copy. | `dematerialize_one` keeps the row listable and sets `content_state=cached`, `body_state=missing`; `free_up_and_download_now_roundtrip` asserts `scan_local_deletes` does not include the freed item. | PASS in AC2.4/AC2.9: `task8-graph-freeup-survives.json`, `task8-mode3-downloadnow-finish-fixed.json`, and `task13-mode-switch-cleanup.json` show local eviction/cleanup while Graph still returns the cloud file. |
+| #655 / #657 root upload | Empty parent id used to build malformed Graph upload URL for drive root. | `GraphClient::upload_to_parent` branches empty parent to `/me/drive/root:/{name}:/content`; test `upload_to_parent_targets_root_or_item_content`. | PASS in AC2.6: `task10-root-upload-mobile.json` uploaded with `parent=""`; `task10-root-upload-root-crosscheck.json` proves the resulting parent id is Graph `/me/drive/root`. |
+| Stale RC wording | Issue #660 and `CONTRIBUTING.md` text can still imply RC-on-main despite No-RC directive. | This document records No-RC as binding; `CONTRIBUTING.md` now says ordinary `dev -> staging -> main` promotion does not publish release artifacts. | PASS in AC3 docs update. |
 | F-D: #660 Mode-2 open skipped cache | Sync-mode mobile open still served a live Graph body without materializing the body into `cache_root`, so AC2.3 lazy-body proof failed. | `b3e572c` updates `DaemonOneDriveOpen` to serve local OneDrive bodies first, download sync-mode misses into `cache_root`, update store body state, and emit transfer progress. Targeted remote regression `onedrive_open_serves_cached_sync_body_before_graph_lookup` passed. | PASS in AC2.3: `sync-lazy-2.txt` moved from no local body to `content_state=cached`, `body_location=cache`, `body_state=available`, `sync_state=clean`; file exists under app `files/cache/mode-sync/`. |
 | F-E: #660 mobile OneDrive toolbar collapsed | A real device screenshot showed deep breadcrumbs squeezing the toolbar into an unusable narrow column on the phone. | `755f147` keeps mobile OneDrive breadcrumbs on a single horizontal scroll row and lets the action toolbar wrap below it. Rebuilt/reinstalled debug APK SHA-256 `d3267c2fd7eae862d001cbd6a0bf8058232ad74d3ff78986640e8665072bf96e`. | PASS in AC2.3: `task7-mode2-layout-fixed.png` and `task7-mode2-transfer-active-fixed.png` show breadcrumbs, sort, upload, verify, view toggle, mode bar, transfer panel, and file grid without overlap. |
+| F-F: #660 Mode-3 stale offline body after remote replace | A remote-dirty item could keep serving an old materialized body if the local size/mtime looked reusable. | `864e631` adds remote/local match validation using size, mtime, and Graph QuickXorHash when available; targeted tests `materialize_redownloads_remote_dirty_when_remote_hash_changed` and `materialize_scoped_redownloads_stale_body_when_remote_hash_changed` passed. | PASS in AC2.4: `task8-graph-stale-body-replace.json` replaced the Graph file with a 64 MiB body and `task8-mode3-stale-body-fix.json` opened the matching SHA-256 from the device. |
+| F-G: #660 download-now transfer never finished | `download-now` could leave a completed transfer slot visible because the progress tracker was not finished on success. | `0dbbc69` makes `download_one` finish progress after the body write; `free_up_and_download_now_roundtrip` now asserts finish progress. | PASS in AC2.9: `task8-mode3-downloadnow-finish-fixed.json` ends with `final_transfers.count=0`. |
 
 ## On-Device Prep
 
@@ -94,12 +98,12 @@ contain on-device evidence plus Graph/store cross-checks. Tokens must never be p
 | AC2.1 | Mode 1 online live root/subfolder browse; on-demand open; no store write | screenshot/CDP, Graph child ids, store `count_by_service` check | PASS - `task5-mode1-online.json`, `task5-graph-crosscheck.json`, `task5-mode1-open.png` |
 | AC2.2 | Mode config toggle and effective-mode inheritance; restart persistence | screenshot/CDP, config/store read after restart | PASS - `task6-mode-config-before-restart.json`, `task6-mode-config-after-restart.json`, screenshots |
 | AC2.3 | Mode 2 sync metadata cache and lazy body into `cache_root`; transfer panel | CDP/store/file-system proof, transfer JSON | PASS - `task7-mode2-sync-lazy.json`, `task7-mode2-layout-fixed.json`, `task7-mode2-transfer-panel-fixed.json`, screenshots |
-| AC2.4 | Mode 3 offline materialization, airplane read, writeback, restart recovery, free-up cloud survival | screenshots/CDP, airplane command proof, Graph version proof, revert proof | PENDING |
-| AC2.5 | Cloud create/rename/move/delete with biometric delete | CDP, BiometricPrompt dumpsys, Graph verify/revert | PENDING |
-| AC2.6 | Upload/replace and root-upload regression | CDP/file picker or binary post, Graph id/eTag/version proof, revert proof | PENDING |
-| AC2.7 | Share link with biometric gate and permission delete | BiometricPrompt dumpsys, Graph permission JSON, DELETE permission proof | PENDING |
-| AC2.8 | SAF DocumentsProvider | system picker screenshot/dumpsys, live children, proxy-fd open proof | PENDING |
-| AC2.9 | Rest features: free-up, download-now, pause/retry/cancel, conflict center, rollback, cleanup | screenshots/CDP, Graph survival proof, store/file-system proof | PENDING |
+| AC2.4 | Mode 3 offline materialization, airplane read, writeback, restart recovery, free-up cloud survival | screenshots/CDP, airplane command proof, Graph version proof, revert proof | PASS - `task8-mode3-progress-ui-moving.json`, `task8-mode3-airplane-open.json`, `task8-mode3-writeback-freeup-guard.json`, `task8-mode3-restart-recovery.json` |
+| AC2.5 | Cloud create/rename/move/delete with biometric delete | CDP, BiometricPrompt dumpsys, Graph verify/revert | PASS - `task9-cloud-crud-combined.json` |
+| AC2.6 | Upload/replace and root-upload regression | CDP binary post, Graph id/eTag/version proof, revert proof | PASS - `task10-upload-mobile.json`, `task10-replace-mobile.json`, `task10-root-upload-root-crosscheck.json`, `task10-upload-revert.json` |
+| AC2.7 | Share link with biometric gate and permission delete | BiometricPrompt dumpsys, Graph permission JSON, DELETE permission proof | PASS - `task11-share-biometric-combined.json` |
+| AC2.8 | SAF DocumentsProvider | system picker screenshot/dumpsys, live children, proxy-fd open proof | PASS - `task12-saf-provider-e2e.json`, screenshots |
+| AC2.9 | Rest features: free-up, download-now, pause/retry/cancel, conflict center, rollback, cleanup | screenshots/CDP, Graph survival proof, store/file-system proof | PASS - `task8-mode3-downloadnow-finish-fixed.json`, `task13-transfer-pause-cancel-control.json`, `task13-mode-switch-cleanup.json` |
 
 ### AC2.1 Mode 1 Online Evidence
 
@@ -208,16 +212,178 @@ Artifacts:
 - `artifacts/onedrive-mobile-660/task7-mode2-transfer-active-fixed.png`
 - `artifacts/onedrive-mobile-660/task7-mode2-transfer-after-fixed.png`
 
+### AC2.4 Mode 3 Offline Evidence
+
+Mode-3 proof used `mode-offline`
+(`892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e`) on the Pixel 8 Pro, with the app kept
+awake and foregrounded:
+
+- Live progress: `task8-mode3-progress-ui-moving.json` created a 180 MiB Graph file under the
+  existing offline scope, then observed the mobile offline pass through
+  `/api/v1/onedrive/transfers`. The artifact records 46 active samples for the same remote id,
+  byte progress from `0` to `188,743,680`, panel text including `Transferring 1 file`, and
+  `task8-mode3-progress-ui-active-1.png` / `task8-mode3-progress-ui-active-2.png` show the
+  visible OneDrive transfer panel at `0%` and `3%`. Graph revert passed in
+  `task8-mode3-progress-ui-moving-revert.json`.
+- Stale-body re-check: `task8-graph-stale-body-replace.json` replaced
+  `offline-progress-endpoint-200mb.bin` with a 64 MiB Graph body
+  (`sha256=f9c46a617f710f053e6458fdace27661fbb653138056b70c3b74d3c417315459`);
+  `task8-mode3-stale-body-fix.json` opened the same 64 MiB body from the phone and matched the
+  SHA-256 after commit `864e631`.
+- Airplane-mode read: `task8-mode3-airplane-open.json` shows `offline-read.txt` as
+  `materialized/sync/available`; after `cmd connectivity airplane-mode enable`, `/onedrive/open`
+  returned HTTP 200 and `OM660 offline read fixture v1`.
+- Writeback: `task8-mode3-writeback-freeup-guard.json` edited the materialized
+  `freeup-guard.txt` under app `files/sync`, observed Graph advance from the 37-byte baseline to
+  the 113-byte phone edit, then reverted Graph to the baseline and verified the original SHA-256.
+- Restart recovery: `task8-mode3-restart-recovery.json` interrupted an active 120 MiB offline
+  transfer with `adb shell am force-stop`; after relaunch and a fresh CDP forward to the new
+  `webview_devtools_remote_$PID`, the same item recovered to `materialized/sync/available` while
+  the Graph item still existed. `task8-mode3-restart-recovery-revert.json` deleted the test item.
+- Free-up cloud survival: `task8-graph-freeup-survives.json` and
+  `task8-mode3-downloadnow-finish-fixed.json` prove local eviction sets the row to
+  `cached/none/missing`, Graph still returns HTTP 200 for the 37-byte file, and `download-now`
+  re-materializes it while leaving `/onedrive/transfers` empty after completion.
+
+One harness gotcha found during this row: after `force-stop`, `tcp:9222` must be re-forwarded to
+the new WebView PID. A stale CDP forward can look like a recovery hang even when the app is
+foreground and alive.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task8-mode3-progress-ui-moving.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-progress-ui-active-1.png`
+- `artifacts/onedrive-mobile-660/task8-mode3-progress-ui-active-2.png`
+- `artifacts/onedrive-mobile-660/task8-mode3-progress-ui-moving-revert.json`
+- `artifacts/onedrive-mobile-660/task8-graph-stale-body-replace.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-stale-body-fix.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-airplane-open.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-writeback-freeup-guard.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-restart-recovery.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-restart-recovery-active.png`
+- `artifacts/onedrive-mobile-660/task8-mode3-restart-recovery-revert.json`
+- `artifacts/onedrive-mobile-660/task8-graph-freeup-survives.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-downloadnow-finish-fixed.json`
+
+### AC2.5 Cloud Operation Evidence
+
+On-device CDP drove the mobile cloud-write endpoints against `ops-source` and `ops-dest`:
+
+- `task9-cloud-crud-combined.json` records create, rename, move, and delete. The delete path
+  displayed Android `BiometricPrompt`; after the user entered the device credential, the mobile
+  delete returned ok and Graph returned 404 for the deleted item.
+- The first delete attempt timed out/cancelled and was kept as
+  `task9-cloud-crud-biometric-delete.json`; the successful retry is
+  `task9-cloud-crud-biometric-delete-retry.json`.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task9-cloud-crud-combined.json`
+- `artifacts/onedrive-mobile-660/task9-cloud-crud-biometric-delete.json`
+- `artifacts/onedrive-mobile-660/task9-cloud-crud-biometric-delete-retry.json`
+
+### AC2.6 Upload / Replace / Root Upload Evidence
+
+The mobile write UI path was exercised through the same binary bridge used by the app:
+
+- `task10-upload-mobile.json` uploaded a new text file into `ops-source`; Graph verified the
+  item id, parent id, eTag, size, and content SHA-256.
+- `task10-replace-mobile.json` replaced that item; Graph verified the eTag changed from version
+  `1` to `2` and the replacement content matched.
+- `task10-root-upload-mobile.json` uploaded with `parent=""`, the root-upload regression case.
+  That raw artifact's `pass=false` is a harness expectation mismatch: Graph's real parent id is
+  the drive root id, not the empty request string. `task10-root-upload-root-crosscheck.json`
+  explicitly queried `/me/drive/root` and proves the uploaded item's parent id equals Graph root.
+- `task10-upload-revert.json` deleted both upload test items and verified 404 afterward.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task10-upload-mobile.json`
+- `artifacts/onedrive-mobile-660/task10-replace-mobile.json`
+- `artifacts/onedrive-mobile-660/task10-root-upload-mobile.json`
+- `artifacts/onedrive-mobile-660/task10-root-upload-root-crosscheck.json`
+- `artifacts/onedrive-mobile-660/task10-upload-revert.json`
+
+### AC2.7 Share Evidence
+
+`task11-share-biometric-combined.json` records the mobile share-link flow:
+
+- The first share prompt timed out in `task11-share-biometric.json`.
+- The retry in `task11-share-biometric-retry.json` succeeded after device credential entry.
+- Graph permission listing found the created permission; the committed artifact stores only
+  sanitized link-presence/SHA evidence, then deletes the permission and verifies it is absent.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task11-share-biometric-combined.json`
+- `artifacts/onedrive-mobile-660/task11-share-biometric.json`
+- `artifacts/onedrive-mobile-660/task11-share-biometric-retry.json`
+
+### AC2.8 SAF DocumentsProvider Evidence
+
+SAF was tested with a temporary external probe app (`com.silentspike.safprobe`) so the evidence
+uses Android's real `ACTION_OPEN_DOCUMENT` picker, not the iSyncYou process:
+
+- The system picker exposed the iSyncYou OneDrive provider
+  (`com.silentspike.isyncyou.debug.documents`).
+- The picker navigated through the fixture root and `mode-online`.
+- The probe opened `online-open.txt` through the returned content URI and read 26 bytes with
+  SHA-256 `56945136c18aed28306883c3e873e818b62356a203c6c55e8ec7b154ef298f49`.
+- `task12-saf-provider-e2e.json` records provider log summary for root, fixture, mode-online,
+  and `openDocument ... bytes=26`.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task12-saf-provider-e2e.json`
+- `artifacts/onedrive-mobile-660/task12-saf-picker-loaded.png`
+- `artifacts/onedrive-mobile-660/task12-saf-provider-open.png`
+- `artifacts/onedrive-mobile-660/task12-saf-probe-mode-online.png`
+- `artifacts/onedrive-mobile-660/task12-saf-file-tapped.png`
+
+### AC2.9 Rest-Feature Evidence
+
+Management-surface proof covers free-up/download-now, transfer controls, conflict center, and
+offline-to-online cleanup:
+
+- `task8-mode3-downloadnow-finish-fixed.json` proves `free-up` evicts only the local body,
+  `download-now` re-materializes it, and `/onedrive/transfers` ends with `count=0` after commit
+  `0dbbc69`.
+- `task13-transfer-pause-cancel-control.json` created two Graph files under the offline scope:
+  pause held one file queue-deep at `remote_dirty` with no body, cancel was one-shot and the next
+  pass re-materialized it, and retry unpaused/materialized the paused item. The fixture files were
+  removed by `task13-transfer-fixture-revert.json`.
+- `task8-mode3-conflict-center-keep-cloud.json` induced a keep-both conflict for
+  `freeup-guard.txt`, listed it through `/onedrive/conflicts`, resolved with `keep-cloud`, and
+  verified the safe-backup copy was removed.
+- `task13-mode-switch-cleanup.json` switched the existing offline scope to `online`, received
+  `cleanup: {freed: 8, kept: 0}`, verified rows dropped local bodies to `cached/none/missing`,
+  verified Graph still returned the 37-byte cloud file, then restored the folder mode to
+  `offline`.
+
+Artifacts:
+
+- `artifacts/onedrive-mobile-660/task8-mode3-downloadnow-finish-fixed.json`
+- `artifacts/onedrive-mobile-660/task13-transfer-pause-cancel-control.json`
+- `artifacts/onedrive-mobile-660/task13-transfer-pause-cancel-fixtures.json`
+- `artifacts/onedrive-mobile-660/task13-transfer-fixture-revert.json`
+- `artifacts/onedrive-mobile-660/task8-mode3-conflict-center-keep-cloud.json`
+- `artifacts/onedrive-mobile-660/task13-mode-switch-cleanup.json`
+
 ## Host / Desktop Regression Matrix
 
 | Check | Command / proof | Status |
 |---|---|---|
-| Workspace tests | `cargo remote -c -- test --workspace` | PENDING |
-| Clippy | `cargo remote -c -- clippy --workspace --all-targets -- -D warnings` | PENDING |
-| Remote fmt parity | `cargo-remote-fmt --check` | PENDING |
-| WebUI syntax | `node --check gui/webui/src/app.js` | PENDING |
-| Desktop OneDrive unchanged | Spot-check `/api/v1/items` + `/view` on desktop daemon path | PENDING |
-| No RC release action | Confirm no `release.yml` run or tag is created for #660 | PENDING |
+| Workspace tests | `cargo remote -c -- test --workspace` | PASS - exit 0. |
+| Clippy | `cargo remote -c -- clippy --workspace --all-targets -- -D warnings` | PASS - exit 0. |
+| Remote fmt parity | `cargo-remote-fmt --check` | PASS - `cargo-remote-fmt --check: CLEAN (CI fmt will pass)`. |
+| WebUI syntax | `node --check gui/webui/src/app.js` | PASS - exit 0. |
+| Desktop daemon build | `cargo remote -c -- build -p isyncyou-daemon` | PASS - exit 0; `target/debug/isyncyoud` produced. |
+| Desktop OneDrive unchanged | Fixture daemon spot-check of `/api/v1/items` + `/api/v1/view` | PASS - `host-desktop-daemon-spotcheck.json` shows `/api/v1/items?account=fixture&service=onedrive&limit=8` returned 8 OneDrive items and `/api/v1/view?account=fixture&service=onedrive&id=fx-od-7` returned HTTP 200 with the fixture body. |
+| No RC release action | `git tag --points-at HEAD`; `gh run list --repo silentspike/isyncyou --workflow release.yml --branch feature/om-660 --limit 5` | PASS - both commands returned no entries; no release workflow or release tag was created for #660. |
+
+Host/desktop artifact:
+
+- `artifacts/onedrive-mobile-660/host-desktop-daemon-spotcheck.json`
 
 ## Task-3 Evidence
 

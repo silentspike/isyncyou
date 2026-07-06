@@ -1,0 +1,15 @@
+{
+  "account": "me",
+  "delete": {
+    "ok": true
+  },
+  "errors": [],
+  "finished_at": "2026-07-06T14:04:35.596Z",
+  "graph_after_delete": {
+    "status": 404
+  },
+  "id": "892B68CBF4A7C544!s64ed3c5df8324c99bbe6c93b8fdda9cd",
+  "kind": "task9-cloud-crud-biometric-delete-retry",
+  "pass": true,
+  "started_at": "2026-07-06T14:04:17.782Z"
+}

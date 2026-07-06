@@ -1,0 +1,38 @@
+{
+  "startedAt": "2026-07-06T13:22:53.389Z",
+  "rid": "892B68CBF4A7C544!sd4492cc4abaa4a9da780f6f4b69d62f3",
+  "expectedSha": "f9c46a617f710f053e6458fdace27661fbb653138056b70c3b74d3c417315459",
+  "expectedSize": 67108864,
+  "settings": {
+    "poll_interval_secs": 5
+  },
+  "samples": [
+    {
+      "i": 0,
+      "at": "2026-07-06T13:23:11.833Z",
+      "item": {
+        "name": "offline-progress-endpoint-200mb.bin",
+        "size": 67108864,
+        "sync_state": "clean",
+        "content_state": "materialized",
+        "body_location": "sync",
+        "body_state": "available",
+        "has_body": true,
+        "remote_mtime": "2026-07-06T13:22:17Z",
+        "etag": "\"{D4492CC4-ABAA-4A9D-A780-F6F4B69D62F3},3\""
+      },
+      "transfers": [],
+      "transfer_text": ""
+    }
+  ],
+  "open": {
+    "status": 200,
+    "header_len": 67108864,
+    "bytes": 67108864,
+    "sha256": "f9c46a617f710f053e6458fdace27661fbb653138056b70c3b74d3c417315459",
+    "matches_expected": true
+  },
+  "errors": [],
+  "finishedAt": "2026-07-06T13:23:13.617Z",
+  "bodyText": "Overview\nMail\nOneDrive\nCalendar\nContacts\nTo Do\nOneNote\nSettings\nAssistant\nMicrosoft 365 on this device\n\nYour live view, cached on this device. Backups live on your computer.\n\nAttention needed\n6 services connected\n\u00b7\nLast sync 06.07.2026 14:58:58\n\u00b7\n3 failed runs\n\u00b7\n314 items cached\nSettings\nItems cached\n314\nacross 6 services\nCached bodies\n306\n97% have content\nFailed runs\n3\nneeds review\nTrash retention\n30days\nindex off\nSync activity\n19 runs \u00b7 14 days\n23. Juni\n29. Juni\n6. Juli\nSuccessful\nFailed\nService breakdown\nSERVICE\tITEMS\tARCHIVED\n\nMail\n\t\n249\n\t241\n\nOneDrive\n\t\n22\n\t22\n\nContacts\n\t\n17\n\t17\n\nCalendar\n\t\n12\n\t12\n\nTo Do\n\t\n7\n\t7\n\nOneNote\n\t\n7\n\t7\nRecent runs\nSuccess\nAudit:Onedrive-Mode\nmode-set account=me folder=892B68CBF4A7C544!sad502b7a0e624b7882e0b98fd3c54556 mode=offline\n06.07.2026 14:58:58\nFailed\nAudit:Onedrive-Mode\nmode-set account=me folder=892B68CBF4A7C544!sad502b7a0e624b7882e0b98fd3c54556 mode=offline\n06.07.2026 14:58:57\nSuccess\nAudit:Onedrive-Mode\nmode-set account=me folder=892B68CBF4A7C544!s394ef6f2649a4eed88d7f86fd2542a05 mode=offline\n06.07.2026 14:55:46\nFailed\nAudit:Onedrive-Mode\nmode-set account=me folder=892B68CBF4A7C544!s394ef6f2649a4eed88d7f86fd2542a05 mode=offline\n06.07.2026 14:"
+}
