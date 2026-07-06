@@ -1829,12 +1829,17 @@ impl isyncyou_webui::TransferProgress for DaemonTransfer {
         self.progress
             .snapshot()
             .into_iter()
-            .map(|s| isyncyou_webui::TransferState {
-                id: s.id,
-                name: s.name,
-                bytes_done: s.bytes_done,
-                bytes_total: s.bytes_total,
-                retry_after_secs: s.retry_after_secs,
+            .map(|s| {
+                // #659: a paused transfer lives in the pause-set (not the slot), so derive the flag.
+                let paused = self.progress.is_paused_id(&s.id);
+                isyncyou_webui::TransferState {
+                    id: s.id,
+                    name: s.name,
+                    bytes_done: s.bytes_done,
+                    bytes_total: s.bytes_total,
+                    retry_after_secs: s.retry_after_secs,
+                    paused,
+                }
             })
             .collect()
     }
@@ -1844,6 +1849,85 @@ impl isyncyou_webui::TransferProgress for DaemonTransfer {
         // completes; the skip applies to the not-yet-started queue).
         self.progress.request_cancel(id);
         true
+    }
+    fn pause(&self, id: &str) -> bool {
+        // #659 queue-deep pause: a persistent skip (unlike cancel, not auto-consumed) the
+        // materialize pass re-checks before each file until resumed. An in-flight download
+        // still completes; the skip applies to the not-yet-started queue.
+        self.progress.request_pause(id);
+        true
+    }
+    fn resume(&self, id: &str) -> bool {
+        self.progress.resume(id);
+        true
+    }
+    fn retry(&self, id: &str) -> bool {
+        // #659: re-queue a paused/backed-off/failed transfer — clear any pause + 429 backoff so
+        // the next materialize pass re-attempts it (queue-deep; a failed item is re-downloaded next
+        // pass because the loop re-attempts any non-materialized item).
+        self.progress.retry_now(id);
+        true
+    }
+}
+
+/// Live OneDrive **local-body management** for the web UI (#659): free-up / download-now / conflict
+/// list+resolve / offline→online cleanup, over the engine wrappers (each opens the account store).
+/// Reloads the config fresh from disk on each call so the cleanup enumerates the *just-persisted*
+/// folder modes (the mode POST saves before this runs); free-up/download-now/resolve address one
+/// item by id. Shares the engine's [`SharedProgress`] so a download-now surfaces in the transfers
+/// panel. On mobile keep-mine + cleanup are additionally biometric-gated by the router.
+pub struct DaemonOneDriveManage {
+    config_path: PathBuf,
+    progress: isyncyou_connectors::SharedProgress,
+}
+impl DaemonOneDriveManage {
+    fn cfg(&self) -> Result<Config, String> {
+        Config::load(&self.config_path).map_err(|e| format!("load config: {e}"))
+    }
+}
+impl isyncyou_webui::OneDriveManageHandler for DaemonOneDriveManage {
+    fn free_up(&self, account: &str, id: &str) -> Result<(), String> {
+        isyncyou_engine::free_up_for(&self.cfg()?, account, id).map(|_| ())
+    }
+    fn download_now(&self, account: &str, id: &str) -> Result<bool, String> {
+        let cfg = self.cfg()?;
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&cfg, account)?;
+        // An explicit user "download now" is a deliberate single-item action → bypass the
+        // background wifi/charging/storage-floor policy the bulk offline pass throttles on.
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let now = unix_now();
+        isyncyou_engine::download_now_for(&cfg, account, id, token, dev, &now, &self.progress)
+    }
+    fn list_conflicts(&self, account: &str) -> Result<serde_json::Value, String> {
+        let items = isyncyou_engine::list_conflicts_for(&self.cfg()?, account)?;
+        Ok(serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|it| {
+                    serde_json::json!({
+                        "id": it.remote_id,
+                        "name": it.name,
+                        // The write-orphan column stores the keep-both copy's file name.
+                        "conflict_copy": it.conflict_state,
+                        "content_state": it.content_state,
+                        "body_state": it.body_state,
+                    })
+                })
+                .collect(),
+        ))
+    }
+    fn resolve_conflict(&self, account: &str, id: &str, resolution: &str) -> Result<(), String> {
+        let cfg = self.cfg()?;
+        let res = isyncyou_connectors::ConflictResolution::parse(resolution)
+            .ok_or_else(|| format!("unknown resolution '{resolution}'"))?;
+        // A keep-mine resolve deletes the cloud copy → needs the write token; keep-both / keep-cloud
+        // are local-only but resolve_conflict_for takes the client uniformly (unused for those).
+        let token = isyncyou_engine::auth::resolve_cached_sync_token(&cfg, account)?;
+        isyncyou_engine::resolve_conflict_for(&cfg, account, id, res, token)
+    }
+    fn cleanup_offline_to_online(&self, account: &str) -> Result<serde_json::Value, String> {
+        let report = isyncyou_engine::cleanup_offline_to_online_for(&self.cfg()?, account)?;
+        Ok(serde_json::json!({ "freed": report.freed, "kept": report.kept }))
     }
 }
 
@@ -1882,7 +1966,9 @@ pub fn build_live_router(
         // #651: OneDrive per-folder mode read/set, wired in the shared builder so both
         // desktop and mobile get it (like with_onedrive_write below).
         .with_onedrive_mode(
-            Arc::new(DaemonOneDriveMode { config_path }),
+            Arc::new(DaemonOneDriveMode {
+                config_path: config_path.clone(),
+            }),
             mint_cap_token(),
         )
         .with_mail_write(
@@ -1930,6 +2016,16 @@ pub fn build_live_router(
         .with_onedrive_write(
             Arc::new(DaemonOneDriveWrite::new(cfg.clone()))
                 as Arc<dyn isyncyou_webui::OneDriveWriteHandler>,
+            mint_cap_token(),
+        )
+        // #659: OneDrive local-body management (free-up / download-now / conflict list+resolve /
+        // offline→online cleanup), wired here so both desktop and mobile get it; on mobile keep-mine
+        // + cleanup are biometric-gated. Reloads the config fresh per call (fresh modes for cleanup).
+        .with_onedrive_manage(
+            Arc::new(DaemonOneDriveManage {
+                config_path: config_path.clone(),
+                progress: progress.clone(),
+            }) as Arc<dyn isyncyou_webui::OneDriveManageHandler>,
             mint_cap_token(),
         )
         // #655: in-flight offline-transfer progress (the engine's SharedProgress) surfaced at
@@ -2025,6 +2121,71 @@ mod tests {
             !progress.is_cancelled("other"),
             "an unrelated id is unaffected"
         );
+    }
+
+    #[test]
+    fn daemon_transfer_pause_resume_retry_and_paused_flag() {
+        // #659: pause/resume/retry map onto the shared progress; the endpoint surfaces `paused`.
+        use isyncyou_connectors::ProgressSink;
+        use isyncyou_webui::TransferProgress;
+        let progress = SharedProgress::new();
+        progress.begin("i1", "photo.jpg", 1000);
+        progress.retry_after("i1", 30);
+        let dt = DaemonTransfer {
+            progress: progress.clone(),
+        };
+        assert!(dt.pause("i1"));
+        assert!(
+            progress.is_paused_id("i1"),
+            "pause is recorded (persistent)"
+        );
+        // The endpoint mapping derives `paused` from the pause-set.
+        assert!(
+            dt.transfers()[0].paused,
+            "transfers() surfaces the paused flag"
+        );
+
+        assert!(dt.resume("i1"));
+        assert!(!progress.is_paused_id("i1"), "resume clears the pause");
+
+        // retry un-pauses AND clears the 429 backoff so the panel shows it retrying now.
+        dt.pause("i1");
+        assert!(dt.retry("i1"));
+        assert!(!progress.is_paused_id("i1"), "retry un-pauses");
+        assert_eq!(
+            progress.snapshot()[0].retry_after_secs,
+            0,
+            "retry clears the backoff timer"
+        );
+    }
+
+    #[test]
+    fn build_live_router_wires_manage_and_transfer_controls() {
+        // #659: build_live_router wires the management handler + the pause/retry transfer controls.
+        // A cap-gated POST with NO cap token returns 401 (not 404) → proves the handler is wired.
+        let events = Arc::new(isyncyou_webui::EventBus::new());
+        let router = build_live_router(
+            Config::default(),
+            None,
+            events,
+            PathBuf::from("/x/isyncyou.toml"),
+            Arc::new(AtomicU64::new(5)),
+            SharedProgress::new(),
+        );
+        for path in [
+            "/api/v1/onedrive/free-up?account=a&id=i1",
+            "/api/v1/onedrive/download-now?account=a&id=i1",
+            "/api/v1/onedrive/conflict/resolve?account=a&id=i1&resolution=keep-both",
+            "/api/v1/onedrive/cleanup?account=a",
+            "/api/v1/onedrive/transfers/pause?id=i1",
+            "/api/v1/onedrive/transfers/retry?id=i1",
+        ] {
+            let resp = router.route(&ApiRequest::new("POST", path));
+            assert_eq!(resp.status, 401, "wired + cap-gated (not 404): {path}");
+        }
+        // The conflicts GET read is wired too (404 would mean no handler).
+        let c = router.route(&ApiRequest::get("/api/v1/onedrive/conflicts?account=a"));
+        assert_ne!(c.status, 404, "conflicts GET is wired");
     }
 
     #[test]

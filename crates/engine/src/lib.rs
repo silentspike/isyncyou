@@ -1147,6 +1147,107 @@ pub fn offline_sync_once_for(
     offline_sync_once(cfg, account, &store, &mut client, host, dev, progress)
 }
 
+/// #659 free-up-space (engine wrapper): open the account store and drop one item's
+/// materialized body (keep the row listable). Reversible via [`download_now_for`].
+pub fn free_up_for(cfg: &Config, account: &str, id: &str) -> Result<bool, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    isyncyou_connectors::dematerialize_one(&store, account, id, &acc.sync_root, &acc.cache_root)
+        .map_err(|e| e.to_string())
+}
+
+/// #659 download-now (engine wrapper): open the store + a Graph client and materialize one
+/// item on demand. `Ok(false)` when the transfer policy blocked it (body stays `missing`).
+#[allow(clippy::too_many_arguments)]
+pub fn download_now_for(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    sync_token: String,
+    dev: isyncyou_core::policy::DeviceState,
+    now: &str,
+    progress: &dyn isyncyou_connectors::ProgressSink,
+) -> Result<bool, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let client = GraphClient::new(sync_token);
+    isyncyou_connectors::download_one(
+        &store,
+        &client,
+        account,
+        id,
+        &acc.sync_root,
+        now,
+        &cfg.sync,
+        &dev,
+        progress,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// #659 Conflict Center (engine wrapper): resolve one item's keep-both conflict
+/// (keep-both / keep-mine / keep-cloud); a keep-mine cloud delete uses the Graph client.
+pub fn resolve_conflict_for(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    resolution: isyncyou_connectors::ConflictResolution,
+    sync_token: String,
+) -> Result<(), String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let client = GraphClient::new(sync_token);
+    isyncyou_connectors::resolve_conflict(&store, account, id, resolution, &acc.sync_root, &client)
+        .map_err(|e| e.to_string())
+}
+
+/// #659 offline→online cleanup (engine wrapper): drop the now-online folders' materialized
+/// bodies that are provably safe in the cloud (to `trash`); keep anything unsynced. No Graph
+/// client needed — it only reads the store + touches local files. Returns `{freed, kept}`.
+pub fn cleanup_offline_to_online_for(
+    cfg: &Config,
+    account: &str,
+) -> Result<isyncyou_connectors::CleanupReport, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let trash = acc.archive_root.join(".isyncyou-trash");
+    isyncyou_connectors::cleanup_offline_to_online(&store, account, &acc.sync_root, &trash, cfg)
+        .map_err(|e| e.to_string())
+}
+
+/// #659 Conflict Center (engine wrapper): the account's unresolved keep-both conflicts (the
+/// write-orphan `conflict_state` rows), for the caller to surface. Read-only.
+pub fn list_conflicts_for(cfg: &Config, account: &str) -> Result<Vec<Item>, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    store.conflicts(account).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
