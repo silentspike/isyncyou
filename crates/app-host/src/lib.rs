@@ -2135,9 +2135,15 @@ mod tests {
             progress: progress.clone(),
         };
         assert!(dt.pause("i1"));
-        assert!(progress.is_paused_id("i1"), "pause is recorded (persistent)");
+        assert!(
+            progress.is_paused_id("i1"),
+            "pause is recorded (persistent)"
+        );
         // The endpoint mapping derives `paused` from the pause-set.
-        assert!(dt.transfers()[0].paused, "transfers() surfaces the paused flag");
+        assert!(
+            dt.transfers()[0].paused,
+            "transfers() surfaces the paused flag"
+        );
 
         assert!(dt.resume("i1"));
         assert!(!progress.is_paused_id("i1"), "resume clears the pause");
@@ -2147,7 +2153,8 @@ mod tests {
         assert!(dt.retry("i1"));
         assert!(!progress.is_paused_id("i1"), "retry un-pauses");
         assert_eq!(
-            progress.snapshot()[0].retry_after_secs, 0,
+            progress.snapshot()[0].retry_after_secs,
+            0,
             "retry clears the backoff timer"
         );
     }

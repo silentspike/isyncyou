@@ -2304,7 +2304,10 @@ mod tests {
         // a non-onedrive row must never appear in conflicts()
         s.upsert_item(&Item::new("a", "mail", "m1", "m1", "message"))
             .unwrap();
-        assert!(s.conflicts("a").unwrap().is_empty(), "no conflicts initially");
+        assert!(
+            s.conflicts("a").unwrap().is_empty(),
+            "no conflicts initially"
+        );
 
         s.set_conflict_state("a", "onedrive", "f1", Some("f1-host-safeBackup-0001.txt"))
             .unwrap();

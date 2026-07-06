@@ -1284,7 +1284,15 @@ pub fn download_one<D: Downloader>(
     let full = sync_root.join(&rel);
     // Storage-floor / Wi-Fi-only / charging gate: a Blocked verdict leaves the body `missing`.
     if !isyncyou_core::policy::evaluate(cfg_sync, dev).is_allowed() {
-        store.set_content_state(account, SERVICE, id, None, Some("sync"), Some("missing"), None)?;
+        store.set_content_state(
+            account,
+            SERVICE,
+            id,
+            None,
+            Some("sync"),
+            Some("missing"),
+            None,
+        )?;
         return Ok(false);
     }
     if let Some(parent) = full.parent() {
@@ -1293,7 +1301,15 @@ pub fn download_one<D: Downloader>(
     let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let total = it.size.unwrap_or(0).max(0) as u64;
     progress.begin(id, name, total);
-    store.set_content_state(account, SERVICE, id, None, Some("sync"), Some("downloading"), None)?;
+    store.set_content_state(
+        account,
+        SERVICE,
+        id,
+        None,
+        Some("sync"),
+        Some("downloading"),
+        None,
+    )?;
     let bytes = downloader
         .download_with_progress(id, &mut |done| progress.advance(id, done))
         .map_err(SyncError::Malformed)?;
@@ -1438,8 +1454,12 @@ pub fn materialize_downloads_scoped<D: Downloader>(
                             report.conflicts += 1;
                             // #659: persist the conflict (best-effort) so the Conflict Center can
                             // surface it; the value is the safeBackup copy name for resolve.
-                            let _ =
-                                store.set_conflict_state(account, SERVICE, &it.remote_id, Some(&copy));
+                            let _ = store.set_conflict_state(
+                                account,
+                                SERVICE,
+                                &it.remote_id,
+                                Some(&copy),
+                            );
                         }
                     }
                 }
@@ -3038,7 +3058,11 @@ mod tests {
         assert_eq!(report.downloaded, 0, "paused file is skipped");
         assert!(!dir.path().join("Photos/a.txt").exists());
         assert_eq!(
-            store.get_item("acc", SERVICE, "a1").unwrap().unwrap().sync_state,
+            store
+                .get_item("acc", SERVICE, "a1")
+                .unwrap()
+                .unwrap()
+                .sync_state,
             "remote_dirty"
         );
         assert!(
@@ -3168,7 +3192,8 @@ mod tests {
         p.retry_now("rid");
         assert!(!p.is_paused_id("rid"), "retry_now un-pauses");
         assert_eq!(
-            p.snapshot()[0].retry_after_secs, 0,
+            p.snapshot()[0].retry_after_secs,
+            0,
             "retry_now clears the 429 backoff timer"
         );
     }
@@ -3833,7 +3858,11 @@ mod tests {
             conflict: true,
             calls: Default::default(),
         };
-        let modifies = vec![("a1".into(), PathBuf::from("Docs/note.txt"), "etag-old".into())];
+        let modifies = vec![(
+            "a1".into(),
+            PathBuf::from("Docs/note.txt"),
+            "etag-old".into(),
+        )];
         apply_local_modifies(&r, &store, &mut map, "acc", dir.path(), "host", &modifies).unwrap();
 
         let it = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
@@ -3843,7 +3872,10 @@ mod tests {
             "the keep-both is now persisted"
         );
         assert_eq!(store.conflicts("acc").unwrap().len(), 1);
-        let copy = dir.path().join("Docs").join("note-host-safeBackup-0001.txt");
+        let copy = dir
+            .path()
+            .join("Docs")
+            .join("note-host-safeBackup-0001.txt");
         assert!(copy.exists());
 
         struct NoWriter;
@@ -3866,7 +3898,11 @@ mod tests {
         .unwrap();
         assert!(!copy.exists(), "keep-cloud drops the local edit copy");
         assert_eq!(
-            store.get_item("acc", SERVICE, "a1").unwrap().unwrap().conflict_state,
+            store
+                .get_item("acc", SERVICE, "a1")
+                .unwrap()
+                .unwrap()
+                .conflict_state,
             None
         );
         assert!(store.conflicts("acc").unwrap().is_empty());
@@ -3917,7 +3953,11 @@ mod tests {
         );
         assert!(!docs.join("note-host-safeBackup-0001.txt").exists());
         assert_eq!(
-            store.get_item("acc", SERVICE, "a1").unwrap().unwrap().conflict_state,
+            store
+                .get_item("acc", SERVICE, "a1")
+                .unwrap()
+                .unwrap()
+                .conflict_state,
             None
         );
     }
@@ -3950,7 +3990,9 @@ mod tests {
                 .unwrap();
         }
         // clean1: clean + a synced reference matching disk -> provably safe.
-        store.set_sync_state("acc", SERVICE, "clean1", "clean").unwrap();
+        store
+            .set_sync_state("acc", SERVICE, "clean1", "clean")
+            .unwrap();
         record_synced_state(
             &store,
             "acc",

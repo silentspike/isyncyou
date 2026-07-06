@@ -1182,7 +1182,15 @@ pub fn download_now_for(
         Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
     let client = GraphClient::new(sync_token);
     isyncyou_connectors::download_one(
-        &store, &client, account, id, &acc.sync_root, now, &cfg.sync, &dev, progress,
+        &store,
+        &client,
+        account,
+        id,
+        &acc.sync_root,
+        now,
+        &cfg.sync,
+        &dev,
+        progress,
     )
     .map_err(|e| e.to_string())
 }

@@ -2816,7 +2816,8 @@ impl Router {
         }
         // keep-mine deletes the cloud version → the destructive per-action biometric gate on mobile.
         if resolution == "keep-mine" {
-            if let Some(r) = self.biometric_challenge("conflict-keep-mine", account, "onedrive", id, req)
+            if let Some(r) =
+                self.biometric_challenge("conflict-keep-mine", account, "onedrive", id, req)
             {
                 return r;
             }
@@ -6243,8 +6244,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             std::sync::Arc::new(FakeOneDriveMode::default()),
             "modecap".into(),
         );
-        let resp =
-            mode_only.route(&post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=online"));
+        let resp = mode_only.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online",
+        ));
         assert_eq!(resp.status, 200);
         let j = body_json(&resp);
         assert_eq!(j["mode"], "online");
@@ -6262,14 +6264,17 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "modecap".into(),
             )
             .with_onedrive_manage(m.clone(), "cap".into());
-        let online =
-            router.route(&post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=online"));
+        let online = router.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online",
+        ));
         assert_eq!(online.status, 200);
         assert_eq!(body_json(&online)["cleanup"]["freed"], 3);
         assert_eq!(*m.cleaned.lock().unwrap(), vec!["a".to_string()]);
 
         // Setting a folder to SYNC (not online) does NOT trigger cleanup.
-        let sync = router.route(&post("/api/v1/onedrive/mode?account=a&folder=Docs&mode=sync"));
+        let sync = router.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Docs&mode=sync",
+        ));
         assert_eq!(sync.status, 200);
         assert!(
             body_json(&sync).get("cleanup").is_none(),
@@ -8254,7 +8259,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // #659: pause + retry are the same cap-gated shape. 401 without the token, 200 with it.
         assert_eq!(
             router
-                .route(&ApiRequest::new("POST", "/api/v1/onedrive/transfers/pause?id=t1"))
+                .route(&ApiRequest::new(
+                    "POST",
+                    "/api/v1/onedrive/transfers/pause?id=t1"
+                ))
                 .status,
             401
         );
@@ -8307,7 +8315,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "conflict_copy": "note-host-safeBackup-0001.txt",
             }]))
         }
-        fn resolve_conflict(&self, _account: &str, id: &str, resolution: &str) -> Result<(), String> {
+        fn resolve_conflict(
+            &self,
+            _account: &str,
+            id: &str,
+            resolution: &str,
+        ) -> Result<(), String> {
             self.resolved
                 .lock()
                 .unwrap()
@@ -8365,7 +8378,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(*m.freed.lock().unwrap(), vec!["i1".to_string()]);
         // missing id -> 400.
         assert_eq!(
-            router.route(&post("/api/v1/onedrive/free-up?account=a")).status,
+            router
+                .route(&post("/api/v1/onedrive/free-up?account=a"))
+                .status,
             400
         );
 
@@ -8381,8 +8396,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(body_json(&cj)["conflicts"][0]["id"], "c1");
 
         // resolve keep-both -> 200; the handler saw the resolution.
-        let rb = router
-            .route(&post("/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-both"));
+        let rb = router.route(&post(
+            "/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-both",
+        ));
         assert_eq!(rb.status, 200);
         assert_eq!(
             *m.resolved.lock().unwrap(),
@@ -8417,8 +8433,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_biometric_gate();
 
         // keep-mine deletes the cloud copy -> challenged; handler NOT called.
-        let km = mobile
-            .route(&post("/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-mine"));
+        let km = mobile.route(&post(
+            "/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-mine",
+        ));
         assert_eq!(km.status, 200);
         assert_eq!(body_json(&km)["status"], "confirmation_required");
         assert!(m.resolved.lock().unwrap().is_empty());
@@ -8430,8 +8447,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(m.cleaned.lock().unwrap().is_empty());
 
         // keep-both is local-only -> straight through (not gated).
-        let kb = mobile
-            .route(&post("/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-both"));
+        let kb = mobile.route(&post(
+            "/api/v1/onedrive/conflict/resolve?account=a&id=c1&resolution=keep-both",
+        ));
         assert_eq!(kb.status, 200);
         assert_eq!(
             *m.resolved.lock().unwrap(),
