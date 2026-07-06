@@ -43,11 +43,49 @@ device-level execution, not only happy paths:
 | #655 / #657 root upload | Empty parent id used to build malformed Graph upload URL for drive root. | `GraphClient::upload_to_parent` branches empty parent to `/me/drive/root:/{name}:/content`; test `upload_to_parent_targets_root_or_item_content`. | Pending in AC2.6 root upload row. |
 | Stale RC wording | Issue #660 and `CONTRIBUTING.md` text can still imply RC-on-main despite No-RC directive. | This document records No-RC as binding; `CONTRIBUTING.md` must be fixed in AC3. | Pending in AC3. |
 
+## On-Device Prep
+
+Task 4 completed on 2026-07-06 against Pixel 8 Pro over `adb connect 10.0.0.115:35619`,
+with `device-lock om-660` held.
+
+Evidence:
+
+- Debug APK rebuilt with `cd android && ./gradlew :app:assembleDebug`; APK:
+  `android/app/build/outputs/apk/debug/app-debug.apk`, SHA-256
+  `40d695946691f4198cfedf2af8fd512dbd5e20d7033913728bb4d4403de43327`.
+- APK installed with `adb install -r`; app launched as `com.silentspike.isyncyou.debug`,
+  live PID `7311`.
+- M365 write token silently re-minted from `~/.config/m365-write/token_cache.json` with
+  `force_refresh=True`, provisioned to
+  `/data/user/0/com.silentspike.isyncyou.debug/files/archive/.isyncyou-token-write.json`
+  via `run-as`; only `expires_at` was printed (`1783342350`, about 59 minutes left at
+  provisioning time).
+- CDP verified through the live PID socket `webview_devtools_remote_7311` with
+  `Runtime.evaluate` (`suppress_origin=True`); app reported `account=me`, `MOBILE=true`,
+  and active caps for `onedriveMode`, `onedrivewrite`, `onedriveManage`, `transfers`, and
+  `share`.
+- Graph fixture root created for this run: `isy-om660-20260706-135511`, id
+  `892B68CBF4A7C544!s243029df950d49938d6a3e7199c5873b`; child fixture folders:
+  `mode-online`, `mode-sync`, `mode-offline`, `ops-source`, and `ops-dest`.
+- Graph fixture files created: `online-open.txt`, `sync-lazy.txt`, `offline-read.txt`,
+  `freeup-guard.txt`, and `progress-24mb.bin` (`25,165,824` bytes; SHA-256
+  `3bbb171e9101245cf763bba6146cc317bc9c681182f7afd5a94e33ea3f3ff5f0`).
+- Device state confirmed `mWakefulness=Awake`; foreground activity confirmed
+  `com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity`.
+- Screenshot evidence: `artifacts/onedrive-mobile-660/task4-overview.png`.
+- Structured fixture evidence:
+  `artifacts/onedrive-mobile-660/task4-fixture.json` and
+  `artifacts/onedrive-mobile-660/task4-graph-root-children.json`.
+
+The mobile store was not wiped for a synthetic clean slate. It already contained 6 OneDrive rows
+from earlier device work at prep time. AC2.1 therefore verifies Mode-1 online browse by proving the
+OneDrive store count is unchanged before/after live browsing, rather than deleting unrelated
+existing mobile cache state.
+
 ## On-Device E2E Matrix
 
-Evidence folder for this run: `docs/evidence/artifacts/onedrive-mobile-660/` (to be created during
-device prep). Each row must contain on-device evidence plus Graph/store cross-checks. Tokens must never
-be printed or committed.
+Evidence folder for this run: `docs/evidence/artifacts/onedrive-mobile-660/`. Each row must
+contain on-device evidence plus Graph/store cross-checks. Tokens must never be printed or committed.
 
 | Row | Scenario | Required proof | Status |
 |---|---|---|---|
