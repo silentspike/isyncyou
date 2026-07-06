@@ -1,0 +1,29 @@
+{
+  "check": "host-desktop-daemon-onedrive-spotcheck",
+  "pass": true,
+  "bind": "127.0.0.1:18765",
+  "fixture_note": "temp fixture adds plaintext sync_root body for fx-od-7 only",
+  "items": {
+    "endpoint": "/api/v1/items?account=fixture&service=onedrive&limit=8",
+    "count": 8,
+    "total": 8,
+    "first_item": {
+      "remote_id": "fx-od-5",
+      "name": "IMG_2024.jpg"
+    },
+    "notes_item": {
+      "remote_id": "fx-od-7",
+      "name": "notes.md",
+      "has_body": true,
+      "body_state": "available"
+    }
+  },
+  "view": {
+    "endpoint": "/api/v1/view?account=fixture&service=onedrive&id=fx-od-7",
+    "id": "fx-od-7",
+    "name": "notes.md",
+    "http_status": 200,
+    "content_type": "Content-Type: text/html; charset=utf-8",
+    "body_contains_fixture_text": true
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "artifacts": [
+    "task11-share-biometric.json",
+    "task11-share-biometric-retry.json"
+  ],
+  "biometric_prompt_observed_via_dumpsys": true,
+  "first_share_biometric_cancelled": true,
+  "graph_permission_matched": true,
+  "item_id": "892B68CBF4A7C544!se0748f2fe81c4973899c57a520cef5fc",
+  "kind": "task11-share-biometric-combined",
+  "pass": true,
+  "permission_delete_status": 204,
+  "permission_still_present_after_delete": false,
+  "retry_share_ok": true
+}
