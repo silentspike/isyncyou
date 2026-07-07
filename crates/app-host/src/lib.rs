@@ -1869,7 +1869,12 @@ fn onedrive_body_bytes(
         acc.sync_root.clone()
     };
     let path = root.join(rel);
-    match isyncyou_core::envelope::read_body(&path) {
+    let body = if isyncyou_core::envelope::body_envelope_required_for_process() {
+        isyncyou_core::envelope::read_sealed_body_required(&path)
+    } else {
+        isyncyou_core::envelope::read_body(&path)
+    };
+    match body {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read cached OneDrive body: {e}")),
@@ -2237,6 +2242,30 @@ pub fn build_live_router(
 mod tests {
     use super::*;
     use isyncyou_webui::ApiRequest;
+    use std::sync::{Mutex as StdMutex, OnceLock as StdOnceLock};
+
+    static ENVELOPE_REQUIREMENT_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    struct EnvelopeRequirementGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvelopeRequirementGuard {
+        fn new() -> Self {
+            let guard = ENVELOPE_REQUIREMENT_TEST_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap();
+            isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for EnvelopeRequirementGuard {
+        fn drop(&mut self) {
+            isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+        }
+    }
 
     #[test]
     fn restore_handler_refuses_non_restorable_service_before_token_lookup() {
@@ -2298,7 +2327,8 @@ mod tests {
     }
 
     #[test]
-    fn onedrive_open_serves_cached_sync_body_before_graph_lookup() {
+    fn onedrive_open_serves_plaintext_cached_sync_body_when_envelope_not_required() {
+        let _guard = EnvelopeRequirementGuard::new();
         let dir =
             std::env::temp_dir().join(format!("isy-apphost-open-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2338,8 +2368,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        isyncyou_core::envelope::write_body_atomic(&cache.join("doc.txt"), b"cached bytes")
-            .unwrap();
+        std::fs::write(cache.join("doc.txt"), b"cached bytes").unwrap();
 
         let h = DaemonOneDriveOpen {
             config_path,
@@ -2347,6 +2376,72 @@ mod tests {
         };
         let got = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap();
         assert_eq!(got, b"cached bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn onedrive_open_requires_sealed_cached_body_when_envelope_required() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(719_001, [1u8; 32]);
+        isyncyou_core::envelope::require_body_envelope_for_process();
+
+        let dir = std::env::temp_dir().join(format!(
+            "isy-apphost-open-cache-strict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let arch = dir.join("archive");
+        let sync = dir.join("sync");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let config_path = dir.join("isyncyou.toml");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a".into(),
+                sync_root: sync,
+                archive_root: arch.clone(),
+                cache_root: cache.clone(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.save(&config_path).unwrap();
+        {
+            let store = isyncyou_store::Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut item = Item::new("a", "onedrive", "file-id", "doc.txt", "file");
+            item.local_path = Some("doc.txt".into());
+            store.upsert_item(&item).unwrap();
+            store
+                .set_content_state(
+                    "a",
+                    "onedrive",
+                    "file-id",
+                    Some("cached"),
+                    Some("cache"),
+                    Some("available"),
+                    None,
+                )
+                .unwrap();
+        }
+        let h = DaemonOneDriveOpen {
+            config_path,
+            progress: SharedProgress::new(),
+        };
+
+        isyncyou_core::envelope::write_body_atomic(&cache.join("doc.txt"), b"sealed cached bytes")
+            .unwrap();
+        let got = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap();
+        assert_eq!(got, b"sealed cached bytes");
+
+        std::fs::write(cache.join("doc.txt"), b"raw cached bytes").unwrap();
+        let err = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap_err();
+        assert!(
+            err.contains("sealed envelope"),
+            "strict mobile open must reject plaintext cached bodies, got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
