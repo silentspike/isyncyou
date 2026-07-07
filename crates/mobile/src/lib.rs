@@ -11,6 +11,8 @@
 //! route. Tokens are NEVER logged.
 
 use isyncyou_core::{AccountConfig, Config, OneDriveMode};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -50,6 +52,14 @@ const HOST: &str = "phone";
 /// to the fail-open baseline (unmetered, charging, ample space) until the first push, so the
 /// first materialize is never blocked before a real reading arrives.
 static DEVICE_STATE: OnceLock<Mutex<isyncyou_core::policy::DeviceState>> = OnceLock::new();
+#[cfg(not(test))]
+static MOBILE_ENCRYPTION_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    static TEST_MOBILE_ENCRYPTION_READY: Cell<bool> = const { Cell::new(false) };
+}
+#[cfg(test)]
+static TEST_FAIL_NEXT_MOBILE_KEY_INSTALL: AtomicBool = AtomicBool::new(false);
 
 fn device_state_cell() -> &'static Mutex<isyncyou_core::policy::DeviceState> {
     DEVICE_STATE.get_or_init(|| Mutex::new(isyncyou_core::policy::DeviceState::always_on(u64::MAX)))
@@ -74,8 +84,111 @@ fn current_device_state() -> isyncyou_core::policy::DeviceState {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+fn mark_mobile_encryption_ready() {
+    #[cfg(not(test))]
+    MOBILE_ENCRYPTION_READY.store(true, Ordering::SeqCst);
+    #[cfg(test)]
+    TEST_MOBILE_ENCRYPTION_READY.with(|ready| ready.set(true));
+}
+
+fn mobile_encryption_ready() -> bool {
+    #[cfg(not(test))]
+    {
+        MOBILE_ENCRYPTION_READY.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    {
+        TEST_MOBILE_ENCRYPTION_READY.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+fn reset_mobile_encryption_ready_for_tests() {
+    TEST_MOBILE_ENCRYPTION_READY.with(|ready| ready.set(false));
+}
+
+#[cfg(test)]
+fn install_test_mobile_encryption() {
+    let key = [9u8; 32];
+    isyncyou_core::envelope::set_body_key(1, key);
+    isyncyou_core::envelope::require_body_envelope_for_process();
+    isyncyou_store::set_store_key(key.to_vec());
+    isyncyou_store::require_store_key_for_process();
+    mark_mobile_encryption_ready();
+}
+
+fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
+    if key_id <= 0 || bytes.len() != 32 {
+        return false;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(bytes);
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if TEST_FAIL_NEXT_MOBILE_KEY_INSTALL.swap(false, Ordering::SeqCst) {
+            panic!("injected mobile key install failure");
+        }
+        // One Keystore-unwrapped data key protects both: the body-file envelope (#0B) AND
+        // the SQLCipher store DB (its PRAGMA key). Both installed before the engine opens
+        // the store or writes a body.
+        isyncyou_core::envelope::set_body_key(key_id as u32, k);
+        isyncyou_core::envelope::require_body_envelope_for_process();
+        isyncyou_store::set_store_key(k.to_vec());
+        isyncyou_store::require_store_key_for_process();
+        mark_mobile_encryption_ready();
+    }))
+    .is_ok()
+}
+
 fn mobile_roots(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (base.join("archive"), base.join("sync"), base.join("cache"))
+}
+
+fn has_plaintext_sqlite_header(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut magic = [0u8; 16];
+    match f.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == b"SQLite format 3\0"),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn cleanup_legacy_plaintext_mobile_state(base: &Path) -> Result<(), String> {
+    let archive_root = base.join("archive");
+    let db = archive_root.join(".isyncyou-store.db");
+    if !has_plaintext_sqlite_header(&db).map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    for p in [
+        db.clone(),
+        archive_root.join(".isyncyou-store.db-wal"),
+        archive_root.join(".isyncyou-store.db-shm"),
+    ] {
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    for p in [base.join("cache"), base.join("sync")] {
+        match std::fs::remove_dir_all(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    isyncyou_core::obs::event(
+        "mobile-encryption",
+        "legacy-plaintext-cache-cleared",
+        "scope=store-db-bodies",
+    );
+    Ok(())
 }
 
 fn prepare_mobile_config_for_files_dir(cfg: &mut Config, base: &Path) -> Result<(), String> {
@@ -343,7 +456,13 @@ pub fn confirm_action(pending_id: &str) -> bool {
 }
 
 fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
+    if !mobile_encryption_ready() {
+        return Err("encrypted storage setup failed; local data was not opened".into());
+    }
+    isyncyou_core::envelope::require_body_envelope_for_process();
+    isyncyou_store::require_store_key_for_process();
     let base = PathBuf::from(files_dir);
+    cleanup_legacy_plaintext_mobile_state(&base)?;
     let (archive_root, sync_root, cache_root) = mobile_roots(&base);
     // OneDrive online/sync-mode lazy previews live here, apart from the offline working
     // copy in sync_root (#onedrive-mobile 0C); the writeback scanner ignores it.
@@ -661,19 +780,11 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyK
         Ok(b) => b,
         Err(_) => return 0,
     };
-    if bytes.len() != 32 {
-        return 0;
+    if install_mobile_body_key(key_id, &bytes) {
+        1
+    } else {
+        0
     }
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&bytes);
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        // One Keystore-unwrapped data key protects both: the body-file envelope (#0B) AND
-        // the SQLCipher store DB (its PRAGMA key). Both installed before the engine opens
-        // the store or writes a body.
-        isyncyou_core::envelope::set_body_key(key_id as u32, k);
-        isyncyou_store::set_store_key(k.to_vec());
-    }));
-    1
 }
 
 /// JNI: record a successful native `BiometricPrompt` for a pending destructive action
@@ -703,6 +814,7 @@ mod tests {
         // Host test of the non-JNI core (#89 P4 / #0A): start succeeds, mints a session
         // token, and a second call reuses the SAME running engine (Activity recreation must
         // not start a second one). No loopback port is bound in the default build.
+        install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         start_engine(path).expect("engine starts");
@@ -711,6 +823,49 @@ mod tests {
         start_engine(path).expect("idempotent restart");
         let tok2 = session_token().expect("token present");
         assert_eq!(tok1, tok2, "second start must reuse the running engine");
+    }
+
+    #[test]
+    fn mobile_start_inner_fails_closed_without_encryption_ready() {
+        reset_mobile_encryption_ready_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = match start_inner(dir.path().to_str().unwrap()) {
+            Ok(_) => panic!("start_inner must fail without encryption readiness"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("encrypted storage setup failed"),
+            "startup must expose a redacted encrypted-storage failure: {err}"
+        );
+        assert!(
+            !dir.path()
+                .join("archive")
+                .join(".isyncyou-store.db")
+                .exists(),
+            "no plaintext store is created when encryption setup failed"
+        );
+    }
+
+    #[test]
+    fn mobile_body_key_install_rejects_bad_length_and_panic() {
+        reset_mobile_encryption_ready_for_tests();
+        assert!(!install_mobile_body_key(1, &[1, 2, 3]));
+        assert!(!mobile_encryption_ready());
+
+        TEST_FAIL_NEXT_MOBILE_KEY_INSTALL.store(true, Ordering::SeqCst);
+        assert!(!install_mobile_body_key(1, &[7u8; 32]));
+        assert!(!mobile_encryption_ready());
+    }
+
+    #[test]
+    fn mobile_body_key_install_marks_encryption_ready_on_success() {
+        reset_mobile_encryption_ready_for_tests();
+
+        assert!(install_mobile_body_key(1, &[7u8; 32]));
+
+        assert!(mobile_encryption_ready());
     }
 
     #[test]
@@ -873,6 +1028,7 @@ mod tests {
 
     #[test]
     fn mobile_config_start_inner_forces_poll_interval_and_persists_once() {
+        install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("isyncyou.toml");
         let mut cfg = Config::default();
@@ -888,6 +1044,40 @@ mod tests {
         assert_eq!(me.archive_root, dir.path().join("archive"));
         assert_eq!(me.sync_root, dir.path().join("sync"));
         assert_eq!(me.cache_root, dir.path().join("cache"));
+    }
+
+    #[test]
+    fn mobile_start_inner_clears_legacy_plaintext_cache_but_keeps_tokens() {
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive");
+        let cache = dir.path().join("cache");
+        let sync = dir.path().join("sync");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::write(
+            archive.join(".isyncyou-store.db"),
+            b"SQLite format 3\0legacy plaintext",
+        )
+        .unwrap();
+        std::fs::write(archive.join(".isyncyou-store.db-wal"), b"wal").unwrap();
+        std::fs::write(archive.join(".isyncyou-store.db-shm"), b"shm").unwrap();
+        std::fs::write(archive.join(".isyncyou-token-write.json"), b"token").unwrap();
+        std::fs::write(cache.join("plain-cache.txt"), b"sentinel").unwrap();
+        std::fs::write(sync.join("plain-sync.txt"), b"sentinel").unwrap();
+
+        let _engine = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+
+        assert!(!archive.join(".isyncyou-store.db").exists());
+        assert!(!archive.join(".isyncyou-store.db-wal").exists());
+        assert!(!archive.join(".isyncyou-store.db-shm").exists());
+        assert_eq!(
+            std::fs::read(archive.join(".isyncyou-token-write.json")).unwrap(),
+            b"token"
+        );
+        assert!(!cache.join("plain-cache.txt").exists());
+        assert!(!sync.join("plain-sync.txt").exists());
     }
 
     #[test]
@@ -1050,6 +1240,7 @@ mod tests {
         // phone — serves the UI shell and fully session-token gates the data API **entirely
         // in-process**, with NO loopback TCP port. `asset_request` serves the shell (as the
         // WebView's shouldInterceptRequest does); `bridge_request` carries the data API.
+        install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
@@ -1094,6 +1285,7 @@ mod tests {
         // #0A: the in-process bridge answers against the same router as loopback and
         // enforces the same session gate — proving the phone needs no TCP port to serve
         // its own UI's data calls.
+        install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
@@ -1119,6 +1311,7 @@ mod tests {
     fn asset_request_serves_the_shell_framed_binary_safe() {
         // #0A: browser-initiated GETs (shell + subresources) are served binary-safe with
         // an explicit content-type, so images/viewers survive intact (no lossy UTF-8).
+        install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let framed = asset_request("/", None);
@@ -1142,6 +1335,7 @@ mod tests {
         // #0A: the push-stream FFI plumbing — gating + open/close registry. Event delivery
         // semantics are proven in webui's open_bridge_stream test; the full push round-trip
         // is device-verified.
+        install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");

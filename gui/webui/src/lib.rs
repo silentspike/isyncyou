@@ -24,6 +24,7 @@
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4185,10 +4186,31 @@ impl Router {
                                 .map(|a| a.archive_root.clone())
                         })
                         .flatten();
+                    let strict_body_acc = (service == "onedrive"
+                        && isyncyou_core::envelope::body_envelope_required_for_process())
+                    .then(|| self.config.accounts.iter().find(|a| a.id == account))
+                    .flatten();
+                    let strict_body_all = if strict_body_acc.is_some() {
+                        match store.items_by_service(account, service) {
+                            Ok(all) => Some(all),
+                            Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+                        }
+                    } else {
+                        None
+                    };
+                    let strict_body_by_id = strict_body_all.as_ref().map(|all| {
+                        all.iter()
+                            .map(|i| (i.remote_id.as_str(), i))
+                            .collect::<HashMap<&str, &Item>>()
+                    });
                     let arr: Vec<Value> = items
                         .iter()
                         .map(|it| {
-                            let mut v = item_json(it);
+                            let mut v = item_json_with_mobile_body_policy(
+                                it,
+                                strict_body_acc,
+                                strict_body_by_id.as_ref(),
+                            );
                             if let Some(root) = archive_root.as_ref() {
                                 let rel = isyncyou_connectors::shard_rel(
                                     "onedrive",
@@ -4228,6 +4250,23 @@ impl Router {
         };
         match store.items_by_service_page(account, service, limit, offset) {
             Ok(items) => {
+                let strict_body_acc = (service == "onedrive"
+                    && isyncyou_core::envelope::body_envelope_required_for_process())
+                .then(|| self.config.accounts.iter().find(|a| a.id == account))
+                .flatten();
+                let strict_body_all = if strict_body_acc.is_some() {
+                    match store.items_by_service(account, service) {
+                        Ok(all) => Some(all),
+                        Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+                    }
+                } else {
+                    None
+                };
+                let strict_body_by_id = strict_body_all.as_ref().map(|all| {
+                    all.iter()
+                        .map(|i| (i.remote_id.as_str(), i))
+                        .collect::<HashMap<&str, &Item>>()
+                });
                 // Rows are enriched with a read-only `preview` parsed from the
                 // archived body on disk, so the bespoke views render richly without an
                 // extra request per item. Additive + best-effort: items without a
@@ -4251,7 +4290,11 @@ impl Router {
                     items
                         .iter()
                         .map(|it| {
-                            let mut v = item_json(it);
+                            let mut v = item_json_with_mobile_body_policy(
+                                it,
+                                strict_body_acc,
+                                strict_body_by_id.as_ref(),
+                            );
                             // Fast path (schema v12): a mail row whose `preview` was
                             // already computed is served straight from the DB column —
                             // no `.eml`/`.json` read, no MIME parse, no attachment decode.
@@ -4341,7 +4384,16 @@ impl Router {
                         })
                         .collect()
                 } else {
-                    items.iter().map(item_json).collect()
+                    items
+                        .iter()
+                        .map(|it| {
+                            item_json_with_mobile_body_policy(
+                                it,
+                                strict_body_acc,
+                                strict_body_by_id.as_ref(),
+                            )
+                        })
+                        .collect()
                 };
                 // Persist freshly parsed previews so later loads hit the DB fast path.
                 // Brief writable open; if the writer lock is busy (a sync is running) this
@@ -4376,7 +4428,30 @@ impl Router {
         };
         let account = req.q("account").unwrap_or_default();
         match store.get_item(account, service, id) {
-            Ok(Some(it)) => ApiResponse::ok_json(&item_json(&it)),
+            Ok(Some(it)) => {
+                let strict_body_acc = (service == "onedrive"
+                    && isyncyou_core::envelope::body_envelope_required_for_process())
+                .then(|| self.config.accounts.iter().find(|a| a.id == account))
+                .flatten();
+                let strict_body_all = if strict_body_acc.is_some() {
+                    match store.items_by_service(account, service) {
+                        Ok(all) => Some(all),
+                        Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+                    }
+                } else {
+                    None
+                };
+                let strict_body_by_id = strict_body_all.as_ref().map(|all| {
+                    all.iter()
+                        .map(|i| (i.remote_id.as_str(), i))
+                        .collect::<HashMap<&str, &Item>>()
+                });
+                ApiResponse::ok_json(&item_json_with_mobile_body_policy(
+                    &it,
+                    strict_body_acc,
+                    strict_body_by_id.as_ref(),
+                ))
+            }
             Ok(None) => ApiResponse::error(404, "item not found"),
             Err(e) => ApiResponse::error(500, &format!("query: {e}")),
         }
@@ -4415,7 +4490,7 @@ impl Router {
             let items = store
                 .items_by_service(account, service)
                 .map_err(|e| ApiResponse::error(500, &format!("query: {e}")))?;
-            let by_id: std::collections::HashMap<&str, &Item> =
+            let by_id: HashMap<&str, &Item> =
                 items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
             isyncyou_connectors::local_rel_path(&by_id, &it)
                 .ok_or_else(|| ApiResponse::error(404, "item has no archived body"))?
@@ -4443,9 +4518,17 @@ impl Router {
         let path = body_root.join(&rel);
         match (path.canonicalize(), body_root.canonicalize()) {
             (Ok(p), Ok(root)) if p.starts_with(&root) => {
-                // Decrypt the sealed body envelope on read (#0B); a plaintext file (desktop)
-                // passes through unchanged.
-                match isyncyou_core::envelope::read_body(&p) {
+                // Desktop may still carry plaintext OneDrive cache files. Mobile sets the
+                // process policy after Keystore unwrap; from then on a raw plaintext body is
+                // not a valid local OneDrive body.
+                let read = if service == "onedrive"
+                    && isyncyou_core::envelope::body_envelope_required_for_process()
+                {
+                    isyncyou_core::envelope::read_sealed_body_required(&p)
+                } else {
+                    isyncyou_core::envelope::read_body(&p)
+                };
+                match read {
                     Ok(bytes) => Ok((rel, bytes, name)),
                     Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
                 }
@@ -4799,12 +4882,13 @@ fn backup_state(it: &Item) -> &'static str {
 }
 
 fn item_json(it: &Item) -> Value {
-    // `has_body`: for OneDrive (mobile modes, schema v14) a body is only "present" when
-    // it is materialized AND valid — `body_state == "available"`; a filesystem probe
-    // (`local_path`) would falsely mark a metadata-only Mode-2 row as openable. Every
-    // other service keeps the `local_path`-based meaning (its body is a plain archived
-    // file). OneDrive rows also carry their content-state fields so the UI can render
-    // online / syncing / offline / conflict without a second request.
+    // `has_body`: for OneDrive (mobile modes, schema v14) the DB-level signal is
+    // `body_state == "available"`; a filesystem probe (`local_path`) would falsely
+    // mark a metadata-only Mode-2 row as openable. In the mobile encrypted process,
+    // `item_json_with_mobile_body_policy` tightens this to a strict envelope probe.
+    // Every other service keeps the `local_path`-based meaning (its body is a plain
+    // archived file). OneDrive rows also carry their content-state fields so the UI
+    // can render online / syncing / offline / conflict without a second request.
     let has_body = if it.service == "onedrive" {
         it.body_state.as_deref() == Some("available")
     } else {
@@ -4833,6 +4917,50 @@ fn item_json(it: &Item) -> Value {
         v["conflict_state"] = json!(it.conflict_state);
         // #659: surface the last download failure so the UI can show a retry affordance.
         v["last_download_error"] = json!(it.last_download_error);
+    }
+    v
+}
+
+fn onedrive_body_root(acc: &isyncyou_core::AccountConfig, it: &Item) -> PathBuf {
+    if it.body_location.as_deref() == Some("cache") {
+        acc.effective_cache_root()
+    } else {
+        acc.sync_root.clone()
+    }
+}
+
+fn onedrive_has_sealed_body(
+    acc: &isyncyou_core::AccountConfig,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) -> bool {
+    if it.body_state.as_deref() != Some("available") {
+        return false;
+    }
+    let Some(rel) = isyncyou_connectors::local_rel_path(by_id, it) else {
+        return false;
+    };
+    let root = onedrive_body_root(acc, it);
+    let path = root.join(rel);
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(p), Ok(root)) if p.starts_with(&root) => {
+            isyncyou_core::envelope::probe_sealed_body_required(&p).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn item_json_with_mobile_body_policy(
+    it: &Item,
+    acc: Option<&isyncyou_core::AccountConfig>,
+    by_id: Option<&HashMap<&str, &Item>>,
+) -> Value {
+    let mut v = item_json(it);
+    if it.service == "onedrive" && isyncyou_core::envelope::body_envelope_required_for_process() {
+        v["has_body"] = json!(match (acc, by_id) {
+            (Some(acc), Some(by_id)) => onedrive_has_sealed_body(acc, by_id, it),
+            _ => false,
+        });
     }
     v
 }
@@ -8879,6 +9007,77 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             serde_json::json!(true),
             "mail with local_path = has_body (unchanged semantics)"
         );
+    }
+
+    #[test]
+    fn mobile_body_policy_rejects_plaintext_onedrive_bodies_in_listing() {
+        struct ResetBodyRequirement;
+        impl Drop for ResetBodyRequirement {
+            fn drop(&mut self) {
+                isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+            }
+        }
+        let _reset = ResetBodyRequirement;
+        isyncyou_core::envelope::set_body_key(719, [7u8; 32]);
+        isyncyou_core::envelope::require_body_envelope_for_process();
+
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("archive");
+        let sync = dir.path().join("sync");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut item = Item::new("a", "onedrive", "file-id", "doc.txt", "file");
+            item.local_path = Some("doc.txt".into());
+            store.upsert_item(&item).unwrap();
+            store
+                .set_content_state(
+                    "a",
+                    "onedrive",
+                    "file-id",
+                    Some("cached"),
+                    Some("cache"),
+                    Some("available"),
+                    None,
+                )
+                .unwrap();
+        }
+        std::fs::write(cache.join("doc.txt"), b"raw plaintext sentinel").unwrap();
+        let router = Router::new(Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: sync,
+                archive_root: arch,
+                cache_root: cache.clone(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        });
+
+        let listed = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=onedrive&limit=10",
+        )));
+        assert_eq!(
+            listed["items"][0]["has_body"], false,
+            "mobile listing must not treat plaintext as a valid OneDrive body"
+        );
+
+        isyncyou_core::envelope::write_body_atomic(&cache.join("doc.txt"), b"sealed bytes")
+            .unwrap();
+        let listed = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=onedrive&limit=10",
+        )));
+        assert_eq!(listed["items"][0]["has_body"], true);
+
+        let body = router.route(&ApiRequest::get(
+            "/api/v1/body?account=a&service=onedrive&id=file-id",
+        ));
+        assert_eq!(body.status, 200);
+        assert_eq!(body.body, b"sealed bytes");
     }
 
     #[test]
