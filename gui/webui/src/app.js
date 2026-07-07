@@ -320,75 +320,34 @@ const CAP = {
   onedriveManage: "__ONEDRIVE_MANAGE_CAP_TOKEN__",
 };
 
-/* ---------------------------------------------------------------- push registration (#576)
-   The native Android shell exposes this device's FCM token via a JS bridge
-   (window.AndroidPush.fcmToken()); register it with the daemon so server-side
-   events (e.g. "backup complete") can notify the phone. No-op in a plain browser
-   (no bridge) or when push is disabled (empty cap token). The token is a device
-   address, not a secret — but we still send it same-origin only. */
-async function registerPushToken() {
-  try {
-    if (!CAP.push) return;                      // push disabled on this daemon
-    const bridge = window.AndroidPush;
-    if (!bridge || typeof bridge.fcmToken !== "function") return; // plain browser
-    const token = bridge.fcmToken();
-    if (!token) return;                         // token not fetched yet
-    await post(`/api/v1/push/register?${qs({ token })}`, CAP.push);
-  } catch (_) { /* best-effort: never block UI load on push */ }
-}
-/* Standalone/mobile (#89): the embedded engine's loopback API is fully gated by a
-   per-process session token. The native shell delivers it two ways — a JS bridge
-   (window.AndroidSession) and an `isy_session` loopback cookie set *before* the page
-   loads. The cookie is the robust carrier: it is readable synchronously at parse time
-   (the bridge can attach a tick later, racing the first synchronous script run on some
-   WebViews) and auto-rides fetch()/iframe/img subresources. On the desktop daemon
-   neither is present (the gate is off), so both resolve to "". */
-function cookieVal(name) {
-  try {
-    const m = (typeof document !== "undefined" ? document.cookie : "")
-      .match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
-    return m ? decodeURIComponent(m[1]) : "";
-  } catch (_) { return ""; }
-}
-function sessionToken() {
-  try {
-    const viaBridge = (window.AndroidSession && window.AndroidSession.token && window.AndroidSession.token()) || "";
-    return viaBridge || cookieVal("isy_session");
-  } catch (_) { return cookieVal("isy_session"); }
-}
-function sessionHeaders() { const t = sessionToken(); return t ? { "X-Session-Token": t } : {}; }
-/* Standalone mobile app (#89 P6): detect the phone profile from the session signal
-   (cookie present, or the bridge) so the UI reads truthfully as a *cache/live
-   companion* ("cached on this device"), not a backup-of-record — the laptop holds the
-   backup. The cookie check is parse-time-reliable (the bridge alone races the first
-   synchronous script run on some WebViews). Restore UI is already hidden in this
-   profile (no restore capability token is injected). */
-const MOBILE = typeof window !== "undefined" &&
-  (!!window.AndroidSession || cookieVal("isy_session") !== "");
-/* Transport (#0A): the standalone phone may expose an in-process message bridge
-   (window.__isyBridge — an origin-bound WebMessageListener) so the data path needs no
-   loopback TCP port, unreachable from any other app. When it is absent (the desktop
-   daemon, or a phone build before the bridge) everything falls back to fetch() with
-   identical behaviour. The bridge also carries a request body natively — the query-string
-   API needs none today, but uploads will. The push/EventSource half is converted together
-   with the native bridge (on-device) so the two ends of the wire are tested as one. */
+/* Transport (#0A/#721): the standalone phone exposes an origin-bound WebMessage bridge.
+   WebView JS never reads or sends the native session token; Kotlin injects the trusted
+   Activity session for bridge requests and app-origin resources. Desktop keeps the normal
+   fetch/EventSource path. */
 const BRIDGE = (typeof window !== "undefined" && window.__isyBridge) || null;
+const MOBILE = !!BRIDGE;
 let _bridgeSeq = 0;
-const _bridgePending = new Map(); // request id -> { resolve }
+const BRIDGE_TIMEOUT_MS = 15000;
+const NATIVE_TIMEOUT_MS = 5000;
+const BIO_TIMEOUT_MS = 120000;
+const _bridgePending = new Map(); // request/native id -> { resolve, reject, timer }
 const _bridgeStreams = new Map(); // stream id -> onEvent handler
-const _bioPending = new Map();    // biometric request id -> { resolve } (#0.6)
+const _bioPending = new Map();    // biometric request id -> { resolve, timer } (#0.6)
+const _bridgeStats = { requests: 0, native: 0, streams: 0, bio: 0, events: 0 };
+if (typeof window !== "undefined") window.__isyBridgeTransportStats = _bridgeStats;
 if (BRIDGE) {
   BRIDGE.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
     if (m.t === "res") {
       const p = _bridgePending.get(m.id);
-      if (p) { _bridgePending.delete(m.id); p.resolve({ status: m.status, body: m.body }); }
+      if (p) { _bridgePending.delete(m.id); clearTimeout(p.timer); p.resolve({ status: m.status, body: m.body }); }
     } else if (m.t === "bio") {
       // Native BiometricPrompt result (#0.6): {ok} tells us whether the human confirmed.
       const p = _bioPending.get(m.id);
-      if (p) { _bioPending.delete(m.id); p.resolve(!!m.ok); }
+      if (p) { _bioPending.delete(m.id); clearTimeout(p.timer); p.resolve(!!m.ok); }
     } else if (m.t === "evt") {
       const h = _bridgeStreams.get(m.id);
+      _bridgeStats.events++;
       if (h && m.ev) h.onEvent(m.ev.event || "message", m.ev.data || "");
     } else if (m.t === "end") {
       const h = _bridgeStreams.get(m.id);
@@ -396,12 +355,54 @@ if (BRIDGE) {
     }
   };
 }
-function bridgeSend(method, path, headers, body) {
-  return new Promise((resolve) => {
-    const id = "r" + (++_bridgeSeq);
-    _bridgePending.set(id, { resolve });
-    BRIDGE.postMessage(JSON.stringify({ t: "req", id, method, path, headers, body: body ?? null }));
+function bridgeRoundTrip(msg, timeoutMs) {
+  if (!BRIDGE) return Promise.reject(new Error("Bridge unavailable"));
+  return new Promise((resolve, reject) => {
+    const id = msg.id || ("n" + (++_bridgeSeq));
+    msg.id = id;
+    const timer = setTimeout(() => {
+      _bridgePending.delete(id);
+      reject(new Error("Bridge timeout"));
+    }, timeoutMs || BRIDGE_TIMEOUT_MS);
+    _bridgePending.set(id, { resolve, reject, timer });
+    try {
+      BRIDGE.postMessage(JSON.stringify(msg));
+    } catch (e) {
+      clearTimeout(timer);
+      _bridgePending.delete(id);
+      reject(e);
+    }
   });
+}
+function bridgeSend(method, path, headers, body) {
+  const id = "r" + (++_bridgeSeq);
+  _bridgeStats.requests++;
+  return bridgeRoundTrip({ t: "req", id, method, path, headers, body: body ?? null }, BRIDGE_TIMEOUT_MS);
+}
+async function nativeCall(op, payload, timeoutMs) {
+  const id = "n" + (++_bridgeSeq);
+  _bridgeStats.native++;
+  const res = await bridgeRoundTrip({ t: "native", id, op, payload: payload || {} }, timeoutMs || NATIVE_TIMEOUT_MS);
+  let body = {};
+  try { body = res.body ? JSON.parse(res.body) : {}; } catch (_) { body = {}; }
+  const status = Number(res.status);
+  if (!Number.isFinite(status) || status < 200 || status >= 300) {
+    throw new Error(body.error || body.reason || status || "Native call failed");
+  }
+  return body;
+}
+/* ---------------------------------------------------------------- push registration (#576)
+   In the Android shell, the FCM token is read through the origin-bound native bridge.
+   Empty token is a no-op/retry; a plain browser has no bridge and skips this entirely. */
+async function registerPushToken() {
+  try {
+    if (!CAP.push || !BRIDGE) return false;
+    const d = await nativeCall("pushToken", {}, NATIVE_TIMEOUT_MS);
+    const token = d && d.token;
+    if (!token) return false;
+    await post(`/api/v1/push/register?${qs({ token })}`, CAP.push);
+    return true;
+  } catch (_) { return false; } // best-effort: never block UI load on push
 }
 /* Ask the native side (#0.6) to run a BiometricPrompt and, on success, arm the server's
    per-action token for `pat`. Resolves true only if the human authenticated. Without the
@@ -410,8 +411,19 @@ function runBiometricConfirm(pat, label) {
   if (!BRIDGE) return Promise.resolve(false);
   return new Promise((resolve) => {
     const id = "b" + (++_bridgeSeq);
-    _bioPending.set(id, { resolve });
-    BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat, label }));
+    const timer = setTimeout(() => {
+      _bioPending.delete(id);
+      resolve(false);
+    }, BIO_TIMEOUT_MS);
+    _bioPending.set(id, { resolve, timer });
+    _bridgeStats.bio++;
+    try {
+      BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat, label }));
+    } catch (_) {
+      clearTimeout(timer);
+      _bioPending.delete(id);
+      resolve(false);
+    }
   });
 }
 /* A short human label for the biometric sheet from the challenge payload (#0.6). */
@@ -420,16 +432,15 @@ function biometricLabel(d) {
     : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
   return `${verb} in ${d.service || "Microsoft 365"}`;
 }
-/* Open an SSE-style stream over the active transport (#0A): the native bridge push
-   channel when present, else EventSource. `onEvent(name, data)` fires per event (name is
-   the SSE `event:` field — "message" when unnamed); `onError()` on stream end/drop.
-   Returns a handle with close(). The two ends of the wire (this + Router::open_bridge_stream)
-   are verified together on-device. */
+/* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses
+   the native stream path and never falls back to EventSource. Desktop uses EventSource. */
 function openEventStream(path, onEvent, onError) {
   if (BRIDGE) {
     const id = "s" + (++_bridgeSeq);
     _bridgeStreams.set(id, { onEvent, onError });
-    BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path }));
+    _bridgeStats.streams++;
+    try { BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path })); }
+    catch (e) { _bridgeStreams.delete(id); if (onError) setTimeout(onError, 0); }
     return { close() { _bridgeStreams.delete(id); try { BRIDGE.postMessage(JSON.stringify({ t: "unsub", id })); } catch (_) {} } };
   }
   const es = new EventSource(path);
@@ -442,13 +453,18 @@ function openEventStream(path, onEvent, onError) {
 /* One request over the active transport; returns parsed JSON, throws on non-2xx. */
 async function request(method, path, opts) {
   const o = opts || {};
-  const headers = sessionHeaders();
+  const headers = {};
   if (o.capToken) headers["X-Capability-Token"] = o.capToken;
-  if (o.headers) Object.assign(headers, o.headers); // #657: e.g. X-Body-Encoding: base64
+  if (o.headers) {
+    Object.entries(o.headers).forEach(([k, v]) => {
+      if (BRIDGE && k.toLowerCase() === "x-session-token") return;
+      headers[k] = v;
+    });
+  } // #657: e.g. X-Body-Encoding: base64
   let status, d;
   if (BRIDGE) {
     const res = await bridgeSend(method, path, headers, o.body);
-    status = res.status;
+    status = Number(res.status);
     d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
   } else {
     const init = { method, headers };
@@ -468,7 +484,7 @@ async function request(method, path, opts) {
     const sep = path.includes("?") ? "&" : "?";
     return request(method, `${path}${sep}_pat=${encodeURIComponent(d.pending_action_id)}`, opts);
   }
-  if (status < 200 || status >= 300) throw new Error(d.error || status);
+  if (!Number.isFinite(status) || status < 200 || status >= 300) throw new Error(d.error || status || "Request failed");
   return d;
 }
 async function api(path) { return request("GET", path); }
@@ -2186,7 +2202,7 @@ function driveFileUrl(it) {
 }
 // Open a file's content. Desktop opens the archived copy in a new browser tab. The mobile
 // WebView has no WebChromeClient (window.open is a no-op), so show the on-demand content in an
-// in-app full-screen viewer whose iframe authenticates via the isy_session cookie (#649).
+  // in-app full-screen viewer whose app-origin iframe is served by the trusted native asset path (#649/#721).
 function driveOpenFile(it) {
   const url = driveFileUrl(it);
   if (!MOBILE) { window.open(url, "_blank", "noopener"); return; }
@@ -4395,50 +4411,66 @@ function openAccountSwitcher() {
   renderAccountMenu(body);
 }
 /* ---------------------------------------------------------------- assistant (S-AG.12: connect) */
-// Begin the device OAuth login: ask the engine for an authorize URL, then navigate to
-// it. The WebView hands the external https URL to the system browser (shouldOverride-
-// UrlLoading), where the operator signs in to their own provider account; the browser
-// returns to our loopback callback, which exchanges the code and stores the token.
-// Loopback-primary login (matches the real claude client): the browser returns to the
-// engine's own /callback, which completes the exchange server-side; the UI polls status.
+// Begin OAuth/device-code login by asking the engine for a provider URL and handing it
+// to the system browser. Mobile uses typed native bridge ops; desktop keeps browser
+// navigation. The engine completes the callback/token exchange and the UI polls status.
+function openDesktopExternal(url, newTab) {
+  if (newTab && typeof window !== "undefined" && window.open) {
+    const w = window.open(url, "_blank", "noopener");
+    if (w) return;
+  }
+  location.href = url;
+}
+async function openExternalAuth(url, kind, opts) {
+  if (!url) throw new Error("Missing auth URL");
+  if (BRIDGE) {
+    await nativeCall("openExternal", { url, kind }, NATIVE_TIMEOUT_MS);
+    return;
+  }
+  openDesktopExternal(url, !!(opts && opts.newTab));
+}
+async function beginNetworkGuard() {
+  if (!BRIDGE) return null;
+  const d = await nativeCall("beginNetworkGuard", {}, NATIVE_TIMEOUT_MS);
+  return d && d.guard_id ? d.guard_id : null;
+}
+async function endNetworkGuard(guardId) {
+  if (!BRIDGE || !guardId) return;
+  try { await nativeCall("endNetworkGuard", { guard_id: guardId }, NATIVE_TIMEOUT_MS); } catch (_) {}
+}
 
-// Open an external auth URL by handing the RAW string to the native bridge (→ ACTION_VIEW).
-// NOT location.href: that routes the URL through the WebView's own navigation, which re-parses/
-// normalises it — mangling the percent-encoded redirect_uri/scope and following the
-// claude.com/cai→claude.ai redirect in-WebView before hand-off — after which claude.ai rejects
-// the consent submit with "Invalid request format". Verified on-device 2026-07-01: a direct
-// browser open completes the consent, the WebView location.href fails. Desktop → location.href.
-function openExternalAuth(url) {
-  if (window.AndroidNav && window.AndroidNav.openExternal) window.AndroidNav.openExternal(url);
-  else location.href = url;
+let AGENT_GUARD_ID = null;
+let CODEX_GUARD_ID = null;
+async function finishAgentGuard() {
+  const id = AGENT_GUARD_ID;
+  AGENT_GUARD_ID = null;
+  await endNetworkGuard(id);
 }
-// Hold the app process foreground (via a short-lived FGS) across the OAuth browser
-// round-trip, so the loopback token exchange isn't killed by the APP_BACKGROUND network
-// restriction. No-op off-Android. Always paired with endNetworkGuard() on completion/
-// timeout/cancel (#640).
-function beginNetworkGuard() {
-  if (window.AndroidNav && window.AndroidNav.beginNetworkGuard) window.AndroidNav.beginNetworkGuard();
+async function finishCodexGuard() {
+  const id = CODEX_GUARD_ID;
+  CODEX_GUARD_ID = null;
+  await endNetworkGuard(id);
 }
-function endNetworkGuard() {
-  if (window.AndroidNav && window.AndroidNav.endNetworkGuard) window.AndroidNav.endNetworkGuard();
+function localCallbackRedirect(host) {
+  return location.port ? `http://${host}:${location.port}/callback` : "";
 }
 
 async function startAiLogin(provider) {
+  let guardId = null;
   try {
-    // Loopback flow with a `localhost` redirect — matches the real `claude setup-token`, which
-    // uses `http://localhost:<port>/callback` and completes the consent. Controlled comparison
-    // (2026-07-01, same host `claude.com/cai` + scope `user:inference`): the loopback redirect
-    // is ACCEPTED, while the manual `platform.claude.com/oauth/code/callback` redirect is
-    // rejected on-device with "Invalid request format". Codex ignores this redirect (its engine
-    // binds its own 127.0.0.1:1455 listener). The engine's `/callback` completes the exchange.
-    const redirect = "http://localhost:" + location.port + "/callback";
-    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider, redirect }), CAP.agent);
+    const params = { provider };
+    const redirect = localCallbackRedirect("localhost");
+    if (redirect) params.redirect = redirect;
+    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
     showWaitingStep();               // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    beginNetworkGuard();             // keep the loopback exchange alive while backgrounded (#640)
-    openExternalAuth(d.authorize_url); // native bridge (raw URL) — NOT location.href (see below)
+    guardId = await beginNetworkGuard();
+    AGENT_GUARD_ID = guardId;
+    await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
+    if (guardId) await endNetworkGuard(guardId);
+    if (AGENT_GUARD_ID === guardId) AGENT_GUARD_ID = null;
     toast("Sign-in unavailable: " + (e.message || e));
   }
 }
@@ -4459,13 +4491,13 @@ function showWaitingStep() {
   if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0); }
 }
 async function pollAgentStatus(n) {
-  if (App.route !== "assistant") { AGENT_POLL_ON = false; endNetworkGuard(); return; }
+  if (App.route !== "assistant") { AGENT_POLL_ON = false; await finishAgentGuard(); return; }
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.connected) { AGENT_POLL_ON = false; endNetworkGuard(); toast("Connected!"); renderAssistantView($("#view")); return; }
+    if (s && s.connected) { AGENT_POLL_ON = false; await finishAgentGuard(); toast("Connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
   if (n < 90) { setTimeout(() => pollAgentStatus(n + 1), 2000); }
-  else { AGENT_POLL_ON = false; endNetworkGuard(); }
+  else { AGENT_POLL_ON = false; await finishAgentGuard(); }
 }
 
 // Swap the connect card to the "paste your code" step.
@@ -4615,30 +4647,32 @@ async function pickModel(provider, model) {
     toast("Could not switch model: " + (err.message || err));
   }
 }
-// Start the real on-device ChatGPT/Codex OAuth (opens the system browser; the daemon's
-// loopback callback server catches the redirect). Then poll until codex connects.
 async function connectCodex() {
+  let guardId = null;
   try {
-    // Codex ignores this redirect (its engine binds a fixed 127.0.0.1:1455 callback listener);
-    // we pass a loopback origin only for symmetry with the API.
-    const redirect = "http://127.0.0.1:" + location.port + "/callback";
-    const d = await post("/api/v1/agent/oauth/start?" + qs({ provider: "codex", redirect }), CAP.agent);
+    const params = { provider: "codex" };
+    const redirect = localCallbackRedirect("127.0.0.1");
+    if (redirect) params.redirect = redirect;
+    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
     toast("Opening ChatGPT sign-in…");
-    beginNetworkGuard();             // keep the 1455 loopback exchange alive while backgrounded (#640)
-    openExternalAuth(d.authorize_url);
+    guardId = await beginNetworkGuard();
+    CODEX_GUARD_ID = guardId;
+    await openExternalAuth(d.authorize_url, "agent_authorize");
     pollCodexStatus(0);
   } catch (e) {
+    if (guardId) await endNetworkGuard(guardId);
+    if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
     toast("ChatGPT sign-in unavailable: " + (e.message || e));
   }
 }
 async function pollCodexStatus(n) {
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.codex) { endNetworkGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
+    if (s && s.codex) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
   if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
-  else endNetworkGuard();
+  else await finishCodexGuard();
 }
 
 // Progressive-search rendering (S-AG.18/#643, S-AG.19/#644). Module-level so BOTH the live
@@ -4798,8 +4832,7 @@ async function agentSend(text) {
   } catch (e) { setText("Error: " + (e.message || e)); return; }
   if (!turn) { setText("Error: could not start the turn"); return; }
 
-  const tok = sessionToken();
-  const url = "/api/v1/agent/stream?" + qs({ turn }) + (tok ? "&_st=" + encodeURIComponent(tok) : "");
+  const url = "/api/v1/agent/stream?" + qs({ turn });
   // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
   // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
   // event or a stream drop ends the turn.
@@ -4857,12 +4890,19 @@ async function startDeviceLogin(a, body) {
   let dc;
   try { dc = await post("/api/v1/account/login/start?account=" + encodeURIComponent(a.id), CAP.account); }
   catch (e) { toast("Sign-in failed: " + e.message, "err"); renderAccountMenu(body); return; }
+  const openDeviceLogin = async () => {
+    try {
+      await openExternalAuth(dc.verification_uri, "account_device_code", { newTab: true });
+    } catch (e) {
+      toast("Could not open sign-in page: " + (e.message || e), "err");
+    }
+  };
   const status = el("div", { class: "acct-dc-status dim", text: "Waiting for you to sign in…" });
   clear(body).append(el("div", { class: "acct-dc" },
     el("div", { class: "acct-dc-title", text: "Sign in to " + (a.username || a.id) }),
     el("p", { class: "dim", text: "Open the page and enter this code:" }),
     el("div", { class: "acct-dc-code", text: dc.user_code || "—" }),
-    el("a", { class: "btn sm primary", href: dc.verification_uri || "#", target: "_blank", rel: "noopener" }, icon("external-link", "icon-sm"), "Open sign-in page"),
+    el("button", { class: "btn sm primary", type: "button", onclick: openDeviceLogin }, icon("external-link", "icon-sm"), "Open sign-in page"),
     status,
     el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: () => renderAccountMenu(body) }, "Cancel")));
   accountMenuPoll = setInterval(async () => {
@@ -4933,10 +4973,8 @@ let _bdT, _evtT;
 // active view (near-real-time). EventSource auto-reconnects if the daemon restarts.
 function subscribeEvents() {
   if (!BRIDGE && !window.EventSource) return;
-  // Transport-abstracted (#0A): the native bridge push channel on the phone (which carries
-  // the session token itself), EventSource on desktop. `_st` covers the EventSource path.
-  const tok = sessionToken();
-  const path = "/api/v1/events" + (tok ? "?_st=" + encodeURIComponent(tok) : "");
+  // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on desktop.
+  const path = "/api/v1/events";
   openEventStream(path, (name) => {
     if (name !== "change") return; // ignore ping heartbeats
     clearTimeout(_evtT);
@@ -5075,13 +5113,16 @@ async function init() {
   setupSwipe();
   // Register this device's push token. The native FCM token is fetched async, so
   // retry a few times before giving up (no-op in a plain browser / when disabled).
-  registerPushToken();
+  let pushRegistered = false;
+  registerPushToken().then((ok) => { pushRegistered = !!ok; });
   let _pushTries = 0;
-  const _pushTimer = setInterval(() => {
-    if (++_pushTries > 5 || (window.AndroidPush && window.AndroidPush.fcmToken())) {
+  const _pushTimer = setInterval(async () => {
+    if (++_pushTries > 5 || pushRegistered) {
       clearInterval(_pushTimer);
+      return;
     }
-    registerPushToken();
+    pushRegistered = await registerPushToken();
+    if (pushRegistered) clearInterval(_pushTimer);
   }, 2000);
 }
 init();
