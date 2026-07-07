@@ -20,6 +20,9 @@ isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+filetime = "0.2"
+
 [features]
 # Desktop default; the mobile crate depends with default-features = false so the
 # whole chain (store, engine, connectors, webui) builds plain (no SQLCipher/OpenSSL,
