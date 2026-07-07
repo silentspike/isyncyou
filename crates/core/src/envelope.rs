@@ -26,6 +26,7 @@
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// A 256-bit body key (from the Android Keystore on mobile; a test/derived key elsewhere).
@@ -40,6 +41,28 @@ const HEADER_LEN: usize = 32;
 const TAG_LEN: usize = 16;
 /// Default plaintext chunk size (64 KiB) — bounds per-chunk memory for large files.
 pub const DEFAULT_CHUNK: u32 = 64 * 1024;
+
+static REQUIRE_BODY_ENVELOPE: AtomicBool = AtomicBool::new(false);
+
+/// Require all OneDrive body reads in this process to use a valid sealed envelope.
+///
+/// Desktop keeps plaintext pass-through compatibility. Mobile calls this only after
+/// the Android Keystore-derived body key has been installed, so WebUI/engine readers
+/// cannot accidentally treat a legacy plaintext file as a valid local OneDrive body.
+pub fn require_body_envelope_for_process() {
+    REQUIRE_BODY_ENVELOPE.store(true, Ordering::SeqCst);
+}
+
+/// Whether this process must reject plaintext body pass-through for OneDrive data.
+pub fn body_envelope_required_for_process() -> bool {
+    REQUIRE_BODY_ENVELOPE.load(Ordering::SeqCst)
+}
+
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn reset_body_envelope_requirement_for_tests() {
+    REQUIRE_BODY_ENVELOPE.store(false, Ordering::SeqCst);
+}
 
 /// Why an envelope could not be produced or opened. Never leaks key material.
 #[derive(Debug, PartialEq, Eq)]
@@ -291,6 +314,27 @@ pub fn read_body(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// Read a body file only if it is a valid sealed envelope. Unlike [`read_body`], this
+/// rejects plaintext pass-through and is therefore the Android/mobile availability check.
+pub fn read_sealed_body_required(path: &Path) -> std::io::Result<Vec<u8>> {
+    let raw = std::fs::read(path)?;
+    let Some(key_id) = blob_key_id(&raw) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "body is not a sealed envelope",
+        ));
+    };
+    let key = key_for_id(key_id).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no body key for blob")
+    })?;
+    open(&raw, &key).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Verify that a body file is sealed and decryptable without exposing its bytes to callers.
+pub fn probe_sealed_body_required(path: &Path) -> std::io::Result<()> {
+    read_sealed_body_required(path).map(|_| ())
+}
+
 /// A temp sibling path in the SAME directory (so the rename is atomic on one filesystem).
 fn tmp_sibling(final_path: &Path) -> std::path::PathBuf {
     let mut name = final_path
@@ -453,6 +497,51 @@ mod tests {
             read_body(&path).unwrap(),
             pt,
             "pre-rotation blob still decrypts"
+        );
+    }
+
+    #[test]
+    fn sealed_body_required_rejects_plaintext_and_invalid_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.bin");
+        let plaintext = b"android-body-sentinel".repeat(32);
+        let key_id = 42_4242;
+        set_body_key(key_id, KEY);
+        write_body_atomic(&path, &plaintext).unwrap();
+
+        assert_eq!(read_sealed_body_required(&path).unwrap(), plaintext);
+        probe_sealed_body_required(&path).unwrap();
+
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, b"raw android-body-sentinel").unwrap();
+        assert_eq!(
+            read_body(&plain).unwrap(),
+            b"raw android-body-sentinel",
+            "desktop plaintext pass-through stays unchanged"
+        );
+        assert_eq!(
+            read_sealed_body_required(&plain).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "mobile strict helper must reject plaintext"
+        );
+
+        let orphan = dir.path().join("orphan.bin");
+        std::fs::write(&orphan, seal(b"secret", &[9u8; 32], 99_999)).unwrap();
+        assert_eq!(
+            read_sealed_body_required(&orphan).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "unknown key id must fail closed"
+        );
+
+        let tampered = dir.path().join("tampered.bin");
+        let mut blob = std::fs::read(&path).unwrap();
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        std::fs::write(&tampered, blob).unwrap();
+        assert_eq!(
+            read_sealed_body_required(&tampered).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "AEAD tampering must fail closed"
         );
     }
 }
