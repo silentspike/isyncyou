@@ -63,4 +63,24 @@ class OAuthGuardRegistryTest {
         assertFalse(registry.end(id))
         assertEquals(1, stopCalls)
     }
+
+    @Test
+    fun clearStopsServiceOnceWhenGuardsAreActive() {
+        var stopCalls = 0
+        val ids = mutableListOf("guard-a", "guard-b")
+        val registry = OAuthGuardRegistry(
+            onStart = {},
+            onStop = { stopCalls += 1 },
+            newId = { ids.removeAt(0) },
+        )
+
+        registry.begin()
+        registry.begin()
+
+        assertEquals(2, registry.clear())
+        assertEquals(1, stopCalls)
+        assertEquals(0, registry.activeCount())
+        assertEquals(0, registry.clear())
+        assertEquals(1, stopCalls)
+    }
 }

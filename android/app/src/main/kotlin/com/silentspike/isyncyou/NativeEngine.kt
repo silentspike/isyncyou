@@ -2,7 +2,9 @@ package com.silentspike.isyncyou
 
 /**
  * JNI bridge to the embedded Rust engine (`libisyncyou_mobile.so`, #89). The native
- * side runs the real iSyncYou engine in-process and serves the web UI over loopback.
+ * side runs the real iSyncYou engine in-process. The Android WebView reaches it
+ * through trusted native asset calls, the origin-bound message bridge, and native
+ * stream handles.
  */
 object NativeEngine {
     init {
@@ -10,9 +12,9 @@ object NativeEngine {
     }
 
     /**
-     * Start the embedded engine (idempotent) and return the bound loopback port, or
-     * -1 on failure. [filesDir] is the app's private files directory; the token
-     * cache + local store live under it.
+     * Start the embedded engine (idempotent) and return a positive ready code, or -1 on
+     * failure. [filesDir] is the app's private files directory; the token cache + local
+     * store live under it.
      */
     external fun nativeStart(filesDir: String): Int
 
@@ -22,8 +24,7 @@ object NativeEngine {
     /**
      * Answer one in-process bridge request (#0A). [requestJson] is the JSON envelope from
      * the WebView's `__isyBridge` (`{t:"req",id,method,path,headers,body}`); the return is
-     * the complete reply envelope (`{t:"res",id,status,body}`) to post back verbatim — no
-     * loopback TCP port is used. All parsing lives in Rust; this side is a dumb forwarder.
+     * the complete reply envelope (`{t:"res",id,status,body}`) to post back verbatim.
      */
     external fun nativeBridgeRequest(requestJson: String): String
 

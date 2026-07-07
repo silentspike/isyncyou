@@ -20,37 +20,35 @@ class BridgeStartupPolicyTest {
 
     @Test
     fun startupDecisionFailsClosedBeforeProceeding() {
-        assertEquals(
-            BridgeStartupDecision.FailForcedDebug,
-            BridgeStartupPolicy.decide(
-                webMessageListenerSupported = true,
-                registrationSucceeded = true,
-                forcedDebugFailure = true,
-            ),
+        val forced = BridgeStartupPolicy.decide(
+            webMessageListenerSupported = true,
+            registrationSucceeded = true,
+            forcedDebugFailure = true,
         )
-        assertEquals(
-            BridgeStartupDecision.FailUnsupported,
-            BridgeStartupPolicy.decide(
-                webMessageListenerSupported = false,
-                registrationSucceeded = true,
-                forcedDebugFailure = false,
-            ),
+        val unsupported = BridgeStartupPolicy.decide(
+            webMessageListenerSupported = false,
+            registrationSucceeded = true,
+            forcedDebugFailure = false,
         )
-        assertEquals(
-            BridgeStartupDecision.FailRegistration,
-            BridgeStartupPolicy.decide(
-                webMessageListenerSupported = true,
-                registrationSucceeded = false,
-                forcedDebugFailure = false,
-            ),
+        val registration = BridgeStartupPolicy.decide(
+            webMessageListenerSupported = true,
+            registrationSucceeded = false,
+            forcedDebugFailure = false,
         )
-        assertEquals(
-            BridgeStartupDecision.Proceed,
-            BridgeStartupPolicy.decide(
-                webMessageListenerSupported = true,
-                registrationSucceeded = true,
-                forcedDebugFailure = false,
-            ),
+        val proceed = BridgeStartupPolicy.decide(
+            webMessageListenerSupported = true,
+            registrationSucceeded = true,
+            forcedDebugFailure = false,
         )
+
+        assertEquals(BridgeStartupDecision.FailForcedDebug, forced)
+        assertEquals(BridgeStartupDecision.FailUnsupported, unsupported)
+        assertEquals(BridgeStartupDecision.FailRegistration, registration)
+        assertEquals(BridgeStartupDecision.Proceed, proceed)
+
+        assertFalse(BridgeStartupPolicy.shouldStartActivityEngine(forced))
+        assertFalse(BridgeStartupPolicy.shouldStartActivityEngine(unsupported))
+        assertFalse(BridgeStartupPolicy.shouldStartActivityEngine(registration))
+        assertTrue(BridgeStartupPolicy.shouldStartActivityEngine(proceed))
     }
 }

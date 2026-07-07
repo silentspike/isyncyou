@@ -28,4 +28,14 @@ class OAuthGuardRegistry(
 
     @Synchronized
     fun activeCount(): Int = active.size
+
+    @Synchronized
+    fun clear(): Int {
+        val count = active.size
+        if (count > 0) {
+            active.clear()
+            onStop()
+        }
+        return count
+    }
 }

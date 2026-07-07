@@ -25,4 +25,7 @@ object BridgeStartupPolicy {
         !registrationSucceeded -> BridgeStartupDecision.FailRegistration
         else -> BridgeStartupDecision.Proceed
     }
+
+    fun shouldStartActivityEngine(decision: BridgeStartupDecision): Boolean =
+        decision == BridgeStartupDecision.Proceed
 }

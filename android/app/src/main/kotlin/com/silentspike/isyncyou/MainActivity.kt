@@ -7,12 +7,13 @@ import android.net.ConnectivityManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.StatFs
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.view.KeyEvent
-import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -26,7 +27,6 @@ import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
-import java.io.File
 import java.security.KeyStore
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -36,31 +36,33 @@ import org.json.JSONObject
 
 /**
  * iSyncYou Android client (#89) — a hardened WebView onto the iSyncYou engine that
- * runs **in this app process**. On launch the native library starts the embedded
- * loopback server (the real engine, live-companion profile) and this WebView loads
- * `http://127.0.0.1:<port>/`. No desktop daemon, no `adb reverse` — the phone is a
- * self-contained iSyncYou node over mobile data. A thin shell: all features live in
- * the web UI.
+ * runs **in this app process**. On launch the Activity first preflights the
+ * origin-bound WebMessage bridge, then starts the embedded engine and loads the
+ * app-origin WebView shell. No desktop daemon and no mobile TCP fallback are part
+ * of the default mobile data path.
  */
 class MainActivity : FragmentActivity() {
 
     private companion object {
         const val TAG = "iSyncYou"
+        const val BIO_TIMEOUT_MS = 120_000L
 
         /** The stable app origin the WebView loads from (#0A) — WebView's reserved
          *  virtual host. GET assets/subresources are served in-process via
-         *  `shouldInterceptRequest`, so no loopback TCP port is exposed. */
+         *  `shouldInterceptRequest`, so no mobile TCP data port is exposed. */
         const val APP_HOST = "appassets.androidplatform.net"
         const val APP_ORIGIN = "https://$APP_HOST"
     }
 
     private lateinit var web: WebView
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     /** The device's FCM registration token (fetched async; read by the JS bridge). */
     @Volatile
     private var fcmToken: String? = null
 
-    /** The embedded engine's session token — gates the loopback data API (#89 P1). */
+    /** The embedded engine's session token — held natively and never exposed to JS. */
     @Volatile
     private var sessionToken: String = ""
 
@@ -73,6 +75,18 @@ class MainActivity : FragmentActivity() {
 
     /** Latches true on the first bridge message so we log the live data path once (#0A). */
     private val bridgeSeen = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private val oauthGuards = OAuthGuardRegistry(
+        onStart = { runOnUiThread { OAuthGuardService.start(this@MainActivity) } },
+        onStop = { runOnUiThread { OAuthGuardService.stop(this@MainActivity) } },
+    )
+
+    private data class PendingBio(
+        val prompt: BiometricPrompt,
+        val timeout: Runnable,
+    )
+
+    private val bioPending = ConcurrentHashMap<String, PendingBio>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -95,37 +109,31 @@ class MainActivity : FragmentActivity() {
         }
         web.clearCache(true)
         web.webViewClient = object : WebViewClient() {
-            // The app-origin UI stays in the WebView; hand any external navigation —
-            // e.g. the device-code sign-in at login.live.com — to the system browser so
-            // the auth page never takes over the app's own UI (#89; RFC 8252).
+            // The app-origin UI stays in the WebView. Typed, exact auth/device-code
+            // destinations are handed to the system browser. Everything else is consumed
+            // fail-closed rather than loaded in-app.
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest,
             ): Boolean {
-                val url = request.url
-                // Only http/https is ever allowed. Anything else (intent:, javascript:,
-                // file:, data:, tel:, custom schemes) is refused outright — defense in
-                // depth so a hostile link can't drive the WebView into a local scheme.
-                val scheme = url.scheme?.lowercase()
-                if (scheme != "http" && scheme != "https") return true
-                // The app-origin UI (and, during the staged rollout, loopback) stays in
-                // the WebView.
-                val host = url.host
-                if (host == APP_HOST || host == "127.0.0.1" || host == "localhost") return false
-                // External http(s) — e.g. the device-code sign-in at login.live.com —
-                // goes to the system browser, never inside the app's own UI.
-                return try {
-                    startActivity(Intent(Intent.ACTION_VIEW, url))
-                    true
-                } catch (_: Exception) {
-                    // Can't hand off → refuse rather than load the external URL in-app.
-                    true
+                val decision = ExternalUrlPolicy.classifyNavigationUrl(request.url.toString())
+                return when (decision.action) {
+                    NavigationAction.AppOrigin -> false
+                    NavigationAction.ExternalBrowser -> {
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                        } catch (_: Exception) {
+                            android.util.Log.w(TAG, "external auth navigation failed (${decision.reason})")
+                        }
+                        true
+                    }
+                    NavigationAction.Block -> true
                 }
             }
 
             // Serve every app-origin GET (the shell + any img/iframe/viewer the WebView
-            // loads itself) in-process from the embedded engine (#0A) — no loopback TCP
-            // port. POST/PATCH/DELETE ride the message bridge (they carry a body, which a
+            // loads itself) in-process from the embedded engine (#0A). POST/PATCH/DELETE
+            // ride the message bridge (they carry a body, which a
             // WebResourceRequest cannot expose), so they are left to the network stack and
             // never reach here. External / non-app-origin requests return null (normal
             // handling → shouldOverrideUrlLoading).
@@ -148,15 +156,18 @@ class MainActivity : FragmentActivity() {
             // Emit a stable signal once the shell has rendered. Used by the CI emulator
             // smoke (REQ-AND-004) and handy for on-device diagnostics.
             override fun onPageFinished(view: WebView, url: String) {
-                if (url.startsWith(APP_ORIGIN) ||
-                    url.startsWith("http://127.0.0.1") ||
-                    url.startsWith("http://localhost")
-                ) {
+                if (url.startsWith(APP_ORIGIN)) {
                     android.util.Log.i(TAG, "shell loaded: $url")
                 }
             }
         }
         setContentView(web)
+
+        val bridgeDecision = setupBridgeOrFail(APP_ORIGIN)
+        if (!BridgeStartupPolicy.shouldStartActivityEngine(bridgeDecision)) {
+            showBridgeStartupFailure(bridgeDecision)
+            return
+        }
 
         // FCM (#575): register the notification channel + request POST_NOTIFICATIONS
         // (Android 13+ needs a runtime grant before notifications can show).
@@ -215,8 +226,8 @@ class MainActivity : FragmentActivity() {
     }
 
     /** Wire the session token into the WebView and load the local UI (UI thread). */
-    private fun onEngineReady(port: Int, token: String) {
-        if (port <= 0) {
+    private fun onEngineReady(readyCode: Int, token: String) {
+        if (readyCode <= 0) {
             android.util.Log.e(TAG, "embedded engine failed to start")
             web.loadData(
                 "<html><body style='font-family:sans-serif;padding:2rem'>" +
@@ -227,26 +238,9 @@ class MainActivity : FragmentActivity() {
             return
         }
         sessionToken = token
-        // The WebView loads from the stable **app origin** (#0A); GET assets/subresources
-        // are served in-process by shouldInterceptRequest and the data path rides the
-        // message bridge, so no loopback TCP port is exposed to other apps.
-        web.addJavascriptInterface(SessionBridge(), "AndroidSession")
-        web.addJavascriptInterface(PushBridge(), "AndroidPush")
-        web.addJavascriptInterface(NavBridge(), "AndroidNav")
-        // Origin-bound message bridge (#0A): the data path (api/post/streams) rides an
-        // origin-bound WebMessageListener bound to the app origin — no other frame/origin
-        // (and, with the no-script sandboxed viewers, no untrusted iframe) can reach it.
-        setupBridge(APP_ORIGIN)
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            // The session cookie auto-rides app-origin subresources (iframe/img); it is set
-            // out-of-band, never served in a static asset another app could read (#89 P1).
-            setCookie("$APP_ORIGIN/", "isy_session=$token; Path=/")
-            // setCookie is async; flush() persists it synchronously so the very first
-            // subresource requests already carry the session cookie.
-            flush()
-        }
-        // nativeStart is idempotent, so on Activity recreation the same engine reloads.
+        // The WebView loads from the stable app origin. GET assets/subresources are served
+        // in-process with the trusted Activity session, and API/stream/native-control
+        // traffic rides the preflighted origin-bound WebMessage bridge.
         android.util.Log.i(TAG, "engine ready (in-process), loading $APP_ORIGIN")
         pushDeviceState()
         web.loadUrl("$APP_ORIGIN/")
@@ -278,128 +272,237 @@ class MainActivity : FragmentActivity() {
         pushDeviceState()
     }
 
-    /** JS bridge: the web UI reads the session token to gate its loopback API calls. */
-    private inner class SessionBridge {
-        @android.webkit.JavascriptInterface
-        fun token(): String = sessionToken
-    }
-
-    /** JS bridge: lets the web UI read the FCM token for push registration (#576). */
-    private inner class PushBridge {
-        @android.webkit.JavascriptInterface
-        fun fcmToken(): String {
-            // Prefer the persisted token (kept current across rotations by onNewToken),
-            // falling back to the value fetched at startup.
-            val persisted = IsyncMessagingService.currentToken(this@MainActivity)
-            return if (persisted.isNotEmpty()) persisted else (fcmToken ?: "")
-        }
+    private fun currentPushToken(): String {
+        val persisted = IsyncMessagingService.currentToken(this)
+        return if (persisted.isNotEmpty()) persisted else (fcmToken ?: "")
     }
 
     /**
-     * JS bridge: open an external URL by handing the RAW string straight to the system browser.
-     * Using `location.href` instead would route the URL through the WebView's own navigation,
-     * which re-parses/normalises it — mangling the percent-encoded `redirect_uri`/`scope` and
-     * following the `claude.com/cai`→`claude.ai` redirect in-WebView before hand-off. claude.ai
-     * then rejects the consent submit with "Invalid request format". `Uri.parse` on the raw
-     * string preserves the exact encoding, matching a direct `am start`/`xdg-open` (verified
-     * on-device 2026-07-01: direct open completes the consent, WebView `location.href` fails).
+     * Register the origin-bound in-process message bridge `__isyBridge` before the Activity
+     * starts the engine. A missing or failed bridge is a startup failure for the WebView data
+     * path, not a fallback opportunity.
      */
-    private inner class NavBridge {
-        @android.webkit.JavascriptInterface
-        fun openExternal(url: String) {
-            runOnUiThread {
-                try {
-                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
-                } catch (_: Exception) {
-                }
-            }
+    private fun setupBridgeOrFail(origin: String): BridgeStartupDecision {
+        val forced = BridgeStartupPolicy.forcedFailureFlag(filesDir, BuildConfig.DEBUG)
+        if (forced) {
+            val decision = BridgeStartupPolicy.decide(
+                webMessageListenerSupported = true,
+                registrationSucceeded = true,
+                forcedDebugFailure = true,
+            )
+            android.util.Log.w(TAG, "bridge preflight failed (${decision.name})")
+            return decision
         }
 
-        /**
-         * Start the OAuth network-guard foreground service just before opening the browser,
-         * so the loopback token exchange survives the app being backgrounded during sign-in
-         * (see [OAuthGuardService]). Must be called while the Activity is still foreground —
-         * it is, since the user just tapped "Connect" — so the Android 14 background-FGS-start
-         * restriction does not apply.
-         */
-        @android.webkit.JavascriptInterface
-        fun beginNetworkGuard() {
-            runOnUiThread { OAuthGuardService.start(this@MainActivity) }
+        val supported = WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
+        if (!supported) {
+            val decision = BridgeStartupPolicy.decide(
+                webMessageListenerSupported = false,
+                registrationSucceeded = false,
+                forcedDebugFailure = false,
+            )
+            android.util.Log.w(TAG, "bridge preflight failed (${decision.name})")
+            return decision
         }
 
-        /** Stop the guard once sign-in completes, times out, or is cancelled. */
-        @android.webkit.JavascriptInterface
-        fun endNetworkGuard() {
-            runOnUiThread { OAuthGuardService.stop(this@MainActivity) }
-        }
-    }
-
-    /**
-     * Register the origin-bound in-process message bridge `__isyBridge` (#0A). The JS side
-     * (`app.js`) posts `{t:"req"|"sub"|"unsub",...}`; we forward to the embedded engine and
-     * post replies back on the reply proxy. `allowedOriginRules` binds the object to the
-     * engine's **exact** origin, so no other origin (and, with the sandboxed no-script
-     * viewers, no untrusted iframe) can obtain it. No-op when the device's WebView lacks the
-     * feature — app.js then falls back to loopback fetch, so the app still works.
-     */
-    private fun setupBridge(origin: String) {
-        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-            android.util.Log.w(TAG, "WEB_MESSAGE_LISTENER unsupported; using loopback fetch")
-            return
-        }
-        try {
+        return try {
             WebViewCompat.addWebMessageListener(web, "__isyBridge", setOf(origin)) {
                 _, message, _, _, replyProxy ->
-                (message.data)?.let { onBridgeMessage(it, replyProxy) }
+                onBridgeMessage(message.data ?: "", replyProxy)
             }
             android.util.Log.i(TAG, "bridge listener registered for $origin")
+            BridgeStartupPolicy.decide(
+                webMessageListenerSupported = true,
+                registrationSucceeded = true,
+                forcedDebugFailure = false,
+            )
         } catch (e: Exception) {
-            android.util.Log.w(TAG, "bridge registration failed; using loopback fetch", e)
+            android.util.Log.w(TAG, "bridge preflight failed (${BridgeStartupDecision.FailRegistration.name})", e)
+            BridgeStartupPolicy.decide(
+                webMessageListenerSupported = true,
+                registrationSucceeded = false,
+                forcedDebugFailure = false,
+            )
         }
+    }
+
+    private fun showBridgeStartupFailure(decision: BridgeStartupDecision) {
+        android.util.Log.e(TAG, "bridge startup blocked (${decision.name}); Activity engine start skipped")
+        val reason = when (decision) {
+            BridgeStartupDecision.FailForcedDebug -> "Bridge startup was forced to fail for verification."
+            BridgeStartupDecision.FailUnsupported -> "This Android WebView does not support the required secure bridge."
+            BridgeStartupDecision.FailRegistration -> "The secure bridge could not be registered."
+            BridgeStartupDecision.Proceed -> "The secure bridge is available."
+        }
+        val html = """
+            <!doctype html>
+            <html>
+              <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>iSyncYou</title>
+              </head>
+              <body style="font-family:sans-serif;padding:2rem;line-height:1.4">
+                <h2>iSyncYou</h2>
+                <p>Secure WebView bridge startup failed. Local data was not opened from this screen.</p>
+                <p>$reason</p>
+              </body>
+            </html>
+        """.trimIndent()
+        web.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
     }
 
     /** Dispatch one inbound bridge message off the UI thread (#0A). */
     private fun onBridgeMessage(data: String, reply: JavaScriptReplyProxy) {
-        val t = try {
-            JSONObject(data).optString("t")
-        } catch (_: Exception) {
-            return // not our envelope
+        val validation = BridgeMessagePolicy.validateEnvelope(data)
+        if (!validation.ok) {
+            postBridgeError(reply, validation.id, 400, "bad_request", validation.error ?: "invalid")
+            return
         }
+        val obj = try {
+            JSONObject(data)
+        } catch (_: Exception) {
+            postBridgeError(reply, validation.id, 400, "bad_request", "malformed_json")
+            return
+        }
+        val t = validation.type ?: ""
         // One-time signal that the WebView actually routes through the bridge (not the
-        // loopback fetch fallback) — proves the in-process data path is live. No payload.
+        // network stack) — proves the in-process data path is live. No payload.
         if (bridgeSeen.compareAndSet(false, true)) {
             android.util.Log.i(TAG, "bridge active: first message t=$t")
         }
         when (t) {
             "req" -> bridgeExecutor.execute {
-                // Rust returns the complete {t:"res",id,status,body} reply — post it verbatim.
-                val resp = NativeEngine.nativeBridgeRequest(data)
+                if (sessionToken.isBlank()) {
+                    postBridgeError(reply, validation.id, 503, "session_not_ready", "session_not_ready")
+                    return@execute
+                }
+                val requestJson = sanitizedBridgeRequest(obj)
+                val resp = try {
+                    NativeEngine.nativeBridgeRequest(requestJson)
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "bridge request failed", e)
+                    BridgeMessagePolicy.responseJson(
+                        validation.id,
+                        500,
+                        JSONObject().put("error", "internal_error"),
+                    )
+                }
                 reply.postMessage(resp)
             }
             "sub" -> {
-                val obj = JSONObject(data)
-                val jsId = obj.optString("id")
+                val jsId = validation.id
                 val path = obj.optString("path")
-                if (jsId.isNotEmpty()) bridgeExecutor.execute { runBridgeStream(jsId, path, reply) }
+                bridgeExecutor.execute { runBridgeStream(jsId, path, reply) }
             }
             "unsub" -> {
-                val jsId = JSONObject(data).optString("id")
-                bridgeStreams.remove(jsId)?.let { NativeEngine.nativeStreamClose(it) }
+                bridgeStreams.remove(validation.id)?.let { NativeEngine.nativeStreamClose(it) }
             }
             // #onedrive-mobile 0.6: the WebUI asks for a biometric before a destructive op.
             // We show BiometricPrompt HERE (native, WebView-unreachable) and only on success
             // arm the server's per-action token via nativeConfirmAction. The reply carries no
             // token — just whether the human confirmed — so the WebView re-issues with `_pat`.
             "bio" -> {
-                val obj = JSONObject(data)
-                val reqId = obj.optString("id")
+                val reqId = validation.id
                 val pat = obj.optString("pat")
                 val label = obj.optString("label").ifEmpty { "Confirm this action" }
-                if (reqId.isNotEmpty() && pat.isNotEmpty()) {
-                    runOnUiThread { runBiometric(reqId, pat, label, reply) }
-                }
+                runOnUiThread { runBiometric(reqId, pat, label, reply) }
+            }
+            "native" -> {
+                handleNativeMessage(obj, validation.id, reply)
             }
         }
+    }
+
+    private fun sanitizedBridgeRequest(obj: JSONObject): String {
+        val out = JSONObject()
+            .put("t", "req")
+            .put("id", obj.optString("id", ""))
+            .put("method", obj.optString("method", "GET"))
+            .put("path", obj.optString("path", "/"))
+            .put("headers", BridgeMessagePolicy.sanitizeHeaders(obj.optJSONObject("headers"), sessionToken))
+        if (obj.has("body") && !obj.isNull("body")) {
+            out.put("body", obj.opt("body"))
+        } else {
+            out.put("body", JSONObject.NULL)
+        }
+        return out.toString()
+    }
+
+    private fun handleNativeMessage(obj: JSONObject, id: String, reply: JavaScriptReplyProxy) {
+        val op = obj.optString("op")
+        val payload = obj.optJSONObject("payload") ?: JSONObject()
+        when (op) {
+            "pushToken" -> postBridgeResponse(
+                reply,
+                id,
+                200,
+                JSONObject().put("token", currentPushToken()),
+            )
+            "beginNetworkGuard" -> {
+                val guardId = oauthGuards.begin()
+                postBridgeResponse(
+                    reply,
+                    id,
+                    200,
+                    JSONObject().put("ok", true).put("guard_id", guardId),
+                )
+            }
+            "endNetworkGuard" -> {
+                val ended = oauthGuards.end(payload.optString("guard_id", ""))
+                postBridgeResponse(
+                    reply,
+                    id,
+                    200,
+                    JSONObject().put("ok", true).put("ended", ended),
+                )
+            }
+            "openExternal" -> openExternalFromBridge(payload, id, reply)
+            else -> postBridgeError(reply, id, 400, "bad_request", "unknown_op")
+        }
+    }
+
+    private fun openExternalFromBridge(payload: JSONObject, id: String, reply: JavaScriptReplyProxy) {
+        val kindWire = payload.optString("kind", "")
+        val url = payload.optString("url", "")
+        val kind = ExternalUrlPolicy.authKindFromWire(kindWire)
+        if (kind == null) {
+            postBridgeError(reply, id, 400, "bad_request", "missing_or_unknown_kind")
+            return
+        }
+        val decision = ExternalUrlPolicy.classifyExternalUrl(url, kind)
+        if (!decision.allowed) {
+            postBridgeError(reply, id, 400, "blocked_url", decision.reason)
+            return
+        }
+        runOnUiThread {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                postBridgeResponse(reply, id, 200, JSONObject().put("ok", true))
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "external auth launch failed (${decision.reason})", e)
+                postBridgeError(reply, id, 500, "external_launch_failed", "launch_failed")
+            }
+        }
+    }
+
+    private fun postBridgeError(
+        reply: JavaScriptReplyProxy,
+        id: String,
+        status: Int,
+        error: String,
+        reason: String,
+    ) {
+        postBridgeResponse(reply, id, status, JSONObject().put("error", error).put("reason", reason))
+    }
+
+    private fun postBridgeResponse(
+        reply: JavaScriptReplyProxy,
+        id: String,
+        status: Int,
+        body: JSONObject,
+    ) {
+        reply.postMessage(BridgeMessagePolicy.responseJson(id, status, body))
     }
 
     /** Keystore alias for the biometric-bound confirmation key (#WP-8). */
@@ -466,7 +569,7 @@ class MainActivity : FragmentActivity() {
      * cannot reach it) and reply `{t:"bio",id,ok}`. Must be called on the UI thread.
      */
     private fun runBiometric(reqId: String, pat: String, label: String, reply: JavaScriptReplyProxy) {
-        fun done(ok: Boolean) = reply.postMessage("{\"t\":\"bio\",\"id\":\"$reqId\",\"ok\":$ok}")
+        fun done(ok: Boolean) = completeBiometric(reqId, reply, ok)
         val mgr = BiometricManager.from(this)
         val strong = BiometricManager.Authenticators.BIOMETRIC_STRONG
         // Crypto-bound path only when a strong biometric is actually enrolled; otherwise fall back
@@ -477,10 +580,17 @@ class MainActivity : FragmentActivity() {
             if (cipher != null) strong else strong or BiometricManager.Authenticators.DEVICE_CREDENTIAL
         if (mgr.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
             android.util.Log.w(TAG, "no biometric or device credential available; destructive op denied")
-            done(false)
+            reply.postMessage(bioReplyJson(reqId, false))
             return
         }
-        val prompt = BiometricPrompt(
+        lateinit var prompt: BiometricPrompt
+        val timeout = Runnable {
+            bioPending.remove(reqId)?.let { pending ->
+                pending.prompt.cancelAuthentication()
+                reply.postMessage(bioReplyJson(reqId, false))
+            }
+        }
+        prompt = BiometricPrompt(
             this,
             ContextCompat.getMainExecutor(this),
             object : BiometricPrompt.AuthenticationCallback() {
@@ -501,11 +611,18 @@ class MainActivity : FragmentActivity() {
                     }
                     done(armed)
                 }
+
                 override fun onAuthenticationError(code: Int, msg: CharSequence) = done(false)
+
                 // A single non-match keeps the prompt up; no reply until success/error/cancel.
                 override fun onAuthenticationFailed() {}
             },
         )
+        bioPending.put(reqId, PendingBio(prompt, timeout))?.let { old ->
+            mainHandler.removeCallbacks(old.timeout)
+            old.prompt.cancelAuthentication()
+        }
+        mainHandler.postDelayed(timeout, BIO_TIMEOUT_MS)
         val info = BiometricPrompt.PromptInfo.Builder()
             .setTitle("Confirm action")
             .setSubtitle(label)
@@ -518,11 +635,33 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun completeBiometric(reqId: String, reply: JavaScriptReplyProxy, ok: Boolean) {
+        val pending = bioPending.remove(reqId) ?: return
+        mainHandler.removeCallbacks(pending.timeout)
+        reply.postMessage(bioReplyJson(reqId, ok))
+    }
+
+    private fun bioReplyJson(reqId: String, ok: Boolean): String =
+        JSONObject().put("t", "bio").put("id", reqId).put("ok", ok).toString()
+
+    private fun cancelPendingBiometrics() {
+        val pending = bioPending.values.toList()
+        bioPending.clear()
+        pending.forEach {
+            mainHandler.removeCallbacks(it.timeout)
+            it.prompt.cancelAuthentication()
+        }
+    }
+
     /** Drain one push stream, forwarding each event to the WebView until it ends (#0A). */
     private fun runBridgeStream(jsId: String, path: String, reply: JavaScriptReplyProxy) {
+        if (sessionToken.isBlank()) {
+            reply.postMessage(streamEndJson(jsId))
+            return
+        }
         val nativeId = NativeEngine.nativeStreamOpen(path, sessionToken)
         if (nativeId <= 0L) {
-            reply.postMessage("{\"t\":\"end\",\"id\":\"$jsId\"}")
+            reply.postMessage(streamEndJson(jsId))
             return
         }
         bridgeStreams[jsId] = nativeId
@@ -532,13 +671,25 @@ class MainActivity : FragmentActivity() {
                 val ev = NativeEngine.nativeStreamNext(nativeId)
                 if (ev.isEmpty()) break
                 // ev is a JSON {event,data} object — embed it as the `ev` field.
-                reply.postMessage("{\"t\":\"evt\",\"id\":\"$jsId\",\"ev\":$ev}")
+                reply.postMessage(streamEventJson(jsId, ev))
             }
         } finally {
             bridgeStreams.remove(jsId)
             NativeEngine.nativeStreamClose(nativeId)
-            reply.postMessage("{\"t\":\"end\",\"id\":\"$jsId\"}")
+            reply.postMessage(streamEndJson(jsId))
         }
+    }
+
+    private fun streamEndJson(jsId: String): String =
+        JSONObject().put("t", "end").put("id", jsId).toString()
+
+    private fun streamEventJson(jsId: String, ev: String): String {
+        val event = try {
+            JSONObject(ev)
+        } catch (_: Exception) {
+            JSONObject().put("error", "bad_stream_event")
+        }
+        return JSONObject().put("t", "evt").put("id", jsId).put("ev", event).toString()
     }
 
     /**
@@ -587,7 +738,12 @@ class MainActivity : FragmentActivity() {
 
     /** Safety net: never leak the sign-in network guard past the Activity's life. */
     override fun onDestroy() {
+        cancelPendingBiometrics()
+        bridgeStreams.values.forEach { NativeEngine.nativeStreamClose(it) }
+        bridgeStreams.clear()
+        oauthGuards.clear()
         OAuthGuardService.stop(this)
+        bridgeExecutor.shutdownNow()
         super.onDestroy()
     }
 }

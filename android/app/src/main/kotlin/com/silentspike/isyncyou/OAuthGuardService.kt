@@ -15,14 +15,14 @@ import android.os.IBinder
  * (FGS type `dataSync`) while the system browser is in front for the OAuth round-trip.
  *
  * Why: during subscription sign-in the app hands the authorize URL to the system browser
- * (app → background), then the embedded engine's loopback `/callback` runs the token
- * exchange — a network call to `platform.claude.com` (Claude) or `chatgpt.com` (Codex).
+ * (app → background), then the embedded engine completes the callback/token exchange — a
+ * network call to `platform.claude.com` (Claude) or `chatgpt.com` (Codex).
  * Android restricts an app's network while it is backgrounded (`blocked=APP_BACKGROUND`,
  * aggressive on GrapheneOS), so the exchange times out. An active foreground service lifts
  * that restriction for the duration — the adb-free, all-devices replacement for the Doze
  * whitelist used during bring-up. Started right before the browser opens; stopped once the
- * login completes, times out, or is cancelled (see `NavBridge.beginNetworkGuard` /
- * `endNetworkGuard` in [MainActivity] and the poll loops in `app.js`).
+ * login completes, times out, or is cancelled (see the native bridge guard ops in
+ * [MainActivity] and the poll loops in `app.js`).
  *
  * If POST_NOTIFICATIONS was denied the notification is simply suppressed by the system —
  * the service still runs and still lifts the network restriction, so sign-in is unaffected.
