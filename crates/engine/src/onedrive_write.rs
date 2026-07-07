@@ -727,6 +727,7 @@ pub fn replace_via_ledger(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::sync::{Mutex, OnceLock};
 
     /// A fake cloud file: `(id, parent, name, bytes)`.
     type FakeFile = (String, String, String, Vec<u8>);
@@ -744,6 +745,7 @@ mod tests {
         move_calls: RefCell<u32>,
         upload_calls: RefCell<u32>,
         replace_calls: RefCell<u32>,
+        replace_attempts: RefCell<Vec<(String, String, Vec<u8>)>>, // (id, etag, bytes)
     }
     impl FakeCloud {
         fn count(&self) -> usize {
@@ -754,6 +756,13 @@ mod tests {
         }
         fn etag_of(&self, id: &str) -> String {
             self.etags.borrow().get(id).cloned().unwrap_or_default()
+        }
+        fn body_of(&self, id: &str) -> Option<Vec<u8>> {
+            self.files
+                .borrow()
+                .iter()
+                .find(|(file_id, _, _, _)| file_id == id)
+                .map(|(_, _, _, bytes)| bytes.clone())
         }
     }
     impl OneDriveWriteSink for FakeCloud {
@@ -841,6 +850,11 @@ mod tests {
             etag: &str,
         ) -> Result<ReplaceOutcome, String> {
             *self.replace_calls.borrow_mut() += 1;
+            self.replace_attempts.borrow_mut().push((
+                item_id.to_string(),
+                etag.to_string(),
+                bytes.to_vec(),
+            ));
             if self.etag_of(item_id) != etag {
                 return Ok(ReplaceOutcome::Conflict); // 412: the cloud moved on
             }
@@ -868,11 +882,43 @@ mod tests {
     const SECRET: &[u8] = b"test-secret";
     const ACCT: &str = "me";
 
+    fn body_key_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static BODY_KEY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        BODY_KEY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A temp file holding `content`, for the Upload/Replace body-source. Returned so the
     /// caller keeps it alive (drop = delete).
     fn body_file(content: &[u8]) -> tempfile::NamedTempFile {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), content).unwrap();
+        f
+    }
+
+    /// A temp body source sealed with the process body-envelope key. The caller must hold
+    /// `body_key_test_guard()` while using this helper because the body-key registry is global.
+    fn sealed_body_file(key_id: u32, key: [u8; 32], content: &[u8]) -> tempfile::NamedTempFile {
+        assert!(!content.is_empty(), "sentinel content must not be empty");
+        isyncyou_core::envelope::set_body_key(key_id, key);
+        let f = tempfile::NamedTempFile::new().unwrap();
+        isyncyou_core::envelope::write_body_atomic(f.path(), content).unwrap();
+        let raw = std::fs::read(f.path()).unwrap();
+        assert_eq!(
+            isyncyou_core::envelope::blob_key_id(&raw),
+            Some(key_id),
+            "sealed body source must carry the expected key id"
+        );
+        assert!(
+            !raw.windows(content.len()).any(|w| w == content),
+            "sealed body source must not contain plaintext bytes"
+        );
+        assert_eq!(
+            isyncyou_core::envelope::read_body(f.path()).unwrap(),
+            content
+        );
         f
     }
 
@@ -1133,6 +1179,49 @@ mod tests {
     }
 
     #[test]
+    fn upload_recovery_replays_from_sealed_body_source() {
+        let _guard = body_key_test_guard();
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let sentinel = b"isy-om720-upload-sealed-source-sentinel";
+        let f = sealed_body_file(720_001, [1u8; 32], sentinel);
+        let w = upload("parent", "sealed-upload.txt", f.path());
+        let (op_id, key) = w.keys(SECRET, ACCT);
+        let op = CloudWriteOp {
+            op_id,
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: "upload".into(),
+            target_id: Some("parent".into()),
+            idempotency_key: key.clone(),
+            if_match_etag: None,
+            state: "pending".into(),
+            result_id: None,
+            intent_json: Some(w.intent_json()),
+            attempts: 1,
+            last_error: None,
+        };
+        s.record_cloud_write(&op, 10).unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            *cloud.upload_calls.borrow(),
+            1,
+            "sealed upload recovery must issue exactly one upload"
+        );
+        assert_eq!(cloud.file_count(), 1);
+        assert_eq!(
+            cloud.body_of("file-1").as_deref(),
+            Some(sentinel.as_slice())
+        );
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.result_id.as_deref(), Some("file-1"));
+    }
+
+    #[test]
     fn recovery_skips_a_missing_local_body_op_without_aborting_the_batch() {
         // #656 F-A: an Upload whose local source file is gone can never be re-sent. It must be
         // marked terminally `failed` (leaving the pending set) and MUST NOT abort recovery of the
@@ -1211,6 +1300,128 @@ mod tests {
     }
 
     #[test]
+    fn missing_sealed_body_source_fails_terminally_and_recovery_continues() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let missing_upload = std::path::PathBuf::from("/nonexistent/om720-missing-upload.bin");
+        let missing_replace = std::path::PathBuf::from("/nonexistent/om720-missing-replace.bin");
+        assert!(!missing_upload.exists());
+        assert!(!missing_replace.exists());
+
+        let w_upload = upload("parent", "missing-upload.txt", &missing_upload);
+        let (upload_id, upload_key) = w_upload.keys(SECRET, ACCT);
+        s.record_cloud_write(
+            &CloudWriteOp {
+                op_id: upload_id,
+                account_id: ACCT.into(),
+                service: SERVICE.into(),
+                op_kind: "upload".into(),
+                target_id: Some("parent".into()),
+                idempotency_key: upload_key.clone(),
+                if_match_etag: None,
+                state: "pending".into(),
+                result_id: None,
+                intent_json: Some(w_upload.intent_json()),
+                attempts: 1,
+                last_error: None,
+            },
+            10,
+        )
+        .unwrap();
+
+        let w_replace = CloudWrite {
+            kind: CloudOpKind::Replace,
+            target_id: "file-replace".into(),
+            name: String::new(),
+            new_parent_id: None,
+            if_match: Some("etag-old".into()),
+            local_path: Some(missing_replace),
+            content_tag: Some("tag-missing".into()),
+        };
+        let (replace_id, replace_key) = w_replace.keys(SECRET, ACCT);
+        s.record_cloud_write(
+            &CloudWriteOp {
+                op_id: replace_id,
+                account_id: ACCT.into(),
+                service: SERVICE.into(),
+                op_kind: "replace".into(),
+                target_id: Some("file-replace".into()),
+                idempotency_key: replace_key.clone(),
+                if_match_etag: Some("etag-old".into()),
+                state: "pending".into(),
+                result_id: None,
+                intent_json: Some(w_replace.intent_json()),
+                attempts: 1,
+                last_error: None,
+            },
+            11,
+        )
+        .unwrap();
+
+        let w_delete = CloudWrite {
+            kind: CloudOpKind::Delete,
+            target_id: "later-delete".into(),
+            name: String::new(),
+            new_parent_id: None,
+            if_match: None,
+            local_path: None,
+            content_tag: None,
+        };
+        let (delete_id, delete_key) = w_delete.keys(SECRET, ACCT);
+        s.record_cloud_write(
+            &CloudWriteOp {
+                op_id: delete_id,
+                account_id: ACCT.into(),
+                service: SERVICE.into(),
+                op_kind: "delete".into(),
+                target_id: Some("later-delete".into()),
+                idempotency_key: delete_key.clone(),
+                if_match_etag: None,
+                state: "pending".into(),
+                result_id: None,
+                intent_json: Some(w_delete.intent_json()),
+                attempts: 1,
+                last_error: None,
+            },
+            12,
+        )
+        .unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+
+        assert_eq!(
+            recovered, 1,
+            "later recoverable op must still run after missing body sources"
+        );
+        assert_eq!(*cloud.delete_calls.borrow(), 1);
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &upload_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &replace_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &delete_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            "applied"
+        );
+        assert!(
+            s.pending_cloud_writes(ACCT).unwrap().is_empty(),
+            "missing upload and replace sources must not leave pending blockers"
+        );
+    }
+
+    #[test]
     fn replace_records_ledger_and_issues_once() {
         let s = Store::open_in_memory().unwrap();
         let cloud = FakeCloud::default();
@@ -1284,6 +1495,63 @@ mod tests {
         // A conflict row is terminal — boot recovery does not re-pick it.
         let n = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn replace_recovery_replays_from_sealed_body_source() {
+        let _guard = body_key_test_guard();
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let fid = cloud.upload("parent", "replace.txt", b"v1").unwrap();
+        let etag = cloud.etag_of(&fid);
+        let replacement = b"isy-om720-replace-sealed-source-v2";
+        let f = sealed_body_file(720_002, [2u8; 32], replacement);
+        let w = CloudWrite {
+            kind: CloudOpKind::Replace,
+            target_id: fid.clone(),
+            name: String::new(),
+            new_parent_id: None,
+            if_match: Some(etag.clone()),
+            local_path: Some(f.path().to_path_buf()),
+            content_tag: Some("tag-sealed-v2".into()),
+        };
+        let (op_id, key) = w.keys(SECRET, ACCT);
+        s.record_cloud_write(
+            &CloudWriteOp {
+                op_id,
+                account_id: ACCT.into(),
+                service: SERVICE.into(),
+                op_kind: "replace".into(),
+                target_id: Some(fid.clone()),
+                idempotency_key: key.clone(),
+                if_match_etag: Some(etag.clone()),
+                state: "pending".into(),
+                result_id: None,
+                intent_json: Some(w.intent_json()),
+                attempts: 1,
+                last_error: None,
+            },
+            10,
+        )
+        .unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            *cloud.replace_calls.borrow(),
+            1,
+            "sealed replace recovery must issue exactly one replace"
+        );
+        assert_eq!(cloud.body_of(&fid).as_deref(), Some(replacement.as_slice()));
+        assert_eq!(
+            *cloud.replace_attempts.borrow(),
+            vec![(fid.clone(), etag, replacement.to_vec())],
+            "recovery must use the recorded If-Match etag path with decrypted bytes"
+        );
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.result_id.as_deref(), Some(fid.as_str()));
     }
 
     #[test]
