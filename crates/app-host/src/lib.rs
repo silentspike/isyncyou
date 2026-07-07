@@ -1734,8 +1734,9 @@ impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
     }
     // #657: an in-app upload/replace carries its bytes in the request body, but the crash-safe
     // cloud-write ledger reads the body from a local path (like the offline writeback). Stage the
-    // bytes to a short-lived plaintext temp file (`read_body` returns a non-sealed file verbatim),
-    // then route through #655's ledger so an in-app write gets the same intent-first crash safety.
+    // bytes under the account-private cache root, through the body-envelope writer, then route
+    // through #655's ledger so an in-app write gets the same intent-first crash safety without
+    // leaving Android plaintext in a process/global temp directory.
     fn upload(
         &self,
         account: &str,
@@ -1743,11 +1744,11 @@ impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
         name: &str,
         bytes: &[u8],
     ) -> Result<String, String> {
-        let tmp = TempBody::write(bytes)?;
+        let tmp = TempBody::write(&self.cfg, account, bytes)?;
         isyncyou_engine::upload_via_ledger(&self.cfg, account, parent_id, name, tmp.path())
     }
     fn replace(&self, account: &str, id: &str, etag: &str, bytes: &[u8]) -> Result<(), String> {
-        let tmp = TempBody::write(bytes)?;
+        let tmp = TempBody::write(&self.cfg, account, bytes)?;
         // Replace is etag-guarded: a 412 is a terminal keep-both conflict, never a blind clobber.
         match isyncyou_engine::replace_via_ledger(&self.cfg, account, id, etag, tmp.path())? {
             isyncyou_engine::WriteOutcome::Applied(_) => Ok(()),
@@ -1759,19 +1760,61 @@ impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
     }
 }
 
-/// A short-lived plaintext temp file holding an in-app upload/replace body (#657). The cloud-write
-/// ledger reads the body from a local path (fresh, and on crash recovery), so a WebUI request's
-/// in-memory bytes are staged here and removed on drop — even on an error path.
+/// A short-lived account-private staging file holding an in-app upload/replace body (#657).
+/// The cloud-write ledger reads the body from a local path (fresh, and on crash recovery), so a
+/// WebUI request's in-memory bytes are staged here and removed on drop — even on an error path.
+/// On Android, the active body key makes [`isyncyou_core::envelope::write_body_atomic`] persist a
+/// sealed envelope instead of plaintext; desktop keeps its no-key plaintext compatibility.
 struct TempBody(PathBuf);
 impl TempBody {
-    fn write(bytes: &[u8]) -> Result<Self, String> {
+    const DIR: &'static str = "upload-staging";
+    const PREFIX: &'static str = "isyncyou-upload-";
+    const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn write(cfg: &Config, account: &str, bytes: &[u8]) -> Result<Self, String> {
+        let acc = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .ok_or_else(|| format!("no account '{account}'"))?;
+        Self::write_in_dir(&acc.effective_cache_root().join(Self::DIR), bytes)
+    }
+
+    fn write_in_dir(dir: &std::path::Path, bytes: &[u8]) -> Result<Self, String> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::fs::create_dir_all(dir).map_err(|e| format!("create upload staging: {e}"))?;
+        Self::cleanup_stale(dir);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("isyncyou-upload-{}-{n}.bin", std::process::id()));
-        std::fs::write(&path, bytes).map_err(|e| format!("stage upload body: {e}"))?;
+        let path = dir.join(format!("{}{}-{n}.bin", Self::PREFIX, std::process::id()));
+        isyncyou_core::envelope::write_body_atomic(&path, bytes)
+            .map_err(|e| format!("stage upload body: {e}"))?;
         Ok(Self(path))
     }
+
+    fn cleanup_stale(dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(Self::PREFIX) {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age >= Self::STALE_AFTER);
+            if stale {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
     fn path(&self) -> &std::path::Path {
         self.0.as_path()
     }
@@ -1826,7 +1869,12 @@ fn onedrive_body_bytes(
         acc.sync_root.clone()
     };
     let path = root.join(rel);
-    match isyncyou_core::envelope::read_body(&path) {
+    let body = if isyncyou_core::envelope::body_envelope_required_for_process() {
+        isyncyou_core::envelope::read_sealed_body_required(&path)
+    } else {
+        isyncyou_core::envelope::read_body(&path)
+    };
+    match body {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read cached OneDrive body: {e}")),
@@ -2194,6 +2242,30 @@ pub fn build_live_router(
 mod tests {
     use super::*;
     use isyncyou_webui::ApiRequest;
+    use std::sync::{Mutex as StdMutex, OnceLock as StdOnceLock};
+
+    static ENVELOPE_REQUIREMENT_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    struct EnvelopeRequirementGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvelopeRequirementGuard {
+        fn new() -> Self {
+            let guard = ENVELOPE_REQUIREMENT_TEST_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap();
+            isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for EnvelopeRequirementGuard {
+        fn drop(&mut self) {
+            isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+        }
+    }
 
     #[test]
     fn restore_handler_refuses_non_restorable_service_before_token_lookup() {
@@ -2255,7 +2327,8 @@ mod tests {
     }
 
     #[test]
-    fn onedrive_open_serves_cached_sync_body_before_graph_lookup() {
+    fn onedrive_open_serves_plaintext_cached_sync_body_when_envelope_not_required() {
+        let _guard = EnvelopeRequirementGuard::new();
         let dir =
             std::env::temp_dir().join(format!("isy-apphost-open-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2295,8 +2368,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        isyncyou_core::envelope::write_body_atomic(&cache.join("doc.txt"), b"cached bytes")
-            .unwrap();
+        std::fs::write(cache.join("doc.txt"), b"cached bytes").unwrap();
 
         let h = DaemonOneDriveOpen {
             config_path,
@@ -2304,6 +2376,120 @@ mod tests {
         };
         let got = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap();
         assert_eq!(got, b"cached bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn onedrive_open_requires_sealed_cached_body_when_envelope_required() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(719_001, [1u8; 32]);
+        isyncyou_core::envelope::require_body_envelope_for_process();
+
+        let dir = std::env::temp_dir().join(format!(
+            "isy-apphost-open-cache-strict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let arch = dir.join("archive");
+        let sync = dir.join("sync");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let config_path = dir.join("isyncyou.toml");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a".into(),
+                sync_root: sync,
+                archive_root: arch.clone(),
+                cache_root: cache.clone(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.save(&config_path).unwrap();
+        {
+            let store = isyncyou_store::Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut item = Item::new("a", "onedrive", "file-id", "doc.txt", "file");
+            item.local_path = Some("doc.txt".into());
+            store.upsert_item(&item).unwrap();
+            store
+                .set_content_state(
+                    "a",
+                    "onedrive",
+                    "file-id",
+                    Some("cached"),
+                    Some("cache"),
+                    Some("available"),
+                    None,
+                )
+                .unwrap();
+        }
+        let h = DaemonOneDriveOpen {
+            config_path,
+            progress: SharedProgress::new(),
+        };
+
+        isyncyou_core::envelope::write_body_atomic(&cache.join("doc.txt"), b"sealed cached bytes")
+            .unwrap();
+        let got = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap();
+        assert_eq!(got, b"sealed cached bytes");
+
+        std::fs::write(cache.join("doc.txt"), b"raw cached bytes").unwrap();
+        let err = isyncyou_webui::OneDriveOpenHandler::download(&h, "a", "file-id").unwrap_err();
+        assert!(
+            err.contains("sealed envelope"),
+            "strict mobile open must reject plaintext cached bodies, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_staging_uses_account_cache_root_and_body_envelope_when_keyed() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(719, [7u8; 32]);
+        let dir =
+            std::env::temp_dir().join(format!("isy-apphost-upload-staging-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = dir.join("cache");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a".into(),
+                sync_root: dir.join("sync"),
+                archive_root: dir.join("archive"),
+                cache_root: cache.clone(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let sentinel = b"upload-stage-plaintext-sentinel-719";
+        let tmp = TempBody::write(&cfg, "a", sentinel).unwrap();
+        let staged_path = tmp.path().to_path_buf();
+        assert!(
+            staged_path.starts_with(cache.join("upload-staging")),
+            "upload staging must stay under the account-private cache root: {staged_path:?}"
+        );
+        let raw = std::fs::read(&staged_path).unwrap();
+        assert_eq!(
+            isyncyou_core::envelope::blob_key_id(&raw),
+            Some(719),
+            "keyed Android staging must be a sealed body envelope"
+        );
+        assert!(
+            !raw.windows(sentinel.len()).any(|w| w == sentinel),
+            "staging file must not contain plaintext upload bytes"
+        );
+        assert_eq!(
+            isyncyou_core::envelope::read_body(&staged_path).unwrap(),
+            sentinel
+        );
+        drop(tmp);
+        assert!(
+            !staged_path.exists(),
+            "short-lived staging file should be removed on drop"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
