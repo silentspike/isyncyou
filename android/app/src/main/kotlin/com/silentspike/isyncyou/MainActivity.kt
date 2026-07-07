@@ -137,10 +137,8 @@ class MainActivity : FragmentActivity() {
                 if (url.host != APP_HOST) return null
                 if (!request.method.equals("GET", ignoreCase = true)) return null
                 val path = (url.encodedPath ?: "/") + (url.encodedQuery?.let { "?$it" } ?: "")
-                // The session cookie auto-rides subresources; read it for the engine gate.
-                val cookie = CookieManager.getInstance().getCookie(url.toString()) ?: ""
                 return try {
-                    decodeAssetResponse(NativeEngine.nativeAssetRequest(path, cookie))
+                    decodeAssetResponse(NativeEngine.nativeAssetRequestWithSession(path, sessionToken))
                 } catch (e: Exception) {
                     android.util.Log.w(TAG, "asset serve failed for ${url.encodedPath}", e)
                     null

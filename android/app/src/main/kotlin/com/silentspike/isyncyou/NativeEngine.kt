@@ -35,6 +35,12 @@ object NativeEngine {
     external fun nativeAssetRequest(path: String, cookie: String): ByteArray
 
     /**
+     * Answer one app-origin GET using the trusted native session token held by the Activity or
+     * DocumentsProvider. No WebView-readable cookie is involved.
+     */
+    external fun nativeAssetRequestWithSession(path: String, sessionToken: String): ByteArray
+
+    /**
      * Open a bridge push stream (the SSE replacement, #0A) for [path], gated by
      * [sessionToken]. Returns a stream id (>0), or 0 if unknown/unauthorized/not started.
      */
