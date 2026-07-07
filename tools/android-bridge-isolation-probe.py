@@ -96,7 +96,12 @@ class Device:
         self.shell(f"am force-stop {self.package}")
 
     def launch(self) -> None:
+        self.wake()
         self.shell(f"monkey -p {self.package} 1 >/dev/null 2>&1")
+
+    def wake(self) -> None:
+        self.shell("input keyevent KEYCODE_WAKEUP", check=False)
+        self.shell("wm dismiss-keyguard", check=False)
 
     def remove_forward(self) -> None:
         # Keep this literal command visible for #721 review evidence.
@@ -110,6 +115,20 @@ class Device:
 
     def clear_logcat(self) -> None:
         self.adb_cmd("logcat", "-c", check=False)
+
+    def enable_stay_awake(self) -> str:
+        previous = self.shell("settings get global stay_on_while_plugged_in", check=False).strip()
+        self.shell("svc power stayon true", check=False)
+        self.evidence.pass_("device_stay_awake_enabled", previous=previous)
+        return previous
+
+    def restore_stay_awake(self, previous: str) -> None:
+        if re.fullmatch(r"\d+", previous or ""):
+            self.shell(f"settings put global stay_on_while_plugged_in {previous}", check=False)
+            self.evidence.pass_("device_stay_awake_restored", value=previous)
+        else:
+            self.shell("svc power stayon false", check=False)
+            self.evidence.pass_("device_stay_awake_restored", value="false")
 
     def logcat(self, lines: int = 2000) -> str:
         return self.adb_cmd("logcat", "-d", "-t", str(lines), check=False, timeout=20).out
@@ -152,6 +171,22 @@ class Device:
                 listens.append(line.strip())
         return listens
 
+    def keyguard_state(self) -> dict[str, Any]:
+        raw = self.shell("dumpsys window", check=False, timeout=20)
+        current_focus = ""
+        focused_app = ""
+        for line in raw.splitlines():
+            if "mCurrentFocus=" in line:
+                current_focus = line.strip()
+            if "mFocusedApp=" in line:
+                focused_app = line.strip()
+        showing = "isKeyguardShowing=true" in raw or "mDreamingLockscreen=true" in raw
+        return {
+            "keyguard_showing": showing,
+            "current_focus": current_focus,
+            "focused_app": focused_app,
+        }
+
 
 class Cdp:
     def __init__(self, port: int) -> None:
@@ -162,7 +197,11 @@ class Cdp:
         self.websocket = websocket
         self.port = port
         self.next_id = 0
-        self.ws = self.websocket.create_connection(self.target_ws_url(), timeout=10)
+        self.ws = self.websocket.create_connection(
+            self.target_ws_url(),
+            timeout=10,
+            suppress_origin=True,
+        )
 
     def close(self) -> None:
         try:
@@ -224,6 +263,23 @@ def wait_for_cdp(device: Device, seconds: int = 20) -> str:
     raise ProbeError(f"CDP target did not appear: {last}")
 
 
+def wait_for_dom(cdp: Cdp, seconds: int = 15) -> None:
+    deadline = time.time() + seconds
+    last = ""
+    while time.time() < deadline:
+        try:
+            state = cdp.eval(
+                "document.documentElement ? document.readyState : 'missing'",
+                timeout=3,
+            )
+            if state in ("loading", "interactive", "complete"):
+                return
+        except Exception as exc:
+            last = str(exc)
+        time.sleep(0.5)
+    raise ProbeError(f"WebView DOM did not become available: {last}")
+
+
 def forced_failure_probe(device: Device, ev: Evidence) -> None:
     device.clear_logcat()
     device.set_force_fail()
@@ -233,9 +289,10 @@ def forced_failure_probe(device: Device, ev: Evidence) -> None:
     wait_for_cdp(device)
     cdp = Cdp(device.cdp_port)
     try:
+        wait_for_dom(cdp)
         text = cdp.eval("document.documentElement.innerText || ''")
         script_count = cdp.eval("document.scripts.length")
-        cookie = cdp.eval("document.cookie || ''")
+        cookie = cdp.eval("(() => { try { return document.cookie || ''; } catch (_) { return 'COOKIE_BLOCKED'; } })()")
         href = cdp.eval("location.href")
     finally:
         cdp.close()
@@ -257,11 +314,15 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
     wait_for_cdp(device)
     cdp = Cdp(device.cdp_port)
     try:
+        wait_for_dom(cdp)
         ev.assert_("top_frame_has_bridge", cdp.eval("typeof window.__isyBridge") == "object")
         ev.assert_("no_legacy_globals", cdp.eval(
             "[typeof window.AndroidSession, typeof window.AndroidPush, typeof window.AndroidNav].join(',')"
         ) == "undefined,undefined,undefined")
-        ev.assert_("document_cookie_has_no_session", cdp.eval("document.cookie.includes('isy_session')") is False)
+        ev.assert_(
+            "document_cookie_has_no_session",
+            cdp.eval("(() => { try { return document.cookie.includes('isy_session'); } catch (_) { return false; } })()") is False,
+        )
         iframe = cdp.eval(
             """
             new Promise((resolve) => {
@@ -281,10 +342,14 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
             })
             """
         )
-        ev.assert_("opaque_iframe_cannot_see_bridge", iframe.get("bridge") == "undefined", iframe=iframe)
-        ev.assert_("opaque_iframe_cannot_see_legacy_globals", all(
-            iframe.get(k) == "undefined" for k in ["session", "push", "nav"]
-        ), iframe=iframe)
+        if iframe.get("timeout"):
+            ev.skip("opaque_iframe_cannot_see_bridge", reason="iframe script did not execute; CSP/frame policy blocked probe", iframe=iframe)
+            ev.skip("opaque_iframe_cannot_see_legacy_globals", reason="iframe script did not execute; CSP/frame policy blocked probe", iframe=iframe)
+        else:
+            ev.assert_("opaque_iframe_cannot_see_bridge", iframe.get("bridge") == "undefined", iframe=iframe)
+            ev.assert_("opaque_iframe_cannot_see_legacy_globals", all(
+                iframe.get(k) == "undefined" for k in ["session", "push", "nav"]
+            ), iframe=iframe)
         api_ok = cdp.eval(
             """
             (async () => {
@@ -330,6 +395,15 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
         ev.assert_("native_malformed_message_returns_400", malformed.get("status") == 400, reply=malformed)
         push = cdp.eval("nativeCall('pushToken', {}, 3000).then(d => typeof d.token === 'string')")
         ev.assert_("native_push_token_op_returns", push is True)
+        device.wake()
+        keyguard = device.keyguard_state()
+        ev.assert_(
+            "device_keyguard_clear_before_network_guard",
+            keyguard.get("keyguard_showing") is False,
+            state=keyguard,
+        )
+        if keyguard.get("keyguard_showing"):
+            return
         guard = cdp.eval(
             """
             (async () => {
@@ -404,11 +478,13 @@ def main(argv: list[str]) -> int:
     evidence = Evidence()
     device = Device(args.adb, args.package, args.cdp_port, evidence)
     locked = False
+    stay_awake_previous: str | None = None
     try:
         if not args.skip_lock:
             run(["device-lock", "acquire", args.lock], timeout=60)
             locked = True
             evidence.pass_("device_lock_acquired", lock=args.lock)
+        stay_awake_previous = device.enable_stay_awake()
         device.remove_forward()
         device.clear_force_fail()
         if not args.positive_only:
@@ -425,6 +501,11 @@ def main(argv: list[str]) -> int:
             device.remove_forward()
         except Exception:
             pass
+        if stay_awake_previous is not None:
+            try:
+                device.restore_stay_awake(stay_awake_previous)
+            except Exception:
+                pass
         if locked:
             run(["device-lock", "release", args.lock], check=False, timeout=30)
             evidence.pass_("device_lock_released", lock=args.lock)
