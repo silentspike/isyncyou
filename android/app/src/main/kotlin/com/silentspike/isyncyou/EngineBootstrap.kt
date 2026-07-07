@@ -24,6 +24,7 @@ object EngineBootstrap {
      * Start-or-reuse the engine and return the session token (`""` if the engine failed to start).
      * Idempotent: the first successful call caches the token; later calls return it without re-running
      * the bootstrap. The caller must invoke this **off the main thread** (it touches disk).
+     * Encrypted-storage setup failures throw and MUST happen before nativeStart/local data open.
      */
     @Synchronized
     fun ensureStarted(filesDir: File): String {
@@ -31,20 +32,17 @@ object EngineBootstrap {
 
         // Install the at-rest body key from the Keystore BEFORE the engine touches disk (#0B), so
         // the first body write/read is already sealed.
-        BodyKeyStore.getOrCreate(filesDir)?.let { r ->
+        val r = BodyKeyStore.getOrCreate(filesDir)
+        try {
             if (r.justCreated) {
-                // First encrypted run: discard the pre-encryption plaintext CACHE (the store DB + body
-                // files) so it re-syncs sealed — but KEEP the auth token (also under archive/,
-                // `.isyncyou-token*`) so the user stays signed in. The cache is reproducible; the token
-                // is not.
-                File(filesDir, "archive").listFiles()?.forEach { f ->
-                    if (!f.name.startsWith(".isyncyou-token")) f.deleteRecursively()
-                }
-                File(filesDir, "sync").deleteRecursively()
-                File(filesDir, "cache").deleteRecursively()
+                discardReproducibleLocalCache(filesDir)
                 Log.i(TAG, "body encryption on: discarded plaintext cache (kept auth)")
             }
-            NativeEngine.nativeSetBodyKey(r.keyId, r.key)
+            if (NativeEngine.nativeSetBodyKey(r.keyId, r.key) != 1) {
+                throw EncryptedStorageSetupException("Encrypted storage key install failed")
+            }
+            Log.i(TAG, "encrypted storage key installed")
+        } finally {
             java.util.Arrays.fill(r.key, 0) // wipe the data key from the JVM heap
         }
 
@@ -57,5 +55,13 @@ object EngineBootstrap {
             return t
         }
         return "" // don't cache failure; a later caller may retry
+    }
+
+    private fun discardReproducibleLocalCache(filesDir: File) {
+        File(filesDir, "archive").listFiles()?.forEach { f ->
+            if (!f.name.startsWith(".isyncyou-token")) f.deleteRecursively()
+        }
+        File(filesDir, "sync").deleteRecursively()
+        File(filesDir, "cache").deleteRecursively()
     }
 }
