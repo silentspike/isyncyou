@@ -7715,7 +7715,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "production iframe sandbox must not combine scripts and same-origin: {line}"
             );
         }
-        assert!(saw_sandbox, "expected at least one production iframe sandbox invariant");
+        assert!(
+            saw_sandbox,
+            "expected at least one production iframe sandbox invariant"
+        );
         assert!(
             APP_JS.contains("sandbox: \"allow-same-origin\""),
             "viewer iframes should remain no-script same-origin frames"
@@ -7733,8 +7736,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "must not construct http://127.0.0.1:/callback on appassets origin"
         );
         assert!(
-            APP_JS.contains("function localCallbackRedirect(host)") &&
-                APP_JS.contains("return location.port ? `http://${host}:${location.port}/callback` : \"\";"),
+            APP_JS.contains("function localCallbackRedirect(host)")
+                && APP_JS.contains(
+                    "return location.port ? `http://${host}:${location.port}/callback` : \"\";"
+                ),
             "callback redirect must be omitted when location.port is empty"
         );
     }
