@@ -28,6 +28,8 @@ pub enum StoreError {
     AlreadyRunning(String),
     #[error("store encryption secret is invalid: {0}")]
     InvalidStoreSecret(String),
+    #[error("store encryption key is required for this process")]
+    MissingStoreKey,
     #[error("store at {0} is already encrypted (not a plaintext SQLite file)")]
     AlreadyEncrypted(String),
     #[error("illegal restore-operation transition: {0}")]
@@ -568,8 +570,14 @@ impl Store {
         // SQLCipher `sqlite3_key` FFI symbol does not exist in the bundled-plain
         // build, so the encrypted branch must be compiled out entirely.
         #[cfg(feature = "encrypted-store")]
-        if let Some(secret) = configured_store_key()? {
-            return Self::open_encrypted(path, &secret);
+        match configured_store_key()? {
+            Some(secret) => return Self::open_encrypted(path, &secret),
+            None if store_key_required_for_process() => return Err(StoreError::MissingStoreKey),
+            None => {}
+        }
+        #[cfg(not(feature = "encrypted-store"))]
+        if store_key_required_for_process() {
+            return Err(StoreError::MissingStoreKey);
         }
         Self::open_plain(path)
     }
@@ -621,10 +629,21 @@ impl Store {
         // writable open that creates + migrates it. NO_MUTEX: single-threaded per handle.
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let path = path.as_ref();
+        #[cfg(feature = "encrypted-store")]
+        let secret = match configured_store_key()? {
+            Some(secret) => Some(secret),
+            None if store_key_required_for_process() => return Err(StoreError::MissingStoreKey),
+            None => None,
+        };
+        #[cfg(not(feature = "encrypted-store"))]
+        if store_key_required_for_process() {
+            return Err(StoreError::MissingStoreKey);
+        }
         let conn = Connection::open_with_flags(path, flags)?;
         #[cfg(feature = "encrypted-store")]
-        if let Some(secret) = configured_store_key()? {
+        if let Some(secret) = secret {
             apply_sqlcipher_key(&conn, &secret)?;
+            let _: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Store { conn, _lock: None })
@@ -1773,12 +1792,56 @@ impl Store {
 /// (encrypted-store) `configured_store_key` reads it.
 static INSTALLED_STORE_KEY: std::sync::OnceLock<std::sync::Mutex<Option<Vec<u8>>>> =
     std::sync::OnceLock::new();
+static REQUIRE_STORE_KEY: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static TEST_REQUIRE_STORE_KEY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 /// Install the process store key (mobile: from the Keystore, #0B). Overrides the env/keyring
 /// sources for every subsequent [`Store::open`]. The key stays in process memory only.
 pub fn set_store_key(secret: Vec<u8>) {
     let cell = INSTALLED_STORE_KEY.get_or_init(|| std::sync::Mutex::new(None));
     *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret);
+}
+
+/// Require every on-disk store open in this process to have a configured SQLCipher key.
+/// Mobile calls this before starting the embedded engine so readonly and writable fallback
+/// paths fail closed instead of creating/opening plaintext.
+pub fn require_store_key_for_process() {
+    #[cfg(test)]
+    {
+        TEST_REQUIRE_STORE_KEY.with(|v| v.set(Some(true)));
+    }
+    #[cfg(not(test))]
+    {
+        REQUIRE_STORE_KEY
+            .get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn store_key_required_for_process() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_REQUIRE_STORE_KEY.with(|required| required.get()) {
+        return v;
+    }
+    REQUIRE_STORE_KEY
+        .get()
+        .map(|v| v.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn reset_store_key_process_state_for_tests() {
+    if let Some(cell) = INSTALLED_STORE_KEY.get() {
+        *cell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    if let Some(required) = REQUIRE_STORE_KEY.get() {
+        required.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    TEST_REQUIRE_STORE_KEY.with(|v| v.set(None));
 }
 
 #[cfg(feature = "encrypted-store")]
@@ -2840,6 +2903,46 @@ mod tests {
                 .name,
             "keep.txt"
         );
+    }
+
+    #[test]
+    fn process_key_required_blocks_plain_writable_and_readonly_opens() {
+        reset_store_key_process_state_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let plain = Store::open(&path).unwrap();
+            plain.upsert_item(&item("a", "r1", "plain.txt")).unwrap();
+        }
+
+        require_store_key_for_process();
+
+        assert!(
+            matches!(Store::open(&path), Err(StoreError::MissingStoreKey)),
+            "key-required process must not writable-open a plaintext fallback"
+        );
+        assert!(
+            matches!(
+                Store::open_readonly(&path),
+                Err(StoreError::MissingStoreKey)
+            ),
+            "key-required process must not readonly-open a plaintext fallback"
+        );
+        reset_store_key_process_state_for_tests();
+    }
+
+    #[test]
+    fn default_process_still_allows_plain_open_without_key_required_mode() {
+        reset_store_key_process_state_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+
+        let store = Store::open(&path).unwrap();
+        store.upsert_item(&item("a", "r1", "plain.txt")).unwrap();
+        drop(store);
+
+        let reader = Store::open_readonly(&path).unwrap();
+        assert!(reader.get_item("a", "onedrive", "r1").unwrap().is_some());
     }
 
     #[test]
