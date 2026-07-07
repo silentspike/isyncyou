@@ -2,6 +2,14 @@ package com.silentspike.isyncyou
 
 import java.util.UUID
 
+data class OAuthGuardBeginResult(
+    val guardId: String?,
+    val error: String? = null,
+) {
+    val ok: Boolean
+        get() = guardId != null
+}
+
 class OAuthGuardRegistry(
     private val onStart: () -> Unit,
     private val onStop: () -> Unit,
@@ -10,12 +18,19 @@ class OAuthGuardRegistry(
     private val active = LinkedHashSet<String>()
 
     @Synchronized
-    fun begin(): String {
+    fun begin(): OAuthGuardBeginResult {
         val wasEmpty = active.isEmpty()
         val id = newId()
         active.add(id)
-        if (wasEmpty) onStart()
-        return id
+        if (wasEmpty) {
+            try {
+                onStart()
+            } catch (ex: RuntimeException) {
+                active.remove(id)
+                return OAuthGuardBeginResult(null, ex.javaClass.simpleName ?: "start_failed")
+            }
+        }
+        return OAuthGuardBeginResult(id)
     }
 
     @Synchronized

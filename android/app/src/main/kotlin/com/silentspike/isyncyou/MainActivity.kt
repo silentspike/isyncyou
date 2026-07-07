@@ -77,8 +77,8 @@ class MainActivity : FragmentActivity() {
     private val bridgeSeen = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val oauthGuards = OAuthGuardRegistry(
-        onStart = { runOnUiThread { OAuthGuardService.start(this@MainActivity) } },
-        onStop = { runOnUiThread { OAuthGuardService.stop(this@MainActivity) } },
+        onStart = { OAuthGuardService.start(this@MainActivity) },
+        onStop = { OAuthGuardService.stop(this@MainActivity) },
     )
 
     private data class PendingBio(
@@ -108,6 +108,7 @@ class MainActivity : FragmentActivity() {
             cacheMode = WebSettings.LOAD_NO_CACHE
         }
         web.clearCache(true)
+        expireLegacySessionCookie()
         web.webViewClient = object : WebViewClient() {
             // The app-origin UI stays in the WebView. Typed, exact auth/device-code
             // destinations are handed to the system browser. Everything else is consumed
@@ -277,6 +278,18 @@ class MainActivity : FragmentActivity() {
         return if (persisted.isNotEmpty()) persisted else (fcmToken ?: "")
     }
 
+    private fun expireLegacySessionCookie() {
+        try {
+            android.webkit.CookieManager.getInstance().apply {
+                setCookie("$APP_ORIGIN/", "isy_session=; Path=/; Max-Age=0")
+                setCookie("$APP_ORIGIN/", "isy_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+                flush()
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "legacy session cookie cleanup failed", t)
+        }
+    }
+
     /**
      * Register the origin-bound in-process message bridge `__isyBridge` before the Activity
      * starts the engine. A missing or failed bridge is a startup failure for the WebView data
@@ -440,13 +453,20 @@ class MainActivity : FragmentActivity() {
                 JSONObject().put("token", currentPushToken()),
             )
             "beginNetworkGuard" -> {
-                val guardId = oauthGuards.begin()
-                postBridgeResponse(
-                    reply,
-                    id,
-                    200,
-                    JSONObject().put("ok", true).put("guard_id", guardId),
-                )
+                bridgeExecutor.execute {
+                    val result = oauthGuards.begin()
+                    if (result.ok) {
+                        postBridgeResponse(
+                            reply,
+                            id,
+                            200,
+                            JSONObject().put("ok", true).put("guard_id", result.guardId),
+                        )
+                    } else {
+                        android.util.Log.w(TAG, "network guard unavailable (${result.error ?: "start_failed"})")
+                        postBridgeError(reply, id, 503, "unavailable", "network_guard_unavailable")
+                    }
+                }
             }
             "endNetworkGuard" -> {
                 val ended = oauthGuards.end(payload.optString("guard_id", ""))

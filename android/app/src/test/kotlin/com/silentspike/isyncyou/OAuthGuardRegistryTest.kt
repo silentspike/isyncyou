@@ -2,6 +2,7 @@ package com.silentspike.isyncyou
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -18,23 +19,25 @@ class OAuthGuardRegistryTest {
         )
 
         val first = registry.begin()
-        assertEquals("guard-a", first)
+        assertTrue(first.ok)
+        assertEquals("guard-a", first.guardId)
         assertEquals(1, startCalls)
         assertEquals(0, stopCalls)
         assertEquals(1, registry.activeCount())
 
         val second = registry.begin()
-        assertEquals("guard-b", second)
+        assertTrue(second.ok)
+        assertEquals("guard-b", second.guardId)
         assertEquals(1, startCalls)
         assertEquals(0, stopCalls)
         assertEquals(2, registry.activeCount())
 
-        assertTrue(registry.end(first))
+        assertTrue(registry.end(first.guardId))
         assertEquals(1, startCalls)
         assertEquals(0, stopCalls)
         assertEquals(1, registry.activeCount())
 
-        assertTrue(registry.end(second))
+        assertTrue(registry.end(second.guardId))
         assertEquals(1, startCalls)
         assertEquals(1, stopCalls)
         assertEquals(0, registry.activeCount())
@@ -54,7 +57,7 @@ class OAuthGuardRegistryTest {
         assertFalse(registry.end("missing"))
         assertEquals(0, stopCalls)
 
-        val id = registry.begin()
+        val id = registry.begin().guardId
         assertFalse(registry.end("missing"))
         assertEquals(0, stopCalls)
 
@@ -82,5 +85,34 @@ class OAuthGuardRegistryTest {
         assertEquals(0, registry.activeCount())
         assertEquals(0, registry.clear())
         assertEquals(1, stopCalls)
+    }
+
+    @Test
+    fun failedStartRollsBackGuardAndCanRetry() {
+        var startCalls = 0
+        var failStart = true
+        val ids = mutableListOf("guard-a", "guard-b")
+        val registry = OAuthGuardRegistry(
+            onStart = {
+                startCalls += 1
+                if (failStart) throw IllegalStateException("fgs denied")
+            },
+            onStop = {},
+            newId = { ids.removeAt(0) },
+        )
+
+        val failed = registry.begin()
+        assertFalse(failed.ok)
+        assertNull(failed.guardId)
+        assertEquals("IllegalStateException", failed.error)
+        assertEquals(1, startCalls)
+        assertEquals(0, registry.activeCount())
+
+        failStart = false
+        val retried = registry.begin()
+        assertTrue(retried.ok)
+        assertEquals("guard-b", retried.guardId)
+        assertEquals(2, startCalls)
+        assertEquals(1, registry.activeCount())
     }
 }
