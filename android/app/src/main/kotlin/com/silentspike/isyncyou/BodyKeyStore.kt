@@ -32,11 +32,14 @@ object BodyKeyStore {
     data class Result(val keyId: Int, val key: ByteArray, val justCreated: Boolean)
 
     /**
-     * Return the data key, generating + wrapping it on first run. `null` if the Keystore is
-     * unavailable — the caller then runs without at-rest body encryption rather than failing.
+     * Return the data key, generating + wrapping it on first run. Throws on any Keystore or
+     * persistence failure so the caller fails closed before the native engine can open local data.
      */
-    fun getOrCreate(filesDir: File): Result? {
+    fun getOrCreate(filesDir: File): Result {
         return try {
+            if (BuildConfig.DEBUG && File(filesDir, ".debug-fail-body-key").exists()) {
+                throw IllegalStateException("debug injected body key failure")
+            }
             val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
             val wrapKey = ensureWrapKey(ks)
             val keyFile = File(filesDir, KEY_FILE)
@@ -55,8 +58,8 @@ object BodyKeyStore {
                 Result(KEY_ID, data, true)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "body key setup failed; running without at-rest body encryption", e)
-            null
+            Log.e(TAG, "encrypted storage setup failed; local data was not opened", e)
+            throw EncryptedStorageSetupException("Encrypted storage setup failed", e)
         }
     }
 

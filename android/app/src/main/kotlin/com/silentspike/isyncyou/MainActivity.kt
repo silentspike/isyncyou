@@ -197,11 +197,23 @@ class MainActivity : FragmentActivity() {
             try {
                 val token = EngineBootstrap.ensureStarted(filesDir)
                 runOnUiThread { onEngineReady(if (token.isEmpty()) -1 else 1, token) }
+            } catch (t: EncryptedStorageSetupException) {
+                android.util.Log.e(TAG, "encrypted storage setup failed; local data was not opened", t)
+                runOnUiThread { onEncryptedStorageFailed() }
             } catch (t: Throwable) {
                 android.util.Log.e(TAG, "engine thread crashed starting the native engine", t)
                 runOnUiThread { onEngineReady(-1, "") }
             }
         }.start()
+    }
+
+    private fun onEncryptedStorageFailed() {
+        web.loadData(
+            "<html><body style='font-family:sans-serif;padding:2rem'>" +
+                "<h2>iSyncYou</h2><p>Encrypted storage setup failed. Local data was not opened.</p></body></html>",
+            "text/html",
+            "utf-8",
+        )
     }
 
     /** Wire the session token into the WebView and load the local UI (UI thread). */
