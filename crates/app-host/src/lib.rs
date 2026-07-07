@@ -2494,6 +2494,80 @@ mod tests {
     }
 
     #[test]
+    fn upload_staging_cleanup_removes_only_stale_staging_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "isy-apphost-upload-staging-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join(format!("{}stale.bin", TempBody::PREFIX));
+        let fresh = dir.join(format!("{}fresh.bin", TempBody::PREFIX));
+        let unrelated = dir.join("unrelated-upload.bin");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::write(&fresh, b"fresh").unwrap();
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+        let old = std::time::SystemTime::now()
+            .checked_sub(TempBody::STALE_AFTER + Duration::from_secs(60))
+            .unwrap();
+        filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(old)).unwrap();
+
+        TempBody::cleanup_stale(&dir);
+
+        assert!(
+            !stale.exists(),
+            "stale upload staging files must be removed"
+        );
+        assert!(fresh.exists(), "fresh upload staging files must be kept");
+        assert!(
+            unrelated.exists(),
+            "non-staging files in the staging directory must be left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_staging_held_file_survives_cleanup_and_stays_sealed() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(720_003, [3u8; 32]);
+        let dir = std::env::temp_dir().join(format!(
+            "isy-apphost-upload-staging-held-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sentinel = b"upload-stage-held-plaintext-sentinel-720";
+        let tmp = TempBody::write_in_dir(&dir, sentinel).unwrap();
+        let staged_path = tmp.path().to_path_buf();
+
+        TempBody::cleanup_stale(&dir);
+
+        assert!(
+            staged_path.exists(),
+            "held fresh staging file must not be removed by cleanup"
+        );
+        let raw = std::fs::read(&staged_path).unwrap();
+        assert_eq!(
+            isyncyou_core::envelope::blob_key_id(&raw),
+            Some(720_003),
+            "held staging file must remain a sealed body envelope"
+        );
+        assert!(
+            !raw.windows(sentinel.len()).any(|w| w == sentinel),
+            "held staging file must not expose plaintext bytes on disk"
+        );
+        assert_eq!(
+            isyncyou_core::envelope::read_body(&staged_path).unwrap(),
+            sentinel
+        );
+        drop(tmp);
+        assert!(
+            !staged_path.exists(),
+            "held staging file should still be removed on drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn daemon_transfer_cancel_requests_cancellation() {
         // DaemonTransfer::cancel (#656) is best-effort: it always accepts and flags the id on
         // the shared progress so the materialize pass skips it before its next file boundary.
