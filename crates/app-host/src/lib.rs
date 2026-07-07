@@ -2447,6 +2447,7 @@ mod tests {
 
     #[test]
     fn upload_staging_uses_account_cache_root_and_body_envelope_when_keyed() {
+        let _guard = EnvelopeRequirementGuard::new();
         isyncyou_core::envelope::set_body_key(719, [7u8; 32]);
         let dir =
             std::env::temp_dir().join(format!("isy-apphost-upload-staging-{}", std::process::id()));
