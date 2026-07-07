@@ -92,7 +92,13 @@ class OneDriveDocumentsProvider : DocumentsProvider() {
         val c = MatrixCursor(proj)
         // The drive root is the empty folder id; a subfolder is the graph id inside its document id.
         val folder = if (parentDocumentId == ROOT_DOC_ID) "" else DocId.decode(parentDocumentId).id
-        val children = liveChildren(folder)
+        val children = try {
+            liveChildren(folder)
+        } catch (e: EncryptedStorageSetupException) {
+            throw encryptedStorageUnavailable(e)
+        } catch (e: IllegalStateException) {
+            throw encryptedStorageUnavailable(e)
+        }
         for (i in 0 until children.length()) {
             children.optJSONObject(i)?.let { addChildRow(c, proj, it) }
         }
@@ -106,7 +112,13 @@ class OneDriveDocumentsProvider : DocumentsProvider() {
     ): ParcelFileDescriptor {
         if (mode != "r") throw FileNotFoundException("read-only provider; unsupported mode: $mode")
         val d = DocId.decode(documentId)
-        val (status, body) = liveOpen(d.id, d.name)
+        val (status, body) = try {
+            liveOpen(d.id, d.name)
+        } catch (e: EncryptedStorageSetupException) {
+            throw encryptedStorageUnavailable(e)
+        } catch (e: IllegalStateException) {
+            throw encryptedStorageUnavailable(e)
+        }
         if (status != 200 || body == null) {
             throw FileNotFoundException("document not available (status=$status): ${d.id}")
         }
@@ -154,13 +166,23 @@ class OneDriveDocumentsProvider : DocumentsProvider() {
 
     // -------------------------------------------------- engine bridge helpers (live Mode-1)
 
+    private fun encryptedStorageUnavailable(cause: Exception): FileNotFoundException {
+        return FileNotFoundException("encrypted local engine unavailable").apply {
+            initCause(cause)
+        }
+    }
+
     private fun token(): String {
         val t = EngineBootstrap.ensureStarted(context!!.filesDir)
         if (t.isEmpty()) throw IllegalStateException("encrypted local engine unavailable")
         return t
     }
 
-    /** `GET /api/v1/onedrive/children?folder=` → the live Graph child list (empty on any failure). */
+    /**
+     * `GET /api/v1/onedrive/children?folder=` → the live Graph child list.
+     * Remote/API failures stay an empty cloud listing, but local encrypted-storage/bootstrap
+     * failures must propagate so the provider fails closed instead of presenting usable state.
+     */
     private fun liveChildren(folder: String): JSONArray {
         val reply = bridgeGet("/api/v1/onedrive/children?account=$ACCOUNT&folder=${enc(folder)}")
             ?: return JSONArray()
@@ -172,17 +194,25 @@ class OneDriveDocumentsProvider : DocumentsProvider() {
         }
     }
 
-    /** Send a bridge GET with the session token; returns the parsed reply envelope, or null. */
+    /**
+     * Send a bridge GET with the session token.
+     * Returns null for malformed/remote bridge replies, but never hides local engine availability
+     * failures that would make encrypted local state unsafe to use.
+     */
     private fun bridgeGet(path: String): JSONObject? {
-        val env = JSONObject().apply {
-            put("t", "req")
-            put("id", "1")
-            put("method", "GET")
-            put("path", path)
-            put("headers", JSONObject().apply { put("X-Session-Token", token()) })
-        }
         return try {
+            val env = JSONObject().apply {
+                put("t", "req")
+                put("id", "1")
+                put("method", "GET")
+                put("path", path)
+                put("headers", JSONObject().apply { put("X-Session-Token", token()) })
+            }
             JSONObject(NativeEngine.nativeBridgeRequest(env.toString()))
+        } catch (e: EncryptedStorageSetupException) {
+            throw e
+        } catch (e: IllegalStateException) {
+            throw e
         } catch (e: Exception) {
             null
         }
