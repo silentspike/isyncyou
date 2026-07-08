@@ -1,0 +1,165 @@
+{
+  "cdp_port": 9222,
+  "lock": "om-721",
+  "ok": true,
+  "package": "com.silentspike.isyncyou.debug",
+  "results": [
+    {
+      "lock": "om-721",
+      "name": "device_lock_acquired",
+      "status": "PASS"
+    },
+    {
+      "name": "device_stay_awake_enabled",
+      "previous": "15",
+      "status": "PASS"
+    },
+    {
+      "name": "cdp_forward",
+      "port": 9222,
+      "socket": "webview_devtools_remote_859",
+      "status": "PASS"
+    },
+    {
+      "name": "forced_failure_page_text",
+      "status": "PASS",
+      "text": "iSyncYou\n\nSecure WebView bridge startup failed. Local data was not opened from this screen.\n\nBridge startup was forced to fail for verification."
+    },
+    {
+      "name": "forced_failure_no_scripts",
+      "script_count": 0,
+      "status": "PASS"
+    },
+    {
+      "cookie": "COOKIE_BLOCKED",
+      "name": "forced_failure_no_session_cookie",
+      "status": "PASS"
+    },
+    {
+      "href": "about:blank",
+      "name": "forced_failure_not_app_origin_shell",
+      "status": "PASS"
+    },
+    {
+      "log_tail": "E:33195 VIRTUAL-SKIN-CHARGE-PERSIST:33195 \n07-08 05:30:34.837  1116  1116 I WifiHAL : Creating message to get link statistics; iface = 47\n07-08 05:30:34.930  1116  1153 I WifiHAL : Getting cached scan results, iface handle = 0xb00d9abff56e360\n07-08 05:30:34.930  1116  1153 E WifiHAL : Creating message to get cached scan results\n07-08 05:30:34.942  1116  1153 I WifiHAL : In GetCachedScanResultsCommand::handleResponse\n07-08 05:30:35.006  1116  1153 D WifiHAL : Start debug command: mType GET_FEATURE\n07-08 05:30:35.007  1116  1153 I WifiHAL : CreateRequest mType = GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : len = 4, expected len = 4\n07-08 05:30:35.040  1516  2184 D ConnectivityService: NetReassign [no changes] [c 7] [a 8] [i 12]\n07-08 05:30:35.987  1516  2112 I UsageStatsService: User[0] Flushing usage stats to disk\n07-08 05:30:36.049  1045 28489 I bthal.activity: bt_power: LeAdvStat: 05:30:35:047 - 05:30:36:049, duration: 1002, le_adv_count: 2, total_le_adv_count: 2230, total_event_count: 2\n07-08 05:30:36.118  1516  2239 D BackgroundInstallControlService: Package event received: 0\n",
+      "name": "forced_failure_activity_engine_not_started",
+      "status": "PASS"
+    },
+    {
+      "log_tail": "E:33195 VIRTUAL-SKIN-CHARGE-PERSIST:33195 \n07-08 05:30:34.837  1116  1116 I WifiHAL : Creating message to get link statistics; iface = 47\n07-08 05:30:34.930  1116  1153 I WifiHAL : Getting cached scan results, iface handle = 0xb00d9abff56e360\n07-08 05:30:34.930  1116  1153 E WifiHAL : Creating message to get cached scan results\n07-08 05:30:34.942  1116  1153 I WifiHAL : In GetCachedScanResultsCommand::handleResponse\n07-08 05:30:35.006  1116  1153 D WifiHAL : Start debug command: mType GET_FEATURE\n07-08 05:30:35.007  1116  1153 I WifiHAL : CreateRequest mType = GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : len = 4, expected len = 4\n07-08 05:30:35.040  1516  2184 D ConnectivityService: NetReassign [no changes] [c 7] [a 8] [i 12]\n07-08 05:30:35.987  1516  2112 I UsageStatsService: User[0] Flushing usage stats to disk\n07-08 05:30:36.049  1045 28489 I bthal.activity: bt_power: LeAdvStat: 05:30:35:047 - 05:30:36:049, duration: 1002, le_adv_count: 2, total_le_adv_count: 2230, total_event_count: 2\n07-08 05:30:36.118  1516  2239 D BackgroundInstallControlService: Package event received: 0\n",
+      "name": "forced_failure_log_marker",
+      "status": "PASS"
+    },
+    {
+      "name": "cdp_forward",
+      "port": 9222,
+      "socket": "webview_devtools_remote_1181",
+      "status": "PASS"
+    },
+    {
+      "name": "top_frame_has_bridge",
+      "status": "PASS"
+    },
+    {
+      "name": "no_legacy_globals",
+      "status": "PASS"
+    },
+    {
+      "name": "document_cookie_has_no_session",
+      "status": "PASS"
+    },
+    {
+      "iframe": {
+        "timeout": true
+      },
+      "name": "opaque_iframe_cannot_see_bridge",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe",
+      "status": "SKIP"
+    },
+    {
+      "iframe": {
+        "timeout": true
+      },
+      "name": "opaque_iframe_cannot_see_legacy_globals",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe",
+      "status": "SKIP"
+    },
+    {
+      "name": "api_works_with_fetch_monkeypatched",
+      "status": "PASS"
+    },
+    {
+      "name": "stream_works_with_eventsource_monkeypatched",
+      "status": "PASS"
+    },
+    {
+      "name": "native_malformed_message_returns_400",
+      "reply": {
+        "body": "{\"error\":\"bad_request\",\"reason\":\"missing_or_unknown_kind\"}",
+        "id": "probe-bad",
+        "status": 400,
+        "t": "res"
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_push_token_op_returns",
+      "status": "PASS"
+    },
+    {
+      "name": "device_keyguard_clear_before_network_guard",
+      "state": {
+        "current_focus": "mCurrentFocus=Window{f4c28d u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
+        "focused_app": "mFocusedApp=ActivityRecord{100125784 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13538}",
+        "keyguard_showing": false
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_network_guard_roundtrip",
+      "status": "PASS"
+    },
+    {
+      "name": "native_openexternal_rejects_blocked_urls",
+      "result": {
+        "ok": true
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "accepted_openexternal_smoke",
+      "reason": "disabled by default to avoid browser focus flake",
+      "status": "SKIP"
+    },
+    {
+      "name": "account_device_code_bridge_function_present",
+      "status": "PASS"
+    },
+    {
+      "name": "bridge_transport_stats",
+      "stats": {
+        "bio": 0,
+        "events": 0,
+        "native": 12,
+        "requests": 9,
+        "streams": 2
+      },
+      "status": "PASS"
+    },
+    {
+      "listen_sockets": [],
+      "name": "default_uid_has_no_listen_sockets",
+      "status": "PASS"
+    },
+    {
+      "name": "device_stay_awake_restored",
+      "status": "PASS",
+      "value": "15"
+    },
+    {
+      "lock": "om-721",
+      "name": "device_lock_released",
+      "status": "PASS"
+    }
+  ]
+}
