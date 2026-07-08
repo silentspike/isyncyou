@@ -3,7 +3,7 @@ name: Promote
 # Autonomous promotion: after a merge into dev (or staging), build the next-stage
 # branch as a tree-overlay of the source onto the target and open a PR that
 # auto-merges once the target's required checks pass. dev -> staging -> main runs
-# hands-off; the final merge into main triggers release.yml (RC publish).
+# hands-off; release.yml is dispatched deliberately from main when cutting an RC.
 #
 # Why a PAT (PROMOTE_TOKEN) and not GITHUB_TOKEN:
 #   - a PR opened by GITHUB_TOKEN does NOT trigger the target's required CI, so

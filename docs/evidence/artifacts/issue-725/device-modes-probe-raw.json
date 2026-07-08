@@ -1,0 +1,485 @@
+{
+  "account_hint": "backupslave@outlook.com",
+  "cleanup": {
+    "graph_delete_root_status": 204
+  },
+  "fixture": {
+    "files": {
+      "offline": {
+        "etag": "\"{3CB7C740-D30B-4A6F-AB82-5E9C67D77441},1\"",
+        "id": "892B68CBF4A7C544!s3cb7c740d30b4a6fab825e9c67d77441",
+        "name": "file-offline.txt",
+        "size": 32
+      },
+      "online": {
+        "etag": "\"{105A7E8C-25C0-4131-8F1D-73784D3D25B0},1\"",
+        "id": "892B68CBF4A7C544!s105a7e8c25c041318f1d73784d3d25b0",
+        "name": "file-online.txt",
+        "size": 23
+      },
+      "sync": {
+        "etag": "\"{2D8E1DDD-C456-48CD-AC23-8669FA37A25B},1\"",
+        "id": "892B68CBF4A7C544!s2d8e1dddc45648cdac238669fa37a25b",
+        "name": "file-sync.txt",
+        "size": 27
+      }
+    },
+    "folders": {
+      "dest": {
+        "id": "892B68CBF4A7C544!s037e91d94c714a51bf551754de361de1",
+        "name": "dest"
+      },
+      "offline": {
+        "id": "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f",
+        "name": "offline"
+      },
+      "online": {
+        "id": "892B68CBF4A7C544!s8c0ab08d3e1049f2888141e85b4ba630",
+        "name": "online"
+      },
+      "sync": {
+        "id": "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec",
+        "name": "sync"
+      }
+    },
+    "root_id": "892B68CBF4A7C544!s1696bdd0f8d74e189cb4b80bb2d8d15a",
+    "root_name": "isy-om725-20260708-142524",
+    "sha256": {
+      "offline": "31f8dbcff6f2e65c42c74b28b56c02e5ed14579c0468a37f7e61c00beb9e2744",
+      "online": "ca86598e8fea8166c69d8799b513c069e0908128cd0544689b082307497d351a",
+      "sync": "70a199d74c115d367cdcba8c49b3230303926851d658fd2e603ded1e837bf519"
+    }
+  },
+  "generated_at": "2026-07-08T14:25:24Z",
+  "rows": {
+    "A_online": {
+      "fixture_children": [
+        {
+          "effective_mode": "online",
+          "id": "892B68CBF4A7C544!s037e91d94c714a51bf551754de361de1",
+          "name": "dest"
+        },
+        {
+          "effective_mode": "online",
+          "id": "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f",
+          "name": "offline"
+        },
+        {
+          "effective_mode": "online",
+          "id": "892B68CBF4A7C544!s8c0ab08d3e1049f2888141e85b4ba630",
+          "name": "online"
+        },
+        {
+          "effective_mode": "online",
+          "id": "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec",
+          "name": "sync"
+        }
+      ],
+      "graph_file": {
+        "id": "892B68CBF4A7C544!s105a7e8c25c041318f1d73784d3d25b0",
+        "sha256": "ca86598e8fea8166c69d8799b513c069e0908128cd0544689b082307497d351a",
+        "size": 23
+      },
+      "item_before_open_message": "item not found",
+      "item_before_open_ok": false,
+      "online_file_listing": [
+        {
+          "effective_mode": "online",
+          "id": "892B68CBF4A7C544!s105a7e8c25c041318f1d73784d3d25b0",
+          "name": "file-online.txt",
+          "size": 23
+        }
+      ],
+      "open": {
+        "contentType": "text/plain",
+        "len": 23,
+        "ok": true,
+        "status": 200,
+        "text": "OM725 online live open\n"
+      },
+      "root_child_count": 18,
+      "status": "PASS",
+      "status_total_after": null,
+      "status_total_before": null
+    },
+    "B_mode_config": {
+      "mode_after": {
+        "ok": true,
+        "value": {
+          "account": "me",
+          "default_mode": "online",
+          "folder_modes": {
+            "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e": "offline",
+            "892B68CBF4A7C544!s394ef6f2649a4eed88d7f86fd2542a05": "offline",
+            "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6": "sync",
+            "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f": "offline",
+            "892B68CBF4A7C544!sad502b7a0e624b7882e0b98fd3c54556": "offline",
+            "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec": "sync"
+          }
+        }
+      },
+      "mode_after_restart": {
+        "ok": true,
+        "value": {
+          "account": "me",
+          "default_mode": "online",
+          "folder_modes": {
+            "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e": "offline",
+            "892B68CBF4A7C544!s394ef6f2649a4eed88d7f86fd2542a05": "offline",
+            "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6": "sync",
+            "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f": "offline",
+            "892B68CBF4A7C544!sad502b7a0e624b7882e0b98fd3c54556": "offline",
+            "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec": "sync"
+          }
+        }
+      },
+      "mode_before": {
+        "ok": true,
+        "value": {
+          "account": "me",
+          "default_mode": "online",
+          "folder_modes": {
+            "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e": "offline",
+            "892B68CBF4A7C544!s394ef6f2649a4eed88d7f86fd2542a05": "offline",
+            "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6": "sync",
+            "892B68CBF4A7C544!sad502b7a0e624b7882e0b98fd3c54556": "offline"
+          }
+        }
+      },
+      "offline_effective_after_restart": [
+        {
+          "effective_mode": "offline",
+          "id": "892B68CBF4A7C544!s3cb7c740d30b4a6fab825e9c67d77441",
+          "name": "file-offline.txt"
+        }
+      ],
+      "offline_effective_before_restart": [
+        {
+          "effective_mode": "offline",
+          "id": "892B68CBF4A7C544!s3cb7c740d30b4a6fab825e9c67d77441",
+          "name": "file-offline.txt"
+        }
+      ],
+      "set_offline": {
+        "ok": true,
+        "value": {
+          "account": "me",
+          "folder": "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f",
+          "mode": "offline"
+        }
+      },
+      "set_sync": {
+        "ok": true,
+        "value": {
+          "account": "me",
+          "folder": "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec",
+          "mode": "sync"
+        }
+      },
+      "status": "PASS",
+      "sync_effective_after_restart": [
+        {
+          "effective_mode": "sync",
+          "id": "892B68CBF4A7C544!s2d8e1dddc45648cdac238669fa37a25b",
+          "name": "file-sync.txt"
+        }
+      ],
+      "sync_effective_before_restart": [
+        {
+          "effective_mode": "sync",
+          "id": "892B68CBF4A7C544!s2d8e1dddc45648cdac238669fa37a25b",
+          "name": "file-sync.txt"
+        }
+      ]
+    },
+    "C_sync_D_offline_download_targets": {
+      "expected": {
+        "offline_target": "sync",
+        "online_download_now": "error",
+        "sync_target": "cache"
+      },
+      "offline_download_now": {
+        "ok": true,
+        "value": {
+          "downloaded": true,
+          "ok": true,
+          "target": "sync"
+        }
+      },
+      "offline_item_after_scoped_pass": {
+        "ok": true,
+        "value": {
+          "body_location": "sync",
+          "body_state": "available",
+          "conflict_state": null,
+          "content_state": "materialized",
+          "deleted": false,
+          "effective_mode": "offline",
+          "etag": "\"{3CB7C740-D30B-4A6F-AB82-5E9C67D77441},1\"",
+          "has_body": true,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "file-offline.txt",
+          "parent_remote_id": "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f",
+          "remote_id": "892B68CBF4A7C544!s3cb7c740d30b4a6fab825e9c67d77441",
+          "remote_mtime": "2026-07-08T14:25:34Z",
+          "service": "onedrive",
+          "size": 32,
+          "state": "live_backup",
+          "sync_state": "clean",
+          "verified_at": null,
+          "verify_status": null
+        }
+      },
+      "online_download_now": {
+        "message": "download-now: unknown item 892B68CBF4A7C544!s105a7e8c25c041318f1d73784d3d25b0",
+        "ok": false
+      },
+      "poll": [
+        {
+          "offline_msg": "item not found",
+          "offline_ok": false,
+          "offline_value": null,
+          "sync_msg": "item not found",
+          "sync_ok": false,
+          "sync_value": null,
+          "t": 0,
+          "transfers": {
+            "ok": true,
+            "value": {
+              "count": 0,
+              "transfers": []
+            }
+          }
+        },
+        {
+          "offline_msg": "item not found",
+          "offline_ok": false,
+          "offline_value": null,
+          "sync_msg": "item not found",
+          "sync_ok": false,
+          "sync_value": null,
+          "t": 5,
+          "transfers": {
+            "ok": true,
+            "value": {
+              "count": 0,
+              "transfers": []
+            }
+          }
+        },
+        {
+          "offline_msg": "item not found",
+          "offline_ok": false,
+          "offline_value": null,
+          "sync_msg": "item not found",
+          "sync_ok": false,
+          "sync_value": null,
+          "t": 10,
+          "transfers": {
+            "ok": true,
+            "value": {
+              "count": 0,
+              "transfers": []
+            }
+          }
+        },
+        {
+          "offline_msg": "item not found",
+          "offline_ok": false,
+          "offline_value": null,
+          "sync_msg": "item not found",
+          "sync_ok": false,
+          "sync_value": null,
+          "t": 15,
+          "transfers": {
+            "ok": true,
+            "value": {
+              "count": 0,
+              "transfers": []
+            }
+          }
+        },
+        {
+          "offline_msg": "item not found",
+          "offline_ok": false,
+          "offline_value": null,
+          "sync_msg": "item not found",
+          "sync_ok": false,
+          "sync_value": null,
+          "t": 20,
+          "transfers": {
+            "ok": true,
+            "value": {
+              "count": 0,
+              "transfers": []
+            }
+          }
+        },
+        {
+          "offline_msg": null,
+          "offline_ok": true,
+          "offline_value": {
+            "body_location": "sync",
+            "body_state": "available",
+            "conflict_state": null,
+            "content_state": "materialized",
+            "deleted": false,
+            "effective_mode": "offline",
+            "etag": "\"{3CB7C740-D30B-4A6F-AB82-5E9C67D77441},1\"",
+            "has_body": true,
+            "item_type": "file",
+            "last_download_error": null,
+            "name": "file-offline.txt",
+            "parent_remote_id": "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f",
+            "remote_id": "892B68CBF4A7C544!s3cb7c740d30b4a6fab825e9c67d77441",
+            "remote_mtime": "2026-07-08T14:25:34Z",
+            "service": "onedrive",
+            "size": 32,
+            "state": "live_backup",
+            "sync_state": "clean",
+            "verified_at": null,
+            "verify_status": null
+          },
+          "sync_msg": "Bridge timeout",
+          "sync_ok": false,
+          "sync_value": null,
+          "t": 25,
+          "transfers": {
+            "ok": true,
+            "value": {
+              "count": 0,
+              "transfers": []
+            }
+          }
+        },
+        {
+          "offline_msg": null,
+          "offline_ok": true,
+          "offline_value": {
+            "body_location": "sync",
+            "body_state": "available",
+            "conflict_state": null,
+            "content_state": "materialized",
+            "deleted": false,
+            "effective_mode": "offline",
+            "etag": "\"{3CB7C740-D30B-4A6F-AB82-5E9C67D77441},1\"",
+            "has_body": true,
+            "item_type": "file",
+            "last_download_error": null,
+            "name": "file-offline.txt",
+            "parent_remote_id": "892B68CBF4A7C544!s70a583e41a9844e5874efb6f1215850f",
+            "remote_id": "892B68CBF4A7C544!s3cb7c740d30b4a6fab825e9c67d77441",
+            "remote_mtime": "2026-07-08T14:25:34Z",
+            "service": "onedrive",
+            "size": 32,
+            "state": "live_backup",
+            "sync_state": "clean",
+            "verified_at": null,
+            "verify_status": null
+          },
+          "sync_msg": null,
+          "sync_ok": true,
+          "sync_value": {
+            "body_location": null,
+            "body_state": null,
+            "conflict_state": null,
+            "content_state": null,
+            "deleted": false,
+            "effective_mode": "sync",
+            "etag": "\"{2D8E1DDD-C456-48CD-AC23-8669FA37A25B},1\"",
+            "has_body": false,
+            "item_type": "file",
+            "last_download_error": null,
+            "name": "file-sync.txt",
+            "parent_remote_id": "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec",
+            "remote_id": "892B68CBF4A7C544!s2d8e1dddc45648cdac238669fa37a25b",
+            "remote_mtime": "2026-07-08T14:25:34Z",
+            "service": "onedrive",
+            "size": 27,
+            "state": "live_backup",
+            "sync_state": "remote_dirty",
+            "verified_at": null,
+            "verify_status": null
+          },
+          "t": 30,
+          "transfers": {
+            "ok": true,
+            "value": {
+              "count": 0,
+              "transfers": []
+            }
+          }
+        }
+      ],
+      "run_as_files": [],
+      "run_as_magic_hex": [],
+      "status": "PASS",
+      "sync_download_now": {
+        "ok": true,
+        "value": {
+          "downloaded": true,
+          "ok": true,
+          "target": "cache"
+        }
+      },
+      "sync_item_after_open": {
+        "ok": true,
+        "value": {
+          "body_location": "cache",
+          "body_state": "available",
+          "conflict_state": null,
+          "content_state": "cached",
+          "deleted": false,
+          "effective_mode": "sync",
+          "etag": "\"{2D8E1DDD-C456-48CD-AC23-8669FA37A25B},1\"",
+          "has_body": true,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "file-sync.txt",
+          "parent_remote_id": "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec",
+          "remote_id": "892B68CBF4A7C544!s2d8e1dddc45648cdac238669fa37a25b",
+          "remote_mtime": "2026-07-08T14:25:34Z",
+          "service": "onedrive",
+          "size": 27,
+          "state": "live_backup",
+          "sync_state": "clean",
+          "verified_at": null,
+          "verify_status": null
+        }
+      },
+      "sync_item_before_open": {
+        "ok": true,
+        "value": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "sync",
+          "etag": "\"{2D8E1DDD-C456-48CD-AC23-8669FA37A25B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "file-sync.txt",
+          "parent_remote_id": "892B68CBF4A7C544!sbf2f257012f8459e84f403e6e98778ec",
+          "remote_id": "892B68CBF4A7C544!s2d8e1dddc45648cdac238669fa37a25b",
+          "remote_mtime": "2026-07-08T14:25:34Z",
+          "service": "onedrive",
+          "size": 27,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        }
+      },
+      "sync_open": {
+        "contentType": "text/plain",
+        "len": 27,
+        "ok": true,
+        "status": 200,
+        "text": "OM725 sync lazy cache body\n"
+      }
+    }
+  }
+}

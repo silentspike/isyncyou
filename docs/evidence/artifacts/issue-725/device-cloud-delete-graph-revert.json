@@ -1,0 +1,9 @@
+{
+  "generated_at": "2026-07-08T14:29:48Z",
+  "graph_get_deleted_body_excerpt": "{\"error\":{\"code\":\"itemNotFound\",\"message\":\"The resource could not be found.\",\"innerError\":{\"date\":\"2026-07-08T14:29:47\",\"request-id\":\"bcdbea25-393c-412b-a5b8-426ecbf1ef3c\",\"client-request-id\":\"bcdbea25-393c-412b-a5b8-426ecbf1ef3c\"}}}",
+  "graph_get_deleted_status": 404,
+  "root_delete_body_excerpt": "",
+  "root_delete_status": 204,
+  "root_id": "892B68CBF4A7C544!s9be02daf103f417a88e1c8be4102e7d6",
+  "target_id": "892B68CBF4A7C544!sc40f1aa1e7d949ac9c9f25c2d6ff6b2c"
+}

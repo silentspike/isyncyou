@@ -453,7 +453,7 @@ pub fn incremental_sync_scoped<T: Transport>(
             active: &active,
         };
         let resynced =
-            walk_scope_delta(transport, store, account, ctx.scope_id, &base, 5, |arr| {
+            match walk_scope_delta(transport, store, account, ctx.scope_id, &base, 5, |arr| {
                 for item in arr {
                     match ingest_item_scoped(
                         store,
@@ -470,7 +470,17 @@ pub fn incremental_sync_scoped<T: Transport>(
                     }
                 }
                 Ok(())
-            })?;
+            }) {
+                Ok(resynced) => resynced,
+                // A configured mobile scope may point at a folder deleted from the cloud
+                // out-of-band. Treat that stale scope as skipped so the remaining scopes,
+                // materialize, and offline writeback are not blocked indefinitely.
+                Err(SyncError::Delta(DeltaError::Fatal(404))) => {
+                    report.skipped += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
         report.resynced |= resynced;
     }
     Ok(report)
@@ -2448,6 +2458,55 @@ mod tests {
             folder_id: id.to_string(),
             mode: Mode::Offline,
         }
+    }
+
+    #[test]
+    fn scoped_delta_skips_stale_404_scope_and_continues() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut map = MappingTable::new();
+        seed_folder(&store, "STALE", Some("root1"));
+        seed_folder(&store, "LIVE", Some("root1"));
+
+        let mut t = MockScopedTransport::new(vec![
+            ("items/STALE/delta", vec![Response::status(404)]),
+            (
+                "items/LIVE/delta",
+                vec![Response::ok(json!({
+                    "value": [ file_item("A", "a.txt", "LIVE") ],
+                    "@odata.deltaLink": "CLIVE"
+                }))],
+            ),
+        ]);
+        let report = incremental_sync_scoped(
+            &mut t,
+            &store,
+            &mut map,
+            "acc",
+            "t",
+            arch.path(),
+            &[offline_scope("STALE"), offline_scope("LIVE")],
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped, 1, "stale scope is counted but not fatal");
+        assert_eq!(report.upserted, 1, "healthy scopes still ingest");
+        assert!(store.get_item("acc", SERVICE, "A").unwrap().is_some());
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "STALE")
+                .unwrap()
+                .as_deref(),
+            None,
+            "404 scope must not persist a bogus cursor"
+        );
+        assert_eq!(
+            store
+                .get_delta_cursor("acc", SERVICE, "LIVE")
+                .unwrap()
+                .as_deref(),
+            Some("CLIVE")
+        );
     }
 
     /// AC1 (a): a real delete deep inside a scope's subtree is tombstoned. The old mail
