@@ -474,6 +474,41 @@ pub trait OneDriveModeHandler: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// Risk classification for OneDrive mobile biometric prompts (#723). Implemented
+/// by app-host so the pure router can gate high-risk mobile actions without
+/// reaching into config/store details itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneDriveMoveRisk {
+    Low,
+    MoveOutOfProtected {
+        source_scope: String,
+        destination_scope: Option<String>,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineModeRisk {
+    pub requires_confirmation: bool,
+    pub file_count: usize,
+    pub known_bytes: u64,
+    pub unknown_size_files: usize,
+    pub reason: String,
+}
+
+pub trait OneDriveRiskHandler: Send + Sync {
+    fn move_risk(
+        &self,
+        account: &str,
+        item_id: &str,
+        destination_parent_id: &str,
+    ) -> Result<OneDriveMoveRisk, String>;
+
+    fn offline_mode_risk(&self, account: &str, folder_id: &str) -> Result<OfflineModeRisk, String>;
+}
+
 /// Performs the live-mail **write** verbs on behalf of a cap-token POST (#561).
 /// Injected by the daemon (which owns the engine + the full write token); the
 /// read-only CLI `serve` does not set it, so every `/api/v1/mail/*` POST is
@@ -717,6 +752,21 @@ pub trait OneDriveManageHandler: Send + Sync {
     fn cleanup_offline_to_online(&self, account: &str) -> Result<serde_json::Value, String>;
 }
 
+pub fn onedrive_move_pat_item(id: &str, new_parent: &str, name: &str) -> String {
+    serde_json::to_string(&["onedrive_move", id, new_parent, name])
+        .expect("static OneDrive move action array serializes")
+}
+
+pub fn onedrive_mode_offline_pat_item(folder: &str) -> String {
+    serde_json::to_string(&["onedrive_mode_offline", folder])
+        .expect("static OneDrive offline-mode action array serializes")
+}
+
+pub fn onedrive_mode_online_cleanup_pat_item(folder: &str) -> String {
+    serde_json::to_string(&["onedrive_mode_online_account_cleanup", folder])
+        .expect("static OneDrive online-cleanup action array serializes")
+}
+
 /// Live account-auth handler (#68): the daemon's device-code sign-in + sign-out.
 /// `None` => the account menu offers only switching (the read-only CLI `serve`).
 pub trait AccountAuthHandler: Send + Sync {
@@ -866,6 +916,9 @@ pub struct Router {
     onedrive_mode: Option<std::sync::Arc<dyn OneDriveModeHandler>>,
     /// Separate capability token for the mode POST (distinct blast radius).
     onedrive_mode_cap_token: Option<String>,
+    /// Optional OneDrive risk classifier for Android-only biometric prompts (#723).
+    /// Desktop routes must not call it when `biometric_gate` is false.
+    onedrive_risk: Option<std::sync::Arc<dyn OneDriveRiskHandler>>,
     /// Optional account-auth handler (#68): device-code sign-in + sign-out. `None`
     /// => the account menu only switches between already-configured accounts.
     account_auth: Option<std::sync::Arc<dyn AccountAuthHandler>>,
@@ -956,6 +1009,7 @@ impl Router {
             onedrive_write_cap_token: None,
             onedrive_mode: None,
             onedrive_mode_cap_token: None,
+            onedrive_risk: None,
             account_auth: None,
             account_cap_token: None,
             push: None,
@@ -1007,6 +1061,7 @@ impl Router {
             onedrive_write_cap_token: None,
             onedrive_mode: None,
             onedrive_mode_cap_token: None,
+            onedrive_risk: None,
             account_auth: None,
             account_cap_token: None,
             push: None,
@@ -1217,6 +1272,12 @@ impl Router {
     ) -> Self {
         self.onedrive_mode = Some(handler);
         self.onedrive_mode_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable OneDrive risk classification for Android biometric gates (#723).
+    pub fn with_onedrive_risk(mut self, handler: std::sync::Arc<dyn OneDriveRiskHandler>) -> Self {
+        self.onedrive_risk = Some(handler);
         self
     }
 
@@ -5403,6 +5464,25 @@ mod tests {
         isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
         isyncyou_core::envelope::reset_body_keys_for_tests();
         BodyEnvelopeTestGuard { _lock: guard }
+    }
+
+    #[test]
+    fn onedrive_risk_action_items_are_canonical_json() {
+        assert_eq!(
+            serde_json::from_str::<Value>(&onedrive_move_pat_item("A:B", "P]1", "N:\"1")).unwrap(),
+            json!(["onedrive_move", "A:B", "P]1", "N:\"1"])
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&onedrive_mode_offline_pat_item("F:1")).unwrap(),
+            json!(["onedrive_mode_offline", "F:1"])
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&onedrive_mode_online_cleanup_pat_item("F]2")).unwrap(),
+            json!(["onedrive_mode_online_account_cleanup", "F]2"])
+        );
+        assert!(!onedrive_move_pat_item("A:B", "P]1", "N:\"1").contains("parent:"));
+        assert!(!onedrive_mode_offline_pat_item("F:1").contains("mode-offline:"));
+        assert!(!onedrive_mode_online_cleanup_pat_item("F]2").contains("mode-online-cleanup:"));
     }
 
     // AC1: the 4-state Live∪Backup model is derived correctly per item, and
