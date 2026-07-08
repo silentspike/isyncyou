@@ -2069,14 +2069,34 @@ impl isyncyou_webui::OneDriveManageHandler for DaemonOneDriveManage {
     fn free_up(&self, account: &str, id: &str) -> Result<(), String> {
         isyncyou_engine::free_up_for(&self.cfg()?, account, id).map(|_| ())
     }
-    fn download_now(&self, account: &str, id: &str) -> Result<bool, String> {
+    fn download_now(
+        &self,
+        account: &str,
+        id: &str,
+    ) -> Result<isyncyou_webui::OneDriveDownloadNowResult, String> {
         let cfg = self.cfg()?;
         let token = isyncyou_engine::auth::resolve_cached_sync_token(&cfg, account)?;
         // An explicit user "download now" is a deliberate single-item action → bypass the
         // background wifi/charging/storage-floor policy the bulk offline pass throttles on.
         let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
         let now = unix_now();
-        isyncyou_engine::download_now_for(&cfg, account, id, token, dev, &now, &self.progress)
+        let result = isyncyou_engine::download_now_for_with_target(
+            &cfg,
+            account,
+            id,
+            token,
+            dev,
+            &now,
+            &self.progress,
+        )?;
+        let target = match result.target {
+            isyncyou_connectors::DownloadBodyTarget::Cache => "cache",
+            isyncyou_connectors::DownloadBodyTarget::Sync => "sync",
+        };
+        Ok(isyncyou_webui::OneDriveDownloadNowResult {
+            downloaded: result.downloaded,
+            target: target.to_string(),
+        })
     }
     fn list_conflicts(&self, account: &str) -> Result<serde_json::Value, String> {
         let items = isyncyou_engine::list_conflicts_for(&self.cfg()?, account)?;

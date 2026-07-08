@@ -17,7 +17,7 @@ isyncyou-store = { path = "../store", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-app-host = { path = "../app-host", default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
-jni = "0.21"
+jni = "0.22"
 
 [features]
 # Android ships SQLCipher (#0B): the vendored-OpenSSL arm64 cross-build works via
