@@ -1,0 +1,287 @@
+{
+  "agent_subscription_experimental_enabled": false,
+  "app_uid": "10246",
+  "cdp_port": 9222,
+  "device_serial": "10.0.0.130:38655",
+  "feature_skips": [
+    {
+      "name": "opaque_iframe_cannot_see_bridge",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe"
+    },
+    {
+      "name": "opaque_iframe_cannot_see_legacy_globals",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe"
+    },
+    {
+      "name": "accepted_openexternal_smoke",
+      "reason": "disabled by default to avoid browser focus flake"
+    }
+  ],
+  "isy_cargo_features": "",
+  "lock": "om-721",
+  "ok": true,
+  "package": "com.silentspike.isyncyou.debug",
+  "results": [
+    {
+      "lock": "om-721",
+      "name": "device_lock_acquired",
+      "status": "PASS"
+    },
+    {
+      "name": "device_stay_awake_enabled",
+      "previous": "15",
+      "status": "PASS"
+    },
+    {
+      "name": "cdp_forward",
+      "port": 9222,
+      "socket": "webview_devtools_remote_5131",
+      "status": "PASS"
+    },
+    {
+      "name": "webview_devtools_target",
+      "status": "PASS",
+      "url": "about:blank",
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/199DB8E379FDF39A125D62657B014414"
+    },
+    {
+      "name": "forced_failure_page_text",
+      "status": "PASS",
+      "text": "iSyncYou\n\nSecure WebView bridge startup failed. Local data was not opened from this screen.\n\nBridge startup was forced to fail for verification."
+    },
+    {
+      "name": "forced_failure_no_scripts",
+      "script_count": 0,
+      "status": "PASS"
+    },
+    {
+      "cookie": "COOKIE_BLOCKED",
+      "name": "forced_failure_no_session_cookie",
+      "status": "PASS"
+    },
+    {
+      "href": "about:blank",
+      "name": "forced_failure_not_app_origin_shell",
+      "status": "PASS"
+    },
+    {
+      "log_tail": "therm:40861 north_therm:37226 quiet_therm:37359 soc_therm:46798 thb_hda:56 usb_pwr_therm:38027 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=3488.54 err=-0.639439 s_power=2527 time_elapsed_ms=7016 p=-76.0932 i=1155.77 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=118.131 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.060000)\n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN:38.9478 raw data: VIRTUAL-SKIN:38947.8 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:38.6394 raw data: VIRTUAL-SKIN-CHARGE:38639.4 VIRTUAL-SKIN-CHARGE-PERSIST:38639.4 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST power_budget=3855.34 err=2.36056 s_power=2383 time_elapsed_ms=7016 p=502.8 i=1383 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=413.457 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.210000)\n07-08 05:52:33.009  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-2 sysfs to 1\n07-08 05:52:33.010  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-0 sysfs to 1\n",
+      "name": "forced_failure_activity_engine_not_started",
+      "status": "PASS"
+    },
+    {
+      "log_tail": "therm:40861 north_therm:37226 quiet_therm:37359 soc_therm:46798 thb_hda:56 usb_pwr_therm:38027 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=3488.54 err=-0.639439 s_power=2527 time_elapsed_ms=7016 p=-76.0932 i=1155.77 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=118.131 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.060000)\n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN:38.9478 raw data: VIRTUAL-SKIN:38947.8 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:38.6394 raw data: VIRTUAL-SKIN-CHARGE:38639.4 VIRTUAL-SKIN-CHARGE-PERSIST:38639.4 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST power_budget=3855.34 err=2.36056 s_power=2383 time_elapsed_ms=7016 p=502.8 i=1383 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=413.457 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.210000)\n07-08 05:52:33.009  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-2 sysfs to 1\n07-08 05:52:33.010  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-0 sysfs to 1\n",
+      "name": "forced_failure_log_marker",
+      "status": "PASS"
+    },
+    {
+      "name": "cdp_forward",
+      "port": 9222,
+      "socket": "webview_devtools_remote_5300",
+      "status": "PASS"
+    },
+    {
+      "name": "webview_devtools_target",
+      "status": "PASS",
+      "url": "https://appassets.androidplatform.net/",
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/FD0AF47AF7D40290C36A4A1354CF6DFB"
+    },
+    {
+      "name": "top_frame_has_bridge",
+      "status": "PASS"
+    },
+    {
+      "name": "no_legacy_globals",
+      "status": "PASS"
+    },
+    {
+      "name": "document_cookie_has_no_session",
+      "status": "PASS"
+    },
+    {
+      "iframe": {
+        "timeout": true
+      },
+      "name": "opaque_iframe_cannot_see_bridge",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe",
+      "status": "SKIP"
+    },
+    {
+      "iframe": {
+        "timeout": true
+      },
+      "name": "opaque_iframe_cannot_see_legacy_globals",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe",
+      "status": "SKIP"
+    },
+    {
+      "name": "api_works_with_fetch_monkeypatched",
+      "status": "PASS"
+    },
+    {
+      "name": "stream_works_with_eventsource_monkeypatched",
+      "status": "PASS"
+    },
+    {
+      "name": "native_malformed_message_returns_400",
+      "reply": {
+        "body": "{\"error\":\"bad_request\",\"reason\":\"missing_or_unknown_kind\"}",
+        "id": "probe-bad",
+        "status": 400,
+        "t": "res"
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_call_rejects_non_json_success_body",
+      "result": {
+        "message": "Native call returned non-JSON response",
+        "ok": true,
+        "pending": 0
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "bridge_js_response_cleanup",
+      "result": {
+        "ok": true,
+        "pending": 0,
+        "rows": [
+          {
+            "name": "duplicate_once",
+            "ok": true
+          },
+          {
+            "name": "timeout_cleared",
+            "ok": true
+          },
+          {
+            "name": "late_ignored",
+            "ok": true
+          }
+        ]
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "bridge_stream_handshake_timeout_cleanup",
+      "result": {
+        "errors": 1,
+        "ok": true,
+        "reason": "timeout_cleanup_observed",
+        "streamCount": 1,
+        "streamStillRegistered": false,
+        "subId": "s13",
+        "unsubscribed": true
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_push_token_op_returns",
+      "status": "PASS"
+    },
+    {
+      "name": "biometric_prompt_started",
+      "state": {
+        "pending": 1,
+        "stats": {
+          "bio": 1,
+          "events": 0,
+          "native": 2,
+          "requests": 9,
+          "streams": 4
+        }
+      },
+      "status": "PASS",
+      "window_state": {
+        "matches": [
+          "mKeyguardOccluded=false mKeyguardOccludedChanged=false mPendingKeyguardOccluded=false",
+          "KeyguardServiceDelegate",
+          "deviceHasKeyguard=true",
+          "KeyguardStateMonitor",
+          "Window #13: WindowStateAnimator{e69107 BiometricPrompt}",
+          "mImeLayeringTarget=Window{b08e1e6 u0 BiometricPrompt}",
+          "mImeInputTarget=Window{b08e1e6 u0 BiometricPrompt}",
+          "mImeControlTarget=Window{b08e1e6 u0 BiometricPrompt}",
+          "mCurrentFocus=Window{b08e1e6 u0 BiometricPrompt}",
+          "mKeyguardDrawComplete=true mWindowManagerDrawComplete=true",
+          "isKeyguardShowing=false",
+          "mFocusedWindow=Window{b08e1e6 u0 BiometricPrompt}"
+        ]
+      }
+    },
+    {
+      "name": "biometric_cancel_and_late_response_cleanup",
+      "result": {
+        "afterLate": 0,
+        "beforeLate": 0,
+        "resultResolved": true
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "device_keyguard_clear_before_network_guard",
+      "state": {
+        "current_focus": "mCurrentFocus=Window{aec64ad u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
+        "focused_app": "mFocusedApp=ActivityRecord{132941631 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13546}",
+        "keyguard_showing": false
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_network_guard_roundtrip",
+      "status": "PASS"
+    },
+    {
+      "name": "native_openexternal_rejects_blocked_urls",
+      "result": {
+        "ok": true
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "accepted_openexternal_smoke",
+      "reason": "disabled by default to avoid browser focus flake",
+      "status": "SKIP"
+    },
+    {
+      "name": "account_device_code_bridge_function_present",
+      "status": "PASS"
+    },
+    {
+      "name": "bridge_transport_stats",
+      "stats": {
+        "bio": 1,
+        "events": 0,
+        "native": 13,
+        "requests": 9,
+        "streams": 4
+      },
+      "status": "PASS"
+    },
+    {
+      "listen_sockets": [],
+      "name": "default_uid_has_no_listen_sockets",
+      "status": "PASS"
+    },
+    {
+      "isy_cargo_features": "",
+      "name": "agent_subscription_experimental_default_off",
+      "note": "default debug APK expected unless ISY_CARGO_FEATURES opts in",
+      "status": "PASS"
+    },
+    {
+      "name": "device_stay_awake_restored",
+      "status": "PASS",
+      "value": "15"
+    },
+    {
+      "lock": "om-721",
+      "name": "device_lock_released",
+      "status": "PASS"
+    }
+  ],
+  "webview_devtools_socket": "webview_devtools_remote_5300",
+  "webview_devtools_target_url": "https://appassets.androidplatform.net/",
+  "webview_devtools_ws_url": "ws://127.0.0.1:9222/devtools/page/FD0AF47AF7D40290C36A4A1354CF6DFB"
+}
