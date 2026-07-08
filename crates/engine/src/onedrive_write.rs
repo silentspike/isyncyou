@@ -1335,9 +1335,8 @@ pub fn pending_cloud_write_count(cfg: &Config, account: &str) -> Result<usize, S
 }
 
 /// Boot-recovery entry for the daemon/CLI: resolve the account's store + write client, then
-/// reconcile every pending cloud-write (the #654 metadata ops a desktop WebUI may leave
-/// mid-flight; the mobile offline pass runs its own recovery inline). Returns the count
-/// reconciled.
+/// reconcile every pending OneDrive cloud-write (metadata/body ops plus #722 share/invite rows;
+/// the mobile offline pass runs its own recovery inline). Returns the count reconciled.
 pub fn recover_pending_cloud_writes_for(cfg: &Config, account: &str) -> Result<usize, String> {
     with_ledger(cfg, account, |store, sink, _secret| {
         recover_pending_cloud_writes(store, account, sink, _secret, now_secs())
@@ -2227,6 +2226,26 @@ mod tests {
         assert!(intent_json.contains(r#""share_kind":"link""#));
         assert!(!intent_json.contains("http"));
         assert!(!intent_json.contains("1drv.ms"));
+    }
+
+    #[test]
+    fn share_link_rejects_invalid_inputs_before_ledger() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        for (item_id, link_type, scope) in [
+            ("", "view", "anonymous"),
+            ("item-1", "owner", "anonymous"),
+            ("item-1", "view", "tenant-wide"),
+        ] {
+            let err = run_share_link(&s, ACCT, item_id, link_type, scope, &cloud, SECRET, 10)
+                .expect_err("invalid share link input must fail");
+            assert!(!err.is_empty());
+        }
+        assert!(
+            s.cloud_write_ledger_summary(ACCT).unwrap().is_empty(),
+            "invalid share link input must not create ledger rows"
+        );
+        assert_eq!(*cloud.create_link_calls.borrow(), 0);
     }
 
     #[test]

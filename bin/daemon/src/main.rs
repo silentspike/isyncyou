@@ -531,8 +531,9 @@ impl isyncyou_webui::SyncControl for Scheduler {
 /// and never fatal — a recovery failure must not stop the daemon.
 fn recover_pending_restores(cfg: &Config) {
     for acc in &cfg.accounts {
-        // #654/#655: reconcile any OneDrive cloud-write left mid-flight (create/rename/move/
-        // delete/upload/replace) before serving — probe-adopt / etag-guarded, never blind.
+        // #654/#655/#722: reconcile any OneDrive cloud-write left mid-flight
+        // (create/rename/move/delete/upload/replace/share/invite) before serving —
+        // probe-adopt / etag-guarded / fail-closed, never blind.
         // Runs regardless of the restore-pending count below.
         if isyncyou_engine::pending_cloud_write_count(cfg, &acc.id).unwrap_or(0) > 0 {
             match isyncyou_engine::recover_pending_cloud_writes_for(cfg, &acc.id) {

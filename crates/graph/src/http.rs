@@ -2970,6 +2970,31 @@ mod tests {
     }
 
     #[test]
+    fn invite_detailed_handles_empty_value_without_panic() {
+        let (base, server) = serve(vec![http_response(200, "OK", "", r#"{"value":[]}"#)]);
+        let outcome = GraphClient::new("tok")
+            .with_base_url(&base)
+            .invite_detailed(
+                "i1",
+                &["person@example.com".to_string()],
+                &["read"],
+                true,
+                true,
+                "",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InviteOutcome::Applied {
+                permission_ids: Vec::new()
+            }
+        );
+        assert!(server.join().unwrap()[0].starts_with("POST /me/drive/items/i1/invite"));
+    }
+
+    #[test]
     fn list_and_delete_permissions_roundtrip() {
         let (base, server) = serve(vec![http_response(
             200,
