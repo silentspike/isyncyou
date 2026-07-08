@@ -322,6 +322,23 @@ pub fn read_body(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn read_body_with_key_for_tests(
+    path: &Path,
+    expected_key_id: u32,
+    key: BodyKey,
+) -> std::io::Result<Vec<u8>> {
+    let raw = std::fs::read(path)?;
+    match blob_key_id(&raw) {
+        Some(key_id) if key_id == expected_key_id => {
+            open(&raw, &key).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
+        Some(_) => read_body(path),
+        None => Ok(raw),
+    }
+}
+
 /// Read a body file only if it is a valid sealed envelope. Unlike [`read_body`], this
 /// rejects plaintext pass-through and is therefore the Android/mobile availability check.
 pub fn read_sealed_body_required(path: &Path) -> std::io::Result<Vec<u8>> {

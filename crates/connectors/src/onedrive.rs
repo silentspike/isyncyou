@@ -2342,10 +2342,10 @@ mod tests {
         // the metadata sidecar archives the full DriveItem JSON straight from the
         // delta — the file sidecar round-trips, and the folder sidecar keeps a
         // facet (folder.childCount) the indexed columns drop (#564 AC-1).
-        let raw = std::fs::read(shard_path(arch.path(), SERVICE, "a1", "json")).unwrap();
+        let raw = read_test_body(shard_path(arch.path(), SERVICE, "a1", "json"));
         let v: Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v, file_item("a1", "IMG.jpg", "F1"));
-        let fraw = std::fs::read(shard_path(arch.path(), SERVICE, "F1", "json")).unwrap();
+        let fraw = read_test_body(shard_path(arch.path(), SERVICE, "F1", "json"));
         let fv: Value = serde_json::from_slice(&fraw).unwrap();
         assert_eq!(
             fv.pointer("/folder/childCount").and_then(Value::as_i64),
@@ -2932,6 +2932,14 @@ mod tests {
         }
     }
 
+    fn read_test_body(path: impl AsRef<Path>) -> Vec<u8> {
+        let path = path.as_ref();
+        isyncyou_core::envelope::read_body(path).unwrap_or_else(|_| {
+            isyncyou_core::envelope::read_body_with_key_for_tests(path, 724_001, [24u8; 32])
+                .unwrap()
+        })
+    }
+
     /// Seed one tracked file at the sync root: store item (remote_dirty with NEW
     /// remote metadata, as after a delta ingest) + on-disk content + optionally
     /// the last-synced reference for that on-disk content.
@@ -2983,11 +2991,11 @@ mod tests {
         assert_eq!(report.conflicts, 1, "local edit must be kept as a copy");
         assert_eq!(report.downloaded, 1);
         // original path now holds the cloud version
-        assert_eq!(std::fs::read(&full).unwrap(), b"v2 REMOTE");
+        assert_eq!(read_test_body(&full), b"v2 REMOTE");
         // the local edit survives in the safeBackup copy
         let copy = dir.path().join("doc-host-safeBackup-0001.txt");
         assert_eq!(
-            std::fs::read(&copy).unwrap(),
+            read_test_body(&copy),
             b"v2 LOCAL edit",
             "local edit was clobbered"
         );
@@ -3010,7 +3018,7 @@ mod tests {
         let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(report.conflicts, 0, "clean update must not create a copy");
         assert_eq!(report.downloaded, 1);
-        assert_eq!(std::fs::read(&full).unwrap(), b"v2 REMOTE");
+        assert_eq!(read_test_body(&full), b"v2 REMOTE");
         assert!(!dir.path().join("doc-host-safeBackup-0001.txt").exists());
     }
 
@@ -3029,7 +3037,7 @@ mod tests {
         );
         let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(report.conflicts, 0);
-        assert_eq!(std::fs::read(&full).unwrap(), b"v2 REMOTE");
+        assert_eq!(read_test_body(&full), b"v2 REMOTE");
         assert!(!dir.path().join("doc-host-safeBackup-0001.txt").exists());
     }
 
@@ -3097,10 +3105,7 @@ mod tests {
             "only the offline-scope file is fetched"
         );
         // The offline file is materialized to sync_root with the content-state marked.
-        assert_eq!(
-            std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
-            b"AAAA"
-        );
+        assert_eq!(read_test_body(dir.path().join("Photos/a.txt")), b"AAAA");
         let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
         assert_eq!(a.content_state.as_deref(), Some("materialized"));
         assert_eq!(a.body_location.as_deref(), Some("sync"));
@@ -3170,7 +3175,7 @@ mod tests {
             report.downloaded, 1,
             "remote replacement must be downloaded"
         );
-        assert_eq!(std::fs::read(&path).unwrap(), b"world");
+        assert_eq!(read_test_body(&path), b"world");
         let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
         assert_eq!(a.body_state.as_deref(), Some("available"));
         assert_eq!(a.content_state.as_deref(), Some("materialized"));
@@ -3679,10 +3684,7 @@ mod tests {
             report2.downloaded, 1,
             "the previously-cancelled file materializes on the next pass"
         );
-        assert_eq!(
-            std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
-            b"AAAA"
-        );
+        assert_eq!(read_test_body(dir.path().join("Photos/a.txt")), b"AAAA");
     }
 
     #[test]
@@ -3863,7 +3865,7 @@ mod tests {
 
         // the file is on disk under Photos/ with the right content
         let path = dir.path().join("Photos").join("IMG.jpg");
-        assert_eq!(std::fs::read(&path).unwrap(), b"JPEGDATA");
+        assert_eq!(read_test_body(&path), b"JPEGDATA");
         // its mtime mirrors the cloud lastModifiedDateTime (2024-01-02T03:04:05Z)
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         let secs = modified
@@ -4012,7 +4014,7 @@ mod tests {
         let report = materialize_downloads(&store, &dl, "acc", dir.path(), "host").unwrap();
         assert_eq!(report.skipped, 0, "stale body must not be skipped");
         assert_eq!(report.downloaded, 1, "remote update must be downloaded");
-        assert_eq!(std::fs::read(&path).unwrap(), b"world");
+        assert_eq!(read_test_body(&path), b"world");
         let (_, _, hash) = store
             .get_synced_state("acc", SERVICE, "a1")
             .unwrap()
@@ -4057,7 +4059,7 @@ mod tests {
         // gone from the sync root, present in the trash (outside sync_root)
         assert!(!sync_root.join("Docs").join("note.txt").exists());
         assert_eq!(
-            std::fs::read(trash_root.join("Docs").join("note.txt")).unwrap(),
+            read_test_body(trash_root.join("Docs").join("note.txt")),
             b"hi"
         );
         assert!(
@@ -4312,7 +4314,7 @@ mod tests {
         );
         let copy = docs.join("note-host-safeBackup-0001.txt");
         assert!(copy.exists(), "conflict copy must exist");
-        assert_eq!(std::fs::read(&copy).unwrap(), b"changed");
+        assert_eq!(read_test_body(&copy), b"changed");
     }
 
     #[test]
@@ -4415,7 +4417,7 @@ mod tests {
             "keep-mine deletes the cloud item"
         );
         assert_eq!(
-            std::fs::read(docs.join("note.txt")).unwrap(),
+            read_test_body(docs.join("note.txt")),
             b"my edit",
             "local edit restored to the original name"
         );
@@ -4997,7 +4999,7 @@ mod tests {
         let dir = sync_root.join("iSyncYou-conflicttest");
         assert!(!local.exists(), "original must be moved aside");
         let copy = dir.join("c-host-safeBackup-0001.txt");
-        assert_eq!(std::fs::read(&copy).unwrap(), b"my local edit");
+        assert_eq!(read_test_body(&copy), b"my local edit");
         assert_eq!(
             store
                 .get_item("acc", SERVICE, &id)
