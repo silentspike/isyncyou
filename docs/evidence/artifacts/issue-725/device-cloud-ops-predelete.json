@@ -1,0 +1,50 @@
+{
+  "cleanup_pending": true,
+  "create": {
+    "ok": true,
+    "value": {
+      "id": "892B68CBF4A7C544!sc40f1aa1e7d949ac9c9f25c2d6ff6b2c",
+      "ok": true
+    }
+  },
+  "dest": {
+    "id": "892B68CBF4A7C544!sff3bc239db5d4d3483da760758976e48",
+    "name": "dest"
+  },
+  "generated_at": "2026-07-08T14:28:59Z",
+  "graph_created": {
+    "id": "892B68CBF4A7C544!sc40f1aa1e7d949ac9c9f25c2d6ff6b2c",
+    "name": "created-folder",
+    "parent": "892B68CBF4A7C544!s9be02daf103f417a88e1c8be4102e7d6"
+  },
+  "graph_moved": {
+    "id": "892B68CBF4A7C544!sc40f1aa1e7d949ac9c9f25c2d6ff6b2c",
+    "name": "renamed-folder",
+    "parent": "892B68CBF4A7C544!sff3bc239db5d4d3483da760758976e48"
+  },
+  "graph_renamed": {
+    "id": "892B68CBF4A7C544!sc40f1aa1e7d949ac9c9f25c2d6ff6b2c",
+    "name": "renamed-folder"
+  },
+  "move": {
+    "ok": true,
+    "value": {
+      "ok": true
+    }
+  },
+  "rename": {
+    "ok": true,
+    "value": {
+      "ok": true
+    }
+  },
+  "root": {
+    "id": "892B68CBF4A7C544!s9be02daf103f417a88e1c8be4102e7d6",
+    "name": "isy-om725-cloudops-20260708-142843"
+  },
+  "target": {
+    "id": "892B68CBF4A7C544!sc40f1aa1e7d949ac9c9f25c2d6ff6b2c",
+    "initial_name": "created-folder",
+    "renamed_name": "renamed-folder"
+  }
+}

@@ -1,0 +1,277 @@
+{
+  "agent_subscription_experimental_enabled": false,
+  "app_uid": "10246",
+  "cdp_port": 9222,
+  "device_serial": "10.0.0.131:46095",
+  "feature_skips": [
+    {
+      "name": "opaque_iframe_cannot_see_bridge",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe"
+    },
+    {
+      "name": "opaque_iframe_cannot_see_legacy_globals",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe"
+    },
+    {
+      "name": "accepted_openexternal_smoke",
+      "reason": "disabled by default to avoid browser focus flake"
+    }
+  ],
+  "isy_cargo_features": "",
+  "lock": "om-725",
+  "ok": true,
+  "package": "com.silentspike.isyncyou.debug",
+  "results": [
+    {
+      "name": "device_stay_awake_enabled",
+      "previous": "15",
+      "status": "PASS"
+    },
+    {
+      "name": "cdp_forward",
+      "port": 9222,
+      "socket": "webview_devtools_remote_10224",
+      "status": "PASS"
+    },
+    {
+      "name": "webview_devtools_target",
+      "status": "PASS",
+      "url": "about:blank",
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/1F211C15E0367D688297F1C492C1F218"
+    },
+    {
+      "name": "forced_failure_page_text",
+      "status": "PASS",
+      "text": "iSyncYou\n\nSecure WebView bridge startup failed. Local data was not opened from this screen.\n\nBridge startup was forced to fail for verification."
+    },
+    {
+      "name": "forced_failure_no_scripts",
+      "script_count": 0,
+      "status": "PASS"
+    },
+    {
+      "cookie": "COOKIE_BLOCKED",
+      "name": "forced_failure_no_session_cookie",
+      "status": "PASS"
+    },
+    {
+      "href": "about:blank",
+      "name": "forced_failure_not_app_origin_shell",
+      "status": "PASS"
+    },
+    {
+      "log_tail": "1 10461 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.236 10461 10461 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.273 10462 10462 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.295 10462 10462 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.297  1295  1295 D AOC     : A3:MSG: usf_vsc_log.cc, 69: VSC: [Auto Brightness] Retune sensor-0 (tout:1 drop:0): avg 100.178 -> 100.178 [wm:121.862\n07-08 16:39:31.298  1295  1295 D AOC     : A3:MSG: usf_vsc_log.cc, 69: VSC: [Auto Brightness] Retune sensor-3 (tout:1 drop:0): avg 98.623 -> 98.623 [wm:121.172]\n07-08 16:39:31.333 10463 10463 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.344 10463 10463 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.372 10465 10465 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.396 10465 10465 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.425 10467 10467 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.440 10467 10467 W libc    : Access denied finding property \"ro.debuggable\"\n",
+      "name": "forced_failure_activity_engine_not_started",
+      "status": "PASS"
+    },
+    {
+      "log_tail": "1 10461 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.236 10461 10461 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.273 10462 10462 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.295 10462 10462 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.297  1295  1295 D AOC     : A3:MSG: usf_vsc_log.cc, 69: VSC: [Auto Brightness] Retune sensor-0 (tout:1 drop:0): avg 100.178 -> 100.178 [wm:121.862\n07-08 16:39:31.298  1295  1295 D AOC     : A3:MSG: usf_vsc_log.cc, 69: VSC: [Auto Brightness] Retune sensor-3 (tout:1 drop:0): avg 98.623 -> 98.623 [wm:121.172]\n07-08 16:39:31.333 10463 10463 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.344 10463 10463 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.372 10465 10465 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.396 10465 10465 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.425 10467 10467 W libc    : Access denied finding property \"ro.debuggable\"\n07-08 16:39:31.440 10467 10467 W libc    : Access denied finding property \"ro.debuggable\"\n",
+      "name": "forced_failure_log_marker",
+      "status": "PASS"
+    },
+    {
+      "name": "cdp_forward",
+      "port": 9222,
+      "socket": "webview_devtools_remote_10546",
+      "status": "PASS"
+    },
+    {
+      "name": "webview_devtools_target",
+      "status": "PASS",
+      "url": "https://appassets.androidplatform.net/",
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/58D55256638FFB1A3F3200096681F5F1"
+    },
+    {
+      "name": "top_frame_has_bridge",
+      "status": "PASS"
+    },
+    {
+      "name": "no_legacy_globals",
+      "status": "PASS"
+    },
+    {
+      "name": "document_cookie_has_no_session",
+      "status": "PASS"
+    },
+    {
+      "iframe": {
+        "timeout": true
+      },
+      "name": "opaque_iframe_cannot_see_bridge",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe",
+      "status": "SKIP"
+    },
+    {
+      "iframe": {
+        "timeout": true
+      },
+      "name": "opaque_iframe_cannot_see_legacy_globals",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe",
+      "status": "SKIP"
+    },
+    {
+      "name": "api_works_with_fetch_monkeypatched",
+      "status": "PASS"
+    },
+    {
+      "name": "stream_works_with_eventsource_monkeypatched",
+      "status": "PASS"
+    },
+    {
+      "name": "native_malformed_message_returns_400",
+      "reply": {
+        "body": "{\"error\":\"bad_request\",\"reason\":\"missing_or_unknown_kind\"}",
+        "id": "probe-bad",
+        "status": 400,
+        "t": "res"
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_call_rejects_non_json_success_body",
+      "result": {
+        "message": "Native call returned non-JSON response",
+        "ok": true,
+        "pending": 0
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "bridge_js_response_cleanup",
+      "result": {
+        "ok": true,
+        "pending": 0,
+        "rows": [
+          {
+            "name": "duplicate_once",
+            "ok": true
+          },
+          {
+            "name": "timeout_cleared",
+            "ok": true
+          },
+          {
+            "name": "late_ignored",
+            "ok": true
+          }
+        ]
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "bridge_stream_handshake_timeout_cleanup",
+      "result": {
+        "errors": 1,
+        "ok": true,
+        "reason": "timeout_cleanup_observed",
+        "streamCount": 1,
+        "streamStillRegistered": false,
+        "subId": "s13",
+        "unsubscribed": true
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_push_token_op_returns",
+      "status": "PASS"
+    },
+    {
+      "name": "biometric_prompt_started",
+      "state": {
+        "pending": 1,
+        "stats": {
+          "bio": 1,
+          "events": 0,
+          "native": 2,
+          "requests": 9,
+          "streams": 4
+        }
+      },
+      "status": "PASS",
+      "window_state": {
+        "matches": [
+          "mKeyguardOccluded=false mKeyguardOccludedChanged=false mPendingKeyguardOccluded=false",
+          "KeyguardServiceDelegate",
+          "deviceHasKeyguard=true",
+          "KeyguardStateMonitor",
+          "Window #14: WindowStateAnimator{9df695f BiometricPrompt}",
+          "mImeLayeringTarget=Window{26f549b u0 BiometricPrompt}",
+          "mImeInputTarget=Window{26f549b u0 BiometricPrompt}",
+          "mImeControlTarget=Window{26f549b u0 BiometricPrompt}",
+          "mCurrentFocus=Window{26f549b u0 BiometricPrompt}",
+          "mKeyguardDrawComplete=true mWindowManagerDrawComplete=true",
+          "isKeyguardShowing=false",
+          "mFocusedWindow=Window{26f549b u0 BiometricPrompt}"
+        ]
+      }
+    },
+    {
+      "name": "biometric_cancel_and_late_response_cleanup",
+      "result": {
+        "afterLate": 0,
+        "beforeLate": 0,
+        "resultResolved": true
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "device_keyguard_clear_before_network_guard",
+      "state": {
+        "current_focus": "mCurrentFocus=Window{bbd5d13 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
+        "focused_app": "mFocusedApp=ActivityRecord{245239320 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13570}",
+        "keyguard_showing": false
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "native_network_guard_roundtrip",
+      "status": "PASS"
+    },
+    {
+      "name": "native_openexternal_rejects_blocked_urls",
+      "result": {
+        "ok": true
+      },
+      "status": "PASS"
+    },
+    {
+      "name": "accepted_openexternal_smoke",
+      "reason": "disabled by default to avoid browser focus flake",
+      "status": "SKIP"
+    },
+    {
+      "name": "account_device_code_bridge_function_present",
+      "status": "PASS"
+    },
+    {
+      "name": "bridge_transport_stats",
+      "stats": {
+        "bio": 1,
+        "events": 0,
+        "native": 13,
+        "requests": 9,
+        "streams": 4
+      },
+      "status": "PASS"
+    },
+    {
+      "listen_sockets": [],
+      "name": "default_uid_has_no_listen_sockets",
+      "status": "PASS"
+    },
+    {
+      "isy_cargo_features": "",
+      "name": "agent_subscription_experimental_default_off",
+      "note": "default debug APK expected unless ISY_CARGO_FEATURES opts in",
+      "status": "PASS"
+    },
+    {
+      "name": "device_stay_awake_restored",
+      "status": "PASS",
+      "value": "15"
+    }
+  ],
+  "webview_devtools_socket": "webview_devtools_remote_10546",
+  "webview_devtools_target_url": "https://appassets.androidplatform.net/",
+  "webview_devtools_ws_url": "ws://127.0.0.1:9222/devtools/page/58D55256638FFB1A3F3200096681F5F1"
+}
