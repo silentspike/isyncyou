@@ -124,6 +124,9 @@ dependencies {
     // Firebase Cloud Messaging via the BoM (#575) — version-aligned, messaging only.
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
 
 // #89: build the embedded Rust engine (libisyncyou_mobile.so) with cargo-ndk into
