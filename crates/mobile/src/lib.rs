@@ -662,17 +662,71 @@ fn refresh_loop(
 // `com.silentspike.isyncyou.NativeEngine.nativeStart(filesDir)` -> bound port (or -1)
 // `com.silentspike.isyncyou.NativeEngine.nativeSessionToken()` -> token string
 
+fn jni_get_string<'local>(
+    env: &mut jni::EnvUnowned<'local>,
+    value: &jni::objects::JString<'local>,
+) -> Option<String> {
+    match env
+        .with_env(|env| -> jni::errors::Result<String> { value.try_to_string(env) })
+        .into_outcome()
+    {
+        jni::Outcome::Ok(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn jni_new_string<'local>(env: &mut jni::EnvUnowned<'local>, value: String) -> jni::sys::jstring {
+    match env
+        .with_env(move |env| -> jni::errors::Result<jni::sys::jstring> {
+            Ok(env.new_string(value)?.into_raw())
+        })
+        .into_outcome()
+    {
+        jni::Outcome::Ok(value) => value,
+        _ => std::ptr::null_mut(),
+    }
+}
+
+fn jni_byte_array_from_slice<'local>(
+    env: &mut jni::EnvUnowned<'local>,
+    bytes: &[u8],
+) -> jni::sys::jbyteArray {
+    let bytes = bytes.to_vec();
+    match env
+        .with_env(move |env| -> jni::errors::Result<jni::sys::jbyteArray> {
+            Ok(env.byte_array_from_slice(&bytes)?.into_raw())
+        })
+        .into_outcome()
+    {
+        jni::Outcome::Ok(value) => value,
+        _ => std::ptr::null_mut(),
+    }
+}
+
+fn jni_convert_byte_array<'local>(
+    env: &mut jni::EnvUnowned<'local>,
+    value: &jni::objects::JByteArray<'local>,
+) -> Option<Vec<u8>> {
+    match env
+        .with_env(|env| -> jni::errors::Result<Vec<u8>> { env.convert_byte_array(value) })
+        .into_outcome()
+    {
+        jni::Outcome::Ok(value) => Some(value),
+        _ => None,
+    }
+}
+
 /// JNI: start the engine, returning the bound loopback port (or -1 on error).
 /// SECURITY: never logs the session token or any secret.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart(
-    mut env: jni::JNIEnv,
-    _class: jni::objects::JClass,
-    files_dir: jni::objects::JString,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
 ) -> jni::sys::jint {
-    let dir: String = match env.get_string(&files_dir) {
-        Ok(s) => s.into(),
-        Err(_) => return -1,
+    let dir = match jni_get_string(&mut env, &files_dir) {
+        Some(s) => s,
+        None => return -1,
     };
     // The default build binds no loopback port, so there is no port to return: 1 = started,
     // -1 = failed. Kotlin only checks `> 0` to know the engine is up (#0A).
@@ -684,42 +738,40 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart(
 
 /// JNI: the per-process session token Kotlin hands to the WebView (header + cookie).
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSessionToken(
-    env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSessionToken<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
 ) -> jni::sys::jstring {
     let tok = session_token().unwrap_or_default();
-    env.new_string(tok)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jni_new_string(&mut env, tok)
 }
 
 /// JNI: push the current device transfer conditions from the Android platform layer — the
 /// active network is metered, the device is charging, and the free bytes on the sync volume —
 /// read by the offline pass's policy gate (#655). May be called any time; the latest wins.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDeviceState(
-    _env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDeviceState<'local>(
+    _env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
     metered: jni::sys::jboolean,
     charging: jni::sys::jboolean,
     free_bytes: jni::sys::jlong,
 ) {
-    set_device_state(metered != 0, charging != 0, free_bytes.max(0) as u64);
+    set_device_state(metered, charging, free_bytes.max(0) as u64);
 }
 
 /// JNI: answer one in-process bridge request (#0A). Kotlin passes the JSON request
 /// envelope from the `WebMessageListener` and posts the returned JSON envelope back on the
 /// message port — no loopback TCP port is used. SECURITY: never logs tokens or bodies.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeBridgeRequest(
-    mut env: jni::JNIEnv,
-    _class: jni::objects::JClass,
-    request_json: jni::objects::JString,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeBridgeRequest<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    request_json: jni::objects::JString<'local>,
 ) -> jni::sys::jstring {
-    let req: String = match env.get_string(&request_json) {
-        Ok(s) => s.into(),
-        Err(_) => return std::ptr::null_mut(),
+    let req = match jni_get_string(&mut env, &request_json) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
     };
     // Panic-isolate: a request-handling panic must never unwind across the FFI boundary.
     let resp =
@@ -727,25 +779,23 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeBridgeRe
             r#"{"t":"res","id":null,"status":500,"body":"{\"error\":\"internal error\"}"}"#
                 .to_string()
         });
-    env.new_string(resp)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jni_new_string(&mut env, resp)
 }
 
 /// JNI: answer one browser-initiated GET subresource (#0A) for `shouldInterceptRequest`,
 /// returning the framed bytes (see [`asset_request`]). Binary-safe. Never logs the cookie.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetRequest(
-    mut env: jni::JNIEnv,
-    _class: jni::objects::JClass,
-    path: jni::objects::JString,
-    cookie: jni::objects::JString,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetRequest<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    path: jni::objects::JString<'local>,
+    cookie: jni::objects::JString<'local>,
 ) -> jni::sys::jbyteArray {
-    let path: String = match env.get_string(&path) {
-        Ok(s) => s.into(),
-        Err(_) => return std::ptr::null_mut(),
+    let path = match jni_get_string(&mut env, &path) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
     };
-    let cookie: String = env.get_string(&cookie).map(Into::into).unwrap_or_default();
+    let cookie = jni_get_string(&mut env, &cookie).unwrap_or_default();
     let cookie = if cookie.is_empty() {
         None
     } else {
@@ -753,28 +803,25 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
     };
     let bytes = std::panic::catch_unwind(AssertUnwindSafe(|| asset_request(&path, cookie)))
         .unwrap_or_default();
-    env.byte_array_from_slice(&bytes)
-        .map(|a| a.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jni_byte_array_from_slice(&mut env, &bytes)
 }
 
 /// JNI: answer one browser-initiated GET subresource using the trusted Activity-held
 /// session token, not a WebView cookie. Binary-safe. Never logs the token.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetRequestWithSession(
-    mut env: jni::JNIEnv,
-    _class: jni::objects::JClass,
-    path: jni::objects::JString,
-    session_token: jni::objects::JString,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetRequestWithSession<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    path: jni::objects::JString<'local>,
+    session_token: jni::objects::JString<'local>,
 ) -> jni::sys::jbyteArray {
-    let path: String = match env.get_string(&path) {
-        Ok(s) => s.into(),
-        Err(_) => return std::ptr::null_mut(),
+    let path = match jni_get_string(&mut env, &path) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
     };
-    let session_token: String = env
-        .get_string(&session_token)
-        .map(Into::into)
-        .unwrap_or_default();
+    let session_token = jni_get_string(&mut env, &session_token).unwrap_or_default();
     let session_token = if session_token.is_empty() {
         None
     } else {
@@ -784,28 +831,23 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
         asset_request_with_session(&path, session_token)
     }))
     .unwrap_or_default();
-    env.byte_array_from_slice(&bytes)
-        .map(|a| a.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jni_byte_array_from_slice(&mut env, &bytes)
 }
 
 /// JNI: open a bridge push stream (#0A), returning a stream id (>0) or 0. The session
 /// token is passed explicitly (the WebView can't set headers on a native stream open).
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOpen(
-    mut env: jni::JNIEnv,
-    _class: jni::objects::JClass,
-    path: jni::objects::JString,
-    session_token: jni::objects::JString,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOpen<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    path: jni::objects::JString<'local>,
+    session_token: jni::objects::JString<'local>,
 ) -> jni::sys::jlong {
-    let path: String = match env.get_string(&path) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
+    let path = match jni_get_string(&mut env, &path) {
+        Some(s) => s,
+        None => return 0,
     };
-    let tok: String = env
-        .get_string(&session_token)
-        .map(Into::into)
-        .unwrap_or_default();
+    let tok = jni_get_string(&mut env, &session_token).unwrap_or_default();
     let tok = if tok.is_empty() { None } else { Some(tok) };
     std::panic::catch_unwind(AssertUnwindSafe(|| stream_open(&path, tok.as_deref()))).unwrap_or(0)
 }
@@ -813,22 +855,20 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOp
 /// JNI: block for the next event on stream `id` (a JSON `{event,data}` object), or "" when
 /// the stream ended/closed. Kotlin's per-stream thread loops on this. Never logs.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamNext(
-    env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamNext<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
     id: jni::sys::jlong,
 ) -> jni::sys::jstring {
     let out = std::panic::catch_unwind(AssertUnwindSafe(|| stream_next(id))).unwrap_or_default();
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jni_new_string(&mut env, out)
 }
 
 /// JNI: close a bridge push stream.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamClose(
-    _env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamClose<'local>(
+    _env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
     id: jni::sys::jlong,
 ) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| stream_close(id)));
@@ -840,15 +880,15 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamCl
 /// only (ring needs raw key material); they are never logged. Returns 1 on success, 0 on a
 /// bad length so Kotlin can surface a setup failure.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyKey(
-    env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyKey<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
     key_id: jni::sys::jint,
-    key: jni::objects::JByteArray,
+    key: jni::objects::JByteArray<'local>,
 ) -> jni::sys::jint {
-    let bytes = match env.convert_byte_array(&key) {
-        Ok(b) => b,
-        Err(_) => return 0,
+    let bytes = match jni_convert_byte_array(&mut env, &key) {
+        Some(b) => b,
+        None => return 0,
     };
     if install_mobile_body_key(key_id, &bytes) {
         1
@@ -862,17 +902,16 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyK
 /// the confirmation cannot originate in the WebView (which holds every cap-token). Returns
 /// 1 when the pending id was found and armed, 0 otherwise (unknown/expired/engine down).
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConfirmAction(
-    mut env: jni::JNIEnv,
-    _class: jni::objects::JClass,
-    pending_id: jni::objects::JString,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConfirmAction<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    pending_id: jni::objects::JString<'local>,
 ) -> jni::sys::jboolean {
-    let id: String = match env.get_string(&pending_id) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
+    let id = match jni_get_string(&mut env, &pending_id) {
+        Some(s) => s,
+        None => return false,
     };
-    let ok = std::panic::catch_unwind(AssertUnwindSafe(|| confirm_action(&id))).unwrap_or(false);
-    u8::from(ok)
+    std::panic::catch_unwind(AssertUnwindSafe(|| confirm_action(&id))).unwrap_or(false)
 }
 
 #[cfg(test)]

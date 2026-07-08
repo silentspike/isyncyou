@@ -2645,31 +2645,46 @@ function openDriveItem(it) {
       el("span", { class: "dim", text: (p.roles || []).join(", ") || "—" }))));
   }).catch(e => { clear(perm); perm.append(el("div", { class: "dim", text: "Access unavailable (" + e.message + ")" })); });
 }
-// #659 per-item local-body management (free-up / download-now). The mobile browse is live Graph
-// (no store state per row), so read this id's store row to pick the right action; absent (never
-// materialized) → offer download-now. Mobile-only, cap-gated. Fills async (row already in the DOM).
+// #659/#724 per-item local-body management (free-up / download-now). The mobile browse is live
+// Graph, so read this id's store row and its effective mode before offering any local-body action.
+// Store miss or effective online rows stay actionless; the engine remains the final authority.
 function driveManageSection(content, it) {
   if (!MOBILE || !CAP.onedriveManage || it.item_type === "folder") return;
   const box = el("div", { style: "margin-top:8px" });
   content.append(box);
   api("/api/v1/item?" + qs({ account: App.account, service: "onedrive", id: it.remote_id }))
     .then(row => driveRenderManage(box, it, row))
-    .catch(() => driveRenderManage(box, it, null)); // not in the store yet → download-now
+    .catch(() => driveRenderManageUnavailable(box));
+}
+function driveManageMode(row) {
+  return row && MODE_KEYS.includes(row.effective_mode) ? row.effective_mode : null;
+}
+function driveCanDownloadNow(row) {
+  const mode = driveManageMode(row);
+  return mode === "sync" || mode === "offline";
+}
+function driveRenderManageUnavailable(box) {
+  clear(box);
+  box.append(el("h4", { class: "od-sec dim", text: "On this device" }));
+  box.append(el("div", { class: "dim", style: "font-size:12px", text: "Available online." }));
 }
 function driveRenderManage(box, it, row) {
   clear(box);
-  const hasBody = !!(row && (row.has_body || row.body_state === "available" || row.content_state === "materialized"));
+  if (!row) { driveRenderManageUnavailable(box); return; }
+  const hasBody = row.has_body === true;
   box.append(el("h4", { class: "od-sec dim", text: "On this device" }));
   if (hasBody) {
     box.append(el("button", { class: "btn ghost sm", type: "button", style: "width:100%;justify-content:flex-start",
       onclick: () => freeUpItem(it) }, icon("hard-drive", "icon-sm"), "Free up space"));
     box.append(el("div", { class: "dim", style: "font-size:12px;margin-top:4px",
       text: "Removes the downloaded copy — the file stays listed and can be downloaded again." }));
-  } else {
+  } else if (driveCanDownloadNow(row)) {
     box.append(el("button", { class: "btn ghost sm", type: "button", style: "width:100%;justify-content:flex-start",
       onclick: () => downloadNowItem(it) }, icon("download", "icon-sm"), "Download now"));
     if (row && row.last_download_error) box.append(el("div", { style: "font-size:12px;margin-top:4px;color:var(--danger,#f87171)",
       text: "Last attempt failed: " + row.last_download_error }));
+  } else {
+    box.append(el("div", { class: "dim", style: "font-size:12px", text: "Available online." }));
   }
 }
 async function freeUpItem(it) {
@@ -2683,7 +2698,7 @@ async function freeUpItem(it) {
 async function downloadNowItem(it) {
   try {
     const d = await post("/api/v1/onedrive/download-now?" + qs({ account: App.account, id: it.remote_id }), CAP.onedriveManage);
-    toast(d && d.materialized === false ? "Not downloaded (blocked by policy)" : "Downloaded " + (it.name || "file"));
+    toast(d && d.downloaded === false ? "Not downloaded (blocked by policy)" : "Downloaded " + (it.name || "file"));
     closeSheet();
     driveLoad();
   } catch (e) { toast("Could not download: " + e.message, "err"); }
