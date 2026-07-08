@@ -29,8 +29,9 @@ import org.json.JSONObject
  * the Android Documents UI, backed by the embedded engine over the **existing** JNI bridge.
  *
  * Live Mode-1 browsing (#648 / #649): [NativeEngine.nativeBridgeRequest] walks the folder tree straight
- * from Graph (`/api/v1/onedrive/children`, fully paged, no store write) and [NativeEngine.nativeAssetRequest]
- * fetches file bytes on demand (`/api/v1/onedrive/open`, a live Graph download). Reads only,
+ * from Graph (`/api/v1/onedrive/children`, fully paged, no store write) and
+ * [NativeEngine.nativeAssetRequestWithSession] fetches file bytes on demand
+ * (`/api/v1/onedrive/open`, a live Graph download). Reads only,
  * session-token gated (never biometric).
  *
  * **No decrypted plaintext ever touches disk:** bytes are served from RAM via a proxy FD (API 26+) or a
@@ -221,7 +222,7 @@ class OneDriveDocumentsProvider : DocumentsProvider() {
     /** `GET /api/v1/onedrive/open?id=&name=` over the binary-safe asset path → (status, bytes-or-null). */
     private fun liveOpen(id: String, name: String): Pair<Int, ByteArray?> {
         val path = "/api/v1/onedrive/open?account=$ACCOUNT&id=${enc(id)}&name=${enc(name)}"
-        return parseAssetFrame(NativeEngine.nativeAssetRequest(path, "isy_session=${token()}"))
+        return parseAssetFrame(NativeEngine.nativeAssetRequestWithSession(path, token()))
     }
 
     /**
