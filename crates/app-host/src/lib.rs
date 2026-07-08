@@ -6,7 +6,8 @@
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::Item;
-use std::collections::HashMap;
+use isyncyou_webui::{OfflineModeRisk, OneDriveMoveRisk};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1834,6 +1835,144 @@ fn onedrive_effective_mode(
     modes.effective_mode(&it.remote_id, &ancestry)
 }
 
+const OFFLINE_BULK_FILE_THRESHOLD: usize = 2;
+const OFFLINE_LARGE_BYTE_THRESHOLD: u64 = 256 * 1024 * 1024;
+
+fn onedrive_ancestry_with_self<'a>(
+    by_id: &HashMap<&'a str, &'a Item>,
+    it: &'a Item,
+) -> Vec<&'a str> {
+    let mut out = Vec::with_capacity(1 + 8);
+    out.push(it.remote_id.as_str());
+    out.extend(onedrive_ancestry(by_id, it));
+    out
+}
+
+fn onedrive_offline_scope_owner(
+    modes: Option<&OneDriveModes>,
+    ancestry: &[&str],
+) -> Option<String> {
+    let scopes = isyncyou_connectors::scopes_from_modes(modes);
+    let offline_ids: BTreeSet<&str> = scopes
+        .iter()
+        .filter(|s| s.mode == isyncyou_connectors::Mode::Offline)
+        .map(|s| s.folder_id.as_str())
+        .collect();
+    isyncyou_connectors::owning_scope(ancestry, &offline_ids).map(str::to_string)
+}
+
+fn classify_onedrive_move_risk_from_items(
+    modes: Option<&OneDriveModes>,
+    by_id: &HashMap<&str, &Item>,
+    source_id: &str,
+    destination_parent_id: &str,
+) -> OneDriveMoveRisk {
+    let Some(source) = by_id.get(source_id) else {
+        return OneDriveMoveRisk::Unknown {
+            reason: "missing_source".into(),
+        };
+    };
+    let source_ancestry = onedrive_ancestry_with_self(by_id, source);
+    let Some(source_scope) = onedrive_offline_scope_owner(modes, &source_ancestry) else {
+        return OneDriveMoveRisk::Low;
+    };
+
+    let destination_scope = if destination_parent_id.is_empty() {
+        None
+    } else {
+        let Some(destination) = by_id.get(destination_parent_id) else {
+            return OneDriveMoveRisk::Unknown {
+                reason: "missing_destination".into(),
+            };
+        };
+        let destination_ancestry = onedrive_ancestry_with_self(by_id, destination);
+        onedrive_offline_scope_owner(modes, &destination_ancestry)
+    };
+
+    if destination_scope.as_deref() == Some(source_scope.as_str()) {
+        OneDriveMoveRisk::Low
+    } else {
+        OneDriveMoveRisk::MoveOutOfProtected {
+            source_scope,
+            destination_scope,
+        }
+    }
+}
+
+fn offline_mode_risk(
+    requires_confirmation: bool,
+    file_count: usize,
+    known_bytes: u64,
+    unknown_size_files: usize,
+    reason: &str,
+) -> OfflineModeRisk {
+    OfflineModeRisk {
+        requires_confirmation,
+        file_count,
+        known_bytes,
+        unknown_size_files,
+        reason: reason.into(),
+    }
+}
+
+fn estimate_onedrive_offline_mode_risk_from_items(
+    by_id: &HashMap<&str, &Item>,
+    folder_id: &str,
+) -> OfflineModeRisk {
+    let Some(folder) = by_id.get(folder_id) else {
+        return offline_mode_risk(true, 0, 0, 0, "unknown_folder");
+    };
+    if folder.item_type != "folder" {
+        return offline_mode_risk(true, 0, 0, 0, "not_folder");
+    }
+
+    let mut file_count = 0usize;
+    let mut known_bytes = 0u64;
+    let mut unknown_size_files = 0usize;
+    for item in by_id.values().copied() {
+        if item.item_type != "file" {
+            continue;
+        }
+        let ancestry = onedrive_ancestry(by_id, item);
+        if !ancestry.contains(&folder_id) {
+            continue;
+        }
+        file_count += 1;
+        match item.size {
+            Some(size) if size >= 0 => known_bytes = known_bytes.saturating_add(size as u64),
+            _ => unknown_size_files += 1,
+        }
+    }
+
+    if file_count >= OFFLINE_BULK_FILE_THRESHOLD {
+        offline_mode_risk(
+            true,
+            file_count,
+            known_bytes,
+            unknown_size_files,
+            "bulk_files",
+        )
+    } else if known_bytes >= OFFLINE_LARGE_BYTE_THRESHOLD {
+        offline_mode_risk(
+            true,
+            file_count,
+            known_bytes,
+            unknown_size_files,
+            "large_bytes",
+        )
+    } else if unknown_size_files > 0 && file_count > 0 {
+        offline_mode_risk(
+            true,
+            file_count,
+            known_bytes,
+            unknown_size_files,
+            "unknown_size",
+        )
+    } else {
+        offline_mode_risk(false, file_count, known_bytes, unknown_size_files, "small")
+    }
+}
+
 fn onedrive_body_bytes(
     acc: &isyncyou_core::AccountConfig,
     by_id: &HashMap<&str, &Item>,
@@ -2131,6 +2270,61 @@ impl isyncyou_webui::OneDriveManageHandler for DaemonOneDriveManage {
     }
 }
 
+pub struct DaemonOneDriveRisk {
+    config_path: PathBuf,
+}
+impl DaemonOneDriveRisk {
+    fn cfg(&self) -> Result<Config, String> {
+        Config::load(&self.config_path).map_err(|e| format!("load config: {e}"))
+    }
+
+    fn items_for<'a>(
+        cfg: &'a Config,
+        account: &str,
+    ) -> Result<(Option<&'a OneDriveModes>, Vec<Item>), String> {
+        let acc = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .ok_or_else(|| format!("no account '{account}'"))?;
+        let store = isyncyou_store::Store::open(acc.archive_root.join(".isyncyou-store.db"))
+            .map_err(|e| format!("open OneDrive store: {e}"))?;
+        let items = store
+            .items_by_service(account, "onedrive")
+            .map_err(|e| format!("query OneDrive store: {e}"))?;
+        Ok((cfg.onedrive_modes.get(account), items))
+    }
+}
+impl isyncyou_webui::OneDriveRiskHandler for DaemonOneDriveRisk {
+    fn move_risk(
+        &self,
+        account: &str,
+        item_id: &str,
+        destination_parent_id: &str,
+    ) -> Result<OneDriveMoveRisk, String> {
+        let cfg = self.cfg()?;
+        let (modes, items) = Self::items_for(&cfg, account)?;
+        let by_id: HashMap<&str, &Item> =
+            items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+        Ok(classify_onedrive_move_risk_from_items(
+            modes,
+            &by_id,
+            item_id,
+            destination_parent_id,
+        ))
+    }
+
+    fn offline_mode_risk(&self, account: &str, folder_id: &str) -> Result<OfflineModeRisk, String> {
+        let cfg = self.cfg()?;
+        let (_modes, items) = Self::items_for(&cfg, account)?;
+        let by_id: HashMap<&str, &Item> =
+            items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+        Ok(estimate_onedrive_offline_mode_risk_from_items(
+            &by_id, folder_id,
+        ))
+    }
+}
+
 pub fn build_live_router(
     cfg: Config,
     gate: Option<Arc<Mutex<()>>>,
@@ -2174,6 +2368,11 @@ pub fn build_live_router(
             }),
             mint_cap_token(),
         )
+        // #723: OneDrive mobile biometric risk classifier. The router only calls it when the
+        // Android biometric gate is active, so desktop avoids this config/store I/O entirely.
+        .with_onedrive_risk(Arc::new(DaemonOneDriveRisk {
+            config_path: config_path.clone(),
+        }) as Arc<dyn isyncyou_webui::OneDriveRiskHandler>)
         .with_mail_write(
             Arc::new(DaemonMailWrite { cfg: cfg.clone() }),
             mint_cap_token(),
@@ -2320,6 +2519,245 @@ mod tests {
         h.set_poll_interval_secs(99_999).unwrap();
         assert_eq!(live.load(Ordering::Relaxed), 3600);
         assert_eq!(Config::load(&path).unwrap().sync.poll_interval_secs, 3600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn od_item(id: &str, parent: Option<&str>, item_type: &str, size: Option<i64>) -> Item {
+        let mut item = Item::new("a", "onedrive", id, id, item_type);
+        item.parent_remote_id = parent.map(str::to_string);
+        item.size = size;
+        item
+    }
+
+    fn od_map(items: &[Item]) -> std::collections::HashMap<&str, &Item> {
+        items
+            .iter()
+            .map(|item| (item.remote_id.as_str(), item))
+            .collect()
+    }
+
+    fn od_modes(default_mode: OneDriveMode, pairs: &[(&str, OneDriveMode)]) -> OneDriveModes {
+        OneDriveModes {
+            default_mode,
+            folder_modes: pairs
+                .iter()
+                .map(|(id, mode)| ((*id).to_string(), *mode))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn onedrive_risk_move_uses_explicit_offline_scope_owner_only() {
+        let items = vec![
+            od_item("off", None, "folder", None),
+            od_item("off-file", Some("off"), "file", Some(1)),
+            od_item("sync", None, "folder", None),
+            od_item("sync-file", Some("sync"), "file", Some(1)),
+            od_item("plain", None, "folder", None),
+            od_item("plain-file", Some("plain"), "file", Some(1)),
+        ];
+        let by_id = od_map(&items);
+        let modes = od_modes(
+            OneDriveMode::Online,
+            &[("off", OneDriveMode::Offline), ("sync", OneDriveMode::Sync)],
+        );
+
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "off-file", ""),
+            OneDriveMoveRisk::MoveOutOfProtected {
+                source_scope: "off".into(),
+                destination_scope: None,
+            }
+        );
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "off-file", "off"),
+            OneDriveMoveRisk::Low
+        );
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "sync-file", ""),
+            OneDriveMoveRisk::Low,
+            "explicit Sync scopes are not protected Offline scopes"
+        );
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "plain-file", "missing"),
+            OneDriveMoveRisk::Low,
+            "unprotected sources stay low-risk even when destination metadata is stale"
+        );
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "off-file", "sync"),
+            OneDriveMoveRisk::MoveOutOfProtected {
+                source_scope: "off".into(),
+                destination_scope: None,
+            },
+            "Sync-only destinations do not count as Offline owners"
+        );
+
+        let default_offline = od_modes(OneDriveMode::Offline, &[]);
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(
+                Some(&default_offline),
+                &by_id,
+                "plain-file",
+                "",
+            ),
+            OneDriveMoveRisk::Low,
+            "default_mode=Offline is not an explicit protected scope root"
+        );
+    }
+
+    #[test]
+    fn onedrive_risk_move_missing_and_nested_scope_cases() {
+        let items = vec![
+            od_item("root-off", None, "folder", None),
+            od_item("child-off", Some("root-off"), "folder", None),
+            od_item("source", Some("child-off"), "file", Some(1)),
+        ];
+        let by_id = od_map(&items);
+        let modes = od_modes(
+            OneDriveMode::Online,
+            &[
+                ("root-off", OneDriveMode::Offline),
+                ("child-off", OneDriveMode::Offline),
+            ],
+        );
+
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "missing", ""),
+            OneDriveMoveRisk::Unknown {
+                reason: "missing_source".into(),
+            }
+        );
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "source", "missing"),
+            OneDriveMoveRisk::Unknown {
+                reason: "missing_destination".into(),
+            }
+        );
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "source", "root-off"),
+            OneDriveMoveRisk::MoveOutOfProtected {
+                source_scope: "child-off".into(),
+                destination_scope: Some("root-off".into()),
+            },
+            "deepest explicit Offline scope owns the source"
+        );
+        assert_eq!(
+            classify_onedrive_move_risk_from_items(Some(&modes), &by_id, "source", "child-off"),
+            OneDriveMoveRisk::Low
+        );
+    }
+
+    #[test]
+    fn onedrive_risk_offline_mode_estimate_thresholds() {
+        let folder = od_item("folder", None, "folder", None);
+        let small = od_item("small", Some("folder"), "file", Some(4));
+        let large = od_item(
+            "large",
+            Some("folder"),
+            "file",
+            Some(OFFLINE_LARGE_BYTE_THRESHOLD as i64),
+        );
+        let unknown = od_item("unknown", Some("folder"), "file", None);
+        let nested_folder = od_item("nested", Some("folder"), "folder", None);
+        let nested_file = od_item("nested-file", Some("nested"), "file", Some(5));
+
+        let missing_items = vec![small.clone()];
+        assert_eq!(
+            estimate_onedrive_offline_mode_risk_from_items(&od_map(&missing_items), "folder"),
+            offline_mode_risk(true, 0, 0, 0, "unknown_folder")
+        );
+
+        let empty_items = vec![folder.clone()];
+        assert_eq!(
+            estimate_onedrive_offline_mode_risk_from_items(&od_map(&empty_items), "folder"),
+            offline_mode_risk(false, 0, 0, 0, "small")
+        );
+
+        let small_items = vec![folder.clone(), small.clone()];
+        assert_eq!(
+            estimate_onedrive_offline_mode_risk_from_items(&od_map(&small_items), "folder"),
+            offline_mode_risk(false, 1, 4, 0, "small")
+        );
+
+        let bulk_items = vec![folder.clone(), small.clone(), nested_folder, nested_file];
+        let bulk = estimate_onedrive_offline_mode_risk_from_items(&od_map(&bulk_items), "folder");
+        assert!(bulk.requires_confirmation);
+        assert_eq!(bulk.file_count, 2);
+        assert_eq!(bulk.reason, "bulk_files");
+
+        let large_items = vec![folder.clone(), large];
+        let large = estimate_onedrive_offline_mode_risk_from_items(&od_map(&large_items), "folder");
+        assert!(large.requires_confirmation);
+        assert_eq!(large.reason, "large_bytes");
+
+        let unknown_items = vec![folder.clone(), unknown];
+        let unknown =
+            estimate_onedrive_offline_mode_risk_from_items(&od_map(&unknown_items), "folder");
+        assert!(unknown.requires_confirmation);
+        assert_eq!(unknown.unknown_size_files, 1);
+        assert_eq!(unknown.reason, "unknown_size");
+
+        let file_items = vec![od_item("file-id", None, "file", Some(1))];
+        assert_eq!(
+            estimate_onedrive_offline_mode_risk_from_items(&od_map(&file_items), "file-id"),
+            offline_mode_risk(true, 0, 0, 0, "not_folder")
+        );
+    }
+
+    #[test]
+    fn daemon_onedrive_risk_reads_store_and_config() {
+        let dir = std::env::temp_dir().join(format!("isy-apphost-risk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let arch = dir.join("archive");
+        let sync = dir.join("sync");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let config_path = dir.join("isyncyou.toml");
+        let mut cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a".into(),
+                sync_root: sync,
+                archive_root: arch.clone(),
+                cache_root: cache,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.onedrive_modes.insert(
+            "a".into(),
+            od_modes(OneDriveMode::Online, &[("off", OneDriveMode::Offline)]),
+        );
+        cfg.save(&config_path).unwrap();
+        {
+            let store = isyncyou_store::Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            for item in [
+                od_item("off", None, "folder", None),
+                od_item("f1", Some("off"), "file", Some(1)),
+                od_item("f2", Some("off"), "file", Some(2)),
+            ] {
+                store.upsert_item(&item).unwrap();
+            }
+        }
+
+        let handler = DaemonOneDriveRisk {
+            config_path: config_path.clone(),
+        };
+        assert_eq!(
+            isyncyou_webui::OneDriveRiskHandler::move_risk(&handler, "a", "f1", "").unwrap(),
+            OneDriveMoveRisk::MoveOutOfProtected {
+                source_scope: "off".into(),
+                destination_scope: None,
+            }
+        );
+        let offline =
+            isyncyou_webui::OneDriveRiskHandler::offline_mode_risk(&handler, "a", "off").unwrap();
+        assert!(offline.requires_confirmation);
+        assert_eq!(offline.file_count, 2);
+        assert_eq!(offline.reason, "bulk_files");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
