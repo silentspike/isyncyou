@@ -7235,6 +7235,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(
             mobile
+                .route(&post(
+                    "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221&_pat=wrong"
+                ))
+                .status,
+            403
+        );
+        assert!(writes.moves.lock().unwrap().is_empty());
+
+        assert_eq!(
+            mobile
                 .route(&post(&format!(
                     "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221&_pat={pat}"
                 )))
@@ -7277,6 +7287,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             *writes.moves.lock().unwrap(),
             vec![("i2".into(), Some("P2".into()), "N".into())]
         );
+        assert_eq!(risk.move_calls(), 1);
+    }
+
+    #[test]
+    fn onedrive_move_unknown_risk_is_biometric_gated_on_mobile() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let (_d, r) = setup();
+        let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let risk = std::sync::Arc::new(FakeOneDriveRisk::with_move(OneDriveMoveRisk::Unknown {
+            reason: "missing destination".into(),
+        }));
+        let mobile = r
+            .with_onedrive_write(writes.clone(), "cap".into())
+            .with_onedrive_risk(risk.clone())
+            .with_biometric_gate();
+
+        let ch = mobile.route(&post(
+            "/api/v1/onedrive/move?account=a&id=i2&parent=P2&name=N",
+        ));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        assert_eq!(j["op"], "move-out-of-protected");
+        assert!(writes.moves.lock().unwrap().is_empty());
         assert_eq!(risk.move_calls(), 1);
     }
 
@@ -7331,6 +7365,23 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(risk.offline_calls(), 1);
 
         let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            mobile
+                .route(&post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline&_pat=wrong"
+                ))
+                .status,
+            403
+        );
+        assert!(
+            modes
+                .modes("a")
+                .unwrap()
+                .folder_modes
+                .get("Photos")
+                .is_none(),
+            "wrong biometric token must not persist the mode"
+        );
         assert!(mobile.confirm_biometric(&pat));
         assert_eq!(
             mobile
