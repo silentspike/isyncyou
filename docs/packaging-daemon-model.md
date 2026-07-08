@@ -51,8 +51,9 @@ the published attestation with:
 gh attestation verify isyncyou-linux-x86_64.tar.gz -R silentspike/isyncyou
 ```
 
-On a push to `main` the workflow publishes an RC prerelease; a `vX.Y.Z` tag
-publishes a release.
+When deliberately dispatched from `main`, the workflow publishes an RC prerelease.
+A `vX.Y.Z` tag publishes a full release and reuses the APK from the matching RC
+commit.
 
 ## Distribution scripts (partial)
 

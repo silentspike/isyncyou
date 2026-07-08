@@ -1,0 +1,65 @@
+{
+  "cleanup": [
+    {
+      "id": "c74d851e-7a20-4fa0-ab33-dc695648c5a3",
+      "label": "permission",
+      "status": 204
+    },
+    {
+      "id": "892B68CBF4A7C544!s58045074f1ce420496d8be011ea58e40",
+      "label": "fixture-root",
+      "status": 204
+    }
+  ],
+  "fixture": {
+    "file_id": "892B68CBF4A7C544!scfd3b760f775428db792da3ed22996d0",
+    "file_name": "share-target.txt",
+    "root_id": "892B68CBF4A7C544!s58045074f1ce420496d8be011ea58e40",
+    "root_name": "isy-om725-share-20260708-164308"
+  },
+  "graph_permissions": {
+    "count": 2,
+    "matching_links": [
+      {
+        "id": "c74d851e-7a20-4fa0-ab33-dc695648c5a3",
+        "link_type": "view",
+        "roles": [
+          "read"
+        ],
+        "scope": "anonymous",
+        "webUrl_sha256": "a95f31ca78a98e2593df5c9859af9d148e64957dff80fb0783d1b7789f33651a"
+      }
+    ]
+  },
+  "mobile_api": {
+    "service": "onedrive",
+    "shared": "892B68CBF4A7C544!scfd3b760f775428db792da3ed22996d0",
+    "type": "view",
+    "webUrl_redacted": true,
+    "webUrl_sha256": "a95f31ca78a98e2593df5c9859af9d148e64957dff80fb0783d1b7789f33651a"
+  },
+  "package": "com.silentspike.isyncyou.debug",
+  "rows": {
+    "G_invite": {
+      "reason": "no controlled recipient configured; live invite would send real email",
+      "status": "SKIP"
+    },
+    "G_share_link": {
+      "biometric_path": "mobile runBiometricConfirm via bridge",
+      "permission_match_count": 1,
+      "status": "PASS",
+      "url_redacted": true
+    }
+  },
+  "status": "PASS",
+  "token": {
+    "access_token_printed": false,
+    "account_cached": true,
+    "scopes": [
+      "Files.ReadWrite",
+      "User.Read"
+    ],
+    "source": "/home/jan/.config/m365-write/token_cache.json"
+  },
+  "ts": "2026-07-08T14:43:07Z"
+}
