@@ -7697,6 +7697,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "BRIDGE_TIMEOUT_MS",
             "NATIVE_TIMEOUT_MS",
             "BIO_TIMEOUT_MS",
+            "BRIDGE_STREAM_TIMEOUT_MS",
+            "Native call returned non-JSON response",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -7755,6 +7757,60 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(
             bridge_stream < event_source,
             "mobile bridge stream branch must be evaluated before desktop EventSource"
+        );
+    }
+
+    #[test]
+    fn bridge_isolation_native_call_rejects_non_json_body() {
+        let start = APP_JS
+            .find("async function nativeCall(")
+            .expect("nativeCall missing");
+        let end = APP_JS[start..]
+            .find("/* ---------------------------------------------------------------- push registration")
+            .expect("nativeCall end marker missing")
+            + start;
+        let native_call = &APP_JS[start..end];
+        assert!(
+            native_call.contains("throw new Error(\"Native call returned non-JSON response\")"),
+            "nativeCall must hard-fail non-JSON native bodies"
+        );
+        assert!(
+            !native_call.contains("catch (_) { body = {}; }"),
+            "nativeCall must not silently coerce malformed native JSON to an empty object"
+        );
+    }
+
+    #[test]
+    fn bridge_isolation_stream_subscription_has_handshake_timeout_cleanup() {
+        let start = APP_JS
+            .find("function openEventStream(")
+            .expect("openEventStream missing");
+        let end = APP_JS[start..]
+            .find("/* One request over the active transport")
+            .expect("openEventStream end marker missing")
+            + start;
+        let stream_fn = &APP_JS[start..end];
+        for needle in [
+            "const timer = setTimeout(() =>",
+            "_bridgeStreams.delete(id);",
+            "BRIDGE.postMessage(JSON.stringify({ t: \"unsub\", id }))",
+            "BRIDGE_STREAM_TIMEOUT_MS",
+            "if (h && h.timer) clearTimeout(h.timer);",
+        ] {
+            assert!(
+                stream_fn.contains(needle),
+                "openEventStream missing stream timeout cleanup invariant: {needle}"
+            );
+        }
+        let bridge_handler = APP_JS
+            .find("if (h.timer) { clearTimeout(h.timer); h.timer = null; }")
+            .expect("stream event handler must clear the handshake timeout");
+        let stream_start = APP_JS
+            .find("_bridgeStreams.set(id, { onEvent, onError, timer });")
+            .expect("stream handler must store the timeout");
+        assert!(
+            bridge_handler < stream_start,
+            "incoming bridge events must clear the stored stream handshake timeout"
         );
     }
 

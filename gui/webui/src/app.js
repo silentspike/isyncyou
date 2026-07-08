@@ -330,6 +330,7 @@ let _bridgeSeq = 0;
 const BRIDGE_TIMEOUT_MS = 15000;
 const NATIVE_TIMEOUT_MS = 5000;
 const BIO_TIMEOUT_MS = 120000;
+const BRIDGE_STREAM_TIMEOUT_MS = BRIDGE_TIMEOUT_MS;
 const _bridgePending = new Map(); // request/native id -> { resolve, reject, timer }
 const _bridgeStreams = new Map(); // stream id -> onEvent handler
 const _bioPending = new Map();    // biometric request id -> { resolve, timer } (#0.6)
@@ -348,10 +349,17 @@ if (BRIDGE) {
     } else if (m.t === "evt") {
       const h = _bridgeStreams.get(m.id);
       _bridgeStats.events++;
-      if (h && m.ev) h.onEvent(m.ev.event || "message", m.ev.data || "");
+      if (h && m.ev) {
+        if (h.timer) { clearTimeout(h.timer); h.timer = null; }
+        h.onEvent(m.ev.event || "message", m.ev.data || "");
+      }
     } else if (m.t === "end") {
       const h = _bridgeStreams.get(m.id);
-      if (h) { _bridgeStreams.delete(m.id); if (h.onError) h.onError(); }
+      if (h) {
+        if (h.timer) clearTimeout(h.timer);
+        _bridgeStreams.delete(m.id);
+        if (h.onError) h.onError();
+      }
     }
   };
 }
@@ -384,7 +392,11 @@ async function nativeCall(op, payload, timeoutMs) {
   _bridgeStats.native++;
   const res = await bridgeRoundTrip({ t: "native", id, op, payload: payload || {} }, timeoutMs || NATIVE_TIMEOUT_MS);
   let body = {};
-  try { body = res.body ? JSON.parse(res.body) : {}; } catch (_) { body = {}; }
+  try {
+    body = res.body ? JSON.parse(res.body) : {};
+  } catch (_) {
+    throw new Error("Native call returned non-JSON response");
+  }
   const status = Number(res.status);
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
     throw new Error(body.error || body.reason || status || "Native call failed");
@@ -437,11 +449,29 @@ function biometricLabel(d) {
 function openEventStream(path, onEvent, onError) {
   if (BRIDGE) {
     const id = "s" + (++_bridgeSeq);
-    _bridgeStreams.set(id, { onEvent, onError });
+    const timer = setTimeout(() => {
+      const h = _bridgeStreams.get(id);
+      if (!h) return;
+      _bridgeStreams.delete(id);
+      try { BRIDGE.postMessage(JSON.stringify({ t: "unsub", id })); } catch (_) {}
+      if (h.onError) h.onError();
+    }, BRIDGE_STREAM_TIMEOUT_MS);
+    _bridgeStreams.set(id, { onEvent, onError, timer });
     _bridgeStats.streams++;
     try { BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path })); }
-    catch (e) { _bridgeStreams.delete(id); if (onError) setTimeout(onError, 0); }
-    return { close() { _bridgeStreams.delete(id); try { BRIDGE.postMessage(JSON.stringify({ t: "unsub", id })); } catch (_) {} } };
+    catch (e) {
+      clearTimeout(timer);
+      _bridgeStreams.delete(id);
+      if (onError) setTimeout(onError, 0);
+    }
+    return {
+      close() {
+        const h = _bridgeStreams.get(id);
+        if (h && h.timer) clearTimeout(h.timer);
+        _bridgeStreams.delete(id);
+        try { BRIDGE.postMessage(JSON.stringify({ t: "unsub", id })); } catch (_) {}
+      }
+    };
   }
   const es = new EventSource(path);
   es.onmessage = (e) => onEvent("message", e.data);

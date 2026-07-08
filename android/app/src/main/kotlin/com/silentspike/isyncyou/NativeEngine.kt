@@ -18,7 +18,7 @@ object NativeEngine {
      */
     external fun nativeStart(filesDir: String): Int
 
-    /** The per-process session token the WebView must send on every data API call. */
+    /** The per-process session token held by trusted native callers, never by WebView JS. */
     external fun nativeSessionToken(): String
 
     /**

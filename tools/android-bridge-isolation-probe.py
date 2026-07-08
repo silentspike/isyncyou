@@ -415,6 +415,43 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
             """
         )
         ev.assert_("native_malformed_message_returns_400", malformed.get("status") == 400, reply=malformed)
+        native_non_json = cdp.eval(
+            """
+            (async () => {
+              const oldPost = window.__isyBridge.postMessage;
+              try {
+                window.__isyBridge.postMessage = (raw) => {
+                  const msg = JSON.parse(raw);
+                  if (msg.t === 'native') {
+                    setTimeout(() => window.__isyBridge.onmessage({
+                      data: JSON.stringify({ t: 'res', id: msg.id, status: 200, body: 'not-json' })
+                    }), 0);
+                    return;
+                  }
+                  oldPost.call(window.__isyBridge, raw);
+                };
+                try {
+                  await nativeCall('pushToken', {}, 1000);
+                  return { ok: false, reason: 'resolved' };
+                } catch (e) {
+                  return {
+                    ok: /non-JSON/.test(String(e && e.message || e)),
+                    message: String(e && e.message || e),
+                    pending: _bridgePending.size,
+                  };
+                }
+              } finally {
+                window.__isyBridge.postMessage = oldPost;
+              }
+            })()
+            """,
+            timeout=5,
+        )
+        ev.assert_(
+            "native_call_rejects_non_json_success_body",
+            native_non_json.get("ok") is True and native_non_json.get("pending") == 0,
+            result=native_non_json,
+        )
         cleanup = cdp.eval(
             """
             (async () => {
@@ -450,6 +487,55 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
             timeout=8,
         )
         ev.assert_("bridge_js_response_cleanup", cleanup.get("ok") is True, result=cleanup)
+        stream_timeout = cdp.eval(
+            """
+            new Promise((resolve) => {
+              const oldPost = window.__isyBridge.postMessage;
+              let subId = null;
+              let unsubscribed = false;
+              let errors = 0;
+              let done = false;
+              const probePath = '/api/v1/events?issue721_probe=stream-timeout';
+              window.__isyBridge.postMessage = (raw) => {
+                let msg;
+                try { msg = JSON.parse(raw); } catch (_) { return oldPost.call(window.__isyBridge, raw); }
+                if (msg.t === 'sub' && msg.path === probePath) { subId = msg.id; return; }
+                if (msg.t === 'unsub' && msg.id === subId) { unsubscribed = true; return; }
+                return oldPost.call(window.__isyBridge, raw);
+              };
+              const stream = openEventStream(probePath, () => {}, () => { errors += 1; });
+              const started = Date.now();
+              const deadlineMs = (typeof BRIDGE_STREAM_TIMEOUT_MS === 'number' ? BRIDGE_STREAM_TIMEOUT_MS : 15000) + 5000;
+              const finish = (ok, reason) => {
+                if (done) return;
+                done = true;
+                clearInterval(poll);
+                const streamStillRegistered = subId ? _bridgeStreams.has(subId) : null;
+                try { stream.close(); } catch (_) {}
+                window.__isyBridge.postMessage = oldPost;
+                resolve({
+                  ok,
+                  reason,
+                  subId,
+                  streamStillRegistered,
+                  errors,
+                  unsubscribed,
+                  streamCount: _bridgeStreams.size,
+                });
+              };
+              const poll = setInterval(() => {
+                const streamStillRegistered = subId ? _bridgeStreams.has(subId) : null;
+                if (subId && streamStillRegistered === false && errors === 1 && unsubscribed === true) {
+                  finish(true, 'timeout_cleanup_observed');
+                } else if (Date.now() - started > deadlineMs) {
+                  finish(false, 'deadline');
+                }
+              }, 100);
+            })
+            """,
+            timeout=22,
+        )
+        ev.assert_("bridge_stream_handshake_timeout_cleanup", stream_timeout.get("ok") is True, result=stream_timeout)
         push = cdp.eval("nativeCall('pushToken', {}, 3000).then(d => typeof d.token === 'string')")
         ev.assert_("native_push_token_op_returns", push is True)
         bio_started = cdp.eval(

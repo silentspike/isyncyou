@@ -35,14 +35,14 @@
     {
       "name": "cdp_forward",
       "port": 9222,
-      "socket": "webview_devtools_remote_2082",
+      "socket": "webview_devtools_remote_5131",
       "status": "PASS"
     },
     {
       "name": "webview_devtools_target",
       "status": "PASS",
       "url": "about:blank",
-      "ws_url": "ws://127.0.0.1:9222/devtools/page/4281379E2CD509F6235BD20E1BEABBEA"
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/199DB8E379FDF39A125D62657B014414"
     },
     {
       "name": "forced_failure_page_text",
@@ -65,26 +65,26 @@
       "status": "PASS"
     },
     {
-      "log_tail": "IN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-SUB-0:33723.3 VIRTUAL-SKIN-CHARGE-SUB-1:32992.2 VIRTUAL-SKIN-CHARGE-SUB-2:32840.2 VIRTUAL-SKIN-CHARGE-SUB-3:34150.9 VIRTUAL-SKIN-CHARGE-WIRED:34150.9 WLC_CHECK:1 battery:34100 cam_therm:33620 charge_therm:38472 disp_therm:34822 neutral_therm:35979 north_therm:33308 quiet_therm:33731 soc_therm:38428 thb_hda:56 usb_pwr_therm:34154 \n07-08 05:34:12.329  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=4102.35 err=3.84911 s_power=2527 time_elapsed_ms=7023 p=458.044 i=1302 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=184.696 (PARTIAL_SYSTEM_POWER: 1539.14 mW, cdev_weight: 0.120000)\n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN:34.402 raw data: VIRTUAL-SKIN:34401.9 \n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:34.1509 raw data: VIRTUAL-SKIN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-PERSIST:34150.9 \n07-08 05:34:13.416  1283  1283 W TracingMuxer: type=1400 audit(0.0:3517208): avc:  denied  { write } for  name=\"traced_producer\" dev=\"tmpfs\" ino=1813 scontext=u:r:gxp_logging:s0 tcontext=u:object_r:traced_producer_socket:s0 tclass=sock_file permissive=0\n",
+      "log_tail": "therm:40861 north_therm:37226 quiet_therm:37359 soc_therm:46798 thb_hda:56 usb_pwr_therm:38027 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=3488.54 err=-0.639439 s_power=2527 time_elapsed_ms=7016 p=-76.0932 i=1155.77 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=118.131 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.060000)\n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN:38.9478 raw data: VIRTUAL-SKIN:38947.8 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:38.6394 raw data: VIRTUAL-SKIN-CHARGE:38639.4 VIRTUAL-SKIN-CHARGE-PERSIST:38639.4 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST power_budget=3855.34 err=2.36056 s_power=2383 time_elapsed_ms=7016 p=502.8 i=1383 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=413.457 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.210000)\n07-08 05:52:33.009  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-2 sysfs to 1\n07-08 05:52:33.010  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-0 sysfs to 1\n",
       "name": "forced_failure_activity_engine_not_started",
       "status": "PASS"
     },
     {
-      "log_tail": "IN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-SUB-0:33723.3 VIRTUAL-SKIN-CHARGE-SUB-1:32992.2 VIRTUAL-SKIN-CHARGE-SUB-2:32840.2 VIRTUAL-SKIN-CHARGE-SUB-3:34150.9 VIRTUAL-SKIN-CHARGE-WIRED:34150.9 WLC_CHECK:1 battery:34100 cam_therm:33620 charge_therm:38472 disp_therm:34822 neutral_therm:35979 north_therm:33308 quiet_therm:33731 soc_therm:38428 thb_hda:56 usb_pwr_therm:34154 \n07-08 05:34:12.329  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=4102.35 err=3.84911 s_power=2527 time_elapsed_ms=7023 p=458.044 i=1302 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=184.696 (PARTIAL_SYSTEM_POWER: 1539.14 mW, cdev_weight: 0.120000)\n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN:34.402 raw data: VIRTUAL-SKIN:34401.9 \n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:34.1509 raw data: VIRTUAL-SKIN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-PERSIST:34150.9 \n07-08 05:34:13.416  1283  1283 W TracingMuxer: type=1400 audit(0.0:3517208): avc:  denied  { write } for  name=\"traced_producer\" dev=\"tmpfs\" ino=1813 scontext=u:r:gxp_logging:s0 tcontext=u:object_r:traced_producer_socket:s0 tclass=sock_file permissive=0\n",
+      "log_tail": "therm:40861 north_therm:37226 quiet_therm:37359 soc_therm:46798 thb_hda:56 usb_pwr_therm:38027 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=3488.54 err=-0.639439 s_power=2527 time_elapsed_ms=7016 p=-76.0932 i=1155.77 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=118.131 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.060000)\n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN:38.9478 raw data: VIRTUAL-SKIN:38947.8 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:38.6394 raw data: VIRTUAL-SKIN-CHARGE:38639.4 VIRTUAL-SKIN-CHARGE-PERSIST:38639.4 \n07-08 05:52:33.008  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST power_budget=3855.34 err=2.36056 s_power=2383 time_elapsed_ms=7016 p=502.8 i=1383 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=413.457 (PARTIAL_SYSTEM_POWER: 1968.84 mW, cdev_weight: 0.210000)\n07-08 05:52:33.009  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-2 sysfs to 1\n07-08 05:52:33.010  1931  1941 I pixel-thermal: Successfully update cdev thermal-cpufreq-0 sysfs to 1\n",
       "name": "forced_failure_log_marker",
       "status": "PASS"
     },
     {
       "name": "cdp_forward",
       "port": 9222,
-      "socket": "webview_devtools_remote_2447",
+      "socket": "webview_devtools_remote_5300",
       "status": "PASS"
     },
     {
       "name": "webview_devtools_target",
       "status": "PASS",
       "url": "https://appassets.androidplatform.net/",
-      "ws_url": "ws://127.0.0.1:9222/devtools/page/250E0AD949728647E8338D529A3B3561"
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/FD0AF47AF7D40290C36A4A1354CF6DFB"
     },
     {
       "name": "top_frame_has_bridge",
@@ -133,6 +133,15 @@
       "status": "PASS"
     },
     {
+      "name": "native_call_rejects_non_json_success_body",
+      "result": {
+        "message": "Native call returned non-JSON response",
+        "ok": true,
+        "pending": 0
+      },
+      "status": "PASS"
+    },
+    {
       "name": "bridge_js_response_cleanup",
       "result": {
         "ok": true,
@@ -155,6 +164,19 @@
       "status": "PASS"
     },
     {
+      "name": "bridge_stream_handshake_timeout_cleanup",
+      "result": {
+        "errors": 1,
+        "ok": true,
+        "reason": "timeout_cleanup_observed",
+        "streamCount": 1,
+        "streamStillRegistered": false,
+        "subId": "s13",
+        "unsubscribed": true
+      },
+      "status": "PASS"
+    },
+    {
       "name": "native_push_token_op_returns",
       "status": "PASS"
     },
@@ -165,9 +187,9 @@
         "stats": {
           "bio": 1,
           "events": 0,
-          "native": 1,
+          "native": 2,
           "requests": 9,
-          "streams": 2
+          "streams": 4
         }
       },
       "status": "PASS",
@@ -177,14 +199,14 @@
           "KeyguardServiceDelegate",
           "deviceHasKeyguard=true",
           "KeyguardStateMonitor",
-          "Window #13: WindowStateAnimator{91625ee BiometricPrompt}",
-          "mImeLayeringTarget=Window{eb16055 u0 BiometricPrompt}",
-          "mImeInputTarget=Window{eb16055 u0 BiometricPrompt}",
-          "mImeControlTarget=Window{eb16055 u0 BiometricPrompt}",
-          "mCurrentFocus=Window{eb16055 u0 BiometricPrompt}",
+          "Window #13: WindowStateAnimator{e69107 BiometricPrompt}",
+          "mImeLayeringTarget=Window{b08e1e6 u0 BiometricPrompt}",
+          "mImeInputTarget=Window{b08e1e6 u0 BiometricPrompt}",
+          "mImeControlTarget=Window{b08e1e6 u0 BiometricPrompt}",
+          "mCurrentFocus=Window{b08e1e6 u0 BiometricPrompt}",
           "mKeyguardDrawComplete=true mWindowManagerDrawComplete=true",
           "isKeyguardShowing=false",
-          "mFocusedWindow=Window{eb16055 u0 BiometricPrompt}"
+          "mFocusedWindow=Window{b08e1e6 u0 BiometricPrompt}"
         ]
       }
     },
@@ -200,8 +222,8 @@
     {
       "name": "device_keyguard_clear_before_network_guard",
       "state": {
-        "current_focus": "mCurrentFocus=Window{78ed3d2 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
-        "focused_app": "mFocusedApp=ActivityRecord{194943305 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13540}",
+        "current_focus": "mCurrentFocus=Window{aec64ad u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
+        "focused_app": "mFocusedApp=ActivityRecord{132941631 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13546}",
         "keyguard_showing": false
       },
       "status": "PASS"
@@ -231,9 +253,9 @@
       "stats": {
         "bio": 1,
         "events": 0,
-        "native": 12,
+        "native": 13,
         "requests": 9,
-        "streams": 2
+        "streams": 4
       },
       "status": "PASS"
     },
@@ -259,7 +281,7 @@
       "status": "PASS"
     }
   ],
-  "webview_devtools_socket": "webview_devtools_remote_2447",
+  "webview_devtools_socket": "webview_devtools_remote_5300",
   "webview_devtools_target_url": "https://appassets.androidplatform.net/",
-  "webview_devtools_ws_url": "ws://127.0.0.1:9222/devtools/page/250E0AD949728647E8338D529A3B3561"
+  "webview_devtools_ws_url": "ws://127.0.0.1:9222/devtools/page/FD0AF47AF7D40290C36A4A1354CF6DFB"
 }
