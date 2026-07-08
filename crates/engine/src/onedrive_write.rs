@@ -20,12 +20,15 @@
 //! not eagerly mutate the item store, to avoid diverging from the scope-ownership rule.
 
 use isyncyou_core::Config;
-use isyncyou_graph::DrivePermission;
+use isyncyou_graph::{DrivePermission, InviteOutcome};
 use isyncyou_store::{CloudOpKind, CloudWriteOp, Store};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SERVICE: &str = "onedrive";
+const INVITE_NOT_STARTED: &str = "invite_not_started_user_retry_required";
+const INVITE_AMBIGUOUS: &str = "invite_recovery_ambiguous";
+const INVITE_PARTIAL_SUCCESS: &str = "invite_partial_success";
 
 /// The outcome of a conditional content [`replace`](OneDriveWriteSink::replace_if_match).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +87,36 @@ impl ShareIntent {
         })
     }
 
+    pub fn invite(
+        account: &str,
+        item_id: &str,
+        emails: &[String],
+        role: &str,
+        secret: &[u8],
+    ) -> Result<(Self, Vec<String>), String> {
+        validate_share_item_id(item_id)?;
+        validate_invite_role(role)?;
+        let normalized = normalize_invite_recipients(emails)?;
+        let recipient_hashes = normalized
+            .iter()
+            .map(|email| recipient_hash(secret, account, email))
+            .collect::<Vec<_>>();
+        Ok((
+            Self {
+                kind: ShareKind::Invite,
+                item_id: item_id.to_string(),
+                link_type: None,
+                scope: None,
+                role: Some(role.to_string()),
+                recipient_count: recipient_hashes.len(),
+                recipient_hashes,
+                require_sign_in: true,
+                send_invitation: true,
+            },
+            normalized,
+        ))
+    }
+
     fn from_op(op: &CloudWriteOp) -> Result<Self, String> {
         let target = op
             .target_id
@@ -107,7 +140,48 @@ impl ShareIntent {
                 Self::link(target, link_type, scope)
             }
             Some("invite") => {
-                Err("invite share recovery is handled by the invite ledger path".into())
+                validate_share_item_id(target)?;
+                let role = intent
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .ok_or("invite intent has no role")?;
+                validate_invite_role(role)?;
+                let recipient_hashes = intent
+                    .get("recipient_hashes")
+                    .and_then(|v| v.as_array())
+                    .ok_or("invite intent has no recipient_hashes")?
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| "invite recipient hash is not a string".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let recipient_count = intent
+                    .get("recipient_count")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("invite intent has no recipient_count")?
+                    as usize;
+                if recipient_hashes.is_empty() || recipient_hashes.len() != recipient_count {
+                    return Err("invite recipient hash count mismatch".into());
+                }
+                Ok(Self {
+                    kind: ShareKind::Invite,
+                    item_id: target.to_string(),
+                    link_type: None,
+                    scope: None,
+                    role: Some(role.to_string()),
+                    recipient_hashes,
+                    recipient_count,
+                    require_sign_in: intent
+                        .get("require_sign_in")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    send_invitation: intent
+                        .get("send_invitation")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                })
             }
             Some(other) => Err(format!("unsupported share_kind '{other}'")),
             None => Err("share ledger row has no share_kind".into()),
@@ -179,6 +253,15 @@ pub trait OneDriveShareSink {
     ) -> Result<DrivePermission, String>;
 
     fn list_share_permissions(&self, item_id: &str) -> Result<Vec<DrivePermission>, String>;
+
+    fn invite_share(
+        &self,
+        item_id: &str,
+        emails: &[String],
+        roles: &[&str],
+        require_sign_in: bool,
+        send_invitation: bool,
+    ) -> Result<InviteOutcome, String>;
 }
 
 impl OneDriveShareSink for isyncyou_graph::GraphClient {
@@ -195,6 +278,27 @@ impl OneDriveShareSink for isyncyou_graph::GraphClient {
     fn list_share_permissions(&self, item_id: &str) -> Result<Vec<DrivePermission>, String> {
         self.list_permissions_detailed(item_id)
             .map_err(|e| e.to_string())
+    }
+
+    fn invite_share(
+        &self,
+        item_id: &str,
+        emails: &[String],
+        roles: &[&str],
+        require_sign_in: bool,
+        send_invitation: bool,
+    ) -> Result<InviteOutcome, String> {
+        self.invite_detailed(
+            item_id,
+            emails,
+            roles,
+            require_sign_in,
+            send_invitation,
+            "",
+            None,
+            None,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -429,6 +533,113 @@ fn validate_share_link_scope(scope: &str) -> Result<(), String> {
     }
 }
 
+fn validate_invite_role(role: &str) -> Result<(), String> {
+    match role {
+        "read" | "write" => Ok(()),
+        _ => Err("invalid invite role".into()),
+    }
+}
+
+fn normalize_invite_recipients(emails: &[String]) -> Result<Vec<String>, String> {
+    if emails.is_empty() {
+        return Err("invite requires at least one recipient".into());
+    }
+    if emails.len() > 20 {
+        return Err("invite recipient count exceeds limit".into());
+    }
+    let mut normalized = Vec::new();
+    for email in emails {
+        let trimmed = email.trim();
+        if trimmed.is_empty() {
+            return Err("invite recipient is empty".into());
+        }
+        if trimmed.len() > 320 {
+            return Err("invite recipient is too long".into());
+        }
+        if trimmed.chars().any(char::is_control) || !trimmed.contains('@') {
+            return Err("invite recipient is malformed".into());
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        if !normalized.contains(&lowered) {
+            normalized.push(lowered);
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn recipient_hash(secret: &[u8], account: &str, normalized_email: &str) -> String {
+    crate::restore_key::idempotency_key(
+        secret,
+        account,
+        SERVICE,
+        &format!("share|recipient|{normalized_email}"),
+        &[],
+    )
+}
+
+fn permission_email_hashes(
+    permission: &DrivePermission,
+    secret: &[u8],
+    account: &str,
+) -> Vec<String> {
+    permission
+        .granted_emails
+        .iter()
+        .chain(permission.invitation_emails.iter())
+        .map(|email| recipient_hash(secret, account, &email.trim().to_ascii_lowercase()))
+        .collect()
+}
+
+fn invite_role_matches(permission: &DrivePermission, intent: &ShareIntent) -> bool {
+    let Some(role) = intent.role.as_deref() else {
+        return false;
+    };
+    permission.roles.iter().any(|r| r == role)
+}
+
+fn invite_recovered_permission_ids(
+    permissions: &[DrivePermission],
+    intent: &ShareIntent,
+    secret: &[u8],
+    account: &str,
+) -> Option<Vec<String>> {
+    let mut matches: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        intent
+            .recipient_hashes
+            .iter()
+            .map(|hash| (hash.clone(), std::collections::BTreeSet::new()))
+            .collect();
+    for permission in permissions {
+        if permission.inherited || !invite_role_matches(permission, intent) {
+            continue;
+        }
+        let hashes = permission_email_hashes(permission, secret, account);
+        if hashes.is_empty() {
+            continue;
+        }
+        for expected in &intent.recipient_hashes {
+            if hashes.iter().any(|hash| hash == expected) {
+                matches
+                    .get_mut(expected)
+                    .expect("expected hash was pre-seeded")
+                    .insert(permission.id.clone());
+            }
+        }
+    }
+    let mut permission_ids = Vec::new();
+    for ids in matches.values() {
+        if ids.len() != 1 {
+            return None;
+        }
+        let id = ids.iter().next().expect("single id").clone();
+        if !permission_ids.contains(&id) {
+            permission_ids.push(id);
+        }
+    }
+    Some(permission_ids)
+}
+
 fn share_permission_web_url(permission: &DrivePermission) -> Result<String, String> {
     permission
         .link_web_url
@@ -541,6 +752,74 @@ fn create_and_apply_share_link<S: OneDriveShareSink>(
     }
 }
 
+fn apply_invite_success(
+    store: &Store,
+    op_id: &str,
+    permission_ids: Vec<String>,
+    recipient_count: usize,
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    let result_id = if permission_ids.len() == 1 {
+        permission_ids.first().map(String::as_str)
+    } else {
+        None
+    };
+    store
+        .set_cloud_write_state(op_id, "applied", result_id, None, now)
+        .map_err(|e| e.to_string())?;
+    Ok(ShareOutcome::Invite {
+        permission_ids,
+        summary: format!("invited {recipient_count} recipient(s)"),
+    })
+}
+
+fn set_invite_failed(
+    store: &Store,
+    op_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    store
+        .set_cloud_write_state(op_id, "failed", None, Some(reason), now)
+        .map_err(|e| e.to_string())?;
+    Ok(ShareOutcome::FailedClosed {
+        reason: reason.to_string(),
+    })
+}
+
+fn issue_invite<S: OneDriveShareSink>(
+    store: &Store,
+    op_id: &str,
+    intent: &ShareIntent,
+    emails: &[String],
+    sink: &S,
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    let role = intent.role.as_deref().ok_or("invite intent has no role")?;
+    match sink.invite_share(
+        &intent.item_id,
+        emails,
+        &[role],
+        intent.require_sign_in,
+        intent.send_invitation,
+    ) {
+        Ok(InviteOutcome::Applied { permission_ids }) => {
+            apply_invite_success(store, op_id, permission_ids, intent.recipient_count, now)
+        }
+        Ok(InviteOutcome::Partial { .. }) => {
+            set_invite_failed(store, op_id, INVITE_PARTIAL_SUCCESS, now)?;
+            Err(INVITE_PARTIAL_SUCCESS.to_string())
+        }
+        Err(e) => {
+            let redacted = redacted_share_error(&e);
+            store
+                .set_cloud_write_state(op_id, "inflight", None, Some(&redacted), now)
+                .map_err(|store_err| store_err.to_string())?;
+            Err(e)
+        }
+    }
+}
+
 /// The result of issuing one op: applied (with an optional new cloud id) or a `Replace`
 /// conflict (a `412` — terminal, keep-both).
 enum Issued {
@@ -626,7 +905,7 @@ pub fn run_cloud_write<S: OneDriveWriteSink + OneDriveShareSink>(
             .cloud_write_by_key(account, &key)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("ledger row for key {key} vanished"))?;
-        return recover_cloud_write_op(store, &existing, sink, now);
+        return recover_cloud_write_op(store, &existing, sink, secret, now);
     }
     store
         .set_cloud_write_state(&op_id, "inflight", None, None, now)
@@ -693,7 +972,7 @@ pub fn run_share_link<S: OneDriveShareSink>(
             .cloud_write_by_key(account, &key)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("share ledger row for key {key} vanished"))?;
-        return recover_share_write_op(store, &existing, sink, now);
+        return recover_share_write_op(store, &existing, sink, secret, now);
     }
     store
         .set_cloud_write_state(&op_id, "inflight", None, None, now)
@@ -701,10 +980,74 @@ pub fn run_share_link<S: OneDriveShareSink>(
     create_and_apply_share_link(store, &op_id, &intent, sink, now)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn run_invite<S: OneDriveShareSink>(
+    store: &Store,
+    account: &str,
+    item_id: &str,
+    emails: &[String],
+    role: &str,
+    sink: &S,
+    secret: &[u8],
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    let (intent, normalized_emails) = ShareIntent::invite(account, item_id, emails, role, secret)?;
+    let (op_id, key) = intent.keys(secret, account);
+    let op = CloudWriteOp {
+        op_id: op_id.clone(),
+        account_id: account.to_string(),
+        service: SERVICE.to_string(),
+        op_kind: CloudOpKind::Share.as_str().to_string(),
+        target_id: Some(item_id.to_string()),
+        idempotency_key: key.clone(),
+        if_match_etag: None,
+        state: "pending".to_string(),
+        result_id: None,
+        intent_json: Some(intent.intent_json()),
+        attempts: 0,
+        last_error: None,
+    };
+    if !store
+        .record_cloud_write(&op, now)
+        .map_err(|e| e.to_string())?
+    {
+        let existing = store
+            .cloud_write_by_key(account, &key)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("invite ledger row for key {key} vanished"))?;
+        if existing.state == "pending" || existing.last_error.as_deref() == Some(INVITE_NOT_STARTED)
+        {
+            store
+                .set_cloud_write_state(&existing.op_id, "inflight", None, None, now)
+                .map_err(|e| e.to_string())?;
+            return issue_invite(
+                store,
+                &existing.op_id,
+                &intent,
+                &normalized_emails,
+                sink,
+                now,
+            );
+        }
+        if existing.state == "failed" {
+            return Err(existing
+                .last_error
+                .clone()
+                .unwrap_or_else(|| INVITE_AMBIGUOUS.to_string()));
+        }
+        return recover_share_write_op(store, &existing, sink, secret, now);
+    }
+    store
+        .set_cloud_write_state(&op_id, "inflight", None, None, now)
+        .map_err(|e| e.to_string())?;
+    issue_invite(store, &op_id, &intent, &normalized_emails, sink, now)
+}
+
 pub fn recover_share_write_op<S: OneDriveShareSink>(
     store: &Store,
     op: &CloudWriteOp,
     sink: &S,
+    secret: &[u8],
     now: i64,
 ) -> Result<ShareOutcome, String> {
     let intent = match ShareIntent::from_op(op) {
@@ -717,9 +1060,24 @@ pub fn recover_share_write_op<S: OneDriveShareSink>(
             return Err(e);
         }
     };
+    match intent.kind {
+        ShareKind::Link => recover_share_link_write_op(store, op, sink, &intent, now),
+        ShareKind::Invite => {
+            recover_invite_write_op(store, account_from_op(op), op, sink, secret, &intent, now)
+        }
+    }
+}
+
+fn recover_share_link_write_op<S: OneDriveShareSink>(
+    store: &Store,
+    op: &CloudWriteOp,
+    sink: &S,
+    intent: &ShareIntent,
+    now: i64,
+) -> Result<ShareOutcome, String> {
     if op.state == "applied" {
         let permissions = sink.list_share_permissions(&intent.item_id)?;
-        let matches = exact_link_matches(&permissions, &intent);
+        let matches = exact_link_matches(&permissions, intent);
         return match matches.as_slice() {
             [permission] => Ok(ShareOutcome::Link {
                 web_url: share_permission_web_url(permission)?,
@@ -738,11 +1096,57 @@ pub fn recover_share_write_op<S: OneDriveShareSink>(
     }
 
     let permissions = sink.list_share_permissions(&intent.item_id)?;
-    let matches = exact_link_matches(&permissions, &intent);
+    let matches = exact_link_matches(&permissions, intent);
     match matches.as_slice() {
         [permission] => apply_share_link_permission(store, &op.op_id, permission, now),
-        _ => create_and_apply_share_link(store, &op.op_id, &intent, sink, now),
+        _ => create_and_apply_share_link(store, &op.op_id, intent, sink, now),
     }
+}
+
+fn account_from_op(op: &CloudWriteOp) -> &str {
+    op.account_id.as_str()
+}
+
+fn recover_invite_write_op<S: OneDriveShareSink>(
+    store: &Store,
+    account: &str,
+    op: &CloudWriteOp,
+    sink: &S,
+    secret: &[u8],
+    intent: &ShareIntent,
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    if op.state == "applied" {
+        return Ok(ShareOutcome::Invite {
+            permission_ids: op.result_id.iter().cloned().collect(),
+            summary: "invite already applied".into(),
+        });
+    }
+    if op.state == "failed" {
+        return Ok(ShareOutcome::FailedClosed {
+            reason: op
+                .last_error
+                .clone()
+                .unwrap_or_else(|| INVITE_AMBIGUOUS.to_string()),
+        });
+    }
+    if op.state == "pending" {
+        return set_invite_failed(store, &op.op_id, INVITE_NOT_STARTED, now);
+    }
+
+    let permissions = sink.list_share_permissions(&intent.item_id)?;
+    if let Some(permission_ids) =
+        invite_recovered_permission_ids(&permissions, intent, secret, account)
+    {
+        return apply_invite_success(
+            store,
+            &op.op_id,
+            permission_ids,
+            intent.recipient_count,
+            now,
+        );
+    }
+    set_invite_failed(store, &op.op_id, INVITE_AMBIGUOUS, now)
 }
 
 /// Reconcile a non-`applied` ledger op to a terminal `applied` state **without a double
@@ -752,6 +1156,7 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink + OneDriveShareSink>(
     store: &Store,
     op: &CloudWriteOp,
     sink: &S,
+    secret: &[u8],
     now: i64,
 ) -> Result<WriteOutcome, String> {
     if op.state == "applied" {
@@ -828,8 +1233,8 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink + OneDriveShareSink>(
             }
         }
         CloudOpKind::Share => {
-            recover_share_write_op(store, op, sink, now)?;
-            WriteOutcome::Applied(String::new())
+            recover_share_write_op(store, op, sink, secret, now)?;
+            return Ok(WriteOutcome::Applied(String::new()));
         }
     };
     match &outcome {
@@ -849,6 +1254,7 @@ pub fn recover_pending_cloud_writes<S: OneDriveWriteSink + OneDriveShareSink>(
     store: &Store,
     account: &str,
     sink: &S,
+    secret: &[u8],
     now: i64,
 ) -> Result<usize, String> {
     let pending = store
@@ -862,7 +1268,7 @@ pub fn recover_pending_cloud_writes<S: OneDriveWriteSink + OneDriveShareSink>(
         // An Upload/Replace whose local source is gone can never succeed → mark it terminally
         // `failed` so it leaves the pending set; any other (e.g. transient network) error stays
         // pending and is retried on the next pass.
-        match recover_cloud_write_op(store, op, sink, now) {
+        match recover_cloud_write_op(store, op, sink, secret, now) {
             Ok(_) => recovered += 1,
             Err(e) => {
                 eprintln!(
@@ -929,7 +1335,7 @@ pub fn pending_cloud_write_count(cfg: &Config, account: &str) -> Result<usize, S
 /// reconciled.
 pub fn recover_pending_cloud_writes_for(cfg: &Config, account: &str) -> Result<usize, String> {
     with_ledger(cfg, account, |store, sink, _secret| {
-        recover_pending_cloud_writes(store, account, sink, now_secs())
+        recover_pending_cloud_writes(store, account, sink, _secret, now_secs())
     })
 }
 
@@ -1122,6 +1528,31 @@ pub fn share_link_via_ledger(
     })
 }
 
+pub fn invite_via_ledger(
+    cfg: &Config,
+    account: &str,
+    item_id: &str,
+    emails: &[String],
+    role: &str,
+) -> Result<String, String> {
+    with_ledger(cfg, account, |store, sink, secret| {
+        match run_invite(
+            store,
+            account,
+            item_id,
+            emails,
+            role,
+            sink,
+            secret,
+            now_secs(),
+        )? {
+            ShareOutcome::Invite { summary, .. } => Ok(summary),
+            ShareOutcome::FailedClosed { reason } => Err(reason),
+            ShareOutcome::Link { .. } => Err("unexpected link outcome for invite".into()),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1145,9 +1576,11 @@ mod tests {
         upload_calls: RefCell<u32>,
         replace_calls: RefCell<u32>,
         create_link_calls: RefCell<u32>,
+        invite_calls: RefCell<u32>,
         replace_attempts: RefCell<Vec<(String, String, Vec<u8>)>>, // (id, etag, bytes)
         permissions: RefCell<Vec<DrivePermission>>,
         create_link_errors: RefCell<Vec<String>>,
+        invite_outcomes: RefCell<Vec<Result<InviteOutcome, String>>>,
     }
     impl FakeCloud {
         fn count(&self) -> usize {
@@ -1316,6 +1749,47 @@ mod tests {
         fn list_share_permissions(&self, _item_id: &str) -> Result<Vec<DrivePermission>, String> {
             Ok(self.permissions.borrow().clone())
         }
+
+        fn invite_share(
+            &self,
+            _item_id: &str,
+            emails: &[String],
+            roles: &[&str],
+            _require_sign_in: bool,
+            _send_invitation: bool,
+        ) -> Result<InviteOutcome, String> {
+            *self.invite_calls.borrow_mut() += 1;
+            {
+                let mut outcomes = self.invite_outcomes.borrow_mut();
+                if !outcomes.is_empty() {
+                    return outcomes.remove(0);
+                }
+            }
+            let roles = roles
+                .iter()
+                .map(|role| (*role).to_string())
+                .collect::<Vec<_>>();
+            let mut permission_ids = Vec::new();
+            for email in emails {
+                let id = {
+                    let mut seq = self.seq.borrow_mut();
+                    *seq += 1;
+                    format!("invite-perm-{seq}")
+                };
+                self.permissions.borrow_mut().push(DrivePermission {
+                    id: id.clone(),
+                    roles: roles.clone(),
+                    link_web_url: None,
+                    link_type: None,
+                    link_scope: None,
+                    granted_emails: Vec::new(),
+                    invitation_emails: vec![email.clone()],
+                    inherited: false,
+                });
+                permission_ids.push(id);
+            }
+            Ok(InviteOutcome::Applied { permission_ids })
+        }
     }
 
     const SECRET: &[u8] = b"test-secret";
@@ -1416,6 +1890,45 @@ mod tests {
         }
     }
 
+    fn invite_emails() -> Vec<String> {
+        vec![
+            "Alpha@example.com".to_string(),
+            "beta@example.com".to_string(),
+        ]
+    }
+
+    fn invite_permission(id: &str, email: &str, role: &str) -> DrivePermission {
+        DrivePermission {
+            id: id.to_string(),
+            roles: vec![role.to_string()],
+            link_web_url: None,
+            link_type: None,
+            link_scope: None,
+            granted_emails: vec![email.to_string()],
+            invitation_emails: Vec::new(),
+            inherited: false,
+        }
+    }
+
+    fn invite_op(item_id: &str, emails: &[String], role: &str, state: &str) -> CloudWriteOp {
+        let (intent, _) = ShareIntent::invite(ACCT, item_id, emails, role, SECRET).unwrap();
+        let (op_id, key) = intent.keys(SECRET, ACCT);
+        CloudWriteOp {
+            op_id,
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: CloudOpKind::Share.as_str().into(),
+            target_id: Some(item_id.into()),
+            idempotency_key: key,
+            if_match_etag: None,
+            state: state.into(),
+            result_id: None,
+            intent_json: Some(intent.intent_json()),
+            attempts: 1,
+            last_error: None,
+        }
+    }
+
     struct LedgerAssertingShareSink<'a> {
         store: &'a Store,
         account: &'a str,
@@ -1443,6 +1956,73 @@ mod tests {
 
         fn list_share_permissions(&self, item_id: &str) -> Result<Vec<DrivePermission>, String> {
             self.cloud.list_share_permissions(item_id)
+        }
+
+        fn invite_share(
+            &self,
+            item_id: &str,
+            emails: &[String],
+            roles: &[&str],
+            require_sign_in: bool,
+            send_invitation: bool,
+        ) -> Result<InviteOutcome, String> {
+            self.cloud
+                .invite_share(item_id, emails, roles, require_sign_in, send_invitation)
+        }
+    }
+
+    struct LedgerAssertingInviteSink<'a> {
+        store: &'a Store,
+        account: &'a str,
+        key: String,
+        raw_emails: Vec<String>,
+        cloud: FakeCloud,
+    }
+
+    impl OneDriveShareSink for LedgerAssertingInviteSink<'_> {
+        fn create_share_link(
+            &self,
+            item_id: &str,
+            link_type: &str,
+            scope: &str,
+        ) -> Result<DrivePermission, String> {
+            self.cloud.create_share_link(item_id, link_type, scope)
+        }
+
+        fn list_share_permissions(&self, item_id: &str) -> Result<Vec<DrivePermission>, String> {
+            self.cloud.list_share_permissions(item_id)
+        }
+
+        fn invite_share(
+            &self,
+            item_id: &str,
+            emails: &[String],
+            roles: &[&str],
+            require_sign_in: bool,
+            send_invitation: bool,
+        ) -> Result<InviteOutcome, String> {
+            let row = self
+                .store
+                .cloud_write_by_key(self.account, &self.key)
+                .unwrap()
+                .expect("invite intent must exist before Graph invite");
+            assert_eq!(row.op_kind, "share");
+            assert_eq!(row.state, "inflight");
+            assert_eq!(row.target_id.as_deref(), Some(item_id));
+            let intent_json = row.intent_json.as_deref().expect("invite intent_json");
+            assert!(intent_json.contains(r#""share_kind":"invite""#));
+            assert!(intent_json.contains(r#""recipient_count":2"#));
+            for raw in &self.raw_emails {
+                assert!(
+                    !intent_json
+                        .to_ascii_lowercase()
+                        .contains(&raw.to_ascii_lowercase()),
+                    "raw invite email leaked into intent_json"
+                );
+            }
+            assert!(!intent_json.contains('@'));
+            self.cloud
+                .invite_share(item_id, emails, roles, require_sign_in, send_invitation)
         }
     }
 
@@ -1535,7 +2115,7 @@ mod tests {
         let _landed = cloud.create_folder("parent", "Docs").unwrap(); // the create that landed
         assert_eq!(cloud.count(), 1);
         // [CRASH] before the ledger was set to applied. Boot recovery runs:
-        let n = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let n = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             *cloud.create_calls.borrow(),
@@ -1574,7 +2154,7 @@ mod tests {
         };
         s.record_cloud_write(&op, 10).unwrap();
         // [CRASH] the POST never happened → the folder is not in the cloud.
-        recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
         assert_eq!(*cloud.create_calls.borrow(), 1);
         assert_eq!(cloud.count(), 1);
     }
@@ -1658,7 +2238,7 @@ mod tests {
         let key = op.idempotency_key.clone();
         s.record_cloud_write(&op, 10).unwrap();
 
-        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
 
         assert_eq!(recovered, 1);
         assert_eq!(
@@ -1679,7 +2259,7 @@ mod tests {
         let key = op.idempotency_key.clone();
         s.record_cloud_write(&op, 10).unwrap();
 
-        recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
 
         assert_eq!(*cloud.create_link_calls.borrow(), 1);
         assert_eq!(cloud.permissions.borrow().len(), 1);
@@ -1701,7 +2281,7 @@ mod tests {
         let key = op.idempotency_key.clone();
         s.record_cloud_write(&op, 10).unwrap();
 
-        recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
 
         assert_eq!(*cloud.create_link_calls.borrow(), 1);
         let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
@@ -1744,7 +2324,7 @@ mod tests {
         assert_eq!(row.state, "inflight");
         assert_eq!(row.last_error.as_deref(), Some("transient network failure"));
 
-        recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
         assert_eq!(*cloud.create_link_calls.borrow(), 2);
         assert_eq!(
             s.cloud_write_by_key(ACCT, &key).unwrap().unwrap().state,
@@ -1806,6 +2386,273 @@ mod tests {
         assert!(s.pending_cloud_writes(ACCT).unwrap().is_empty());
     }
 
+    #[test]
+    fn invite_rejects_invalid_inputs_before_ledger() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        for (item_id, emails, role) in [
+            ("item-1", Vec::<String>::new(), "read"),
+            ("item-1", vec!["not-an-email".to_string()], "read"),
+            (
+                "item-1",
+                vec!["bad\nperson@example.com".to_string()],
+                "read",
+            ),
+            ("item-1", vec!["person@example.com".to_string()], "owner"),
+            ("", vec!["person@example.com".to_string()], "read"),
+        ] {
+            let err = run_invite(&s, ACCT, item_id, &emails, role, &cloud, SECRET, 10)
+                .expect_err("invalid invite input must fail");
+            assert!(!err.is_empty());
+        }
+        assert!(
+            s.cloud_write_ledger_summary(ACCT).unwrap().is_empty(),
+            "invalid invite input must not create ledger rows"
+        );
+        assert_eq!(*cloud.invite_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn invite_records_intent_before_graph_mutation() {
+        let s = Store::open_in_memory().unwrap();
+        let emails = invite_emails();
+        let (intent, _) = ShareIntent::invite(ACCT, "item-1", &emails, "read", SECRET).unwrap();
+        let (_op_id, key) = intent.keys(SECRET, ACCT);
+        let sink = LedgerAssertingInviteSink {
+            store: &s,
+            account: ACCT,
+            key: key.clone(),
+            raw_emails: emails.clone(),
+            cloud: FakeCloud::default(),
+        };
+
+        let out = run_invite(&s, ACCT, "item-1", &emails, "read", &sink, SECRET, 10).unwrap();
+
+        match out {
+            ShareOutcome::Invite {
+                permission_ids,
+                summary,
+            } => {
+                assert_eq!(permission_ids.len(), 2);
+                assert_eq!(summary, "invited 2 recipient(s)");
+            }
+            other => panic!("unexpected invite outcome: {other:?}"),
+        }
+        assert_eq!(*sink.cloud.invite_calls.borrow(), 1);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.op_kind, "share");
+        assert_eq!(
+            row.result_id, None,
+            "multi-invite ids are not packed into result_id"
+        );
+        let intent_json = row.intent_json.unwrap();
+        assert!(intent_json.contains(r#""share_kind":"invite""#));
+        assert!(intent_json.contains(r#""recipient_hashes""#));
+        assert!(!intent_json.contains('@'));
+        assert!(!intent_json.contains("Alpha@example.com"));
+        assert!(!intent_json.contains("beta@example.com"));
+    }
+
+    #[test]
+    fn invite_pending_not_started_boot_recovery_marks_retry_required() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let emails = invite_emails();
+        let op = invite_op("item-1", &emails, "read", "pending");
+        let key = op.idempotency_key.clone();
+        s.record_cloud_write(&op, 10).unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(*cloud.invite_calls.borrow(), 0);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some(INVITE_NOT_STARTED));
+        assert!(s.pending_cloud_writes(ACCT).unwrap().is_empty());
+    }
+
+    #[test]
+    fn invite_user_retry_can_resume_not_started_row() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let emails = invite_emails();
+        let op = invite_op("item-1", &emails, "read", "pending");
+        let key = op.idempotency_key.clone();
+        let old_op_id = op.op_id.clone();
+        s.record_cloud_write(&op, 10).unwrap();
+        recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
+        assert_eq!(*cloud.invite_calls.borrow(), 0);
+
+        let out = run_invite(&s, ACCT, "item-1", &emails, "read", &cloud, SECRET, 30).unwrap();
+
+        assert!(matches!(out, ShareOutcome::Invite { .. }));
+        assert_eq!(*cloud.invite_calls.borrow(), 1);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.op_id, old_op_id);
+        assert_eq!(row.state, "applied");
+        assert_eq!(
+            s.cloud_write_ledger_summary(ACCT).unwrap(),
+            vec![("applied".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn invite_inflight_with_all_permissions_recovers_applied_without_invite() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let emails = invite_emails();
+        cloud.permissions.borrow_mut().extend([
+            invite_permission("perm-alpha", "alpha@example.com", "read"),
+            invite_permission("perm-beta", "beta@example.com", "read"),
+        ]);
+        let op = invite_op("item-1", &emails, "read", "inflight");
+        let key = op.idempotency_key.clone();
+        s.record_cloud_write(&op, 10).unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            *cloud.invite_calls.borrow(),
+            0,
+            "recovery must probe landed permissions, not resend invite"
+        );
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.result_id, None);
+    }
+
+    #[test]
+    fn invite_recovery_ambiguous_fails_closed_without_blocking_later_delete() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let emails = invite_emails();
+        cloud.permissions.borrow_mut().extend([
+            invite_permission("perm-alpha-1", "alpha@example.com", "read"),
+            invite_permission("perm-alpha-2", "alpha@example.com", "read"),
+            invite_permission("perm-beta", "beta@example.com", "read"),
+        ]);
+        let invite = invite_op("item-1", &emails, "read", "inflight");
+        let invite_key = invite.idempotency_key.clone();
+        s.record_cloud_write(&invite, 10).unwrap();
+
+        let delete = CloudWrite {
+            kind: CloudOpKind::Delete,
+            target_id: "later-delete".into(),
+            name: String::new(),
+            new_parent_id: None,
+            if_match: None,
+            local_path: None,
+            content_tag: None,
+        };
+        let (delete_id, delete_key) = delete.keys(SECRET, ACCT);
+        s.record_cloud_write(
+            &CloudWriteOp {
+                op_id: delete_id,
+                account_id: ACCT.into(),
+                service: SERVICE.into(),
+                op_kind: "delete".into(),
+                target_id: Some("later-delete".into()),
+                idempotency_key: delete_key.clone(),
+                if_match_etag: None,
+                state: "pending".into(),
+                result_id: None,
+                intent_json: Some(delete.intent_json()),
+                attempts: 1,
+                last_error: None,
+            },
+            11,
+        )
+        .unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
+
+        assert_eq!(recovered, 2);
+        assert_eq!(*cloud.invite_calls.borrow(), 0);
+        assert_eq!(*cloud.delete_calls.borrow(), 1);
+        let invite_row = s.cloud_write_by_key(ACCT, &invite_key).unwrap().unwrap();
+        assert_eq!(invite_row.state, "failed");
+        assert_eq!(invite_row.last_error.as_deref(), Some(INVITE_AMBIGUOUS));
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &delete_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            "applied"
+        );
+        assert!(s.pending_cloud_writes(ACCT).unwrap().is_empty());
+    }
+
+    #[test]
+    fn invite_graph_207_partial_success_is_failed_closed_and_not_auto_retried() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        cloud
+            .invite_outcomes
+            .borrow_mut()
+            .push(Ok(InviteOutcome::Partial {
+                successful_permission_ids: vec!["perm-ok".into()],
+                failed_recipient_count: 1,
+                redacted_reason: "partial_success".into(),
+            }));
+        let emails = invite_emails();
+        let (intent, _) = ShareIntent::invite(ACCT, "item-1", &emails, "read", SECRET).unwrap();
+        let (_op_id, key) = intent.keys(SECRET, ACCT);
+
+        let err = run_invite(&s, ACCT, "item-1", &emails, "read", &cloud, SECRET, 10)
+            .expect_err("Graph 207 partial must fail closed");
+
+        assert_eq!(err, INVITE_PARTIAL_SUCCESS);
+        assert_eq!(*cloud.invite_calls.borrow(), 1);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.result_id, None);
+        assert_eq!(row.last_error.as_deref(), Some(INVITE_PARTIAL_SUCCESS));
+        let intent_json = row.intent_json.as_deref().unwrap();
+        assert!(!intent_json.contains('@'));
+        assert!(!row.last_error.as_deref().unwrap().contains('@'));
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            *cloud.invite_calls.borrow(),
+            1,
+            "failed partial invite must not be auto-retried"
+        );
+    }
+
+    #[test]
+    fn failed_ambiguous_invite_blocks_silent_identical_retry() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let emails = invite_emails();
+        cloud.permissions.borrow_mut().extend([
+            invite_permission("perm-alpha-1", "alpha@example.com", "read"),
+            invite_permission("perm-alpha-2", "alpha@example.com", "read"),
+            invite_permission("perm-beta", "beta@example.com", "read"),
+        ]);
+        let op = invite_op("item-1", &emails, "read", "inflight");
+        let key = op.idempotency_key.clone();
+        s.record_cloud_write(&op, 10).unwrap();
+        recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
+        assert_eq!(*cloud.invite_calls.borrow(), 0);
+
+        let err = run_invite(&s, ACCT, "item-1", &emails, "read", &cloud, SECRET, 30)
+            .expect_err("ambiguous failed invite must require explicit conflict handling");
+
+        assert_eq!(err, INVITE_AMBIGUOUS);
+        assert_eq!(*cloud.invite_calls.borrow(), 0);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some(INVITE_AMBIGUOUS));
+        assert_eq!(
+            s.cloud_write_ledger_summary(ACCT).unwrap(),
+            vec![("failed".into(), 1)]
+        );
+    }
+
     // ---- #655: Upload / Replace over the same ledger ------------------------------------
 
     fn upload(target: &str, name: &str, path: &std::path::Path) -> CloudWrite {
@@ -1862,7 +2709,7 @@ mod tests {
         // The upload LANDED out-of-band, then [CRASH] before the ledger was set applied.
         let _landed = cloud.upload("parent", "n.txt", b"hello").unwrap();
         assert_eq!(cloud.file_count(), 1);
-        let n = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let n = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             *cloud.upload_calls.borrow(),
@@ -1904,7 +2751,7 @@ mod tests {
         };
         s.record_cloud_write(&op, 10).unwrap();
 
-        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
 
         assert_eq!(recovered, 1);
         assert_eq!(
@@ -1979,7 +2826,7 @@ mod tests {
         };
         s.record_cloud_write(&op2, 11).unwrap();
 
-        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
         assert_eq!(
             recovered, 1,
             "the recoverable delete is reconciled despite the failing upload"
@@ -2088,7 +2935,7 @@ mod tests {
         )
         .unwrap();
 
-        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
 
         assert_eq!(
             recovered, 1,
@@ -2194,7 +3041,7 @@ mod tests {
             "conflict"
         );
         // A conflict row is terminal — boot recovery does not re-pick it.
-        let n = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let n = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
         assert_eq!(n, 0);
     }
 
@@ -2236,7 +3083,7 @@ mod tests {
         )
         .unwrap();
 
-        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
 
         assert_eq!(recovered, 1);
         assert_eq!(
