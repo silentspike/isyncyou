@@ -424,10 +424,12 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             .ok_or_else(|| AgentError::ToolArgs(format!("no item {service}/{id}")))?;
         let bytes = self.source.read_body(service, id)?;
         let (format, content) = convert_export(service, &bytes)?;
+        let source = Self::source_ref(&item);
         Ok(serde_json::json!({
             "service": item.service,
             "id": item.id,
             "path": item.path,
+            "source": source,
             "format": format,
             "content": content,
         })
@@ -1152,7 +1154,94 @@ mod tests {
         assert_eq!(v["format"], "raw"); // mail → raw without the connectors feature
         assert_eq!(v["service"], "mail");
         assert_eq!(v["id"], "m1");
+        assert_eq!(v["source"]["service"], "mail");
+        assert_eq!(v["source"]["id"], "m1");
+        assert_eq!(v["source"]["path"], "mail/m1.bin");
         assert!(v["content"].as_str().unwrap().contains("Spotify"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn export_calendar_returns_ics_with_source() {
+        let event = serde_json::json!({
+            "id": "cal-1",
+            "iCalUId": "uid-1",
+            "subject": "Q2 review",
+            "bodyPreview": "Agenda line",
+            "location": { "displayName": "Room 1" },
+            "start": { "dateTime": "2026-03-01T09:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-03-01T10:00:00.0000000", "timeZone": "UTC" },
+            "lastModifiedDateTime": "2026-02-20T08:00:00Z"
+        });
+        let body = event.to_string();
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item(
+                "calendar",
+                "cal-1",
+                "Q2 review",
+                Some(&body),
+            )],
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.export("calendar", "cal-1").unwrap()).unwrap();
+        assert_eq!(v["format"], "ics");
+        assert_eq!(v["source"]["service"], "calendar");
+        assert_eq!(v["source"]["id"], "cal-1");
+        let content = v["content"].as_str().unwrap();
+        assert!(content.starts_with("BEGIN:VCALENDAR\r\nVERSION:2.0"));
+        assert!(content.contains("BEGIN:VEVENT"));
+        assert!(content.contains("SUMMARY:Q2 review"));
+        assert!(content.contains("DTSTART:20260301T090000"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn export_contact_returns_vcard_with_source() {
+        let contact = serde_json::json!({
+            "displayName": "Ada Lovelace",
+            "givenName": "Ada",
+            "surname": "Lovelace",
+            "emailAddresses": [{ "address": "ada@example.com", "name": "Ada" }],
+            "mobilePhone": "+1 555 0100",
+            "companyName": "Analytical Engines",
+            "jobTitle": "Mathematician"
+        });
+        let body = contact.to_string();
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item(
+                "contacts",
+                "contact-1",
+                "Ada Lovelace",
+                Some(&body),
+            )],
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.export("contacts", "contact-1").unwrap()).unwrap();
+        assert_eq!(v["format"], "vcard");
+        assert_eq!(v["source"]["service"], "contacts");
+        assert_eq!(v["source"]["id"], "contact-1");
+        let content = v["content"].as_str().unwrap();
+        assert!(content.starts_with("BEGIN:VCARD\r\nVERSION:3.0"));
+        assert!(content.contains("FN:Ada Lovelace"));
+        assert!(content.contains("EMAIL:ada@example.com"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn export_invalid_structured_body_is_tool_error() {
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item(
+                "calendar",
+                "bad-cal",
+                "Broken",
+                Some("not-json"),
+            )],
+        });
+        let err = ex.export("calendar", "bad-cal").unwrap_err();
+        assert!(err.to_string().contains("export parse"));
     }
 
     #[test]
