@@ -345,7 +345,7 @@ on `main`, attested on the RC:
 | **dev** | `fmt` · `clippy -D warnings` · unit tests · MSRV · JS parse-check · **Semgrep** (JS/Kotlin/secrets SAST) · `cargo deny` · dependency review · gitleaks · a 75 % coverage gate |
 | **staging** *(heaviest, pre-prod)* | a token-free **deploy + end-to-end UI smoke**, an **Android build** + an **emulator smoke** (boots the APK on a KVM emulator and asserts the WebView loads), **CodeQL** (Rust + JavaScript + Kotlin), an **OWASP ZAP** baseline DAST against the live UI, a CycloneDX **SBOM**, and the release build |
 | **main** | the release-grade build · a **Trivy** vulnerability scan · CodeQL |
-| **RC** | every merge to `main` publishes a prerelease whose artifacts are **cosign keyless-signed**, with **SLSA provenance** and an **SBOM attestation** |
+| **RC** | an explicit `release.yml` dispatch from `main` publishes a prerelease whose artifacts are **cosign keyless-signed**, with **SLSA provenance** and an **SBOM attestation** |
 
 Promotion between stages is an automated **tree-overlay** (the promoted tree is
 byte-identical to its source), so a change is *gated*, never re-edited, on the way
