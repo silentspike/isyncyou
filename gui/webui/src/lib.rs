@@ -2709,6 +2709,31 @@ impl Router {
             Some(p) => p,
             None => return ApiResponse::error(400, "parent (destination) is required"),
         };
+        if self.biometric_gate {
+            let requires_confirmation = match &self.onedrive_risk {
+                Some(risk) => match risk.move_risk(account, id, new_parent) {
+                    Ok(OneDriveMoveRisk::Low) => false,
+                    Ok(
+                        OneDriveMoveRisk::MoveOutOfProtected { .. }
+                        | OneDriveMoveRisk::Unknown { .. },
+                    ) => true,
+                    Err(_) => true,
+                },
+                None => true,
+            };
+            if requires_confirmation {
+                let item = onedrive_move_pat_item(id, new_parent, name);
+                if let Some(r) = self.biometric_challenge(
+                    "move-out-of-protected",
+                    account,
+                    "onedrive",
+                    &item,
+                    req,
+                ) {
+                    return r;
+                }
+            }
+        }
         self.onedrive_result(
             account,
             &format!("move id={id}"),
@@ -3652,6 +3677,35 @@ impl Router {
             },
             None => None,
         };
+        if self.biometric_gate {
+            if mode == Some(OneDriveMode::Offline) {
+                let requires_confirmation = match &self.onedrive_risk {
+                    Some(risk) => match risk.offline_mode_risk(account, folder) {
+                        Ok(risk) => risk.requires_confirmation,
+                        Err(_) => true,
+                    },
+                    None => true,
+                };
+                if requires_confirmation {
+                    let item = onedrive_mode_offline_pat_item(folder);
+                    if let Some(r) = self.biometric_challenge(
+                        "mode-switch-offline-large",
+                        account,
+                        "onedrive",
+                        &item,
+                        req,
+                    ) {
+                        return r;
+                    }
+                }
+            }
+            if mode == Some(OneDriveMode::Online) && self.onedrive_manage.is_some() {
+                let item = onedrive_mode_online_cleanup_pat_item(folder);
+                if let Some(r) = self.biometric_challenge("bulk", account, "onedrive", &item, req) {
+                    return r;
+                }
+            }
+        }
         let summary = format!(
             "mode-set account={account} folder={folder} mode={}",
             mode.map(|m| m.as_str()).unwrap_or("clear")
@@ -6452,6 +6506,100 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
 
+    struct FakeOneDriveRisk {
+        move_result: std::sync::Mutex<Result<OneDriveMoveRisk, String>>,
+        offline_result: std::sync::Mutex<Result<OfflineModeRisk, String>>,
+        move_calls: std::sync::atomic::AtomicUsize,
+        offline_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl Default for FakeOneDriveRisk {
+        fn default() -> Self {
+            Self {
+                move_result: std::sync::Mutex::new(Ok(OneDriveMoveRisk::Low)),
+                offline_result: std::sync::Mutex::new(Ok(OfflineModeRisk {
+                    requires_confirmation: false,
+                    file_count: 0,
+                    known_bytes: 0,
+                    unknown_size_files: 0,
+                    reason: "small".into(),
+                })),
+                move_calls: std::sync::atomic::AtomicUsize::new(0),
+                offline_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl FakeOneDriveRisk {
+        fn with_move(result: OneDriveMoveRisk) -> Self {
+            Self {
+                move_result: std::sync::Mutex::new(Ok(result)),
+                ..Self::default()
+            }
+        }
+
+        fn with_offline_requires(reason: &str) -> Self {
+            Self {
+                offline_result: std::sync::Mutex::new(Ok(OfflineModeRisk {
+                    requires_confirmation: true,
+                    file_count: 2,
+                    known_bytes: 0,
+                    unknown_size_files: 0,
+                    reason: reason.into(),
+                })),
+                ..Self::default()
+            }
+        }
+
+        fn move_calls(&self) -> usize {
+            self.move_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn offline_calls(&self) -> usize {
+            self.offline_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl OneDriveRiskHandler for FakeOneDriveRisk {
+        fn move_risk(
+            &self,
+            _account: &str,
+            _item_id: &str,
+            _destination_parent_id: &str,
+        ) -> Result<OneDriveMoveRisk, String> {
+            self.move_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.move_result.lock().unwrap().clone()
+        }
+
+        fn offline_mode_risk(
+            &self,
+            _account: &str,
+            _folder_id: &str,
+        ) -> Result<OfflineModeRisk, String> {
+            self.offline_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.offline_result.lock().unwrap().clone()
+        }
+    }
+
+    struct PanicOneDriveRisk;
+    impl OneDriveRiskHandler for PanicOneDriveRisk {
+        fn move_risk(
+            &self,
+            _account: &str,
+            _item_id: &str,
+            _destination_parent_id: &str,
+        ) -> Result<OneDriveMoveRisk, String> {
+            panic!("desktop must not call OneDrive risk classifier")
+        }
+
+        fn offline_mode_risk(
+            &self,
+            _account: &str,
+            _folder_id: &str,
+        ) -> Result<OfflineModeRisk, String> {
+            panic!("desktop must not call OneDrive risk classifier")
+        }
+    }
+
     /// A list handler returning one file child + one subfolder child, so the
     /// `effective_mode` enrichment can be checked for inheritance and own-override.
     struct ModeFakeList;
@@ -7052,6 +7200,277 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .push((id.into(), etag.into(), bytes.to_vec()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn onedrive_move_out_of_protected_is_biometric_gated_on_mobile() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let (_d, r) = setup();
+        let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let risk = std::sync::Arc::new(FakeOneDriveRisk::with_move(
+            OneDriveMoveRisk::MoveOutOfProtected {
+                source_scope: "offline-folder".into(),
+                destination_scope: None,
+            },
+        ));
+        let mobile = r
+            .with_onedrive_write(writes.clone(), "cap".into())
+            .with_onedrive_risk(risk.clone())
+            .with_biometric_gate();
+
+        let ch = mobile.route(&post(
+            "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221",
+        ));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        assert_eq!(j["op"], "move-out-of-protected");
+        assert_eq!(
+            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
+            json!(["onedrive_move", "A:B", "P]1", "N:\"1"])
+        );
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(writes.moves.lock().unwrap().is_empty());
+        assert_eq!(risk.move_calls(), 1);
+
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert!(writes.moves.lock().unwrap().is_empty());
+
+        assert!(mobile.confirm_biometric(&pat));
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221&_pat={pat}"
+                )))
+                .status,
+            200
+        );
+        assert_eq!(
+            *writes.moves.lock().unwrap(),
+            vec![("A:B".into(), Some("P]1".into()), "N:\"1".into())]
+        );
+    }
+
+    #[test]
+    fn onedrive_move_low_risk_is_not_biometric_gated_on_mobile() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let (_d, r) = setup();
+        let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let risk = std::sync::Arc::new(FakeOneDriveRisk::default());
+        let mobile = r
+            .with_onedrive_write(writes.clone(), "cap".into())
+            .with_onedrive_risk(risk.clone())
+            .with_biometric_gate();
+
+        let ok = mobile.route(&post(
+            "/api/v1/onedrive/move?account=a&id=i2&parent=P2&name=N",
+        ));
+        assert_eq!(ok.status, 200);
+        assert_eq!(
+            *writes.moves.lock().unwrap(),
+            vec![("i2".into(), Some("P2".into()), "N".into())]
+        );
+        assert_eq!(risk.move_calls(), 1);
+    }
+
+    #[test]
+    fn onedrive_move_missing_risk_classifier_fails_closed_on_mobile() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let (_d, r) = setup();
+        let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let mobile = r
+            .with_onedrive_write(writes.clone(), "cap".into())
+            .with_biometric_gate();
+
+        let ch = mobile.route(&post(
+            "/api/v1/onedrive/move?account=a&id=i2&parent=P2&name=N",
+        ));
+        assert_eq!(ch.status, 200);
+        assert_eq!(body_json(&ch)["status"], "confirmation_required");
+        assert!(writes.moves.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn onedrive_offline_large_mode_switch_is_biometric_gated_before_persist() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let (_d, r) = setup();
+        let modes = std::sync::Arc::new(FakeOneDriveMode::default());
+        let risk = std::sync::Arc::new(FakeOneDriveRisk::with_offline_requires("bulk_files"));
+        let mobile = r
+            .with_onedrive_mode(modes.clone(), "modecap".into())
+            .with_onedrive_risk(risk.clone())
+            .with_biometric_gate();
+
+        let ch = mobile.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline",
+        ));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        assert_eq!(j["op"], "mode-switch-offline-large");
+        assert_eq!(
+            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
+            json!(["onedrive_mode_offline", "Photos"])
+        );
+        assert!(
+            modes
+                .modes("a")
+                .unwrap()
+                .folder_modes
+                .get("Photos")
+                .is_none(),
+            "mode must not persist before biometric confirmation"
+        );
+        assert_eq!(risk.offline_calls(), 1);
+
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(mobile.confirm_biometric(&pat));
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline&_pat={pat}"
+                )))
+                .status,
+            200
+        );
+        assert_eq!(
+            modes
+                .modes("a")
+                .unwrap()
+                .folder_modes
+                .get("Photos")
+                .copied(),
+            Some(OneDriveMode::Offline)
+        );
+    }
+
+    #[test]
+    fn onedrive_offline_small_mode_switch_is_not_gated() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let (_d, r) = setup();
+        let modes = std::sync::Arc::new(FakeOneDriveMode::default());
+        let risk = std::sync::Arc::new(FakeOneDriveRisk::default());
+        let mobile = r
+            .with_onedrive_mode(modes.clone(), "modecap".into())
+            .with_onedrive_risk(risk.clone())
+            .with_biometric_gate();
+
+        let ok = mobile.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Tiny&mode=offline",
+        ));
+        assert_eq!(ok.status, 200);
+        assert_eq!(
+            modes.modes("a").unwrap().folder_modes.get("Tiny").copied(),
+            Some(OneDriveMode::Offline)
+        );
+        assert_eq!(risk.offline_calls(), 1);
+    }
+
+    #[test]
+    fn onedrive_mode_online_cleanup_is_bulk_gated_before_persist() {
+        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let (_d, r) = setup();
+        let modes = std::sync::Arc::new(FakeOneDriveMode::default());
+        let manage = std::sync::Arc::new(MockManage::default());
+        let mobile = r
+            .with_onedrive_mode(modes.clone(), "modecap".into())
+            .with_onedrive_manage(manage.clone(), "managecap".into())
+            .with_biometric_gate();
+
+        let ch = mobile.route(&post(
+            "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online",
+        ));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        assert_eq!(j["op"], "bulk");
+        assert_eq!(
+            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
+            json!(["onedrive_mode_online_account_cleanup", "Photos"])
+        );
+        assert!(
+            modes
+                .modes("a")
+                .unwrap()
+                .folder_modes
+                .get("Photos")
+                .is_none(),
+            "mode must not persist before account-wide cleanup prompt"
+        );
+        assert!(manage.cleaned.lock().unwrap().is_empty());
+
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+        assert!(mobile.confirm_biometric(&pat));
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online&_pat={pat}"
+                )))
+                .status,
+            200
+        );
+        assert_eq!(
+            modes
+                .modes("a")
+                .unwrap()
+                .folder_modes
+                .get("Photos")
+                .copied(),
+            Some(OneDriveMode::Online)
+        );
+        assert_eq!(*manage.cleaned.lock().unwrap(), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn onedrive_risk_classifier_is_not_called_on_desktop() {
+        let move_post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let mode_post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let (_d, r) = setup();
+        let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let modes = std::sync::Arc::new(FakeOneDriveMode::default());
+        let manage = std::sync::Arc::new(MockManage::default());
+        let desktop = r
+            .with_onedrive_write(writes.clone(), "cap".into())
+            .with_onedrive_mode(modes.clone(), "modecap".into())
+            .with_onedrive_manage(manage.clone(), "managecap".into())
+            .with_onedrive_risk(std::sync::Arc::new(PanicOneDriveRisk));
+
+        assert_eq!(
+            desktop
+                .route(&move_post(
+                    "/api/v1/onedrive/move?account=a&id=i2&parent=P2&name=N"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            desktop
+                .route(&mode_post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            desktop
+                .route(&mode_post(
+                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online"
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            *writes.moves.lock().unwrap(),
+            vec![("i2".into(), Some("P2".into()), "N".into())]
+        );
+        assert_eq!(*manage.cleaned.lock().unwrap(), vec!["a".to_string()]);
     }
 
     // #654 (AC1, webui part): the OneDrive cloud-write POST arms — cap-gate + verb dispatch.
