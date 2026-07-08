@@ -8293,6 +8293,24 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_biometric_labels_cover_onedrive_risk_ops() {
+        for needle in [
+            "\"move-out-of-protected\"",
+            "Move out of offline folder",
+            "\"mode-switch-offline-large\"",
+            "Make folder offline",
+            "\"bulk\"",
+            "Bulk OneDrive change",
+            "d.service === \"onedrive\" ? \"OneDrive\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #723 biometric label invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn bridge_isolation_app_js_has_no_legacy_mobile_session_path() {
         for needle in [
             "AndroidSession",
