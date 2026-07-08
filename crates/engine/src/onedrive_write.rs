@@ -20,6 +20,7 @@
 //! not eagerly mutate the item store, to avoid diverging from the scope-ownership rule.
 
 use isyncyou_core::Config;
+use isyncyou_graph::DrivePermission;
 use isyncyou_store::{CloudOpKind, CloudWriteOp, Store};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +45,157 @@ pub enum WriteOutcome {
     Applied(String),
     /// A `Replace` hit a `412` conflict — terminal; the caller resolves it keep-both.
     Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareKind {
+    Link,
+    Invite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareIntent {
+    pub kind: ShareKind,
+    pub item_id: String,
+    pub link_type: Option<String>,
+    pub scope: Option<String>,
+    pub role: Option<String>,
+    pub recipient_hashes: Vec<String>,
+    pub recipient_count: usize,
+    pub require_sign_in: bool,
+    pub send_invitation: bool,
+}
+
+impl ShareIntent {
+    pub fn link(item_id: &str, link_type: &str, scope: &str) -> Result<Self, String> {
+        validate_share_item_id(item_id)?;
+        validate_share_link_type(link_type)?;
+        validate_share_link_scope(scope)?;
+        Ok(Self {
+            kind: ShareKind::Link,
+            item_id: item_id.to_string(),
+            link_type: Some(link_type.to_string()),
+            scope: Some(scope.to_string()),
+            role: None,
+            recipient_hashes: Vec::new(),
+            recipient_count: 0,
+            require_sign_in: false,
+            send_invitation: false,
+        })
+    }
+
+    fn from_op(op: &CloudWriteOp) -> Result<Self, String> {
+        let target = op
+            .target_id
+            .as_deref()
+            .ok_or("share ledger row has no target item id")?;
+        let intent: serde_json::Value = op
+            .intent_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .ok_or("share ledger row has malformed intent_json")?;
+        match intent.get("share_kind").and_then(|v| v.as_str()) {
+            Some("link") => {
+                let link_type = intent
+                    .get("link_type")
+                    .and_then(|v| v.as_str())
+                    .ok_or("share link intent has no link_type")?;
+                let scope = intent
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .ok_or("share link intent has no scope")?;
+                Self::link(target, link_type, scope)
+            }
+            Some("invite") => {
+                Err("invite share recovery is handled by the invite ledger path".into())
+            }
+            Some(other) => Err(format!("unsupported share_kind '{other}'")),
+            None => Err("share ledger row has no share_kind".into()),
+        }
+    }
+
+    fn intent_json(&self) -> String {
+        match self.kind {
+            ShareKind::Link => serde_json::json!({
+                "share_kind": "link",
+                "link_type": self.link_type,
+                "scope": self.scope,
+            })
+            .to_string(),
+            ShareKind::Invite => serde_json::json!({
+                "share_kind": "invite",
+                "role": self.role,
+                "recipient_hashes": self.recipient_hashes,
+                "recipient_count": self.recipient_count,
+                "require_sign_in": self.require_sign_in,
+                "send_invitation": self.send_invitation,
+            })
+            .to_string(),
+        }
+    }
+
+    fn keys(&self, secret: &[u8], account: &str) -> (String, String) {
+        let source = match self.kind {
+            ShareKind::Link => format!(
+                "share|link|{}|{}|{}",
+                self.item_id,
+                self.link_type.as_deref().unwrap_or(""),
+                self.scope.as_deref().unwrap_or("")
+            ),
+            ShareKind::Invite => format!(
+                "share|invite|{}|{}|{}|{}|{}",
+                self.item_id,
+                self.role.as_deref().unwrap_or(""),
+                self.require_sign_in,
+                self.send_invitation,
+                self.recipient_hashes.join(",")
+            ),
+        };
+        let key = crate::restore_key::idempotency_key(secret, account, SERVICE, &source, &[]);
+        (format!("{account}:{key}"), key)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareOutcome {
+    Link {
+        web_url: String,
+    },
+    Invite {
+        permission_ids: Vec<String>,
+        summary: String,
+    },
+    FailedClosed {
+        reason: String,
+    },
+}
+
+pub trait OneDriveShareSink {
+    fn create_share_link(
+        &self,
+        item_id: &str,
+        link_type: &str,
+        scope: &str,
+    ) -> Result<DrivePermission, String>;
+
+    fn list_share_permissions(&self, item_id: &str) -> Result<Vec<DrivePermission>, String>;
+}
+
+impl OneDriveShareSink for isyncyou_graph::GraphClient {
+    fn create_share_link(
+        &self,
+        item_id: &str,
+        link_type: &str,
+        scope: &str,
+    ) -> Result<DrivePermission, String> {
+        self.create_link_detailed(item_id, link_type, scope, None, None, None)
+            .map_err(|e| e.to_string())
+    }
+
+    fn list_share_permissions(&self, item_id: &str) -> Result<Vec<DrivePermission>, String> {
+        self.list_permissions_detailed(item_id)
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// The cloud side of a OneDrive write, abstracted so recovery can be tested with an
@@ -253,6 +405,142 @@ fn non_empty(s: &str) -> Option<&str> {
     }
 }
 
+fn validate_share_item_id(item_id: &str) -> Result<(), String> {
+    if item_id.is_empty() {
+        return Err("share item id is empty".into());
+    }
+    if item_id.len() > 512 {
+        return Err("share item id is too long".into());
+    }
+    Ok(())
+}
+
+fn validate_share_link_type(link_type: &str) -> Result<(), String> {
+    match link_type {
+        "view" | "edit" | "embed" => Ok(()),
+        _ => Err("invalid share link type".into()),
+    }
+}
+
+fn validate_share_link_scope(scope: &str) -> Result<(), String> {
+    match scope {
+        "anonymous" | "organization" | "users" => Ok(()),
+        _ => Err("invalid share link scope".into()),
+    }
+}
+
+fn share_permission_web_url(permission: &DrivePermission) -> Result<String, String> {
+    permission
+        .link_web_url
+        .clone()
+        .ok_or_else(|| "share link permission had no webUrl".to_string())
+}
+
+fn exact_link_matches<'a>(
+    permissions: &'a [DrivePermission],
+    intent: &ShareIntent,
+) -> Vec<&'a DrivePermission> {
+    let link_type = intent.link_type.as_deref();
+    let scope = intent.scope.as_deref();
+    permissions
+        .iter()
+        .filter(|permission| {
+            !permission.inherited
+                && permission.link_web_url.is_some()
+                && permission.link_type.as_deref() == link_type
+                && permission.link_scope.as_deref() == scope
+        })
+        .collect()
+}
+
+fn share_policy_final_error(intent: &ShareIntent, error: &str) -> bool {
+    if intent.link_type.as_deref() != Some("embed") {
+        return false;
+    }
+    let lower = error.to_ascii_lowercase();
+    lower.contains("unsupported")
+        || lower.contains("not supported")
+        || lower.contains("not available")
+        || lower.contains("onedrive personal")
+        || lower.contains("http 400")
+        || lower.contains("http 403")
+}
+
+fn redacted_share_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("1drv.ms")
+        || error.contains('@')
+    {
+        return "share_error".to_string();
+    }
+    error.chars().take(200).collect()
+}
+
+fn set_share_error_state(
+    store: &Store,
+    op_id: &str,
+    intent: &ShareIntent,
+    error: &str,
+    now: i64,
+) -> Result<(), String> {
+    if share_policy_final_error(intent, error) {
+        store
+            .set_cloud_write_state(op_id, "failed", None, Some("share_policy_unsupported"), now)
+            .map_err(|e| e.to_string())
+    } else {
+        let redacted = redacted_share_error(error);
+        store
+            .set_cloud_write_state(op_id, "inflight", None, Some(&redacted), now)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn apply_share_link_permission(
+    store: &Store,
+    op_id: &str,
+    permission: &DrivePermission,
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    let web_url = share_permission_web_url(permission)?;
+    store
+        .set_cloud_write_state(op_id, "applied", non_empty(&permission.id), None, now)
+        .map_err(|e| e.to_string())?;
+    Ok(ShareOutcome::Link { web_url })
+}
+
+fn create_and_apply_share_link<S: OneDriveShareSink>(
+    store: &Store,
+    op_id: &str,
+    intent: &ShareIntent,
+    sink: &S,
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    let item_id = &intent.item_id;
+    let link_type = intent
+        .link_type
+        .as_deref()
+        .ok_or("share link intent missing link_type")?;
+    let scope = intent
+        .scope
+        .as_deref()
+        .ok_or("share link intent missing scope")?;
+    match sink.create_share_link(item_id, link_type, scope) {
+        Ok(permission) => match apply_share_link_permission(store, op_id, &permission, now) {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                set_share_error_state(store, op_id, intent, &e, now)?;
+                Err(e)
+            }
+        },
+        Err(e) => {
+            set_share_error_state(store, op_id, intent, &e, now)?;
+            Err(e)
+        }
+    }
+}
+
 /// The result of issuing one op: applied (with an optional new cloud id) or a `Replace`
 /// conflict (a `412` — terminal, keep-both).
 enum Issued {
@@ -305,7 +593,7 @@ fn issue<S: OneDriveWriteSink>(sink: &S, w: &CloudWrite) -> Result<Issued, Strin
 /// Drive a fresh cloud-write to completion, recording the ledger intent **before** the Graph
 /// call. Idempotent by key: a re-issued identical intent recovers the existing op instead of
 /// creating a second cloud effect. Returns the resulting cloud id (`Create`) or `""`.
-pub fn run_cloud_write<S: OneDriveWriteSink>(
+pub fn run_cloud_write<S: OneDriveWriteSink + OneDriveShareSink>(
     store: &Store,
     account: &str,
     w: &CloudWrite,
@@ -370,10 +658,97 @@ pub fn run_cloud_write<S: OneDriveWriteSink>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn run_share_link<S: OneDriveShareSink>(
+    store: &Store,
+    account: &str,
+    item_id: &str,
+    link_type: &str,
+    scope: &str,
+    sink: &S,
+    secret: &[u8],
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    let intent = ShareIntent::link(item_id, link_type, scope)?;
+    let (op_id, key) = intent.keys(secret, account);
+    let op = CloudWriteOp {
+        op_id: op_id.clone(),
+        account_id: account.to_string(),
+        service: SERVICE.to_string(),
+        op_kind: CloudOpKind::Share.as_str().to_string(),
+        target_id: Some(item_id.to_string()),
+        idempotency_key: key.clone(),
+        if_match_etag: None,
+        state: "pending".to_string(),
+        result_id: None,
+        intent_json: Some(intent.intent_json()),
+        attempts: 0,
+        last_error: None,
+    };
+    if !store
+        .record_cloud_write(&op, now)
+        .map_err(|e| e.to_string())?
+    {
+        let existing = store
+            .cloud_write_by_key(account, &key)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("share ledger row for key {key} vanished"))?;
+        return recover_share_write_op(store, &existing, sink, now);
+    }
+    store
+        .set_cloud_write_state(&op_id, "inflight", None, None, now)
+        .map_err(|e| e.to_string())?;
+    create_and_apply_share_link(store, &op_id, &intent, sink, now)
+}
+
+pub fn recover_share_write_op<S: OneDriveShareSink>(
+    store: &Store,
+    op: &CloudWriteOp,
+    sink: &S,
+    now: i64,
+) -> Result<ShareOutcome, String> {
+    let intent = match ShareIntent::from_op(op) {
+        Ok(intent) => intent,
+        Err(e) => {
+            let redacted = redacted_share_error(&e);
+            store
+                .set_cloud_write_state(&op.op_id, "failed", None, Some(&redacted), now)
+                .map_err(|store_err| store_err.to_string())?;
+            return Err(e);
+        }
+    };
+    if op.state == "applied" {
+        let permissions = sink.list_share_permissions(&intent.item_id)?;
+        let matches = exact_link_matches(&permissions, &intent);
+        return match matches.as_slice() {
+            [permission] => Ok(ShareOutcome::Link {
+                web_url: share_permission_web_url(permission)?,
+            }),
+            [] => Err("applied share link permission was not found".into()),
+            _ => Err("applied share link permission is ambiguous".into()),
+        };
+    }
+    if op.state == "failed" {
+        return Ok(ShareOutcome::FailedClosed {
+            reason: op
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "share_failed_closed".to_string()),
+        });
+    }
+
+    let permissions = sink.list_share_permissions(&intent.item_id)?;
+    let matches = exact_link_matches(&permissions, &intent);
+    match matches.as_slice() {
+        [permission] => apply_share_link_permission(store, &op.op_id, permission, now),
+        _ => create_and_apply_share_link(store, &op.op_id, &intent, sink, now),
+    }
+}
+
 /// Reconcile a non-`applied` ledger op to a terminal `applied` state **without a double
 /// effect**, per its [`CloudOpKind`] recovery rule. Called both by boot recovery and by the
 /// re-issue path of [`run_cloud_write`]. Returns the op's cloud id (`Create`) or `""`.
-pub fn recover_cloud_write_op<S: OneDriveWriteSink>(
+pub fn recover_cloud_write_op<S: OneDriveWriteSink + OneDriveShareSink>(
     store: &Store,
     op: &CloudWriteOp,
     sink: &S,
@@ -452,11 +827,9 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink>(
                 ReplaceOutcome::Conflict => WriteOutcome::Conflict,
             }
         }
-        other => {
-            return Err(format!(
-                "recovery unimplemented for kind '{}'",
-                other.as_str()
-            ))
+        CloudOpKind::Share => {
+            recover_share_write_op(store, op, sink, now)?;
+            WriteOutcome::Applied(String::new())
         }
     };
     match &outcome {
@@ -472,7 +845,7 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink>(
 
 /// Boot recovery: reconcile every not-yet-terminal cloud-write for an account. Returns the
 /// number of ops reconciled. Call once at engine start, before serving writes.
-pub fn recover_pending_cloud_writes<S: OneDriveWriteSink>(
+pub fn recover_pending_cloud_writes<S: OneDriveWriteSink + OneDriveShareSink>(
     store: &Store,
     account: &str,
     sink: &S,
@@ -723,6 +1096,32 @@ pub fn replace_via_ledger(
     })
 }
 
+/// Create or return a OneDrive sharing link through the crash-safe cloud-write ledger.
+pub fn share_link_via_ledger(
+    cfg: &Config,
+    account: &str,
+    item_id: &str,
+    link_type: &str,
+    scope: &str,
+) -> Result<String, String> {
+    with_ledger(cfg, account, |store, sink, secret| {
+        match run_share_link(
+            store,
+            account,
+            item_id,
+            link_type,
+            scope,
+            sink,
+            secret,
+            now_secs(),
+        )? {
+            ShareOutcome::Link { web_url } => Ok(web_url),
+            ShareOutcome::FailedClosed { reason } => Err(reason),
+            ShareOutcome::Invite { .. } => Err("unexpected invite outcome for share link".into()),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,7 +1144,10 @@ mod tests {
         move_calls: RefCell<u32>,
         upload_calls: RefCell<u32>,
         replace_calls: RefCell<u32>,
+        create_link_calls: RefCell<u32>,
         replace_attempts: RefCell<Vec<(String, String, Vec<u8>)>>, // (id, etag, bytes)
+        permissions: RefCell<Vec<DrivePermission>>,
+        create_link_errors: RefCell<Vec<String>>,
     }
     impl FakeCloud {
         fn count(&self) -> usize {
@@ -879,6 +1281,43 @@ mod tests {
         }
     }
 
+    impl OneDriveShareSink for FakeCloud {
+        fn create_share_link(
+            &self,
+            item_id: &str,
+            link_type: &str,
+            scope: &str,
+        ) -> Result<DrivePermission, String> {
+            *self.create_link_calls.borrow_mut() += 1;
+            if let Some(error) = self.create_link_errors.borrow_mut().pop() {
+                return Err(error);
+            }
+            let id = {
+                let mut seq = self.seq.borrow_mut();
+                *seq += 1;
+                format!("perm-{seq}")
+            };
+            let permission = DrivePermission {
+                id: id.clone(),
+                roles: vec![if link_type == "edit" { "write" } else { "read" }.to_string()],
+                link_web_url: Some(format!(
+                    "https://1drv.ms/{item_id}/{link_type}/{scope}/{id}"
+                )),
+                link_type: Some(link_type.to_string()),
+                link_scope: Some(scope.to_string()),
+                granted_emails: Vec::new(),
+                invitation_emails: Vec::new(),
+                inherited: false,
+            };
+            self.permissions.borrow_mut().push(permission.clone());
+            Ok(permission)
+        }
+
+        fn list_share_permissions(&self, _item_id: &str) -> Result<Vec<DrivePermission>, String> {
+            Ok(self.permissions.borrow().clone())
+        }
+    }
+
     const SECRET: &[u8] = b"test-secret";
     const ACCT: &str = "me";
 
@@ -931,6 +1370,79 @@ mod tests {
             if_match: None,
             local_path: None,
             content_tag: None,
+        }
+    }
+
+    fn link_permission(id: &str, link_type: &str, scope: &str, url: &str) -> DrivePermission {
+        DrivePermission {
+            id: id.to_string(),
+            roles: vec![if link_type == "edit" { "write" } else { "read" }.to_string()],
+            link_web_url: Some(url.to_string()),
+            link_type: Some(link_type.to_string()),
+            link_scope: Some(scope.to_string()),
+            granted_emails: Vec::new(),
+            invitation_emails: Vec::new(),
+            inherited: false,
+        }
+    }
+
+    fn inherited_link_permission(
+        id: &str,
+        link_type: &str,
+        scope: &str,
+        url: &str,
+    ) -> DrivePermission {
+        let mut permission = link_permission(id, link_type, scope, url);
+        permission.inherited = true;
+        permission
+    }
+
+    fn share_link_op(item_id: &str, link_type: &str, scope: &str, state: &str) -> CloudWriteOp {
+        let intent = ShareIntent::link(item_id, link_type, scope).unwrap();
+        let (op_id, key) = intent.keys(SECRET, ACCT);
+        CloudWriteOp {
+            op_id,
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: CloudOpKind::Share.as_str().into(),
+            target_id: Some(item_id.into()),
+            idempotency_key: key,
+            if_match_etag: None,
+            state: state.into(),
+            result_id: None,
+            intent_json: Some(intent.intent_json()),
+            attempts: 1,
+            last_error: None,
+        }
+    }
+
+    struct LedgerAssertingShareSink<'a> {
+        store: &'a Store,
+        account: &'a str,
+        key: String,
+        cloud: FakeCloud,
+    }
+
+    impl OneDriveShareSink for LedgerAssertingShareSink<'_> {
+        fn create_share_link(
+            &self,
+            item_id: &str,
+            link_type: &str,
+            scope: &str,
+        ) -> Result<DrivePermission, String> {
+            let row = self
+                .store
+                .cloud_write_by_key(self.account, &self.key)
+                .unwrap()
+                .expect("share intent must exist before Graph createLink");
+            assert_eq!(row.op_kind, "share");
+            assert_eq!(row.state, "inflight");
+            assert_eq!(row.target_id.as_deref(), Some(item_id));
+            self.cloud.create_share_link(item_id, link_type, scope)
+        }
+
+        fn list_share_permissions(&self, item_id: &str) -> Result<Vec<DrivePermission>, String> {
+            self.cloud.list_share_permissions(item_id)
         }
     }
 
@@ -1103,6 +1615,195 @@ mod tests {
                 .state,
             "applied"
         );
+    }
+
+    #[test]
+    fn share_link_records_intent_before_graph_mutation() {
+        let s = Store::open_in_memory().unwrap();
+        let intent = ShareIntent::link("item-1", "view", "anonymous").unwrap();
+        let (_op_id, key) = intent.keys(SECRET, ACCT);
+        let sink = LedgerAssertingShareSink {
+            store: &s,
+            account: ACCT,
+            key: key.clone(),
+            cloud: FakeCloud::default(),
+        };
+
+        let out =
+            run_share_link(&s, ACCT, "item-1", "view", "anonymous", &sink, SECRET, 10).unwrap();
+
+        assert!(matches!(out, ShareOutcome::Link { .. }));
+        assert_eq!(*sink.cloud.create_link_calls.borrow(), 1);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.op_kind, "share");
+        assert_eq!(row.result_id.as_deref(), Some("perm-1"));
+        let intent_json = row.intent_json.unwrap();
+        assert!(intent_json.contains(r#""share_kind":"link""#));
+        assert!(!intent_json.contains("http"));
+        assert!(!intent_json.contains("1drv.ms"));
+    }
+
+    #[test]
+    fn share_link_crash_after_graph_success_recovers_without_duplicate() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        cloud.permissions.borrow_mut().push(link_permission(
+            "perm-landed",
+            "view",
+            "anonymous",
+            "https://1drv.ms/landed",
+        ));
+        let op = share_link_op("item-1", "view", "anonymous", "inflight");
+        let key = op.idempotency_key.clone();
+        s.record_cloud_write(&op, 10).unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            *cloud.create_link_calls.borrow(),
+            0,
+            "recovery must adopt landed link, not call createLink"
+        );
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.result_id.as_deref(), Some("perm-landed"));
+    }
+
+    #[test]
+    fn share_link_recovery_creates_once_when_no_matching_link_exists() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let op = share_link_op("item-1", "view", "anonymous", "inflight");
+        let key = op.idempotency_key.clone();
+        s.record_cloud_write(&op, 10).unwrap();
+
+        recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+
+        assert_eq!(*cloud.create_link_calls.borrow(), 1);
+        assert_eq!(cloud.permissions.borrow().len(), 1);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.result_id.as_deref(), Some("perm-1"));
+    }
+
+    #[test]
+    fn share_link_recovery_create_link_when_permission_match_is_ambiguous() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        cloud.permissions.borrow_mut().extend([
+            link_permission("perm-a", "view", "anonymous", "https://1drv.ms/a"),
+            link_permission("perm-b", "view", "anonymous", "https://1drv.ms/b"),
+            inherited_link_permission("perm-inh", "view", "anonymous", "https://1drv.ms/inh"),
+        ]);
+        let op = share_link_op("item-1", "view", "anonymous", "inflight");
+        let key = op.idempotency_key.clone();
+        s.record_cloud_write(&op, 10).unwrap();
+
+        recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+
+        assert_eq!(*cloud.create_link_calls.borrow(), 1);
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.result_id.as_deref(), Some("perm-1"));
+    }
+
+    #[test]
+    fn share_link_retry_uses_existing_ledger_key() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+
+        let first =
+            run_share_link(&s, ACCT, "item-1", "view", "anonymous", &cloud, SECRET, 10).unwrap();
+        let second =
+            run_share_link(&s, ACCT, "item-1", "view", "anonymous", &cloud, SECRET, 20).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(*cloud.create_link_calls.borrow(), 1);
+        assert_eq!(cloud.permissions.borrow().len(), 1);
+    }
+
+    #[test]
+    fn share_link_create_link_transient_error_remains_recoverable() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        cloud
+            .create_link_errors
+            .borrow_mut()
+            .push("transient network failure".into());
+
+        let err = run_share_link(&s, ACCT, "item-1", "view", "anonymous", &cloud, SECRET, 10)
+            .unwrap_err();
+        assert_eq!(err, "transient network failure");
+        let key = ShareIntent::link("item-1", "view", "anonymous")
+            .unwrap()
+            .keys(SECRET, ACCT)
+            .1;
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "inflight");
+        assert_eq!(row.last_error.as_deref(), Some("transient network failure"));
+
+        recover_pending_cloud_writes(&s, ACCT, &cloud, 20).unwrap();
+        assert_eq!(*cloud.create_link_calls.borrow(), 2);
+        assert_eq!(
+            s.cloud_write_by_key(ACCT, &key).unwrap().unwrap().state,
+            "applied"
+        );
+    }
+
+    #[test]
+    fn share_link_accepts_organization_scope() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+
+        run_share_link(
+            &s,
+            ACCT,
+            "item-1",
+            "edit",
+            "organization",
+            &cloud,
+            SECRET,
+            10,
+        )
+        .unwrap();
+
+        let key = ShareIntent::link("item-1", "edit", "organization")
+            .unwrap()
+            .keys(SECRET, ACCT)
+            .1;
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "applied");
+        assert_eq!(row.op_kind, "share");
+        assert!(row.idempotency_key.len() > 16);
+        assert!(cloud.permissions.borrow()[0]
+            .link_scope
+            .as_deref()
+            .is_some_and(|scope| scope == "organization"));
+    }
+
+    #[test]
+    fn share_link_embed_unsupported_is_policy_final() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        cloud
+            .create_link_errors
+            .borrow_mut()
+            .push("HTTP 400: embed links are only supported for OneDrive personal".into());
+
+        let err = run_share_link(&s, ACCT, "item-1", "embed", "anonymous", &cloud, SECRET, 10)
+            .unwrap_err();
+
+        assert!(err.contains("embed links"));
+        let key = ShareIntent::link("item-1", "embed", "anonymous")
+            .unwrap()
+            .keys(SECRET, ACCT)
+            .1;
+        let row = s.cloud_write_by_key(ACCT, &key).unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some("share_policy_unsupported"));
+        assert!(s.pending_cloud_writes(ACCT).unwrap().is_empty());
     }
 
     // ---- #655: Upload / Replace over the same ledger ------------------------------------
