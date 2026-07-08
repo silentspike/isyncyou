@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-08T16:42:26Z",
+  "generated_at": "2026-07-08T18:46:07Z",
   "commit": "40e86cc42d60cfa31cf24b8ea249606f481153ed",
   "entries": [
     {
@@ -102,6 +102,16 @@
       "result": "pass",
       "evidence": "Probe passed bridge, monkeypatched fetch/EventSource, no-cookie, native validation, BiometricPrompt, and empty UID LISTEN checks.",
       "artifact": "docs/evidence/artifacts/issue-725/bridge-isolation-probe.json"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-OPS-004",
+      "claim": "Manual release.yml workflow_dispatch from main published v1.0.0-rc.83 for the RC commit, with required release assets, checksums, SBOM, cosign bundles, GitHub attestation, and Android release APK smoke.",
+      "method": "command",
+      "command": "gh workflow run release.yml --ref main; gh release view v1.0.0-rc.83; sha256sum -c SHA256SUMS; gh attestation verify isyncyou-android-arm64.apk --repo silentspike/isyncyou; adb install/launch smoke for com.silentspike.isyncyou",
+      "result": "pass",
+      "evidence": "release.yml run #83 completed successfully on main at ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75; v1.0.0-rc.83 is a prerelease pointing to that commit; SHA256SUMS and Android sidecar checks passed; GitHub attestation verified SLSA provenance for the six signed subjects; the published release APK installed and launched on Pixel 8 Pro.",
+      "artifact": "docs/evidence/artifacts/issue-725/release-run.json"
     }
   ]
 }

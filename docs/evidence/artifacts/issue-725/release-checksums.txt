@@ -1,0 +1,15 @@
+# v1.0.0-rc.83 release checksum verification
+
+## sha256sum -c SHA256SUMS
+isyncyou-linux-x86_64.tar.gz: OK
+isyncyou-x86_64.AppImage: OK
+isyncyou-windows-x86_64.zip: OK
+isyncyou-android-arm64.apk: OK
+isyncyou.sbom.cdx.json: OK
+
+## sha256sum -c isyncyou-android-arm64.apk.sha256
+isyncyou-android-arm64.apk: OK
+
+## selected sha256
+9770b262212067afed5f959f6a599eabe6887298e371de1bf296f567a6ab2c3e  /tmp/isyncyou-om725-rc83.2Pnjff/isyncyou-android-arm64.apk
+0c48d149ea3099c8cee5bdd00ba77359a9a3b8e09b78df18e7a820029a8ddfd7  /tmp/isyncyou-om725-rc83.2Pnjff/SHA256SUMS

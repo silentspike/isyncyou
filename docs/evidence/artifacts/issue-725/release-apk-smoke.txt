@@ -1,0 +1,15 @@
+# v1.0.0-rc.83 release APK smoke
+
+APK: /tmp/isyncyou-om725-rc83.2Pnjff/isyncyou-android-arm64.apk
+Package: com.silentspike.isyncyou
+Device: Pixel 8 Pro, serial redacted in report
+
+Result: PASS
+
+Evidence summary:
+- adb install -r returned Success
+- monkey launcher event injected for com.silentspike.isyncyou
+- pidof returned process 11601
+- dumpsys activity showed MainActivity resumed and focused
+- logcat tail had no AndroidRuntime/FATAL/UnsatisfiedLink/dlopen crash lines for launch
+- device-lock om-725-release acquired and released
