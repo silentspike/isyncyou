@@ -144,7 +144,8 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             hits.retain(|i| services.iter().any(|s| s == &i.service));
         }
         let total = hits.len();
-        let results: Vec<serde_json::Value> = hits.iter().take(cap).map(Self::source_ref).collect();
+        let results: Vec<serde_json::Value> =
+            hits.iter().take(cap).map(|it| self.hit_json(it)).collect();
         Ok(serde_json::json!({
             "query": query,
             "returned": results.len(),
@@ -614,6 +615,7 @@ mod tests {
         assert!(ids.contains(&"m1") && ids.contains(&"f1"));
         for r in v["results"].as_array().unwrap() {
             assert!(r["service"].is_string() && r["id"].is_string() && r["path"].is_string());
+            assert!(r["snippet"].is_string());
         }
     }
 
@@ -664,7 +666,12 @@ mod tests {
         assert_eq!(v["total_matches"], 2);
         assert!(v["deep_search_hint"].is_string());
         for r in v["results"].as_array().unwrap() {
-            assert!(r["service"].is_string() && r["id"].is_string());
+            for field in ["service", "id", "name", "item_type", "path", "snippet"] {
+                assert!(
+                    !r[field].is_null(),
+                    "staged final result must carry {field}: {r}"
+                );
+            }
         }
     }
 
@@ -690,6 +697,35 @@ mod tests {
         assert_eq!(done, vec![("names".into(), 0), ("bodies".into(), 1)]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["results"][0]["id"], "m1");
+        assert!(
+            v["results"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("receipt"),
+            "body-only search hit should carry a readable snippet"
+        );
+    }
+
+    #[test]
+    fn non_streaming_search_body_only_hit_carries_snippet() {
+        let ex = fixture();
+        let out = ex.search(&[], "receipt", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["results"][0]["id"], "m1");
+        assert!(v["results"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("receipt"));
+    }
+
+    #[test]
+    fn search_keeps_unreadable_body_hit_with_empty_snippet() {
+        let ex = fixture();
+        let out = ex.search(&["onedrive".into()], "spotify", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 1);
+        assert_eq!(v["results"][0]["id"], "f1");
+        assert_eq!(v["results"][0]["snippet"], "");
     }
 
     #[test]
