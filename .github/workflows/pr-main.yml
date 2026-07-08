@@ -1,8 +1,8 @@
 name: PR (main)
 
 # Release-grade gate for PRs into `main`: everything from staging plus a
-# release build. main is the release branch; RC artifacts are produced by
-# release.yml on merge.
+# release build. main is the release branch; RC artifacts are produced only by
+# an explicit release.yml dispatch from main, not by ordinary promotion merges.
 on:
   pull_request:
     branches: [main]

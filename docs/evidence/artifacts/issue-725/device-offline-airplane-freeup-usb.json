@@ -1,0 +1,684 @@
+{
+  "account_hint": "backupslave@outlook.com",
+  "cdp": {
+    "page_url": "https://appassets.androidplatform.net/",
+    "socket": "webview_devtools_remote_17241"
+  },
+  "cleanup": {
+    "airplane_final": {
+      "cmd": "disabled",
+      "settings": "0"
+    },
+    "graph_delete_root_status": 204
+  },
+  "completed_at": "2026-07-08T15:34:28Z",
+  "device": {
+    "package": "com.silentspike.isyncyou.debug",
+    "serial": "3B301FDJG0020Z",
+    "transport": "usb"
+  },
+  "recovered_probe_timeout": "The initial materialization poll timed out, then the probe recovered with download-now fallback and captured the required airplane-mode local-open evidence.",
+  "fixture": {
+    "body_len": 48,
+    "body_sha256": "db3a57486ff331fe1151b99e9e03f3717989787b8ebc6a3c9499563256ea1790",
+    "file": {
+      "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+      "id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+      "name": "offline-usb.txt",
+      "sha256": "db3a57486ff331fe1151b99e9e03f3717989787b8ebc6a3c9499563256ea1790",
+      "size": 48
+    },
+    "folder": {
+      "id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+      "name": "offline-usb",
+      "webUrl_sha256": "93e7138325f0010d589540b76d052d3c0f637343101cf9e5ab84c6427296efc8"
+    },
+    "root": {
+      "id": "892B68CBF4A7C544!s5ea6cdc7e4ad4d9096f3184044ab129c",
+      "name": "isy-om725-usb-d-20260708-152740",
+      "webUrl_sha256": "4ec690bef337bfc673b3110740249eda96e8a8e30997dde1427cc35f37ab818a"
+    }
+  },
+  "generated_at": "2026-07-08T15:27:37Z",
+  "issue": 725,
+  "row": "D",
+  "status": "pass",
+  "steps": {
+    "airplane_disabled": {
+      "cmd": "disabled",
+      "settings": "0"
+    },
+    "airplane_enabled": {
+      "cmd": "enabled",
+      "settings": "1"
+    },
+    "airplane_initial": {
+      "cmd": "disabled",
+      "settings": "0"
+    },
+    "cdp_ready": {
+      "account": "me",
+      "bridge": "function",
+      "capManage": true,
+      "capMode": true,
+      "typeofCAP": "object",
+      "url": "https://appassets.androidplatform.net/"
+    },
+    "children_after_mode": {
+      "children": [
+        {
+          "@odata.etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "eTag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "effective_mode": "offline",
+          "file": {
+            "hashes": {
+              "quickXorHash": "zIK8yVfJUDw/WTl4/K804uCDy8Y="
+            },
+            "mimeType": "text/plain"
+          },
+          "id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "lastModifiedDateTime": "2026-07-08T15:27:45Z",
+          "name": "offline-usb.txt",
+          "size": 48
+        }
+      ]
+    },
+    "download_now_fallback": {
+      "__error": "Bridge timeout",
+      "stack": "Error: Bridge timeout\n    at https://appassets.androidplatform.net/app.js:373:14"
+    },
+    "graph_before": {
+      "content": {
+        "available": true,
+        "len": 48,
+        "sha256": "db3a57486ff331fe1151b99e9e03f3717989787b8ebc6a3c9499563256ea1790",
+        "status": 200,
+        "text_prefix": "OM725 USB offline airplane body 20260708-152740\n"
+      },
+      "meta": {
+        "download_url_sha256": "d59f9a98243cf8444f42aaa898e34605d9429c2cb3fadadd987f12d555a4bbf9",
+        "has_download_url": true,
+        "item": {
+          "cTag": "\"c:{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "eTag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "file": {
+            "hashes": {
+              "quickXorHash": "zIK8yVfJUDw/WTl4/K804uCDy8Y="
+            },
+            "mimeType": "text/plain"
+          },
+          "id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "name": "offline-usb.txt",
+          "parentReference": {
+            "driveId": "892B68CBF4A7C544",
+            "id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+            "name": "offline-usb",
+            "path": "/drive/root:/isy-om725-usb-d-20260708-152740/offline-usb"
+          },
+          "size": 48
+        },
+        "status": 200
+      }
+    },
+    "local_body_before_airplane": {
+      "body": "OM725 USB offline airplane body 20260708-152740\n",
+      "len": 48,
+      "status": 200
+    },
+    "local_body_during_airplane": {
+      "body": "OM725 USB offline airplane body 20260708-152740\n",
+      "len": 48,
+      "status": 200
+    },
+    "materialization_poll": [
+      {
+        "item": {
+          "__error": "item not found",
+          "stack": "Error: item not found\n    at request (https://appassets.androidplatform.net/app.js:521:72)\n    at async <anonymous>:1:23"
+        },
+        "t": 0.3,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 24.1,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 34.4,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 44.8,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "__error": "Bridge timeout",
+          "stack": "Error: Bridge timeout\n    at https://appassets.androidplatform.net/app.js:373:14"
+        },
+        "t": 69.8,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 80.3,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 90.7,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 101.0,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "__error": "Bridge timeout",
+          "stack": "Error: Bridge timeout\n    at https://appassets.androidplatform.net/app.js:373:14"
+        },
+        "t": 126.1,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 136.5,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 146.9,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "__error": "Bridge timeout",
+          "stack": "Error: Bridge timeout\n    at https://appassets.androidplatform.net/app.js:373:14"
+        },
+        "t": 171.9,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 182.2,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 192.5,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 202.9,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "__error": "Bridge timeout",
+          "stack": "Error: Bridge timeout\n    at https://appassets.androidplatform.net/app.js:373:14"
+        },
+        "t": 227.9,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 238.2,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 248.5,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      },
+      {
+        "item": {
+          "body_location": null,
+          "body_state": null,
+          "conflict_state": null,
+          "content_state": null,
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": false,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "remote_dirty",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 258.8,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      }
+    ],
+    "materialization_poll_after_fallback": [
+      {
+        "item": {
+          "body_location": "sync",
+          "body_state": "available",
+          "conflict_state": null,
+          "content_state": "materialized",
+          "deleted": false,
+          "effective_mode": "online",
+          "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+          "has_body": true,
+          "item_type": "file",
+          "last_download_error": null,
+          "name": "offline-usb.txt",
+          "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+          "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+          "remote_mtime": "2026-07-08T15:27:45Z",
+          "service": "onedrive",
+          "size": 48,
+          "state": "live_backup",
+          "sync_state": "clean",
+          "verified_at": null,
+          "verify_status": null
+        },
+        "t": 1.7,
+        "transfers": {
+          "count": 0,
+          "transfers": []
+        }
+      }
+    ],
+    "materialized_item": null,
+    "materialized_item_after_fallback": {
+      "body_location": "sync",
+      "body_state": "available",
+      "conflict_state": null,
+      "content_state": "materialized",
+      "deleted": false,
+      "effective_mode": "online",
+      "etag": "\"{069F08FE-EE7B-4483-AC40-ADDB5896582B},1\"",
+      "has_body": true,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "offline-usb.txt",
+      "parent_remote_id": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+      "remote_id": "892B68CBF4A7C544!s069f08feee7b4483ac40addb5896582b",
+      "remote_mtime": "2026-07-08T15:27:45Z",
+      "service": "onedrive",
+      "size": 48,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "open_before_airplane": {
+      "body": "OM725 USB offline airplane body 20260708-152740\n",
+      "len": 48,
+      "status": 200
+    },
+    "open_during_airplane": {
+      "body": "OM725 USB offline airplane body 20260708-152740\n",
+      "len": 48,
+      "status": 200
+    },
+    "screenshot": {
+      "bytes": 44550,
+      "path": "docs/evidence/artifacts/issue-725/screenshots/offline-airplane-viewer-usb.png",
+      "pull_rc": 0
+    },
+    "set_offline_mode": {
+      "account": "me",
+      "folder": "892B68CBF4A7C544!saad13ae8fde14cc1b6c8e1b5bf81fd25",
+      "mode": "offline"
+    },
+    "viewer_during_airplane": {
+      "iframe": true,
+      "text": "OM725 USB offline airplane body 20260708-152740\n",
+      "title": "offline-usb.txt"
+    }
+  },
+  "assertions": {
+    "airplane_mode_enabled_over_usb": true,
+    "local_body_read_succeeded_while_offline": true,
+    "onedrive_open_succeeded_while_offline": true,
+    "viewer_rendered_local_body_while_offline": true,
+    "airplane_mode_disabled_after_probe": true,
+    "graph_fixture_deleted_after_probe": true
+  }
+}

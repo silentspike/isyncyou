@@ -1,0 +1,107 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-08T16:42:26Z",
+  "commit": "40e86cc42d60cfa31cf24b8ea249606f481153ed",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-OPS-006",
+      "claim": "Fresh #725 host gates were captured against the current release-closeout branch.",
+      "method": "command",
+      "command": "cargo +1.95.0 fmt --all --check && node --check gui/webui/src/app.js && cargo +1.95.0 clippy --workspace --all-targets -- -D warnings && cargo +1.95.0 test --workspace --no-fail-fast && python3 tools/check_traceability.py && python3 tools/check_evidence.py && python3 tools/check_workflow_pins.py && git diff --check origin/dev...HEAD",
+      "result": "pass",
+      "evidence": "All listed host gates passed; see the captured log for exact command output.",
+      "artifact": "docs/evidence/artifacts/issue-725/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AND-001",
+      "claim": "The local Android debug build path used for device evidence builds and test-compiles successfully.",
+      "method": "command",
+      "command": "(cd android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin :app:assembleDebug && sha256sum app/build/outputs/apk/debug/app-debug.apk)",
+      "result": "pass",
+      "evidence": "Gradle build was successful; debug APK SHA256 is 78dc2b78cb0224e5b76fcfdda6341c2035240d803c953c3dea3d87e7cad77796.",
+      "artifact": "docs/evidence/artifacts/issue-725/android-debug-build.txt"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-OPS-004",
+      "claim": "The edited workflow files still satisfy the immutable GitHub Actions pin policy.",
+      "method": "command",
+      "command": "python3 tools/check_workflow_pins.py",
+      "result": "pass",
+      "evidence": "workflow action pins: 126 action refs checked; OK - every external workflow action is pinned to a commit SHA.",
+      "artifact": "docs/evidence/artifacts/issue-725/host-gates.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AND-016",
+      "claim": "Pixel 8 Pro Mode 1/2/3 target evidence was captured, including Mode 3 airplane-open, free-up cloud survival, and sealed local writeback.",
+      "method": "probe",
+      "command": "Pixel 8 Pro CDP probe plus run-as filesystem checks under device-lock om-725",
+      "result": "pass",
+      "evidence": "Rows A/B/C pass. Row D is PASS: materialization, USB airplane-open, free-up local eviction with Graph survival, and sealed local edit -> mobile writeback -> Graph new version were all captured.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-modes-probe-raw.json"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AND-016",
+      "claim": "Pixel 8 Pro USB-Airplane evidence proved a Mode 3 offline file opened from the local body path while the phone was offline.",
+      "method": "probe",
+      "command": "Pixel 8 Pro USB ADB + CDP probe: enable airplane mode, read /api/v1/body and /api/v1/onedrive/open, capture viewer screenshot, disable airplane mode and delete Graph fixture",
+      "result": "pass",
+      "evidence": "Airplane mode was enabled via USB ADB; local body and OneDrive open returned the expected file text while offline; viewer iframe rendered the same text; airplane mode was disabled and fixture cleanup returned 204.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-offline-airplane-freeup-usb.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AND-016",
+      "claim": "Mode 3 free-up and writeback were verified on Pixel 8 Pro over USB with Graph readbacks and cleanup.",
+      "method": "probe",
+      "command": "Pixel 8 Pro USB ADB + CDP + Graph: free-up materialized file, verify cloud body survives, sealed local sync-root edit, wait for mobile scoped-pass writeback, verify Graph new version, restore original.",
+      "result": "pass",
+      "evidence": "Free-up changed local body_state to missing and body route 404 while Graph SHA-256 stayed unchanged; supporting artifact: docs/evidence/artifacts/issue-725/device-freeup-cloud-survival-usb.json. Sealed local edit had ISYE magic; after fixing stale-scope 404 tolerance, mobile scoped pass reported 1 modified and Graph content/eTag changed; cleanup restored cloud/local original with store clean and no conflict.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-writeback-sealed-usb.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AND-016",
+      "claim": "Mobile upload, replace, and root upload worked end-to-end and all Graph fixtures were reverted.",
+      "method": "probe",
+      "command": "Mobile bridge upload/replace/root-upload probe with Graph content verification and cleanup",
+      "result": "pass",
+      "evidence": "Graph body hashes and parent IDs match; replace changed eTag; root upload parent matched drive root; cleanup returned 204.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-upload-replace-root-rerun.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AND-013",
+      "claim": "Mobile share-link creation produced a Graph permission that was verified and deleted; invite was deliberately skipped without a controlled recipient.",
+      "method": "probe",
+      "command": "Mobile bridge share-link probe with Graph permissions verification and delete_permission cleanup",
+      "result": "pass",
+      "evidence": "One matching link permission was found and deleted; raw share URL was redacted to a SHA-256 hash.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-share-link-permission.json"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-SEC-010",
+      "claim": "Android debug package at-rest sentinel scan found no plaintext sentinel in private archive/cache/sync roots.",
+      "method": "command",
+      "command": "ANDROID_PACKAGE=com.silentspike.isyncyou.debug tools/android-at-rest-sentinel-scan.sh ISY-OM725-SENTINEL-<redacted> docs/evidence/artifacts/issue-725",
+      "result": "pass",
+      "evidence": "Scanner reported PASS; store header was not plaintext SQLite; no plaintext sentinel was found in files/archive, files/cache, files/sync, or cache.",
+      "artifact": "docs/evidence/artifacts/issue-725/android-at-rest-sentinel-scan-20260708T143922Z.log"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AND-011",
+      "claim": "Default debug APK exposes no general app UID TCP listener and uses the WebView message bridge path.",
+      "method": "probe",
+      "command": "python3 tools/android-bridge-isolation-probe.py --package com.silentspike.isyncyou.debug --lock om-725 --skip-lock --output docs/evidence/artifacts/issue-725/bridge-isolation-probe.json",
+      "result": "pass",
+      "evidence": "Probe passed bridge, monkeypatched fetch/EventSource, no-cookie, native validation, BiometricPrompt, and empty UID LISTEN checks.",
+      "artifact": "docs/evidence/artifacts/issue-725/bridge-isolation-probe.json"
+    }
+  ]
+}

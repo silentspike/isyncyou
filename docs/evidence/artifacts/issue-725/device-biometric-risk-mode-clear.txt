@@ -1,0 +1,3 @@
+timestamp_utc=2026-07-08T14:55:51Z
+cleared_folder=892B68CBF4A7C544!sd5e27e5f28c04715a821e11eb94fb3a1
+{"modeKeys": 4, "stillPresent": false}

@@ -1,0 +1,23 @@
+Issue #725 biometric prompt evidence for delete
+timestamp_utc=2026-07-08T14:29:19Z
+    mKeyguardOccluded=false mKeyguardOccludedChanged=false mPendingKeyguardOccluded=false
+    KeyguardServiceDelegate
+      deviceHasKeyguard=true
+      KeyguardStateMonitor
+  mCurrentFocus=Window{6ba85b8 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}
+  mFocusedApp=ActivityRecord{234709864 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13568}
+    mKeyguardDrawComplete=true mWindowManagerDrawComplete=true
+    isKeyguardShowing=false
+    SettingsEntry{mWindowingMode=0, mUserRotationMode=null, mUserRotation=null, mForcedWidth=0, mForcedHeight=0, mForcedDensity=408, mForcedDensityRatio=0.0, mForcedScalingMode=null, mRemoveContentMode=0, mShouldShowWithInsecureKeyguard=null, mShouldShowSystemDecors=null, mIsHomeSupported=null, mShouldShowIme=null, mFixedToUserRotation=null, mIgnoreOrientationRequest=null, mIgnoreDisplayCutout=null, mDontMoveToTop=null, mForceAppsUniversalResizable=null}
+
+--- second window poll ---
+timestamp_utc=2026-07-08T14:29:29Z
+    mKeyguardOccluded=false mKeyguardOccludedChanged=false mPendingKeyguardOccluded=false
+    KeyguardServiceDelegate
+      deviceHasKeyguard=true
+      KeyguardStateMonitor
+  mCurrentFocus=Window{6ba85b8 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}
+  mFocusedApp=ActivityRecord{234709864 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13568}
+    mKeyguardDrawComplete=true mWindowManagerDrawComplete=true
+    isKeyguardShowing=false
+    SettingsEntry{mWindowingMode=0, mUserRotationMode=null, mUserRotation=null, mForcedWidth=0, mForcedHeight=0, mForcedDensity=408, mForcedDensityRatio=0.0, mForcedScalingMode=null, mRemoveContentMode=0, mShouldShowWithInsecureKeyguard=null, mShouldShowSystemDecors=null, mIsHomeSupported=null, mShouldShowIme=null, mFixedToUserRotation=null, mIgnoreOrientationRequest=null, mIgnoreDisplayCutout=null, mDontMoveToTop=null, mForceAppsUniversalResizable=null}
