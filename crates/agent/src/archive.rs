@@ -243,18 +243,35 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "retrieval"))]
+pub(crate) struct BodyKeyTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, feature = "retrieval"))]
+impl BodyKeyTestGuard {
+    pub(crate) fn new() -> Self {
+        static BODY_KEY_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let guard = BODY_KEY_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        isyncyou_core::envelope::reset_body_keys_for_tests();
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(all(test, feature = "retrieval"))]
+impl Drop for BodyKeyTestGuard {
+    fn drop(&mut self) {
+        isyncyou_core::envelope::reset_body_keys_for_tests();
+    }
+}
+
+#[cfg(all(test, feature = "retrieval"))]
 mod store_archive_tests {
     use super::*;
     use isyncyou_store::{Item, Store};
-    use std::sync::{Mutex, OnceLock};
-
-    fn body_key_guard() -> std::sync::MutexGuard<'static, ()> {
-        static BODY_KEY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        BODY_KEY_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap()
-    }
 
     fn upsert_body_item(root: &Path, service: &str, id: &str, rel: &str, body: &[u8]) {
         let store = Store::open(root.join(".isyncyou-store.db")).unwrap();
@@ -270,7 +287,7 @@ mod store_archive_tests {
 
     #[test]
     fn store_archive_reads_sealed_body_with_envelope_reader() {
-        let _guard = body_key_guard();
+        let _guard = BodyKeyTestGuard::new();
         isyncyou_core::envelope::reset_body_keys_for_tests();
         isyncyou_core::envelope::set_body_key(618_001, [18u8; 32]);
 
@@ -287,7 +304,7 @@ mod store_archive_tests {
 
     #[test]
     fn store_archive_fails_closed_when_sealed_body_key_is_missing() {
-        let _guard = body_key_guard();
+        let _guard = BodyKeyTestGuard::new();
         isyncyou_core::envelope::reset_body_keys_for_tests();
         isyncyou_core::envelope::set_body_key(618_002, [19u8; 32]);
 

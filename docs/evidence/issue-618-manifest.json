@@ -16,12 +16,12 @@
     {
       "id": "EV-002",
       "requirement": "REQ-AGENT-009",
-      "claim": "The real StoreArchive path reads encrypted/sealed archived bodies through the envelope-aware reader and supports the structured retrieval feature build.",
+      "claim": "The real StoreArchive path reads encrypted/sealed archived bodies and supports Search, Read, List, and Export through ToolExecutor over a populated temp archive fixture.",
       "method": "test",
       "command": "cargo +1.95.0 test -p isyncyou-agent --features retrieval retrieval -- --nocapture && cargo +1.95.0 test -p isyncyou-agent --features retrieval store_archive -- --nocapture",
       "result": "pass",
-      "evidence": "The retrieval feature run passed 26 retrieval tests, including calendar/contact export source coverage; the store_archive run passed 7 tests, including store_archive_reads_sealed_body_with_envelope_reader.",
-      "test": "store_archive_reads_sealed_body_with_envelope_reader"
+      "evidence": "The retrieval feature run passed 27 retrieval tests, including store_archive_executor_covers_search_read_list_export_shapes and calendar/contact export source coverage; the store_archive run passed 8 tests, including store_archive_reads_sealed_body_with_envelope_reader.",
+      "test": "store_archive_executor_covers_search_read_list_export_shapes"
     },
     {
       "id": "EV-003",

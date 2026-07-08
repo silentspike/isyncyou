@@ -149,4 +149,5 @@ requirements:
       - test: list_pages_flat_service_items_with_count
       - test: export_raw_passthrough_carries_source_ids
       - test: store_archive_reads_sealed_body_with_envelope_reader
+      - test: store_archive_executor_covers_search_read_list_export_shapes
       - test: experimental_agent_executor_reads_store_archive_fixture

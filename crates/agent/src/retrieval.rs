@@ -63,6 +63,14 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         Ok(())
     }
 
+    fn citation_ref(it: &ItemRef) -> serde_json::Value {
+        serde_json::json!({
+            "service": it.service,
+            "id": it.id,
+            "path": it.path,
+        })
+    }
+
     fn source_ref(it: &ItemRef) -> serde_json::Value {
         serde_json::json!({
             "service": it.service,
@@ -70,6 +78,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             "name": it.name,
             "item_type": it.item_type,
             "path": it.path,
+            "source": Self::citation_ref(it),
         })
     }
 
@@ -130,6 +139,15 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             String::from_utf8_lossy(body).into_owned()
         };
         text
+    }
+
+    fn content_kind(service: &str) -> &'static str {
+        match service {
+            "mail" => "mail-text",
+            "calendar" | "contacts" | "todo" => "json",
+            "onedrive" | "onenote" => "text",
+            _ => "text",
+        }
     }
 
     fn utf8_budget_slice(text: &str, max_bytes: usize) -> (&str, bool) {
@@ -374,13 +392,14 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         let text = Self::body_model_text(service, &bytes);
         let budget = max_bytes.unwrap_or(DEFAULT_READ_BUDGET) as usize;
         let (content, truncated) = Self::utf8_budget_slice(&text, budget);
-        let source = Self::source_ref(&item);
+        let source = Self::citation_ref(&item);
         Ok(serde_json::json!({
             "service": item.service,
             "id": item.id,
             "name": item.name,
             "path": item.path,
             "source": source,
+            "content_kind": Self::content_kind(service),
             "bytes_total": text.len(),
             "bytes_returned": content.len(),
             "truncated": truncated,
@@ -424,7 +443,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             .ok_or_else(|| AgentError::ToolArgs(format!("no item {service}/{id}")))?;
         let bytes = self.source.read_body(service, id)?;
         let (format, content) = convert_export(service, &bytes)?;
-        let source = Self::source_ref(&item);
+        let source = Self::citation_ref(&item);
         Ok(serde_json::json!({
             "service": item.service,
             "id": item.id,
@@ -735,6 +754,21 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "retrieval")]
+    fn upsert_store_body(
+        store: &isyncyou_store::Store,
+        root: &std::path::Path,
+        mut item: isyncyou_store::Item,
+        rel: &str,
+        body: &[u8],
+    ) {
+        item.local_path = Some(rel.into());
+        store.upsert_item(&item).unwrap();
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        isyncyou_core::envelope::write_body_atomic(&path, body).unwrap();
+    }
+
     #[test]
     fn search_returns_source_tagged_hits_across_names_and_bodies() {
         let ex = fixture();
@@ -751,6 +785,7 @@ mod tests {
         assert!(ids.contains(&"m1") && ids.contains(&"f1"));
         for r in v["results"].as_array().unwrap() {
             assert!(r["service"].is_string() && r["id"].is_string() && r["path"].is_string());
+            assert!(r["source"]["service"].is_string() && r["source"]["id"].is_string());
             assert!(r["snippet"].is_string());
         }
     }
@@ -1013,8 +1048,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["source"]["service"], "mail");
         assert_eq!(v["source"]["id"], "m1");
-        assert_eq!(v["source"]["name"], "Spotify invoice March");
         assert_eq!(v["source"]["path"], "mail/m1.bin");
+        assert_eq!(v["name"], "Spotify invoice March");
+        assert_eq!(v["content_kind"], "mail-text");
     }
 
     #[test]
@@ -1073,6 +1109,8 @@ mod tests {
         assert_eq!(v["returned"], 1);
         assert_eq!(v["results"][0]["id"], "flat-1");
         assert_eq!(v["results"][0]["path"], "onedrive/flat-1.bin");
+        assert_eq!(v["results"][0]["source"]["id"], "flat-1");
+        assert_eq!(v["results"][0]["source"]["path"], "onedrive/flat-1.bin");
     }
 
     #[test]
@@ -1242,6 +1280,168 @@ mod tests {
         });
         let err = ex.export("calendar", "bad-cal").unwrap_err();
         assert!(err.to_string().contains("export parse"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn store_archive_executor_covers_search_read_list_export_shapes() {
+        let _guard = crate::archive::BodyKeyTestGuard::new();
+        isyncyou_core::envelope::set_body_key(618_090, [90u8; 32]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = isyncyou_store::Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "mail", "m1", "Visible mail", "message"),
+            "mail/aa/m1.eml",
+            concat!(
+                "Subject: Store runtime mail\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "\r\n",
+                "Hello archived mail text.\r\n"
+            )
+            .as_bytes(),
+        );
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "mail", "m2", "Body only mail", "message"),
+            "mail/aa/m2.eml",
+            b"needle618 appears only in the indexed body",
+        );
+        store
+            .index_body(
+                "me",
+                "mail",
+                "m2",
+                "needle618 appears only in the indexed body",
+            )
+            .unwrap();
+
+        let folder = isyncyou_store::Item::new("me", "onedrive", "folder", "Folder", "folder");
+        store.upsert_item(&folder).unwrap();
+        let mut child = isyncyou_store::Item::new("me", "onedrive", "child", "Child.txt", "file");
+        child.parent_remote_id = Some("folder".into());
+        store.upsert_item(&child).unwrap();
+
+        let event = serde_json::json!({
+            "id": "cal-1",
+            "iCalUId": "uid-1",
+            "subject": "Store event",
+            "start": { "dateTime": "2026-03-01T09:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-03-01T10:00:00.0000000", "timeZone": "UTC" }
+        })
+        .to_string();
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "calendar", "cal-1", "Store event", "event"),
+            "calendar/cal-1.json",
+            event.as_bytes(),
+        );
+
+        let contact = serde_json::json!({
+            "displayName": "Ada Lovelace",
+            "givenName": "Ada",
+            "surname": "Lovelace",
+            "emailAddresses": [{ "address": "ada@example.com" }]
+        })
+        .to_string();
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "contacts", "contact-1", "Ada Lovelace", "contact"),
+            "contacts/contact-1.json",
+            contact.as_bytes(),
+        );
+        drop(store);
+
+        let ex = RetrievalExecutor::new(crate::archive::StoreArchive::new("me", dir.path()));
+
+        let search = ToolAction::Search {
+            account: "me".into(),
+            services: vec!["mail".into()],
+            query: "needle618".into(),
+            limit: Some(10),
+        };
+        let search_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&search).unwrap()).unwrap();
+        assert_eq!(search_out["results"][0]["id"], "m2");
+        assert_eq!(search_out["results"][0]["source"]["service"], "mail");
+        assert!(search_out["results"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("needle618"));
+
+        let read = ToolAction::Read {
+            account: "me".into(),
+            service: "mail".into(),
+            id: "m1".into(),
+            max_bytes: None,
+        };
+        let read_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&read).unwrap()).unwrap();
+        assert_eq!(read_out["content_kind"], "mail-text");
+        assert_eq!(read_out["source"]["path"], "mail/aa/m1.eml");
+        assert!(read_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("Hello archived mail text."));
+        assert!(!read_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("Content-Type:"));
+
+        let list_root = ToolAction::List {
+            account: "me".into(),
+            service: "onedrive".into(),
+            parent: Some("root".into()),
+            limit: Some(10),
+            offset: Some(0),
+        };
+        let root_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&list_root).unwrap()).unwrap();
+        assert_eq!(root_out["results"][0]["id"], "folder");
+        assert_eq!(root_out["results"][0]["source"]["id"], "folder");
+
+        let list_child = ToolAction::List {
+            account: "me".into(),
+            service: "onedrive".into(),
+            parent: Some("folder".into()),
+            limit: Some(10),
+            offset: Some(0),
+        };
+        let child_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&list_child).unwrap()).unwrap();
+        assert_eq!(child_out["results"][0]["id"], "child");
+
+        let calendar = ToolAction::Export {
+            account: "me".into(),
+            service: "calendar".into(),
+            id: "cal-1".into(),
+        };
+        let calendar_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&calendar).unwrap()).unwrap();
+        assert_eq!(calendar_out["format"], "ics");
+        assert!(calendar_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN:VCALENDAR"));
+
+        let contacts = ToolAction::Export {
+            account: "me".into(),
+            service: "contacts".into(),
+            id: "contact-1".into(),
+        };
+        let contacts_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&contacts).unwrap()).unwrap();
+        assert_eq!(contacts_out["format"], "vcard");
+        assert!(contacts_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("EMAIL:ada@example.com"));
     }
 
     #[test]
