@@ -259,6 +259,14 @@ pub fn active_key_id() -> Option<u32> {
         .map(|(id, _)| id)
 }
 
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn reset_body_keys_for_tests() {
+    let mut reg = keys().lock().unwrap_or_else(|e| e.into_inner());
+    reg.active = None;
+    reg.older.clear();
+}
+
 fn key_for_id(key_id: u32) -> Option<BodyKey> {
     let reg = keys().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((id, k)) = reg.active {

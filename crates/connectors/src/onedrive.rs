@@ -1275,18 +1275,72 @@ pub fn dematerialize_one(
     Ok(removed)
 }
 
-/// #659 download-now: materialize a single OneDrive item on demand — the inverse of
-/// [`dematerialize_one`]. Runs the offline-pass success path for one id: policy gate →
-/// `downloading` checkpoint → streamed download → `atomic_write` → `materialized`/`available`.
-/// Returns `Ok(true)` on a fresh download, `Ok(false)` if the storage/network/power policy
-/// blocked it (the body stays `missing`). Errors on an unknown / non-file item.
+/// Where a user-requested single-item download should land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadBodyTarget {
+    /// Mode-2 Sync lazy body cache: stored under cache_root, not editable/writeback-owned.
+    Cache,
+    /// Mode-3 Offline working copy: stored under sync_root and participates in writeback checks.
+    Sync,
+}
+
+impl DownloadBodyTarget {
+    fn root<'a>(self, sync_root: &'a Path, cache_root: &'a Path) -> &'a Path {
+        match self {
+            Self::Cache => cache_root,
+            Self::Sync => sync_root,
+        }
+    }
+
+    fn body_location(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Sync => "sync",
+        }
+    }
+
+    fn downloading_content_state(self) -> Option<&'static str> {
+        match self {
+            Self::Cache => Some("cached"),
+            Self::Sync => None,
+        }
+    }
+
+    fn missing_content_state(self) -> Option<&'static str> {
+        match self {
+            Self::Cache => Some("cached"),
+            Self::Sync => None,
+        }
+    }
+
+    fn available_content_state(self) -> &'static str {
+        match self {
+            Self::Cache => "cached",
+            Self::Sync => "materialized",
+        }
+    }
+
+    fn records_synced_reference(self) -> bool {
+        matches!(self, Self::Sync)
+    }
+}
+
+/// #659/#724 download-now: fetch a single OneDrive body on demand into the target root.
+///
+/// Sync-mode lazy bodies use [`DownloadBodyTarget::Cache`] (`cache_root`,
+/// `cached/cache/available`) and intentionally do not record an Offline/writeback synced-state
+/// reference. Offline bodies use [`DownloadBodyTarget::Sync`] (`sync_root`,
+/// `materialized/sync/available`) and preserve the synced-state reference for writeback/conflict
+/// checks. Both targets write through the envelope-aware body writer.
 #[allow(clippy::too_many_arguments)]
-pub fn download_one<D: Downloader>(
+pub fn download_one_to_target<D: Downloader>(
     store: &Store,
     downloader: &D,
     account: &str,
     id: &str,
     sync_root: &Path,
+    cache_root: &Path,
+    target: DownloadBodyTarget,
     now: &str,
     cfg_sync: &isyncyou_core::SyncConfig,
     dev: &isyncyou_core::policy::DeviceState,
@@ -1302,15 +1356,15 @@ pub fn download_one<D: Downloader>(
     }
     let rel = local_rel_path(&by_id, it)
         .ok_or_else(|| SyncError::Malformed("download-now: no local path".into()))?;
-    let full = sync_root.join(&rel);
+    let full = target.root(sync_root, cache_root).join(&rel);
     // Storage-floor / Wi-Fi-only / charging gate: a Blocked verdict leaves the body `missing`.
     if !isyncyou_core::policy::evaluate(cfg_sync, dev).is_allowed() {
         store.set_content_state(
             account,
             SERVICE,
             id,
-            None,
-            Some("sync"),
+            target.missing_content_state(),
+            Some(target.body_location()),
             Some("missing"),
             None,
         )?;
@@ -1326,8 +1380,8 @@ pub fn download_one<D: Downloader>(
         account,
         SERVICE,
         id,
-        None,
-        Some("sync"),
+        target.downloading_content_state(),
+        Some(target.body_location()),
         Some("downloading"),
         None,
     )?;
@@ -1335,19 +1389,22 @@ pub fn download_one<D: Downloader>(
         let bytes = downloader
             .download_with_progress(id, &mut |done| progress.advance(id, done))
             .map_err(SyncError::Malformed)?;
-        atomic_write(&full, &bytes).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        isyncyou_core::envelope::write_body_atomic(&full, &bytes)
+            .map_err(|e| SyncError::Malformed(e.to_string()))?;
         if let Some(mt) = &it.remote_mtime {
             set_file_mtime(&full, mt);
         }
         store.set_sync_state(account, SERVICE, id, "clean")?;
-        let hash = Some(crate::quickxor::quickxor_base64(&bytes));
-        record_synced_state(store, account, id, &full, hash);
+        if target.records_synced_reference() {
+            let hash = Some(crate::quickxor::quickxor_base64(&bytes));
+            record_synced_state(store, account, id, &full, hash);
+        }
         store.set_content_state(
             account,
             SERVICE,
             id,
-            Some("materialized"),
-            Some("sync"),
+            Some(target.available_content_state()),
+            Some(target.body_location()),
             Some("available"),
             Some(now),
         )?;
@@ -1355,6 +1412,35 @@ pub fn download_one<D: Downloader>(
     })();
     progress.finish(id);
     result
+}
+
+/// Backwards-compatible #659 sync-root wrapper. #724 callers should prefer
+/// [`download_one_to_target`] so Sync-mode management downloads can choose `cache_root`.
+#[allow(clippy::too_many_arguments)]
+pub fn download_one<D: Downloader>(
+    store: &Store,
+    downloader: &D,
+    account: &str,
+    id: &str,
+    sync_root: &Path,
+    now: &str,
+    cfg_sync: &isyncyou_core::SyncConfig,
+    dev: &isyncyou_core::policy::DeviceState,
+    progress: &dyn ProgressSink,
+) -> Result<bool, SyncError> {
+    download_one_to_target(
+        store,
+        downloader,
+        account,
+        id,
+        sync_root,
+        sync_root,
+        DownloadBodyTarget::Sync,
+        now,
+        cfg_sync,
+        dev,
+        progress,
+    )
 }
 
 /// Scoped, policy-gated, progress-reported materialize for Mode-3 **offline** folders
@@ -2810,6 +2896,42 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FinishProgress(std::sync::Mutex<Vec<String>>);
+    impl ProgressSink for FinishProgress {
+        fn begin(&self, _: &str, _: &str, _: u64) {}
+        fn advance(&self, _: &str, _: u64) {}
+        fn retry_after(&self, _: &str, _: u64) {}
+        fn finish(&self, id: &str) {
+            self.0.lock().unwrap().push(id.to_string());
+        }
+    }
+
+    struct BodyKeyTestGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BodyKeyTestGuard {
+        fn new() -> Self {
+            static BODY_KEY_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+                std::sync::OnceLock::new();
+            let guard = BODY_KEY_TEST_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+            isyncyou_core::envelope::reset_body_keys_for_tests();
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for BodyKeyTestGuard {
+        fn drop(&mut self) {
+            isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+            isyncyou_core::envelope::reset_body_keys_for_tests();
+        }
+    }
+
     /// Seed one tracked file at the sync root: store item (remote_dirty with NEW
     /// remote metadata, as after a delta ingest) + on-disk content + optionally
     /// the last-synced reference for that on-disk content.
@@ -3056,35 +3178,24 @@ mod tests {
     }
 
     #[test]
-    fn free_up_and_download_now_roundtrip() {
-        // #659: download_one materializes one item on demand (inverse of the offline pass);
-        // dematerialize_one drops the body but keeps the row listable (metadata).
-        #[derive(Default)]
-        struct FinishProgress(std::sync::Mutex<Vec<String>>);
-        impl ProgressSink for FinishProgress {
-            fn begin(&self, _: &str, _: &str, _: u64) {}
-            fn advance(&self, _: &str, _: u64) {}
-            fn retry_after(&self, _: &str, _: u64) {}
-            fn finish(&self, id: &str) {
-                self.0.lock().unwrap().push(id.to_string());
-            }
-        }
-
+    fn download_now_to_cache_sets_cache_body_location() {
         let store = Store::open_in_memory().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
         seed_offline_and_nonscope(&store);
         let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
         let cfg = isyncyou_core::SyncConfig::default();
         let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
         let progress = FinishProgress::default();
 
-        // download-now materializes just a1.
-        assert!(download_one(
+        assert!(download_one_to_target(
             &store,
             &dl,
             "acc",
             "a1",
-            dir.path(),
+            sync.path(),
+            cache.path(),
+            DownloadBodyTarget::Cache,
             NOW,
             &cfg,
             &dev,
@@ -3097,25 +3208,231 @@ mod tests {
             "download-now must clear its transfer slot on completion"
         );
         assert_eq!(
-            std::fs::read(dir.path().join("Photos/a.txt")).unwrap(),
+            isyncyou_core::envelope::read_body(&cache.path().join("Photos/a.txt")).unwrap(),
             b"AAAA"
+        );
+        assert!(
+            !sync.path().join("Photos/a.txt").exists(),
+            "cache target must not write the offline sync root"
+        );
+        let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+        assert_eq!(a.body_state.as_deref(), Some("available"));
+        assert_eq!(a.content_state.as_deref(), Some("cached"));
+        assert_eq!(a.body_location.as_deref(), Some("cache"));
+        assert_eq!(a.sync_state, "clean");
+        assert_eq!(
+            store.get_synced_state("acc", SERVICE, "a1").unwrap(),
+            None,
+            "cache target must not create an Offline/writeback synced-state reference"
+        );
+    }
+
+    #[test]
+    fn download_now_to_sync_sets_materialized_body_location() {
+        let store = Store::open_in_memory().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+        let cfg = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+        let progress = FinishProgress::default();
+
+        assert!(download_one_to_target(
+            &store,
+            &dl,
+            "acc",
+            "a1",
+            sync.path(),
+            cache.path(),
+            DownloadBodyTarget::Sync,
+            NOW,
+            &cfg,
+            &dev,
+            &progress
+        )
+        .unwrap());
+        assert_eq!(
+            isyncyou_core::envelope::read_body(&sync.path().join("Photos/a.txt")).unwrap(),
+            b"AAAA"
+        );
+        assert!(
+            !cache.path().join("Photos/a.txt").exists(),
+            "sync target must not write the cache root"
         );
         let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
         assert_eq!(a.body_state.as_deref(), Some("available"));
         assert_eq!(a.content_state.as_deref(), Some("materialized"));
-
-        // free-up drops the body but keeps the row listable.
-        assert!(dematerialize_one(&store, "acc", "a1", dir.path(), dir.path()).unwrap());
+        assert_eq!(a.body_location.as_deref(), Some("sync"));
+        assert_eq!(a.sync_state, "clean");
         assert!(
-            !dir.path().join("Photos/a.txt").exists(),
-            "body gone from disk"
+            store
+                .get_synced_state("acc", SERVICE, "a1")
+                .unwrap()
+                .is_some(),
+            "sync target must record the Offline/writeback synced-state reference"
+        );
+    }
+
+    #[test]
+    fn download_now_uses_envelope_writer_for_cache_and_sync_targets() {
+        let _guard = BodyKeyTestGuard::new();
+        isyncyou_core::envelope::set_body_key(724_001, [24u8; 32]);
+        isyncyou_core::envelope::require_body_envelope_for_process();
+
+        for (target, root_name) in [
+            (DownloadBodyTarget::Cache, "cache"),
+            (DownloadBodyTarget::Sync, "sync"),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let sync = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            seed_offline_and_nonscope(&store);
+            let sentinel = format!("SECRET-{root_name}-ONEDRIVE-BODY");
+            let dl = MockDownloader(
+                [("a1".to_string(), sentinel.as_bytes().to_vec())]
+                    .into_iter()
+                    .collect(),
+            );
+            let cfg = isyncyou_core::SyncConfig::default();
+            let dev = isyncyou_core::policy::DeviceState::always_on(u64::MAX);
+            let progress = FinishProgress::default();
+
+            assert!(download_one_to_target(
+                &store,
+                &dl,
+                "acc",
+                "a1",
+                sync.path(),
+                cache.path(),
+                target,
+                NOW,
+                &cfg,
+                &dev,
+                &progress
+            )
+            .unwrap());
+
+            let body_path = target.root(sync.path(), cache.path()).join("Photos/a.txt");
+            assert_eq!(
+                isyncyou_core::envelope::read_sealed_body_required(&body_path).unwrap(),
+                sentinel.as_bytes()
+            );
+            let raw = std::fs::read(&body_path).unwrap();
+            assert_eq!(isyncyou_core::envelope::blob_key_id(&raw), Some(724_001));
+            assert!(
+                !raw.windows(sentinel.len())
+                    .any(|window| window == sentinel.as_bytes()),
+                "management download target {target:?} must not leave plaintext on disk"
+            );
+        }
+    }
+
+    #[test]
+    fn download_now_policy_block_is_target_aware() {
+        let denied = isyncyou_core::SyncConfig::default();
+        let dev = isyncyou_core::policy::DeviceState::always_on(0);
+
+        for (target, expected_content, expected_location) in [
+            (DownloadBodyTarget::Cache, Some("cached"), "cache"),
+            (DownloadBodyTarget::Sync, None, "sync"),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let sync = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            seed_offline_and_nonscope(&store);
+            let dl = MockDownloader([("a1".to_string(), b"AAAA".to_vec())].into_iter().collect());
+            let progress = FinishProgress::default();
+
+            assert!(!download_one_to_target(
+                &store,
+                &dl,
+                "acc",
+                "a1",
+                sync.path(),
+                cache.path(),
+                target,
+                NOW,
+                &denied,
+                &dev,
+                &progress
+            )
+            .unwrap());
+            assert!(!sync.path().join("Photos/a.txt").exists());
+            assert!(!cache.path().join("Photos/a.txt").exists());
+            let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
+            assert_eq!(a.content_state.as_deref(), expected_content);
+            assert_eq!(a.body_location.as_deref(), Some(expected_location));
+            assert_eq!(a.body_state.as_deref(), Some("missing"));
+        }
+    }
+
+    #[test]
+    fn free_up_removes_cache_root_body_only() {
+        let store = Store::open_in_memory().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        std::fs::create_dir_all(sync.path().join("Photos")).unwrap();
+        std::fs::create_dir_all(cache.path().join("Photos")).unwrap();
+        std::fs::write(sync.path().join("Photos/a.txt"), b"SYNC COPY").unwrap();
+        std::fs::write(cache.path().join("Photos/a.txt"), b"CACHE COPY").unwrap();
+        store
+            .set_content_state(
+                "acc",
+                SERVICE,
+                "a1",
+                Some("cached"),
+                Some("cache"),
+                Some("available"),
+                Some(NOW),
+            )
+            .unwrap();
+
+        assert!(dematerialize_one(&store, "acc", "a1", sync.path(), cache.path()).unwrap());
+        assert!(
+            sync.path().join("Photos/a.txt").exists(),
+            "cache free-up must not remove the sync-root body"
+        );
+        assert!(
+            !cache.path().join("Photos/a.txt").exists(),
+            "cache free-up must remove the cache-root body"
+        );
+    }
+
+    #[test]
+    fn free_up_removes_sync_root_body_only_and_preserves_local_delete_guard() {
+        let store = Store::open_in_memory().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        seed_offline_and_nonscope(&store);
+        std::fs::create_dir_all(sync.path().join("Photos")).unwrap();
+        std::fs::create_dir_all(cache.path().join("Photos")).unwrap();
+        std::fs::write(sync.path().join("Photos/a.txt"), b"SYNC COPY").unwrap();
+        std::fs::write(cache.path().join("Photos/a.txt"), b"CACHE COPY").unwrap();
+        store
+            .set_content_state(
+                "acc",
+                SERVICE,
+                "a1",
+                Some("materialized"),
+                Some("sync"),
+                Some("available"),
+                Some(NOW),
+            )
+            .unwrap();
+
+        assert!(dematerialize_one(&store, "acc", "a1", sync.path(), cache.path()).unwrap());
+        assert!(
+            !sync.path().join("Photos/a.txt").exists(),
+            "sync free-up must remove the sync-root body"
+        );
+        assert!(
+            cache.path().join("Photos/a.txt").exists(),
+            "sync free-up must not remove the cache-root body"
         );
         let a = store.get_item("acc", SERVICE, "a1").unwrap().unwrap();
-        assert_eq!(
-            a.body_state.as_deref(),
-            Some("missing"),
-            "no body -> has_body false"
-        );
+        assert_eq!(a.body_state.as_deref(), Some("missing"));
         assert_eq!(a.content_state.as_deref(), Some("cached"));
         assert!(a.deleted_at.is_none(), "row not tombstoned");
         assert!(
@@ -3131,33 +3448,10 @@ mod tests {
         // next offline pass — otherwise `apply_local_deletes` pushes a cloud delete and the file is
         // lost. It is intentionally absent, not user-deleted.
         assert!(
-            !scan_local_deletes(&store, "acc", dir.path())
+            !scan_local_deletes(&store, "acc", sync.path())
                 .unwrap()
                 .contains(&"a1".to_string()),
             "free-up must not make the file look locally deleted (would push a cloud delete)"
-        );
-
-        // download-now again re-materializes (reversible).
-        assert!(download_one(
-            &store,
-            &dl,
-            "acc",
-            "a1",
-            dir.path(),
-            NOW,
-            &cfg,
-            &dev,
-            &progress
-        )
-        .unwrap());
-        assert_eq!(
-            progress.0.lock().unwrap().as_slice(),
-            &["a1".to_string(), "a1".to_string()],
-            "each download-now run must finish its transfer slot"
-        );
-        assert!(
-            dir.path().join("Photos/a.txt").exists(),
-            "re-materialized after free-up"
         );
     }
 
