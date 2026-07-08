@@ -1,24 +1,26 @@
 {
   "issue": 725,
   "epic": 646,
-  "status": "in_progress_partial_device",
-  "generated_at": "2026-07-08T16:42:26Z",
+  "status": "release_complete_partial_device_closeout_pending",
+  "generated_at": "2026-07-08T18:46:07Z",
   "repo": "silentspike/isyncyou",
   "refs": {
-    "origin_dev": "14e819d8e182a6f440e4c255692e0545cd8c1b0d",
-    "origin_staging": "12d700904bfc86a39463aa00c50488a8b2ed9505",
-    "origin_main": "fdc0eb4d7a6839b97c9fd639ac5ba66514e401a7",
-    "evidence_base_commit": "40e86cc42d60cfa31cf24b8ea249606f481153ed"
+    "origin_dev": "0893548554e6ef4df3e3361ce9da145260b4238f",
+    "origin_staging": "a5c706d3419714302ea0be4b148dd072cce780fd",
+    "origin_main": "ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75",
+    "rc_commit": "ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75",
+    "runtime_fix_manifest_commit": "40e86cc42d60cfa31cf24b8ea249606f481153ed",
+    "release_fix_dev_commit": "0893548554e6ef4df3e3361ce9da145260b4238f"
   },
   "gate": {
     "issues_718_724_closed": true,
-    "issue_725_open": true,
+    "issue_725_open": false,
     "issue_646_open": true,
     "open_prs": 0,
     "open_promote_prs": 0,
     "codeql_main_run": {
-      "number": 221,
-      "head_sha": "fdc0eb4d7a6839b97c9fd639ac5ba66514e401a7",
+      "number": 227,
+      "head_sha": "ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75",
       "status": "completed",
       "conclusion": "success"
     }
@@ -93,7 +95,30 @@
     }
   },
   "release": {
-    "status": "pending",
+    "status": "pass",
+    "current_release": {
+      "tag": "v1.0.0-rc.83",
+      "url": "https://github.com/silentspike/isyncyou/releases/tag/v1.0.0-rc.83",
+      "run_number": 83,
+      "run_url": "https://github.com/silentspike/isyncyou/actions/runs/28965965773",
+      "event": "workflow_dispatch",
+      "head_branch": "main",
+      "head_sha": "ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75",
+      "prerelease": true,
+      "tag_target": "ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75",
+      "android_apk_sha256": "9770b262212067afed5f959f6a599eabe6887298e371de1bf296f567a6ab2c3e",
+      "sha256sums_sha256": "0c48d149ea3099c8cee5bdd00ba77359a9a3b8e09b78df18e7a820029a8ddfd7",
+      "checksum_verification": "pass",
+      "attestation_verification": "pass",
+      "release_apk_smoke": "pass"
+    },
+    "superseded_failed_release_run": {
+      "number": 82,
+      "conclusion": "failure",
+      "head_sha": "68cd18ac2e8201379f01a5ec34e825f2e66b898b",
+      "failed_job": "build & publish",
+      "fix_pr": 750
+    },
     "latest_completed_release_run_before_725": {
       "number": 81,
       "conclusion": "cancelled",
@@ -102,8 +127,8 @@
     "latest_prerelease_before_725": "v1.0.0-rc.80"
   },
   "notes": [
-    "No release workflow has been dispatched for #725 yet.",
-    "No issue or epic close-out is claimed by this in-progress summary.",
+    "Release run #83 published v1.0.0-rc.83 from main after the #750 release Windows cross-build fix reached main.",
+    "#725 is already closed; #646 remains open until the release/evidence close-out comment is posted.",
     "Row D is now PASS with USB airplane-open, free-up cloud-survival, and sealed local writeback evidence.",
     "During Row D, #725 fixed stale OneDrive scope 404 tolerance so one deleted configured scope cannot abort remaining offline scopes/writeback."
   ]

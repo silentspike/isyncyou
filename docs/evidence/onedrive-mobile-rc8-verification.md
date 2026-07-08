@@ -3,11 +3,11 @@
 Issue: [#725](https://github.com/silentspike/isyncyou/issues/725)
 Epic: [#646](https://github.com/silentspike/isyncyou/issues/646)
 Repo: `silentspike/isyncyou`
-Report status: `IN_PROGRESS_PARTIAL_DEVICE`
+Report status: `RELEASE_COMPLETE_PARTIAL_DEVICE_CLOSEOUT_PENDING`
 
 This report records the #725 release-governance close-out evidence. It is intentionally
 strict: a row is `PASS` only when backed by a committed artifact or a linked GitHub run.
-Rows that still need physical-device or release-pipeline proof remain `PENDING`.
+Rows with incomplete physical-device coverage remain `PARTIAL`, not pass-by-narrative.
 
 ## Gate
 
@@ -20,20 +20,22 @@ Rows that still need physical-device or release-pipeline proof remain `PENDING`.
 | #722 | PASS | `gh issue view` returned CLOSED |
 | #723 | PASS | `gh issue view` returned CLOSED |
 | #724 | PASS | `gh issue view` returned CLOSED |
-| #725 | OPEN | This close-out issue remains open during evidence collection |
+| #725 | PASS | `gh issue view` returned CLOSED; final release evidence is recorded by this docs-only follow-up |
 | #646 | OPEN | Epic remains open until #725 ACs and release proof are complete |
 | Open PRs | PASS | `gh pr list --state open` returned `[]` |
 | Open `promote/*` PRs | PASS | Promote-filter query returned no rows |
-| CodeQL on current `main` | PASS | Run #221 on `fdc0eb4` completed successfully, including `Analyze (java-kotlin)` |
+| CodeQL on RC `main` | PASS | Run #227 on `ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75` completed successfully, including `Analyze (java-kotlin)` |
 
 Branch/commit snapshot at host-gate collection:
 
 | Ref | SHA |
 |---|---|
-| `origin/dev` | `14e819d8e182a6f440e4c255692e0545cd8c1b0d` |
-| `origin/staging` | `12d700904bfc86a39463aa00c50488a8b2ed9505` |
-| `origin/main` | `fdc0eb4d7a6839b97c9fd639ac5ba66514e401a7` |
+| `origin/dev` | `0893548554e6ef4df3e3361ce9da145260b4238f` |
+| `origin/staging` | `a5c706d3419714302ea0be4b148dd072cce780fd` |
+| `origin/main` / `RC_COMMIT` | `ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75` |
 | Runtime fix / manifest commit | `40e86cc42d60cfa31cf24b8ea249606f481153ed` |
+| Release fix commit on `dev` | `0893548554e6ef4df3e3361ce9da145260b4238f` |
+| Evidence follow-up commit | Docs-only commit containing this report; final merge SHA is recorded in the issue close-out comment |
 
 The #725 evidence manifest is intentionally pinned to the runtime-fix commit above:
 the later Row D artifacts and this Markdown report are docs/evidence-only follow-up
@@ -43,19 +45,29 @@ match the current working tree HEAD.
 
 ## Release Pipeline
 
-Current status: `PENDING`.
+Current status: `PASS`.
 
-The latest completed `release.yml` run before #725 evidence was run #81, which was
-`cancelled` on commit `d44320126fdd1a62e307ac3f40dc123f9cdffd91`. The latest published
-prerelease was `v1.0.0-rc.80` from 2026-06-27, so it is not evidence for the current
-RC8 tree.
+The current RC is `v1.0.0-rc.83`, published by manual `release.yml`
+`workflow_dispatch` from `main`.
 
-Required before this section can pass:
+| Field | Value |
+|---|---|
+| Release run | [#83](https://github.com/silentspike/isyncyou/actions/runs/28965965773) |
+| Event / branch | `workflow_dispatch` / `main` |
+| Head SHA / `RC_COMMIT` | `ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75` |
+| Release | [`v1.0.0-rc.83`](https://github.com/silentspike/isyncyou/releases/tag/v1.0.0-rc.83) |
+| Prerelease | `true` |
+| Tag target | `ed72dcee14eae8b09fe5992ff1f2fcd4f8af8d75` |
+| `android signed APK (build-once)` | PASS |
+| `build & publish` | PASS |
+| Artifact JSON | [`release-run.json`](artifacts/issue-725/release-run.json), [`release-assets.json`](artifacts/issue-725/release-assets.json) |
 
-- merge #725 through `dev -> staging -> main` after the local evidence commit;
-- manually dispatch `release.yml` from `main`;
-- verify the new `v1.0.0-rc.<run>` prerelease, tag target, assets, checksums,
-  cosign bundles, and attestations.
+The first #725 release dispatch, run
+[#82](https://github.com/silentspike/isyncyou/actions/runs/28962145782), failed in
+`build & publish` while cross-compiling the Windows daemon. The fix was merged via
+[#750](https://github.com/silentspike/isyncyou/pull/750) and reached `main` through
+[#751](https://github.com/silentspike/isyncyou/pull/751) and
+[#752](https://github.com/silentspike/isyncyou/pull/752). Run #83 supersedes run #82.
 
 ## Host And Android Gates
 
@@ -143,21 +155,81 @@ Notes on Row D completion and the remaining partial rows:
 
 ## Release Artifact Verification
 
-Status: `PENDING`.
+Status: `PASS`.
 
-The final RC artifact verification must record:
+Artifact inventory and release metadata are captured in
+[`release-assets.json`](artifacts/issue-725/release-assets.json). The release contains:
 
-- `release.yml` run number, URL, event, head branch, and head SHA;
-- `v1.0.0-rc.<run>` release URL and prerelease flag;
-- tag target equals `RC_COMMIT`;
-- asset list includes Linux tarball, AppImage, Windows zip, Android APK, SBOM,
-  `SHA256SUMS`, and the expected cosign bundles;
-- `.sha256` sidecars are not expected to have their own `.cosign.bundle` files;
-- APK checksum matches the release asset and release smoke result.
+- `isyncyou-linux-x86_64.tar.gz`
+- `isyncyou-linux-x86_64.tar.gz.sha256`
+- `isyncyou-linux-x86_64.tar.gz.cosign.bundle`
+- `isyncyou-x86_64.AppImage`
+- `isyncyou-x86_64.AppImage.sha256`
+- `isyncyou-x86_64.AppImage.cosign.bundle`
+- `isyncyou-windows-x86_64.zip`
+- `isyncyou-windows-x86_64.zip.sha256`
+- `isyncyou-windows-x86_64.zip.cosign.bundle`
+- `isyncyou-android-arm64.apk`
+- `isyncyou-android-arm64.apk.sha256`
+- `isyncyou-android-arm64.apk.cosign.bundle`
+- `SHA256SUMS`
+- `SHA256SUMS.cosign.bundle`
+- `isyncyou.sbom.cdx.json`
+- `isyncyou.sbom.cdx.json.cosign.bundle`
+
+The individual `.sha256` sidecars are checksum inputs and are not expected to have
+their own `.cosign.bundle` files in the current workflow.
+
+Checksum verification was run from a temporary download directory outside the repo:
+
+```text
+isyncyou-linux-x86_64.tar.gz: OK
+isyncyou-x86_64.AppImage: OK
+isyncyou-windows-x86_64.zip: OK
+isyncyou-android-arm64.apk: OK
+isyncyou.sbom.cdx.json: OK
+isyncyou-android-arm64.apk: OK
+```
+
+Full checksum output is in
+[`release-checksums.txt`](artifacts/issue-725/release-checksums.txt). Selected digests:
+
+```text
+9770b262212067afed5f959f6a599eabe6887298e371de1bf296f567a6ab2c3e  isyncyou-android-arm64.apk
+0c48d149ea3099c8cee5bdd00ba77359a9a3b8e09b78df18e7a820029a8ddfd7  SHA256SUMS
+```
+
+`gh attestation verify` passed for the published Android APK and returned SLSA
+provenance for all six signed release subjects: Linux tarball, AppImage, Windows zip,
+Android APK, SBOM, and `SHA256SUMS`. The certificate SAN was:
+
+```text
+https://github.com/silentspike/isyncyou/.github/workflows/release.yml@refs/heads/main
+```
+
+The attestation JSON is stored in
+[`release-attestation.json`](artifacts/issue-725/release-attestation.json).
+
+Local verifier limits:
+
+- `cosign` was not installed locally, so local `cosign verify-blob` is `SKIP:
+  verifier unavailable`.
+- `apksigner` was not found in PATH or the checked Android SDK paths. The release
+  workflow's signed-APK job did run its own APK-signature verification step, and the
+  published APK was installed and launched on the Pixel 8 Pro.
+
+Release APK smoke result: `PASS`.
+
+The published `isyncyou-android-arm64.apk` installed on the Pixel 8 Pro, launched as
+`com.silentspike.isyncyou`, returned a live PID, and `dumpsys activity` showed
+`MainActivity` resumed and focused. The logcat tail used for the smoke had no
+`AndroidRuntime`, `FATAL`, `UnsatisfiedLink`, or `dlopen` launch crash lines. Summary
+artifact: [`release-apk-smoke.txt`](artifacts/issue-725/release-apk-smoke.txt).
 
 ## Issue And Epic Close-Out
 
-Status: `PENDING`.
+Status: `PENDING_EPIC_COMMENT`.
 
-#725 and #646 must stay open until all #725 ACs pass or are explicitly waived with a
-linked owner decision. No close-out is claimed by this in-progress report.
+#725 is already closed. #646 remains open at the time of this docs-only evidence
+follow-up. Close-out comments must link this report, `v1.0.0-rc.83`, run #83, and the
+known partial device rows before #646 is closed.
