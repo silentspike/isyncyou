@@ -1,0 +1,53 @@
+{
+  "issue": 725,
+  "epic": 646,
+  "status": "in_progress",
+  "generated_at": "2026-07-08T14:15:59Z",
+  "repo": "silentspike/isyncyou",
+  "refs": {
+    "origin_dev": "14e819d8e182a6f440e4c255692e0545cd8c1b0d",
+    "origin_staging": "12d700904bfc86a39463aa00c50488a8b2ed9505",
+    "origin_main": "fdc0eb4d7a6839b97c9fd639ac5ba66514e401a7",
+    "evidence_base_commit": "b289ba7d3a4e5f3476bba93592f8ddf5a05b5a97"
+  },
+  "gate": {
+    "issues_718_724_closed": true,
+    "issue_725_open": true,
+    "issue_646_open": true,
+    "open_prs": 0,
+    "open_promote_prs": 0,
+    "codeql_main_run": {
+      "number": 221,
+      "head_sha": "fdc0eb4d7a6839b97c9fd639ac5ba66514e401a7",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  },
+  "host_gates": {
+    "status": "pass",
+    "artifact": "docs/evidence/artifacts/issue-725/host-gates.txt"
+  },
+  "android_debug_build": {
+    "status": "pass",
+    "artifact": "docs/evidence/artifacts/issue-725/android-debug-build.txt",
+    "apk_sha256": "8f2c3f23e3f7b2cbde7342f24b8211ec6d2b02a65fba50eaee047599744915f7"
+  },
+  "device_e2e": {
+    "status": "pending",
+    "rows": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+  },
+  "release": {
+    "status": "pending",
+    "latest_completed_release_run_before_725": {
+      "number": 81,
+      "conclusion": "cancelled",
+      "head_sha": "d44320126fdd1a62e307ac3f40dc123f9cdffd91"
+    },
+    "latest_prerelease_before_725": "v1.0.0-rc.80"
+  },
+  "notes": [
+    "No release workflow has been dispatched for #725 yet.",
+    "No device E2E row is marked pass until fresh Pixel 8 Pro evidence is captured.",
+    "No issue or epic close-out is claimed by this in-progress summary."
+  ]
+}

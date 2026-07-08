@@ -1,0 +1,37 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-08T14:15:59Z",
+  "commit": "b289ba7d3a4e5f3476bba93592f8ddf5a05b5a97",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-OPS-006",
+      "claim": "Fresh #725 host gates were captured against the current release-closeout branch.",
+      "method": "command",
+      "command": "cargo +1.95.0 fmt --all --check && node --check gui/webui/src/app.js && cargo +1.95.0 clippy --workspace --all-targets -- -D warnings && cargo +1.95.0 test --workspace --no-fail-fast && python3 tools/check_traceability.py && python3 tools/check_evidence.py && python3 tools/check_workflow_pins.py && git diff --check origin/dev...HEAD",
+      "result": "pass",
+      "evidence": "All listed host gates passed; see the captured log for exact command output.",
+      "artifact": "docs/evidence/artifacts/issue-725/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AND-001",
+      "claim": "The local Android debug build path used for device evidence builds and test-compiles successfully.",
+      "method": "command",
+      "command": "(cd android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin :app:assembleDebug && sha256sum app/build/outputs/apk/debug/app-debug.apk)",
+      "result": "pass",
+      "evidence": "Gradle build was successful; debug APK SHA256 is 8f2c3f23e3f7b2cbde7342f24b8211ec6d2b02a65fba50eaee047599744915f7.",
+      "artifact": "docs/evidence/artifacts/issue-725/android-debug-build.txt"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-OPS-004",
+      "claim": "The edited workflow files still satisfy the immutable GitHub Actions pin policy.",
+      "method": "command",
+      "command": "python3 tools/check_workflow_pins.py",
+      "result": "pass",
+      "evidence": "workflow action pins: 126 action refs checked; OK - every external workflow action is pinned to a commit SHA.",
+      "artifact": "docs/evidence/artifacts/issue-725/host-gates.txt"
+    }
+  ]
+}
