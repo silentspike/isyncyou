@@ -7254,6 +7254,18 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(writes.moves.lock().unwrap().is_empty());
 
         assert!(mobile.confirm_biometric(&pat));
+        for changed in [
+            "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P2&name=N%3A%221",
+            "/api/v1/onedrive/move?account=a&id=Other&parent=P%5D1&name=N%3A%221",
+            "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=Other",
+        ] {
+            assert_eq!(
+                mobile.route(&post(&format!("{changed}&_pat={pat}"))).status,
+                403,
+                "confirmed move token must not authorize a mutated action: {changed}"
+            );
+            assert!(writes.moves.lock().unwrap().is_empty());
+        }
         assert_eq!(
             mobile
                 .route(&post(&format!(
@@ -7381,6 +7393,23 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "wrong biometric token must not persist the mode"
         );
         assert!(mobile.confirm_biometric(&pat));
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/onedrive/mode?account=a&folder=Archive%3A%5D&mode=offline&_pat={pat}"
+                )))
+                .status,
+            403,
+            "confirmed Offline-mode token must not authorize another folder"
+        );
+        assert!(
+            !modes
+                .modes("a")
+                .unwrap()
+                .folder_modes
+                .contains_key("Archive:]"),
+            "folder-mismatched biometric token must not persist the other folder"
+        );
         assert_eq!(
             mobile
                 .route(&post(&format!(
