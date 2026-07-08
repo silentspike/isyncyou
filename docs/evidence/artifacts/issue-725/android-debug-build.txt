@@ -1,4 +1,24 @@
-Issue #725 Android debug gates
+Issue #725 Row D fix Android debug gate addendum
+branch=feature/om-725
+head=40e86cc42d60cfa31cf24b8ea249606f481153ed
+started_at=2026-07-08T16:42:26Z
+
+$ ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin :app:assembleDebug
+BUILD SUCCESSFUL in 6s
+46 actionable tasks: 6 executed, 40 up-to-date
+
+$ sha256sum android/app/build/outputs/apk/debug/app-debug.apk
+78dc2b78cb0224e5b76fcfdda6341c2035240d803c953c3dea3d87e7cad77796  android/app/build/outputs/apk/debug/app-debug.apk
+
+$ adb -s 3B301FDJG0020Z install -r android/app/build/outputs/apk/debug/app-debug.apk
+Performing Streamed Install
+Success
+
+$ adb cleanup
+temporary om725-sealbody.dex helper removed from app cache and /data/local/tmp; /tmp/om725-seal-helper removed; airplane_mode_on=0
+
+
+Original Issue #725 Android debug gates
 branch=feature/om-725
 head=9048679c2ebcce9cdb5bb233a5c2a967e0bb4408
 started_at=2026-07-08T16:12:21+02:00

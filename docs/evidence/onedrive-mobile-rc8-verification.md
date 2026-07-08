@@ -1,8 +1,8 @@
 # OneDrive Mobile RC8 Verification (#725)
 
-Issue: [#725](https://github.com/silentspike/isyncyou/issues/725)  
-Epic: [#646](https://github.com/silentspike/isyncyou/issues/646)  
-Repo: `silentspike/isyncyou`  
+Issue: [#725](https://github.com/silentspike/isyncyou/issues/725)
+Epic: [#646](https://github.com/silentspike/isyncyou/issues/646)
+Repo: `silentspike/isyncyou`
 Report status: `IN_PROGRESS_PARTIAL_DEVICE`
 
 This report records the #725 release-governance close-out evidence. It is intentionally
@@ -92,7 +92,7 @@ artifact proves only a subset of the requested behavior.
 | A | Mode 1 online browse/open; no local store write | PASS | [`device-modes-probe-raw.json`](artifacts/issue-725/device-modes-probe-raw.json) |
 | B | Mode configuration and persistence | PASS | [`device-modes-probe-raw.json`](artifacts/issue-725/device-modes-probe-raw.json) |
 | C | Mode 2 Sync lazy cache body path | PASS | [`device-modes-probe-raw.json`](artifacts/issue-725/device-modes-probe-raw.json), [`device-modes-files.txt`](artifacts/issue-725/device-modes-files.txt) |
-| D | Mode 3 Offline materialization, airplane open, writeback, free-up guard | PARTIAL/BLOCKED | Materialization proved in [`device-modes-probe-raw.json`](artifacts/issue-725/device-modes-probe-raw.json) and [`device-modes-files.txt`](artifacts/issue-725/device-modes-files.txt); true airplane-mode and writeback remain blocked without USB ADB |
+| D | Mode 3 Offline materialization, airplane open, writeback, free-up guard | PASS | Materialization proved in [`device-modes-probe-raw.json`](artifacts/issue-725/device-modes-probe-raw.json) and [`device-modes-files.txt`](artifacts/issue-725/device-modes-files.txt); USB-Airplane local open proved in [`device-offline-airplane-freeup-usb.json`](artifacts/issue-725/device-offline-airplane-freeup-usb.json) and [`offline-airplane-viewer-usb.png`](artifacts/issue-725/screenshots/offline-airplane-viewer-usb.png); free-up cloud-survival proved in [`device-freeup-cloud-survival-usb.json`](artifacts/issue-725/device-freeup-cloud-survival-usb.json); sealed local edit -> mobile writeback -> Graph new version -> cleanup proved in [`device-writeback-sealed-usb.json`](artifacts/issue-725/device-writeback-sealed-usb.json) |
 | E | Cloud create/rename/move/delete with biometric gate and Graph revert | PARTIAL | [`device-cloud-ops-predelete.json`](artifacts/issue-725/device-cloud-ops-predelete.json), [`device-cloud-delete-result.json`](artifacts/issue-725/device-cloud-delete-result.json), [`device-cloud-delete-graph-revert.json`](artifacts/issue-725/device-cloud-delete-graph-revert.json); the delete BiometricPrompt window was not captured |
 | F | Upload/replace plus root upload | PASS | [`device-upload-replace-root-rerun.json`](artifacts/issue-725/device-upload-replace-root-rerun.json) |
 | G | Share/invite with permission verification and revert | PARTIAL | Link share PASS and reverted in [`device-share-link-permission.json`](artifacts/issue-725/device-share-link-permission.json); invite live-send skipped without a controlled recipient |
@@ -101,11 +101,21 @@ artifact proves only a subset of the requested behavior.
 | J | No general mobile TCP data listener | PASS | [`bridge-isolation-probe.json`](artifacts/issue-725/bridge-isolation-probe.json) |
 | K | #723 biometric risk catalogue re-check | PARTIAL | [`device-biometric-risk-recheck.json`](artifacts/issue-725/device-biometric-risk-recheck.json) proves offline-mode biometric gating and materialization; [`device-biometric-risk-mode-clear.txt`](artifacts/issue-725/device-biometric-risk-mode-clear.txt) proves stale mode cleanup; move-out and bulk cleanup were not completed |
 
-Notes on the partial rows:
+Notes on Row D completion and the remaining partial rows:
 
-- Row D true airplane-mode proof was not run because the only visible ADB transport was
-  Wi-Fi (`10.0.0.131:46095`). Enabling airplane mode over that transport can strand the
-  device. This row requires USB ADB before it can be completed safely.
+- Row D was re-run with USB ADB (`3B301FDJG0020Z`). The phone entered airplane
+  mode (`settings=1`, `cmd connectivity airplane-mode=enabled`), and both
+  `/api/v1/body` and `/api/v1/onedrive/open` returned the offline file's local
+  text while offline. The viewer screenshot was captured under airplane mode.
+  Free-up evicted only the local body (`body_state=missing`, body route 404) while
+  Graph metadata/content survived with the same SHA-256. A sealed local sync-root
+  edit (`ISYE` magic) then produced a mobile scoped-pass report with `1 modified`;
+  Graph showed the edited body at eTag `...,2`. During this probe a stale configured
+  OneDrive scope returned `delta: Fatal(404)` and initially blocked the whole
+  offline pass; #725 fixes that by skipping stale 404 scopes and continuing the
+  remaining scopes, with a focused connector regression test. Cleanup restored the
+  cloud and local body to the original content, store `sync_state=clean`, and
+  `conflict_state=null`.
 - Row E delete completed and Graph returned 404 for the deleted item, followed by a
   204 fixture-root cleanup. The saved `dumpsys window` poll did not catch the secure
   BiometricPrompt, so the biometric-window sub-proof remains partial.

@@ -2,13 +2,13 @@
   "issue": 725,
   "epic": 646,
   "status": "in_progress_partial_device",
-  "generated_at": "2026-07-08T14:15:59Z",
+  "generated_at": "2026-07-08T16:42:26Z",
   "repo": "silentspike/isyncyou",
   "refs": {
     "origin_dev": "14e819d8e182a6f440e4c255692e0545cd8c1b0d",
     "origin_staging": "12d700904bfc86a39463aa00c50488a8b2ed9505",
     "origin_main": "fdc0eb4d7a6839b97c9fd639ac5ba66514e401a7",
-    "evidence_base_commit": "b289ba7d3a4e5f3476bba93592f8ddf5a05b5a97"
+    "evidence_base_commit": "40e86cc42d60cfa31cf24b8ea249606f481153ed"
   },
   "gate": {
     "issues_718_724_closed": true,
@@ -30,7 +30,7 @@
   "android_debug_build": {
     "status": "pass",
     "artifact": "docs/evidence/artifacts/issue-725/android-debug-build.txt",
-    "apk_sha256": "8f2c3f23e3f7b2cbde7342f24b8211ec6d2b02a65fba50eaee047599744915f7"
+    "apk_sha256": "78dc2b78cb0224e5b76fcfdda6341c2035240d803c953c3dea3d87e7cad77796"
   },
   "device_e2e": {
     "status": "partial",
@@ -51,8 +51,16 @@
         ]
       },
       "D": {
-        "status": "partial_blocked",
-        "reason": "materialization and sealed sync-root target proved; true airplane-mode and writeback require USB ADB"
+        "status": "pass",
+        "artifacts": [
+          "docs/evidence/artifacts/issue-725/device-modes-probe-raw.json",
+          "docs/evidence/artifacts/issue-725/device-modes-files.txt",
+          "docs/evidence/artifacts/issue-725/device-offline-airplane-freeup-usb.json",
+          "docs/evidence/artifacts/issue-725/screenshots/offline-airplane-viewer-usb.png",
+          "docs/evidence/artifacts/issue-725/device-freeup-cloud-survival-usb.json",
+          "docs/evidence/artifacts/issue-725/device-writeback-sealed-usb.json"
+        ],
+        "finding_fixed": "stale per-folder OneDrive scope 404 no longer aborts the mobile scoped pass before writeback"
       },
       "E": {
         "status": "partial",
@@ -95,8 +103,8 @@
   },
   "notes": [
     "No release workflow has been dispatched for #725 yet.",
-    "Fresh Pixel 8 Pro debug evidence was captured, but several rows remain partial or blocked.",
-    "Airplane-mode evidence requires a USB ADB transport; Wi-Fi ADB was the only visible transport during this run.",
-    "No issue or epic close-out is claimed by this in-progress summary."
+    "No issue or epic close-out is claimed by this in-progress summary.",
+    "Row D is now PASS with USB airplane-open, free-up cloud-survival, and sealed local writeback evidence.",
+    "During Row D, #725 fixed stale OneDrive scope 404 tolerance so one deleted configured scope cannot abort remaining offline scopes/writeback."
   ]
 }

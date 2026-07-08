@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-08T14:15:59Z",
-  "commit": "b289ba7d3a4e5f3476bba93592f8ddf5a05b5a97",
+  "generated_at": "2026-07-08T16:42:26Z",
+  "commit": "40e86cc42d60cfa31cf24b8ea249606f481153ed",
   "entries": [
     {
       "id": "EV-001",
@@ -20,7 +20,7 @@
       "method": "command",
       "command": "(cd android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin :app:assembleDebug && sha256sum app/build/outputs/apk/debug/app-debug.apk)",
       "result": "pass",
-      "evidence": "Gradle build was successful; debug APK SHA256 is 8f2c3f23e3f7b2cbde7342f24b8211ec6d2b02a65fba50eaee047599744915f7.",
+      "evidence": "Gradle build was successful; debug APK SHA256 is 78dc2b78cb0224e5b76fcfdda6341c2035240d803c953c3dea3d87e7cad77796.",
       "artifact": "docs/evidence/artifacts/issue-725/android-debug-build.txt"
     },
     {
@@ -36,12 +36,32 @@
     {
       "id": "EV-004",
       "requirement": "REQ-AND-016",
-      "claim": "Pixel 8 Pro Mode 1/2/3 target evidence was captured, with full PASS only for online, mode persistence, and sync lazy-cache rows.",
+      "claim": "Pixel 8 Pro Mode 1/2/3 target evidence was captured, including Mode 3 airplane-open, free-up cloud survival, and sealed local writeback.",
       "method": "probe",
       "command": "Pixel 8 Pro CDP probe plus run-as filesystem checks under device-lock om-725",
       "result": "pass",
-      "evidence": "Rows A/B/C pass; Row D materialization is present but airplane-mode and writeback remain blocked without USB ADB.",
+      "evidence": "Rows A/B/C pass. Row D is PASS: materialization, USB airplane-open, free-up local eviction with Graph survival, and sealed local edit -> mobile writeback -> Graph new version were all captured.",
       "artifact": "docs/evidence/artifacts/issue-725/device-modes-probe-raw.json"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AND-016",
+      "claim": "Pixel 8 Pro USB-Airplane evidence proved a Mode 3 offline file opened from the local body path while the phone was offline.",
+      "method": "probe",
+      "command": "Pixel 8 Pro USB ADB + CDP probe: enable airplane mode, read /api/v1/body and /api/v1/onedrive/open, capture viewer screenshot, disable airplane mode and delete Graph fixture",
+      "result": "pass",
+      "evidence": "Airplane mode was enabled via USB ADB; local body and OneDrive open returned the expected file text while offline; viewer iframe rendered the same text; airplane mode was disabled and fixture cleanup returned 204.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-offline-airplane-freeup-usb.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AND-016",
+      "claim": "Mode 3 free-up and writeback were verified on Pixel 8 Pro over USB with Graph readbacks and cleanup.",
+      "method": "probe",
+      "command": "Pixel 8 Pro USB ADB + CDP + Graph: free-up materialized file, verify cloud body survives, sealed local sync-root edit, wait for mobile scoped-pass writeback, verify Graph new version, restore original.",
+      "result": "pass",
+      "evidence": "Free-up changed local body_state to missing and body route 404 while Graph SHA-256 stayed unchanged; supporting artifact: docs/evidence/artifacts/issue-725/device-freeup-cloud-survival-usb.json. Sealed local edit had ISYE magic; after fixing stale-scope 404 tolerance, mobile scoped pass reported 1 modified and Graph content/eTag changed; cleanup restored cloud/local original with store clean and no conflict.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-writeback-sealed-usb.json"
     },
     {
       "id": "EV-005",

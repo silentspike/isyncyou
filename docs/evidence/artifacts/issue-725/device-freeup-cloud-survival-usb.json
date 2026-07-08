@@ -1,0 +1,94 @@
+{
+  "schema": "isyncyou.issue725.device-freeup-cloud-survival.v1",
+  "status": "pass",
+  "created_at": "2026-07-08T16:00:51.892025Z",
+  "device": {
+    "serial": "3B301FDJG0020Z",
+    "package": "com.silentspike.isyncyou.debug",
+    "transport": "usb"
+  },
+  "cdp": {
+    "target_url": "https://appassets.androidplatform.net/",
+    "socket": "webview_devtools_remote_17241",
+    "transport": "bridge"
+  },
+  "graph_scopes_used": [
+    "Files.ReadWrite/User.Read or Files.ReadWrite.All/User.Read from local MSAL cache; access token redacted"
+  ],
+  "target": {
+    "name": "freeup-guard.txt",
+    "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+    "parent_id": null
+  },
+  "preflight": {
+    "mode_parent": "offline",
+    "store_row": {
+      "name": "freeup-guard.txt",
+      "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "body_state": "available",
+      "body_location": "sync",
+      "has_body": true,
+      "content_state": "materialized",
+      "sync_state": "clean",
+      "size": 37,
+      "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\""
+    }
+  },
+  "local_before": {
+    "ok": true,
+    "status": 200,
+    "body_sha256": "0daa67715cc53428476e72f775c411b92c14d80f77a938e40759d92c2174815a",
+    "body_preview": "OM660 free-up cloud-survival fixture\n"
+  },
+  "free_up_response": {
+    "ok": true,
+    "response": {
+      "ok": true
+    }
+  },
+  "local_after_immediate": {
+    "ok": true,
+    "body": {
+      "status": 404,
+      "body_preview": "{\"error\":\"body file missing\"}"
+    },
+    "row": {
+      "name": "freeup-guard.txt",
+      "body_state": "missing",
+      "body_location": "none",
+      "has_body": false,
+      "content_state": "cached",
+      "sync_state": "clean",
+      "size": 37,
+      "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\""
+    }
+  },
+  "graph_before": {
+    "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+    "name": "freeup-guard.txt",
+    "size": 37,
+    "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+    "cTag": "\"c:{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+    "lastModifiedDateTime": "2026-07-06T13:56:25Z",
+    "sha256": "0daa67715cc53428476e72f775c411b92c14d80f77a938e40759d92c2174815a",
+    "bytes": 37,
+    "preview": "OM660 free-up cloud-survival fixture\n"
+  },
+  "graph_after": {
+    "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+    "name": "freeup-guard.txt",
+    "size": 37,
+    "eTag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+    "cTag": "\"c:{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+    "lastModifiedDateTime": "2026-07-06T13:56:25Z",
+    "sha256": "0daa67715cc53428476e72f775c411b92c14d80f77a938e40759d92c2174815a",
+    "bytes": 37,
+    "preview": "OM660 free-up cloud-survival fixture\n"
+  },
+  "assertions": {
+    "free_up_route_ok": true,
+    "cloud_metadata_survives": true,
+    "cloud_body_hash_unchanged": true,
+    "local_body_evicted_or_store_missing": true
+  }
+}

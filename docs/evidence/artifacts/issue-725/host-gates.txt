@@ -1,4 +1,46 @@
-Issue #725 host gates
+Issue #725 Row D fix gate addendum
+branch=feature/om-725
+head=40e86cc42d60cfa31cf24b8ea249606f481153ed
+started_at=2026-07-08T16:42:26Z
+
+$ cargo +1.95.0 fmt --all --check
+PASS
+
+$ node --check gui/webui/src/app.js
+PASS
+
+$ git diff --check
+PASS
+
+$ python3 tools/check_evidence.py --manifest docs/evidence/issue-725-manifest.json
+PASS
+
+$ cargo +1.95.0 test -p isyncyou-connectors scoped_delta_skips_stale_404_scope_and_continues -- --nocapture
+PASS — 1 passed; stale OneDrive scope 404 is skipped and the healthy scope still ingests.
+
+$ cargo +1.95.0 test -p isyncyou-connectors -p isyncyou-mobile -- --nocapture
+PASS — isyncyou-connectors 138 passed / 24 ignored; isyncyou-mobile 20 passed.
+
+$ cargo +1.95.0 clippy -p isyncyou-connectors -p isyncyou-mobile --all-targets -- -D warnings
+PASS
+
+$ python3 tools/check_traceability.py
+PASS — requirements: 65 total | 59 implemented | 6 planned.
+
+$ python3 tools/check_workflow_pins.py
+PASS — 126 action refs checked; every external workflow action is pinned to a commit SHA.
+
+$ python3 tools/check_evidence.py
+PASS — sample manifest schema-valid and all cited artifacts/tests/requirements exist.
+
+$ cargo +1.95.0 test --workspace --no-fail-fast
+PASS — workspace tests and doc-tests completed successfully.
+
+$ cargo +1.95.0 clippy --workspace --all-targets -- -D warnings
+PASS
+
+
+Original Issue #725 host gates
 branch=feature/om-725
 head=9048679c2ebcce9cdb5bb233a5c2a967e0bb4408
 started_at=2026-07-08T16:12:21+02:00
