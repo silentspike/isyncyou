@@ -1,0 +1,65 @@
+{
+  "issue": "723",
+  "generated_at": "2026-07-08T07:43:43.658657Z",
+  "branch": "feature/om-723",
+  "head": "de361f6",
+  "package": "com.silentspike.isyncyou.debug",
+  "device_serial": "10.0.0.130:38655",
+  "apk_sha256": "6f0916e1e67a6b3a98bde3cfe0b148f236d6cbb18fceb78ff15cf1c1e6639a59",
+  "cdp_target": {
+    "id": "281E5F140539DC02DC315719FFDAC8B1",
+    "title": "iSyncYou",
+    "url": "https://appassets.androidplatform.net/"
+  },
+  "probe": {
+    "route": "POST /api/v1/onedrive/move",
+    "path_redacted": "/api/v1/onedrive/move?account=me&id=<missing-source-id>&parent=__om723_parent&name=probe.txt",
+    "reason_for_missing_source_fixture": "The live risk classifier treats a missing source item as unknown risk on mobile, which exercises the fail-closed gate before move_item or Graph mutation. The normal post path was cancelled before native confirmation."
+  },
+  "raw_bridge_challenge": {
+    "status": 200,
+    "body": {
+      "status": "confirmation_required",
+      "op": "move-out-of-protected",
+      "account": "me",
+      "service": "onedrive",
+      "item_redacted": "[\"onedrive_move\",\"<missing-source-id>\",\"__om723_parent\",\"probe.txt\"]",
+      "pending_action_id": {
+        "redacted": true,
+        "length": 48,
+        "sha256_prefix": "a1dede0e6d9e"
+      }
+    }
+  },
+  "unconfirmed_pat_reissue": {
+    "status": 403,
+    "body": {
+      "error": "biometric confirmation invalid: NotConfirmed"
+    }
+  },
+  "normal_post_path": {
+    "started": true,
+    "native_prompt_focus_before_cancel": [
+      "Window #16: WindowStateAnimator{caad3cb BiometricPrompt}",
+      "mCurrentFocus=Window{b07aea1 u0 BiometricPrompt}",
+      "mFocusedWindow=Window{b07aea1 u0 BiometricPrompt}"
+    ],
+    "cancel_action": "adb shell input keyevent 4",
+    "post_cancel_state": {
+      "state": "rejected",
+      "message": "Confirmation cancelled"
+    },
+    "focus_after_cancel": [
+      "mCurrentFocus=Window{7f042de u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
+      "mFocusedWindow=Window{7f042de u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}"
+    ]
+  },
+  "claims": {
+    "confirmation_required_move_out_of_protected": true,
+    "unconfirmed_pat_rejected": true,
+    "native_biometric_prompt_observed": true,
+    "cancelled_post_rejected": true,
+    "graph_move_not_attempted": "not_applicable_missing_source_cancelled_before_confirm",
+    "large_offline_mode_live_not_run": "host tests cover classifier thresholds; no live large-folder fixture mutation was performed in this evidence run"
+  }
+}
