@@ -290,7 +290,7 @@ fn run(args: &Args) -> Result<(), String> {
         live_interval.clone(),
         // Desktop runs the whole-tree sync_once, not the mobile offline pass, so this stays
         // idle (GET /onedrive/transfers reports empty) — the wiring is for the mobile profile.
-        isyncyou_connectors::SharedProgress::new(),
+        isyncyou_app_host::SharedProgress::new(),
     )
     .with_restore(
         Arc::new(isyncyou_app_host::DaemonRestore::new(cfg.clone()))
