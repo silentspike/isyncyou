@@ -10,9 +10,9 @@
 //! It returns a structured [`SyncReport`] and does **no** printing: the caller
 //! decides how to surface progress (stdout lines, an activity-log row, a metric).
 
-use isyncyou_connectors::MailPreview;
+use isyncyou_connectors::{DownloadBodyTarget, Downloader, MailPreview};
 use isyncyou_core::guard::{DeleteGuard, Direction, GuardVerdict};
-use isyncyou_core::Config;
+use isyncyou_core::{Config, OneDriveMode};
 use isyncyou_graph::GraphClient;
 use isyncyou_pathmap::MappingTable;
 use isyncyou_store::{Item, Store};
@@ -1163,8 +1163,115 @@ pub fn free_up_for(cfg: &Config, account: &str, id: &str) -> Result<bool, String
         .map_err(|e| e.to_string())
 }
 
-/// #659 download-now (engine wrapper): open the store + a Graph client and materialize one
-/// item on demand. `Ok(false)` when the transfer policy blocked it (body stays `missing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadNowResult {
+    pub downloaded: bool,
+    pub target: DownloadBodyTarget,
+}
+
+fn onedrive_item_ancestry<'a>(by_id: &HashMap<&'a str, &'a Item>, it: &'a Item) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut cur = it;
+    for _ in 0..256 {
+        let Some(parent) = cur.parent_remote_id.as_deref() else {
+            break;
+        };
+        out.push(parent);
+        match by_id.get(parent) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    out
+}
+
+fn onedrive_effective_mode_for_item(
+    cfg: &Config,
+    account: &str,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) -> OneDriveMode {
+    let modes = cfg.onedrive_modes.get(account).cloned().unwrap_or_default();
+    let ancestry = onedrive_item_ancestry(by_id, it);
+    modes.effective_mode(&it.remote_id, &ancestry)
+}
+
+fn download_now_target_for_mode(mode: OneDriveMode) -> Result<DownloadBodyTarget, String> {
+    match mode {
+        OneDriveMode::Sync => Ok(DownloadBodyTarget::Cache),
+        OneDriveMode::Offline => Ok(DownloadBodyTarget::Sync),
+        OneDriveMode::Online => Err("download-now: online item unavailable".into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_now_for_inner<D: Downloader>(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    store: &Store,
+    downloader: &D,
+    dev: isyncyou_core::policy::DeviceState,
+    now: &str,
+    progress: &dyn isyncyou_connectors::ProgressSink,
+) -> Result<DownloadNowResult, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let items = store
+        .items_by_service(account, "onedrive")
+        .map_err(|e| e.to_string())?;
+    let by_id: HashMap<&str, &Item> = items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+    let it = by_id
+        .get(id)
+        .copied()
+        .ok_or_else(|| format!("download-now: unknown item {id}"))?;
+    let mode = onedrive_effective_mode_for_item(cfg, account, &by_id, it);
+    let target = download_now_target_for_mode(mode)?;
+    let downloaded = isyncyou_connectors::download_one_to_target(
+        store,
+        downloader,
+        account,
+        id,
+        &acc.sync_root,
+        &acc.cache_root,
+        target,
+        now,
+        &cfg.sync,
+        &dev,
+        progress,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(DownloadNowResult { downloaded, target })
+}
+
+/// #724 download-now (engine wrapper): open the store + a Graph client and download one
+/// item on demand into the root implied by its current effective OneDrive mode.
+#[allow(clippy::too_many_arguments)]
+pub fn download_now_for_with_target(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    sync_token: String,
+    dev: isyncyou_core::policy::DeviceState,
+    now: &str,
+    progress: &dyn isyncyou_connectors::ProgressSink,
+) -> Result<DownloadNowResult, String> {
+    let acc = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| format!("no account '{account}'"))?;
+    let store =
+        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let client = GraphClient::new(sync_token);
+    download_now_for_inner(cfg, account, id, &store, &client, dev, now, progress)
+}
+
+/// #659 compatibility wrapper: returns only whether a body was downloaded. New #724 callers that
+/// need the cache-vs-sync target should use [`download_now_for_with_target`].
 #[allow(clippy::too_many_arguments)]
 pub fn download_now_for(
     cfg: &Config,
@@ -1175,26 +1282,8 @@ pub fn download_now_for(
     now: &str,
     progress: &dyn isyncyou_connectors::ProgressSink,
 ) -> Result<bool, String> {
-    let acc = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}'"))?;
-    let store =
-        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
-    let client = GraphClient::new(sync_token);
-    isyncyou_connectors::download_one(
-        &store,
-        &client,
-        account,
-        id,
-        &acc.sync_root,
-        now,
-        &cfg.sync,
-        &dev,
-        progress,
-    )
-    .map_err(|e| e.to_string())
+    download_now_for_with_target(cfg, account, id, sync_token, dev, now, progress)
+        .map(|result| result.downloaded)
 }
 
 /// #659 Conflict Center (engine wrapper): resolve one item's keep-both conflict
@@ -1254,6 +1343,60 @@ pub fn list_conflicts_for(cfg: &Config, account: &str) -> Result<Vec<Item>, Stri
 mod tests {
     use super::*;
 
+    struct MockDownloader(std::collections::HashMap<String, Vec<u8>>);
+    impl Downloader for MockDownloader {
+        fn download(&self, remote_id: &str) -> Result<Vec<u8>, String> {
+            self.0
+                .get(remote_id)
+                .cloned()
+                .ok_or_else(|| format!("no content for {remote_id}"))
+        }
+    }
+
+    fn test_account(sync_root: PathBuf, archive_root: PathBuf, cache_root: PathBuf) -> Config {
+        Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "acc".into(),
+                username: "acc@example.com".into(),
+                sync_root,
+                archive_root,
+                cache_root,
+                mount_point: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn seed_download_now_tree(store: &Store, file_parent: &str) {
+        let mut root = Item::new("acc", "onedrive", "root", "Root", "folder");
+        root.local_path = Some("Root".into());
+        store.upsert_item(&root).unwrap();
+
+        let mut child = Item::new("acc", "onedrive", "child", "Child", "folder");
+        child.local_path = Some("Child".into());
+        child.parent_remote_id = Some("root".into());
+        store.upsert_item(&child).unwrap();
+
+        let mut file = Item::new("acc", "onedrive", "file", "note.txt", "file");
+        file.local_path = Some("note.txt".into());
+        file.parent_remote_id = Some(file_parent.into());
+        file.size = Some(4);
+        store.upsert_item(&file).unwrap();
+    }
+
+    fn set_folder_mode(cfg: &mut Config, folder_id: &str, mode: OneDriveMode) {
+        let modes = cfg.onedrive_modes.entry("acc".into()).or_default();
+        modes.folder_modes.insert(folder_id.into(), mode);
+    }
+
+    fn downloader() -> MockDownloader {
+        MockDownloader(
+            [("file".to_string(), b"DATA".to_vec())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
     #[test]
     fn offline_sync_once_is_noop_without_offline_scopes() {
         // An account with no `onedrive_modes` → `scopes_from_modes` is empty → the pass returns
@@ -1277,6 +1420,253 @@ mod tests {
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.uploaded_creates, 0);
         assert_eq!(report.cloud_deleted, 0);
+    }
+
+    #[test]
+    fn download_now_target_for_sync_mode_is_cache() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "root");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+        set_folder_mode(&mut cfg, "root", OneDriveMode::Sync);
+        let items = store.items_by_service("acc", "onedrive").unwrap();
+        let by_id: HashMap<&str, &Item> =
+            items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+        let file = *by_id.get("file").unwrap();
+
+        assert_eq!(
+            download_now_target_for_mode(onedrive_effective_mode_for_item(
+                &cfg, "acc", &by_id, file
+            ))
+            .unwrap(),
+            DownloadBodyTarget::Cache
+        );
+    }
+
+    #[test]
+    fn download_now_target_for_offline_mode_is_sync() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "root");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+        set_folder_mode(&mut cfg, "root", OneDriveMode::Offline);
+        let items = store.items_by_service("acc", "onedrive").unwrap();
+        let by_id: HashMap<&str, &Item> =
+            items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+        let file = *by_id.get("file").unwrap();
+
+        assert_eq!(
+            download_now_target_for_mode(onedrive_effective_mode_for_item(
+                &cfg, "acc", &by_id, file
+            ))
+            .unwrap(),
+            DownloadBodyTarget::Sync
+        );
+    }
+
+    #[test]
+    fn download_now_online_mode_is_unavailable() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "root");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+        let items = store.items_by_service("acc", "onedrive").unwrap();
+        let by_id: HashMap<&str, &Item> =
+            items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+        let file = *by_id.get("file").unwrap();
+
+        assert_eq!(
+            download_now_target_for_mode(onedrive_effective_mode_for_item(
+                &cfg, "acc", &by_id, file
+            ))
+            .unwrap_err(),
+            "download-now: online item unavailable"
+        );
+    }
+
+    #[test]
+    fn download_now_effective_mode_uses_deepest_ancestor() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "child");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+        set_folder_mode(&mut cfg, "root", OneDriveMode::Offline);
+        set_folder_mode(&mut cfg, "child", OneDriveMode::Sync);
+        let items = store.items_by_service("acc", "onedrive").unwrap();
+        let by_id: HashMap<&str, &Item> =
+            items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+        let file = *by_id.get("file").unwrap();
+
+        assert_eq!(
+            onedrive_effective_mode_for_item(&cfg, "acc", &by_id, file),
+            OneDriveMode::Sync,
+            "the deepest explicit mode must own the download-now target"
+        );
+    }
+
+    #[test]
+    fn download_now_default_mode_is_honored_for_known_rows() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "root");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+        cfg.onedrive_modes
+            .entry("acc".into())
+            .or_default()
+            .default_mode = OneDriveMode::Sync;
+        let items = store.items_by_service("acc", "onedrive").unwrap();
+        let by_id: HashMap<&str, &Item> =
+            items.iter().map(|it| (it.remote_id.as_str(), it)).collect();
+        let file = *by_id.get("file").unwrap();
+
+        assert_eq!(
+            download_now_target_for_mode(onedrive_effective_mode_for_item(
+                &cfg, "acc", &by_id, file
+            ))
+            .unwrap(),
+            DownloadBodyTarget::Cache,
+            "known-row management downloads honor default_mode; scoped background passes differ"
+        );
+    }
+
+    #[test]
+    fn download_now_for_inner_sync_writes_cache_root() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "root");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+        set_folder_mode(&mut cfg, "root", OneDriveMode::Sync);
+
+        let result = download_now_for_inner(
+            &cfg,
+            "acc",
+            "file",
+            &store,
+            &downloader(),
+            isyncyou_core::policy::DeviceState::always_on(u64::MAX),
+            "2026-07-08T00:00:00Z",
+            &(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            DownloadNowResult {
+                downloaded: true,
+                target: DownloadBodyTarget::Cache
+            }
+        );
+        assert_eq!(
+            isyncyou_core::envelope::read_body(&dir.path().join("cache/Root/note.txt")).unwrap(),
+            b"DATA"
+        );
+        assert!(!dir.path().join("sync/Root/note.txt").exists());
+        let item = store.get_item("acc", "onedrive", "file").unwrap().unwrap();
+        assert_eq!(item.content_state.as_deref(), Some("cached"));
+        assert_eq!(item.body_location.as_deref(), Some("cache"));
+        assert_eq!(item.body_state.as_deref(), Some("available"));
+        assert_eq!(
+            store.get_synced_state("acc", "onedrive", "file").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn download_now_for_inner_offline_writes_sync_root() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "root");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+        set_folder_mode(&mut cfg, "root", OneDriveMode::Offline);
+
+        let result = download_now_for_inner(
+            &cfg,
+            "acc",
+            "file",
+            &store,
+            &downloader(),
+            isyncyou_core::policy::DeviceState::always_on(u64::MAX),
+            "2026-07-08T00:00:00Z",
+            &(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            DownloadNowResult {
+                downloaded: true,
+                target: DownloadBodyTarget::Sync
+            }
+        );
+        assert_eq!(
+            isyncyou_core::envelope::read_body(&dir.path().join("sync/Root/note.txt")).unwrap(),
+            b"DATA"
+        );
+        assert!(!dir.path().join("cache/Root/note.txt").exists());
+        let item = store.get_item("acc", "onedrive", "file").unwrap().unwrap();
+        assert_eq!(item.content_state.as_deref(), Some("materialized"));
+        assert_eq!(item.body_location.as_deref(), Some("sync"));
+        assert_eq!(item.body_state.as_deref(), Some("available"));
+        assert!(store
+            .get_synced_state("acc", "onedrive", "file")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn download_now_for_inner_online_rejects_known_missing_body() {
+        let store = Store::open_in_memory().unwrap();
+        seed_download_now_tree(&store, "root");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_account(
+            dir.path().join("sync"),
+            dir.path().join("archive"),
+            dir.path().join("cache"),
+        );
+
+        let err = download_now_for_inner(
+            &cfg,
+            "acc",
+            "file",
+            &store,
+            &downloader(),
+            isyncyou_core::policy::DeviceState::always_on(u64::MAX),
+            "2026-07-08T00:00:00Z",
+            &(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "download-now: online item unavailable");
+        assert!(!dir.path().join("sync/Root/note.txt").exists());
+        assert!(!dir.path().join("cache/Root/note.txt").exists());
     }
 
     #[test]

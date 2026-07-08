@@ -259,6 +259,14 @@ pub fn active_key_id() -> Option<u32> {
         .map(|(id, _)| id)
 }
 
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn reset_body_keys_for_tests() {
+    let mut reg = keys().lock().unwrap_or_else(|e| e.into_inner());
+    reg.active = None;
+    reg.older.clear();
+}
+
 fn key_for_id(key_id: u32) -> Option<BodyKey> {
     let reg = keys().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((id, k)) = reg.active {
@@ -311,6 +319,23 @@ pub fn read_body(path: &Path) -> std::io::Result<Vec<u8>> {
             open(&raw, &key).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         }
         None => Ok(raw), // plaintext (pre-encryption / desktop)
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn read_body_with_key_for_tests(
+    path: &Path,
+    expected_key_id: u32,
+    key: BodyKey,
+) -> std::io::Result<Vec<u8>> {
+    let raw = std::fs::read(path)?;
+    match blob_key_id(&raw) {
+        Some(key_id) if key_id == expected_key_id => {
+            open(&raw, &key).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
+        Some(_) => read_body(path),
+        None => Ok(raw),
     }
 }
 
