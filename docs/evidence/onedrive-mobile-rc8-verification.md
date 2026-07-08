@@ -33,7 +33,13 @@ Branch/commit snapshot at host-gate collection:
 | `origin/dev` | `14e819d8e182a6f440e4c255692e0545cd8c1b0d` |
 | `origin/staging` | `12d700904bfc86a39463aa00c50488a8b2ed9505` |
 | `origin/main` | `fdc0eb4d7a6839b97c9fd639ac5ba66514e401a7` |
-| Evidence branch head before this report | `b289ba7d3a4e5f3476bba93592f8ddf5a05b5a97` |
+| Runtime fix / manifest commit | `40e86cc42d60cfa31cf24b8ea249606f481153ed` |
+
+The #725 evidence manifest is intentionally pinned to the runtime-fix commit above:
+the later Row D artifacts and this Markdown report are docs/evidence-only follow-up
+commits. The manifest is therefore validated without `--require-head`; that option is
+reserved for generated CI manifests that are created after checkout and are expected to
+match the current working tree HEAD.
 
 ## Release Pipeline
 
@@ -68,8 +74,12 @@ Required before this section can pass:
 Debug APK SHA256 from the local Android gate:
 
 ```text
-8f2c3f23e3f7b2cbde7342f24b8211ec6d2b02a65fba50eaee047599744915f7  app/build/outputs/apk/debug/app-debug.apk
+78dc2b78cb0224e5b76fcfdda6341c2035240d803c953c3dea3d87e7cad77796  android/app/build/outputs/apk/debug/app-debug.apk
 ```
+
+The Android gate artifact also keeps the original pre-fix APK checksum from the first
+debug build log. The checksum above is the final Row D fix APK that was installed for
+the USB device re-check.
 
 Evidence-validator boundary: `tools/check_evidence.py` validates
 `docs/evidence/sample-manifest.json` by default. The #725 manifest is separate and must
@@ -78,6 +88,10 @@ be checked explicitly with:
 ```sh
 python3 tools/check_evidence.py --manifest docs/evidence/issue-725-manifest.json
 ```
+
+Do not use `--require-head` for this tracked #725 manifest: it records the exact
+runtime-fix commit whose behavior was exercised, while later committed files are
+sanitized evidence artifacts and narrative report updates.
 
 ## On-Device E2E Matrix
 
