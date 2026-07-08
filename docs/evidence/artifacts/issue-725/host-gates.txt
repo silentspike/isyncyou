@@ -1,0 +1,1251 @@
+Issue #725 host gates
+branch=feature/om-725
+head=9048679c2ebcce9cdb5bb233a5c2a967e0bb4408
+started_at=2026-07-08T16:12:21+02:00
+
+
+$ cargo +1.95.0 fmt --all --check
+
+$ node --check gui/webui/src/app.js
+
+$ python3 tools/check_traceability.py
+requirements: 65 total | 59 implemented | 6 planned | 6 file(s)
+OK — every requirement is well-formed and every implemented requirement is traceable to existing tests.
+
+$ python3 tools/check_evidence.py
+evidence manifest: 43 entries | sample-manifest.json
+OK — manifest is schema-valid; manifest commit exists; every cited requirement exists; every test entry names a real test; every artifact exists.
+
+$ python3 tools/check_workflow_pins.py
+workflow action pins: 126 action refs checked | 18 workflow file(s)
+OK - every external workflow action is pinned to a commit SHA.
+
+$ git diff --check origin/dev...HEAD
+
+$ cargo +1.95.0 clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.69s
+
+$ cargo +1.95.0 test --workspace --no-fail-fast
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.11s
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_acceptance-2fe632bb19ab053f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/chaos.rs (target/debug/deps/chaos-b12562fd74bd41fb)
+
+running 12 tests
+test chaos_410_on_first_request_resyncs ... ok
+test chaos_410_resync_to_empty_snapshot_discards_stale ... ok
+test chaos_disk_full_combines_with_auth_failure ... ok
+test chaos_atomic_write_failure_leaves_no_partial ... ok
+test chaos_disk_full_recovers_to_green ... ok
+test chaos_disk_full_boundary_exact_minimum_is_ok ... ok
+test chaos_overflow_as_first_event_forces_rescan ... ok
+test chaos_overflow_baseline_clean_batch_is_trusted ... ok
+test chaos_resume_from_zero_completes ... ok
+test chaos_resume_honors_server_offset_ahead ... ok
+test chaos_overflow_midstream_drops_everything ... ok
+test chaos_journal_partial_commit_across_crash ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/mvp.rs (target/debug/deps/mvp-7d0592226710da6e)
+
+running 10 tests
+test a4_gone_triggers_reconciliation ... ok
+test a2_delete_guard_both_directions ... ok
+test a5_upload_resume_survives_kill ... ok
+test a3_etag_precondition_no_silent_overwrite ... ok
+test a6_atomic_write_safe_restart ... ok
+test a8_disk_full_is_red ... ok
+test a7_inotify_overflow_forces_rescan ... ok
+test a10_crash_recovery_journal ... ok
+test a9_archive_separate_from_sync_root ... ok
+test a1_no_path_or_name_data_loss ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_agent-de0acb312cb58e0c)
+
+running 58 tests
+test archive::tests::safe_join_allows_normal_relative_paths ... ok
+test archive::tests::safe_join_rejects_escapes_and_absolutes ... ok
+test confirm::tests::expired_token_is_rejected ... ok
+test confirm::tests::a_token_for_another_pending_is_rejected ... ok
+test http::tests::backoff_honours_retry_after_then_exponential ... ok
+test confirm::tests::wrong_token_is_rejected_and_does_not_consume ... ok
+test confirm::tests::confirm_with_right_token_returns_action_and_is_single_use ... ok
+test confirm::tests::unknown_id_is_not_found ... ok
+test http::tests::classify_maps_status_to_action ... ok
+test provider::anthropic::tests::build_messages_round_trips_tool_use_and_result ... ok
+test provider::anthropic::tests::parse_response_extracts_text_and_tool_use_and_usage ... ok
+test provider::anthropic::tests::parse_response_surfaces_api_errors_without_leaking ... ok
+test provider::anthropic::tests::build_request_advertises_the_isyncyou_tool_and_system ... ok
+test provider::openai::tests::build_messages_round_trips_tool_calls_with_string_arguments ... ok
+test provider::openai::tests::parse_response_extracts_text_tool_calls_and_usage ... ok
+test provider::openai::tests::parse_response_surfaces_api_errors ... ok
+test provider::openai::tests::build_request_sets_store_false_by_default_and_advertises_the_tool ... ok
+test retrieval::tests::destructive_action_is_refused_by_the_read_executor ... ok
+test retrieval::tests::export_raw_passthrough_carries_source_ids ... ok
+test retrieval::tests::execute_read_dispatches_search_via_tooaction ... ok
+test retrieval::tests::deep_search_surfaces_keyword_less_candidate_and_excludes_matched ... ok
+test retrieval::tests::list_reports_items_and_service_total ... ok
+test retrieval::tests::read_respects_byte_budget_and_flags_truncation ... ok
+test retrieval::tests::deep_search_budget_and_cursor_paginate ... ok
+test retrieval::tests::progressive_search_stage2_adds_body_only_hits ... ok
+test retrieval::tests::search_returns_source_tagged_hits_across_names_and_bodies ... ok
+test retrieval::tests::search_respects_service_filter_and_limit ... ok
+test secrets::tests::files_are_owner_only_0600 ... ok
+test secrets::tests::provided_key_path_works_and_differs_from_local ... ok
+test secrets::tests::local_key_persists_across_opens ... ok
+test session::tests::ulid_is_26_chars_and_time_ordered ... ok
+test retrieval::tests::progressive_search_streams_staged_deduped_results ... ok
+test secrets::tests::wrong_class_is_rejected_no_cross_class_confusion ... ok
+test session_crypto::tests::ciphertext_contains_no_plaintext ... ok
+test secrets::tests::delete_removes_the_secret ... ok
+test session_crypto::tests::a_different_device_local_key_cannot_decrypt ... ok
+test session::tests::lease_prevents_concurrent_turns ... ok
+test session::tests::offline_writes_then_sync_is_idempotent ... ok
+test session::tests::fork_detection_flags_two_children_of_one_head ... ok
+test stream::tests::cancel_stops_emission ... ok
+test secrets::tests::secret_debug_is_redacted ... ok
+test stream::tests::emit_returns_false_when_receiver_dropped ... ok
+test stream::tests::emit_to_unknown_turn_returns_false ... ok
+test stream::tests::streams_events_in_order_then_disconnects_on_close ... ok
+test session_crypto::tests::round_trips_with_the_pairing_secret ... ok
+test session::tests::only_ciphertext_is_stored_no_plaintext ... ok
+test secrets::tests::each_class_round_trips ... ok
+test tool::tests::parse_bad_input_returns_help_not_panic ... ok
+test tool::tests::parse_good_search_yields_typed_action ... ok
+test session::tests::append_then_load_roundtrips ... ok
+test session::tests::load_returns_turns_sorted_by_ulid ... ok
+test tool::tests::registry_snapshot_exposes_only_isyncyou_tool ... ok
+test turn::tests::destructive_action_stops_for_confirmation_without_executing ... ok
+test turn::tests::injected_content_does_not_trigger_a_tool_action ... ok
+test turn::tests::loop_runs_end_to_end_with_fakeprovider ... ok
+test tool::tests::classify_separates_read_from_destructive ... ok
+test session_crypto::tests::tampering_aad_fields_fails_decryption ... ok
+test session::tests::appends_are_strictly_monotonic_even_within_one_ms ... ok
+
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/live_subscription.rs (target/debug/deps/live_subscription-796d53038be738b6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_app_host-12c9801cf924bbf5)
+
+running 17 tests
+test tests::daemon_share_impl_does_not_call_graph_share_mutations_directly ... ok
+test tests::daemon_transfer_cancel_requests_cancellation ... ok
+test tests::restore_handler_refuses_non_restorable_service_before_token_lookup ... ok
+test tests::daemon_transfer_pause_resume_retry_and_paused_flag ... ok
+test tests::upload_staging_cleanup_removes_only_stale_staging_files ... ok
+test tests::onedrive_risk_offline_mode_estimate_thresholds ... ok
+test tests::mobile_live_router_wires_share_but_omits_restore ... ok
+test tests::build_live_router_wires_manage_and_transfer_controls ... ok
+test tests::daemon_transfer_surfaces_shared_progress_at_endpoint ... ok
+test tests::onedrive_risk_move_missing_and_nested_scope_cases ... ok
+test tests::onedrive_risk_move_uses_explicit_offline_scope_owner_only ... ok
+test tests::daemon_settings_persists_and_applies_poll_interval ... ok
+test tests::onedrive_open_requires_sealed_cached_body_when_envelope_required ... ok
+test tests::upload_staging_held_file_survives_cleanup_and_stays_sealed ... ok
+test tests::daemon_onedrive_risk_reads_store_and_config ... ok
+test tests::onedrive_open_serves_plaintext_cached_sync_body_when_envelope_not_required ... ok
+test tests::upload_staging_uses_account_cache_root_and_body_envelope_when_keyed ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_change_source-7f24f0048807ba58)
+
+running 32 tests
+test fanotify::tests::fanotify_reports_crud_when_root ... ok
+test fanotify::tests::parse_create_and_delete ... ok
+test fanotify::tests::parse_overflow_skips_tlvs ... ok
+test fanotify::tests::parse_modify ... ok
+test fanotify::tests::parse_bad_version_breaks ... ok
+test fanotify::tests::parse_rename_pairs_with_shared_cookie ... ok
+test fanotify::tests::parse_truncated_buffer_stops_cleanly ... ok
+test fanotify::tests::parse_two_records_back_to_back ... ok
+test fanotify::tests::parse_unpaired_move_degrades_to_delete ... ok
+test reconcile::tests::duplicate_keys_collapse_last_wins ... ok
+test reconcile::tests::everything_gone_is_all_deleted ... ok
+test reconcile::tests::mixed_changes_sorted_by_key ... ok
+test reconcile::tests::detects_modification_via_fingerprint ... ok
+test reconcile::tests::first_scan_is_all_created ... ok
+test source::tests::decide_ebpf_needs_privilege_and_availability ... ok
+test source::tests::decide_inotify_is_invariant ... ok
+test source::tests::decide_reconcile_only_is_invariant ... ok
+test source::tests::select_reconcile_only_yields_no_watcher ... ok
+test watcher::tests::delete_then_recreate_is_modify ... ok
+test watcher::tests::modify_burst_collapses ... ok
+test source::tests::select_inotify_yields_an_inotify_watcher ... ok
+test reconcile::tests::unchanged_produces_nothing ... ok
+test watcher::tests::output_is_sorted_and_independent_paths_kept ... ok
+test watch::tests::map_event_translates_kinds ... ok
+test watcher::tests::create_then_delete_cancels ... ok
+test watcher::tests::overflow_clears_and_signals_rescan ... ok
+test watcher::tests::create_then_modify_is_one_create ... ok
+test source::tests::select_ebpf_falls_back_to_inotify_when_unprivileged ... ok
+test watcher::tests::move_pair_becomes_rename ... ok
+test watcher::tests::unpaired_moves_become_delete_or_create ... ok
+test watch::tests::poll_returns_empty_when_idle ... ok
+test watch::tests::poll_observes_a_created_file ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running unittests src/main.rs (target/debug/deps/isyncyou-46c5c7aab5757206)
+
+running 54 tests
+test tests::cli_share_mutations_do_not_call_graph_share_apis_directly ... ok
+test tests::check_reports_invalid_config ... ok
+test tests::init_rejects_invalid_account ... ok
+test tests::cloud_restore_blocked_when_flag_off_at_cli ... ok
+test tests::migrate_encrypt_store_refuses_without_a_configured_key ... ok
+test tests::local_restore_path_sanitizes_and_disambiguates ... ok
+test tests::non_restorable_cloud_restore_refuses_before_token_lookup ... ok
+test tests::confirm_identity_live ... ok
+test tests::migrate_rejects_bad_targets ... ok
+test tests::make_available_reads_files_recursively ... ok
+test tests::backup_without_account_or_all_errors_at_runtime ... ok
+test tests::init_writes_validated_account_config ... ok
+test tests::owning_account_for_path_longest_prefix_and_root_reject ... ok
+test tests::cmd_backup_rejects_unknown_service ... ok
+test tests::ask_prefers_flag_then_default_then_errors ... ok
+test tests::parses_check ... ok
+test tests::check_has_default_config ... ok
+test tests::parses_migrate ... ok
+test tests::parses_restore ... ok
+test tests::parses_backup_with_defaults ... ok
+test tests::parses_backup_with_service_and_limit ... ok
+test tests::parses_rm ... ok
+test tests::parses_login ... ok
+test tests::parses_search ... ok
+test tests::parses_serve_tcp_opt_in ... ok
+test tests::resolve_config_path_falls_back_to_xdg_for_bare_default ... ok
+test tests::parses_migrate_encrypt_store_without_new_root ... ok
+test tests::parses_sync_with_account_and_token ... ok
+test tests::resolve_token_prefers_explicit_else_requires_login ... ok
+test tests::rm_refuses_when_cloud_restore_gate_is_off ... ok
+test tests::rm_refuses_unsupported_service ... ok
+test tests::parses_sync_watch_flag ... ok
+test tests::parses_serve_defaults_to_unix_socket_transport ... ok
+test tests::parses_setup_defaults ... ok
+test tests::select_accounts_resolution ... ok
+test tests::setup_requires_username_in_non_interactive ... ok
+test tests::share_mutation_args_fail_closed_when_not_ledger_modeled ... ok
+test tests::resolve_sync_token_prefers_write_then_read ... ok
+test tests::setup_writes_config_and_round_trips ... ok
+test tests::sync_requires_account ... ok
+test tests::status_parses ... ok
+test tests::parses_share ... ok
+test tests::unknown_subcommand_errors ... ok
+test tests::migrate_moves_archive_and_updates_config ... ok
+test tests::account_status_counts_per_service ... ok
+test tests::cmd_export_writes_ics_from_archived_event ... ok
+test tests::restore_to_local_recovers_an_archived_item ... ok
+test tests::restore_preview_inspects_mail_without_token_or_gate ... ok
+test tests::restore_errors_when_item_has_no_archived_body ... ok
+test tests::verify_checks_onedrive_items_against_the_sync_root ... ok
+test tests::search_account_includes_body_hits ... ok
+test tests::search_account_finds_matching_items ... ok
+test tests::verify_account_flags_missing_and_empty_bodies ... ok
+test tests::cmd_search_across_accounts ... ok
+
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_connectors-2f3540e1a6a8e36f)
+
+running 161 tests
+test archive::tests::live_archive_calendar_bodies ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test archive::tests::live_archive_onenote_bodies ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test archive::tests::live_archive_todo_bodies ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test calendar::tests::live_incremental_sync_calendar ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test archive::tests::contacts_use_the_contacts_url ... ok
+test archive::tests::onenote_archives_page_html ... ok
+test contacts::tests::assembles_name_from_parts_when_displayname_missing ... ok
+test contacts::tests::live_incremental_sync_contacts ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test export::tests::contact_assembles_fn_and_uses_business_phone ... ok
+test export::tests::contact_renders_valid_vcard ... ok
+test export::tests::event_renders_valid_vevent ... ok
+test export::tests::event_uid_falls_back_to_id ... ok
+test archive::tests::todo_uses_the_list_scoped_task_url ... ok
+test archive::tests::onenote_archives_resource_manifest_from_page_html ... ok
+test archive::tests::archives_event_json_and_records_local_path ... ok
+test calendar::tests::cancelled_event_is_tombstoned ... ok
+test archive::tests::limit_caps_archive_per_pass ... ok
+test contacts::tests::contact_photos_written_for_present_skipped_on_404 ... ok
+test calendar::tests::second_run_reuses_persisted_cursor ... ok
+test calendar::tests::events_mode_stores_master_and_far_future_without_explosion ... ok
+test mail::tests::live_download_message_bodies ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test mail::tests::live_incremental_sync_mail ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test calendar::tests::ingests_calendars_events_and_per_calendar_cursors ... ok
+test calendar::tests::separates_series_master_from_its_occurrences ... ok
+test calendar::tests::backup_calendar_flanks_snapshots_calendars_groups_and_permissions ... ok
+test calendar::tests::backup_event_attachments_snapshots_only_events_with_attachments ... ok
+test mime::tests::base64_body_decodes ... ok
+test mime::tests::encoded_word_subject_decodes ... ok
+test mime::tests::extract_html_decodes_quoted_printable_and_is_none_for_plain ... ok
+test mime::tests::extract_html_returns_raw_markup_of_html_part ... ok
+test mime::tests::extract_html_with_inline_images_collects_safe_cid_parts ... ok
+test mime::tests::html_only_is_stripped ... ok
+test mime::tests::lists_and_extracts_attachments_from_multipart_mixed ... ok
+test mime::tests::mail_preview_flags_html_and_truncates_snippet ... ok
+test mime::tests::mail_preview_never_panics_on_garbage ... ok
+test mime::tests::mail_preview_parses_headers_and_body_without_network ... ok
+test mime::tests::malformed_input_does_not_panic ... ok
+test mime::tests::multipart_prefers_text_plain ... ok
+test mime::tests::no_attachments_for_a_plain_message ... ok
+test mime::tests::plain_text_7bit ... ok
+test mime::tests::quoted_printable_decodes_umlauts_and_soft_breaks ... ok
+test mime::tests::set_message_id_inserts_when_absent_and_handles_garbage ... ok
+test mime::tests::set_message_id_replaces_existing_and_preserves_body ... ok
+test calendar::tests::events_mode_reconciles_deletions ... ok
+test contacts::tests::deleted_default_contact_is_tombstoned ... ok
+test contacts::tests::ingests_default_and_folder_contacts_with_scoped_cursors ... ok
+test mail::tests::backfill_fills_null_senders_from_json_sidecar ... ok
+test mail::tests::ingest_writes_full_message_json_sidecar ... ok
+test mail::tests::backup_mailbox_flanks_snapshots_settings_rules_and_categories ... ok
+test onedrive::tests::apply_local_deletes_skips_already_gone_paths ... ok
+test mail::tests::ingest_captures_display_sender_into_the_item ... ok
+test mail::tests::index_mail_bodies_extracts_and_indexes_for_search ... ok
+test mail::tests::downloads_bodies_and_records_local_path ... ok
+test onedrive::tests::cloud_dest_path_encodes_each_segment ... ok
+test onedrive::tests::conflict_copy_name_disambiguates ... ok
+test mail::tests::message_without_subject_gets_placeholder ... ok
+test mail::tests::tombstone_removes_the_json_sidecar ... ok
+test mail::tests::limit_caps_downloads_per_pass ... ok
+test mail::tests::move_in_is_not_clobbered_by_removal_in_old_folder ... ok
+test mail::tests::ingests_folders_messages_and_per_folder_cursors ... ok
+test mail::tests::real_deletion_in_owning_folder_tombstones ... ok
+test onedrive::tests::ac1_nested_delete_inside_scope_is_tombstoned ... ok
+test onedrive::tests::live_incremental_sync ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_local_create_uploads_to_cloud ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_local_delete_removes_from_cloud ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_local_modify_replaces_cloud_content ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_materialize_downloads ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_modify_conflict_keeps_both ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_push_upload_then_delete ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_remote_delete_moves_local_to_trash ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::live_upload_resume_survives_process_kill ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::ac1_cross_scope_move_is_not_clobbered ... ok
+test onedrive::tests::apply_local_modifies_keeps_both_on_conflict ... ok
+test onedrive::tests::apply_local_modifies_uploads_then_refreshes_store ... ok
+test onedrive::tests::download_now_to_cache_sets_cache_body_location ... ok
+test onedrive::tests::cleanup_offline_to_online_drops_safe_keeps_unsynced ... ok
+test onedrive::tests::ac2_persists_nextlink_per_page_and_resumes ... ok
+test onedrive::tests::free_up_removes_cache_root_body_only ... ok
+test onedrive::tests::ac2_last_write_wins_on_repeated_id_across_pages ... ok
+test onedrive::tests::download_now_to_sync_sets_materialized_body_location ... ok
+test onedrive::tests::materialize_counts_unresolvable_item_as_failed_not_panic ... ok
+test onedrive::tests::ingests_files_folders_and_tombstones ... ok
+test onedrive::tests::keep_both_persists_conflict_state_and_keep_cloud_resolves ... ok
+test onedrive::tests::free_up_removes_sync_root_body_only_and_preserves_local_delete_guard ... ok
+test onedrive::tests::materialize_keeps_both_when_local_file_was_edited ... ok
+test onedrive::tests::ac3_overlapping_scopes_item_owned_by_deepest ... ok
+test onedrive::tests::materialize_overwrites_stale_clean_file_without_conflict_copy ... ok
+test onedrive::tests::materialize_redownloads_remote_dirty_when_remote_hash_changed ... ok
+test onedrive::tests::materialize_without_synced_reference_keeps_legacy_overwrite ... ok
+test onedrive::tests::materialize_skips_file_already_present_and_unchanged ... ok
+test onedrive::tests::download_now_policy_block_is_target_aware ... ok
+test onedrive::tests::materialize_scoped_reports_incremental_download_progress ... ok
+test onedrive::tests::download_now_uses_envelope_writer_for_cache_and_sync_targets ... ok
+test onedrive::tests::rfc3339_to_unix_parses_utc_timestamps ... ok
+test onedrive::tests::materialize_scoped_reports_and_clears_progress ... ok
+test onedrive::tests::materialize_scoped_storage_floor_stops_new_downloads ... ok
+test onedrive::tests::materialize_writes_remote_dirty_files_then_marks_clean ... ok
+test onedrive::tests::materialize_scoped_redownloads_stale_body_when_remote_hash_changed ... ok
+test onedrive::tests::materialize_scoped_writes_only_offline_items_and_marks_content_state ... ok
+test onedrive::tests::materialize_scoped_skips_cancelled_transfer_then_retries_next_pass ... ok
+test onedrive::tests::push_delete_tombstones_after_remote_delete ... ok
+test onedrive::tests::shared_progress_cancel_is_one_shot ... ok
+test onedrive::tests::shared_progress_retry_now_unpauses_and_clears_backoff ... ok
+test onedrive::tests::shared_progress_tracks_and_clears_slots ... ok
+test onedrive::tests::unix_to_rfc3339_roundtrips_with_rfc3339_to_unix ... ok
+test onedrive::tests::pending_and_apply_local_deletes_move_tombstoned_files_to_trash ... ok
+test onedrive::tests::materialize_skips_paused_and_resumes ... ok
+test onenote::tests::live_incremental_sync_onenote ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::push_local_creates_records_the_synced_reference ... ok
+test onedrive::tests::push_local_creates_uploads_each_to_its_cloud_path ... ok
+test onedrive::tests::push_upload_preserves_local_mtime ... ok
+test onedrive::tests::push_upload_without_mtime_skips_set_mtime ... ok
+test quickxor::tests::base64_encode_basics ... ok
+test quickxor::tests::matches_onedrive_ground_truth ... ok
+test restore::tests::empty_payloads_are_rejected ... ok
+test restore::tests::live_restore_contact_roundtrip ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test restore::tests::live_restore_event_roundtrip ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test restore::tests::live_restore_message_roundtrip ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test restore::tests::live_restore_page_roundtrip ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test restore::tests::live_restore_task_roundtrip ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test restore::tests::restore_contact_posts_to_contacts_path_sanitized ... ok
+test restore::tests::restore_event_posts_to_events_path_sanitized ... ok
+test restore::tests::restore_message_passes_mime_and_returns_id ... ok
+test restore::tests::restore_message_rejects_empty_mime ... ok
+test restore::tests::restore_page_uses_plain_html_when_no_resources ... ok
+test restore::tests::restore_page_with_resources_uses_multipart_parts ... ok
+test restore::tests::restore_task_posts_to_list_path_sanitized ... ok
+test restore::tests::sanitize_contact_drops_photo_fields_for_personal_account_restore ... ok
+test restore::tests::sanitize_event_keeps_writable_drops_server_fields ... ok
+test scope::tests::deepest_active_ancestor_wins_on_overlap ... ok
+test scope::tests::deeply_nested_item_resolves_to_its_single_active_root ... ok
+test scope::tests::disjoint_scopes_each_own_their_own_subtree ... ok
+test onedrive::tests::push_upload_stores_clean_item ... ok
+test scope::tests::from_onedrive_mode_bridges_each_variant ... ok
+test scope::tests::no_active_ancestor_returns_none ... ok
+test scope::tests::scope_root_owns_itself ... ok
+test scope::tests::scopes_from_modes_keeps_non_online_folders_only ... ok
+test onedrive::tests::resolve_keep_mine_deletes_cloud_and_restores_local ... ok
+test shared::tests::live_shared_with_me ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test onedrive::tests::scan_local_creates_finds_only_untracked_files ... ok
+test onedrive::tests::scan_creates_scoped_keeps_only_offline_prefix ... ok
+test onedrive::tests::scan_local_modifies_catches_same_size_edit_via_hash ... ok
+test onedrive::tests::scan_local_deletes_only_clean_files_now_missing ... ok
+test todo::tests::live_incremental_sync_todo ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test todo::tests::parse_lists_keeps_the_full_list_resource ... ok
+test onedrive::tests::second_run_uses_persisted_cursor_and_paginates ... ok
+test onedrive::tests::scan_modifies_scoped_keeps_only_offline_items ... ok
+test onenote::tests::ingests_pages_with_section_parent ... ok
+test onenote::tests::backup_onenote_hierarchy_stores_notebooks_groups_sections_with_parents ... ok
+test onenote::tests::pages_absent_from_live_list_are_tombstoned ... ok
+test onenote::tests::writes_page_metadata_sidecar_with_rich_fields ... ok
+test onenote::tests::paginates_the_page_list ... ok
+test shared::tests::empty_listing_is_fine ... ok
+test onenote::tests::unchanged_pages_are_skipped_on_second_run ... ok
+test shared::tests::ingests_shared_items_with_remote_item_fallback ... ok
+test todo::tests::completed_then_removed_task_is_tombstoned ... ok
+test todo::tests::backup_todo_list_flanks_writes_sidecars_with_list_fields ... ok
+test onedrive::tests::scan_local_modifies_detects_size_change_only ... ok
+test todo::tests::task_without_title_gets_placeholder ... ok
+test todo::tests::ingests_lists_tasks_and_per_list_cursors ... ok
+test todo::tests::backup_task_subresources_snapshots_checklist_linked_and_gated_attachments ... ok
+
+test result: ok. 137 passed; 0 failed; 24 ignored; 0 measured; 0 filtered out; finished in 6.51s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_core-ab94e9b0acbb70f2)
+
+running 84 tests
+test config::tests::cloud_restore_stays_off_when_omitted_from_toml ... ok
+test config::tests::cache_root_defaults_distinct_and_validation_rejects_overlap ... ok
+test config::tests::change_source_accepts_fanotify_alias ... ok
+test config::tests::collects_multiple_errors_at_once ... ok
+test config::tests::defaults_are_sane ... ok
+test config::tests::detects_duplicate_account_ids ... ok
+test config::tests::detects_bad_guard_fraction ... ok
+test config::tests::detects_same_sync_and_archive_root ... ok
+test config::tests::onedrive_modes_validation_rejects_invalid_entries ... ok
+test config::tests::onedrive_modes_duplicate_key_rejected_by_parser ... ok
+test config::tests::partial_toml_fills_defaults ... ok
+test conflict::tests::both_edited_is_content_conflict ... ok
+test config::tests::mount_point_is_optional_and_round_trips ... ok
+test conflict::tests::conflict_copy_naming ... ok
+test conflict::tests::edit_delete_and_rename_delete ... ok
+test conflict::tests::gui_policy_skips_for_prompt ... ok
+test conflict::tests::headless_keeps_both_for_data_risk ... ok
+test conflict::tests::one_sided_change_is_not_a_conflict ... ok
+test conflict::tests::rename_plus_edit_is_mergeable ... ok
+test conflict::tests::rename_rename_only_conflicts_on_divergent_targets ... ok
+test config::tests::poll_interval_round_trips_and_defaults_when_omitted ... ok
+test conflict::tests::transfer_conflicts_reevaluate ... ok
+test config::tests::transfer_policy_fields_round_trip ... ok
+test conflict::tests::type_change_is_file_folder_conflict ... ok
+test conflict::tests::version_comparison ... ok
+test config::tests::toml_roundtrips_via_save_load ... ok
+test envelope::tests::key_id_is_readable_without_the_key_for_rotation ... ok
+test envelope::tests::malformed_blobs_error_not_panic ... ok
+test config::tests::onedrive_modes_round_trip_and_default_when_omitted ... ok
+test guard::tests::absolute_limit_blocks ... ok
+test envelope::tests::on_disk_plaintext_len_reads_the_header_not_the_sealed_size ... ok
+test envelope::tests::wrong_key_and_tamper_fail_closed ... ok
+test guard::tests::custom_thresholds ... ok
+test guard::tests::fraction_limit_blocks_when_half_vanishes ... ok
+test guard::tests::exactly_at_fraction_blocks ... ok
+test guard::tests::normal_batch_proceeds ... ok
+test guard::tests::tiny_total_not_subject_to_fraction_rule ... ok
+test guard::tests::nothing_to_delete_proceeds ... ok
+test obs::tests::format_event_carries_op_and_request_id_but_no_bearer ... ok
+test envelope::tests::body_io_seals_on_disk_reads_plaintext_passthrough_and_rotates ... ok
+test envelope::tests::sealed_body_required_rejects_plaintext_and_invalid_envelopes ... ok
+test obs::tests::redact_blanks_bearer_and_secret_keys_but_keeps_context ... ok
+test obs::tests::redact_leaves_secret_free_text_untouched ... ok
+test onedrive_mode::tests::effective_mode_falls_back_to_default ... ok
+test obs::tests::redact_blanks_token_values_in_json_and_query ... ok
+test onedrive_mode::tests::effective_mode_folder_itself_beats_ancestors ... ok
+test onedrive_mode::tests::effective_mode_deepest_ancestor_wins ... ok
+test onedrive_mode::tests::prune_removes_tombstoned_entries ... ok
+test onedrive_mode::tests::serde_lowercase_matches_as_str ... ok
+test pending::tests::biometric_confirm_past_ttl_is_rejected_and_swept ... ok
+test pending::tests::confirmed_token_authorizes_once_then_replay_fails ... ok
+test pending::tests::consume_without_biometric_is_rejected_but_retained ... ok
+test pending::tests::gate_catalogue_covers_destructive_ops_and_excludes_restore_cloud ... ok
+test pending::tests::each_register_yields_a_distinct_unguessable_id ... ok
+test pending::tests::token_expires_after_ttl ... ok
+test pending::tests::token_binds_exactly_one_action_hash_is_immutable ... ok
+test pending::tests::unknown_id_is_not_found ... ok
+test policy::tests::below_the_storage_floor_blocks_new_downloads ... ok
+test policy::tests::charging_only_blocks_on_battery_but_allows_charging ... ok
+test policy::tests::defaults_allow_everything_above_the_floor ... ok
+test policy::tests::storage_floor_takes_precedence_over_network_and_power ... ok
+test policy::tests::the_floor_only_gates_new_work_not_a_quota ... ok
+test policy::tests::wifi_only_blocks_metered_but_allows_unmetered ... ok
+test recovery::tests::red_takes_precedence_over_yellow ... ok
+test recovery::tests::self_check_green_when_all_ok ... ok
+test recovery::tests::self_check_yellow_on_staleness ... ok
+test recovery::tests::atomic_write_creates_and_overwrites ... ok
+test sync_state::tests::change_mid_transfer_invalidates ... ok
+test sync_state::tests::concurrent_edits_become_both_dirty_then_resolve ... ok
+test sync_state::tests::edit_delete_conflicts ... ok
+test recovery::tests::journal_records_and_recovers_pending ... ok
+test sync_state::tests::error_recovery_cycle ... ok
+test sync_state::tests::happy_download_path ... ok
+test recovery::tests::journal_seq_is_monotonic_across_reopen ... ok
+test sync_state::tests::helpers ... ok
+test sync_state::tests::happy_upload_path ... ok
+test sync_state::tests::local_delete_propagates ... ok
+test sync_state::tests::remote_delete_trashes_local ... ok
+test sync_state::tests::serde_uses_snake_case_matching_as_str ... ok
+test sync_state::tests::string_roundtrip_for_all_states ... ok
+test sync_state::tests::unknown_transitions_are_noops ... ok
+test envelope::tests::ciphertext_contains_no_plaintext_sentinel ... ok
+test recovery::tests::self_check_red_on_hard_problems ... ok
+test envelope::tests::roundtrips_empty_small_and_multichunk ... ok
+
+test result: ok. 84 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/isyncyoud-9c0515818939c560)
+
+running 11 tests
+test tests::cap_status_line_never_contains_the_token ... ok
+test tests::backup_delta_notification_text ... ok
+test tests::file_uri_and_xml_escape_encode_special_chars ... ok
+test tests::ensure_place_adds_exactly_one_entry_and_is_idempotent ... ok
+test tests::parses_socket ... ok
+test tests::parses_overrides ... ok
+test tests::parses_defaults ... ok
+test tests::parses_sync_secs ... ok
+test tests::run_rejects_invalid_config ... ok
+test tests::parses_token_refresh_secs ... ok
+test tests::fuse_overlay_status_maps_placeholder_materialized_syncing ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_dbus_status-834ccc0c60fa0065)
+
+running 3 tests
+test tests::maps_store_states_to_overlays ... ok
+test tests::overlay_wire_strings_are_stable ... ok
+test tests::store_provider_resolves_by_sync_root_and_reads_state ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/main.rs (target/debug/deps/isyncyou_doctor-b101c590a9c70abb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_doctor_lib-37073d60fd5f815a)
+
+running 11 tests
+test tests::encrypted_login_token_with_secret_is_ok ... ok
+test tests::check_install_present_vs_missing ... ok
+test tests::invalid_config_is_fail ... ok
+test tests::keyring_login_token_marker_is_ok_without_plaintext_secret ... ok
+test tests::missing_config_is_fail ... ok
+test tests::parse_config_arg_variants ... ok
+test tests::healthy_config_with_missing_store_is_warn_not_fail ... ok
+test tests::non_plaintext_store_is_ok_only_when_store_key_is_available ... ok
+test tests::plaintext_login_token_is_an_auth_warning_without_secret ... ok
+test tests::plaintext_store_is_a_warning_until_sqlcipher_keyed ... ok
+test tests::missing_login_token_is_an_auth_warning ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_engine-152466a1462af1de)
+
+running 119 tests
+test onedrive_live::tests::onedrive_lister_is_object_safe_and_returns_children ... ok
+test calendar_live::tests::calendar_writer_is_object_safe_and_ops_carry_ids ... ok
+test mail_live::tests::trait_is_object_safe_and_ops_carry_ids ... ok
+test contacts_live::tests::contact_writer_is_object_safe_and_ops_carry_ids ... ok
+test mail_restore::tests::apply_skips_default_state_and_never_sends ... ok
+test mail_restore::tests::apply_patches_non_default_state_after_create ... ok
+test mail_live::tests::build_message_shapes_recipients_and_omits_empty_cc_bcc ... ok
+test mail_restore::tests::mail_restore_state_from_json_parses_structured_fields ... ok
+test mail_restore::tests::marker_round_trips_through_set_message_id_and_parser ... ok
+test mail_restore::tests::happy_path_creates_one_and_is_idempotent_on_repeat ... ok
+test mail_restore::tests::crash_after_post_landed_does_not_duplicate ... ok
+test onedrive_write::tests::create_crash_before_post_creates_one ... ok
+test onedrive_write::tests::delete_recovery_is_blind_replay_safe ... ok
+test onedrive_write::tests::invite_records_intent_before_graph_mutation ... ok
+test onedrive_write::tests::invite_pending_not_started_boot_recovery_marks_retry_required ... ok
+test onedrive_write::tests::invite_inflight_with_all_permissions_recovers_applied_without_invite ... ok
+test mail_restore::tests::crash_before_post_landed_creates_exactly_one_on_recovery ... ok
+test onedrive_write::tests::invite_user_retry_can_resume_not_started_row ... ok
+test onedrive_write::tests::invite_rejects_invalid_inputs_before_ledger ... ok
+test onedrive_write::tests::invite_graph_207_partial_success_is_failed_closed_and_not_auto_retried ... ok
+test onedrive_write::tests::create_crash_after_post_landed_no_duplicate ... ok
+test onedrive_write::tests::invite_recovery_ambiguous_fails_closed_without_blocking_later_delete ... ok
+test onedrive_live::tests::list_children_writes_no_store_row ... ok
+test onedrive_write::tests::failed_ambiguous_invite_blocks_silent_identical_retry ... ok
+test mail_restore::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok
+test onedrive_write::tests::missing_sealed_body_source_fails_terminally_and_recovery_continues ... ok
+test onedrive_write::tests::reissued_identical_intent_makes_no_second_effect ... ok
+test onedrive_write::tests::replace_records_ledger_and_issues_once ... ok
+test onedrive_write::tests::recovery_skips_a_missing_local_body_op_without_aborting_the_batch ... ok
+test onedrive_write::tests::replace_stale_etag_marks_conflict_and_is_terminal ... ok
+test onedrive_write::tests::rename_move_delete_are_ledger_recorded ... ok
+test onedrive_write::tests::replace_content_tag_distinguishes_successive_edits ... ok
+test onedrive_write::tests::run_records_ledger_and_issues_once ... ok
+test onenote_live::tests::append_escapes_html_in_the_user_text ... ok
+test onenote_live::tests::page_writer_is_object_safe_and_ops_carry_args ... ok
+test onedrive_write::tests::malformed_share_intent_recovery_fails_closed_without_loop ... ok
+test onedrive_write::tests::replace_recovery_replays_from_sealed_body_source ... ok
+test onedrive_write::tests::share_link_embed_unsupported_is_policy_final ... ok
+test onedrive_write::tests::share_link_accepts_organization_scope ... ok
+test restore_calendar::tests::create_stamps_transaction_id_and_drops_non_writable_fields ... ok
+test onedrive_write::tests::share_link_create_link_transient_error_remains_recoverable ... ok
+test onedrive_write::tests::share_link_records_intent_before_graph_mutation ... ok
+test onedrive_write::tests::share_link_crash_after_graph_success_recovers_without_duplicate ... ok
+test restore_contacts::tests::create_stamps_marker_property_and_drops_non_writable_fields ... ok
+test onedrive_write::tests::share_link_recovery_create_link_when_permission_match_is_ambiguous ... ok
+test restore_key::tests::calendar_marker_is_a_short_stable_transaction_id ... ok
+test restore_key::tests::contact_marker_is_a_short_stable_value ... ok
+test restore_key::tests::field_boundaries_do_not_collide ... ok
+test restore_key::tests::key_changes_with_every_field ... ok
+test restore_key::tests::key_is_deterministic_and_hex ... ok
+test restore_key::tests::mail_marker_is_a_valid_invalid_message_id ... ok
+test restore_key::tests::onenote_marker_is_a_short_stable_value ... ok
+test restore_key::tests::secret_is_created_then_reused ... ok
+test restore_key::tests::todo_marker_is_a_short_stable_value ... ok
+test onedrive_write::tests::share_link_recovery_creates_once_when_no_matching_link_exists ... ok
+test onedrive_write::tests::upload_crash_recovery_adopts_landed_upload_no_duplicate ... ok
+test onedrive_write::tests::share_link_rejects_invalid_inputs_before_ledger ... ok
+test restore_onenote::tests::create_stamps_invisible_marker_found_by_scan ... ok
+test onedrive_write::tests::share_link_retry_uses_existing_ledger_key ... ok
+test restore_calendar::tests::happy_path_creates_one_and_is_idempotent_on_repeat ... ok
+test restore_onenote::tests::missing_manifest_means_plain_html_restore ... ok
+test restore_onenote::tests::load_resources_builds_parts_and_rewrites_from_manifest ... ok
+test restore_onenote::tests::prepare_html_appends_comment_when_no_body_close ... ok
+test restore_onenote::tests::prepare_html_inserts_comment_before_body_close_and_rewrites_urls ... ok
+test restore_onenote::tests::restore_targets_the_pages_original_section ... ok
+test onedrive_write::tests::upload_recovery_replays_from_sealed_body_source ... ok
+test restore_calendar::tests::crash_before_post_landed_creates_exactly_one_on_recovery ... ok
+test onedrive_write::tests::upload_records_ledger_and_issues_once ... ok
+test restore_calendar::tests::crash_after_post_landed_does_not_duplicate ... ok
+test restore_contacts::tests::crash_before_post_landed_creates_exactly_one_on_recovery ... ok
+test restore_contacts::tests::crash_after_post_landed_does_not_duplicate ... ok
+test restore_contacts::tests::happy_path_creates_one_and_is_idempotent_on_repeat ... ok
+test restore_calendar::tests::boot_recovery_reconciles_a_pending_op_without_duplicating ... ok
+test restore_contacts::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok
+test restore_onenote::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok
+test restore_todo::tests::create_embeds_marker_and_find_scans_for_it ... ok
+test restore_todo::tests::embed_marker_creates_body_when_absent ... ok
+test restore_todo::tests::embed_marker_keeps_existing_body_and_appends ... ok
+test restore_onenote::tests::happy_path_creates_one_and_is_idempotent_on_repeat ... ok
+test task_live::tests::task_writer_is_object_safe_and_ops_carry_ids ... ok
+test tests::cache_refresh_token_prefers_read_then_falls_back_to_write ... ok
+test tests::default_report_summary_is_all_zero ... ok
+test restore_onenote::tests::crash_after_post_landed_does_not_duplicate ... ok
+test restore_recovery::tests::c3_crash_during_post_not_landed_creates_one ... ok
+test restore_recovery::tests::c2_crash_after_preflight_before_post ... ok
+test restore_recovery::tests::c4_crash_after_post_before_record_no_duplicate ... ok
+test restore_recovery::tests::recovery_is_idempotent_when_already_committed ... ok
+test restore_recovery::tests::c3_crash_during_post_landed_no_duplicate ... ok
+test onedrive_write::tests::share_redaction_covers_link_and_invite_last_error ... ok
+test restore_recovery::tests::happy_path_creates_exactly_one ... ok
+test tests::every_backup_service_is_ledger_backed_and_unknown_is_rejected ... ok
+test restore_recovery::tests::c6_concurrent_identical_key_is_rejected_by_ledger ... ok
+test tests::refresh_counts_changed_is_false_only_for_a_noop_pass ... ok
+test tests::restore_cloud_refuses_when_disabled_by_default ... ok
+test tests::restore_cloud_routes_calendar_past_the_support_gate ... ok
+test tests::restore_cloud_routes_contacts_past_the_support_gate ... ok
+test tests::restore_cloud_routes_onenote_past_the_support_gate ... ok
+test tests::restore_cloud_routes_todo_past_the_support_gate ... ok
+test restore_recovery::tests::c4_failed_not_landed_resumes_one ... ok
+test tests::restore_scopes_use_delegated_onenote_write_scope ... ok
+test tests::scopes_cover_mailbox_settings_and_people_without_all_variants ... ok
+test restore_onenote::tests::crash_before_post_landed_creates_exactly_one_on_recovery ... ok
+test tests::summary_mentions_cancelled_transfers ... ok
+test tests::summary_mentions_each_direction_and_conflicts ... ok
+test restore_todo::tests::boot_recovery_reconciles_a_pending_op_without_creating ... ok
+test restore_todo::tests::crash_after_post_landed_does_not_duplicate ... ok
+test restore_todo::tests::crash_before_post_landed_creates_exactly_one_on_recovery ... ok
+test restore_todo::tests::happy_path_creates_one_and_is_idempotent_on_repeat ... ok
+test tests::download_now_default_mode_is_honored_for_known_rows ... ok
+test tests::download_now_target_for_sync_mode_is_cache ... ok
+test tests::offline_sync_once_is_noop_without_offline_scopes ... ok
+test tests::download_now_effective_mode_uses_deepest_ancestor ... ok
+test tests::download_now_for_inner_sync_writes_cache_root ... ok
+test tests::download_now_target_for_offline_mode_is_sync ... ok
+test tests::download_now_online_mode_is_unavailable ... ok
+test tests::download_now_for_inner_offline_writes_sync_root ... ok
+test tests::download_now_for_inner_online_rejects_known_missing_body ... ok
+test tests::restore_preview_reads_mail_without_token_or_gate ... ok
+test verify::tests::verify_baselines_then_detects_drift_and_missing ... ok
+
+test result: ok. 119 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_fuse-31ee05ad132e62ba)
+
+running 21 tests
+test fs_tests::failed_hydrate_leaves_no_partial_or_temp_file ... ok
+test fs_tests::cache_survives_a_fresh_fs_instance ... ok
+test fs_tests::create_file_uploads_new_item_and_records_remote_id ... ok
+test fs_tests::hydrator_called_only_once_across_many_reads ... ok
+test fs_tests::observer_fires_on_hydrate_but_not_on_cache_hit ... ok
+test fs_tests::mount_mutations_issue_the_right_cloud_ops ... ok
+test fs_tests::read_materializes_to_disk_atomically_then_serves_locally ... ok
+test fs_tests::read_only_mount_rejects_create_and_writes ... ok
+test fs_tests::read_only_mount_rejects_writes ... ok
+test fs_tests::observer_reports_failed_hydrate ... ok
+test tests::cache_file_name_matches_index_remote_id_and_is_a_single_segment ... ok
+test fs_tests::rename_of_a_never_flushed_new_file_touches_no_cloud_then_creates_at_new_path ... ok
+test fs_tests::refresh_is_throttled_and_reconciles_cloud_changes ... ok
+test tests::file_attr_reports_cloud_mtime_for_recent_sort ... ok
+test tests::from_items_parses_cloud_mtime_onto_nodes ... ok
+test tests::insert_file_path_of_and_set_remote_id ... ok
+test tests::placeholder_index_resolves_paths_to_items ... ok
+test fs_tests::write_back_uploads_dirty_buffer_on_flush ... ok
+test tests::tree_builds_hierarchy_with_sizes ... ok
+test tests::tree_insert_dir_remove_and_rename_node ... ok
+test tests::reconcile_is_inode_stable_adds_removes_and_keeps_local ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_graph-91ee1484853574e6)
+
+running 112 tests
+test auth::tests::live_refresh_from_cached_refresh_token ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test auth::tests::short_ttl_does_not_underflow ... ok
+test auth::tests::validity_window ... ok
+test auth::tests::deserializes_real_shaped_response ... ok
+test auth::tests::device_code_poll_keeps_going_on_transient_and_stops_on_terminal ... ok
+test auth::tests::from_response_expires_a_minute_early ... ok
+test client::tests::auth_and_fatal_errors ... ok
+test client::tests::incremental_run_starts_from_cursor ... ok
+test client::tests::page_without_cursor_is_an_error ... ok
+test client::tests::gone_triggers_resync_from_base ... ok
+test client::tests::retries_then_succeeds ... ok
+test client::tests::follows_pages_then_returns_delta_cursor ... ok
+test auth::tests::token_cache_secret_file_is_trimmed_and_nonempty ... ok
+test auth::tests::token_cache_save_preserves_existing_keyring_backend ... ok
+test auth::tests::token_cache_keyring_roundtrip_writes_marker_only ... ok
+test client::tests::retry_budget_is_enforced ... ok
+test error::tests::other_client_errors_are_fatal ... ok
+test client::tests::success_decays_backoff_back_toward_full_speed ... ok
+test error::tests::rate_limited_carries_retry_after ... ok
+test error::tests::success_is_ok ... ok
+test error::tests::specific_statuses_map_to_specific_actions ... ok
+test http::tests::base64_matches_known_vectors ... ok
+test client::tests::retry_backs_off_exponentially_without_retry_after ... ok
+test auth::tests::legacy_plaintext_cache_still_loads ... ok
+test client::tests::retry_honors_server_retry_after ... ok
+test error::tests::server_errors_are_retryable ... ok
+test http::tests::abs_prefixes_paths_but_not_urls ... ok
+test http::tests::create_link_detailed_accepts_organization_scope_and_returns_permission ... ok
+test http::tests::detailed_permission_parser_extracts_link_identities_and_invitation ... ok
+test http::tests::delete_message_encodes_the_id_in_the_path ... ok
+test http::tests::create_message_from_mime_posts_base64_with_text_plain ... ok
+test http::tests::create_folder_posts_to_children_and_returns_new_id ... ok
+test http::tests::enc_path_encodes_each_segment_keeps_slash_strips_leading ... ok
+test http::tests::encode_id_escapes_base64_chars_in_outlook_ids ... ok
+test http::tests::flag_body_sets_due_with_required_start ... ok
+test http::tests::contact_verbs_hit_the_right_urls_and_encode_ids ... ok
+test http::tests::delete_url_accepts_2xx_and_classifies_failures ... ok
+test http::tests::get_bytes_prefixes_a_relative_path_with_the_base ... ok
+test http::tests::download_content_and_message_mime_fetch_bytes_from_the_base ... ok
+test http::tests::create_upload_session_parses_upload_url_and_rejects_missing_one ... ok
+test http::tests::get_json_classifies_4xx_with_truncated_body ... ok
+test http::tests::invite_detailed_handles_empty_value_without_panic ... ok
+test http::tests::get_json_malformed_json_is_a_parse_error_not_a_panic ... ok
+test http::tests::get_bytes_with_progress_streams_body_and_reports_cumulative ... ok
+test http::tests::create_link_posts_createlink_and_returns_weburl ... ok
+test http::tests::get_json_retries_on_429_then_succeeds ... ok
+test http::tests::invite_posts_invite_and_returns_permission_ids ... ok
+test http::tests::get_json_paged_follows_odata_nextlink ... ok
+test http::tests::invite_detailed_parses_207_partial_as_distinct_outcome ... ok
+test http::tests::live_flag_read_categories_move ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test http::tests::live_onedrive_delta ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test http::tests::live_onedrive_upload_roundtrip ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test http::tests::live_send_mail_to_self ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test http::tests::live_sharing_roundtrip ... ignored, live: opt-in integration test; needs ISYNCYOU_* credentials, run with --ignored
+test http::tests::mail_write_builders_have_exact_shapes ... ok
+test http::tests::item_id_for_path_resolves_via_root_path_addressing ... ok
+test http::tests::list_children_targets_children_with_select ... ok
+test http::tests::get_bytes_returns_content_and_classifies_5xx ... ok
+test http::tests::list_permissions_detailed_preserves_tuple_compatibility ... ok
+test http::tests::onenote_multipart_body_rejects_header_injection ... ok
+test http::tests::onenote_multipart_body_uses_presentation_and_binary_parts ... ok
+test http::tests::list_and_delete_permissions_roundtrip ... ok
+test http::tests::list_children_retries_via_central_policy_then_pages ... ok
+test http::tests::move_message_posts_to_move_and_returns_resource ... ok
+test http::tests::replace_content_if_match_returns_none_on_412_conflict ... ok
+test http::tests::move_item_patches_the_item_and_classifies_conflict ... ok
+test http::tests::list_children_pages_over_200_items ... ok
+test http::tests::post_json_prefixes_paths_with_the_base_and_returns_created ... ok
+test http::tests::onenote_section_create_and_content_append_hit_the_right_urls ... ok
+test http::tests::onenote_page_create_multipart_and_delete_roundtrip ... ok
+test http::tests::send_draft_posts_to_send_with_no_body ... ok
+test http::tests::reply_and_forward_hit_the_right_action_paths ... ok
+test http::tests::send_mail_posts_to_send_mail_action ... ok
+test http::tests::set_read_patches_the_message ... ok
+test http::tests::small_upload_takes_the_single_put_path ... ok
+test http::tests::transport_get_maps_network_failure_to_retryable_503 ... ok
+test http::tests::replace_content_if_match_returns_item_on_200_and_error_otherwise ... ok
+test http::tests::transport_get_sends_prefer_immutable_id_header_when_enabled ... ok
+test http::tests::put_content_and_delete_item_roundtrip_and_classify ... ok
+test push::tests::b64url_is_unpadded_urlsafe ... ok
+test push::tests::live_fcm_send ... ignored, live: needs ISY_FCM_SA + ISY_FCM_TOKEN env; sends a real push
+test push::tests::missing_field_errors ... ok
+test push::tests::parses_service_account_fields ... ok
+test push::tests::pem_strips_headers_and_decodes ... ok
+test throttle::tests::backoff_without_retry_after_is_exponential_and_capped ... ok
+test throttle::tests::decays_back_to_full_speed_after_throttle ... ok
+test http::tests::transport_get_surfaces_429_with_retry_after ... ok
+test throttle::tests::starts_at_full_speed ... ok
+test throttle::tests::success_keeps_full_speed ... ok
+test throttle::tests::retry_after_is_honored_and_capped ... ok
+test upload::tests::final_chunk_is_exact_remainder ... ok
+test http::tests::writes_do_not_blind_retry_on_429 ... ok
+test upload::tests::large_file_chunks_are_320kib_aligned ... ok
+test upload::tests::max_chunk_below_align_still_sends_one_unit ... ok
+test upload::tests::max_chunk_is_capped_below_60mib ... ok
+test upload::tests::resume_continues_from_a_persisted_offset ... ok
+test upload::tests::single_chunk_for_small_file ... ok
+test upload::tests::walks_to_completion ... ok
+test upload::tests::resume_from_next_expected_ranges ... ok
+test http::tests::resumable_upload_chunk_error_is_classified_and_keeps_the_session ... ok
+test http::tests::upload_status_parses_next_expected_offset_and_classifies_errors ... ok
+test http::tests::upload_to_parent_targets_root_or_item_content ... ok
+test http::tests::todo_write_verbs_hit_the_right_urls ... ok
+test http::tests::resumable_upload_resumes_from_server_offset_and_completes ... ok
+test http::tests::client_times_out_on_a_hung_connection ... ok
+test auth::tests::cache_save_load_roundtrip ... ok
+test auth::tests::token_cache_encrypted_roundtrip_hides_plaintext ... ok
+test auth::tests::token_cache_encrypted_roundtrip_rejects_wrong_secret ... ok
+test auth::tests::save_without_secret_encrypts_with_auto_local_key ... ok
+test auth::tests::legacy_plaintext_cache_migrates_to_encrypted_on_next_save ... ok
+test auth::tests::token_cache_save_is_owner_only_on_unix ... ok
+test auth::tests::ensure_returns_cached_token_when_valid_without_network ... ok
+
+test result: ok. 105 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 13.12s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_ipc_types-cd06eaf4e6294aec)
+
+running 1 test
+test tests::ipc_status_wire_roundtrip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_mobile-7fc1b3ab906081cd)
+
+running 20 tests
+test tests::asset_request_with_session_frames_not_ready_as_503 ... ok
+test tests::onedrive_sync_report_changed_is_ui_data_refresh_signal ... ok
+test tests::mobile_body_key_install_marks_encryption_ready_on_success ... ok
+test tests::mobile_start_inner_fails_closed_without_encryption_ready ... ok
+test tests::mobile_config_reload_accepts_change_canonicalizes_and_does_not_save ... ok
+test tests::mobile_config_prepare_rejects_invalid_foreign_onedrive_modes ... ok
+test tests::device_state_push_updates_the_global ... ok
+test tests::mobile_config_start_inner_forces_poll_interval_and_persists_once ... ok
+test tests::start_engine_is_idempotent_and_mints_a_session_token ... ok
+test tests::stream_registry_opens_gated_and_closes ... ok
+test tests::onedrive_explicit_scopes_detect_sync_and_offline_only ... ok
+test tests::mobile_body_key_install_rejects_bad_length_and_panic ... ok
+test tests::mobile_config_prepare_canonicalizes_me_without_deleting_other_accounts ... ok
+test tests::asset_request_with_session_uses_trusted_session_not_cookie_or_query ... ok
+test tests::asset_request_serves_the_shell_framed_binary_safe ... ok
+test tests::mobile_start_inner_clears_legacy_plaintext_cache_but_keeps_tokens ... ok
+test tests::mobile_config_reload_rejects_invalid_toml_and_invalid_config ... ok
+test tests::bridge_request_routes_against_the_running_engine_without_a_port ... ok
+test tests::standalone_serves_ui_and_gates_the_api_in_process ... ok
+test tests::onedrive_scoped_pass_waits_for_store_gate_before_token_lookup ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_pathmap-7bc9e8fe1a3b2eba)
+
+running 11 tests
+test tests::forbidden_chars_roundtrip ... ok
+test tests::dedupe_inserts_before_extension ... ok
+test tests::different_parents_do_not_collide ... ok
+test tests::interior_dots_and_spaces_untouched ... ok
+test tests::case_collision_is_deduped_and_reversible ... ok
+test tests::reserved_names_detected ... ok
+test tests::same_local_name_is_idempotent ... ok
+test tests::trailing_dot_and_space_encoded_and_restored ... ok
+test tests::table_serde_roundtrips ... ok
+test tests::unicode_normalized_cloud_collisions_are_deduped ... ok
+test tests::prop_codec_roundtrip ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_pbs-9eb4c7e92a30fdb6)
+
+running 2 tests
+test tests::parses_the_created_snapshot_from_backup_output ... ok
+test tests::errors_never_leak_the_password_and_use_env_not_argv ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_statusbar-5b8c456d70cc879f)
+
+running 12 tests
+test tests::apply_pauses_from_error ... ok
+test tests::apply_toggles_pause_and_browser_is_inert ... ok
+test tests::hit_test_maps_clicks_to_controls ... ok
+test tests::bundled_font_system_loads_only_the_bundled_font ... ok
+test tests::shapes_make_it_non_blank ... ok
+test tests::header_text_renders_glyph_pixels ... ok
+test tests::background_pixel_is_dark ... ok
+test tests::renders_correct_dimensions ... ok
+test tests::error_state_renders_red ... ok
+test tests::throttled_state_renders ... ok
+test tests::render_png_has_png_signature ... ok
+test tests::reason_banner_only_for_throttled_and_error ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s
+
+     Running unittests src/main.rs (target/debug/deps/isyncyou_statusbar-de232e654b94e515)
+
+running 3 tests
+test tests::live_view_surfaces_a_dead_daemon_instead_of_inventing_data ... ok
+test tests::live_view_reads_account_and_sync_state_from_the_daemon_api ... ok
+test tests::snapshot_writes_a_png_rendered_from_live_data ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_store-d8f737190739291a)
+
+running 45 tests
+test tests::clear_delta_cursor_removes_only_the_target_scope ... ok
+test tests::cloud_write_ledger_summary_counts_by_state ... ok
+test tests::delta_cursor_persists_and_bumps_generation ... ok
+test tests::cloud_write_ledger_is_idempotent_and_recovers_pending ... ok
+test tests::live_remote_ids_lists_non_deleted_for_service ... ok
+test tests::items_by_type_and_set_local_path ... ok
+test tests::default_process_still_allows_plain_open_without_key_required_mode ... ok
+test tests::children_by_parent_excludes_tombstones ... ok
+test tests::items_by_service_returns_all_types_non_deleted ... ok
+test tests::body_fts_indexes_searches_updates_and_scopes ... ok
+test tests::conflict_state_set_clear_and_conflicts_query ... ok
+test tests::fts_search_matches_names_and_respects_account ... ok
+test tests::backup_to_writes_a_readable_consistent_copy ... ok
+test tests::concurrent_opens_from_one_process_all_succeed ... ok
+test tests::migrates_to_current_version ... ok
+test tests::per_folder_delta_scopes_are_isolated ... ok
+test tests::onedrive_content_state_roundtrips_and_backfills_available ... ok
+test tests::migrate_refuses_empty_secret_and_leaves_store_untouched ... ok
+test tests::persists_across_reopen ... ok
+test tests::restore_state_machine_rules_and_roundtrip ... ok
+test tests::process_key_required_blocks_plain_writable_and_readonly_opens ... ok
+test tests::preview_json_roundtrip_and_body_change_invalidation ... ok
+test tests::restore_op_create_and_get ... ok
+test tests::restore_op_failed_after_commit_reconciles_or_resumes ... ok
+test tests::restore_op_happy_path_transitions_and_audit ... ok
+test tests::store_secret_file_is_trimmed_and_nonempty ... ok
+test tests::restore_op_idempotency_key_is_unique_per_account ... ok
+test tests::restore_op_illegal_transition_is_rejected_and_state_unchanged ... ok
+test tests::restore_op_lease_is_single_owner_until_expiry ... ok
+test tests::runs_record_and_list_newest_first ... ok
+test tests::restore_op_recoverable_excludes_terminal_and_other_accounts ... ok
+test tests::roots_returns_items_whose_parent_is_not_tracked ... ok
+test tests::set_local_path_records_body_etag_for_stale_detection ... ok
+test tests::set_verify_roundtrip_and_counts ... ok
+2026-07-08 16:13:37.728: ERROR CORE sqlcipher_page_cipher: hmac check failed for pgno=1
+2026-07-08 16:13:37.728: ERROR CORE sqlite3Codec: error decrypting page 1 data: 1
+2026-07-08 16:13:37.728: ERROR CORE sqlcipher_codec_ctx_set_error 1
+test tests::encrypted_backup_to_keeps_snapshot_encrypted ... ok
+test tests::synced_state_roundtrip_and_default_none ... ok
+test tests::upload_session_roundtrips_and_clears ... ok
+test tests::upsert_then_get_roundtrips ... ok
+test tests::upsert_updates_in_place ... ok
+test tests::migrate_already_encrypted_store_is_a_detectable_noop ... ok
+test tests::encrypted_store_hides_plaintext_and_requires_key ... ok
+test tests::migrate_recovers_from_stale_tmp_of_a_crashed_run ... ok
+test tests::migrate_to_encrypted_preserves_rows_and_fts ... ok
+test tests::open_readonly_reads_while_a_writer_holds_the_lock ... ok
+test tests::single_instance_lock_blocks_second_open ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.85s
+
+     Running unittests src/lib.rs (target/debug/deps/isyncyou_webui-681547623e0db122)
+
+running 165 tests
+test serve::tests::decode_body_base64_roundtrips_and_bounds ... ok
+test serve::tests::loopback_host_and_origin_validation ... ok
+test serve::tests::serve_refuses_non_loopback_bind_address ... ok
+test serve::tests::parses_request_line ... ok
+test serve::tests::dispatch_message_routes_without_a_socket ... ok
+test serve::tests::tcp_bind_address_must_be_loopback ... ok
+test serve::tests::build_request_resolves_cookie_session_and_carries_body ... ok
+test serve::tests::formats_http_message ... ok
+test serve::tests::handle_bridge_request_frames_json_response_and_enforces_session ... ok
+test serve::tests::keep_alive_reuses_one_connection_for_several_requests ... ok
+test tests::account_routes_refused_without_a_handler ... ok
+test serve::tests::serve_responds_over_a_real_socket ... ok
+test serve::tests::serve_unix_responds_and_is_owner_only ... ok
+test tests::agent_handler_open_stream_yields_a_receiver ... ok
+test tests::app_css_served_with_css_content_type ... ok
+test serve::tests::sse_path_enforces_loopback_host ... ok
+test tests::app_js_has_agent_cap_token_placeholder ... ok
+test serve::tests::tcp_rejects_non_loopback_host_and_origin ... ok
+test serve::tests::sse_streams_change_frame_and_serves_concurrently ... ok
+test serve::tests::http_reads_body_then_serves_next_request_on_same_connection ... ok
+test tests::app_js_has_contact_write_cap_token_placeholder ... ok
+test tests::app_js_has_mail_write_cap_token_placeholder ... ok
+test serve::tests::session_token_gates_data_routes_over_http ... ok
+test tests::app_js_biometric_labels_cover_onedrive_risk_ops ... ok
+test tests::app_js_has_calendar_write_cap_token_placeholder ... ok
+test tests::app_js_has_account_cap_token_placeholder ... ok
+test tests::app_js_has_onenote_write_cap_token_placeholder ... ok
+test tests::app_js_has_task_write_cap_token_placeholder ... ok
+test tests::app_js_has_push_cap_token_placeholder ... ok
+test tests::app_js_lists_browsable_services ... ok
+test tests::app_shell_carries_strict_csp_header ... ok
+test tests::app_js_wires_pagination ... ok
+test tests::backup_state_derives_four_states ... ok
+test tests::app_js_wires_overview_dashboard ... ok
+test tests::app_js_gates_download_now_by_store_mode ... ok
+test tests::app_js_has_onedrive_write_cap_token_placeholder ... ok
+test tests::app_js_has_onedrive_manage_cap_token_placeholder ... ok
+test tests::app_js_has_transfer_cap_token_placeholder ... ok
+test tests::app_js_injects_separate_capability_tokens_when_enabled ... ok
+test tests::bridge_isolation_iframe_sandboxes_remain_no_script ... ok
+test tests::bridge_isolation_mobile_streams_prefer_bridge_before_eventsource ... ok
+test tests::bridge_isolation_native_call_rejects_non_json_body ... ok
+test tests::bridge_isolation_oauth_redirects_do_not_build_empty_port_callbacks ... ok
+test tests::bridge_isolation_stream_subscription_has_handshake_timeout_cleanup ... ok
+test tests::bridge_isolation_app_js_requires_native_control_bridge ... ok
+test tests::cap_ok_accepts_only_the_exact_token ... ok
+test tests::bridge_isolation_app_js_has_no_legacy_mobile_session_path ... ok
+test tests::agent_routes_are_404_when_not_enabled ... ok
+test tests::ct_eq_is_exact_and_length_checked ... ok
+test tests::accounts_lists_configured_accounts ... ok
+test tests::agent_oauth_callback_is_session_gate_exempt_for_the_browser ... ok
+test tests::gated_router_serves_and_releases_the_gate ... ok
+test tests::hydrations_endpoint_lists_in_flight_downloads ... ok
+test tests::agent_routes_require_cap_token_and_validate_params ... ok
+test tests::agent_oauth_start_is_cap_gated_and_returns_authorize_url ... ok
+test tests::item_json_has_body_derives_per_service ... ok
+test tests::agent_status_route_reports_enabled_and_connected ... ok
+test tests::activity_lists_recent_runs_newest_first ... ok
+test tests::body_resolves_nested_onedrive_path_via_parent_chain ... ok
+test tests::attachment_lists_and_downloads_with_inert_type ... ok
+test tests::contact_photo_serves_archived_jpg_or_404 ... ok
+test tests::body_serves_archived_bytes_with_safe_content_type ... ok
+test tests::calendar_write_endpoints_are_cap_gated_and_route_params ... ok
+test tests::contact_write_endpoints_are_cap_gated_and_route_params ... ok
+test tests::drive_quota_route_returns_handler_json_or_404 ... ok
+test tests::body_serves_onedrive_cache_mode_file_from_cache_root ... ok
+test tests::invite_fail_closed_share_errors_return_conflict ... ok
+test tests::biometric_gate_challenges_and_consumes_a_per_action_token ... ok
+test tests::items_calendar_carries_preview_from_archived_json ... ok
+test tests::destructive_capability_tokens_are_action_scoped ... ok
+test tests::items_calendar_entity_carries_colour_preview ... ok
+test tests::item_returns_one_or_404 ... ok
+test tests::onedrive_children_is_session_gated ... ok
+test tests::items_contacts_and_todo_carry_preview_from_archived_json ... ok
+test tests::items_lists_a_service ... ok
+test tests::item_endpoint_enriches_onedrive_effective_mode ... ok
+test tests::items_mail_preview_exposes_structured_fields_and_categories ... ok
+test tests::items_mail_carries_preview_from_archived_eml ... ok
+test tests::items_mail_preview_shows_indexed_sender_without_eml ... ok
+test tests::items_paginate_with_limit_and_offset ... ok
+test tests::missing_params_and_unknown_routes_are_errors ... ok
+test tests::onedrive_mode_serde_round_trips_with_as_str ... ok
+test tests::onedrive_children_carry_effective_mode ... ok
+test tests::mail_write_does_not_notify_the_sse_bus ... ok
+test tests::onedrive_children_route_returns_handler_json_or_404 ... ok
+test tests::items_parent_navigates_onedrive_folders ... ok
+test tests::body_serves_onedrive_file_from_sync_root ... ok
+test tests::onedrive_delete_is_biometric_gated_on_mobile ... ok
+test tests::onedrive_open_is_session_gated ... ok
+test tests::onedrive_items_carry_preview_from_sidecar ... ok
+test tests::onedrive_preview_captures_all_rich_facets ... ok
+test tests::onedrive_preview_omits_absent_facets ... ok
+test tests::onedrive_risk_action_items_are_canonical_json ... ok
+test tests::mail_write_endpoints_are_cap_token_gated_and_route_params ... ok
+test tests::onedrive_manage_biometric_gating_on_mobile ... ok
+test tests::onedrive_mode_online_cleanup_is_bulk_gated_before_persist ... ok
+test tests::onedrive_mode_post_is_audited ... ok
+test tests::onedrive_move_missing_risk_classifier_fails_closed_on_mobile ... ok
+test tests::onedrive_move_out_of_protected_is_biometric_gated_on_mobile ... ok
+test tests::onedrive_move_unknown_risk_is_biometric_gated_on_mobile ... ok
+test tests::open_external_confirms_only_safe_http_urls ... ok
+test tests::onedrive_move_low_risk_is_not_biometric_gated_on_mobile ... ok
+test tests::push_register_needs_cap_token_and_records ... ok
+test tests::push_register_rejects_empty_token ... ok
+test tests::push_routes_refused_without_a_handler ... ok
+test tests::request_parses_path_and_query ... ok
+test tests::onedrive_offline_large_mode_switch_is_biometric_gated_before_persist ... ok
+test tests::restore_post_refused_when_not_enabled ... ok
+test tests::onedrive_open_route_returns_bytes_or_404 ... ok
+test tests::onedrive_offline_small_mode_switch_is_not_gated ... ok
+test tests::onedrive_upload_replace_are_biometric_gated_on_mobile ... ok
+test tests::safe_content_type_serves_raster_images_but_not_svg ... ok
+test tests::mode_post_online_triggers_cleanup_only_when_manage_wired ... ok
+test tests::mobile_body_policy_rejects_plaintext_onedrive_bodies_in_listing ... ok
+test tests::session_gate_leaves_static_shell_open ... ok
+test tests::session_gate_off_by_default_desktop ... ok
+test tests::session_gate_requires_token_on_data_routes ... ok
+test tests::onedrive_manage_endpoints_cap_gate_and_dispatch ... ok
+test tests::onenote_preview_exposes_page_metadata_from_sidecar ... ok
+test tests::onedrive_risk_classifier_is_not_called_on_desktop ... ok
+test tests::onedrive_mode_post_persists_and_get_reflects ... ok
+test tests::permissions_route_returns_handler_json_or_404 ... ok
+test tests::open_bridge_stream_gates_events_and_agent ... ok
+test tests::onenote_write_endpoints_are_cap_gated_and_route_params ... ok
+test tests::static_assets_carry_correct_type_and_no_store ... ok
+test tests::root_serves_html ... ok
+test tests::sync_control_state_and_token_guarded_commands ... ok
+test tests::restore_post_audits_handler_errors ... ok
+test tests::restore_post_requires_a_valid_capability_token ... ok
+test tests::search_includes_indexed_body_hits ... ok
+test tests::transfer_control_posts_are_gate_exempt_during_a_pass ... ok
+test tests::restore_post_writes_a_durable_audit_log ... ok
+test tests::transfers_poll_is_gate_exempt_for_the_live_panel ... ok
+test tests::transfers_progress_cancel_and_policy_endpoints ... ok
+test tests::settings_exposes_sync_config_and_account_roots_without_secrets ... ok
+test view::tests::contact_joins_emails_and_phones ... ok
+test view::tests::escape_neutralizes_markup_and_quotes ... ok
+test view::tests::event_renders_fields_and_escapes_values ... ok
+test view::tests::external_content_opt_in_keeps_src_and_uses_relaxed_csp ... ok
+test view::tests::external_link_dialog_page_requires_safe_http_url ... ok
+test view::tests::generic_renders_scalars_and_skips_nested ... ok
+test view::tests::mail_page_is_csp_locked_and_shows_escaped_subject ... ok
+test view::tests::mail_page_maps_cid_images_to_data_urls ... ok
+test view::tests::mail_page_rewrites_external_links_to_confirm_dialog ... ok
+test view::tests::note_page_sanitizes_and_is_csp_locked ... ok
+test view::tests::page_embeds_csp_meta ... ok
+test view::tests::sanitize_keeps_styling_for_fidelity ... ok
+test view::tests::sanitize_strips_scripts_and_blocks_remote_resources ... ok
+test tests::search_matches_names ... ok
+test view::tests::task_shows_status_due_and_body ... ok
+test tests::settings_post_requires_cap_token_and_validates_interval ... ok
+test tests::onedrive_upload_replace_dispatch_and_gates ... ok
+test view::tests::source_page_escapes_and_caps ... ok
+test tests::onedrive_write_cap_gate_and_dispatch ... ok
+test tests::share_invite_is_biometric_gated_before_handler_call_on_mobile ... ok
+test tests::share_handler_errors_are_redacted_in_response_and_audit ... ok
+test tests::share_is_biometric_gated_on_mobile ... ok
+test tests::share_post_invite_mode_routes_to_invite_not_link ... ok
+test tests::status_reports_per_service_counts_and_totals ... ok
+test tests::todo_list_preview_exposes_list_level_fields ... ok
+test tests::verify_post_requires_token_and_is_disabled_without_handler ... ok
+test tests::todo_attachment_lists_and_downloads_from_taskatt_sidecar ... ok
+test tests::view_renders_safe_html_with_csp_and_escapes_untrusted_values ... ok
+test tests::todo_write_endpoints_are_cap_gated_and_route_params ... ok
+test tests::share_post_requires_token_returns_weburl_and_is_disabled_without_handler ... ok
+
+test result: ok. 165 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.12s
+
+   Doc-tests isyncyou_acceptance
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_agent
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_app_host
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_change_source
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_connectors
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_dbus_status
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_doctor_lib
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_engine
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_fuse
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_graph
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_ipc_types
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_pathmap
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_pbs
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_statusbar
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests isyncyou_webui
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+$ # issue-725 JSON artifact sanity boundary
+issue-725 JSON artifacts: none yet; dedicated manifest/artifact JSON is Task 4
