@@ -1600,9 +1600,8 @@ impl isyncyou_webui::PushHandler for DaemonPush {
     }
 }
 
-/// Web-UI outbound sharing (#494): create a sharing link for a OneDrive item by id
-/// using the cached write token (`Files.ReadWrite`). Only OneDrive drive items are
-/// shareable via `createLink`.
+/// Web-UI outbound sharing (#494/#722): route OneDrive link/invite mutations through
+/// the crash-safe cloud-write ledger. Only OneDrive drive items are shareable.
 pub struct DaemonShare {
     cfg: Config,
 }
@@ -1620,10 +1619,7 @@ impl isyncyou_webui::ShareHandler for DaemonShare {
                 "sharing is only supported for OneDrive items, not '{service}'"
             ));
         }
-        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
-        isyncyou_graph::GraphClient::new(token)
-            .create_link(id, link_type, scope, None, None, None)
-            .map_err(|e| e.to_string())
+        isyncyou_engine::share_link_via_ledger(&self.cfg, account, id, link_type, scope)
     }
     fn invite(
         &self,
@@ -1638,22 +1634,8 @@ impl isyncyou_webui::ShareHandler for DaemonShare {
                 "sharing is only supported for OneDrive items, not '{service}'"
             ));
         }
-        let roles: &[&str] = if role == "write" {
-            &["write"]
-        } else {
-            &["read"]
-        };
-        let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)?;
-        // Invite named people: require sign-in + send the invitation email.
-        isyncyou_graph::GraphClient::new(token)
-            .invite(id, emails, roles, true, true, "", None, None)
-            .map(|ids| {
-                format!(
-                    "invited {} recipient(s) ({role})",
-                    emails.len().max(ids.len())
-                )
-            })
-            .map_err(|e| e.to_string())
+        let role = if role == "write" { "write" } else { "read" };
+        isyncyou_engine::invite_via_ledger(&self.cfg, account, id, emails, role)
     }
 }
 
@@ -2276,6 +2258,27 @@ mod tests {
         };
         let err = isyncyou_webui::RestoreHandler::restore(&h, "a", "onedrive", "x").unwrap_err();
         assert!(err.contains("not crash-safe yet"), "onedrive: got: {err}");
+    }
+
+    #[test]
+    fn daemon_share_impl_does_not_call_graph_share_mutations_directly() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("impl isyncyou_webui::ShareHandler for DaemonShare")
+            .expect("DaemonShare ShareHandler impl exists");
+        let tail = &src[start..];
+        let end = tail
+            .find("/// Live OneDrive info")
+            .expect("DaemonShare impl sentinel exists");
+        let block = &tail[..end];
+        assert!(
+            !block.contains(".create_link("),
+            "DaemonShare must route share links through the engine ledger wrapper"
+        );
+        assert!(
+            !block.contains(".invite("),
+            "DaemonShare must route invites through the engine ledger wrapper"
+        );
     }
 
     #[test]
