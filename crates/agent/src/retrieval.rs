@@ -37,6 +37,28 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         Self { source }
     }
 
+    fn ensure_account(&self, action: &ToolAction) -> Result<(), AgentError> {
+        let account = match action {
+            ToolAction::Search { account, .. }
+            | ToolAction::DeepSearch { account, .. }
+            | ToolAction::Read { account, .. }
+            | ToolAction::List { account, .. }
+            | ToolAction::Export { account, .. }
+            | ToolAction::RestoreLocal { account, .. }
+            | ToolAction::Backup { account, .. }
+            | ToolAction::RestoreCloud { account, .. }
+            | ToolAction::LiveWrite { account, .. }
+            | ToolAction::Share { account, .. } => account,
+        };
+        if account != self.source.account() {
+            return Err(AgentError::ToolArgs(format!(
+                "account mismatch: tool requested {account}, executor is bound to {}",
+                self.source.account()
+            )));
+        }
+        Ok(())
+    }
+
     fn source_ref(it: &ItemRef) -> serde_json::Value {
         serde_json::json!({
             "service": it.service,
@@ -256,7 +278,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         };
         let mut candidates: Vec<ItemRef> = Vec::new();
         for svc in &scan {
-            for it in self.source.list(svc, None)? {
+            for it in self.source.list_page(svc, u32::MAX, 0)? {
                 if it.path.is_some() && !matched.contains(&(it.service.clone(), it.id.clone())) {
                     candidates.push(it);
                 }
@@ -335,7 +357,11 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
     }
 
     fn list(&self, service: &str, parent: Option<&str>) -> Result<String, AgentError> {
-        let items = self.source.list(service, parent)?;
+        let items = match parent {
+            Some("root") | Some("") => self.source.roots(service)?,
+            Some(parent) => self.source.children(service, parent)?,
+            None => self.source.list_page(service, u32::MAX, 0)?,
+        };
         let count = self.source.count(service)?;
         let results: Vec<serde_json::Value> = items.iter().map(Self::source_ref).collect();
         Ok(serde_json::json!({
@@ -393,6 +419,7 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 action.op()
             )));
         }
+        self.ensure_account(action)?;
         match action {
             ToolAction::Search {
                 services,
@@ -433,6 +460,10 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
         action: &ToolAction,
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<String, AgentError> {
+        if action.class() != ToolClass::Read {
+            return self.execute_read(action);
+        }
+        self.ensure_account(action)?;
         // Search + deep-search run as visible stages; every other read is single-shot.
         match action {
             ToolAction::Search {
@@ -459,6 +490,7 @@ mod tests {
 
     /// In-memory archive for testing the executor logic without a store.
     struct FakeArchive {
+        account: String,
         items: Vec<(ItemRef, Option<Vec<u8>>)>,
     }
     impl FakeArchive {
@@ -481,6 +513,10 @@ mod tests {
         }
     }
     impl ArchiveSource for FakeArchive {
+        fn account(&self) -> &str {
+            &self.account
+        }
+
         fn search_names(&self, query: &str) -> Result<Vec<ItemRef>, AgentError> {
             let q = query.to_lowercase();
             Ok(self
@@ -517,13 +553,25 @@ mod tests {
                 .and_then(|(_, b)| b.clone())
                 .ok_or_else(|| AgentError::ToolArgs(format!("no body {service}/{id}")))
         }
-        fn list(&self, service: &str, _parent: Option<&str>) -> Result<Vec<ItemRef>, AgentError> {
+        fn list_page(
+            &self,
+            service: &str,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<Vec<ItemRef>, AgentError> {
             Ok(self
                 .items
                 .iter()
                 .filter(|(i, _)| i.service == service)
                 .map(|(i, _)| i.clone())
                 .collect())
+        }
+        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.list_page(service, u32::MAX, 0)
+        }
+        fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError> {
+            let _ = parent;
+            self.list_page(service, u32::MAX, 0)
         }
         fn count(&self, service: &str) -> Result<u64, AgentError> {
             Ok(self
@@ -536,6 +584,7 @@ mod tests {
 
     fn fixture() -> RetrievalExecutor<FakeArchive> {
         RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
             items: vec![
                 FakeArchive::item(
                     "mail",
@@ -649,6 +698,7 @@ mod tests {
         // deep pass); m2 is about the same topic but never says "distrokid" (the keyword-less
         // match the deep read must surface); m3 is noise.
         let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
             items: vec![
                 FakeArchive::item(
                     "mail",
@@ -714,7 +764,10 @@ mod tests {
                 )
             })
             .collect();
-        let ex = RetrievalExecutor::new(FakeArchive { items });
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items,
+        });
         // Query matches nothing → all 5 are unmatched candidates; budget of 2 per pass.
         let out = ex
             .deep_search(&["mail".into()], "zzzznomatch", None, Some(2), &mut |_| {})
@@ -807,5 +860,18 @@ mod tests {
         };
         let out = ex.execute_read(&action).unwrap();
         assert!(out.contains("total_matches"));
+    }
+
+    #[test]
+    fn execute_read_rejects_account_mismatch() {
+        let ex = fixture();
+        let action = ToolAction::Search {
+            account: "other".into(),
+            services: vec![],
+            query: "spotify".into(),
+            limit: None,
+        };
+        let err = ex.execute_read(&action).unwrap_err();
+        assert!(err.to_string().contains("account mismatch"));
     }
 }

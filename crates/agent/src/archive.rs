@@ -25,6 +25,8 @@ pub struct ItemRef {
 
 /// Read-only retrieval over the archive. Account scope is fixed by the implementation.
 pub trait ArchiveSource {
+    /// Account id this archive is bound to.
+    fn account(&self) -> &str;
     /// FTS over names/subjects/filenames, best-first.
     fn search_names(&self, query: &str) -> Result<Vec<ItemRef>, AgentError>;
     /// FTS over indexed bodies → `(service, remote_id)` pairs, best-first.
@@ -33,8 +35,13 @@ pub trait ArchiveSource {
     fn get(&self, service: &str, id: &str) -> Result<Option<ItemRef>, AgentError>;
     /// Read an item's archived body bytes (traversal-safe).
     fn read_body(&self, service: &str, id: &str) -> Result<Vec<u8>, AgentError>;
-    /// List items under a parent (`None` = service root).
-    fn list(&self, service: &str, parent: Option<&str>) -> Result<Vec<ItemRef>, AgentError>;
+    /// One bounded flat page of a service's archived items.
+    fn list_page(&self, service: &str, limit: u32, offset: u32)
+        -> Result<Vec<ItemRef>, AgentError>;
+    /// Top-level items of a service.
+    fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError>;
+    /// Direct children of a parent item.
+    fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError>;
     /// Count items in a service.
     fn count(&self, service: &str) -> Result<u64, AgentError>;
 }
@@ -100,16 +107,36 @@ mod store_backed {
             }
         }
 
-        fn open(&self) -> Result<Store, AgentError> {
-            // Store::open auto-applies SQLCipher when a store key is configured.
-            Store::open(self.archive_root.join(".isyncyou-store.db"))
+        fn open_readonly(&self) -> Result<Store, AgentError> {
+            // Repo-specific WAL read-query handle: no .lock, no create/migration.
+            // It is intentionally not a raw SQLite READ_ONLY connection.
+            Store::open_readonly(self.archive_root.join(".isyncyou-store.db"))
                 .map_err(|e| AgentError::Provider(format!("store open: {e}")))
+        }
+
+        fn body_path(&self, rel: &str) -> Result<PathBuf, AgentError> {
+            let joined = super::safe_join(&self.archive_root, rel)?;
+            let root = self
+                .archive_root
+                .canonicalize()
+                .map_err(|e| AgentError::Provider(format!("archive root: {e}")))?;
+            let path = joined
+                .canonicalize()
+                .map_err(|e| AgentError::Provider(format!("body path: {e}")))?;
+            if !path.starts_with(&root) {
+                return Err(AgentError::ToolArgs(format!("path escape rejected: {rel}")));
+            }
+            Ok(path)
         }
     }
 
     impl ArchiveSource for StoreArchive {
+        fn account(&self) -> &str {
+            &self.account
+        }
+
         fn search_names(&self, query: &str) -> Result<Vec<ItemRef>, AgentError> {
-            let store = self.open()?;
+            let store = self.open_readonly()?;
             Ok(store
                 .search_names(&self.account, query)
                 .map_err(|e| AgentError::Provider(e.to_string()))?
@@ -119,14 +146,14 @@ mod store_backed {
         }
 
         fn search_bodies(&self, query: &str) -> Result<Vec<(String, String)>, AgentError> {
-            let store = self.open()?;
+            let store = self.open_readonly()?;
             store
                 .search_bodies(&self.account, query)
                 .map_err(|e| AgentError::Provider(e.to_string()))
         }
 
         fn get(&self, service: &str, id: &str) -> Result<Option<ItemRef>, AgentError> {
-            let store = self.open()?;
+            let store = self.open_readonly()?;
             Ok(store
                 .get_item(&self.account, service, id)
                 .map_err(|e| AgentError::Provider(e.to_string()))?
@@ -140,22 +167,46 @@ mod store_backed {
             let rel = item.path.ok_or_else(|| {
                 AgentError::ToolArgs(format!("{service}/{id} has no archived body"))
             })?;
-            let path = super::safe_join(&self.archive_root, &rel)?;
-            std::fs::read(&path).map_err(|e| AgentError::Provider(format!("read body: {e}")))
+            let path = self.body_path(&rel)?;
+            isyncyou_core::envelope::read_body(&path)
+                .map_err(|e| AgentError::Provider(format!("read body: {e}")))
         }
 
-        fn list(&self, service: &str, parent: Option<&str>) -> Result<Vec<ItemRef>, AgentError> {
-            let store = self.open()?;
-            let items = match parent {
-                Some(_) => store.children(&self.account, service, parent),
-                None => store.items_by_service(&self.account, service),
-            }
-            .map_err(|e| AgentError::Provider(e.to_string()))?;
+        fn list_page(
+            &self,
+            service: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<Vec<ItemRef>, AgentError> {
+            let store = self.open_readonly()?;
+            let items = store
+                .items_by_service_page(&self.account, service, limit, offset)
+                .map_err(|e| AgentError::Provider(e.to_string()))?;
             Ok(items.into_iter().map(to_ref).collect())
         }
 
+        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
+            let store = self.open_readonly()?;
+            Ok(store
+                .roots(&self.account, service)
+                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .into_iter()
+                .map(to_ref)
+                .collect())
+        }
+
+        fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError> {
+            let store = self.open_readonly()?;
+            Ok(store
+                .children(&self.account, service, Some(parent))
+                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .into_iter()
+                .map(to_ref)
+                .collect())
+        }
+
         fn count(&self, service: &str) -> Result<u64, AgentError> {
-            let store = self.open()?;
+            let store = self.open_readonly()?;
             store
                 .count_by_service(&self.account, service)
                 .map_err(|e| AgentError::Provider(e.to_string()))
@@ -188,5 +239,147 @@ mod tests {
         assert!(safe_join(root, "../etc/passwd").is_err());
         assert!(safe_join(root, "a/../../secret").is_err());
         assert!(safe_join(root, "/etc/passwd").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "retrieval"))]
+mod store_archive_tests {
+    use super::*;
+    use isyncyou_store::{Item, Store};
+    use std::sync::{Mutex, OnceLock};
+
+    fn body_key_guard() -> std::sync::MutexGuard<'static, ()> {
+        static BODY_KEY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        BODY_KEY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    fn upsert_body_item(root: &Path, service: &str, id: &str, rel: &str, body: &[u8]) {
+        let store = Store::open(root.join(".isyncyou-store.db")).unwrap();
+        let mut item = Item::new("me", service, id, format!("{id} name"), "message");
+        item.local_path = Some(rel.into());
+        store.upsert_item(&item).unwrap();
+        drop(store);
+
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        isyncyou_core::envelope::write_body_atomic(&path, body).unwrap();
+    }
+
+    #[test]
+    fn store_archive_reads_sealed_body_with_envelope_reader() {
+        let _guard = body_key_guard();
+        isyncyou_core::envelope::reset_body_keys_for_tests();
+        isyncyou_core::envelope::set_body_key(618_001, [18u8; 32]);
+
+        let dir = tempfile::tempdir().unwrap();
+        upsert_body_item(dir.path(), "mail", "m1", "mail/aa/m1.eml", b"sealed text");
+        let raw = std::fs::read(dir.path().join("mail/aa/m1.eml")).unwrap();
+        assert_ne!(raw, b"sealed text");
+        assert!(raw.starts_with(b"ISYE"));
+
+        let archive = StoreArchive::new("me", dir.path());
+        assert_eq!(archive.read_body("mail", "m1").unwrap(), b"sealed text");
+        isyncyou_core::envelope::reset_body_keys_for_tests();
+    }
+
+    #[test]
+    fn store_archive_fails_closed_when_sealed_body_key_is_missing() {
+        let _guard = body_key_guard();
+        isyncyou_core::envelope::reset_body_keys_for_tests();
+        isyncyou_core::envelope::set_body_key(618_002, [19u8; 32]);
+
+        let dir = tempfile::tempdir().unwrap();
+        upsert_body_item(dir.path(), "mail", "m1", "mail/aa/m1.eml", b"sealed text");
+        isyncyou_core::envelope::reset_body_keys_for_tests();
+
+        let archive = StoreArchive::new("me", dir.path());
+        let err = archive.read_body("mail", "m1").unwrap_err();
+        assert!(
+            err.to_string().contains("no body key"),
+            "missing key must fail closed, got {err}"
+        );
+    }
+
+    #[test]
+    fn store_archive_uses_readonly_handle_while_writer_holds_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+        writer
+            .upsert_item(&Item::new("me", "mail", "m1", "Mail item", "message"))
+            .unwrap();
+
+        let archive = StoreArchive::new("me", dir.path());
+        let item = archive.get("mail", "m1").unwrap().unwrap();
+        assert_eq!(item.name, "Mail item");
+    }
+
+    #[test]
+    fn store_archive_read_does_not_create_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".isyncyou-store.db");
+        let archive = StoreArchive::new("me", dir.path());
+
+        assert!(!db.exists());
+        assert!(archive.search_names("anything").is_err());
+        assert!(!db.exists(), "read-only archive open must not create a DB");
+    }
+
+    #[test]
+    fn store_archive_rejects_traversal_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+        let mut item = Item::new("me", "mail", "m1", "Bad path", "message");
+        item.local_path = Some("../secret.eml".into());
+        store.upsert_item(&item).unwrap();
+        drop(store);
+
+        let archive = StoreArchive::new("me", dir.path());
+        let err = archive.read_body("mail", "m1").unwrap_err();
+        assert!(err.to_string().contains("path traversal rejected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_archive_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+
+        let body_dir = dir.path().join("mail");
+        std::fs::create_dir_all(&body_dir).unwrap();
+        std::os::unix::fs::symlink(outside.path(), body_dir.join("link.eml")).unwrap();
+
+        let store = Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+        let mut item = Item::new("me", "mail", "m1", "Link path", "message");
+        item.local_path = Some("mail/link.eml".into());
+        store.upsert_item(&item).unwrap();
+        drop(store);
+
+        let archive = StoreArchive::new("me", dir.path());
+        let err = archive.read_body("mail", "m1").unwrap_err();
+        assert!(err.to_string().contains("path escape rejected"));
+    }
+
+    #[test]
+    fn store_archive_split_list_methods_cover_page_roots_and_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+        let folder = Item::new("me", "onedrive", "folder", "Folder", "folder");
+        let mut child = Item::new("me", "onedrive", "child", "Child.txt", "file");
+        child.parent_remote_id = Some("folder".into());
+        store.upsert_item(&folder).unwrap();
+        store.upsert_item(&child).unwrap();
+        drop(store);
+
+        let archive = StoreArchive::new("me", dir.path());
+        assert_eq!(archive.list_page("onedrive", 10, 0).unwrap().len(), 2);
+        assert_eq!(archive.roots("onedrive").unwrap()[0].id, "folder");
+        assert_eq!(
+            archive.children("onedrive", "folder").unwrap()[0].id,
+            "child"
+        );
     }
 }
