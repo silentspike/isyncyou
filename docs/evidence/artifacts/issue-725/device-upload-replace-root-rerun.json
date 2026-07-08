@@ -1,0 +1,84 @@
+{
+  "bridge": {
+    "long_timeout_ms": 120000
+  },
+  "cleanup": [
+    {
+      "id": "892B68CBF4A7C544!sc8975cb5f07146c98870f5b62a7a0fc0",
+      "label": "root-upload",
+      "status": 204
+    },
+    {
+      "id": "892B68CBF4A7C544!sc1091633a1dc4228b728a4af73c78350",
+      "label": "fixture-root",
+      "status": 204
+    }
+  ],
+  "drive_root": {
+    "id": "892B68CBF4A7C544!sea8cc6beffdb43d7976fbc7da445c639",
+    "name": "root"
+  },
+  "fixture": {
+    "id": "892B68CBF4A7C544!sc1091633a1dc4228b728a4af73c78350",
+    "name": "isy-om725-upload-rerun-20260708-163830"
+  },
+  "mobile_api": {
+    "account": "me",
+    "cookie": "",
+    "hasBridge": true,
+    "replace": {
+      "ok": true
+    },
+    "rootUpload": {
+      "id": "892B68CBF4A7C544!sc8975cb5f07146c98870f5b62a7a0fc0",
+      "ok": true
+    },
+    "upload": {
+      "id": "892B68CBF4A7C544!s05f1c2ea31734eaab5260b6a38ad7e38",
+      "ok": true
+    }
+  },
+  "package": "com.silentspike.isyncyou.debug",
+  "rows": {
+    "F_root_upload": {
+      "body_matches_root_upload": true,
+      "body_preview": "ISY-OM725-ROOT-UPLOAD isy-om725-upload-rerun-20260708-163830\n",
+      "graph_body_sha256": "dae1ac71a141a0fbf6aa4d2edbfe4f4eb944a26a8ab3bf0a6729e2680e02e063",
+      "name": "isy-om725-upload-rerun-20260708-163830-root.txt",
+      "parent_id": "892B68CBF4A7C544!sea8cc6beffdb43d7976fbc7da445c639",
+      "parent_matches_drive_root": true,
+      "status": "PASS",
+      "uploaded_id": "892B68CBF4A7C544!sc8975cb5f07146c98870f5b62a7a0fc0"
+    },
+    "F_upload_replace": {
+      "graph_item": {
+        "etag_changed": true,
+        "etag_present": true,
+        "id": "892B68CBF4A7C544!s05f1c2ea31734eaab5260b6a38ad7e38",
+        "name": "upload-new.txt",
+        "parent_id": "892B68CBF4A7C544!sc1091633a1dc4228b728a4af73c78350",
+        "parent_matches_fixture": true,
+        "size": 60
+      },
+      "replace_body_matches_v2_after_replace": true,
+      "status": "PASS",
+      "upload_body_matches_v1_before_replace": true,
+      "uploaded_id": "892B68CBF4A7C544!s05f1c2ea31734eaab5260b6a38ad7e38",
+      "v1_preview": "ISY-OM725-UPLOAD-V1 isy-om725-upload-rerun-20260708-163830\n",
+      "v1_sha256": "6c8cf36a172e0e582c548c7c04ba5d2a07ac111bba8d289e3b1df86cc68f48b5",
+      "v2_preview": "ISY-OM725-REPLACE-V2 isy-om725-upload-rerun-20260708-163830\n",
+      "v2_sha256": "a3d2ec8e43019007764b15ad52ff90563ae0e9362a6d8f0a97cbb6a9b3c9f886"
+    }
+  },
+  "status": "PASS",
+  "token": {
+    "access_token_printed": false,
+    "account_cached": true,
+    "scopes": [
+      "Files.ReadWrite",
+      "User.Read"
+    ],
+    "source": "/home/jan/.config/m365-write/token_cache.json"
+  },
+  "ts": "2026-07-08T14:38:29Z"
+}

@@ -1,0 +1,7 @@
+Issue #725 mode target filesystem evidence
+timestamp_utc=2026-07-08T14:27:45Z
+package=com.silentspike.isyncyou.debug
+files/cache/sync/file-sync.txt
+files/sync/offline/file-offline.txt
+files/cache/sync/file-sync.txt 49535945
+files/sync/offline/file-offline.txt 49535945
