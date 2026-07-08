@@ -232,6 +232,35 @@ impl ApiResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicShareError {
+    status: u16,
+    message: String,
+}
+
+fn redact_share_error_for_public_surface(error: &str) -> PublicShareError {
+    let trimmed = error.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (status, message) = match trimmed {
+        "invite_recovery_ambiguous"
+        | "invite_partial_success"
+        | "invite_not_started_user_retry_required" => (409, trimmed.to_string()),
+        "share_policy_unsupported" => (400, trimmed.to_string()),
+        _ if lower.starts_with("invalid share")
+            || lower.starts_with("invalid invite")
+            || lower.starts_with("invite recipient")
+            || lower.starts_with("invite requires") =>
+        {
+            (400, "invalid_share_request".to_string())
+        }
+        _ if lower.contains("sharing is only supported") => {
+            (400, "share_unsupported_service".to_string())
+        }
+        _ => (500, "share_transient_failure".to_string()),
+    };
+    PublicShareError { status, message }
+}
+
 /// Performs a destructive cloud action on behalf of a POST request. Injected by
 /// the daemon (which owns the Graph/engine stack) so the router itself stays a
 /// pure read surface. Returns the new cloud id on success.
@@ -3221,13 +3250,14 @@ impl Router {
                     )
                 }
                 Err(e) => {
+                    let public = redact_share_error_for_public_surface(&e);
                     let _ = self.audit_account(
                         account,
                         "audit:share",
                         "error",
-                        &format!("invite error service={service} id={id}: {e}"),
+                        &format!("invite error service={service} id={id}: {}", public.message),
                     );
-                    ApiResponse::error(500, &e)
+                    ApiResponse::error(public.status, &public.message)
                 }
             };
         }
@@ -3257,13 +3287,14 @@ impl Router {
                 )
             }
             Err(e) => {
+                let public = redact_share_error_for_public_surface(&e);
                 let _ = self.audit_account(
                     account,
                     "audit:share",
                     "error",
-                    &format!("share error service={service} id={id}: {e}"),
+                    &format!("share error service={service} id={id}: {}", public.message),
                 );
-                ApiResponse::error(500, &e)
+                ApiResponse::error(public.status, &public.message)
             }
         }
     }
@@ -8055,6 +8086,48 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
 
+    #[derive(Default)]
+    struct SpyShare {
+        share_calls: std::sync::atomic::AtomicUsize,
+        invite_calls: std::sync::atomic::AtomicUsize,
+        share_error: Option<String>,
+        invite_error: Option<String>,
+    }
+
+    impl ShareHandler for SpyShare {
+        fn share(
+            &self,
+            _a: &str,
+            _s: &str,
+            _i: &str,
+            _t: &str,
+            _sc: &str,
+        ) -> Result<String, String> {
+            self.share_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = &self.share_error {
+                return Err(error.clone());
+            }
+            Ok("https://1drv.ms/x/spy".into())
+        }
+
+        fn invite(
+            &self,
+            _a: &str,
+            _s: &str,
+            _i: &str,
+            emails: &[String],
+            role: &str,
+        ) -> Result<String, String> {
+            self.invite_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = &self.invite_error {
+                return Err(error.clone());
+            }
+            Ok(format!("invited {} ({role})", emails.len()))
+        }
+    }
+
     #[test]
     fn share_post_requires_token_returns_weburl_and_is_disabled_without_handler() {
         let (_d, router) = setup();
@@ -8131,6 +8204,99 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(!body.contains("webUrl"), "invite must not create a link");
         // invite still needs the capability token
         assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+    }
+
+    #[test]
+    fn share_invite_is_biometric_gated_before_handler_call_on_mobile() {
+        let (_d, router) = setup();
+        let spy = std::sync::Arc::new(SpyShare::default());
+        let mobile = router
+            .with_share(spy.clone(), "secret".into())
+            .with_biometric_gate();
+        let cap = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        let q = "/api/v1/share?account=a&service=onedrive&id=x&email=p%40e.com&role=write";
+
+        let ch = mobile.route(&cap(q));
+        assert_eq!(ch.status, 200);
+        let j = body_json(&ch);
+        assert_eq!(j["status"], "confirmation_required");
+        assert_eq!(
+            spy.invite_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(spy.share_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let pat = j["pending_action_id"].as_str().unwrap().to_string();
+
+        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        assert_eq!(
+            spy.invite_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        assert!(mobile.confirm_biometric(&pat));
+        let ok = mobile.route(&cap(&format!("{q}&_pat={pat}")));
+        assert_eq!(ok.status, 200);
+        assert_eq!(
+            spy.invite_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(spy.share_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        assert_eq!(
+            spy.invite_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn share_handler_errors_are_redacted_in_response_and_audit() {
+        let (_d, router) = setup();
+        let raw = "Graph failed for person@example.com at https://1drv.ms/raw-secret";
+        let router = router.with_share(
+            std::sync::Arc::new(SpyShare {
+                invite_error: Some(raw.into()),
+                ..Default::default()
+            }),
+            "secret".into(),
+        );
+        let q = "/api/v1/share?account=a&service=onedrive&id=x&email=person%40example.com";
+
+        let resp = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+
+        assert_eq!(resp.status, 500);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(body.contains("share_transient_failure"));
+        assert!(!body.contains("person@example.com"));
+        assert!(!body.contains("https://"));
+        assert!(!body.contains("1drv.ms"));
+
+        let audit =
+            body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=5")));
+        let audit_text = serde_json::to_string(&audit).unwrap();
+        assert!(audit_text.contains("share_transient_failure"));
+        assert!(!audit_text.contains("person@example.com"));
+        assert!(!audit_text.contains("https://"));
+        assert!(!audit_text.contains("1drv.ms"));
+    }
+
+    #[test]
+    fn invite_fail_closed_share_errors_return_conflict() {
+        let (_d, router) = setup();
+        let router = router.with_share(
+            std::sync::Arc::new(SpyShare {
+                invite_error: Some("invite_recovery_ambiguous".into()),
+                ..Default::default()
+            }),
+            "secret".into(),
+        );
+        let q = "/api/v1/share?account=a&service=onedrive&id=x&email=p%40e.com";
+
+        let resp = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+
+        assert_eq!(resp.status, 409);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(body.contains("invite_recovery_ambiguous"));
     }
 
     #[test]

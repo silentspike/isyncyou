@@ -321,11 +321,11 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// Share file(s)/folder(s) from the OneDrive mount: create a sharing link
-    /// (default — copied to the clipboard, the Dolphin "Share" action), invite by
-    /// email, or list/revoke existing shares. Uses the cached write token
-    /// (`Files.ReadWrite`). The OneDrive root itself is not shareable on personal
-    /// accounts; `--password`/`--expiry` are account/Premium-dependent. Linux-only.
+    /// Share file(s)/folder(s) from the OneDrive mount: create a ledger-backed
+    /// sharing link (default — copied to the clipboard, the Dolphin "Share" action),
+    /// invite by email through the ledger, or list/revoke existing shares. Uses the
+    /// cached write token (`Files.ReadWrite`) for mutations. The OneDrive root itself
+    /// is not shareable on personal accounts. Linux-only.
     #[cfg(target_os = "linux")]
     Share {
         #[arg(long, default_value = "isyncyou.toml")]
@@ -334,12 +334,12 @@ enum Command {
         #[arg(long = "type", value_parser = ["view", "edit", "embed"], default_value = "view")]
         link_type: String,
         /// Sharing-link scope (link mode).
-        #[arg(long, value_parser = ["anonymous", "users"], default_value = "anonymous")]
+        #[arg(long, value_parser = ["anonymous", "organization", "users"], default_value = "anonymous")]
         scope: String,
-        /// Password-protect the link/invite (account/Premium-dependent).
+        /// Password-protect the link/invite (not supported by crash-safe share ledger yet).
         #[arg(long)]
         password: Option<String>,
-        /// Link/invite expiry, RFC3339 (account/Premium-dependent).
+        /// Link/invite expiry, RFC3339 (not supported by crash-safe share ledger yet).
         #[arg(long)]
         expiry: Option<String>,
         /// Invite this email address instead of creating a link (repeatable).
@@ -348,13 +348,13 @@ enum Command {
         /// With --email: grant edit (write) instead of read.
         #[arg(long, requires = "email")]
         write: bool,
-        /// With --email: the invitation message.
+        /// With --email: the invitation message (not supported by crash-safe share ledger yet).
         #[arg(long, default_value = "")]
         message: String,
-        /// With --email: require the recipient to sign in.
+        /// With --email: require the recipient to sign in. Ledger-backed invites always do this.
         #[arg(long, requires = "email")]
         require_signin: bool,
-        /// With --email: create the permission without sending an email.
+        /// With --email: create the permission without sending an email (not supported by crash-safe share ledger yet).
         #[arg(long, requires = "email")]
         no_send: bool,
         /// List existing permissions for the path(s) instead of sharing.
@@ -363,6 +363,8 @@ enum Command {
         /// Revoke this permission id (from --list) on the path(s).
         #[arg(long)]
         revoke: Option<String>,
+        /// Explicit token. Supported for --list/--revoke; share/invite mutations
+        /// use the cached write token so the ledger can recover.
         #[arg(long, env = "ISYNCYOU_TOKEN")]
         token: Option<String>,
         /// Files/folders to share (Dolphin passes the selection via `%F`).
@@ -540,7 +542,7 @@ fn run(command: Command) -> Result<(), String> {
             email,
             write,
             message,
-            require_signin,
+            require_signin: _,
             no_send,
             list,
             revoke,
@@ -555,7 +557,6 @@ fn run(command: Command) -> Result<(), String> {
             emails: &email,
             write,
             message: &message,
-            require_signin,
             no_send,
             list,
             revoke: revoke.as_deref(),
@@ -686,7 +687,6 @@ struct ShareArgs<'a> {
     emails: &'a [String],
     write: bool,
     message: &'a str,
-    require_signin: bool,
     no_send: bool,
     list: bool,
     revoke: Option<&'a str>,
@@ -768,12 +768,40 @@ fn clipboard_copy(text: &str) -> bool {
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
+fn validate_share_mutation_args(args: &ShareArgs) -> Result<(), String> {
+    if args.token.is_some() {
+        return Err(
+            "share/invite mutations are crash-safe ledger-backed and do not accept --token; run `isyncyou login --write` for the account and retry"
+                .into(),
+        );
+    }
+    if args.password.is_some() || args.expiry.is_some() {
+        return Err(
+            "share/invite --password and --expiry are not supported by the crash-safe share ledger yet"
+                .into(),
+        );
+    }
+    if !args.message.is_empty() {
+        return Err("invite --message is not supported by the crash-safe share ledger yet".into());
+    }
+    if !args.emails.is_empty() && args.no_send {
+        return Err("invite --no-send is not supported by the crash-safe share ledger yet".into());
+    }
+    Ok(())
+}
+
 /// Share one path. `Some(webUrl)` in link mode (the caller copies links to the
 /// clipboard); `None` for invite/list/revoke (which print their own output).
 #[cfg(target_os = "linux")]
 fn share_one(cfg: &Config, path: &Path, args: &ShareArgs) -> Result<Option<String>, String> {
     let (account, rel) = owning_account_for_path(cfg, path)?;
-    let token = resolve_token(cfg, &account, args.token.clone(), true)?;
+    let token = if args.list || args.revoke.is_some() {
+        resolve_token(cfg, &account, args.token.clone(), true)?
+    } else {
+        validate_share_mutation_args(args)?;
+        resolve_token(cfg, &account, None, true)?
+    };
     let client = isyncyou_graph::GraphClient::new(token);
     let id = client
         .item_id_for_path(&rel)
@@ -797,38 +825,13 @@ fn share_one(cfg: &Config, path: &Path, args: &ShareArgs) -> Result<Option<Strin
         return Ok(None);
     }
     if !args.emails.is_empty() {
-        let roles: &[&str] = if args.write { &["write"] } else { &["read"] };
-        let ids = client
-            .invite(
-                &id,
-                args.emails,
-                roles,
-                args.require_signin,
-                !args.no_send,
-                args.message,
-                args.expiry,
-                args.password,
-            )
-            .map_err(|e| e.to_string())?;
-        println!(
-            "{}: invited {} ({}) — {} permission(s)",
-            path.display(),
-            args.emails.join(", "),
-            if args.write { "write" } else { "read" },
-            ids.len()
-        );
+        let role = if args.write { "write" } else { "read" };
+        let summary = isyncyou_engine::invite_via_ledger(cfg, &account, &id, args.emails, role)?;
+        println!("{}: {} ({})", path.display(), summary, role,);
         return Ok(None);
     }
-    let link = client
-        .create_link(
-            &id,
-            args.link_type,
-            args.scope,
-            args.password,
-            args.expiry,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+    let link =
+        isyncyou_engine::share_link_via_ledger(cfg, &account, &id, args.link_type, args.scope)?;
     Ok(Some(link))
 }
 
@@ -3152,6 +3155,12 @@ mod tests {
             parse(&["isyncyou", "share", "--type", "edit", "/mnt/f.txt"]).unwrap().command,
             Command::Share { ref link_type, .. } if link_type == "edit"
         ));
+        assert!(matches!(
+            parse(&["isyncyou", "share", "--scope", "organization", "/mnt/f.txt"])
+                .unwrap()
+                .command,
+            Command::Share { ref scope, .. } if scope == "organization"
+        ));
         // repeated --email collects all addresses
         match parse(&[
             "isyncyou",
@@ -3185,6 +3194,102 @@ mod tests {
         .is_err());
         assert!(parse(&["isyncyou", "share", "--type", "bogus", "/mnt/f.txt"]).is_err());
         assert!(parse(&["isyncyou", "share"]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_share_args<'a>(
+        emails: &'a [String],
+        message: &'a str,
+        token: Option<String>,
+        password: Option<&'a str>,
+        expiry: Option<&'a str>,
+        no_send: bool,
+    ) -> ShareArgs<'a> {
+        ShareArgs {
+            config: Path::new("isyncyou.toml"),
+            link_type: "view",
+            scope: "anonymous",
+            password,
+            expiry,
+            emails,
+            write: false,
+            message,
+            no_send,
+            list: false,
+            revoke: None,
+            token,
+            paths: &[],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn share_mutation_args_fail_closed_when_not_ledger_modeled() {
+        assert!(
+            validate_share_mutation_args(&test_share_args(&[], "", None, None, None, false))
+                .is_ok()
+        );
+        let emails = vec!["person@example.com".to_string()];
+        assert!(validate_share_mutation_args(&test_share_args(
+            &[],
+            "",
+            Some("TOK".into()),
+            None,
+            None,
+            false
+        ))
+        .unwrap_err()
+        .contains("do not accept --token"));
+        assert!(validate_share_mutation_args(&test_share_args(
+            &[],
+            "",
+            None,
+            Some("pw"),
+            None,
+            false
+        ))
+        .unwrap_err()
+        .contains("--password"));
+        assert!(validate_share_mutation_args(&test_share_args(
+            &[],
+            "",
+            None,
+            None,
+            Some("2026-07-08T00:00:00Z"),
+            false
+        ))
+        .unwrap_err()
+        .contains("--expiry"));
+        assert!(validate_share_mutation_args(&test_share_args(
+            &emails, "hello", None, None, None, false
+        ))
+        .unwrap_err()
+        .contains("--message"));
+        assert!(validate_share_mutation_args(&test_share_args(
+            &emails, "", None, None, None, true
+        ))
+        .unwrap_err()
+        .contains("--no-send"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_share_mutations_do_not_call_graph_share_apis_directly() {
+        let src = include_str!("main.rs");
+        let start = src.find("fn share_one(").expect("share_one exists");
+        let tail = &src[start..];
+        let end = tail.find("/// `share`:").expect("cmd_share marker exists");
+        let block = &tail[..end];
+        assert!(
+            !block.contains(".create_link("),
+            "CLI share mutation must use the crash-safe ledger, not Graph createLink directly"
+        );
+        assert!(
+            !block.contains(".invite("),
+            "CLI invite mutation must use the crash-safe ledger, not Graph invite directly"
+        );
+        assert!(block.contains("share_link_via_ledger"));
+        assert!(block.contains("invite_via_ledger"));
     }
 
     #[cfg(target_os = "linux")]
