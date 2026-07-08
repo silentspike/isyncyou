@@ -1057,7 +1057,7 @@ pub fn recover_share_write_op<S: OneDriveShareSink>(
             store
                 .set_cloud_write_state(&op.op_id, "failed", None, Some(&redacted), now)
                 .map_err(|store_err| store_err.to_string())?;
-            return Err(e);
+            return Ok(ShareOutcome::FailedClosed { reason: redacted });
         }
     };
     match intent.kind {
@@ -1271,9 +1271,14 @@ pub fn recover_pending_cloud_writes<S: OneDriveWriteSink + OneDriveShareSink>(
         match recover_cloud_write_op(store, op, sink, secret, now) {
             Ok(_) => recovered += 1,
             Err(e) => {
+                let public_error = if CloudOpKind::parse(&op.op_kind) == Some(CloudOpKind::Share) {
+                    redacted_share_error(&e)
+                } else {
+                    e.clone()
+                };
                 eprintln!(
-                    "isyncyou: cloud-write recovery for {} skipped: {e}",
-                    op.op_id
+                    "isyncyou: cloud-write recovery for {} skipped: {public_error}",
+                    op.op_id,
                 );
                 if cloud_write_body_source_missing(op) {
                     let _ = store.set_cloud_write_state(&op.op_id, "failed", None, Some(&e), now);
@@ -2384,6 +2389,103 @@ mod tests {
         assert_eq!(row.state, "failed");
         assert_eq!(row.last_error.as_deref(), Some("share_policy_unsupported"));
         assert!(s.pending_cloud_writes(ACCT).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_share_intent_recovery_fails_closed_without_loop() {
+        let s = Store::open_in_memory().unwrap();
+        let cloud = FakeCloud::default();
+        let op = CloudWriteOp {
+            op_id: "malformed-share-op".into(),
+            account_id: ACCT.into(),
+            service: SERVICE.into(),
+            op_kind: CloudOpKind::Share.as_str().into(),
+            target_id: Some("item-1".into()),
+            idempotency_key: "malformed-share-key".into(),
+            if_match_etag: None,
+            state: "inflight".into(),
+            result_id: None,
+            intent_json: Some(r#"{"share_kind":"link"}"#.into()),
+            attempts: 1,
+            last_error: None,
+        };
+        s.record_cloud_write(&op, 10).unwrap();
+
+        let recovered = recover_pending_cloud_writes(&s, ACCT, &cloud, SECRET, 20).unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(*cloud.create_link_calls.borrow(), 0);
+        assert_eq!(*cloud.invite_calls.borrow(), 0);
+        let row = s
+            .cloud_write_by_key(ACCT, "malformed-share-key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("share link intent has no link_type")
+        );
+        assert!(s.pending_cloud_writes(ACCT).unwrap().is_empty());
+    }
+
+    #[test]
+    fn share_redaction_covers_link_and_invite_last_error() {
+        let raw = "Graph failed for person@example.com at https://1drv.ms/raw-secret";
+
+        let link_store = Store::open_in_memory().unwrap();
+        let link_cloud = FakeCloud::default();
+        link_cloud.create_link_errors.borrow_mut().push(raw.into());
+        let link_err = run_share_link(
+            &link_store,
+            ACCT,
+            "item-1",
+            "view",
+            "anonymous",
+            &link_cloud,
+            SECRET,
+            10,
+        )
+        .unwrap_err();
+        assert!(link_err.contains("person@example.com"));
+        let link_key = ShareIntent::link("item-1", "view", "anonymous")
+            .unwrap()
+            .keys(SECRET, ACCT)
+            .1;
+        let link_row = link_store
+            .cloud_write_by_key(ACCT, &link_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(link_row.state, "inflight");
+        assert_eq!(link_row.last_error.as_deref(), Some("share_error"));
+
+        let invite_store = Store::open_in_memory().unwrap();
+        let invite_cloud = FakeCloud::default();
+        invite_cloud
+            .invite_outcomes
+            .borrow_mut()
+            .push(Err(raw.into()));
+        let emails = invite_emails();
+        let invite_err = run_invite(
+            &invite_store,
+            ACCT,
+            "item-1",
+            &emails,
+            "read",
+            &invite_cloud,
+            SECRET,
+            10,
+        )
+        .unwrap_err();
+        assert!(invite_err.contains("person@example.com"));
+        let (intent, _) = ShareIntent::invite(ACCT, "item-1", &emails, "read", SECRET).unwrap();
+        let invite_key = intent.keys(SECRET, ACCT).1;
+        let invite_row = invite_store
+            .cloud_write_by_key(ACCT, &invite_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(invite_row.state, "inflight");
+        assert_eq!(invite_row.last_error.as_deref(), Some("share_error"));
+        assert!(!invite_row.intent_json.unwrap().contains('@'));
     }
 
     #[test]
