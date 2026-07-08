@@ -56,6 +56,7 @@ def run(argv: list[str], *, check: bool = True, timeout: int = 30) -> CmdResult:
 class Evidence:
     def __init__(self) -> None:
         self.rows: list[dict[str, Any]] = []
+        self.meta: dict[str, Any] = {}
 
     def pass_(self, name: str, **details: Any) -> None:
         self.rows.append({"name": name, "status": "PASS", **details})
@@ -85,6 +86,9 @@ class Device:
 
     def adb_cmd(self, *args: str, check: bool = True, timeout: int = 30) -> CmdResult:
         return run([self.adb, *args], check=check, timeout=timeout)
+
+    def serial(self) -> str:
+        return self.adb_cmd("get-serialno", check=False).out.strip()
 
     def shell(self, command: str, *, check: bool = True, timeout: int = 30) -> str:
         return self.adb_cmd("shell", command, check=check, timeout=timeout).out
@@ -144,6 +148,7 @@ class Device:
         self.remove_forward()
         sock = self.webview_socket()
         self.adb_cmd("forward", f"tcp:{self.cdp_port}", f"localabstract:{sock}")
+        self.evidence.meta["webview_devtools_socket"] = sock
         self.evidence.pass_("cdp_forward", socket=sock, port=self.cdp_port)
         return sock
 
@@ -187,6 +192,15 @@ class Device:
             "focused_app": focused_app,
         }
 
+    def prompt_window_state(self) -> dict[str, Any]:
+        raw = self.shell("dumpsys window", check=False, timeout=20)
+        matches = [
+            line.strip()
+            for line in raw.splitlines()
+            if re.search(r"biometric|credential|prompt|keyguard", line, re.I)
+        ]
+        return {"matches": matches[:12]}
+
 
 class Cdp:
     def __init__(self, port: int) -> None:
@@ -197,8 +211,10 @@ class Cdp:
         self.websocket = websocket
         self.port = port
         self.next_id = 0
+        self.target = self.target_info()
+        self.ws_url = self.target["webSocketDebuggerUrl"]
         self.ws = self.websocket.create_connection(
-            self.target_ws_url(),
+            self.ws_url,
             timeout=10,
             suppress_origin=True,
         )
@@ -209,15 +225,15 @@ class Cdp:
         except Exception:
             pass
 
-    def target_ws_url(self) -> str:
+    def target_info(self) -> dict[str, Any]:
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=10) as resp:
             targets = json.loads(resp.read().decode("utf-8"))
         pages = [t for t in targets if t.get("type") == "page"]
         for target in pages:
             if "appassets.androidplatform.net" in target.get("url", ""):
-                return target["webSocketDebuggerUrl"]
+                return target
         if pages:
-            return pages[0]["webSocketDebuggerUrl"]
+            return pages[0]
         raise ProbeError("no CDP page target found")
 
     def call(self, method: str, params: dict[str, Any] | None = None, timeout: int = 10) -> dict[str, Any]:
@@ -288,6 +304,9 @@ def forced_failure_probe(device: Device, ev: Evidence) -> None:
     time.sleep(3)
     wait_for_cdp(device)
     cdp = Cdp(device.cdp_port)
+    ev.meta["webview_devtools_target_url"] = cdp.target.get("url", "")
+    ev.meta["webview_devtools_ws_url"] = cdp.ws_url
+    ev.pass_("webview_devtools_target", url=cdp.target.get("url", ""), ws_url=cdp.ws_url)
     try:
         wait_for_dom(cdp)
         text = cdp.eval("document.documentElement.innerText || ''")
@@ -313,6 +332,9 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
     time.sleep(5)
     wait_for_cdp(device)
     cdp = Cdp(device.cdp_port)
+    ev.meta["webview_devtools_target_url"] = cdp.target.get("url", "")
+    ev.meta["webview_devtools_ws_url"] = cdp.ws_url
+    ev.pass_("webview_devtools_target", url=cdp.target.get("url", ""), ws_url=cdp.ws_url)
     try:
         wait_for_dom(cdp)
         ev.assert_("top_frame_has_bridge", cdp.eval("typeof window.__isyBridge") == "object")
@@ -393,8 +415,80 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
             """
         )
         ev.assert_("native_malformed_message_returns_400", malformed.get("status") == 400, reply=malformed)
+        cleanup = cdp.eval(
+            """
+            (async () => {
+              const rows = [];
+              const oldPost = window.__isyBridge.postMessage;
+              try {
+                window.__isyBridge.onmessage({ data: 'not-json' });
+                window.__isyBridge.onmessage({ data: JSON.stringify({ t: 'res', id: 'wrong-id', status: 200, body: '{}' }) });
+                let duplicateCount = 0;
+                const dupId = 'probe-dup';
+                _bridgePending.set(dupId, {
+                  resolve: () => { duplicateCount += 1; },
+                  reject: () => {},
+                  timer: setTimeout(() => {}, 5000)
+                });
+                window.__isyBridge.onmessage({ data: JSON.stringify({ t: 'res', id: dupId, status: 200, body: '{}' }) });
+                window.__isyBridge.onmessage({ data: JSON.stringify({ t: 'res', id: dupId, status: 200, body: '{}' }) });
+                rows.push({ name: 'duplicate_once', ok: duplicateCount === 1 && !_bridgePending.has(dupId) });
+
+                const timeoutId = 'probe-timeout';
+                window.__isyBridge.postMessage = () => {};
+                try { await bridgeRoundTrip({ t: 'native', id: timeoutId, op: 'pushToken', payload: {} }, 50); }
+                catch (_) {}
+                rows.push({ name: 'timeout_cleared', ok: !_bridgePending.has(timeoutId) });
+                window.__isyBridge.onmessage({ data: JSON.stringify({ t: 'res', id: timeoutId, status: 200, body: '{}' }) });
+                rows.push({ name: 'late_ignored', ok: !_bridgePending.has(timeoutId) });
+              } finally {
+                window.__isyBridge.postMessage = oldPost;
+              }
+              return { ok: rows.every(r => r.ok), rows, pending: _bridgePending.size };
+            })()
+            """,
+            timeout=8,
+        )
+        ev.assert_("bridge_js_response_cleanup", cleanup.get("ok") is True, result=cleanup)
         push = cdp.eval("nativeCall('pushToken', {}, 3000).then(d => typeof d.token === 'string')")
         ev.assert_("native_push_token_op_returns", push is True)
+        bio_started = cdp.eval(
+            """
+            new Promise((resolve) => {
+              window.__isyBioProbe = runBiometricConfirm('issue-721-probe', 'Issue 721 probe');
+              setTimeout(() => resolve({
+                pending: _bioPending.size,
+                stats: window.__isyBridgeTransportStats,
+              }), 700);
+            })
+            """,
+            timeout=5,
+        )
+        prompt_state = device.prompt_window_state()
+        ev.pass_("biometric_prompt_started", state=bio_started, window_state=prompt_state)
+        device.shell("input keyevent KEYCODE_BACK", check=False)
+        time.sleep(1)
+        bio_cleanup = cdp.eval(
+            """
+            new Promise((resolve) => setTimeout(() => {
+              const beforeLate = _bioPending.size;
+              if (window.__isyBridge && window.__isyBridge.onmessage) {
+                window.__isyBridge.onmessage({ data: JSON.stringify({ t: 'bio', id: 'missing-bio-probe', ok: true }) });
+              }
+              resolve({
+                beforeLate,
+                afterLate: _bioPending.size,
+                resultResolved: !!window.__isyBioProbe,
+              });
+            }, 700))
+            """,
+            timeout=5,
+        )
+        ev.assert_(
+            "biometric_cancel_and_late_response_cleanup",
+            bio_cleanup.get("beforeLate") == 0 and bio_cleanup.get("afterLate") == 0,
+            result=bio_cleanup,
+        )
         device.wake()
         keyguard = device.keyguard_state()
         ev.assert_(
@@ -457,6 +551,7 @@ def positive_bridge_probe(device: Device, ev: Evidence, accepted_open: bool) -> 
         cdp.close()
 
     listens = device.listen_sockets_for_uid()
+    ev.meta["app_uid"] = device.uid()
     ev.assert_("default_uid_has_no_listen_sockets", not listens, listen_sockets=listens)
 
 
@@ -480,6 +575,13 @@ def main(argv: list[str]) -> int:
     locked = False
     stay_awake_previous: str | None = None
     try:
+        evidence.meta["device_serial"] = device.serial()
+        evidence.meta["isy_cargo_features"] = os.environ.get("ISY_CARGO_FEATURES", "")
+        agent_features = evidence.meta["isy_cargo_features"]
+        evidence.meta["agent_subscription_experimental_enabled"] = (
+            "agent-subscription-experimental" in agent_features.split(",")
+            or "agent-subscription-experimental" in agent_features.split()
+        )
         if not args.skip_lock:
             run(["device-lock", "acquire", args.lock], timeout=60)
             locked = True
@@ -490,6 +592,12 @@ def main(argv: list[str]) -> int:
         if not args.positive_only:
             forced_failure_probe(device, evidence)
         positive_bridge_probe(device, evidence, args.accepted_open)
+        evidence.assert_(
+            "agent_subscription_experimental_default_off",
+            evidence.meta["agent_subscription_experimental_enabled"] is False,
+            isy_cargo_features=evidence.meta["isy_cargo_features"],
+            note="default debug APK expected unless ISY_CARGO_FEATURES opts in",
+        )
     except Exception as exc:
         evidence.fail("probe_exception", error=str(exc))
     finally:
@@ -516,6 +624,12 @@ def main(argv: list[str]) -> int:
         "cdp_port": args.cdp_port,
         "ok": evidence.ok(),
         "results": evidence.rows,
+        **evidence.meta,
+        "feature_skips": [
+            {"name": row.get("name"), "reason": row.get("reason")}
+            for row in evidence.rows
+            if row.get("status") == "SKIP"
+        ],
     }
     data = json.dumps(report, indent=2, sort_keys=True)
     if args.output:

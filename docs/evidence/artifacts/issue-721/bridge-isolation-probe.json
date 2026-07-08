@@ -1,5 +1,23 @@
 {
+  "agent_subscription_experimental_enabled": false,
+  "app_uid": "10246",
   "cdp_port": 9222,
+  "device_serial": "10.0.0.130:38655",
+  "feature_skips": [
+    {
+      "name": "opaque_iframe_cannot_see_bridge",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe"
+    },
+    {
+      "name": "opaque_iframe_cannot_see_legacy_globals",
+      "reason": "iframe script did not execute; CSP/frame policy blocked probe"
+    },
+    {
+      "name": "accepted_openexternal_smoke",
+      "reason": "disabled by default to avoid browser focus flake"
+    }
+  ],
+  "isy_cargo_features": "",
   "lock": "om-721",
   "ok": true,
   "package": "com.silentspike.isyncyou.debug",
@@ -17,8 +35,14 @@
     {
       "name": "cdp_forward",
       "port": 9222,
-      "socket": "webview_devtools_remote_859",
+      "socket": "webview_devtools_remote_2082",
       "status": "PASS"
+    },
+    {
+      "name": "webview_devtools_target",
+      "status": "PASS",
+      "url": "about:blank",
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/4281379E2CD509F6235BD20E1BEABBEA"
     },
     {
       "name": "forced_failure_page_text",
@@ -41,20 +65,26 @@
       "status": "PASS"
     },
     {
-      "log_tail": "E:33195 VIRTUAL-SKIN-CHARGE-PERSIST:33195 \n07-08 05:30:34.837  1116  1116 I WifiHAL : Creating message to get link statistics; iface = 47\n07-08 05:30:34.930  1116  1153 I WifiHAL : Getting cached scan results, iface handle = 0xb00d9abff56e360\n07-08 05:30:34.930  1116  1153 E WifiHAL : Creating message to get cached scan results\n07-08 05:30:34.942  1116  1153 I WifiHAL : In GetCachedScanResultsCommand::handleResponse\n07-08 05:30:35.006  1116  1153 D WifiHAL : Start debug command: mType GET_FEATURE\n07-08 05:30:35.007  1116  1153 I WifiHAL : CreateRequest mType = GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : len = 4, expected len = 4\n07-08 05:30:35.040  1516  2184 D ConnectivityService: NetReassign [no changes] [c 7] [a 8] [i 12]\n07-08 05:30:35.987  1516  2112 I UsageStatsService: User[0] Flushing usage stats to disk\n07-08 05:30:36.049  1045 28489 I bthal.activity: bt_power: LeAdvStat: 05:30:35:047 - 05:30:36:049, duration: 1002, le_adv_count: 2, total_le_adv_count: 2230, total_event_count: 2\n07-08 05:30:36.118  1516  2239 D BackgroundInstallControlService: Package event received: 0\n",
+      "log_tail": "IN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-SUB-0:33723.3 VIRTUAL-SKIN-CHARGE-SUB-1:32992.2 VIRTUAL-SKIN-CHARGE-SUB-2:32840.2 VIRTUAL-SKIN-CHARGE-SUB-3:34150.9 VIRTUAL-SKIN-CHARGE-WIRED:34150.9 WLC_CHECK:1 battery:34100 cam_therm:33620 charge_therm:38472 disp_therm:34822 neutral_therm:35979 north_therm:33308 quiet_therm:33731 soc_therm:38428 thb_hda:56 usb_pwr_therm:34154 \n07-08 05:34:12.329  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=4102.35 err=3.84911 s_power=2527 time_elapsed_ms=7023 p=458.044 i=1302 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=184.696 (PARTIAL_SYSTEM_POWER: 1539.14 mW, cdev_weight: 0.120000)\n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN:34.402 raw data: VIRTUAL-SKIN:34401.9 \n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:34.1509 raw data: VIRTUAL-SKIN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-PERSIST:34150.9 \n07-08 05:34:13.416  1283  1283 W TracingMuxer: type=1400 audit(0.0:3517208): avc:  denied  { write } for  name=\"traced_producer\" dev=\"tmpfs\" ino=1813 scontext=u:r:gxp_logging:s0 tcontext=u:object_r:traced_producer_socket:s0 tclass=sock_file permissive=0\n",
       "name": "forced_failure_activity_engine_not_started",
       "status": "PASS"
     },
     {
-      "log_tail": "E:33195 VIRTUAL-SKIN-CHARGE-PERSIST:33195 \n07-08 05:30:34.837  1116  1116 I WifiHAL : Creating message to get link statistics; iface = 47\n07-08 05:30:34.930  1116  1153 I WifiHAL : Getting cached scan results, iface handle = 0xb00d9abff56e360\n07-08 05:30:34.930  1116  1153 E WifiHAL : Creating message to get cached scan results\n07-08 05:30:34.942  1116  1153 I WifiHAL : In GetCachedScanResultsCommand::handleResponse\n07-08 05:30:35.006  1116  1153 D WifiHAL : Start debug command: mType GET_FEATURE\n07-08 05:30:35.007  1116  1153 I WifiHAL : CreateRequest mType = GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE\n07-08 05:30:35.007  1116  1153 D WifiHAL : len = 4, expected len = 4\n07-08 05:30:35.040  1516  2184 D ConnectivityService: NetReassign [no changes] [c 7] [a 8] [i 12]\n07-08 05:30:35.987  1516  2112 I UsageStatsService: User[0] Flushing usage stats to disk\n07-08 05:30:36.049  1045 28489 I bthal.activity: bt_power: LeAdvStat: 05:30:35:047 - 05:30:36:049, duration: 1002, le_adv_count: 2, total_le_adv_count: 2230, total_event_count: 2\n07-08 05:30:36.118  1516  2239 D BackgroundInstallControlService: Package event received: 0\n",
+      "log_tail": "IN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-SUB-0:33723.3 VIRTUAL-SKIN-CHARGE-SUB-1:32992.2 VIRTUAL-SKIN-CHARGE-SUB-2:32840.2 VIRTUAL-SKIN-CHARGE-SUB-3:34150.9 VIRTUAL-SKIN-CHARGE-WIRED:34150.9 WLC_CHECK:1 battery:34100 cam_therm:33620 charge_therm:38472 disp_therm:34822 neutral_therm:35979 north_therm:33308 quiet_therm:33731 soc_therm:38428 thb_hda:56 usb_pwr_therm:34154 \n07-08 05:34:12.329  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=4102.35 err=3.84911 s_power=2527 time_elapsed_ms=7023 p=458.044 i=1302 d=-0 dt_per_min=nan compensation=0 budget transient=0 control target=2 excluded power budget=184.696 (PARTIAL_SYSTEM_POWER: 1539.14 mW, cdev_weight: 0.120000)\n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN:34.402 raw data: VIRTUAL-SKIN:34401.9 \n07-08 05:34:12.330  1931  1941 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:34.1509 raw data: VIRTUAL-SKIN-CHARGE:34150.9 VIRTUAL-SKIN-CHARGE-PERSIST:34150.9 \n07-08 05:34:13.416  1283  1283 W TracingMuxer: type=1400 audit(0.0:3517208): avc:  denied  { write } for  name=\"traced_producer\" dev=\"tmpfs\" ino=1813 scontext=u:r:gxp_logging:s0 tcontext=u:object_r:traced_producer_socket:s0 tclass=sock_file permissive=0\n",
       "name": "forced_failure_log_marker",
       "status": "PASS"
     },
     {
       "name": "cdp_forward",
       "port": 9222,
-      "socket": "webview_devtools_remote_1181",
+      "socket": "webview_devtools_remote_2447",
       "status": "PASS"
+    },
+    {
+      "name": "webview_devtools_target",
+      "status": "PASS",
+      "url": "https://appassets.androidplatform.net/",
+      "ws_url": "ws://127.0.0.1:9222/devtools/page/250E0AD949728647E8338D529A3B3561"
     },
     {
       "name": "top_frame_has_bridge",
@@ -103,14 +133,75 @@
       "status": "PASS"
     },
     {
+      "name": "bridge_js_response_cleanup",
+      "result": {
+        "ok": true,
+        "pending": 0,
+        "rows": [
+          {
+            "name": "duplicate_once",
+            "ok": true
+          },
+          {
+            "name": "timeout_cleared",
+            "ok": true
+          },
+          {
+            "name": "late_ignored",
+            "ok": true
+          }
+        ]
+      },
+      "status": "PASS"
+    },
+    {
       "name": "native_push_token_op_returns",
+      "status": "PASS"
+    },
+    {
+      "name": "biometric_prompt_started",
+      "state": {
+        "pending": 1,
+        "stats": {
+          "bio": 1,
+          "events": 0,
+          "native": 1,
+          "requests": 9,
+          "streams": 2
+        }
+      },
+      "status": "PASS",
+      "window_state": {
+        "matches": [
+          "mKeyguardOccluded=false mKeyguardOccludedChanged=false mPendingKeyguardOccluded=false",
+          "KeyguardServiceDelegate",
+          "deviceHasKeyguard=true",
+          "KeyguardStateMonitor",
+          "Window #13: WindowStateAnimator{91625ee BiometricPrompt}",
+          "mImeLayeringTarget=Window{eb16055 u0 BiometricPrompt}",
+          "mImeInputTarget=Window{eb16055 u0 BiometricPrompt}",
+          "mImeControlTarget=Window{eb16055 u0 BiometricPrompt}",
+          "mCurrentFocus=Window{eb16055 u0 BiometricPrompt}",
+          "mKeyguardDrawComplete=true mWindowManagerDrawComplete=true",
+          "isKeyguardShowing=false",
+          "mFocusedWindow=Window{eb16055 u0 BiometricPrompt}"
+        ]
+      }
+    },
+    {
+      "name": "biometric_cancel_and_late_response_cleanup",
+      "result": {
+        "afterLate": 0,
+        "beforeLate": 0,
+        "resultResolved": true
+      },
       "status": "PASS"
     },
     {
       "name": "device_keyguard_clear_before_network_guard",
       "state": {
-        "current_focus": "mCurrentFocus=Window{f4c28d u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
-        "focused_app": "mFocusedApp=ActivityRecord{100125784 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13538}",
+        "current_focus": "mCurrentFocus=Window{78ed3d2 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity}",
+        "focused_app": "mFocusedApp=ActivityRecord{194943305 u0 com.silentspike.isyncyou.debug/com.silentspike.isyncyou.MainActivity t13540}",
         "keyguard_showing": false
       },
       "status": "PASS"
@@ -138,7 +229,7 @@
     {
       "name": "bridge_transport_stats",
       "stats": {
-        "bio": 0,
+        "bio": 1,
         "events": 0,
         "native": 12,
         "requests": 9,
@@ -152,6 +243,12 @@
       "status": "PASS"
     },
     {
+      "isy_cargo_features": "",
+      "name": "agent_subscription_experimental_default_off",
+      "note": "default debug APK expected unless ISY_CARGO_FEATURES opts in",
+      "status": "PASS"
+    },
+    {
       "name": "device_stay_awake_restored",
       "status": "PASS",
       "value": "15"
@@ -161,5 +258,8 @@
       "name": "device_lock_released",
       "status": "PASS"
     }
-  ]
+  ],
+  "webview_devtools_socket": "webview_devtools_remote_2447",
+  "webview_devtools_target_url": "https://appassets.androidplatform.net/",
+  "webview_devtools_ws_url": "ws://127.0.0.1:9222/devtools/page/250E0AD949728647E8338D529A3B3561"
 }
