@@ -15,15 +15,17 @@ lifecycle that backs it.
 ## Branch model
 
 ```
-dev  ──(pr-dev.yml)──►  staging  ──(pr-staging.yml + codeql.yml)──►  main  ──►  RC (release.yml)
-        fast gate            heaviest pre-prod gate                  release-grade   signed + attested
+dev  ──(pr-dev.yml)──►  staging  ──(pr-staging.yml + codeql.yml)──►  main  ──(manual release.yml)──►  RC
+        fast gate            heaviest pre-prod gate                  release-grade       signed + attested
 ```
 
 A change is opened as a single PR into `dev`. On merge, `promote.yml` cascades it
 automatically: it cuts a promotion branch from the **target** and overlays the
 **source tree** (so the promoted tree is byte-identical to the source), opens an
-auto-merging PR, and lets the target branch's gate run. `dev → staging → main`, then a
-push to `main` triggers `release.yml`, which publishes the RC pre-release.
+auto-merging PR, and lets the target branch's gate run. `dev → staging → main` keeps
+the release branch current; an owner then deliberately dispatches `release.yml` from
+`main` to publish an RC pre-release. Stable releases are explicit `vX.Y.Z` tag
+actions, not a side effect of ordinary promotion.
 
 ## Distribution of disciplines
 
