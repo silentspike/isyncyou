@@ -1,0 +1,83 @@
+{
+  "schema": "isyncyou.issue725.device-writeback-sealed.v1",
+  "status": "pass",
+  "created_at": "2026-07-08T16:34:37.797972Z",
+  "device": {
+    "serial": "3B301FDJG0020Z",
+    "model": "Pixel 8 Pro",
+    "package": "com.silentspike.isyncyou.debug",
+    "transport": "usb"
+  },
+  "target": {
+    "name": "offline-read.txt",
+    "id": "892B68CBF4A7C544!sbeb430a8b5a74122859fab06145ec8ea",
+    "parent_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+    "explicit_parent_mode": "offline",
+    "local_path": "/data/user/0/com.silentspike.isyncyou.debug/files/sync/mode-offline/offline-read.txt"
+  },
+  "setup": {
+    "body_key_helper": "temporary app_process helper outside repo sealed the local file through AndroidKeystore-unwrapped body.key; helper output redacted to path/byte count only",
+    "local_magic_after_edit": "49 53 59 45",
+    "local_body_via_app_bridge_after_edit": "OM725-writeback-sealed-20260708T160037Z\\n",
+    "token_cache": "fresh Files.ReadWrite access token re-minted into app-private .isyncyou-token-write.json; token value redacted"
+  },
+  "finding_fixed_during_probe": {
+    "summary": "stale configured OneDrive scope returned Graph delta 404 and aborted the whole mobile offline pass before writeback",
+    "before_log": [
+      "mobile OneDrive scoped pass starting",
+      "mobile OneDrive scoped pass failed: delta: Fatal(404)"
+    ],
+    "fix": "crates/connectors/src/onedrive.rs incremental_sync_scoped now treats per-scope DeltaError::Fatal(404) as skipped and continues other scopes",
+    "test": "cargo +1.95.0 test -p isyncyou-connectors scoped_delta_skips_stale_404_scope_and_continues -- --nocapture"
+  },
+  "graph_before": {
+    "sha256": "0d937971eb080cde279d0fb2a070aa57061c31d585a1ff5cf92111a74e7e9462",
+    "bytes": 30,
+    "preview": "OM660 offline read fixture v1\n",
+    "eTag": "\"{BEB430A8-B5A7-4122-859F-AB06145EC8EA},1\""
+  },
+  "writeback_observed": {
+    "logcat": [
+      "mobile OneDrive scoped pass starting",
+      "mobile OneDrive scoped pass: sync: 0 upserted, 0 deleted, 3 skipped; 0 downloaded, 0 trashed; 0 created, 1 modified, 0 cloud-deleted up"
+    ],
+    "graph": {
+      "matched_expected": true,
+      "sha256": "5b9fa7bc4c0cff3111551cfea72e76516c8b8343112dbd9abb7573b3eb3a4457",
+      "bytes": 40,
+      "preview": "OM725-writeback-sealed-20260708T160037Z\n",
+      "eTag": "\"{BEB430A8-B5A7-4122-859F-AB06145EC8EA},2\"",
+      "lastModified": "2026-07-08T16:27:59Z"
+    }
+  },
+  "cleanup": {
+    "method": "Graph was reverted to original, then the mobile scoped pass materialized the remote change back into the sync root.",
+    "logcat": [
+      "mobile OneDrive scoped pass: sync: 2 upserted, 0 deleted, 3 skipped; 1 downloaded, 0 trashed; 0 created, 0 modified, 0 cloud-deleted up"
+    ],
+    "final_app_bridge_body": "OM660 offline read fixture v1\\n",
+    "final_store_row": {
+      "size": 30,
+      "eTag": "\"{BEB430A8-B5A7-4122-859F-AB06145EC8EA},3\"",
+      "sync_state": "clean",
+      "body_state": "available",
+      "content_state": "materialized",
+      "conflict_state": null
+    },
+    "graph": {
+      "sha256": "0d937971eb080cde279d0fb2a070aa57061c31d585a1ff5cf92111a74e7e9462",
+      "bytes": 30,
+      "preview": "OM660 offline read fixture v1\n",
+      "eTag": "\"{BEB430A8-B5A7-4122-859F-AB06145EC8EA},3\"",
+      "lastModified": "2026-07-08T16:32:11Z"
+    }
+  },
+  "assertions": {
+    "local_edit_was_sealed": true,
+    "stale_scope_404_no_longer_blocks_pass": true,
+    "mobile_pass_reported_one_modified_upload": true,
+    "graph_observed_new_body": true,
+    "cleanup_restored_cloud_and_local_body": true,
+    "final_store_clean_no_conflict": true
+  }
+}

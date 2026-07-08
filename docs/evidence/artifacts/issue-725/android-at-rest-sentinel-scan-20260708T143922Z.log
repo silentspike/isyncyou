@@ -1,0 +1,15 @@
+Android at-rest sentinel scan evidence
+timestamp_utc=20260708T143922Z
+package=com.silentspike.isyncyou.debug
+sentinel_len=35
+sentinel_value=REDACTED
+adb=adb
+--- device output ---
+SCAN_ROOT files/archive
+SCAN_ROOT files/cache
+SCAN_ROOT files/sync
+SCAN_ROOT cache
+DB_HEADER_NOT_SQLITE files/archive/.isyncyou-store.db 93250e8083727e048bb5ff2fc9b1e67c
+KEYLESS_SQLITE_OPEN_SKIP sqlite3_missing files/archive/.isyncyou-store.db
+PASS no plaintext sentinel in files/archive, files/cache, files/sync, cache
+result=PASS

@@ -21,6 +21,32 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+#[cfg(target_os = "android")]
+fn android_info(message: &str) {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+
+    unsafe extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    let Ok(tag) = CString::new("iSyncYou") else {
+        return;
+    };
+    let Ok(msg) = CString::new(message) else {
+        return;
+    };
+    // ANDROID_LOG_INFO = 4
+    unsafe {
+        let _ = __android_log_write(4, tag.as_ptr(), msg.as_ptr());
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn android_info(message: &str) {
+    eprintln!("{message}");
+}
+
 /// The single configured account id on the phone. The user signs in to it via the
 /// account menu's device-code flow; its token cache + store live under `filesDir`.
 const ACCOUNT: &str = "me";
@@ -610,8 +636,20 @@ fn run_onedrive_scoped_pass(
     };
     let dev = current_device_state();
     match isyncyou_engine::offline_sync_once_for(cfg, ACCOUNT, HOST, token, dev, progress) {
-        Ok(r) => sync_report_changed(&r),
-        Err(_) => false,
+        Ok(r) => {
+            let changed = sync_report_changed(&r);
+            if changed || r.modified_failed > 0 || r.materialize_failed > 0 {
+                android_info(&format!("mobile OneDrive scoped pass: {}", r.summary()));
+            }
+            changed
+        }
+        Err(e) => {
+            android_info(&format!(
+                "mobile OneDrive scoped pass failed: {}",
+                isyncyou_core::obs::redact(&e)
+            ));
+            false
+        }
     }
 }
 
