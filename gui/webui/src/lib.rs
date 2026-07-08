@@ -1409,12 +1409,12 @@ impl Router {
 
     /// Dispatch one request to a response. Never panics; unknown routes → 404.
     pub fn route(&self, req: &ApiRequest) -> ApiResponse {
-        // Mobile/standalone profile (#89): the data API is fully session-token gated
-        // because the loopback server is reachable by any app on the device. The
-        // static shell (`/`, `/app.js`, `/app.css`, fonts, `/sfx/*`) stays open so
-        // the WebView can bootstrap — it carries no user data and no token. The token
-        // rides a header (`X-Session-Token`) or, for iframe/img `src`, the `_st`
-        // query param. No-op on the desktop daemon (session_token = None).
+        // Mobile/standalone profile (#89/#721): the data API is fully session-token
+        // gated. The static shell (`/`, `/app.js`, `/app.css`, fonts, `/sfx/*`) stays
+        // open so the WebView can bootstrap — it carries no user data and no token.
+        // The current Android WebView path injects the trusted session natively; `_st`
+        // remains accepted only for legacy/non-WebView callers. No-op on the desktop
+        // daemon (session_token = None).
         if req.path.starts_with("/api/v1/") {
             let provided = req.session_token.as_deref().or_else(|| req.q("_st"));
             if !self.session_authorized(provided) {
@@ -7657,6 +7657,164 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn bridge_isolation_app_js_has_no_legacy_mobile_session_path() {
+        for needle in [
+            "AndroidSession",
+            "AndroidPush",
+            "AndroidNav",
+            "addJavascriptInterface",
+            "isy_session",
+            "cookieVal(",
+            "sessionToken(",
+            "sessionHeaders(",
+            "_st=",
+            "\"X-Session-Token\"",
+            "loopback",
+        ] {
+            assert!(
+                !APP_JS.contains(needle),
+                "app.js must not contain legacy mobile bridge/session text: {needle}"
+            );
+        }
+        assert!(
+            APP_JS.contains("k.toLowerCase() === \"x-session-token\""),
+            "bridge requests must drop JS-supplied session header variants"
+        );
+    }
+
+    #[test]
+    fn bridge_isolation_app_js_requires_native_control_bridge() {
+        for needle in [
+            "const MOBILE = !!BRIDGE",
+            "function nativeCall(",
+            "nativeCall(\"pushToken\"",
+            "nativeCall(\"openExternal\"",
+            "nativeCall(\"beginNetworkGuard\"",
+            "nativeCall(\"endNetworkGuard\"",
+            "\"agent_authorize\"",
+            "\"account_device_code\"",
+            "__isyBridgeTransportStats",
+            "BRIDGE_TIMEOUT_MS",
+            "NATIVE_TIMEOUT_MS",
+            "BIO_TIMEOUT_MS",
+            "BRIDGE_STREAM_TIMEOUT_MS",
+            "Native call returned non-JSON response",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #721 bridge invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_isolation_iframe_sandboxes_remain_no_script() {
+        let mut saw_sandbox = false;
+        for line in APP_JS.lines().filter(|line| line.contains("sandbox:")) {
+            saw_sandbox = true;
+            assert!(
+                !(line.contains("allow-scripts") && line.contains("allow-same-origin")),
+                "production iframe sandbox must not combine scripts and same-origin: {line}"
+            );
+        }
+        assert!(
+            saw_sandbox,
+            "expected at least one production iframe sandbox invariant"
+        );
+        assert!(
+            APP_JS.contains("sandbox: \"allow-same-origin\""),
+            "viewer iframes should remain no-script same-origin frames"
+        );
+    }
+
+    #[test]
+    fn bridge_isolation_oauth_redirects_do_not_build_empty_port_callbacks() {
+        assert!(
+            !APP_JS.contains("http://localhost:\" + location.port + \"/callback\""),
+            "must not construct http://localhost:/callback on appassets origin"
+        );
+        assert!(
+            !APP_JS.contains("http://127.0.0.1:\" + location.port + \"/callback\""),
+            "must not construct http://127.0.0.1:/callback on appassets origin"
+        );
+        assert!(
+            APP_JS.contains("function localCallbackRedirect(host)")
+                && APP_JS.contains(
+                    "return location.port ? `http://${host}:${location.port}/callback` : \"\";"
+                ),
+            "callback redirect must be omitted when location.port is empty"
+        );
+    }
+
+    #[test]
+    fn bridge_isolation_mobile_streams_prefer_bridge_before_eventsource() {
+        let bridge_stream = APP_JS
+            .find("if (BRIDGE) {\n    const id = \"s\"")
+            .expect("openEventStream bridge branch missing");
+        let event_source = APP_JS
+            .find("const es = new EventSource(path)")
+            .expect("desktop EventSource branch missing");
+        assert!(
+            bridge_stream < event_source,
+            "mobile bridge stream branch must be evaluated before desktop EventSource"
+        );
+    }
+
+    #[test]
+    fn bridge_isolation_native_call_rejects_non_json_body() {
+        let start = APP_JS
+            .find("async function nativeCall(")
+            .expect("nativeCall missing");
+        let end = APP_JS[start..]
+            .find("/* ---------------------------------------------------------------- push registration")
+            .expect("nativeCall end marker missing")
+            + start;
+        let native_call = &APP_JS[start..end];
+        assert!(
+            native_call.contains("throw new Error(\"Native call returned non-JSON response\")"),
+            "nativeCall must hard-fail non-JSON native bodies"
+        );
+        assert!(
+            !native_call.contains("catch (_) { body = {}; }"),
+            "nativeCall must not silently coerce malformed native JSON to an empty object"
+        );
+    }
+
+    #[test]
+    fn bridge_isolation_stream_subscription_has_handshake_timeout_cleanup() {
+        let start = APP_JS
+            .find("function openEventStream(")
+            .expect("openEventStream missing");
+        let end = APP_JS[start..]
+            .find("/* One request over the active transport")
+            .expect("openEventStream end marker missing")
+            + start;
+        let stream_fn = &APP_JS[start..end];
+        for needle in [
+            "const timer = setTimeout(() =>",
+            "_bridgeStreams.delete(id);",
+            "BRIDGE.postMessage(JSON.stringify({ t: \"unsub\", id }))",
+            "BRIDGE_STREAM_TIMEOUT_MS",
+            "if (h && h.timer) clearTimeout(h.timer);",
+        ] {
+            assert!(
+                stream_fn.contains(needle),
+                "openEventStream missing stream timeout cleanup invariant: {needle}"
+            );
+        }
+        let bridge_handler = APP_JS
+            .find("if (h.timer) { clearTimeout(h.timer); h.timer = null; }")
+            .expect("stream event handler must clear the handshake timeout");
+        let stream_start = APP_JS
+            .find("_bridgeStreams.set(id, { onEvent, onError, timer });")
+            .expect("stream handler must store the timeout");
+        assert!(
+            bridge_handler < stream_start,
+            "incoming bridge events must clear the stored stream handshake timeout"
+        );
+    }
+
+    #[test]
     fn account_routes_refused_without_a_handler() {
         // The read-only `serve` wires no account-auth handler → every account
         // login/sign-out POST is refused 404, never reaching the (absent) gate (#68).
@@ -8146,7 +8304,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             401,
             "correct header token must pass the gate"
         );
-        // Correct token via `_st` query (for iframe/img/EventSource) → passes.
+        // Legacy `_st` query support remains accepted at the router gate.
         let ok_q = ApiRequest::get("/api/v1/status?_st=sess-tok-0001");
         assert_ne!(
             r.route(&ok_q).status,
