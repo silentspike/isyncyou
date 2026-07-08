@@ -7354,12 +7354,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             json!(["onedrive_mode_offline", "Photos"])
         );
         assert!(
-            modes
+            !modes
                 .modes("a")
                 .unwrap()
                 .folder_modes
-                .get("Photos")
-                .is_none(),
+                .contains_key("Photos"),
             "mode must not persist before biometric confirmation"
         );
         assert_eq!(risk.offline_calls(), 1);
@@ -7374,12 +7373,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             403
         );
         assert!(
-            modes
+            !modes
                 .modes("a")
                 .unwrap()
                 .folder_modes
-                .get("Photos")
-                .is_none(),
+                .contains_key("Photos"),
             "wrong biometric token must not persist the mode"
         );
         assert!(mobile.confirm_biometric(&pat));
@@ -7447,12 +7445,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             json!(["onedrive_mode_online_account_cleanup", "Photos"])
         );
         assert!(
-            modes
+            !modes
                 .modes("a")
                 .unwrap()
                 .folder_modes
-                .get("Photos")
-                .is_none(),
+                .contains_key("Photos"),
             "mode must not persist before account-wide cleanup prompt"
         );
         assert!(manage.cleaned.lock().unwrap().is_empty());
