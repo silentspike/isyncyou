@@ -1,0 +1,265 @@
+{
+  "ac1_online_live_row": {
+    "download_posts": [],
+    "item": {
+      "effective_mode": "online",
+      "id": "892B68CBF4A7C544!s47c226be7ef640e9b3d606887da4d762",
+      "name": "conflict-e2e-1782468185-38940.txt"
+    },
+    "item_lookup": {
+      "error": "item not found",
+      "ok": false
+    },
+    "sheet_has_available_online": true,
+    "sheet_has_download_now": false
+  },
+  "ac2_sync_download_now_cache": {
+    "after": {
+      "body_location": "cache",
+      "body_state": "available",
+      "conflict_state": null,
+      "content_state": "cached",
+      "deleted": false,
+      "effective_mode": "sync",
+      "etag": "\"{185B8203-5348-4CD0-ACB6-EB835CEAA2E4},1\"",
+      "has_body": true,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "sync-lazy.txt",
+      "parent_remote_id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "remote_id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+      "remote_mtime": "2026-07-06T11:55:20Z",
+      "service": "onedrive",
+      "size": 24,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "after_recaptured_after_guard_fix": {
+      "body_location": "cache",
+      "body_state": "available",
+      "conflict_state": null,
+      "content_state": "cached",
+      "deleted": false,
+      "effective_mode": "sync",
+      "etag": "\"{185B8203-5348-4CD0-ACB6-EB835CEAA2E4},1\"",
+      "has_body": true,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "sync-lazy.txt",
+      "parent_remote_id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "remote_id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+      "remote_mtime": "2026-07-06T11:55:20Z",
+      "service": "onedrive",
+      "size": 24,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "before": {
+      "body_location": "none",
+      "body_state": "missing",
+      "conflict_state": null,
+      "content_state": "cached",
+      "deleted": false,
+      "effective_mode": "sync",
+      "etag": "\"{185B8203-5348-4CD0-ACB6-EB835CEAA2E4},1\"",
+      "has_body": false,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "sync-lazy.txt",
+      "parent_remote_id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "remote_id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+      "remote_mtime": "2026-07-06T11:55:20Z",
+      "service": "onedrive",
+      "size": 24,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "body_api_probe": {
+      "len": 2,
+      "ok": true
+    },
+    "item": {
+      "effective_mode": "sync",
+      "id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+      "name": "sync-lazy.txt",
+      "size": 24
+    },
+    "response": {
+      "downloaded": true,
+      "ok": true,
+      "target": "cache"
+    },
+    "response_recaptured_after_guard_fix": {
+      "downloaded": true,
+      "ok": true,
+      "target": "cache"
+    },
+    "root_and_header_recaptured_after_guard_fix": "cache_paths:\nfiles/cache/mode-sync/sync-lazy.txt\nsync_paths:\ncache_header_hex:  49 53 59 45"
+  },
+  "ac3_offline_download_now_sync": {
+    "after": {
+      "body_location": "sync",
+      "body_state": "available",
+      "conflict_state": null,
+      "content_state": "materialized",
+      "deleted": false,
+      "effective_mode": "offline",
+      "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+      "has_body": true,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "freeup-guard.txt",
+      "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+      "remote_id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "remote_mtime": "2026-07-06T13:56:25Z",
+      "service": "onedrive",
+      "size": 37,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "before": {
+      "body_location": "none",
+      "body_state": "missing",
+      "conflict_state": null,
+      "content_state": "cached",
+      "deleted": false,
+      "effective_mode": "offline",
+      "etag": "\"{CF1B808A-9250-40AA-81F5-220913177BE5},3\"",
+      "has_body": false,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "freeup-guard.txt",
+      "parent_remote_id": "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e",
+      "remote_id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "remote_mtime": "2026-07-06T13:56:25Z",
+      "service": "onedrive",
+      "size": 37,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "item": {
+      "effective_mode": "offline",
+      "id": "892B68CBF4A7C544!scf1b808a925040aa81f5220913177be5",
+      "name": "freeup-guard.txt",
+      "size": 37
+    },
+    "response": {
+      "downloaded": true,
+      "ok": true,
+      "target": "sync"
+    },
+    "root_and_header_recaptured_after_guard_fix": "sync_paths:\nfiles/sync/mode-offline/freeup-guard.txt\ncache_paths:\nsync_header_hex:  49 53 59 45"
+  },
+  "ac4_sync_free_up": {
+    "after": {
+      "body_location": "none",
+      "body_state": "missing",
+      "conflict_state": null,
+      "content_state": "cached",
+      "deleted": false,
+      "effective_mode": "sync",
+      "etag": "\"{185B8203-5348-4CD0-ACB6-EB835CEAA2E4},1\"",
+      "has_body": false,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "sync-lazy.txt",
+      "parent_remote_id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "remote_id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+      "remote_mtime": "2026-07-06T11:55:20Z",
+      "service": "onedrive",
+      "size": 24,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "after_recaptured_after_guard_fix": {
+      "body_location": "none",
+      "body_state": "missing",
+      "conflict_state": null,
+      "content_state": "cached",
+      "deleted": false,
+      "effective_mode": "sync",
+      "etag": "\"{185B8203-5348-4CD0-ACB6-EB835CEAA2E4},1\"",
+      "has_body": false,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "sync-lazy.txt",
+      "parent_remote_id": "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6",
+      "remote_id": "892B68CBF4A7C544!s185b820353484cd0acb6eb835ceaa2e4",
+      "remote_mtime": "2026-07-06T11:55:20Z",
+      "service": "onedrive",
+      "size": 24,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    },
+    "cloud_listing_still_contains_item": true,
+    "response": {
+      "ok": true
+    },
+    "response_recaptured_after_guard_fix": {
+      "ok": true
+    },
+    "root_paths_after_free_recaptured_after_guard_fix": "cache_paths_after_free:\nsync_paths_after_free:"
+  },
+  "branch": "feature/om-724",
+  "captured_at_local": "2026-07-08T12:28:57+02:00",
+  "cdp_target": {
+    "description": "{\"attached\":true,\"empty\":false,\"height\":2719,\"never_attached\":false,\"screenX\":0,\"screenY\":151,\"visible\":true,\"width\":1344}",
+    "id": "55BD765BA3DE08D741067EA11E07A897",
+    "title": "iSyncYou",
+    "type": "page",
+    "url": "https://appassets.androidplatform.net/"
+  },
+  "device": "10.0.0.130:38655\tdevice",
+  "head": "db0b58a",
+  "issue": 724,
+  "meta": {
+    "account": "me",
+    "caps": {
+      "account": "<present-redacted>",
+      "agent": "<present-redacted>",
+      "calendarwrite": "<present-redacted>",
+      "contactwrite": "<present-redacted>",
+      "mailwrite": "<present-redacted>",
+      "onedriveManage": "<present-redacted>",
+      "onedriveMode": "<present-redacted>",
+      "onedrivewrite": "<present-redacted>",
+      "onenotewrite": "<present-redacted>",
+      "push": "",
+      "restore": "",
+      "settings": "<present-redacted>",
+      "share": "<present-redacted>",
+      "sync": "",
+      "todowrite": "<present-redacted>",
+      "transfers": "<present-redacted>",
+      "verify": "<present-redacted>"
+    },
+    "href": "https://appassets.androidplatform.net/",
+    "title": "iSyncYou",
+    "ua": "Mozilla/5.0 (Linux; Android 10; K; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/150.0.0.0 Mobile Safari/537.36"
+  },
+  "mode": {
+    "account": "me",
+    "default_mode": "online",
+    "folder_modes": {
+      "892B68CBF4A7C544!s0eefa6bd13314bd59a1d48f84a86bb8e": "offline",
+      "892B68CBF4A7C544!s394ef6f2649a4eed88d7f86fd2542a05": "offline",
+      "892B68CBF4A7C544!s52ac141d4b63421eb7586d07d884aee6": "sync",
+      "892B68CBF4A7C544!sad502b7a0e624b7882e0b98fd3c54556": "offline"
+    }
+  },
+  "package": "com.silentspike.isyncyou.debug"
+}
