@@ -302,15 +302,17 @@ pub fn start_engine(files_dir: &str) -> Result<(), String> {
 /// running engine's router — **no loopback TCP port involved**. Returns a JSON response
 /// envelope, or an error envelope when the engine hasn't started. Host-testable.
 pub fn bridge_request(request_json: &str) -> String {
-    let router = {
-        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().map(|s| Arc::clone(&s.router))
-    };
+    let router = current_router();
     match router {
         Some(router) => isyncyou_webui::handle_bridge_request(&router, request_json),
         None => r#"{"t":"res","id":null,"status":503,"body":"{\"error\":\"engine not started\"}"}"#
             .to_string(),
     }
+}
+
+fn current_router() -> Option<Arc<isyncyou_webui::Router>> {
+    let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|s| Arc::clone(&s.router))
 }
 
 /// Answer one browser-initiated GET subresource (#0A) — the static shell and any
@@ -320,15 +322,52 @@ pub fn bridge_request(request_json: &str) -> String {
 /// `[status:u16 BE][ct_len:u16 BE][content_type][hdr_len:u16 BE][headers "K: V\r\n"…][body]`.
 /// Cookie-gated exactly like the loopback path. Empty vec when the engine hasn't started.
 pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
-    let router = {
-        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().map(|s| Arc::clone(&s.router))
-    };
+    let router = current_router();
     let Some(router) = router else {
         return Vec::new();
     };
     let resp =
         isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
+    frame_response(resp)
+}
+
+/// Answer one app-origin GET using the Activity-held native session token, without a
+/// WebView-readable cookie or `_st` query parameter. This is the MainActivity asset path
+/// used after #721; trusted native callers pass the session they obtained from the engine.
+pub fn asset_request_with_session(path: &str, session_token: Option<&str>) -> Vec<u8> {
+    asset_request_with_session_for_router(current_router(), path, session_token)
+}
+
+fn asset_request_with_session_for_router(
+    router: Option<Arc<isyncyou_webui::Router>>,
+    path: &str,
+    session_token: Option<&str>,
+) -> Vec<u8> {
+    let Some(session_token) = session_token.filter(|token| !token.is_empty()) else {
+        return framed_error(401, "missing session token");
+    };
+    let Some(router) = router else {
+        return framed_error(503, "engine not started");
+    };
+    if !router.session_authorized(Some(session_token)) {
+        return framed_error(401, "missing or invalid session token");
+    }
+    let req = isyncyou_webui::ApiRequest::new("GET", path)
+        .with_session_token(Some(session_token.to_string()));
+    frame_response(router.route(&req))
+}
+
+fn framed_error(status: u16, message: &str) -> Vec<u8> {
+    let body = format!(r#"{{"error":"{message}"}}"#).into_bytes();
+    frame_response(isyncyou_webui::ApiResponse {
+        status,
+        content_type: "application/json".into(),
+        body,
+        headers: Vec::new(),
+    })
+}
+
+fn frame_response(resp: isyncyou_webui::ApiResponse) -> Vec<u8> {
     let ct = resp.content_type.as_bytes();
     // Extra response headers (e.g. the viewer's CSP) as "Key: Value\r\n", CRLF-sanitised.
     let mut hdrs = String::new();
@@ -719,6 +758,37 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// JNI: answer one browser-initiated GET subresource using the trusted Activity-held
+/// session token, not a WebView cookie. Binary-safe. Never logs the token.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetRequestWithSession(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    path: jni::objects::JString,
+    session_token: jni::objects::JString,
+) -> jni::sys::jbyteArray {
+    let path: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let session_token: String = env
+        .get_string(&session_token)
+        .map(Into::into)
+        .unwrap_or_default();
+    let session_token = if session_token.is_empty() {
+        None
+    } else {
+        Some(session_token.as_str())
+    };
+    let bytes = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        asset_request_with_session(&path, session_token)
+    }))
+    .unwrap_or_default();
+    env.byte_array_from_slice(&bytes)
+        .map(|a| a.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// JNI: open a bridge push stream (#0A), returning a stream id (>0) or 0. The session
 /// token is passed explicitly (the WebView can't set headers on a native stream open).
 #[no_mangle]
@@ -808,6 +878,11 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConfirmA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame_status(framed: &[u8]) -> u16 {
+        assert!(framed.len() >= 2, "framed response has status bytes");
+        u16::from_be_bytes([framed[0], framed[1]])
+    }
 
     #[test]
     fn start_engine_is_idempotent_and_mints_a_session_token() {
@@ -1327,6 +1402,64 @@ mod tests {
         assert!(
             String::from_utf8_lossy(body).contains("<"),
             "shell body is HTML"
+        );
+    }
+
+    #[test]
+    fn asset_request_with_session_uses_trusted_session_not_cookie_or_query() {
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let tok = session_token().expect("token");
+
+        assert_eq!(
+            frame_status(&asset_request_with_session("/", Some(&tok))),
+            200,
+            "trusted native session serves the shell"
+        );
+        assert_eq!(
+            frame_status(&asset_request_with_session("/", None)),
+            401,
+            "missing trusted session must not serve a half-open shell"
+        );
+        assert_eq!(
+            frame_status(&asset_request_with_session("/", Some(""))),
+            401,
+            "empty trusted session must not serve a half-open shell"
+        );
+        assert_eq!(
+            frame_status(&asset_request_with_session("/", Some("wrong"))),
+            401,
+            "wrong trusted session must not serve even static app-origin assets"
+        );
+        assert_eq!(
+            frame_status(&asset_request_with_session(
+                &format!("/api/v1/status?_st={tok}"),
+                None,
+            )),
+            401,
+            "_st query must not authorize MainActivity asset requests"
+        );
+        assert_ne!(
+            frame_status(&asset_request_with_session(
+                "/api/v1/status?_st=wrong",
+                Some(&tok),
+            )),
+            401,
+            "trusted native session, not _st, authorizes app-origin API GETs"
+        );
+    }
+
+    #[test]
+    fn asset_request_with_session_frames_not_ready_as_503() {
+        assert_eq!(
+            frame_status(&asset_request_with_session_for_router(
+                None,
+                "/",
+                Some("session")
+            )),
+            503,
+            "not-ready engine must frame 503 rather than return an empty response"
         );
     }
 
