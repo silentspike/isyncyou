@@ -25,7 +25,6 @@
     },
     "api_confirmed_status": 200,
     "api_returned_webUrl": true,
-    "api_webUrl_sha256": "791cc2443607c5df89b76156a396ae048113b1e608d94ac0b67b0ce3f2bd9180",
     "graph_matching_direct_link_count": 1,
     "graph_matching_permission_id_prefixes": [
       "3974afb8-5053-42b6-b769-"
@@ -64,13 +63,13 @@
     },
     "api_confirmed_status": 200,
     "api_returned_webUrl": true,
-    "api_webUrl_sha256": "791cc2443607c5df89b76156a396ae048113b1e608d94ac0b67b0ce3f2bd9180",
     "graph_matching_direct_link_count": 1,
     "graph_matching_permission_id_prefixes": [
       "3974afb8-5053-42b6-b769-"
     ],
     "same_count_as_first": true,
-    "same_permission_ids_as_first": true
+    "same_permission_ids_as_first": true,
+    "same_webUrl_as_first": true
   },
   "revert": {
     "file_get_status_after_folder_delete": 404,
