@@ -1,7 +1,7 @@
 {
   "issue": 725,
   "epic": 646,
-  "status": "in_progress",
+  "status": "in_progress_partial_device",
   "generated_at": "2026-07-08T14:15:59Z",
   "repo": "silentspike/isyncyou",
   "refs": {
@@ -33,8 +33,56 @@
     "apk_sha256": "8f2c3f23e3f7b2cbde7342f24b8211ec6d2b02a65fba50eaee047599744915f7"
   },
   "device_e2e": {
-    "status": "pending",
-    "rows": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+    "status": "partial",
+    "rows": {
+      "A": {
+        "status": "pass",
+        "artifact": "docs/evidence/artifacts/issue-725/device-modes-probe-raw.json"
+      },
+      "B": {
+        "status": "pass",
+        "artifact": "docs/evidence/artifacts/issue-725/device-modes-probe-raw.json"
+      },
+      "C": {
+        "status": "pass",
+        "artifacts": [
+          "docs/evidence/artifacts/issue-725/device-modes-probe-raw.json",
+          "docs/evidence/artifacts/issue-725/device-modes-files.txt"
+        ]
+      },
+      "D": {
+        "status": "partial_blocked",
+        "reason": "materialization and sealed sync-root target proved; true airplane-mode and writeback require USB ADB"
+      },
+      "E": {
+        "status": "partial",
+        "reason": "Graph create/rename/move/delete/revert passed; delete BiometricPrompt window was not captured"
+      },
+      "F": {
+        "status": "pass",
+        "artifact": "docs/evidence/artifacts/issue-725/device-upload-replace-root-rerun.json"
+      },
+      "G": {
+        "status": "partial",
+        "reason": "share-link permission verified and reverted; invite live-send skipped without controlled recipient"
+      },
+      "H": {
+        "status": "partial",
+        "reason": "DocumentsUI provider/list/preview path captured; granted SAF URI byte-hash read not captured"
+      },
+      "I": {
+        "status": "pass",
+        "artifact": "docs/evidence/artifacts/issue-725/android-at-rest-sentinel-scan-20260708T143922Z.log"
+      },
+      "J": {
+        "status": "pass",
+        "artifact": "docs/evidence/artifacts/issue-725/bridge-isolation-probe.json"
+      },
+      "K": {
+        "status": "partial",
+        "reason": "offline-mode biometric challenge/confirmation captured; move-out/bulk cleanup re-check not completed"
+      }
+    }
   },
   "release": {
     "status": "pending",
@@ -47,7 +95,8 @@
   },
   "notes": [
     "No release workflow has been dispatched for #725 yet.",
-    "No device E2E row is marked pass until fresh Pixel 8 Pro evidence is captured.",
+    "Fresh Pixel 8 Pro debug evidence was captured, but several rows remain partial or blocked.",
+    "Airplane-mode evidence requires a USB ADB transport; Wi-Fi ADB was the only visible transport during this run.",
     "No issue or epic close-out is claimed by this in-progress summary."
   ]
 }

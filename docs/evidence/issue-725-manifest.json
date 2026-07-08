@@ -32,6 +32,56 @@
       "result": "pass",
       "evidence": "workflow action pins: 126 action refs checked; OK - every external workflow action is pinned to a commit SHA.",
       "artifact": "docs/evidence/artifacts/issue-725/host-gates.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AND-016",
+      "claim": "Pixel 8 Pro Mode 1/2/3 target evidence was captured, with full PASS only for online, mode persistence, and sync lazy-cache rows.",
+      "method": "probe",
+      "command": "Pixel 8 Pro CDP probe plus run-as filesystem checks under device-lock om-725",
+      "result": "pass",
+      "evidence": "Rows A/B/C pass; Row D materialization is present but airplane-mode and writeback remain blocked without USB ADB.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-modes-probe-raw.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AND-016",
+      "claim": "Mobile upload, replace, and root upload worked end-to-end and all Graph fixtures were reverted.",
+      "method": "probe",
+      "command": "Mobile bridge upload/replace/root-upload probe with Graph content verification and cleanup",
+      "result": "pass",
+      "evidence": "Graph body hashes and parent IDs match; replace changed eTag; root upload parent matched drive root; cleanup returned 204.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-upload-replace-root-rerun.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AND-013",
+      "claim": "Mobile share-link creation produced a Graph permission that was verified and deleted; invite was deliberately skipped without a controlled recipient.",
+      "method": "probe",
+      "command": "Mobile bridge share-link probe with Graph permissions verification and delete_permission cleanup",
+      "result": "pass",
+      "evidence": "One matching link permission was found and deleted; raw share URL was redacted to a SHA-256 hash.",
+      "artifact": "docs/evidence/artifacts/issue-725/device-share-link-permission.json"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-SEC-010",
+      "claim": "Android debug package at-rest sentinel scan found no plaintext sentinel in private archive/cache/sync roots.",
+      "method": "command",
+      "command": "ANDROID_PACKAGE=com.silentspike.isyncyou.debug tools/android-at-rest-sentinel-scan.sh ISY-OM725-SENTINEL-<redacted> docs/evidence/artifacts/issue-725",
+      "result": "pass",
+      "evidence": "Scanner reported PASS; store header was not plaintext SQLite; no plaintext sentinel was found in files/archive, files/cache, files/sync, or cache.",
+      "artifact": "docs/evidence/artifacts/issue-725/android-at-rest-sentinel-scan-20260708T143922Z.log"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AND-011",
+      "claim": "Default debug APK exposes no general app UID TCP listener and uses the WebView message bridge path.",
+      "method": "probe",
+      "command": "python3 tools/android-bridge-isolation-probe.py --package com.silentspike.isyncyou.debug --lock om-725 --skip-lock --output docs/evidence/artifacts/issue-725/bridge-isolation-probe.json",
+      "result": "pass",
+      "evidence": "Probe passed bridge, monkeypatched fetch/EventSource, no-cookie, native validation, BiometricPrompt, and empty UID LISTEN checks.",
+      "artifact": "docs/evidence/artifacts/issue-725/bridge-isolation-probe.json"
     }
   ]
 }
