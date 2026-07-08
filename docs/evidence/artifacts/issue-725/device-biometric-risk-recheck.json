@@ -1,0 +1,164 @@
+{
+  "cleanup": [
+    {
+      "id": "892B68CBF4A7C544!scf2659d59af84956bce748fd5f7c2a85",
+      "label": "fixture-root",
+      "status": 204
+    }
+  ],
+  "fixture": {
+    "dest_id": "892B68CBF4A7C544!sa8cd3bf4e7a8412d9743e092bdaec064",
+    "file_id": "892B68CBF4A7C544!s9544744aeca44337bd1baa4b543d0f10",
+    "offline_src_id": "892B68CBF4A7C544!sd5e27e5f28c04715a821e11eb94fb3a1",
+    "root_id": "892B68CBF4A7C544!scf2659d59af84956bce748fd5f7c2a85",
+    "root_name": "isy-om725-risk-20260708-164749"
+  },
+  "mode_set_response": {
+    "confirmed": true,
+    "first": {
+      "body": {
+        "account": "me",
+        "item": "[\"onedrive_mode_offline\",\"892B68CBF4A7C544!sd5e27e5f28c04715a821e11eb94fb3a1\"]",
+        "op": "mode-switch-offline-large",
+        "pending_action_id": "ebc691c80a7c441b7765826f29528281b5e9959a6197950b",
+        "service": "onedrive",
+        "status": "confirmation_required"
+      },
+      "status": 200
+    },
+    "label": "Make folder offline in OneDrive",
+    "second": {
+      "body": {
+        "account": "me",
+        "folder": "892B68CBF4A7C544!sd5e27e5f28c04715a821e11eb94fb3a1",
+        "mode": "offline"
+      },
+      "status": 200
+    }
+  },
+  "package": "com.silentspike.isyncyou.debug",
+  "pre_move_evidence": {
+    "children": {
+      "children": [
+        {
+          "@odata.etag": "\"{9544744A-ECA4-4337-BD1B-AA4B543D0F10},1\"",
+          "eTag": "\"{9544744A-ECA4-4337-BD1B-AA4B543D0F10},1\"",
+          "effective_mode": "offline",
+          "file": {
+            "hashes": {
+              "quickXorHash": "71402CtLW/o0W82J9IyC54qimG4="
+            },
+            "mimeType": "text/plain"
+          },
+          "id": "892B68CBF4A7C544!s9544744aeca44337bd1baa4b543d0f10",
+          "lastModifiedDateTime": "2026-07-08T14:47:53Z",
+          "name": "risk-move.txt",
+          "size": 46
+        }
+      ]
+    },
+    "destination_outside_owner": true,
+    "explicit_offline_scope_owner": "892B68CBF4A7C544!sd5e27e5f28c04715a821e11eb94fb3a1",
+    "graph_parent_id": "892B68CBF4A7C544!sd5e27e5f28c04715a821e11eb94fb3a1",
+    "polls": [
+      {
+        "effective_mode": null,
+        "item_error": "Error: item not found",
+        "t": 1783522085
+      },
+      {
+        "effective_mode": null,
+        "item_error": "Error: item not found",
+        "t": 1783522091
+      },
+      {
+        "effective_mode": null,
+        "item_error": "Error: item not found",
+        "t": 1783522098
+      },
+      {
+        "effective_mode": null,
+        "item_error": "Error: Bridge timeout",
+        "t": 1783522123
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522129
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522135
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522142
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522149
+      },
+      {
+        "effective_mode": null,
+        "item_error": "Error: Bridge timeout",
+        "t": 1783522172
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522178
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522184
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522191
+      },
+      {
+        "effective_mode": null,
+        "item_error": null,
+        "t": 1783522198
+      }
+    ],
+    "store_item": {
+      "body_location": "sync",
+      "body_state": "available",
+      "conflict_state": null,
+      "content_state": "materialized",
+      "deleted": false,
+      "effective_mode": "online",
+      "etag": "\"{9544744A-ECA4-4337-BD1B-AA4B543D0F10},1\"",
+      "has_body": true,
+      "item_type": "file",
+      "last_download_error": null,
+      "name": "risk-move.txt",
+      "parent_remote_id": "892B68CBF4A7C544!sd5e27e5f28c04715a821e11eb94fb3a1",
+      "remote_id": "892B68CBF4A7C544!s9544744aeca44337bd1baa4b543d0f10",
+      "remote_mtime": "2026-07-08T14:47:53Z",
+      "service": "onedrive",
+      "size": 46,
+      "state": "live_backup",
+      "sync_state": "clean",
+      "verified_at": null,
+      "verify_status": null
+    }
+  },
+  "rows": {},
+  "token": {
+    "access_token_printed": false,
+    "account_cached": true,
+    "scopes": [
+      "Files.ReadWrite",
+      "User.Read"
+    ],
+    "source": "/home/jan/.config/m365-write/token_cache.json"
+  },
+  "ts": "2026-07-08T14:47:48Z"
+}
