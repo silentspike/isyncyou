@@ -14,6 +14,10 @@ use crate::AgentError;
 pub const DEFAULT_READ_BUDGET: u64 = 64 * 1024;
 /// Default search result cap when the model does not set `limit`.
 pub const DEFAULT_SEARCH_LIMIT: u32 = 20;
+/// Default flat list page size when the model does not set `limit`.
+pub const DEFAULT_LIST_LIMIT: u32 = 50;
+/// Hard cap for public list pages; deep-search uses its own candidate budget.
+pub const MAX_LIST_LIMIT: u32 = 200;
 /// Body preview length (chars) attached to each hit: enough for a real content preview in
 /// the expanded card, not just the one-line header. Whitespace is collapsed first.
 pub const PREVIEW_CHARS: usize = 1200;
@@ -137,6 +141,18 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             end -= 1;
         }
         (&text[..end], true)
+    }
+
+    fn list_limit(limit: Option<u32>) -> u32 {
+        limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT)
+    }
+
+    fn page_items(items: Vec<ItemRef>, limit: u32, offset: u32) -> Vec<ItemRef> {
+        items
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect()
     }
 
     fn search(
@@ -373,17 +389,27 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         .to_string())
     }
 
-    fn list(&self, service: &str, parent: Option<&str>) -> Result<String, AgentError> {
+    fn list(
+        &self,
+        service: &str,
+        parent: Option<&str>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<String, AgentError> {
+        let limit = Self::list_limit(limit);
+        let offset = offset.unwrap_or(0);
         let items = match parent {
-            Some("root") | Some("") => self.source.roots(service)?,
-            Some(parent) => self.source.children(service, parent)?,
-            None => self.source.list_page(service, u32::MAX, 0)?,
+            Some("root") | Some("") => Self::page_items(self.source.roots(service)?, limit, offset),
+            Some(parent) => Self::page_items(self.source.children(service, parent)?, limit, offset),
+            None => self.source.list_page(service, limit, offset)?,
         };
         let count = self.source.count(service)?;
         let results: Vec<serde_json::Value> = items.iter().map(Self::source_ref).collect();
         Ok(serde_json::json!({
             "service": service,
             "parent": parent,
+            "limit": limit,
+            "offset": offset,
             "service_total": count,
             "returned": results.len(),
             "results": results,
@@ -458,8 +484,12 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 ..
             } => self.read(service, id, *max_bytes),
             ToolAction::List {
-                service, parent, ..
-            } => self.list(service, parent.as_deref()),
+                service,
+                parent,
+                limit,
+                offset,
+                ..
+            } => self.list(service, parent.as_deref(), *limit, *offset),
             ToolAction::Export { service, id, .. } => self.export(service, id),
             // restore-local is read-class but writes a local file — it lands in S-AG.9/#624.
             ToolAction::RestoreLocal { .. } => Err(AgentError::ToolArgs(
@@ -573,9 +603,19 @@ mod tests {
         fn list_page(
             &self,
             service: &str,
-            _limit: u32,
-            _offset: u32,
+            limit: u32,
+            offset: u32,
         ) -> Result<Vec<ItemRef>, AgentError> {
+            Ok(self
+                .items
+                .iter()
+                .filter(|(i, _)| i.service == service)
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(|(i, _)| i.clone())
+                .collect())
+        }
+        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
             Ok(self
                 .items
                 .iter()
@@ -583,12 +623,9 @@ mod tests {
                 .map(|(i, _)| i.clone())
                 .collect())
         }
-        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
-            self.list_page(service, u32::MAX, 0)
-        }
         fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError> {
             let _ = parent;
-            self.list_page(service, u32::MAX, 0)
+            self.roots(service)
         }
         fn count(&self, service: &str) -> Result<u64, AgentError> {
             Ok(self
@@ -596,6 +633,87 @@ mod tests {
                 .iter()
                 .filter(|(i, _)| i.service == service)
                 .count() as u64)
+        }
+    }
+
+    struct RoutingArchive {
+        account: String,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl RoutingArchive {
+        fn new(calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Self {
+            Self {
+                account: "me".into(),
+                calls,
+            }
+        }
+
+        fn route_item(service: &str, id: &str, name: &str) -> ItemRef {
+            ItemRef {
+                service: service.into(),
+                id: id.into(),
+                name: name.into(),
+                item_type: "folder".into(),
+                path: Some(format!("{service}/{id}.bin")),
+            }
+        }
+    }
+
+    impl ArchiveSource for RoutingArchive {
+        fn account(&self) -> &str {
+            &self.account
+        }
+
+        fn search_names(&self, _query: &str) -> Result<Vec<ItemRef>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        fn search_bodies(&self, _query: &str) -> Result<Vec<(String, String)>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        fn get(&self, _service: &str, _id: &str) -> Result<Option<ItemRef>, AgentError> {
+            Ok(None)
+        }
+
+        fn read_body(&self, service: &str, id: &str) -> Result<Vec<u8>, AgentError> {
+            Err(AgentError::ToolArgs(format!("no body {service}/{id}")))
+        }
+
+        fn list_page(
+            &self,
+            service: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<Vec<ItemRef>, AgentError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("list_page:{limit}:{offset}"));
+            let items = vec![
+                Self::route_item(service, "flat-0", "Flat 0"),
+                Self::route_item(service, "flat-1", "Flat 1"),
+                Self::route_item(service, "flat-2", "Flat 2"),
+            ];
+            Ok(items
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
+        }
+
+        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.calls.borrow_mut().push("roots".into());
+            Ok(vec![Self::route_item(service, "root-only", "Root Only")])
+        }
+
+        fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.calls.borrow_mut().push(format!("children:{parent}"));
+            Ok(vec![Self::route_item(service, "child-only", "Child Only")])
+        }
+
+        fn count(&self, _service: &str) -> Result<u64, AgentError> {
+            Ok(123)
         }
     }
 
@@ -932,9 +1050,99 @@ mod tests {
     #[test]
     fn list_reports_items_and_service_total() {
         let ex = fixture();
-        let v: serde_json::Value = serde_json::from_str(&ex.list("mail", None).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.list("mail", None, None, None).unwrap()).unwrap();
         assert_eq!(v["service_total"], 2);
         assert_eq!(v["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_pages_flat_service_items_with_count() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ex = RetrievalExecutor::new(RoutingArchive::new(calls.clone()));
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.list("onedrive", None, Some(1), Some(1)).unwrap()).unwrap();
+        assert_eq!(*calls.borrow(), vec!["list_page:1:1"]);
+        assert_eq!(v["service"], "onedrive");
+        assert_eq!(v["parent"], serde_json::Value::Null);
+        assert_eq!(v["limit"], 1);
+        assert_eq!(v["offset"], 1);
+        assert_eq!(v["service_total"], 123);
+        assert_eq!(v["returned"], 1);
+        assert_eq!(v["results"][0]["id"], "flat-1");
+        assert_eq!(v["results"][0]["path"], "onedrive/flat-1.bin");
+    }
+
+    #[test]
+    fn list_root_uses_roots_not_whole_service() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ex = RetrievalExecutor::new(RoutingArchive::new(calls.clone()));
+        let v: serde_json::Value = serde_json::from_str(
+            &ex.list("onedrive", Some("root"), Some(10), Some(0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["roots"]);
+        assert_eq!(v["parent"], "root");
+        assert_eq!(v["results"][0]["id"], "root-only");
+    }
+
+    #[test]
+    fn list_parent_uses_children() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ex = RetrievalExecutor::new(RoutingArchive::new(calls.clone()));
+        let v: serde_json::Value = serde_json::from_str(
+            &ex.list("onedrive", Some("folder-1"), Some(10), Some(0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["children:folder-1"]);
+        assert_eq!(v["parent"], "folder-1");
+        assert_eq!(v["results"][0]["id"], "child-only");
+    }
+
+    #[test]
+    fn list_limit_and_offset_are_applied() {
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![
+                FakeArchive::item("mail", "m0", "Mail 0", Some("body 0")),
+                FakeArchive::item("mail", "m1", "Mail 1", Some("body 1")),
+                FakeArchive::item("mail", "m2", "Mail 2", Some("body 2")),
+            ],
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.list("mail", None, Some(1), Some(2)).unwrap()).unwrap();
+        assert_eq!(v["limit"], 1);
+        assert_eq!(v["offset"], 2);
+        assert_eq!(v["service_total"], 3);
+        assert_eq!(v["returned"], 1);
+        assert_eq!(v["results"][0]["id"], "m2");
+    }
+
+    #[test]
+    fn deep_search_still_scans_candidates_after_list_refactor() {
+        let items: Vec<_> = (0..(DEFAULT_LIST_LIMIT + 5))
+            .map(|i| {
+                FakeArchive::item(
+                    "mail",
+                    &format!("bulk-{i}"),
+                    &format!("Bulk {i}"),
+                    Some(&format!("unmatched body {i}")),
+                )
+            })
+            .collect();
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items,
+        });
+        let out = ex
+            .deep_search(&["mail".into()], "zzzznomatch", None, Some(40), &mut |_| {})
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["candidates_total"], DEFAULT_LIST_LIMIT + 5);
+        assert_eq!(v["read"], MAX_DEEP_READS);
+        assert_eq!(v["budget_reached"], true);
     }
 
     #[test]
