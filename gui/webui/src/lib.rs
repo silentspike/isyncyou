@@ -695,11 +695,18 @@ pub trait OneDriveWriteHandler: Send + Sync {
 /// management route is refused there. free-up / download-now are local-only + reversible (not
 /// biometric-gated); a keep-mine resolve deletes the cloud copy (biometric-gated by the router);
 /// cleanup is a bulk op (biometric-gated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneDriveDownloadNowResult {
+    pub downloaded: bool,
+    pub target: String,
+}
+
 pub trait OneDriveManageHandler: Send + Sync {
     /// Free up space: drop `id`'s materialized body but keep the item listable (metadata-only).
     fn free_up(&self, account: &str, id: &str) -> Result<(), String>;
-    /// Download now: materialize `id` on demand. `Ok(false)` when the transfer policy blocked it.
-    fn download_now(&self, account: &str, id: &str) -> Result<bool, String>;
+    /// Download now: fetch `id` on demand to the mode-appropriate target. `downloaded=false`
+    /// means the transfer policy blocked it.
+    fn download_now(&self, account: &str, id: &str) -> Result<OneDriveDownloadNowResult, String>;
     /// The account's unresolved conflicts (write-orphan `conflict_state` rows) for the Conflict
     /// Center. Returns a JSON array of `{ id, name, conflict_copy, … }`.
     fn list_conflicts(&self, account: &str) -> Result<serde_json::Value, String>;
@@ -2772,8 +2779,9 @@ impl Router {
         }
     }
 
-    /// `POST /api/v1/onedrive/download-now?account=…&id=…` — materialize one item on demand (#659).
-    /// Local-only + reversible → NOT biometric-gated. `materialized:false` when policy blocked it.
+    /// `POST /api/v1/onedrive/download-now?account=…&id=…` — fetch one item on demand (#659/#724).
+    /// Local-only + reversible → NOT biometric-gated. Sync mode targets cache; offline targets the
+    /// editable sync root. `downloaded:false` when policy blocked it.
     fn onedrive_download_now(&self, req: &ApiRequest) -> ApiResponse {
         let h = match self.manage_gate(req) {
             Ok(h) => h,
@@ -2787,9 +2795,13 @@ impl Router {
             _ => return ApiResponse::error(400, "account and id are required"),
         };
         match h.download_now(account, id) {
-            Ok(materialized) => {
+            Ok(result) => {
                 let _ = self.audit_account(account, "audit:onedrive-manage", "ok", "download-now");
-                ApiResponse::ok_json(&json!({ "ok": true, "materialized": materialized }))
+                ApiResponse::ok_json(&json!({
+                    "ok": true,
+                    "downloaded": result.downloaded,
+                    "target": result.target,
+                }))
             }
             Err(e) => {
                 let _ = self.audit_account(
@@ -4464,7 +4476,7 @@ impl Router {
                     && isyncyou_core::envelope::body_envelope_required_for_process())
                 .then(|| self.config.accounts.iter().find(|a| a.id == account))
                 .flatten();
-                let strict_body_all = if strict_body_acc.is_some() {
+                let onedrive_all = if service == "onedrive" {
                     match store.items_by_service(account, service) {
                         Ok(all) => Some(all),
                         Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
@@ -4472,16 +4484,20 @@ impl Router {
                 } else {
                     None
                 };
-                let strict_body_by_id = strict_body_all.as_ref().map(|all| {
+                let onedrive_by_id = onedrive_all.as_ref().map(|all| {
                     all.iter()
                         .map(|i| (i.remote_id.as_str(), i))
                         .collect::<HashMap<&str, &Item>>()
                 });
-                ApiResponse::ok_json(&item_json_with_mobile_body_policy(
+                let mut v = item_json_with_mobile_body_policy(
                     &it,
                     strict_body_acc,
-                    strict_body_by_id.as_ref(),
-                ))
+                    onedrive_by_id.as_ref(),
+                );
+                if let Some(by_id) = onedrive_by_id.as_ref() {
+                    enrich_onedrive_effective_mode(&mut v, &self.config, account, by_id, &it);
+                }
+                ApiResponse::ok_json(&v)
             }
             Ok(None) => ApiResponse::error(404, "item not found"),
             Err(e) => ApiResponse::error(500, &format!("query: {e}")),
@@ -4952,6 +4968,45 @@ fn item_json(it: &Item) -> Value {
     v
 }
 
+fn onedrive_store_ancestry(by_id: &HashMap<&str, &Item>, it: &Item) -> Vec<String> {
+    let mut ancestry = Vec::new();
+    let mut parent = it.parent_remote_id.as_deref();
+    while let Some(pid) = parent.filter(|p| !p.is_empty()) {
+        if ancestry.iter().any(|seen| seen == pid) {
+            break;
+        }
+        ancestry.push(pid.to_string());
+        parent = by_id
+            .get(pid)
+            .and_then(|parent_item| parent_item.parent_remote_id.as_deref());
+    }
+    ancestry
+}
+
+fn onedrive_effective_mode_for_store_item(
+    config: &Config,
+    account: &str,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) -> OneDriveMode {
+    let ancestry = onedrive_store_ancestry(by_id, it);
+    let refs: Vec<&str> = ancestry.iter().map(String::as_str).collect();
+    config.effective_mode(account, &it.remote_id, &refs)
+}
+
+fn enrich_onedrive_effective_mode(
+    v: &mut Value,
+    config: &Config,
+    account: &str,
+    by_id: &HashMap<&str, &Item>,
+    it: &Item,
+) {
+    if it.service == "onedrive" {
+        v["effective_mode"] =
+            json!(onedrive_effective_mode_for_store_item(config, account, by_id, it).as_str());
+    }
+}
+
 fn onedrive_body_root(acc: &isyncyou_core::AccountConfig, it: &Item) -> PathBuf {
     if it.body_location.as_deref() == Some("cache") {
         acc.effective_cache_root()
@@ -5329,6 +5384,26 @@ fn mail_preview_enrichment(
 mod tests {
     use super::*;
     use isyncyou_core::config::AccountConfig;
+
+    struct BodyEnvelopeTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for BodyEnvelopeTestGuard {
+        fn drop(&mut self) {
+            isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+            isyncyou_core::envelope::reset_body_keys_for_tests();
+        }
+    }
+
+    fn body_envelope_test_guard() -> BodyEnvelopeTestGuard {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let lock = LOCK.get_or_init(|| std::sync::Mutex::new(()));
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+        isyncyou_core::envelope::reset_body_keys_for_tests();
+        BodyEnvelopeTestGuard { _lock: guard }
+    }
 
     // AC1: the 4-state Live∪Backup model is derived correctly per item, and
     // AC2: a body archived at an older etag than the item's current sync etag
@@ -7678,6 +7753,31 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_gates_download_now_by_store_mode() {
+        for needle in [
+            "function driveManageMode(row)",
+            "function driveCanDownloadNow(row)",
+            "return row && MODE_KEYS.includes(row.effective_mode) ? row.effective_mode : null;",
+            "return mode === \"sync\" || mode === \"offline\";",
+            ".catch(() => driveRenderManageUnavailable(box))",
+            "d && d.downloaded === false",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #724 download-now eligibility invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains(".catch(() => driveRenderManage(box, it, null))"),
+            "store-miss must not render the download-now action"
+        );
+        assert!(
+            !APP_JS.contains("d && d.materialized === false"),
+            "download-now UI must not consume the old materialized response field"
+        );
+    }
+
+    #[test]
     fn app_js_has_push_cap_token_placeholder() {
         assert!(APP_JS.contains("__PUSH_CAP_TOKEN__"));
     }
@@ -8756,9 +8856,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             self.freed.lock().unwrap().push(id.into());
             Ok(())
         }
-        fn download_now(&self, _account: &str, id: &str) -> Result<bool, String> {
+        fn download_now(
+            &self,
+            _account: &str,
+            id: &str,
+        ) -> Result<OneDriveDownloadNowResult, String> {
             self.downloaded.lock().unwrap().push(id.into());
-            Ok(true)
+            Ok(OneDriveDownloadNowResult {
+                downloaded: true,
+                target: "cache".into(),
+            })
         }
         fn list_conflicts(&self, _account: &str) -> Result<serde_json::Value, String> {
             Ok(json!([{
@@ -8836,10 +8943,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             400
         );
 
-        // download-now -> 200, materialized reflects the return.
+        // download-now -> 200, downloaded/target reflect the handler result.
         let dn = router.route(&post("/api/v1/onedrive/download-now?account=a&id=i2"));
         assert_eq!(dn.status, 200);
-        assert_eq!(body_json(&dn)["materialized"], true);
+        let dnj = body_json(&dn);
+        assert_eq!(dnj["downloaded"], true);
+        assert_eq!(dnj["target"], "cache");
+        assert!(dnj.get("materialized").is_none());
         assert_eq!(*m.downloaded.lock().unwrap(), vec!["i2".to_string()]);
 
         // conflicts GET -> 200 + shape.
@@ -9335,13 +9445,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn mobile_body_policy_rejects_plaintext_onedrive_bodies_in_listing() {
-        struct ResetBodyRequirement;
-        impl Drop for ResetBodyRequirement {
-            fn drop(&mut self) {
-                isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
-            }
-        }
-        let _reset = ResetBodyRequirement;
+        let _guard = body_envelope_test_guard();
         isyncyou_core::envelope::set_body_key(719, [7u8; 32]);
         isyncyou_core::envelope::require_body_envelope_for_process();
 
@@ -9867,6 +9971,73 @@ Content-Type: text/html; charset=utf-8\r\n\
     }
 
     #[test]
+    fn item_endpoint_enriches_onedrive_effective_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let offline = Item::new("a", "onedrive", "F_OFF", "Offline", "folder");
+            let mut sync = Item::new("a", "onedrive", "F_SYNC", "Sync", "folder");
+            sync.parent_remote_id = Some("F_OFF".into());
+            let mut online = Item::new("a", "onedrive", "F_ON", "Online", "folder");
+            online.parent_remote_id = Some("F_OFF".into());
+            let mut offline_file = Item::new("a", "onedrive", "FILE_OFF", "offline.txt", "file");
+            offline_file.parent_remote_id = Some("F_OFF".into());
+            let mut sync_file = Item::new("a", "onedrive", "FILE_SYNC", "sync.txt", "file");
+            sync_file.parent_remote_id = Some("F_SYNC".into());
+            let mut online_file = Item::new("a", "onedrive", "FILE_ON", "online.txt", "file");
+            online_file.parent_remote_id = Some("F_ON".into());
+            for it in [offline, sync, online, offline_file, sync_file, online_file] {
+                store.upsert_item(&it).unwrap();
+            }
+            store
+                .upsert_item(&Item::new("a", "mail", "m1", "Mail", "message"))
+                .unwrap();
+        }
+        let mut folder_modes = std::collections::BTreeMap::new();
+        folder_modes.insert("F_OFF".to_string(), OneDriveMode::Offline);
+        folder_modes.insert("F_SYNC".to_string(), OneDriveMode::Sync);
+        folder_modes.insert("F_ON".to_string(), OneDriveMode::Online);
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@outlook.com".into(),
+                sync_root: dir.path().join("sync"),
+                archive_root: arch,
+                cache_root: dir.path().join("cache"),
+                mount_point: None,
+            }],
+            onedrive_modes: std::collections::BTreeMap::from([(
+                "a".to_string(),
+                OneDriveModes {
+                    default_mode: OneDriveMode::Online,
+                    folder_modes,
+                },
+            )]),
+            ..Default::default()
+        };
+        let router = Router::new(cfg);
+
+        let offline = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/item?account=a&service=onedrive&id=FILE_OFF",
+        )));
+        assert_eq!(offline["effective_mode"], "offline");
+        let sync = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/item?account=a&service=onedrive&id=FILE_SYNC",
+        )));
+        assert_eq!(sync["effective_mode"], "sync");
+        let online = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/item?account=a&service=onedrive&id=FILE_ON",
+        )));
+        assert_eq!(online["effective_mode"], "online");
+        let mail = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/item?account=a&service=mail&id=m1",
+        )));
+        assert!(mail.get("effective_mode").is_none());
+    }
+
+    #[test]
     fn search_matches_names() {
         let (_d, router) = setup();
         let resp = router.route(&ApiRequest::get("/api/v1/search?account=a&q=invoice"));
@@ -9984,6 +10155,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 
     #[test]
     fn body_serves_onedrive_file_from_sync_root() {
+        let _guard = body_envelope_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let arch = dir.path().join("arch");
         let sync = dir.path().join("od");
@@ -10030,6 +10202,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 
     #[test]
     fn body_resolves_nested_onedrive_path_via_parent_chain() {
+        let _guard = body_envelope_test_guard();
         // Real ingest stores `local_path` as the NAME segment only; the body path must walk the
         // parent folder chain (materialize writes `sync_root/<folder>/<name>`). Regression for
         // the mobile materialized-nested-file read surfaced on-device (#655).
@@ -10073,6 +10246,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 
     #[test]
     fn body_serves_onedrive_cache_mode_file_from_cache_root() {
+        let _guard = body_envelope_test_guard();
         // Root-aware serving (#onedrive-mobile 0C): a `body_location=="cache"` OneDrive
         // item must be read from cache_root, NOT sync_root. Same relative name exists in
         // both roots with different content to prove the correct root is chosen.
