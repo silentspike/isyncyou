@@ -441,8 +441,12 @@ function runBiometricConfirm(pat, label) {
 /* A short human label for the biometric sheet from the challenge payload (#0.6). */
 function biometricLabel(d) {
   const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
+    : d.op === "move-out-of-protected" ? "Move out of offline folder"
+    : d.op === "mode-switch-offline-large" ? "Make folder offline"
+    : d.op === "bulk" ? "Bulk OneDrive change"
     : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
-  return `${verb} in ${d.service || "Microsoft 365"}`;
+  const service = d.service === "onedrive" ? "OneDrive" : d.service || "Microsoft 365";
+  return `${verb} in ${service}`;
 }
 /* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses
    the native stream path and never falls back to EventSource. Desktop uses EventSource. */
