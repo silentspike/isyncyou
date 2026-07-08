@@ -95,6 +95,18 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
     /// text the store indexes — instead of showing raw headers/boundaries. Other services
     /// archive already-readable bodies (ics/vCard/text), so pass them through.
     fn body_preview(service: &str, body: &[u8]) -> String {
+        Self::body_model_text(service, body)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(PREVIEW_CHARS)
+            .collect()
+    }
+
+    /// Convert archived bytes into the text exposed to the model. Counters and
+    /// truncation are defined over this final UTF-8 string, not the raw archive bytes.
+    fn body_model_text(service: &str, body: &[u8]) -> String {
         #[cfg(feature = "retrieval")]
         let text = if service == "mail" {
             // Real mail is `.eml` MIME → extract the readable text. A non-MIME/plain body
@@ -113,12 +125,18 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             let _ = service;
             String::from_utf8_lossy(body).into_owned()
         };
-        text.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(PREVIEW_CHARS)
-            .collect()
+        text
+    }
+
+    fn utf8_budget_slice(text: &str, max_bytes: usize) -> (&str, bool) {
+        if text.len() <= max_bytes {
+            return (text, false);
+        }
+        let mut end = max_bytes;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        (&text[..end], true)
     }
 
     fn search(
@@ -337,22 +355,20 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             .get(service, id)?
             .ok_or_else(|| AgentError::ToolArgs(format!("no item {service}/{id}")))?;
         let bytes = self.source.read_body(service, id)?;
+        let text = Self::body_model_text(service, &bytes);
         let budget = max_bytes.unwrap_or(DEFAULT_READ_BUDGET) as usize;
-        let truncated = bytes.len() > budget;
-        let slice = if truncated {
-            &bytes[..budget]
-        } else {
-            &bytes[..]
-        };
+        let (content, truncated) = Self::utf8_budget_slice(&text, budget);
+        let source = Self::source_ref(&item);
         Ok(serde_json::json!({
             "service": item.service,
             "id": item.id,
             "name": item.name,
             "path": item.path,
-            "bytes_total": bytes.len(),
-            "bytes_returned": slice.len(),
+            "source": source,
+            "bytes_total": text.len(),
+            "bytes_returned": content.len(),
             "truncated": truncated,
-            "content": String::from_utf8_lossy(slice),
+            "content": content,
         })
         .to_string())
     }
@@ -854,6 +870,63 @@ mod tests {
         let full: serde_json::Value =
             serde_json::from_str(&ex.read("mail", "m1", None).unwrap()).unwrap();
         assert_eq!(full["truncated"], false);
+    }
+
+    #[test]
+    fn read_counts_model_text_and_truncates_on_utf8_boundary() {
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item("onedrive", "u1", "Utf8", Some("ééx"))],
+        });
+        let out = ex.read("onedrive", "u1", Some(3)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["bytes_total"], "ééx".len());
+        assert_eq!(v["bytes_returned"], "é".len());
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["content"], "é");
+    }
+
+    #[test]
+    fn read_includes_source_object() {
+        let ex = fixture();
+        let out = ex.read("mail", "m1", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["source"]["service"], "mail");
+        assert_eq!(v["source"]["id"], "m1");
+        assert_eq!(v["source"]["name"], "Spotify invoice March");
+        assert_eq!(v["source"]["path"], "mail/m1.bin");
+    }
+
+    #[test]
+    fn read_missing_body_returns_controlled_error() {
+        let ex = fixture();
+        let err = ex.read("onedrive", "f1", None).unwrap_err();
+        assert!(err.to_string().contains("no body onedrive/f1"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn read_mail_returns_model_text_not_raw_eml_headers() {
+        let eml = concat!(
+            "Subject: Quarterly Report\r\n",
+            "From: Ada <ada@example.com>\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Hello from the extracted body.\r\n"
+        );
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item("mail", "eml1", "Quarterly", Some(eml))],
+        });
+        let out = ex.read("mail", "eml1", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let content = v["content"].as_str().unwrap();
+        assert!(content.contains("Quarterly Report"));
+        assert!(content.contains("Hello from the extracted body."));
+        assert!(!content.contains("Content-Type:"));
+        assert_eq!(v["bytes_total"], content.len());
+        assert_eq!(v["bytes_returned"], content.len());
+        assert_eq!(v["truncated"], false);
     }
 
     #[test]
