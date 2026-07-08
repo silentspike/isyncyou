@@ -2671,7 +2671,7 @@ function driveRenderManageUnavailable(box) {
 function driveRenderManage(box, it, row) {
   clear(box);
   if (!row) { driveRenderManageUnavailable(box); return; }
-  const hasBody = !!(row && (row.has_body || row.body_state === "available" || row.content_state === "materialized"));
+  const hasBody = row.has_body === true;
   box.append(el("h4", { class: "od-sec dim", text: "On this device" }));
   if (hasBody) {
     box.append(el("button", { class: "btn ghost sm", type: "button", style: "width:100%;justify-content:flex-start",

@@ -7759,6 +7759,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "function driveCanDownloadNow(row)",
             "return row && MODE_KEYS.includes(row.effective_mode) ? row.effective_mode : null;",
             "return mode === \"sync\" || mode === \"offline\";",
+            "const hasBody = row.has_body === true;",
             ".catch(() => driveRenderManageUnavailable(box))",
             "d && d.downloaded === false",
         ] {
@@ -7774,6 +7775,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(
             !APP_JS.contains("d && d.materialized === false"),
             "download-now UI must not consume the old materialized response field"
+        );
+        assert!(
+            !APP_JS.contains("row.body_state === \"available\"")
+                && !APP_JS.contains("row.content_state === \"materialized\""),
+            "download-now UI must not bypass the server/sealed-body has_body policy"
         );
     }
 
