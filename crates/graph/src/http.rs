@@ -19,6 +19,124 @@ pub struct OneNotePagePart {
     pub bytes: Vec<u8>,
 }
 
+/// Parsed Microsoft Graph permission data needed for crash-safe share recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrivePermission {
+    pub id: String,
+    pub roles: Vec<String>,
+    pub link_web_url: Option<String>,
+    pub link_type: Option<String>,
+    pub link_scope: Option<String>,
+    pub granted_emails: Vec<String>,
+    pub invitation_emails: Vec<String>,
+    pub inherited: bool,
+}
+
+impl DrivePermission {
+    pub fn from_graph_value(value: &serde_json::Value) -> Option<Self> {
+        let id = value.get("id")?.as_str()?.to_string();
+        let roles = string_array(value.get("roles"));
+        let link = value.get("link");
+        let link_web_url = link
+            .and_then(|l| l.get("webUrl"))
+            .and_then(|u| u.as_str())
+            .map(String::from);
+        let link_type = link
+            .and_then(|l| l.get("type"))
+            .and_then(|t| t.as_str())
+            .map(String::from);
+        let link_scope = link
+            .and_then(|l| l.get("scope"))
+            .and_then(|s| s.as_str())
+            .map(String::from);
+        let mut granted_emails = Vec::new();
+        for key in ["grantedToV2", "grantedTo"] {
+            if let Some(identity) = value.get(key) {
+                collect_identity_emails(identity, &mut granted_emails);
+            }
+        }
+        for key in ["grantedToIdentitiesV2", "grantedToIdentities"] {
+            if let Some(identities) = value.get(key).and_then(|v| v.as_array()) {
+                for identity in identities {
+                    collect_identity_emails(identity, &mut granted_emails);
+                }
+            }
+        }
+        let mut invitation_emails = Vec::new();
+        if let Some(email) = value
+            .get("invitation")
+            .and_then(|i| i.get("email"))
+            .and_then(|e| e.as_str())
+        {
+            push_unique_nonempty(&mut invitation_emails, email);
+        }
+        let inherited = value
+            .get("inheritedFrom")
+            .is_some_and(|inherited| !inherited.is_null());
+        Some(Self {
+            id,
+            roles,
+            link_web_url,
+            link_type,
+            link_scope,
+            granted_emails,
+            invitation_emails,
+            inherited,
+        })
+    }
+}
+
+/// Result from Microsoft Graph invite that preserves partial-success semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteOutcome {
+    Applied {
+        permission_ids: Vec<String>,
+    },
+    Partial {
+        successful_permission_ids: Vec<String>,
+        failed_recipient_count: usize,
+        redacted_reason: String,
+    },
+}
+
+fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_identity_emails(value: &serde_json::Value, out: &mut Vec<String>) {
+    for key in ["email", "mail", "userPrincipalName", "loginName"] {
+        if let Some(candidate) = value.get(key).and_then(|v| v.as_str()) {
+            push_email_candidate(out, candidate);
+        }
+    }
+    for key in ["user", "siteUser", "emailAddress"] {
+        if let Some(child) = value.get(key) {
+            collect_identity_emails(child, out);
+        }
+    }
+}
+
+fn push_email_candidate(out: &mut Vec<String>, candidate: &str) {
+    if candidate.contains('@') {
+        push_unique_nonempty(out, candidate);
+    }
+}
+
+fn push_unique_nonempty(out: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+        out.push(trimmed.to_string());
+    }
+}
+
 /// Errors from the live upload/delete path.
 #[derive(Debug)]
 pub enum UploadError {
@@ -572,8 +690,8 @@ impl GraphClient {
 
     /// Create (or, idempotently per `(link_type, scope)`, return the existing)
     /// sharing link for an item. `link_type` = `view`/`edit`/`embed`, `scope` =
-    /// `anonymous`/`users`. `password`/`expiry` are account/Premium-dependent on
-    /// personal accounts. Returns the link's `webUrl`.
+    /// `anonymous`/`organization`/`users`. `password`/`expiry` are
+    /// account/Premium-dependent on personal accounts. Returns the link's `webUrl`.
     pub fn create_link(
         &self,
         item_id: &str,
@@ -583,6 +701,52 @@ impl GraphClient {
         expiry: Option<&str>,
         retain_inherited: Option<bool>,
     ) -> Result<String, UploadError> {
+        let v = self.post_create_link_json(
+            item_id,
+            link_type,
+            scope,
+            password,
+            expiry,
+            retain_inherited,
+        )?;
+        v.pointer("/link/webUrl")
+            .and_then(|u| u.as_str())
+            .map(String::from)
+            .ok_or_else(|| UploadError::Parse("createLink response had no link.webUrl".into()))
+    }
+
+    /// Create (or return an existing) sharing link and preserve the returned
+    /// permission id plus link metadata for share-ledger recovery.
+    pub fn create_link_detailed(
+        &self,
+        item_id: &str,
+        link_type: &str,
+        scope: &str,
+        password: Option<&str>,
+        expiry: Option<&str>,
+        retain_inherited: Option<bool>,
+    ) -> Result<DrivePermission, UploadError> {
+        let v = self.post_create_link_json(
+            item_id,
+            link_type,
+            scope,
+            password,
+            expiry,
+            retain_inherited,
+        )?;
+        DrivePermission::from_graph_value(&v)
+            .ok_or_else(|| UploadError::Parse("createLink response was not a permission".into()))
+    }
+
+    fn post_create_link_json(
+        &self,
+        item_id: &str,
+        link_type: &str,
+        scope: &str,
+        password: Option<&str>,
+        expiry: Option<&str>,
+        retain_inherited: Option<bool>,
+    ) -> Result<serde_json::Value, UploadError> {
         let url = format!("/me/drive/items/{}/createLink", encode_id(item_id));
         let mut body = serde_json::json!({ "type": link_type, "scope": scope });
         if let Some(p) = password {
@@ -594,11 +758,7 @@ impl GraphClient {
         if let Some(r) = retain_inherited {
             body["retainInheritedPermissions"] = serde_json::Value::Bool(r);
         }
-        let v = self.post_json(&url, &body)?;
-        v.pointer("/link/webUrl")
-            .and_then(|u| u.as_str())
-            .map(String::from)
-            .ok_or_else(|| UploadError::Parse("createLink response had no link.webUrl".into()))
+        self.post_json(&url, &body)
     }
 
     /// Invite people to an item by email. `roles` is e.g. `["read"]` or
@@ -615,6 +775,40 @@ impl GraphClient {
         expiry: Option<&str>,
         password: Option<&str>,
     ) -> Result<Vec<String>, UploadError> {
+        match self.invite_detailed(
+            item_id,
+            emails,
+            roles,
+            require_sign_in,
+            send_invitation,
+            message,
+            expiry,
+            password,
+        )? {
+            InviteOutcome::Applied { permission_ids } => Ok(permission_ids),
+            InviteOutcome::Partial {
+                redacted_reason, ..
+            } => Err(UploadError::Http {
+                status: 207,
+                body: redacted_reason,
+            }),
+        }
+    }
+
+    /// Invite people to an item while preserving `207 Multi-Status` as a
+    /// distinct partial outcome for crash-safe invite recovery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invite_detailed(
+        &self,
+        item_id: &str,
+        emails: &[String],
+        roles: &[&str],
+        require_sign_in: bool,
+        send_invitation: bool,
+        message: &str,
+        expiry: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<InviteOutcome, UploadError> {
         let url = format!("/me/drive/items/{}/invite", encode_id(item_id));
         let recipients: Vec<serde_json::Value> = emails
             .iter()
@@ -633,15 +827,21 @@ impl GraphClient {
         if let Some(p) = password {
             body["password"] = serde_json::Value::String(p.to_string());
         }
-        let v = self.post_json(&url, &body)?;
-        Ok(v.get("value")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| p.get("id").and_then(|i| i.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default())
+        let (status, v) = self.post_json_with_status(&url, &body)?;
+        let permission_ids = permission_ids_from_invite_value(&v);
+        if status == 207 {
+            let value_len = v
+                .get("value")
+                .and_then(|a| a.as_array())
+                .map_or(0, Vec::len);
+            let failed_recipient_count = value_len.saturating_sub(permission_ids.len());
+            return Ok(InviteOutcome::Partial {
+                successful_permission_ids: permission_ids,
+                failed_recipient_count,
+                redacted_reason: "partial_success".to_string(),
+            });
+        }
+        Ok(InviteOutcome::Applied { permission_ids })
     }
 
     /// List an item's permissions as `(permission id, roles, link webUrl, grantee
@@ -651,34 +851,39 @@ impl GraphClient {
         &self,
         item_id: &str,
     ) -> Result<Vec<(String, Vec<String>, Option<String>, Option<String>)>, UploadError> {
+        Ok(self
+            .list_permissions_detailed(item_id)?
+            .into_iter()
+            .map(|permission| {
+                let grantee = permission
+                    .granted_emails
+                    .first()
+                    .cloned()
+                    .or_else(|| permission.invitation_emails.first().cloned());
+                (
+                    permission.id,
+                    permission.roles,
+                    permission.link_web_url,
+                    grantee,
+                )
+            })
+            .collect())
+    }
+
+    /// List an item's permissions with the fields needed for share/invite
+    /// recovery. Inherited permissions are preserved so callers can ignore them
+    /// deliberately.
+    pub fn list_permissions_detailed(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<DrivePermission>, UploadError> {
         let url = format!("/me/drive/items/{}/permissions", encode_id(item_id));
         let v = self.get_json(&url)?;
         Ok(v.get("value")
             .and_then(|a| a.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|p| {
-                        let id = p.get("id")?.as_str()?.to_string();
-                        let roles = p
-                            .get("roles")
-                            .and_then(|r| r.as_array())
-                            .map(|r| {
-                                r.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let link = p
-                            .pointer("/link/webUrl")
-                            .and_then(|u| u.as_str())
-                            .map(String::from);
-                        let grantee = p
-                            .pointer("/grantedToV2/user/displayName")
-                            .or_else(|| p.pointer("/grantedTo/user/displayName"))
-                            .and_then(|n| n.as_str())
-                            .map(String::from);
-                        Some((id, roles, link, grantee))
-                    })
+                    .filter_map(DrivePermission::from_graph_value)
                     .collect()
             })
             .unwrap_or_default())
@@ -864,6 +1069,15 @@ impl GraphClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, UploadError> {
+        self.post_json_with_status(url, body)
+            .map(|(_, value)| value)
+    }
+
+    fn post_json_with_status(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<(u16, serde_json::Value), UploadError> {
         let url = self.abs(url);
         let resp = self
             .client
@@ -872,7 +1086,7 @@ impl GraphClient {
             .json(body)
             .send()
             .map_err(|e| UploadError::Transport(e.to_string()))?;
-        json_or_err(resp)
+        json_with_status_or_err(resp)
     }
 
     /// PATCH a JSON body onto a Graph resource and return the updated resource.
@@ -1584,10 +1798,18 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 fn json_or_err(resp: reqwest::blocking::Response) -> Result<serde_json::Value, UploadError> {
+    json_with_status_or_err(resp).map(|(_, value)| value)
+}
+
+fn json_with_status_or_err(
+    resp: reqwest::blocking::Response,
+) -> Result<(u16, serde_json::Value), UploadError> {
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
-        resp.json::<serde_json::Value>()
-            .map_err(|e| UploadError::Parse(e.to_string()))
+        let value = resp
+            .json::<serde_json::Value>()
+            .map_err(|e| UploadError::Parse(e.to_string()))?;
+        Ok((status, value))
     } else {
         let body = resp.text().unwrap_or_default();
         Err(UploadError::Http {
@@ -1595,6 +1817,24 @@ fn json_or_err(resp: reqwest::blocking::Response) -> Result<serde_json::Value, U
             body: body.chars().take(300).collect(),
         })
     }
+}
+
+fn permission_ids_from_invite_value(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("value")
+        .and_then(|items| items.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|permission| {
+                    permission
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Minimal path encoding for OneDrive `root:/PATH:` addressing (spaces only;
@@ -1744,7 +1984,11 @@ mod tests {
         if content_length > 0 {
             sock.read_exact(&mut body).unwrap();
         }
-        head
+        if body.is_empty() {
+            head
+        } else {
+            format!("{head}\n{}", String::from_utf8_lossy(&body))
+        }
     }
 
     /// Serve `responses` verbatim, one connection each; returns the base URL and
@@ -2489,6 +2733,149 @@ mod tests {
     }
 
     #[test]
+    fn create_link_detailed_accepts_organization_scope_and_returns_permission() {
+        let (base, server) = serve(vec![http_response(
+            201,
+            "Created",
+            "",
+            r#"{
+                "id": "perm-org",
+                "roles": ["write"],
+                "link": {
+                    "type": "edit",
+                    "scope": "organization",
+                    "webUrl": "https://contoso.sharepoint.com/:w:/r/doc"
+                }
+            }"#,
+        )]);
+        let permission = GraphClient::new("tok")
+            .with_base_url(&base)
+            .create_link_detailed("i1", "edit", "organization", None, None, None)
+            .unwrap();
+        assert_eq!(permission.id, "perm-org");
+        assert_eq!(permission.roles, vec!["write".to_string()]);
+        assert_eq!(permission.link_type.as_deref(), Some("edit"));
+        assert_eq!(permission.link_scope.as_deref(), Some("organization"));
+        assert_eq!(
+            permission.link_web_url.as_deref(),
+            Some("https://contoso.sharepoint.com/:w:/r/doc")
+        );
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/drive/items/i1/createLink"));
+        assert!(seen[0].contains(r#""scope":"organization""#));
+    }
+
+    #[test]
+    fn detailed_permission_parser_extracts_link_identities_and_invitation() {
+        let value = serde_json::json!({
+            "id": "perm1",
+            "roles": ["read"],
+            "inheritedFrom": {"id": "parent"},
+            "link": {
+                "webUrl": "https://1drv.ms/x/abc",
+                "type": "view",
+                "scope": "anonymous"
+            },
+            "grantedToV2": {
+                "user": {"email": "Ada@Example.com"},
+                "siteUser": {"loginName": "ada@example.com"}
+            },
+            "grantedToIdentitiesV2": [
+                {"user": {"userPrincipalName": "bob@example.com"}},
+                {"siteUser": {"loginName": "not-an-email"}}
+            ],
+            "grantedTo": {
+                "user": {"mail": "carol@example.com"}
+            },
+            "invitation": {"email": "invitee@example.com"}
+        });
+        let permission = DrivePermission::from_graph_value(&value).unwrap();
+        assert_eq!(permission.id, "perm1");
+        assert_eq!(permission.roles, vec!["read".to_string()]);
+        assert_eq!(
+            permission.link_web_url.as_deref(),
+            Some("https://1drv.ms/x/abc")
+        );
+        assert_eq!(permission.link_type.as_deref(), Some("view"));
+        assert_eq!(permission.link_scope.as_deref(), Some("anonymous"));
+        assert!(permission.inherited);
+        for email in [
+            "Ada@Example.com",
+            "ada@example.com",
+            "bob@example.com",
+            "carol@example.com",
+        ] {
+            assert!(permission.granted_emails.contains(&email.to_string()));
+        }
+        assert_eq!(permission.granted_emails.len(), 4);
+        assert_eq!(
+            permission.invitation_emails,
+            vec!["invitee@example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_permissions_detailed_preserves_tuple_compatibility() {
+        let (base, server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            r#"{
+                "value": [
+                    {
+                        "id": "p1",
+                        "roles": ["read"],
+                        "link": {
+                            "webUrl": "https://1drv.ms/x/abc",
+                            "type": "view",
+                            "scope": "users"
+                        },
+                        "grantedToV2": {
+                            "user": {"email": "reader@example.com"}
+                        }
+                    }
+                ]
+            }"#,
+        )]);
+        let client = GraphClient::new("tok").with_base_url(&base);
+        let detailed = client.list_permissions_detailed("i1").unwrap();
+        assert_eq!(detailed.len(), 1);
+        assert_eq!(detailed[0].id, "p1");
+        assert_eq!(detailed[0].link_type.as_deref(), Some("view"));
+        assert_eq!(detailed[0].link_scope.as_deref(), Some("users"));
+        assert_eq!(
+            detailed[0].granted_emails,
+            vec!["reader@example.com".to_string()]
+        );
+        assert!(server.join().unwrap()[0].starts_with("GET /me/drive/items/i1/permissions"));
+
+        let (base2, _server2) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            r#"{
+                "value": [
+                    {
+                        "id": "p1",
+                        "roles": ["read"],
+                        "link": {"webUrl": "u"},
+                        "invitation": {"email": "fallback@example.com"}
+                    }
+                ]
+            }"#,
+        )]);
+        let tuples = GraphClient::new("tok")
+            .with_base_url(&base2)
+            .list_permissions("i1")
+            .unwrap();
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].0, "p1");
+        assert_eq!(tuples[0].1, vec!["read".to_string()]);
+        assert_eq!(tuples[0].2.as_deref(), Some("u"));
+        assert_eq!(tuples[0].3.as_deref(), Some("fallback@example.com"));
+    }
+
+    #[test]
     fn invite_posts_invite_and_returns_permission_ids() {
         let (base, server) = serve(vec![http_response(
             200,
@@ -2513,6 +2900,73 @@ mod tests {
         let seen = server.join().unwrap();
         assert!(seen[0].starts_with("POST /me/drive/items/i1/invite"));
         assert!(seen[0].contains("content-type: application/json"));
+    }
+
+    #[test]
+    fn invite_detailed_parses_207_partial_as_distinct_outcome() {
+        let (base, server) = serve(vec![http_response(
+            207,
+            "Multi-Status",
+            "",
+            r#"{
+                "value": [
+                    {"id": "perm-ok", "roles": ["read"]},
+                    {"error": {"code": "recipientNotFound", "message": "raw person@example.com"}}
+                ]
+            }"#,
+        )]);
+        let outcome = GraphClient::new("tok")
+            .with_base_url(&base)
+            .invite_detailed(
+                "i1",
+                &["person@example.com".to_string()],
+                &["read"],
+                true,
+                true,
+                "",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InviteOutcome::Partial {
+                successful_permission_ids: vec!["perm-ok".to_string()],
+                failed_recipient_count: 1,
+                redacted_reason: "partial_success".to_string(),
+            }
+        );
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/drive/items/i1/invite"));
+        assert!(seen[0].contains(r#""sendInvitation":true"#));
+
+        let (base2, _server2) = serve(vec![http_response(
+            207,
+            "Multi-Status",
+            "",
+            r#"{"value":[{"id":"perm-ok"},{"error":{"message":"raw person@example.com"}}]}"#,
+        )]);
+        match GraphClient::new("tok")
+            .with_base_url(&base2)
+            .invite(
+                "i1",
+                &["person@example.com".to_string()],
+                &["read"],
+                true,
+                true,
+                "",
+                None,
+                None,
+            )
+            .unwrap_err()
+        {
+            UploadError::Http { status, body } => {
+                assert_eq!(status, 207);
+                assert_eq!(body, "partial_success");
+                assert!(!body.contains("person@example.com"));
+            }
+            other => panic!("expected redacted 207 Http error, got {other}"),
+        }
     }
 
     #[test]
