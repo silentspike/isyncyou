@@ -1,8 +1,8 @@
 #![cfg(feature = "onedrive")]
 
 use isyncyou_agent::{
-    new_ulid, DeviceId, OneDriveTransport, Session, SessionCryptoConfig, SessionId,
-    SessionTransport,
+    new_ulid, DeviceId, FileSessionCache, OneDriveTransport, Session, SessionCryptoConfig,
+    SessionId, SessionTransport,
 };
 use isyncyou_graph::http::{GraphClient, UploadError};
 
@@ -95,9 +95,9 @@ fn live_onedrive_session_roundtrip_ciphertext_and_cleanup() {
     .expect("session A");
     let session_b = Session::new_with_crypto_config(
         &session_id,
-        pairing_secret,
+        pairing_secret.clone(),
         OneDriveTransport::new(token.clone()),
-        config,
+        config.clone(),
     )
     .expect("session B");
     let device_a = DeviceId::new("pixel-a").expect("device A");
@@ -131,11 +131,48 @@ fn live_onedrive_session_roundtrip_ciphertext_and_cleanup() {
     assert!(loaded.fork.is_none(), "live linear session must not fork");
     assert_eq!(loaded.turns[0].content, SENTINEL);
 
+    let left_cache = tempfile::tempdir().expect("left offline cache");
+    let right_cache = tempfile::tempdir().expect("right offline cache");
+    let session_left = Session::new_with_cache(
+        &session_id,
+        pairing_secret.clone(),
+        OneDriveTransport::new(token.clone()),
+        config.clone(),
+        FileSessionCache::new(left_cache.path()),
+    )
+    .expect("left offline session");
+    let session_right = Session::new_with_cache(
+        &session_id,
+        pairing_secret.clone(),
+        OneDriveTransport::new(token.clone()),
+        config,
+        FileSessionCache::new(right_cache.path()),
+    )
+    .expect("right offline session");
+    session_left
+        .load_full()
+        .expect("left observes current head");
+    session_right
+        .load_full()
+        .expect("right observes same current head");
+    session_left
+        .append_offline_pending(&device_a, "user", "offline-left")
+        .expect("left offline turn");
+    session_right
+        .append_offline_pending(&device_b, "user", "offline-right")
+        .expect("right offline turn");
+    assert_eq!(session_left.sync().expect("sync left pending"), 1);
+    assert_eq!(session_right.sync().expect("sync right pending"), 1);
+
+    let forked = session_a.load_full().expect("load forked session");
+    let fork = forked.fork.expect("live concurrent offline heads fork");
+    assert_eq!(fork.heads.len(), 2, "fork must expose the two live heads");
+
     let transport = OneDriveTransport::new(token.clone());
     let listed = transport
         .list(&SessionId::new(&session_id).expect("session id"))
         .expect("list turn ids");
-    assert_eq!(listed.len(), 3, "only turn files should be listed");
+    assert_eq!(listed.len(), 5, "only turn files should be listed");
 
     let raw_path = format!("{session_path}/{}.json", first.ulid);
     let raw = graph
@@ -156,9 +193,11 @@ fn live_onedrive_session_roundtrip_ciphertext_and_cleanup() {
         serde_json::json!({
             "session_id": session_id,
             "turn_count": listed.len(),
-            "heads": loaded.heads.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "linear_heads": loaded.heads.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "fork_heads": fork.heads.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "ciphertext_only": true,
             "lease_blocked_second_holder": true,
+            "fork_reported": true,
             "cleanup_path": session_path
         })
     );
