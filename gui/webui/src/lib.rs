@@ -1628,7 +1628,7 @@ impl Router {
                 "/api/v1/account/signout" => self.account_signout(req),
                 "/api/v1/push/register" => self.push_register(req),
                 "/api/v1/push/test" => self.push_test(req),
-                "/api/v1/agent/turn" => self.agent_turn(req),
+                "/api/v1/agent/turn" | "/api/v1/agent/chat" => self.agent_turn(req),
                 "/api/v1/agent/confirm" => self.agent_confirm(req),
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
@@ -4047,7 +4047,7 @@ impl Router {
             Ok(summary) => {
                 ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary }))
             }
-            Err(e) => ApiResponse::error(409, &e),
+            Err(e) => ApiResponse::error(agent_confirm_error_status(&e), &e),
         }
     }
 
@@ -4983,6 +4983,19 @@ fn audit_summary(summary: &str) -> String {
         out.push_str("...");
     }
     out
+}
+
+fn agent_confirm_error_status(error: &str) -> u16 {
+    if error.contains("BadToken")
+        || error.contains("Expired")
+        || error.contains("ActionMismatch")
+        || error.contains("NotFound")
+        || error == "bad token"
+    {
+        409
+    } else {
+        500
+    }
 }
 
 /// Default and maximum page size for the items listing.
@@ -6046,6 +6059,79 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let cancel = ApiRequest::new("POST", "/api/v1/agent/cancel?turn=turn-123")
             .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&cancel).status, 200);
+    }
+
+    #[test]
+    fn agent_chat_alias_matches_turn_route() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let turn = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
+                .with_cap_token(Some("agentsecret".into())),
+        );
+        let chat = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/chat?account=a&prompt=hi")
+                .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(turn.status, 200);
+        assert_eq!(chat.status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&turn.body),
+            String::from_utf8_lossy(&chat.body)
+        );
+    }
+
+    #[test]
+    fn agent_confirm_requires_action_hash() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let missing_hash = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=right")
+                .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(missing_hash.status, 400);
+        assert!(String::from_utf8_lossy(&missing_hash.body).contains("action_hash"));
+        let missing_token = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&action_hash=hash")
+                .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(missing_token.status, 400);
+    }
+
+    #[test]
+    fn mobile_agent_routes_require_session_token_even_with_cap_token() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("sess".into());
+        for path in [
+            "/api/v1/agent/turn?account=a&prompt=hi",
+            "/api/v1/agent/chat?account=a&prompt=hi",
+            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
+            "/api/v1/agent/cancel?turn=turn-123",
+        ] {
+            let r = router
+                .route(&ApiRequest::new("POST", path).with_cap_token(Some("agentsecret".into())));
+            assert_eq!(r.status, 401, "{path}");
+            assert!(
+                String::from_utf8_lossy(&r.body).contains("session token"),
+                "{path} must fail at the session gate before cap handling"
+            );
+        }
+        let no_cap = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
+                .with_session_token(Some("sess".into())),
+        );
+        assert_eq!(no_cap.status, 401);
+        assert!(String::from_utf8_lossy(&no_cap.body).contains("capability token"));
+
+        let status_without_session = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
+        assert_eq!(status_without_session.status, 401);
+        let status_with_session = router.route(
+            &ApiRequest::new("GET", "/api/v1/agent/status").with_session_token(Some("sess".into())),
+        );
+        assert_eq!(status_with_session.status, 200);
+        assert!(String::from_utf8_lossy(&status_with_session.body).contains("\"enabled\":true"));
     }
 
     #[test]
