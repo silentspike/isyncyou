@@ -278,7 +278,7 @@ pub trait AgentHandler: Send + Sync {
     /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
     /// Confirm a pending destructive action with its one-time token; returns a summary.
-    fn confirm(&self, pending_id: &str, token: &str) -> Result<String, String>;
+    fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String>;
     /// Cancel an in-flight turn.
     fn cancel(&self, turn_id: &str);
     /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
@@ -4034,11 +4034,16 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let (pending, token) = match (req.q("pending"), req.q("token")) {
-            (Some(i), Some(t)) if !i.is_empty() && !t.is_empty() => (i, t),
-            _ => return ApiResponse::error(400, "pending and token are required"),
-        };
-        match handler.confirm(pending, token) {
+        let (pending, token, action_hash) =
+            match (req.q("pending"), req.q("token"), req.q("action_hash")) {
+                (Some(i), Some(t), Some(h)) if !i.is_empty() && !t.is_empty() && !h.is_empty() => {
+                    (i, t, h)
+                }
+                _ => {
+                    return ApiResponse::error(400, "pending, token, and action_hash are required")
+                }
+            };
+        match handler.confirm(pending, token, action_hash) {
             Ok(summary) => {
                 ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary }))
             }
@@ -5973,8 +5978,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
             Ok("turn-123".into())
         }
-        fn confirm(&self, pending: &str, token: &str) -> Result<String, String> {
-            if token == "right" {
+        fn confirm(&self, pending: &str, token: &str, action_hash: &str) -> Result<String, String> {
+            if token == "right" && action_hash == "hash" {
                 Ok(format!("ran {pending}"))
             } else {
                 Err("bad token".into())
@@ -6025,11 +6030,17 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&bad).status, 400);
         // confirm: wrong one-time token -> 409, right -> 200
-        let cwrong = ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=wrong")
-            .with_cap_token(Some("agentsecret".into()));
+        let cwrong = ApiRequest::new(
+            "POST",
+            "/api/v1/agent/confirm?pending=p1&token=wrong&action_hash=hash",
+        )
+        .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&cwrong).status, 409);
-        let cok = ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=right")
-            .with_cap_token(Some("agentsecret".into()));
+        let cok = ApiRequest::new(
+            "POST",
+            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
+        )
+        .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&cok).status, 200);
         // cancel -> 200
         let cancel = ApiRequest::new("POST", "/api/v1/agent/cancel?turn=turn-123")

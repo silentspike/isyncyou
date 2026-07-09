@@ -138,6 +138,51 @@ impl ToolAction {
             ToolAction::Share { .. } => "share",
         }
     }
+
+    pub fn account(&self) -> &str {
+        match self {
+            ToolAction::Search { account, .. }
+            | ToolAction::DeepSearch { account, .. }
+            | ToolAction::Read { account, .. }
+            | ToolAction::List { account, .. }
+            | ToolAction::Export { account, .. }
+            | ToolAction::RestoreLocal { account, .. }
+            | ToolAction::Backup { account, .. }
+            | ToolAction::RestoreCloud { account, .. }
+            | ToolAction::LiveWrite { account, .. }
+            | ToolAction::Share { account, .. } => account,
+        }
+    }
+
+    pub fn service(&self) -> Option<&str> {
+        match self {
+            ToolAction::Read { service, .. }
+            | ToolAction::List { service, .. }
+            | ToolAction::Export { service, .. }
+            | ToolAction::RestoreLocal { service, .. }
+            | ToolAction::RestoreCloud { service, .. }
+            | ToolAction::LiveWrite { service, .. }
+            | ToolAction::Share { service, .. } => Some(service),
+            ToolAction::Search { .. }
+            | ToolAction::DeepSearch { .. }
+            | ToolAction::Backup { .. } => None,
+        }
+    }
+
+    pub fn item_or_target(&self) -> Option<&str> {
+        match self {
+            ToolAction::Read { id, .. }
+            | ToolAction::Export { id, .. }
+            | ToolAction::RestoreLocal { id, .. }
+            | ToolAction::RestoreCloud { id, .. }
+            | ToolAction::Share { id, .. } => Some(id),
+            ToolAction::LiveWrite { target, .. } => target.as_deref(),
+            ToolAction::Search { .. }
+            | ToolAction::DeepSearch { .. }
+            | ToolAction::List { .. }
+            | ToolAction::Backup { .. } => None,
+        }
+    }
 }
 
 /// Human/model-readable help, appended to a parse error (`--help`-on-error).

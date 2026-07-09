@@ -178,11 +178,6 @@ pub fn run_turn(
                 ToolClass::Destructive => {
                     // Never execute here — stop the turn for human confirmation.
                     let preview = format!("Requires confirmation — {} {:?}", action.op(), action);
-                    emit(StreamEvent::ConfirmationRequired {
-                        id: tu.id.clone(),
-                        action: action.clone(),
-                        preview: preview.clone(),
-                    });
                     return Ok(TurnOutcome::PendingConfirmation {
                         id: tu.id,
                         action,
@@ -312,9 +307,12 @@ mod tests {
             0,
             "a destructive action must not execute a read"
         );
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })),
+            "run_turn must not emit public confirmation before registry registration"
+        );
         assert!(
             !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
             "a pending turn is not Done"

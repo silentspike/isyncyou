@@ -63,6 +63,10 @@ pub enum StreamEvent {
         id: String,
         action: ToolAction,
         preview: String,
+        action_hash: String,
+        risk: String,
+        expires_at_ms: u64,
+        token: String,
     },
     /// A non-fatal error message for the stream.
     Error(String),
@@ -104,9 +108,24 @@ impl StreamEvent {
             } => serde_json::json!({
                 "event": "tool_result", "id": id, "content": content, "untrusted": untrusted
             }),
-            Self::ConfirmationRequired { id, preview, .. } => {
-                serde_json::json!({ "event": "confirmation_required", "tool_id": id, "preview": preview })
-            }
+            Self::ConfirmationRequired {
+                id,
+                preview,
+                action_hash,
+                risk,
+                expires_at_ms,
+                token,
+                ..
+            } => serde_json::json!({
+                "event": "confirmation_required",
+                "pending_id": id,
+                "tool_id": id,
+                "preview": preview,
+                "action_hash": action_hash,
+                "risk": risk,
+                "expires_at_ms": expires_at_ms,
+                "token": token
+            }),
             Self::SearchStage {
                 stage,
                 status,
@@ -197,12 +216,16 @@ mod tests {
                 untrusted: true,
             },
             StreamEvent::ConfirmationRequired {
-                id: "t2".into(),
+                id: "pending-1".into(),
                 action: ToolAction::Backup {
                     account: "me".into(),
                     services: vec!["mail".into()],
                 },
                 preview: "Requires confirmation".into(),
+                action_hash: "a".repeat(64),
+                risk: "destructive".into(),
+                expires_at_ms: 60_000,
+                token: "confirm-token".into(),
             },
             StreamEvent::Error("redacted".into()),
             StreamEvent::done(DoneReason::Cancelled),
