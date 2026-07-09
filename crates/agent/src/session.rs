@@ -71,6 +71,20 @@ pub struct ActiveTurn<'a, T: SessionTransport, C: LocalSessionCache = MemorySess
     finished: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedSession {
+    pub turns: Vec<Turn>,
+    pub heads: Vec<TurnId>,
+    pub fork: Option<SessionFork>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFork {
+    pub heads: Vec<TurnId>,
+    pub conflicting_turns: Vec<TurnId>,
+    pub missing_parent_refs: Vec<TurnId>,
+}
+
 // ----- ULID (timestamp-ordered, Crockford base32) -----
 
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -404,6 +418,62 @@ pub fn detect_fork(turns: &[Turn]) -> Vec<String> {
     conflicts
 }
 
+fn analyze_loaded_turns(turns: &[Turn]) -> Result<(Vec<TurnId>, Option<SessionFork>), AgentError> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    let turn_ids: HashSet<String> = turns.iter().map(|turn| turn.ulid.clone()).collect();
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut missing_parent_refs: BTreeSet<TurnId> = BTreeSet::new();
+    let mut missing_parent_children: BTreeSet<TurnId> = BTreeSet::new();
+    for turn in turns {
+        for parent in &turn.parent_turn_ids {
+            referenced.insert(parent.clone());
+            if !turn_ids.contains(parent) {
+                missing_parent_refs.insert(TurnId::new(parent)?);
+                missing_parent_children.insert(TurnId::new(&turn.ulid)?);
+            }
+        }
+    }
+
+    let mut heads: Vec<TurnId> = turns
+        .iter()
+        .filter(|turn| !referenced.contains(&turn.ulid))
+        .map(|turn| TurnId::new(&turn.ulid))
+        .collect::<Result<_, _>>()?;
+    heads.sort();
+
+    let mut by_observed_head: HashMap<Option<String>, Vec<TurnId>> = HashMap::new();
+    for turn in turns {
+        by_observed_head
+            .entry(turn.observed_head.clone())
+            .or_default()
+            .push(TurnId::new(&turn.ulid)?);
+    }
+    let mut conflicting_turns: BTreeSet<TurnId> = BTreeSet::new();
+    for (observed_head, children) in by_observed_head {
+        if observed_head.is_some() && children.len() > 1 {
+            conflicting_turns.extend(children);
+        }
+    }
+    if heads.len() > 1 {
+        conflicting_turns.extend(heads.iter().cloned());
+    }
+    conflicting_turns.extend(missing_parent_children);
+
+    let fork =
+        if heads.len() > 1 || !conflicting_turns.is_empty() || !missing_parent_refs.is_empty() {
+            Some(SessionFork {
+                heads: heads.clone(),
+                conflicting_turns: conflicting_turns.into_iter().collect(),
+                missing_parent_refs: missing_parent_refs.into_iter().collect(),
+            })
+        } else {
+            None
+        };
+
+    Ok((heads, fork))
+}
+
 /// An encrypted, conflict-safe session over a [`SessionTransport`].
 pub struct Session<T: SessionTransport, C: LocalSessionCache = MemorySessionCache> {
     pub session_id: SessionId,
@@ -564,6 +634,12 @@ impl<T: SessionTransport, C: LocalSessionCache> Session<T, C> {
     /// Load the whole conversation, decrypted and sorted by ULID (= creation order).
     /// Merges transport files with any still-pending local turns.
     pub fn load(&self) -> Result<Vec<Turn>, AgentError> {
+        Ok(self.load_full()?.turns)
+    }
+
+    /// Load the whole conversation plus computed heads/fork state. Deterministic
+    /// display order remains ULID sort; callers must inspect `fork` before choosing a head.
+    pub fn load_full(&self) -> Result<LoadedSession, AgentError> {
         use std::collections::BTreeMap;
         let mut sealed_by_ulid: BTreeMap<TurnId, SealedTurn> = BTreeMap::new();
         for turn_id in self.transport.list(&self.session_id)? {
@@ -597,7 +673,11 @@ impl<T: SessionTransport, C: LocalSessionCache> Session<T, C> {
                 .map_err(|e| AgentError::Provider(e.to_string()))?;
             turns.push(turn);
         }
-        Ok(turns) // BTreeMap iterates keys (ULIDs) in sorted order
+        let (heads, fork) = analyze_loaded_turns(&turns)?;
+        if fork.is_none() {
+            *self.head.borrow_mut() = heads.first().cloned();
+        }
+        Ok(LoadedSession { turns, heads, fork }) // BTreeMap iterates keys (ULIDs) in sorted order
     }
 
     /// Acquire the active-turn lease (anti-fork) for `holder`.
@@ -1131,6 +1211,42 @@ mod tests {
         TurnLeaseState::offline_unleased(&did("fixture"))
     }
 
+    fn fixture_turn(
+        ulid: &str,
+        observed_head: Option<&str>,
+        parent_turn_ids: Vec<&str>,
+        content: &str,
+    ) -> Turn {
+        Turn {
+            ulid: ulid.into(),
+            role: "user".into(),
+            content: content.into(),
+            observed_head: observed_head.map(String::from),
+            parent_turn_ids: parent_turn_ids.into_iter().map(String::from).collect(),
+            lease_state: test_lease_state(),
+            ts_ms: 0,
+        }
+    }
+
+    fn put_fixture_turn_with_key(
+        transport: &InMemoryTransport,
+        config: &SessionCryptoConfig,
+        key: &SessionKey,
+        turn: Turn,
+    ) {
+        let turn_id = tid(&turn.ulid);
+        let plaintext = serde_json::to_vec(&turn).unwrap();
+        let sealed =
+            session_crypto::seal(key, config, &sid("sess1"), &turn_id, &plaintext).unwrap();
+        transport
+            .put(
+                &sid("sess1"),
+                &turn_id,
+                &serde_json::to_vec(&sealed).unwrap(),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn ulid_is_26_chars_and_time_ordered() {
         assert_eq!(new_ulid().unwrap().len(), 26);
@@ -1196,19 +1312,124 @@ mod tests {
                 lease_state: test_lease_state(),
                 ts_ms: 0,
             };
-            let pt = serde_json::to_vec(&turn).unwrap();
-            let sealed =
-                session_crypto::seal(&key, &config, &sid("sess1"), &tid(ulid), &pt).unwrap();
-            t.put(
-                &sid("sess1"),
-                &tid(ulid),
-                &serde_json::to_vec(&sealed).unwrap(),
-            )
-            .unwrap();
+            put_fixture_turn_with_key(&t, &config, &key, turn);
         }
         let s = Session::new_with_crypto_config("sess1", KEY.to_vec(), t, config).unwrap();
         let ulids: Vec<String> = s.load().unwrap().into_iter().map(|t| t.ulid).collect();
         assert_eq!(ulids, vec![TURN_A, TURN_B, TURN_C]);
+    }
+
+    #[test]
+    fn linear_session_has_single_head_and_no_fork() {
+        let t = InMemoryTransport::new();
+        let config = crypto_config();
+        let key = crypto_key(&config);
+        put_fixture_turn_with_key(&t, &config, &key, fixture_turn(TURN_A, None, vec![], "a"));
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_B, Some(TURN_A), vec![TURN_A], "b"),
+        );
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_C, Some(TURN_B), vec![TURN_B], "c"),
+        );
+        let s = Session::new_with_crypto_config("sess1", KEY.to_vec(), t, config).unwrap();
+        let loaded = s.load_full().unwrap();
+        assert_eq!(loaded.heads, vec![tid(TURN_C)]);
+        assert!(loaded.fork.is_none());
+        assert_eq!(
+            loaded
+                .turns
+                .iter()
+                .map(|turn| turn.ulid.as_str())
+                .collect::<Vec<_>>(),
+            vec![TURN_A, TURN_B, TURN_C]
+        );
+    }
+
+    #[test]
+    fn load_reports_two_heads_as_fork() {
+        let t = InMemoryTransport::new();
+        let config = crypto_config();
+        let key = crypto_key(&config);
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_A, None, vec![], "root"),
+        );
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_B, Some(TURN_A), vec![TURN_A], "left"),
+        );
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_C, Some(TURN_A), vec![TURN_A], "right"),
+        );
+        let s = Session::new_with_crypto_config("sess1", KEY.to_vec(), t, config).unwrap();
+        let loaded = s.load_full().unwrap();
+        assert_eq!(loaded.heads, vec![tid(TURN_B), tid(TURN_C)]);
+        let fork = loaded.fork.expect("two heads should be a fork");
+        assert_eq!(fork.heads, vec![tid(TURN_B), tid(TURN_C)]);
+        assert_eq!(fork.conflicting_turns, vec![tid(TURN_B), tid(TURN_C)]);
+        assert!(fork.missing_parent_refs.is_empty());
+    }
+
+    #[test]
+    fn load_reports_missing_parent_as_fork_or_corruption() {
+        let t = InMemoryTransport::new();
+        let config = crypto_config();
+        let key = crypto_key(&config);
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_B, Some(TURN_A), vec![TURN_A], "orphan"),
+        );
+        let s = Session::new_with_crypto_config("sess1", KEY.to_vec(), t, config).unwrap();
+        let loaded = s.load_full().unwrap();
+        assert_eq!(loaded.heads, vec![tid(TURN_B)]);
+        let fork = loaded.fork.expect("missing parent should be reported");
+        assert_eq!(fork.missing_parent_refs, vec![tid(TURN_A)]);
+        assert_eq!(fork.conflicting_turns, vec![tid(TURN_B)]);
+    }
+
+    #[test]
+    fn forced_offline_concurrent_turns_surface_fork_on_reconnect() {
+        let t = InMemoryTransport::new();
+        let config = crypto_config();
+        let key = crypto_key(&config);
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_A, None, vec![], "root"),
+        );
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_B, Some(TURN_A), vec![TURN_A], "offline-left"),
+        );
+        put_fixture_turn_with_key(
+            &t,
+            &config,
+            &key,
+            fixture_turn(TURN_C, Some(TURN_A), vec![TURN_A], "offline-right"),
+        );
+        let s = Session::new_with_crypto_config("sess1", KEY.to_vec(), t, config).unwrap();
+        let loaded = s.load_full().unwrap();
+        let fork = loaded.fork.expect("forced concurrent children should fork");
+        assert_eq!(fork.heads, vec![tid(TURN_B), tid(TURN_C)]);
+        assert_eq!(fork.conflicting_turns, vec![tid(TURN_B), tid(TURN_C)]);
     }
 
     #[test]
