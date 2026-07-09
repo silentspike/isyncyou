@@ -5,7 +5,7 @@
 
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
-use isyncyou_store::Item;
+use isyncyou_store::{Item, Store};
 use isyncyou_webui::{OfflineModeRisk, OneDriveMoveRisk};
 use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "agent-subscription-experimental")]
@@ -22,6 +22,13 @@ fn unix_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0)
         .to_string()
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Mint a per-process capability token from `/dev/urandom` (hex), with a
@@ -113,36 +120,7 @@ fn make_executor(
 
 /// Serialize one stream event to a single-line JSON SSE-data payload.
 fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
-    use isyncyou_agent::StreamEvent as E;
-    let v = match ev {
-        E::Token(t) => serde_json::json!({ "event": "token", "text": t }),
-        E::ToolCall { id, name, input } => {
-            serde_json::json!({ "event": "tool_call", "id": id, "name": name, "input": input })
-        }
-        E::ToolResult {
-            id,
-            content,
-            untrusted,
-        } => serde_json::json!({
-            "event": "tool_result", "id": id, "content": content, "untrusted": untrusted
-        }),
-        E::ConfirmationRequired { id, preview, .. } => {
-            serde_json::json!({ "event": "confirmation_required", "tool_id": id, "preview": preview })
-        }
-        E::SearchStage {
-            stage,
-            status,
-            hits,
-        } => serde_json::json!({
-            "event": "search_stage", "stage": stage, "status": status, "hits": hits
-        }),
-        E::PartialResult { stage, items } => {
-            serde_json::json!({ "event": "partial_result", "stage": stage, "items": items })
-        }
-        E::Error(e) => serde_json::json!({ "event": "error", "message": e }),
-        E::Done => serde_json::json!({ "event": "done" }),
-    };
-    v.to_string()
+    ev.to_public_json_string()
 }
 
 /// Default model for the in-app agent (override with `ISYNCYOU_AGENT_MODEL`). The
@@ -167,6 +145,129 @@ const CODEX_MODELS: &[(&str, &str)] = &[("gpt-5.5", "GPT-5.5"), ("gpt-5.4", "GPT
 #[cfg(feature = "agent-subscription-experimental")]
 type ProviderBuilder =
     fn(&DaemonAgent, &str) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>>;
+#[cfg(test)]
+type TestProviderScript = Arc<Mutex<Option<Vec<Vec<isyncyou_agent::AssistantBlock>>>>>;
+
+/// Result returned by the confirmed destructive-action executor. #621 defines the
+/// confirmation contract; #624 wires the real destructive operations behind this seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedActionResult {
+    pub summary: String,
+}
+
+impl ConfirmedActionResult {
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+        }
+    }
+}
+
+/// Narrow seam for destructive actions after human confirmation.
+pub trait AgentConfirmedActionExecutor: Send + Sync {
+    fn execute_confirmed(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+    ) -> Result<ConfirmedActionResult, String>;
+}
+
+/// Narrow audit seam for confirmed agent actions. The live implementation writes the
+/// same durable account run log used by Router audit paths; tests use an in-memory sink.
+pub trait AgentAuditSink: Send + Sync {
+    fn record_confirm(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        status: &str,
+        summary: &str,
+    ) -> Result<(), String>;
+}
+
+struct NotImplementedConfirmedActionExecutor;
+
+impl AgentConfirmedActionExecutor for NotImplementedConfirmedActionExecutor {
+    fn execute_confirmed(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+    ) -> Result<ConfirmedActionResult, String> {
+        Err(format!(
+            "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
+            action.op()
+        ))
+    }
+}
+
+struct StoreAgentAuditSink {
+    cfg: Config,
+}
+
+impl StoreAgentAuditSink {
+    fn store_path(&self, account: &str) -> Option<PathBuf> {
+        self.cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .or_else(|| self.cfg.accounts.first())
+            .map(|a| a.archive_root.join(".isyncyou-store.db"))
+    }
+}
+
+impl AgentAuditSink for StoreAgentAuditSink {
+    fn record_confirm(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        status: &str,
+        summary: &str,
+    ) -> Result<(), String> {
+        let account = action.account();
+        let path = self
+            .store_path(account)
+            .ok_or_else(|| format!("unknown account '{account}'"))?;
+        let store = Store::open(path).map_err(|e| e.to_string())?;
+        let now = unix_now();
+        store
+            .add_run(
+                account,
+                "audit:agent-confirm",
+                &now,
+                &now,
+                status,
+                &agent_audit_summary(summary),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn agent_action_summary(action: &isyncyou_agent::ToolAction) -> String {
+    let mut parts = vec![
+        format!("op={}", action.op()),
+        format!("account={}", action.account()),
+    ];
+    if let Some(service) = action.service() {
+        parts.push(format!("service={service}"));
+    }
+    if let Some(item) = action.item_or_target() {
+        parts.push(format!("item={item}"));
+    }
+    parts.join(" ")
+}
+
+fn agent_audit_summary(summary: &str) -> String {
+    const MAX: usize = 400;
+    let mut out: String = summary.chars().take(MAX).collect();
+    if summary.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
+fn agent_safe_executor_error(error: &str) -> &'static str {
+    if error.contains("not_implemented") {
+        "not_implemented"
+    } else {
+        "execution_failed"
+    }
+}
 
 /// The agent's system prompt — app-/M365-scoped (the only tool is `isyncyou`).
 const AGENT_SYSTEM_PROMPT: &str = "You are the iSyncYou in-app assistant. You help the user with \
@@ -180,6 +281,14 @@ bullet lists) — answer in one or two short plain-language sentences about what
 Destructive actions (backup, restore-cloud, live-write, share) are confirmed by \
 the user out of band — propose them, never assume they ran.";
 
+const AGENT_CONFIRM_TTL_MS: u64 = 120_000;
+const AGENT_STREAM_UNOPENED_TTL_MS: u64 = 120_000;
+
+struct AgentStreamSlot {
+    rx: std::sync::mpsc::Receiver<String>,
+    created_at_ms: u64,
+}
+
 /// The in-app agent handler (S-AG.6/#621). Drives a real turn: the experimental
 /// subscription provider when the user has connected an account, otherwise a deterministic
 /// "not connected" message. Owns the stream hub + pending-action registry, so the model
@@ -190,7 +299,9 @@ pub struct DaemonAgent {
     cfg: Config,
     hub: Arc<isyncyou_agent::AgentStreamHub>,
     pending: Arc<isyncyou_agent::PendingRegistry>,
-    streams: Mutex<std::collections::HashMap<String, std::sync::mpsc::Receiver<String>>>,
+    confirmed_executor: Arc<dyn AgentConfirmedActionExecutor>,
+    audit_sink: Arc<dyn AgentAuditSink>,
+    streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
     seq: AtomicU64,
     /// Directory holding the operator's local, uncommitted OAuth recipe
     /// (`agent-oauth.json`) and the credential store — the parent of the config file.
@@ -200,20 +311,53 @@ pub struct DaemonAgent {
     /// Tracks in-flight device OAuth logins between start and the browser callback.
     #[cfg(feature = "agent-subscription-experimental")]
     oauth: isyncyou_agent::AgentOAuth,
+    #[cfg(test)]
+    test_provider_script: Option<TestProviderScript>,
 }
 
 impl DaemonAgent {
     pub fn new(cfg: Config, oauth_dir: PathBuf) -> Self {
+        let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
         Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
             pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
+            confirmed_executor: Arc::new(NotImplementedConfirmedActionExecutor),
+            audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
             seq: AtomicU64::new(0),
             oauth_dir,
             #[cfg(feature = "agent-subscription-experimental")]
             oauth: isyncyou_agent::AgentOAuth::new(),
+            #[cfg(test)]
+            test_provider_script: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_confirm_components(
+        cfg: Config,
+        oauth_dir: PathBuf,
+        executor: Arc<dyn AgentConfirmedActionExecutor>,
+        audit_sink: Arc<dyn AgentAuditSink>,
+    ) -> Self {
+        let mut agent = Self::new(cfg, oauth_dir);
+        agent.confirmed_executor = executor;
+        agent.audit_sink = audit_sink;
+        agent
+    }
+
+    #[cfg(test)]
+    fn with_test_provider_script_and_confirm_components(
+        cfg: Config,
+        oauth_dir: PathBuf,
+        script: Vec<Vec<isyncyou_agent::AssistantBlock>>,
+        executor: Arc<dyn AgentConfirmedActionExecutor>,
+        audit_sink: Arc<dyn AgentAuditSink>,
+    ) -> Self {
+        let mut agent = Self::with_test_confirm_components(cfg, oauth_dir, executor, audit_sink);
+        agent.test_provider_script = Some(Arc::new(Mutex::new(Some(script))));
+        agent
     }
 
     /// Resolve an account's archive root (holds `.isyncyou-store.db` + the on-disk body
@@ -229,10 +373,41 @@ impl DaemonAgent {
             .unwrap_or_default()
     }
 
+    fn sweep_unopened_streams_locked(
+        streams: &mut std::collections::HashMap<String, AgentStreamSlot>,
+        now_ms: u64,
+    ) -> usize {
+        let before = streams.len();
+        streams.retain(|_, slot| {
+            now_ms
+                <= slot
+                    .created_at_ms
+                    .saturating_add(AGENT_STREAM_UNOPENED_TTL_MS)
+        });
+        before - streams.len()
+    }
+
+    #[cfg(test)]
+    fn sweep_unopened_streams_for_tests(&self, now_ms: u64) -> usize {
+        let mut streams = self.streams.lock().unwrap();
+        Self::sweep_unopened_streams_locked(&mut streams, now_ms)
+    }
+
+    #[cfg(test)]
+    fn unopened_stream_count_for_tests(&self) -> usize {
+        self.streams.lock().unwrap().len()
+    }
+
     /// Pick the turn provider: the connected subscription (experimental feature) when a
     /// token is present, otherwise a deterministic "not connected" message so the UI still
     /// streams a clear instruction instead of erroring.
     fn build_turn_provider(&self, system: &str) -> Box<dyn isyncyou_agent::LlmProvider + Send> {
+        #[cfg(test)]
+        if let Some(script) = &self.test_provider_script {
+            if let Some(script) = script.lock().unwrap().take() {
+                return Box::new(isyncyou_agent::FakeProvider::new(script));
+            }
+        }
         #[cfg(feature = "agent-subscription-experimental")]
         {
             // Provider preference comes from the in-app switcher (persisted), falling back
@@ -943,7 +1118,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 }
             }
         });
-        self.streams.lock().unwrap().insert(turn_id.clone(), rx_str);
+        let now_ms = unix_now_ms();
+        {
+            let mut streams = self.streams.lock().unwrap();
+            Self::sweep_unopened_streams_locked(&mut streams, now_ms);
+            streams.insert(
+                turn_id.clone(),
+                AgentStreamSlot {
+                    rx: rx_str,
+                    created_at_ms: now_ms,
+                },
+            );
+        }
         // Build the provider on this thread (it may read the local token), then run the
         // turn on a background thread streaming events into the hub.
         let hub = self.hub.clone();
@@ -955,10 +1141,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let account_id = account.to_string();
         let archive_root = self.archive_root_for(&account_id);
         let mut provider = self.build_turn_provider(&system);
+        let pending = self.pending.clone();
         std::thread::spawn(move || {
             let exec = make_executor(&account_id, archive_root);
             let mut history = vec![isyncyou_agent::Message::user(prompt)];
-            let _ = isyncyou_agent::run_turn(
+            let outcome = isyncyou_agent::run_turn(
                 provider.as_mut(),
                 exec.as_ref(),
                 &mut history,
@@ -966,22 +1153,85 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     hub.emit(&tid, ev);
                 },
             );
+            match outcome {
+                Ok(isyncyou_agent::TurnOutcome::Final { .. }) => {}
+                Ok(isyncyou_agent::TurnOutcome::PendingConfirmation {
+                    action, preview, ..
+                }) => {
+                    match pending.register(action, preview, unix_now_ms(), AGENT_CONFIRM_TTL_MS) {
+                        Ok((pending_action, token)) => {
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::ConfirmationRequired {
+                                    id: pending_action.id,
+                                    action: pending_action.action,
+                                    preview: pending_action.preview,
+                                    action_hash: pending_action.action_hash,
+                                    risk: pending_action.risk,
+                                    expires_at_ms: pending_action.expires_at_ms,
+                                    token,
+                                },
+                            );
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::done(
+                                    isyncyou_agent::DoneReason::PendingConfirmation,
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            let _ =
+                                hub.emit(&tid, isyncyou_agent::StreamEvent::Error(e.to_string()));
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::done(
+                                    isyncyou_agent::DoneReason::Error,
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = hub.emit(&tid, isyncyou_agent::StreamEvent::Error(e.to_string()));
+                    let _ = hub.emit(
+                        &tid,
+                        isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
+                    );
+                }
+            }
             hub.close(&tid);
         });
         Ok(turn_id)
     }
 
-    fn confirm(&self, pending_id: &str, token: &str) -> Result<String, String> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        match self.pending.confirm(pending_id, token, now_ms) {
-            Ok(action) => Ok(format!(
-                "confirmed {} (execution lands in S-AG.9/#624)",
-                action.op()
-            )),
-            Err(e) => Err(format!("{e:?}")),
+    fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String> {
+        let action = self
+            .pending
+            .confirm(pending_id, token, action_hash, unix_now_ms())
+            .map_err(|e| format!("{e:?}"))?;
+        let action_summary = agent_action_summary(&action);
+        self.audit_sink
+            .record_confirm(&action, "started", &action_summary)?;
+        match self.confirmed_executor.execute_confirmed(&action) {
+            Ok(result) => {
+                self.audit_sink
+                    .record_confirm(&action, "ok", &format!("{action_summary} ok"))?;
+                serde_json::to_string(&serde_json::json!({
+                    "status": "ok",
+                    "op": action.op(),
+                    "summary": result.summary,
+                }))
+                .map_err(|e| e.to_string())
+            }
+            Err(e) => {
+                let safe = agent_safe_executor_error(&e);
+                self.audit_sink.record_confirm(
+                    &action,
+                    "error",
+                    &format!("{action_summary} error={safe}"),
+                )?;
+                Err(format!("{} failed: {safe}", action.op()))
+            }
         }
     }
 
@@ -990,7 +1240,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     }
 
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
-        self.streams.lock().unwrap().remove(turn_id)
+        self.streams.lock().unwrap().remove(turn_id).map(|s| s.rx)
     }
 
     /// EXPERIMENTAL (S-AG.12). Begin the MANUAL device OAuth login: PKCE + state, with the
@@ -2505,6 +2755,116 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingConfirmedExecutor {
+        calls: Arc<StdMutex<Vec<isyncyou_agent::ToolAction>>>,
+        result: Arc<StdMutex<Result<ConfirmedActionResult, String>>>,
+        order: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl RecordingConfirmedExecutor {
+        fn ok(summary: &str, order: Arc<StdMutex<Vec<String>>>) -> Self {
+            Self {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                result: Arc::new(StdMutex::new(Ok(ConfirmedActionResult::new(summary)))),
+                order,
+            }
+        }
+
+        fn err(error: &str, order: Arc<StdMutex<Vec<String>>>) -> Self {
+            Self {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                result: Arc::new(StdMutex::new(Err(error.to_string()))),
+                order,
+            }
+        }
+
+        fn set_error(&self, error: impl Into<String>) {
+            *self.result.lock().unwrap() = Err(error.into());
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl AgentConfirmedActionExecutor for RecordingConfirmedExecutor {
+        fn execute_confirmed(
+            &self,
+            action: &isyncyou_agent::ToolAction,
+        ) -> Result<ConfirmedActionResult, String> {
+            self.order.lock().unwrap().push("execute".to_string());
+            self.calls.lock().unwrap().push(action.clone());
+            self.result.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingAuditSink {
+        events: Arc<StdMutex<Vec<(String, String, String)>>>,
+        order: Arc<StdMutex<Vec<String>>>,
+        fail_start: bool,
+    }
+
+    impl RecordingAuditSink {
+        fn new(order: Arc<StdMutex<Vec<String>>>) -> Self {
+            Self {
+                events: Arc::new(StdMutex::new(Vec::new())),
+                order,
+                fail_start: false,
+            }
+        }
+
+        fn failing_start(order: Arc<StdMutex<Vec<String>>>) -> Self {
+            Self {
+                fail_start: true,
+                ..Self::new(order)
+            }
+        }
+
+        fn events(&self) -> Vec<(String, String, String)> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl AgentAuditSink for RecordingAuditSink {
+        fn record_confirm(
+            &self,
+            action: &isyncyou_agent::ToolAction,
+            status: &str,
+            summary: &str,
+        ) -> Result<(), String> {
+            self.order.lock().unwrap().push(format!("audit:{status}"));
+            if self.fail_start && status == "started" {
+                return Err("audit_start_failed".to_string());
+            }
+            self.events.lock().unwrap().push((
+                action.op().to_string(),
+                status.to_string(),
+                summary.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn backup_action() -> isyncyou_agent::ToolAction {
+        isyncyou_agent::parse_action(
+            &serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+        )
+        .unwrap()
+    }
+
+    fn temp_agent_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "isy-apphost-agent-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     #[cfg(feature = "agent-subscription-experimental")]
     struct AppHostCredentialEnvGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -2558,6 +2918,620 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn agent_confirm_audits_once_and_calls_executor_once() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order.clone());
+        let root = temp_agent_root("confirm-ok");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let result = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["op"], "backup");
+        assert_eq!(result["summary"], "backup accepted");
+        assert_eq!(executor.call_count(), 1);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["audit:started", "execute", "audit:ok"]
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, "started");
+        assert_eq!(events[1].1, "ok");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_replay_rejected_and_executor_not_called_twice() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-replay");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        isyncyou_webui::AgentHandler::confirm(&agent, &pending.id, &token, &pending.action_hash)
+            .unwrap();
+        let replay = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+        assert!(replay.contains("NotFound"));
+        assert_eq!(executor.call_count(), 1);
+        assert_eq!(audit.events().len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_executor_error_is_audited_without_revealing_token() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::err("placeholder", order.clone());
+        let audit = RecordingAuditSink::new(order.clone());
+        let root = temp_agent_root("confirm-exec-error");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+        executor.set_error(format!(
+            "provider token leaked? token={token} cap=cap-secret"
+        ));
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+        assert_eq!(err, "backup failed: execution_failed");
+        assert_eq!(executor.call_count(), 1);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["audit:started", "execute", "audit:error"]
+        );
+        let audit_text = serde_json::to_string(&audit.events()).unwrap();
+        assert!(!audit_text.contains(&token));
+        assert!(!audit_text.contains("cap-secret"));
+        assert!(!audit_text.contains("provider token leaked"));
+        assert!(audit_text.contains("execution_failed"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_unknown_or_expired_pending_does_not_audit_execution() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-invalid");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+
+        let unknown =
+            isyncyou_webui::AgentHandler::confirm(&agent, "missing", "token", "hash").unwrap_err();
+        assert!(unknown.contains("NotFound"));
+        let (pending, token) = agent
+            .pending
+            .register(backup_action(), "backup mail", 0, 1)
+            .unwrap();
+        let expired = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+        assert!(expired.contains("Expired"));
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_audit_start_failure_does_not_execute() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::failing_start(order.clone());
+        let root = temp_agent_root("confirm-audit-fail");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+        assert_eq!(err, "audit_start_failed");
+        assert_eq!(executor.call_count(), 0);
+        assert_eq!(order.lock().unwrap().as_slice(), ["audit:started"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_fake_turn_streams_tokens_to_subscriber() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::Text(
+            "hello world".into(),
+        )]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("unused", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("fake-token-stream");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "hello").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut tokens = Vec::new();
+        let mut done_reason = String::new();
+        for _ in 0..6 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("token") => tokens.push(event["text"].as_str().unwrap().to_string()),
+                Some("done") => {
+                    done_reason = event["reason"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event: {other:?} {line}"),
+            }
+        }
+        assert_eq!(tokens, ["hello ", "world"]);
+        assert_eq!(done_reason, "complete");
+        assert_eq!(executor.call_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_destructive_turn_registers_pending_without_executing() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("fake-pending-no-exec");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "back up mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "confirmation_required" {
+                pending_id = event["pending_id"].as_str().unwrap().to_string();
+                break;
+            }
+        }
+        assert!(!pending_id.is_empty());
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_pending_turn_stream_closes_with_pending_confirmation_done() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("fake-pending-done");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "back up mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut saw_confirmation = false;
+        let mut done_reason = String::new();
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("confirmation_required") => saw_confirmation = true,
+                Some("done") => {
+                    done_reason = event["reason"].as_str().unwrap().to_string();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_confirmation);
+        assert_eq!(done_reason, "pending_confirmation");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_confirm_runs_executor_once_and_replay_fails() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order.clone());
+        let root = temp_agent_root("fake-confirm-once");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "back up mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        let mut token = String::new();
+        let mut action_hash = String::new();
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "confirmation_required" {
+                pending_id = event["pending_id"].as_str().unwrap().to_string();
+                token = event["token"].as_str().unwrap().to_string();
+                action_hash = event["action_hash"].as_str().unwrap().to_string();
+                break;
+            }
+        }
+        assert!(!pending_id.is_empty());
+        let result =
+            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
+                .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["summary"], "backup accepted");
+        let replay =
+            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
+                .unwrap_err();
+        assert!(replay.contains("NotFound"));
+        assert_eq!(executor.call_count(), 1);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["audit:started", "execute", "audit:ok"]
+        );
+        assert_eq!(audit.events().len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_cancel_ends_stream_with_cancelled_done() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("unused", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("cancel-done");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+        let turn = "turn-cancel";
+        let rx_events = agent.hub.open(turn, 8);
+        let (tx_str, rx_str) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(ev) = rx_events.recv() {
+                if tx_str.send(agent_event_json(&ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        agent.streams.lock().unwrap().insert(
+            turn.to_string(),
+            AgentStreamSlot {
+                rx: rx_str,
+                created_at_ms: unix_now_ms(),
+            },
+        );
+
+        isyncyou_webui::AgentHandler::cancel(&agent, turn);
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, turn).expect("turn stream");
+        let line = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled done event");
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["event"], "done");
+        assert_eq!(event["reason"], "cancelled");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_unopened_stream_is_swept() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::Text(
+            "hello world".into(),
+        )]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("unused", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("unopened-sweep");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+        let _turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "hello").unwrap();
+        assert_eq!(agent.unopened_stream_count_for_tests(), 1);
+        assert_eq!(
+            agent.sweep_unopened_streams_for_tests(
+                unix_now_ms().saturating_add(AGENT_STREAM_UNOPENED_TTL_MS + 1)
+            ),
+            1
+        );
+        assert_eq!(agent.unopened_stream_count_for_tests(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_stream_token_events_contain_no_confirmation_token() {
+        let script = vec![vec![
+            isyncyou_agent::AssistantBlock::Text("Preparing backup ".into()),
+            isyncyou_agent::AssistantBlock::ToolUse {
+                id: "tool-1".into(),
+                input: serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+            },
+        ]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("stream-token-redaction");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "back up mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut token_text = String::new();
+        let mut confirmation_token = String::new();
+        for _ in 0..10 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("token") => token_text.push_str(event["text"].as_str().unwrap()),
+                Some("confirmation_required") => {
+                    confirmation_token = event["token"].as_str().unwrap().to_string();
+                }
+                Some("done") => break,
+                _ => {}
+            }
+        }
+        assert!(!confirmation_token.is_empty());
+        assert!(token_text.contains("Preparing backup"));
+        assert!(
+            !token_text.contains(&confirmation_token),
+            "token stream leaked confirmation token"
+        );
+        assert!(!token_text.contains("confirmation_required"));
+        assert!(!token_text.contains("action_hash"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_error_and_audit_redact_confirmation_token() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::err("placeholder", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-redact-token");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+        executor.set_error(format!(
+            "raw executor failure includes confirmation token {token}"
+        ));
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+        assert_eq!(err, "backup failed: execution_failed");
+        assert!(!err.contains(&token));
+        let audit_text = serde_json::to_string(&audit.events()).unwrap();
+        assert!(!audit_text.contains(&token));
+        assert!(!audit_text.contains("raw executor failure"));
+        assert!(audit_text.contains("execution_failed"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_pending_turn_outcome_is_registered_and_confirmable() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+        }]];
+        let root = std::env::temp_dir().join(format!(
+            "isy-apphost-agent-pending-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order);
+        let audit = RecordingAuditSink::new(Arc::new(StdMutex::new(Vec::new())));
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "back up mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+
+        let mut pending_id = String::new();
+        let mut token = String::new();
+        let mut action_hash = String::new();
+        let mut saw_pending_done = false;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("confirmation_required") => {
+                    pending_id = event["pending_id"].as_str().unwrap().to_string();
+                    token = event["token"].as_str().unwrap().to_string();
+                    action_hash = event["action_hash"].as_str().unwrap().to_string();
+                    assert_ne!(pending_id, "tool-1", "pending id must be registry-owned");
+                    assert_eq!(action_hash.len(), 64);
+                    assert_eq!(event["risk"], "destructive");
+                    assert!(event["expires_at_ms"].as_u64().unwrap() > 0);
+                    assert!(event["preview"].as_str().unwrap().contains("backup"));
+                }
+                Some("done") => {
+                    assert_eq!(event["reason"], "pending_confirmation");
+                    saw_pending_done = true;
+                    break;
+                }
+                Some("tool_call") => {
+                    assert_eq!(event["id"], "tool-1");
+                    assert_eq!(event["name"], "isyncyou");
+                }
+                other => panic!("unexpected event before pending confirmation: {other:?} {line}"),
+            }
+        }
+
+        assert!(
+            saw_pending_done,
+            "pending turn must close with pending_confirmation done"
+        );
+        assert!(
+            !pending_id.is_empty(),
+            "registered pending id should be streamed"
+        );
+        let result =
+            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
+                .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["op"], "backup");
+        let replay =
+            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
+                .unwrap_err();
+        assert!(replay.contains("NotFound"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(feature = "agent-subscription-experimental")]

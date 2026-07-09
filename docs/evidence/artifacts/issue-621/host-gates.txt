@@ -1,0 +1,69 @@
+Issue #621 host-gate evidence
+Generated: 2026-07-09T20:44:02+02:00
+Evidence code commit: 98d946a102569ce542cb15a576f6d90286a739fe
+Branch: feature/ag-621
+Base: origin/dev at aba35da10ab1a4a4892a1a26e75b4ab7499c2530
+
+Remote workflow guard:
+- promote.yml disabled before merging #762 into dev.
+- promote-watchdog.yml disabled before merging #762 into dev.
+- No release.yml run, no tag, no RC, no staging/main cascade started for #621.
+
+Task 1 - stream events and backpressure:
+- PASS: cargo +1.95.0 test -p isyncyou-agent stream -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-agent turn -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental agent -- --nocapture
+- PASS: cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 fmt --all --check
+- PASS: git diff --check
+
+Task 2 - canonical PendingAction registration:
+- PASS: cargo +1.95.0 test -p isyncyou-agent confirm -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-agent turn -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental agent -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-webui agent -- --nocapture
+- PASS: cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 clippy -p isyncyou-webui --all-targets -- -D warnings
+- PASS: cargo +1.95.0 fmt --all --check
+- PASS: git diff --check
+
+Task 3 - confirmed-action executor and audit seam:
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental agent_confirm -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental agent -- --nocapture
+- PASS: cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 fmt --all --check
+- PASS: git diff --check
+
+Task 4 - router/API contract:
+- PASS: cargo +1.95.0 test -p isyncyou-webui agent_stream_sse_requires_session_token_on_mobile -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-webui agent -- --nocapture
+- PASS: cargo +1.95.0 clippy -p isyncyou-webui --all-targets -- -D warnings
+- PASS: cargo +1.95.0 fmt --all --check
+- PASS: git diff --check
+
+Task 5 - DaemonAgent FakeProvider end-to-end flow:
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental daemon_agent -- --nocapture
+- PASS: cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 fmt --all --check
+- PASS: git diff --check
+
+Task 6 - no-token-leakage proof:
+- PASS: cargo +1.95.0 test -p isyncyou-agent agent_context_contains_no_capability_token -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-agent confirmation_required_event_not_in_provider_history -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental agent_stream_token_events_contain_no_confirmation_token -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental agent_error_and_audit_redact_confirmation_token -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-agent turn -- --nocapture
+- PASS: cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental agent -- --nocapture
+- PASS: cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS: cargo +1.95.0 fmt --all --check
+- PASS: git diff --check
+
+Task 7 - docs/evidence:
+- To be validated by:
+  - python3 tools/check_traceability.py
+  - python3 tools/check_evidence.py --manifest docs/evidence/issue-621-manifest.json
+  - cargo +1.95.0 fmt --all --check
+  - git diff --check

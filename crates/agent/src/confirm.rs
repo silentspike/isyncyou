@@ -11,9 +11,12 @@ use crate::tool::ToolAction;
 use crate::AgentError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
+use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+const ACTION_HASH_DOMAIN: &str = "isyncyou-agent-confirm-v1";
 
 /// A destructive action awaiting human confirmation. `id` + the (separately returned)
 /// one-time token are what the UI confirms with; `preview` is the human-readable diff.
@@ -22,11 +25,15 @@ pub struct PendingAction {
     pub id: String,
     pub action: ToolAction,
     pub preview: String,
+    pub action_hash: String,
+    pub risk: String,
+    pub expires_at_ms: u64,
 }
 
 struct Pending {
     action: ToolAction,
     token: String,
+    action_hash: String,
     expires_at_ms: u64,
 }
 
@@ -39,6 +46,8 @@ pub enum ConfirmError {
     Expired,
     /// The token did not match this pending action.
     BadToken,
+    /// The caller's action hash does not match the registered action binding.
+    ActionMismatch,
 }
 
 /// Registry of pending destructive actions, keyed by pending id.
@@ -68,6 +77,30 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+pub fn action_hash(action: &ToolAction, expires_at_ms: u64) -> Result<String, AgentError> {
+    let payload = serde_json::json!({
+        "domain": ACTION_HASH_DOMAIN,
+        "v": 1,
+        "action": action,
+        "binding": {
+            "account": action.account(),
+            "service": action.service().unwrap_or(""),
+            "item": action.item_or_target().unwrap_or(""),
+            "expires_at_ms": expires_at_ms,
+        },
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| AgentError::Provider(e.to_string()))?;
+    Ok(hex(digest::digest(&digest::SHA256, &bytes).as_ref()))
+}
+
 impl PendingRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -84,12 +117,16 @@ impl PendingRegistry {
     ) -> Result<(PendingAction, String), AgentError> {
         let id = random_b64(16)?;
         let token = random_b64(32)?;
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+        let action_hash = action_hash(&action, expires_at_ms)?;
+        let risk = "destructive".to_string();
         self.inner.lock().unwrap().insert(
             id.clone(),
             Pending {
                 action: action.clone(),
                 token: token.clone(),
-                expires_at_ms: now_ms.saturating_add(ttl_ms),
+                action_hash: action_hash.clone(),
+                expires_at_ms,
             },
         );
         Ok((
@@ -97,6 +134,9 @@ impl PendingRegistry {
                 id,
                 action,
                 preview: preview.into(),
+                action_hash,
+                risk,
+                expires_at_ms,
             },
             token,
         ))
@@ -108,6 +148,7 @@ impl PendingRegistry {
         &self,
         pending_id: &str,
         token: &str,
+        action_hash: &str,
         now_ms: u64,
     ) -> Result<ToolAction, ConfirmError> {
         let mut map = self.inner.lock().unwrap();
@@ -115,6 +156,9 @@ impl PendingRegistry {
         if now_ms > pending.expires_at_ms {
             map.remove(pending_id);
             return Err(ConfirmError::Expired);
+        }
+        if !ct_eq(action_hash.as_bytes(), pending.action_hash.as_bytes()) {
+            return Err(ConfirmError::ActionMismatch);
         }
         if !ct_eq(token.as_bytes(), pending.token.as_bytes()) {
             return Err(ConfirmError::BadToken); // not consumed — the legit user can retry
@@ -144,16 +188,21 @@ mod tests {
     }
 
     #[test]
-    fn confirm_with_right_token_returns_action_and_is_single_use() {
+    fn confirmation_token_is_single_use_and_action_bound() {
         let reg = PendingRegistry::new();
         let (pending, token) = reg
             .register(backup(), "back up mail", 1_000, 60_000)
             .unwrap();
-        let action = reg.confirm(&pending.id, &token, 2_000).unwrap();
+        assert_eq!(pending.risk, "destructive");
+        assert_eq!(pending.expires_at_ms, 61_000);
+        assert_eq!(pending.action_hash.len(), 64);
+        let action = reg
+            .confirm(&pending.id, &token, &pending.action_hash, 2_000)
+            .unwrap();
         assert_eq!(action.op(), "backup");
         // replay → consumed
         assert_eq!(
-            reg.confirm(&pending.id, &token, 2_001),
+            reg.confirm(&pending.id, &token, &pending.action_hash, 2_001),
             Err(ConfirmError::NotFound)
         );
         assert!(reg.is_empty());
@@ -164,28 +213,48 @@ mod tests {
         let reg = PendingRegistry::new();
         let (pending, token) = reg.register(backup(), "p", 0, 60_000).unwrap();
         assert_eq!(
-            reg.confirm(&pending.id, "not-the-token", 1),
+            reg.confirm(&pending.id, "not-the-token", &pending.action_hash, 1),
             Err(ConfirmError::BadToken)
         );
         // still confirmable with the real token afterwards
-        assert!(reg.confirm(&pending.id, &token, 2).is_ok());
+        assert!(reg
+            .confirm(&pending.id, &token, &pending.action_hash, 2)
+            .is_ok());
     }
 
     #[test]
-    fn a_token_for_another_pending_is_rejected() {
+    fn confirm_rejects_action_hash_mismatch_without_consuming() {
+        let reg = PendingRegistry::new();
+        let (pending, token) = reg.register(backup(), "p", 0, 60_000).unwrap();
+        let bad_hash = action_hash(&backup(), pending.expires_at_ms + 1).unwrap();
+        assert_ne!(pending.action_hash, bad_hash);
+        assert_eq!(
+            reg.confirm(&pending.id, &token, &bad_hash, 1),
+            Err(ConfirmError::ActionMismatch)
+        );
+        assert!(reg
+            .confirm(&pending.id, &token, &pending.action_hash, 2)
+            .is_ok());
+    }
+
+    #[test]
+    fn confirm_rejects_token_from_another_pending() {
         let reg = PendingRegistry::new();
         let (p1, _t1) = reg.register(backup(), "p1", 0, 60_000).unwrap();
         let (_p2, t2) = reg.register(backup(), "p2", 0, 60_000).unwrap();
         // t2 cannot confirm p1
-        assert_eq!(reg.confirm(&p1.id, &t2, 1), Err(ConfirmError::BadToken));
+        assert_eq!(
+            reg.confirm(&p1.id, &t2, &p1.action_hash, 1),
+            Err(ConfirmError::BadToken)
+        );
     }
 
     #[test]
-    fn expired_token_is_rejected() {
+    fn expired_confirmation_token_is_rejected_and_swept() {
         let reg = PendingRegistry::new();
         let (pending, token) = reg.register(backup(), "p", 1_000, 5_000).unwrap();
         assert_eq!(
-            reg.confirm(&pending.id, &token, 10_000),
+            reg.confirm(&pending.id, &token, &pending.action_hash, 10_000),
             Err(ConfirmError::Expired)
         );
         assert!(reg.is_empty()); // swept
@@ -194,6 +263,29 @@ mod tests {
     #[test]
     fn unknown_id_is_not_found() {
         let reg = PendingRegistry::new();
-        assert_eq!(reg.confirm("nope", "x", 0), Err(ConfirmError::NotFound));
+        assert_eq!(
+            reg.confirm("nope", "x", "hash", 0),
+            Err(ConfirmError::NotFound)
+        );
+    }
+
+    #[test]
+    fn action_hash_changes_when_binding_fields_change() {
+        let restore = crate::tool::parse_action(
+            &json!({"op":"restore-cloud","account":"me","service":"mail","id":"m1"}),
+        )
+        .unwrap();
+        let different_item = crate::tool::parse_action(
+            &json!({"op":"restore-cloud","account":"me","service":"mail","id":"m2"}),
+        )
+        .unwrap();
+        assert_ne!(
+            action_hash(&restore, 60_000).unwrap(),
+            action_hash(&different_item, 60_000).unwrap()
+        );
+        assert_ne!(
+            action_hash(&restore, 60_000).unwrap(),
+            action_hash(&restore, 60_001).unwrap()
+        );
     }
 }

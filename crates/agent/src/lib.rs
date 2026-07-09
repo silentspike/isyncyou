@@ -39,9 +39,9 @@ pub mod tool;
 pub mod turn;
 
 pub use archive::{ArchiveSource, ItemRef};
-pub use confirm::{ConfirmError, PendingAction, PendingRegistry};
+pub use confirm::{action_hash, ConfirmError, PendingAction, PendingRegistry};
 pub use error::AgentError;
-pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage};
+pub use provider::{AssistantBlock, DoneReason, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
 pub use secrets::{
     provider_api_key_secret_id, provider_oauth_refresh_secret_id, set_process_credential_key,

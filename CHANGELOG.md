@@ -8,6 +8,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent API and confirmation backend**
+- `agent`+`app-host`+`webui`: completed #621's AgentStreamHub/PendingAction
+  backend with typed per-turn events (`token`, `tool_call`, `tool_result`,
+  `confirmation_required`, `error`, `done.reason`), bounded backpressure,
+  cancel semantics, `/api/v1/agent/{turn,chat,confirm,cancel,status,stream}`,
+  action-hash-bound one-time confirmation tokens, exactly-once confirmed-action
+  executor and durable audit seams, mobile session gating for POST and SSE paths,
+  unopened-stream cleanup, FakeProvider end-to-end coverage, and explicit
+  no-token-leak tests for model history, public token events, errors, and audit.
+  Real destructive operations still land in #624 behind the new executor seam.
+
 **Agent credential storage**
 - `agent`+`app-host`+`mobile`+`android`: added #620 typed encrypted
   CredentialStore coverage for provider API keys, provider OAuth refresh tokens, and
