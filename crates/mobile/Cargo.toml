@@ -17,6 +17,8 @@ isyncyou-store = { path = "../store", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-app-host = { path = "../app-host", default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
+isyncyou-agent = { path = "../agent", optional = true }
+serde_json = { workspace = true }
 jni = "0.22"
 
 [features]
@@ -42,6 +44,10 @@ encrypted-store = [
 # OAuth login + provider. Enabled only for the operator's own APK via
 # ISY_CARGO_FEATURES; never in CI/release artifacts.
 agent-subscription-experimental = ["isyncyou-app-host/agent-subscription-experimental"]
+# TEST/EVIDENCE ONLY, default-OFF: exposes a JNI-only Argon2id/HKDF session-key
+# benchmark for Pixel evidence in #619. It is not wired to WebView, HTTP, or the normal
+# bridge, and release/CI builds leave ISY_CARGO_FEATURES unset.
+agent-session-kdf-bench = ["dep:isyncyou-agent"]
 
 [dev-dependencies]
 tempfile = "3"

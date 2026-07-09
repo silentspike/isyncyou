@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 # for salts/nonces/ULID randomness. ring is already in the workspace (graph uses it).
 ring = "0.17"
 base64 = "0.22"
+argon2 = "0.5"
 # Live LLM HTTP transport (the agent's OWN client, not GraphClient). Off by default so
 # the pure-logic build (loop, tools, FakeProvider) stays fast and dependency-light;
 # the retry/backoff classification is pure and tested without this feature.

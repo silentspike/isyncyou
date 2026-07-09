@@ -237,6 +237,50 @@ fn prepare_mobile_config_for_files_dir(cfg: &mut Config, base: &Path) -> Result<
     cfg.validate().map_err(|errs| errs.join("; "))
 }
 
+#[cfg(feature = "agent-session-kdf-bench")]
+pub fn agent_session_kdf_benchmark_json(iterations: usize) -> Result<String, String> {
+    let iterations = iterations.clamp(1, 25);
+    let profile = isyncyou_agent::KdfProfile::production([0x42; 16]);
+    let config =
+        isyncyou_agent::SessionCryptoConfig::new(profile.clone()).map_err(|e| e.to_string())?;
+    let pairing_secret = vec![0xA7; 32];
+    let mut micros = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = std::time::Instant::now();
+        let session = isyncyou_agent::Session::new_with_crypto_config(
+            "benchsess",
+            pairing_secret.clone(),
+            isyncyou_agent::InMemoryTransport::new(),
+            config.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        std::hint::black_box(session.session_id.as_str());
+        micros.push(start.elapsed().as_micros() as u64);
+    }
+    micros.sort_unstable();
+    let median = micros[micros.len() / 2];
+    let p95_idx = ((micros.len() * 95).div_ceil(100))
+        .saturating_sub(1)
+        .min(micros.len() - 1);
+    let p95 = micros[p95_idx];
+    serde_json::to_string(&serde_json::json!({
+        "benchmark": "agent_session_argon2id_hkdf",
+        "scope": "jni_only_feature_gated",
+        "iterations": iterations,
+        "median_ms": (median as f64) / 1000.0,
+        "p95_ms": (p95 as f64) / 1000.0,
+        "samples_us": micros,
+        "kdf": {
+            "alg": profile.alg,
+            "version": profile.version,
+            "memory_kib": profile.memory_kib,
+            "iterations": profile.iterations,
+            "lanes": profile.lanes
+        }
+    }))
+    .map_err(|e| e.to_string())
+}
+
 fn log_mobile_config_reload_failure(reason: &str, detail: &str, warned: &AtomicBool) {
     if warned.swap(true, Ordering::Relaxed) {
         return;
@@ -935,6 +979,37 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyK
     }
 }
 
+/// JNI test/evidence hook for #619. Built only with
+/// `ISY_CARGO_FEATURES=agent-session-kdf-bench`; there is deliberately no WebView,
+/// bridge, HTTP, or normal app UI path to this method.
+#[cfg(feature = "agent-session-kdf-bench")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAgentSessionKdfBenchmark<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    iterations: jni::sys::jint,
+) -> jni::sys::jstring {
+    let iterations = if iterations <= 0 {
+        3
+    } else {
+        iterations as usize
+    };
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        agent_session_kdf_benchmark_json(iterations)
+    }))
+    .unwrap_or_else(|_| Err("panic".into()))
+    .unwrap_or_else(|error| {
+        serde_json::json!({
+            "benchmark": "agent_session_argon2id_hkdf",
+            "error": isyncyou_core::obs::redact(&error)
+        })
+        .to_string()
+    });
+    jni_new_string(&mut env, out)
+}
+
 /// JNI: record a successful native `BiometricPrompt` for a pending destructive action
 /// (#onedrive-mobile 0.6). Kotlin calls this ONLY from the biometric success callback, so
 /// the confirmation cannot originate in the WebView (which holds every cap-token). Returns
@@ -959,6 +1034,24 @@ mod tests {
     fn frame_status(framed: &[u8]) -> u16 {
         assert!(framed.len() >= 2, "framed response has status bytes");
         u16::from_be_bytes([framed[0], framed[1]])
+    }
+
+    #[cfg(feature = "agent-session-kdf-bench")]
+    #[test]
+    fn agent_session_kdf_benchmark_json_is_structured_and_redacted() {
+        let out = agent_session_kdf_benchmark_json(1).unwrap();
+        assert!(!out.contains("A7A7"));
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["benchmark"].as_str(),
+            Some("agent_session_argon2id_hkdf")
+        );
+        assert_eq!(value["scope"].as_str(), Some("jni_only_feature_gated"));
+        assert_eq!(value["iterations"].as_u64(), Some(1));
+        assert!(value["median_ms"].as_f64().unwrap() > 0.0);
+        assert_eq!(value["kdf"]["memory_kib"].as_u64(), Some(65_536));
+        assert_eq!(value["kdf"]["iterations"].as_u64(), Some(3));
+        assert_eq!(value["kdf"]["lanes"].as_u64(), Some(4));
     }
 
     #[test]
