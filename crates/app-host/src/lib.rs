@@ -8,7 +8,7 @@ use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::Item;
 use isyncyou_webui::{OfflineModeRisk, OneDriveMoveRisk};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -345,23 +345,71 @@ impl CodexStoredCredential {
     }
 }
 
-/// Persist a Codex credential to the encrypted store under `oauth_dir` (id `codex`).
 #[cfg(feature = "agent-subscription-experimental")]
-fn store_codex_blob(
-    oauth_dir: &std::path::Path,
-    cred: &CodexStoredCredential,
-) -> Result<(), String> {
-    let dir = oauth_dir.join("agent-credentials");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let key = isyncyou_agent::LocalKey::new(oauth_dir.join("agent-credentials.key"));
-    let store = isyncyou_agent::CredentialStore::new(dir, key);
+const SUBSCRIPTION_CREDENTIAL_ID: &str = "subscription";
+
+#[cfg(feature = "agent-subscription-experimental")]
+const CODEX_CREDENTIAL_ID: &str = "codex";
+
+#[cfg(feature = "agent-subscription-experimental")]
+fn credential_store_error(e: impl std::fmt::Display) -> String {
+    let raw = e.to_string();
+    let redacted = isyncyou_core::obs::redact(&raw);
+    if redacted != raw {
+        format!("agent credential store error: {redacted}")
+    } else {
+        "agent credential store error".to_string()
+    }
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+fn agent_credential_config(oauth_dir: &Path) -> isyncyou_agent::CredentialStoreConfig {
+    isyncyou_agent::CredentialStoreConfig::new(oauth_dir)
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+fn agent_credential_store(
+    oauth_dir: &Path,
+) -> Result<isyncyou_agent::AgentCredentialStore, String> {
+    isyncyou_agent::CredentialStoreResolver::new(agent_credential_config(oauth_dir))
+        .resolve()
+        .map_err(credential_store_error)
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+fn agent_credential_store_exists(oauth_dir: &Path) -> bool {
+    agent_credential_config(oauth_dir).store_dir().exists()
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+fn store_agent_credential_blob(oauth_dir: &Path, id: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let store = agent_credential_store(oauth_dir)?;
     store
         .put(
             isyncyou_agent::SecretClass::ProviderOAuthRefresh,
-            "codex",
-            &isyncyou_agent::Secret::new(cred.to_json()),
+            id,
+            &isyncyou_agent::Secret::new(bytes),
         )
-        .map_err(|e| e.to_string())
+        .map_err(credential_store_error)
+}
+
+#[cfg(feature = "agent-subscription-experimental")]
+fn load_agent_credential_blob(
+    oauth_dir: &Path,
+    id: &str,
+) -> Result<Option<isyncyou_agent::Secret>, String> {
+    if !agent_credential_store_exists(oauth_dir) {
+        return Ok(None);
+    }
+    agent_credential_store(oauth_dir)?
+        .get(isyncyou_agent::SecretClass::ProviderOAuthRefresh, id)
+        .map_err(credential_store_error)
+}
+
+/// Persist a Codex credential to the encrypted store under `oauth_dir` (id `codex`).
+#[cfg(feature = "agent-subscription-experimental")]
+fn store_codex_blob(oauth_dir: &Path, cred: &CodexStoredCredential) -> Result<(), String> {
+    store_agent_credential_blob(oauth_dir, CODEX_CREDENTIAL_ID, cred.to_json())
 }
 
 /// Minimal percent-decode for the loopback callback query (`+`→space, `%XX`→byte).
@@ -577,17 +625,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// Persist a subscription credential (access + refresh + expiry) at rest under a
     /// device-local key, so the daemon can refresh the access token itself.
     fn store_credential(&self, cred: &StoredCredential) -> Result<(), String> {
-        let dir = self.oauth_dir.join("agent-credentials");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
-        let store = isyncyou_agent::CredentialStore::new(dir, key);
-        store
-            .put(
-                isyncyou_agent::SecretClass::ProviderOAuthRefresh,
-                "subscription",
-                &isyncyou_agent::Secret::new(cred.to_json()),
-            )
-            .map_err(|e| e.to_string())
+        store_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID, cred.to_json())
     }
 
     /// Persist the FULL token set from the OAuth code exchange (access + refresh + expiry) so
@@ -673,14 +711,10 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// callback) first, else the existing `claude` CLI login on desktop
     /// (`~/.claude/.credentials.json` → `claudeAiOauth.accessToken`). Never logged.
     fn subscription_token(&self) -> Option<String> {
-        let dir = self.oauth_dir.join("agent-credentials");
-        if dir.exists() {
-            let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
-            let store = isyncyou_agent::CredentialStore::new(dir, key);
-            if let Ok(Some(secret)) = store.get(
-                isyncyou_agent::SecretClass::ProviderOAuthRefresh,
-                "subscription",
-            ) {
+        if agent_credential_store_exists(&self.oauth_dir) {
+            if let Ok(Some(secret)) =
+                load_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
+            {
                 let raw = secret.expose();
                 // Newer format: a JSON credential blob (access + refresh + expiry). Older
                 // format (pre-refresh): the bare access token as UTF-8.
@@ -783,12 +817,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// (`~/.codex/auth.json` → tokens.access_token + account_id). Never logged.
     fn codex_credentials(&self) -> Option<(String, String)> {
         // Mobile: a device-logged-in Codex credential in the store, refreshed if expired.
-        let dir = self.oauth_dir.join("agent-credentials");
-        if dir.exists() {
-            let key = isyncyou_agent::LocalKey::new(self.oauth_dir.join("agent-credentials.key"));
-            let store = isyncyou_agent::CredentialStore::new(dir, key);
+        if agent_credential_store_exists(&self.oauth_dir) {
             if let Ok(Some(secret)) =
-                store.get(isyncyou_agent::SecretClass::ProviderOAuthRefresh, "codex")
+                load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID)
             {
                 if let Some(cred) = CodexStoredCredential::from_json(secret.expose()) {
                     return self.fresh_codex_credential(cred);
@@ -2446,6 +2477,8 @@ mod tests {
     use std::sync::{Mutex as StdMutex, OnceLock as StdOnceLock};
 
     static ENVELOPE_REQUIREMENT_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+    #[cfg(feature = "agent-subscription-experimental")]
+    static APP_HOST_CREDENTIAL_ENV_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
 
     struct EnvelopeRequirementGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -2468,6 +2501,61 @@ mod tests {
             isyncyou_core::envelope::reset_body_keys_for_tests();
             isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
         }
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    struct AppHostCredentialEnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        home: Option<std::ffi::OsString>,
+        cred_key: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    impl AppHostCredentialEnvGuard {
+        fn new() -> Self {
+            let guard = APP_HOST_CREDENTIAL_ENV_TEST_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap();
+            let home = std::env::var_os("HOME");
+            let cred_key = std::env::var_os("ISYNCYOU_AGENT_CRED_KEY");
+            std::env::remove_var("ISYNCYOU_AGENT_CRED_KEY");
+            Self {
+                _guard: guard,
+                home,
+                cred_key,
+            }
+        }
+
+        fn set_home(&self, home: &Path) {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    impl Drop for AppHostCredentialEnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.cred_key {
+                Some(value) => std::env::set_var("ISYNCYOU_AGENT_CRED_KEY", value),
+                None => std::env::remove_var("ISYNCYOU_AGENT_CRED_KEY"),
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn apphost_credential_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "isy-apphost-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[cfg(feature = "agent-subscription-experimental")]
@@ -2556,6 +2644,147 @@ mod tests {
             .unwrap()
             .contains("Runtime body archived text"));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn subscription_credential_round_trips_through_agent_credential_store() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("subscription-credential");
+        let _ = std::fs::remove_dir_all(&root);
+        let cred = StoredCredential {
+            access_token: "subscription-access-token".into(),
+            refresh_token: "subscription-refresh-token".into(),
+            expires_at_ms: 123_456,
+        };
+
+        store_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID, cred.to_json()).unwrap();
+        let raw = load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+            .unwrap()
+            .expect("stored subscription credential");
+        let got = StoredCredential::from_json(raw.expose()).unwrap();
+
+        assert_eq!(got.access_token, "subscription-access-token");
+        assert_eq!(got.refresh_token, "subscription-refresh-token");
+        assert_eq!(got.expires_at_ms, 123_456);
+        let store_dir = agent_credential_config(&root).store_dir().to_path_buf();
+        let stored = std::fs::read_dir(store_dir)
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            stored.iter().all(|bytes| !bytes
+                .windows(b"subscription-access-token".len())
+                .any(|window| window == b"subscription-access-token")),
+            "encrypted credential store must not expose subscription token plaintext"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn codex_credential_round_trips_through_agent_credential_store() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("codex-credential");
+        let _ = std::fs::remove_dir_all(&root);
+        let cred = CodexStoredCredential {
+            access_token: "codex-access-token".into(),
+            refresh_token: "codex-refresh-token".into(),
+            account_id: "acct_123".into(),
+            expires_at_ms: 654_321,
+        };
+
+        store_codex_blob(&root, &cred).unwrap();
+        let raw = load_agent_credential_blob(&root, CODEX_CREDENTIAL_ID)
+            .unwrap()
+            .expect("stored codex credential");
+        let got = CodexStoredCredential::from_json(raw.expose()).unwrap();
+
+        assert_eq!(got.access_token, "codex-access-token");
+        assert_eq!(got.refresh_token, "codex-refresh-token");
+        assert_eq!(got.account_id, "acct_123");
+        assert_eq!(got.expires_at_ms, 654_321);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn credential_store_preferred_over_desktop_cli_fallback() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("credential-preference");
+        let _ = std::fs::remove_dir_all(&root);
+        let oauth_dir = root.join("oauth");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"desktop-claude-token"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".codex/auth.json"),
+            r#"{"tokens":{"access_token":"desktop-codex-token","account_id":"desktop-account"}}"#,
+        )
+        .unwrap();
+        env.set_home(&home);
+
+        let agent = DaemonAgent::new(Config::default(), oauth_dir.clone());
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "stored-claude-token".into(),
+                refresh_token: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+            })
+            .unwrap();
+        store_codex_blob(
+            &oauth_dir,
+            &CodexStoredCredential {
+                access_token: "stored-codex-token".into(),
+                refresh_token: String::new(),
+                account_id: "stored-account".into(),
+                expires_at_ms: now_ms() + 3_600_000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            agent.subscription_token().as_deref(),
+            Some("stored-claude-token")
+        );
+        assert_eq!(
+            agent.codex_credentials(),
+            Some(("stored-codex-token".into(), "stored-account".into()))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn stored_credential_error_redaction_does_not_leak_tokens() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("credential-redaction");
+        let _ = std::fs::remove_dir_all(&root);
+        let leaked_env_value = "access_token=apphost-redaction-sentinel refresh_token=also-secret";
+        std::env::set_var("ISYNCYOU_AGENT_CRED_KEY", leaked_env_value);
+        let err = store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            StoredCredential {
+                access_token: "payload-access-token-sentinel".into(),
+                refresh_token: "payload-refresh-token-sentinel".into(),
+                expires_at_ms: 0,
+            }
+            .to_json(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "agent credential store error");
+        assert!(!err.contains("apphost-redaction-sentinel"));
+        assert!(!err.contains("also-secret"));
+        assert!(!err.contains("payload-access-token-sentinel"));
+        assert!(!err.contains("payload-refresh-token-sentinel"));
         let _ = std::fs::remove_dir_all(root);
     }
 
