@@ -3,7 +3,7 @@
 //!
 //! (The module is named `turn`, not `loop`, because `loop` is a Rust keyword.)
 
-use crate::provider::{AssistantBlock, LlmProvider, StreamEvent};
+use crate::provider::{AssistantBlock, DoneReason, LlmProvider, StreamEvent};
 use crate::tool::{parse_action, ToolAction, ToolClass, TOOL_NAME};
 
 /// Who authored a message in the conversation.
@@ -133,7 +133,7 @@ pub fn run_turn(
 
         // No tool calls → the turn is done.
         if tool_uses.is_empty() {
-            emit(StreamEvent::Done);
+            emit(StreamEvent::done(DoneReason::Complete));
             return Ok(TurnOutcome::Final { text: final_text });
         }
 
@@ -266,7 +266,12 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::Done)));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Done {
+                reason: DoneReason::Complete
+            }
+        )));
 
         // History must round-trip: the assistant turn records its tool_use, and the
         // tool-result turn binds back to it by id (so a real provider can pair them).
@@ -311,7 +316,7 @@ mod tests {
             .iter()
             .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })));
         assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::Done)),
+            !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
             "a pending turn is not Done"
         );
     }

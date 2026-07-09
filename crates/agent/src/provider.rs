@@ -3,6 +3,26 @@
 
 use crate::tool::ToolAction;
 
+/// Why a turn stream reached its terminal `done` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneReason {
+    Complete,
+    PendingConfirmation,
+    Cancelled,
+    Error,
+}
+
+impl DoneReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::PendingConfirmation => "pending_confirmation",
+            Self::Cancelled => "cancelled",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// One streamed event produced while a turn runs. This is the typed event set the
 /// `AgentStreamHub` will carry to the UI (REQ-AGENT-007); here it is emitted via a sink.
 #[derive(Debug, Clone)]
@@ -47,7 +67,66 @@ pub enum StreamEvent {
     /// A non-fatal error message for the stream.
     Error(String),
     /// The turn finished.
-    Done,
+    Done { reason: DoneReason },
+}
+
+impl StreamEvent {
+    pub fn done(reason: DoneReason) -> Self {
+        Self::Done { reason }
+    }
+
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            Self::Token(_) => "token",
+            Self::ToolCall { .. } => "tool_call",
+            Self::ToolResult { .. } => "tool_result",
+            Self::SearchStage { .. } => "search_stage",
+            Self::PartialResult { .. } => "partial_result",
+            Self::ConfirmationRequired { .. } => "confirmation_required",
+            Self::Error(_) => "error",
+            Self::Done { .. } => "done",
+        }
+    }
+
+    /// Serialize the public stream event shape once, in the agent core, so SSE and
+    /// bridge transports cannot drift. This is a UI data signal; it deliberately omits
+    /// the raw destructive action until Task 2 registers a canonical PendingAction.
+    pub fn to_public_json(&self) -> serde_json::Value {
+        match self {
+            Self::Token(t) => serde_json::json!({ "event": "token", "text": t }),
+            Self::ToolCall { id, name, input } => {
+                serde_json::json!({ "event": "tool_call", "id": id, "name": name, "input": input })
+            }
+            Self::ToolResult {
+                id,
+                content,
+                untrusted,
+            } => serde_json::json!({
+                "event": "tool_result", "id": id, "content": content, "untrusted": untrusted
+            }),
+            Self::ConfirmationRequired { id, preview, .. } => {
+                serde_json::json!({ "event": "confirmation_required", "tool_id": id, "preview": preview })
+            }
+            Self::SearchStage {
+                stage,
+                status,
+                hits,
+            } => serde_json::json!({
+                "event": "search_stage", "stage": stage, "status": status, "hits": hits
+            }),
+            Self::PartialResult { stage, items } => {
+                serde_json::json!({ "event": "partial_result", "stage": stage, "items": items })
+            }
+            Self::Error(e) => serde_json::json!({ "event": "error", "message": e }),
+            Self::Done { reason } => {
+                serde_json::json!({ "event": "done", "reason": reason.as_str() })
+            }
+        }
+    }
+
+    pub fn to_public_json_string(&self) -> String {
+        self.to_public_json().to_string()
+    }
 }
 
 /// One block of a single assistant response: either text, or a tool invocation.
@@ -97,3 +176,55 @@ pub mod openai;
 #[cfg(feature = "agent-subscription-experimental")]
 pub mod subscription;
 pub use fake::FakeProvider;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn agent_stream_event_json_is_single_line_and_stable() {
+        let events = [
+            StreamEvent::Token("hello".into()),
+            StreamEvent::ToolCall {
+                id: "t1".into(),
+                name: "isyncyou".into(),
+                input: json!({"op": "search"}),
+            },
+            StreamEvent::ToolResult {
+                id: "t1".into(),
+                content: "{}".into(),
+                untrusted: true,
+            },
+            StreamEvent::ConfirmationRequired {
+                id: "t2".into(),
+                action: ToolAction::Backup {
+                    account: "me".into(),
+                    services: vec!["mail".into()],
+                },
+                preview: "Requires confirmation".into(),
+            },
+            StreamEvent::Error("redacted".into()),
+            StreamEvent::done(DoneReason::Cancelled),
+        ];
+        let names: Vec<_> = events.iter().map(StreamEvent::event_name).collect();
+        assert!(names.contains(&"token"));
+        assert!(names.contains(&"tool_call"));
+        assert!(names.contains(&"tool_result"));
+        assert!(names.contains(&"confirmation_required"));
+        assert!(names.contains(&"error"));
+        assert!(names.contains(&"done"));
+        for event in events {
+            let line = event.to_public_json_string();
+            assert!(
+                !line.contains('\n'),
+                "event JSON must be single-line: {line}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(parsed["event"], event.event_name());
+            if event.event_name() == "done" {
+                assert_eq!(parsed["reason"], "cancelled");
+            }
+        }
+    }
+}
