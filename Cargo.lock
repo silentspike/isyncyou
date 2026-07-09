@@ -1743,12 +1743,14 @@ dependencies = [
 name = "isyncyou-mobile"
 version = "1.0.0"
 dependencies = [
+ "isyncyou-agent",
  "isyncyou-app-host",
  "isyncyou-core",
  "isyncyou-engine",
  "isyncyou-store",
  "isyncyou-webui",
  "jni",
+ "serde_json",
  "tempfile",
 ]
 
