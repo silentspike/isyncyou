@@ -64,11 +64,26 @@ object NativeEngine {
     external fun nativeSetBodyKey(keyId: Int, key: ByteArray): Int
 
     /**
+     * Install the at-rest agent credential key (#620): the 32-byte data key the Android
+     * Keystore unwrapped for provider credentials. MUST be called before [nativeStart] so
+     * the embedded app-host credential resolver uses this process-installed key. Returns
+     * 1 on success, 0 on a bad key length or native install failure.
+     */
+    external fun nativeSetAgentCredentialKey(key: ByteArray): Int
+
+    /**
      * #619 evidence hook: available only when the Rust library is built with
      * `ISY_CARGO_FEATURES=agent-session-kdf-bench`. This is intentionally a direct native
      * instrumentation path, not a WebView, bridge, HTTP, or production UI capability.
      */
     external fun nativeAgentSessionKdfBenchmark(iterations: Int): String
+
+    /**
+     * #620 evidence hook: available only when the Rust library is built with
+     * `ISY_CARGO_FEATURES=agent-credential-store-self-test`. This is intentionally a direct
+     * native instrumentation path, not a WebView, bridge, HTTP, or production UI capability.
+     */
+    external fun nativeAgentCredentialStoreSelfTest(filesDir: String, sentinel: String): String
 
     /**
      * Record a successful native `BiometricPrompt` for a pending destructive action
