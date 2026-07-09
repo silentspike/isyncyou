@@ -8467,6 +8467,35 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_nav_is_services_entry_and_cap_gated() {
+        for needle in [
+            "{ id: \"assistant\", label: \"Assistant\", icon: \"sparkles\", cap: \"agent\", appOnly: true }",
+            "const serviceVisible = (s) => !s.cap || !!CAP[s.cap];",
+            "const visibleServices = () => SERVICES.filter(serviceVisible);",
+            "const archiveServices = () => SERVICES.filter(s => !s.appOnly);",
+            "visibleServices().map(s => {",
+            "const routeLabel = (r) => (visibleServices().find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || \"iSyncYou\";",
+            "if (!visibleServices().find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = \"overview\";",
+            "archiveServices().forEach(s => {",
+            "...visibleServices().map(s => ({ label: \"Go to \" + s.label",
+            "const order = visibleServices().map((s) => s.id);",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 assistant nav invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("id: \"nav-assistant\""),
+            "Assistant must be a primary SERVICES tab, not a separate System nav button"
+        );
+        assert!(
+            !APP_JS.contains("assistant: \"Assistant\""),
+            "Assistant must not remain an EXTRA_ROUTES bypass around the capability gate"
+        );
+    }
+
+    #[test]
     fn app_js_biometric_labels_cover_onedrive_risk_ops() {
         for needle in [
             "\"move-out-of-protected\"",

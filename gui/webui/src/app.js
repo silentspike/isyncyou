@@ -621,7 +621,11 @@ const SERVICES = [
   { id: "contacts", label: "Contacts", icon: "users" },
   { id: "todo", label: "To Do", icon: "check-square" },
   { id: "onenote", label: "OneNote", icon: "notebook" },
+  { id: "assistant", label: "Assistant", icon: "sparkles", cap: "agent", appOnly: true },
 ];
+const serviceVisible = (s) => !s.cap || !!CAP[s.cap];
+const visibleServices = () => SERVICES.filter(serviceVisible);
+const archiveServices = () => SERVICES.filter(s => !s.appOnly);
 const RESTORABLE = new Set(["mail", "calendar", "contacts", "todo", "onenote"]);
 const SHAREABLE = new Set(["onedrive"]);
 
@@ -1000,7 +1004,7 @@ function invadersGame(canvas) {
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const nav = el("nav", { class: "nav" },
-    SERVICES.map(s => {
+    visibleServices().map(s => {
       const cnt = App.counts[s.id];
       const connected = cnt != null && cnt > 0;
       const item = el("button", {
@@ -1053,8 +1057,6 @@ function renderShell() {
         el("span", { class: "nav-meta" }, el("span", { id: "alerts-badge", class: "count", text: "·" }))),
       el("button", { id: "nav-settings", class: "nav-item" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") },
         icon("settings"), el("span", { class: "label", text: "Settings" })),
-      CAP.agent ? el("button", { id: "nav-assistant", class: "nav-item" + (App.route === "assistant" ? " active" : ""), title: "AI Assistant", onclick: () => go("assistant") },
-        icon("sparkles"), el("span", { class: "label", text: "Assistant" })) : null,
       eggOn() ? el("button", { id: "nav-ufo", class: "nav-item" + (App.route === "invaders" ? " active" : ""), title: "Invaders", onclick: () => go("invaders") },
         ufoGlyph(), el("span", { class: "label", text: "Invaders" })) : null),
     el("div", { id: "sync-widget", class: "sync-widget" }),
@@ -1126,8 +1128,8 @@ function updateNavCounts() {
 
 /* ---------------------------------------------------------------- router */
 function go(route) { location.hash = "#/" + route; }
-const EXTRA_ROUTES = { search: "Search", settings: "Settings", assistant: "Assistant", invaders: "Invaders" };
-const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
+const EXTRA_ROUTES = { search: "Search", settings: "Settings", invaders: "Invaders" };
+const routeLabel = (r) => (visibleServices().find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
   // Each navigation rebuilds the view from scratch; the view's render re-registers its
   // own live-update handler (or leaves it null). Reset it here so a stale handler from
@@ -1142,7 +1144,7 @@ function onRoute() {
   const raw = location.hash.replace(/^#\//, "") || "overview";
   App.route = raw.split("?")[0];
   App.query = (raw.split("?")[1] || "").replace(/^q=/, "");
-  if (!SERVICES.find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
+  if (!visibleServices().find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
   if (App.route === "invaders" && !eggOn()) App.route = "overview";   // egg-gated route
   // Close any open overlay (detail sheet / command palette) on a real navigation
   // so it can't leak across routes; a same-route refresh keeps it open.
@@ -4341,7 +4343,7 @@ async function doSearch(q) {
     const groups = {};
     hits.forEach(h => (groups[h.service] = groups[h.service] || []).push(h));
     box.append(el("div", { class: "dim", style: "margin-bottom:12px", text: `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”` }));
-    SERVICES.forEach(s => {
+    archiveServices().forEach(s => {
       const g = groups[s.id]; if (!g || !g.length) return;
       box.append(el("h3", { class: "sb-section", style: "display:flex;align-items:center;gap:8px" }, icon(s.icon, "icon-sm"), `${s.label} (${g.length})`));
       const list = el("div", { class: "card", style: "padding:0;overflow:hidden;margin-bottom:16px" });
@@ -4985,7 +4987,7 @@ function openPalette() {
     });
   };
   const jumps = [
-    ...SERVICES.map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } })),
+    ...visibleServices().map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } })),
     { label: "Go to Settings", icon: "settings", run: () => { closePalette(); go("settings"); } },
     { label: "Sync now", icon: "refresh-cw", run: () => { closePalette(); syncCmd("now"); } },
     { label: "Pause sync", icon: "pause", run: () => { closePalette(); syncCmd("pause"); } },
@@ -5073,7 +5075,7 @@ function setupSwipe() {
     if (dt > 600 || Math.abs(dx) < 64 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
     if (sheetEl || palette) return;                       // overlay owns the gesture
     if (dx > 0 && mobileBack()) return;                   // right-swipe → back from detail
-    const order = SERVICES.map((s) => s.id);
+    const order = visibleServices().map((s) => s.id);
     const i = order.indexOf(App.route);
     if (i < 0) return;
     if (dx < 0 && i < order.length - 1) go(order[i + 1]); // left → next tab
