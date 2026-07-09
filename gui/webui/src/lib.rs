@@ -8638,6 +8638,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_model_picker_and_usage_chip_are_status_driven() {
+        for needle in [
+            "function renderAssistantUsageChip(st)",
+            "Usage unavailable",
+            "if (usage.request_id) parts.push(\"Request \" + agentCompactValue(usage.request_id, 28));",
+            "if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);",
+            "if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);",
+            "function agentProviderLabel(provider)",
+            "if (provider === \"claude\") return \"Claude\";",
+            "if (provider === \"codex\") return \"ChatGPT\";",
+            "if (provider === \"openai\") return \"OpenAI\";",
+            "const list = models[prov] || [];",
+            "if (!connected || !list.length) return;",
+            "\"data-agent-model-option\": val",
+            "\"data-agent-model-connect\": \"codex\"",
+            "await post(\"/api/v1/agent/model?\" + qs({ provider, model }), CAP.agent);",
+            "const st = await api(\"/api/v1/agent/status\");",
+            "rememberAssistantStatus(st);",
+            "renderAssistantView($(\"#view\"));",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 model/usage invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("request_id:") && !APP_JS.contains("rate_limit: \"ok\""),
+            "production UI must not fabricate usage fields"
+        );
+    }
+
+    #[test]
     fn app_js_biometric_labels_cover_onedrive_risk_ops() {
         for needle in [
             "\"move-out-of-protected\"",

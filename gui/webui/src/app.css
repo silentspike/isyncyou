@@ -1552,7 +1552,9 @@ a.note-meta-chip:hover { color: var(--accent); }
 }
 .mdl-item {
   display: flex; align-items: center; gap: var(--sp-2);
+  width: 100%; border: 0; text-align: left;
   padding: 8px 9px; border-radius: var(--r-md);
+  background: transparent;
   color: var(--text-mid); font-size: var(--fs-base); cursor: pointer;
   transition: background .13s, color .13s;
 }

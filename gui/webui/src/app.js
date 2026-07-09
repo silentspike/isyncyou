@@ -4713,8 +4713,10 @@ function renderAssistantUsageChip(st) {
       icon("info", "icon-sm"), "Usage unavailable");
   }
   const parts = [];
+  if (usage.request_id) parts.push("Request " + agentCompactValue(usage.request_id, 28));
   if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);
   if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);
+  if (usage.rate_limit) parts.push(String(usage.rate_limit));
   return el("span", { class: "chip assistant-usage", "data-agent-usage": "1", "data-testid": "agent-usage" },
     icon("info", "icon-sm"), parts.join(" · ") || "Usage");
 }
@@ -4724,32 +4726,42 @@ function renderAssistantUsageChip(st) {
 // Custom in-UI model picker (no native <select>): a glass panel that unfolds with a
 // spring animation, models grouped by provider, active one highlighted. Falls back to a
 // plain label when nothing is connected.
+function agentProviderLabel(provider) {
+  if (provider === "claude") return "Claude";
+  if (provider === "codex") return "ChatGPT";
+  if (provider === "openai") return "OpenAI";
+  return "Assistant";
+}
 function agentModelSwitcher(st) {
   const models = st.models || {};
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
-    for (const [prov, tag] of [["claude", "Claude"], ["codex", "ChatGPT"]]) {
+    for (const prov of ["claude", "codex", "openai"]) {
+      const tag = agentProviderLabel(prov);
       const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
       if (m) return tag + " · " + m.label;
     }
-    return st.model || "Select model";
+    return st.model ? agentProviderLabel(st.provider) + " · " + st.model : "Select model";
   };
   const rows = [];
-  const addGroup = (prov, connected, tag) => {
-    if (!connected) return;
+  const addGroup = (prov, connected) => {
+    const list = models[prov] || [];
+    if (!connected || !list.length) return;
+    const tag = agentProviderLabel(prov);
     rows.push(el("div", { class: "mdl-group" }, tag));
-    (models[prov] || []).forEach((m) => {
+    list.forEach((m) => {
       const val = prov + "|" + m.id;
-      rows.push(el("div",
-        { class: "mdl-item" + (val === cur ? " active" : ""), role: "option", onclick: () => pickModel(prov, m.id) },
+      rows.push(el("button",
+        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", "data-agent-model-option": val, onclick: () => pickModel(prov, m.id) },
         el("span", { class: "mdl-dot" }),
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
   };
-  addGroup("claude", st.claude, "Claude");
-  addGroup("codex", st.codex, "ChatGPT");
+  addGroup("claude", st.claude);
+  addGroup("codex", st.codex);
+  addGroup("openai", st.openai);
   if (!st.codex) {
-    rows.push(el("div", { class: "mdl-item mdl-connect", onclick: () => connectCodex() },
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectCodex() },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
   }
@@ -4780,7 +4792,9 @@ function agentModelSwitcher(st) {
 async function pickModel(provider, model) {
   try {
     await post("/api/v1/agent/model?" + qs({ provider, model }), CAP.agent);
-    toast("Model: " + model);
+    const st = await api("/api/v1/agent/status");
+    rememberAssistantStatus(st);
+    toast("Model: " + agentProviderLabel(provider) + " · " + model);
     renderAssistantView($("#view"));
   } catch (err) {
     toast("Could not switch model: " + (err.message || err));
