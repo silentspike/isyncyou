@@ -1439,6 +1439,33 @@ a.note-meta-chip:hover { color: var(--accent); }
   margin-top: var(--sp-1);
   font-size: var(--fs-sm);
 }
+.asst-pending-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.asst-pending-card.confirmed {
+  border-color: color-mix(in oklab, var(--ok) 35%, transparent);
+  background: var(--ok-soft);
+}
+.asst-pending-card.cancelled,
+.asst-pending-card.expired {
+  background: var(--bg-2);
+}
+.asst-pending-card.error {
+  border-color: color-mix(in oklab, var(--err) 35%, transparent);
+  background: var(--err-soft);
+}
+.asst-pending-result,
+.asst-pending-error {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+.asst-pending-error {
+  color: var(--text-hi);
+}
 .asst-citations {
   display: flex;
   flex-wrap: wrap;

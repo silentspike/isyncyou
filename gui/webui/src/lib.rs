@@ -8510,7 +8510,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "AssistantState.pendingCardsById.set(pending.pending_id",
             "token: d.token || \"\"",
             "action_hash: d.action_hash || \"\"",
-            "renderAgentPendingPlaceholder(pending)",
+            "renderAgentPendingCard(pending)",
             "renderAgentToolRow(row)",
             "renderAgentError(message)",
             "Invalid stream payload",
@@ -8586,6 +8586,54 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(
             !citation_helpers.contains("token") && !citation_helpers.contains("action_hash"),
             "Assistant citation helpers must not inspect pending secrets"
+        );
+    }
+
+    #[test]
+    fn assistant_pending_action_cards_post_confirm_cancel_without_dom_secrets() {
+        for needle in [
+            "function confirmAgentPending(pendingId)",
+            "function cancelAgentPending(pendingId)",
+            "function renderAgentPendingCard(pending)",
+            "AssistantState.pendingCardsById.set(pending.pending_id",
+            "token: d.token || \"\"",
+            "action_hash: d.action_hash || \"\"",
+            "post(\"/api/v1/agent/confirm?\" + qs({ pending: pendingId, token: record.token, action_hash: record.action_hash }), CAP.agent)",
+            "post(\"/api/v1/agent/cancel?\" + qs({ turn }), CAP.agent)",
+            "record.status = \"confirming\"",
+            "record.status = \"confirmed\"",
+            "record.status = \"cancelling\"",
+            "record.status = \"cancelled\"",
+            "pending.status = \"expired\"",
+            "record.status = \"error\"",
+            "confirm.setAttribute(\"disabled\", \"disabled\")",
+            "cancel.setAttribute(\"disabled\", \"disabled\")",
+            "\"data-agent-pending-confirm\": pending.pending_id || \"\"",
+            "\"data-agent-pending-cancel\": pending.pending_id || \"\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 PendingAction invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.to_lowercase().contains("run anyway")
+                && !APP_JS.to_lowercase().contains("run-anyway"),
+            "Assistant must not expose a run-anyway bypass"
+        );
+        let start = APP_JS
+            .find("function renderAgentPendingCard")
+            .expect("pending renderer start");
+        let end = APP_JS
+            .find("function renderAssistantMessage")
+            .expect("pending renderer end");
+        let pending_renderer = &APP_JS[start..end];
+        assert!(
+            !pending_renderer.contains("token")
+                && !pending_renderer.contains("action_hash")
+                && !pending_renderer.contains("localStorage")
+                && !pending_renderer.contains("sessionStorage"),
+            "PendingAction renderer must not expose or persist secrets"
         );
     }
 

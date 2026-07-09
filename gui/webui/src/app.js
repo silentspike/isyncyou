@@ -4992,16 +4992,97 @@ function renderAgentError(message) {
     el("span", { text: message || "Stream error" }));
 }
 
-function renderAgentPendingPlaceholder(pending) {
+function pendingRecord(pendingId) {
+  return pendingId ? AssistantState.pendingCardsById.get(pendingId) : null;
+}
+
+function rerenderPendingCards(pendingId) {
+  document.querySelectorAll("[data-agent-pending-card]").forEach((node) => {
+    if (node.getAttribute("data-agent-pending-card") !== pendingId) return;
+    const record = pendingRecord(pendingId);
+    if (record) node.replaceWith(renderAgentPendingCard(record));
+  });
+}
+
+function pendingStatus(pending) {
+  const status = pending.status || "pending";
+  if (status === "pending" && pending.expires_at_ms && Date.now() >= Number(pending.expires_at_ms)) {
+    pending.status = "expired";
+    return "expired";
+  }
+  return status;
+}
+
+async function confirmAgentPending(pendingId) {
+  const record = pendingRecord(pendingId);
+  if (!record || !record.token || !record.action_hash) return;
+  record.status = "confirming";
+  record.error = "";
+  rerenderPendingCards(pendingId);
+  try {
+    const d = await post("/api/v1/agent/confirm?" + qs({ pending: pendingId, token: record.token, action_hash: record.action_hash }), CAP.agent);
+    record.status = "confirmed";
+    record.result = d && d.result ? d.result : "Confirmed";
+    record.token = "";
+    record.action_hash = "";
+  } catch (e) {
+    record.status = "error";
+    record.error = agentCompactValue(e.message || e, 180);
+  }
+  rerenderPendingCards(pendingId);
+}
+
+async function cancelAgentPending(pendingId) {
+  const record = pendingRecord(pendingId);
+  if (!record) return;
+  const turn = record.turn_id || AssistantState.activeTurnId;
+  if (!turn) {
+    record.status = "error";
+    record.error = "Missing turn id";
+    rerenderPendingCards(pendingId);
+    return;
+  }
+  record.status = "cancelling";
+  record.error = "";
+  rerenderPendingCards(pendingId);
+  try {
+    await post("/api/v1/agent/cancel?" + qs({ turn }), CAP.agent);
+    record.status = "cancelled";
+    record.token = "";
+    record.action_hash = "";
+    closeAssistantStream("pending-cancel");
+  } catch (e) {
+    record.status = "error";
+    record.error = agentCompactValue(e.message || e, 180);
+  }
+  rerenderPendingCards(pendingId);
+}
+
+function renderAgentPendingCard(pending) {
+  const status = pendingStatus(pending);
   const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
+  const done = status === "confirmed" || status === "cancelled";
+  const waiting = status === "confirming" || status === "cancelling";
+  const confirmDisabled = waiting || done || status === "expired";
+  const cancelDisabled = waiting || done;
+  const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": pending.pending_id || "" },
+    icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
+  const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": pending.pending_id || "" },
+    icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
+  if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
+  if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
   return el("div", {
-    class: "asst-pending-card",
+    class: "asst-pending-card " + status,
     "data-agent-pending-card": pending.pending_id || "",
   },
     el("div", { class: "asst-pending-head" },
       icon("shield-check", "icon-sm"),
       el("span", { class: "asst-pending-title", text: pending.preview || "Action requires confirmation" })),
-    el("div", { class: "dim asst-pending-meta", text: risk }));
+    el("div", { class: "dim asst-pending-meta", text: risk }),
+    pending.expires_at_ms ? el("div", { class: "dim asst-pending-meta", text: status === "expired" ? "Expired" : "Expires " + fmtDate(pending.expires_at_ms) }) : null,
+    pending.result ? el("div", { class: "asst-pending-result", text: pending.result }) : null,
+    pending.error ? el("div", { class: "asst-pending-error", text: pending.error }) : null,
+    el("div", { class: "asst-pending-actions" }, confirm, cancel));
 }
 
 function renderAssistantMessage(m) {
@@ -5012,7 +5093,7 @@ function renderAssistantMessage(m) {
   (m.chips || []).forEach(c => bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: c })));
   (m.tools || []).forEach(t => bubble.append(renderAgentToolRow(t)));
   (m.errors || []).forEach(e => bubble.append(renderAgentError(e)));
-  if (m.pending) bubble.append(renderAgentPendingPlaceholder(m.pending));
+  if (m.pending) bubble.append(renderAgentPendingCard(m.pending));
   if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));
   // Re-render the turn's search stages + result cards (persisted in the message), so a view
   // switch brings the whole conversation back — not just the text (#644).
@@ -5055,13 +5136,15 @@ function handleAgentEvent(message, turnState) {
         preview: d.preview || "Action requires confirmation",
         risk: d.risk || "",
         expires_at_ms: d.expires_at_ms || null,
+        turn_id: AssistantState.activeTurnId || "",
+        status: "pending",
+        result: "",
+        error: "",
+        token: d.token || "",
+        action_hash: d.action_hash || "",
       };
       if (pending.pending_id) {
-        AssistantState.pendingCardsById.set(pending.pending_id, {
-          ...pending,
-          token: d.token || "",
-          action_hash: d.action_hash || "",
-        });
+        AssistantState.pendingCardsById.set(pending.pending_id, pending);
       }
       turnState.setPending(pending);
       break;
@@ -5138,7 +5221,7 @@ async function agentSend(text) {
     asst.pending = pending;
     const old = bubble.querySelector("[data-agent-pending-card]");
     if (old) old.remove();
-    bubble.append(renderAgentPendingPlaceholder(pending));
+    bubble.append(renderAgentPendingCard(pending));
     log.scrollTop = log.scrollHeight;
   };
   let citationsBox = null;
