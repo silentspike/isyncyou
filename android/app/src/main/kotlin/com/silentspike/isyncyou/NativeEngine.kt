@@ -64,6 +64,13 @@ object NativeEngine {
     external fun nativeSetBodyKey(keyId: Int, key: ByteArray): Int
 
     /**
+     * #619 evidence hook: available only when the Rust library is built with
+     * `ISY_CARGO_FEATURES=agent-session-kdf-bench`. This is intentionally a direct native
+     * instrumentation path, not a WebView, bridge, HTTP, or production UI capability.
+     */
+    external fun nativeAgentSessionKdfBenchmark(iterations: Int): String
+
+    /**
      * Record a successful native `BiometricPrompt` for a pending destructive action
      * (#onedrive-mobile 0.6). Called ONLY from the biometric success callback — the WebView
      * has no path to it, which makes the per-action token a real second factor. Returns true

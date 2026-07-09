@@ -32,6 +32,23 @@ pub struct DrivePermission {
     pub inherited: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictBehavior {
+    Fail,
+    Replace,
+    Rename,
+}
+
+impl ConflictBehavior {
+    fn as_graph(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Replace => "replace",
+            Self::Rename => "rename",
+        }
+    }
+}
+
 impl DrivePermission {
     pub fn from_graph_value(value: &serde_json::Value) -> Option<Self> {
         let id = value.get("id")?.as_str()?.to_string();
@@ -313,6 +330,68 @@ impl GraphClient {
             .send()
             .map_err(|e| UploadError::Transport(e.to_string()))?;
         json_or_err(resp)
+    }
+
+    pub fn upload_content_with_conflict_behavior(
+        &self,
+        dest_path: &str,
+        data: &[u8],
+        behavior: ConflictBehavior,
+    ) -> Result<Option<serde_json::Value>, UploadError> {
+        let url = format!(
+            "{}/me/drive/root:/{}:/content?@microsoft.graph.conflictBehavior={}",
+            self.base,
+            enc_path(dest_path),
+            behavior.as_graph()
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 201 => Ok(Some(
+                resp.json::<serde_json::Value>()
+                    .map_err(|e| UploadError::Parse(e.to_string()))?,
+            )),
+            409 => Ok(None),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            }),
+        }
+    }
+
+    pub fn get_drive_item_by_path(
+        &self,
+        path: &str,
+        select: &[&str],
+    ) -> Result<Option<serde_json::Value>, UploadError> {
+        let mut url = format!("{}/me/drive/root:/{}:", self.base, enc_path(path));
+        if !select.is_empty() {
+            url.push_str("?$select=");
+            url.push_str(&select.join(","));
+        }
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 => Ok(Some(
+                resp.json::<serde_json::Value>()
+                    .map_err(|e| UploadError::Parse(e.to_string()))?,
+            )),
+            404 => Ok(None),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            }),
+        }
     }
 
     /// Open a resumable upload session for `dest_path` (`total` = file size).
@@ -610,6 +689,25 @@ impl GraphClient {
             .map_err(|e| UploadError::Transport(e.to_string()))?;
         match resp.status().as_u16() {
             200 | 204 => Ok(()),
+            s => Err(UploadError::Http {
+                status: s,
+                body: resp.text().unwrap_or_default().chars().take(200).collect(),
+            }),
+        }
+    }
+
+    pub fn delete_item_if_match(&self, item_id: &str, etag: &str) -> Result<bool, UploadError> {
+        let url = format!("{}/me/drive/items/{}", self.base, encode_id(item_id));
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::IF_MATCH, etag)
+            .send()
+            .map_err(|e| UploadError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 204 => Ok(true),
+            412 => Ok(false),
             s => Err(UploadError::Http {
                 status: s,
                 body: resp.text().unwrap_or_default().chars().take(200).collect(),
@@ -2430,6 +2528,94 @@ mod tests {
             }
             other => panic!("expected Http error, got {other}"),
         }
+    }
+
+    #[test]
+    fn upload_content_with_conflict_behavior_puts_query_not_json() {
+        let (base, server) = serve(vec![http_response(201, "Created", "", "{\"id\":\"t1\"}")]);
+        let out = GraphClient::new("tok")
+            .with_base_url(&base)
+            .upload_content_with_conflict_behavior(
+                "/Apps/iSyncYou/agent/sess1/turn one.json",
+                b"sealed",
+                ConflictBehavior::Fail,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["id"].as_str(), Some("t1"));
+        let seen = server.join().unwrap();
+        assert!(
+            seen[0].contains(
+                "PUT /me/drive/root:/Apps/iSyncYou/agent/sess1/turn%20one.json:/content?@microsoft.graph.conflictBehavior=fail "
+            ),
+            "unexpected request: {}",
+            seen[0]
+        );
+        assert!(!seen[0].contains("@microsoft.graph.conflictBehavior\":\"fail"));
+        assert!(seen[0].contains("sealed"));
+    }
+
+    #[test]
+    fn upload_content_with_conflict_behavior_returns_none_on_409() {
+        let (base, _server) = serve(vec![http_response(409, "Conflict", "", "exists")]);
+        let out = GraphClient::new("tok")
+            .with_base_url(&base)
+            .upload_content_with_conflict_behavior(
+                "/Apps/iSyncYou/agent/sess1/turn.json",
+                b"sealed",
+                ConflictBehavior::Fail,
+            )
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn get_drive_item_by_path_encodes_path_and_selects_fields() {
+        let (base, server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            "{\"id\":\"lease\",\"eTag\":\"\\\"e\\\"\"}",
+        )]);
+        let out = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_drive_item_by_path(
+                "/Apps/iSyncYou/agent/sess1/.active_turn_lease.json",
+                &["id", "eTag", "name"],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["id"].as_str(), Some("lease"));
+        let seen = server.join().unwrap();
+        assert!(
+            seen[0].contains(
+                "GET /me/drive/root:/Apps/iSyncYou/agent/sess1/.active_turn_lease.json:?$select=id,eTag,name "
+            ),
+            "unexpected request: {}",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn delete_item_if_match_sends_header_and_returns_false_on_412() {
+        let (base, server) = serve(vec![http_response(412, "Precondition Failed", "", "")]);
+        let deleted = GraphClient::new("tok")
+            .with_base_url(&base)
+            .delete_item_if_match("item9", "\"etag-1\"")
+            .unwrap();
+        assert!(!deleted);
+        let seen = server.join().unwrap();
+        assert!(seen[0].contains("DELETE /me/drive/items/item9 "));
+        assert!(seen[0].contains("if-match: \"etag-1\""));
+    }
+
+    #[test]
+    fn delete_item_if_match_returns_true_on_204() {
+        let (base, _server) = serve(vec![http_response(204, "No Content", "", "")]);
+        assert!(GraphClient::new("tok")
+            .with_base_url(&base)
+            .delete_item_if_match("item9", "\"etag-1\"")
+            .unwrap());
     }
 
     #[test]
