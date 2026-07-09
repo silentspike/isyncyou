@@ -14,6 +14,10 @@ use crate::AgentError;
 pub const DEFAULT_READ_BUDGET: u64 = 64 * 1024;
 /// Default search result cap when the model does not set `limit`.
 pub const DEFAULT_SEARCH_LIMIT: u32 = 20;
+/// Default flat list page size when the model does not set `limit`.
+pub const DEFAULT_LIST_LIMIT: u32 = 50;
+/// Hard cap for public list pages; deep-search uses its own candidate budget.
+pub const MAX_LIST_LIMIT: u32 = 200;
 /// Body preview length (chars) attached to each hit: enough for a real content preview in
 /// the expanded card, not just the one-line header. Whitespace is collapsed first.
 pub const PREVIEW_CHARS: usize = 1200;
@@ -37,6 +41,36 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         Self { source }
     }
 
+    fn ensure_account(&self, action: &ToolAction) -> Result<(), AgentError> {
+        let account = match action {
+            ToolAction::Search { account, .. }
+            | ToolAction::DeepSearch { account, .. }
+            | ToolAction::Read { account, .. }
+            | ToolAction::List { account, .. }
+            | ToolAction::Export { account, .. }
+            | ToolAction::RestoreLocal { account, .. }
+            | ToolAction::Backup { account, .. }
+            | ToolAction::RestoreCloud { account, .. }
+            | ToolAction::LiveWrite { account, .. }
+            | ToolAction::Share { account, .. } => account,
+        };
+        if account != self.source.account() {
+            return Err(AgentError::ToolArgs(format!(
+                "account mismatch: tool requested {account}, executor is bound to {}",
+                self.source.account()
+            )));
+        }
+        Ok(())
+    }
+
+    fn citation_ref(it: &ItemRef) -> serde_json::Value {
+        serde_json::json!({
+            "service": it.service,
+            "id": it.id,
+            "path": it.path,
+        })
+    }
+
     fn source_ref(it: &ItemRef) -> serde_json::Value {
         serde_json::json!({
             "service": it.service,
@@ -44,6 +78,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             "name": it.name,
             "item_type": it.item_type,
             "path": it.path,
+            "source": Self::citation_ref(it),
         })
     }
 
@@ -73,6 +108,18 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
     /// text the store indexes — instead of showing raw headers/boundaries. Other services
     /// archive already-readable bodies (ics/vCard/text), so pass them through.
     fn body_preview(service: &str, body: &[u8]) -> String {
+        Self::body_model_text(service, body)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(PREVIEW_CHARS)
+            .collect()
+    }
+
+    /// Convert archived bytes into the text exposed to the model. Counters and
+    /// truncation are defined over this final UTF-8 string, not the raw archive bytes.
+    fn body_model_text(service: &str, body: &[u8]) -> String {
         #[cfg(feature = "retrieval")]
         let text = if service == "mail" {
             // Real mail is `.eml` MIME → extract the readable text. A non-MIME/plain body
@@ -91,11 +138,38 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             let _ = service;
             String::from_utf8_lossy(body).into_owned()
         };
-        text.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(PREVIEW_CHARS)
+        text
+    }
+
+    fn content_kind(service: &str) -> &'static str {
+        match service {
+            "mail" => "mail-text",
+            "calendar" | "contacts" | "todo" => "json",
+            "onedrive" | "onenote" => "text",
+            _ => "text",
+        }
+    }
+
+    fn utf8_budget_slice(text: &str, max_bytes: usize) -> (&str, bool) {
+        if text.len() <= max_bytes {
+            return (text, false);
+        }
+        let mut end = max_bytes;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        (&text[..end], true)
+    }
+
+    fn list_limit(limit: Option<u32>) -> u32 {
+        limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT)
+    }
+
+    fn page_items(items: Vec<ItemRef>, limit: u32, offset: u32) -> Vec<ItemRef> {
+        items
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
             .collect()
     }
 
@@ -122,7 +196,8 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             hits.retain(|i| services.iter().any(|s| s == &i.service));
         }
         let total = hits.len();
-        let results: Vec<serde_json::Value> = hits.iter().take(cap).map(Self::source_ref).collect();
+        let results: Vec<serde_json::Value> =
+            hits.iter().take(cap).map(|it| self.hit_json(it)).collect();
         Ok(serde_json::json!({
             "query": query,
             "returned": results.len(),
@@ -256,7 +331,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         };
         let mut candidates: Vec<ItemRef> = Vec::new();
         for svc in &scan {
-            for it in self.source.list(svc, None)? {
+            for it in self.source.list_page(svc, u32::MAX, 0)? {
                 if it.path.is_some() && !matched.contains(&(it.service.clone(), it.id.clone())) {
                     candidates.push(it);
                 }
@@ -314,33 +389,46 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             .get(service, id)?
             .ok_or_else(|| AgentError::ToolArgs(format!("no item {service}/{id}")))?;
         let bytes = self.source.read_body(service, id)?;
+        let text = Self::body_model_text(service, &bytes);
         let budget = max_bytes.unwrap_or(DEFAULT_READ_BUDGET) as usize;
-        let truncated = bytes.len() > budget;
-        let slice = if truncated {
-            &bytes[..budget]
-        } else {
-            &bytes[..]
-        };
+        let (content, truncated) = Self::utf8_budget_slice(&text, budget);
+        let source = Self::citation_ref(&item);
         Ok(serde_json::json!({
             "service": item.service,
             "id": item.id,
             "name": item.name,
             "path": item.path,
-            "bytes_total": bytes.len(),
-            "bytes_returned": slice.len(),
+            "source": source,
+            "content_kind": Self::content_kind(service),
+            "bytes_total": text.len(),
+            "bytes_returned": content.len(),
             "truncated": truncated,
-            "content": String::from_utf8_lossy(slice),
+            "content": content,
         })
         .to_string())
     }
 
-    fn list(&self, service: &str, parent: Option<&str>) -> Result<String, AgentError> {
-        let items = self.source.list(service, parent)?;
+    fn list(
+        &self,
+        service: &str,
+        parent: Option<&str>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<String, AgentError> {
+        let limit = Self::list_limit(limit);
+        let offset = offset.unwrap_or(0);
+        let items = match parent {
+            Some("root") | Some("") => Self::page_items(self.source.roots(service)?, limit, offset),
+            Some(parent) => Self::page_items(self.source.children(service, parent)?, limit, offset),
+            None => self.source.list_page(service, limit, offset)?,
+        };
         let count = self.source.count(service)?;
         let results: Vec<serde_json::Value> = items.iter().map(Self::source_ref).collect();
         Ok(serde_json::json!({
             "service": service,
             "parent": parent,
+            "limit": limit,
+            "offset": offset,
             "service_total": count,
             "returned": results.len(),
             "results": results,
@@ -355,10 +443,12 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             .ok_or_else(|| AgentError::ToolArgs(format!("no item {service}/{id}")))?;
         let bytes = self.source.read_body(service, id)?;
         let (format, content) = convert_export(service, &bytes)?;
+        let source = Self::citation_ref(&item);
         Ok(serde_json::json!({
             "service": item.service,
             "id": item.id,
             "path": item.path,
+            "source": source,
             "format": format,
             "content": content,
         })
@@ -393,6 +483,7 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 action.op()
             )));
         }
+        self.ensure_account(action)?;
         match action {
             ToolAction::Search {
                 services,
@@ -414,8 +505,12 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 ..
             } => self.read(service, id, *max_bytes),
             ToolAction::List {
-                service, parent, ..
-            } => self.list(service, parent.as_deref()),
+                service,
+                parent,
+                limit,
+                offset,
+                ..
+            } => self.list(service, parent.as_deref(), *limit, *offset),
             ToolAction::Export { service, id, .. } => self.export(service, id),
             // restore-local is read-class but writes a local file — it lands in S-AG.9/#624.
             ToolAction::RestoreLocal { .. } => Err(AgentError::ToolArgs(
@@ -433,6 +528,10 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
         action: &ToolAction,
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<String, AgentError> {
+        if action.class() != ToolClass::Read {
+            return self.execute_read(action);
+        }
+        self.ensure_account(action)?;
         // Search + deep-search run as visible stages; every other read is single-shot.
         match action {
             ToolAction::Search {
@@ -459,6 +558,7 @@ mod tests {
 
     /// In-memory archive for testing the executor logic without a store.
     struct FakeArchive {
+        account: String,
         items: Vec<(ItemRef, Option<Vec<u8>>)>,
     }
     impl FakeArchive {
@@ -481,6 +581,10 @@ mod tests {
         }
     }
     impl ArchiveSource for FakeArchive {
+        fn account(&self) -> &str {
+            &self.account
+        }
+
         fn search_names(&self, query: &str) -> Result<Vec<ItemRef>, AgentError> {
             let q = query.to_lowercase();
             Ok(self
@@ -517,13 +621,32 @@ mod tests {
                 .and_then(|(_, b)| b.clone())
                 .ok_or_else(|| AgentError::ToolArgs(format!("no body {service}/{id}")))
         }
-        fn list(&self, service: &str, _parent: Option<&str>) -> Result<Vec<ItemRef>, AgentError> {
+        fn list_page(
+            &self,
+            service: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<Vec<ItemRef>, AgentError> {
+            Ok(self
+                .items
+                .iter()
+                .filter(|(i, _)| i.service == service)
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(|(i, _)| i.clone())
+                .collect())
+        }
+        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
             Ok(self
                 .items
                 .iter()
                 .filter(|(i, _)| i.service == service)
                 .map(|(i, _)| i.clone())
                 .collect())
+        }
+        fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError> {
+            let _ = parent;
+            self.roots(service)
         }
         fn count(&self, service: &str) -> Result<u64, AgentError> {
             Ok(self
@@ -534,8 +657,90 @@ mod tests {
         }
     }
 
+    struct RoutingArchive {
+        account: String,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl RoutingArchive {
+        fn new(calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Self {
+            Self {
+                account: "me".into(),
+                calls,
+            }
+        }
+
+        fn route_item(service: &str, id: &str, name: &str) -> ItemRef {
+            ItemRef {
+                service: service.into(),
+                id: id.into(),
+                name: name.into(),
+                item_type: "folder".into(),
+                path: Some(format!("{service}/{id}.bin")),
+            }
+        }
+    }
+
+    impl ArchiveSource for RoutingArchive {
+        fn account(&self) -> &str {
+            &self.account
+        }
+
+        fn search_names(&self, _query: &str) -> Result<Vec<ItemRef>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        fn search_bodies(&self, _query: &str) -> Result<Vec<(String, String)>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        fn get(&self, _service: &str, _id: &str) -> Result<Option<ItemRef>, AgentError> {
+            Ok(None)
+        }
+
+        fn read_body(&self, service: &str, id: &str) -> Result<Vec<u8>, AgentError> {
+            Err(AgentError::ToolArgs(format!("no body {service}/{id}")))
+        }
+
+        fn list_page(
+            &self,
+            service: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<Vec<ItemRef>, AgentError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("list_page:{limit}:{offset}"));
+            let items = vec![
+                Self::route_item(service, "flat-0", "Flat 0"),
+                Self::route_item(service, "flat-1", "Flat 1"),
+                Self::route_item(service, "flat-2", "Flat 2"),
+            ];
+            Ok(items
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
+        }
+
+        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.calls.borrow_mut().push("roots".into());
+            Ok(vec![Self::route_item(service, "root-only", "Root Only")])
+        }
+
+        fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.calls.borrow_mut().push(format!("children:{parent}"));
+            Ok(vec![Self::route_item(service, "child-only", "Child Only")])
+        }
+
+        fn count(&self, _service: &str) -> Result<u64, AgentError> {
+            Ok(123)
+        }
+    }
+
     fn fixture() -> RetrievalExecutor<FakeArchive> {
         RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
             items: vec![
                 FakeArchive::item(
                     "mail",
@@ -547,6 +752,21 @@ mod tests {
                 FakeArchive::item("onedrive", "f1", "spotify-logo.png", None),
             ],
         })
+    }
+
+    #[cfg(feature = "retrieval")]
+    fn upsert_store_body(
+        store: &isyncyou_store::Store,
+        root: &std::path::Path,
+        mut item: isyncyou_store::Item,
+        rel: &str,
+        body: &[u8],
+    ) {
+        item.local_path = Some(rel.into());
+        store.upsert_item(&item).unwrap();
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        isyncyou_core::envelope::write_body_atomic(&path, body).unwrap();
     }
 
     #[test]
@@ -565,6 +785,8 @@ mod tests {
         assert!(ids.contains(&"m1") && ids.contains(&"f1"));
         for r in v["results"].as_array().unwrap() {
             assert!(r["service"].is_string() && r["id"].is_string() && r["path"].is_string());
+            assert!(r["source"]["service"].is_string() && r["source"]["id"].is_string());
+            assert!(r["snippet"].is_string());
         }
     }
 
@@ -615,7 +837,12 @@ mod tests {
         assert_eq!(v["total_matches"], 2);
         assert!(v["deep_search_hint"].is_string());
         for r in v["results"].as_array().unwrap() {
-            assert!(r["service"].is_string() && r["id"].is_string());
+            for field in ["service", "id", "name", "item_type", "path", "snippet"] {
+                assert!(
+                    !r[field].is_null(),
+                    "staged final result must carry {field}: {r}"
+                );
+            }
         }
     }
 
@@ -641,6 +868,35 @@ mod tests {
         assert_eq!(done, vec![("names".into(), 0), ("bodies".into(), 1)]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["results"][0]["id"], "m1");
+        assert!(
+            v["results"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("receipt"),
+            "body-only search hit should carry a readable snippet"
+        );
+    }
+
+    #[test]
+    fn non_streaming_search_body_only_hit_carries_snippet() {
+        let ex = fixture();
+        let out = ex.search(&[], "receipt", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["results"][0]["id"], "m1");
+        assert!(v["results"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("receipt"));
+    }
+
+    #[test]
+    fn search_keeps_unreadable_body_hit_with_empty_snippet() {
+        let ex = fixture();
+        let out = ex.search(&["onedrive".into()], "spotify", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 1);
+        assert_eq!(v["results"][0]["id"], "f1");
+        assert_eq!(v["results"][0]["snippet"], "");
     }
 
     #[test]
@@ -649,6 +905,7 @@ mod tests {
         // deep pass); m2 is about the same topic but never says "distrokid" (the keyword-less
         // match the deep read must surface); m3 is noise.
         let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
             items: vec![
                 FakeArchive::item(
                     "mail",
@@ -714,7 +971,10 @@ mod tests {
                 )
             })
             .collect();
-        let ex = RetrievalExecutor::new(FakeArchive { items });
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items,
+        });
         // Query matches nothing → all 5 are unmatched candidates; budget of 2 per pass.
         let out = ex
             .deep_search(&["mail".into()], "zzzznomatch", None, Some(2), &mut |_| {})
@@ -768,11 +1028,161 @@ mod tests {
     }
 
     #[test]
+    fn read_counts_model_text_and_truncates_on_utf8_boundary() {
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item("onedrive", "u1", "Utf8", Some("ééx"))],
+        });
+        let out = ex.read("onedrive", "u1", Some(3)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["bytes_total"], "ééx".len());
+        assert_eq!(v["bytes_returned"], "é".len());
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["content"], "é");
+    }
+
+    #[test]
+    fn read_includes_source_object() {
+        let ex = fixture();
+        let out = ex.read("mail", "m1", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["source"]["service"], "mail");
+        assert_eq!(v["source"]["id"], "m1");
+        assert_eq!(v["source"]["path"], "mail/m1.bin");
+        assert_eq!(v["name"], "Spotify invoice March");
+        assert_eq!(v["content_kind"], "mail-text");
+    }
+
+    #[test]
+    fn read_missing_body_returns_controlled_error() {
+        let ex = fixture();
+        let err = ex.read("onedrive", "f1", None).unwrap_err();
+        assert!(err.to_string().contains("no body onedrive/f1"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn read_mail_returns_model_text_not_raw_eml_headers() {
+        let eml = concat!(
+            "Subject: Quarterly Report\r\n",
+            "From: Ada <ada@example.com>\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Hello from the extracted body.\r\n"
+        );
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item("mail", "eml1", "Quarterly", Some(eml))],
+        });
+        let out = ex.read("mail", "eml1", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let content = v["content"].as_str().unwrap();
+        assert!(content.contains("Quarterly Report"));
+        assert!(content.contains("Hello from the extracted body."));
+        assert!(!content.contains("Content-Type:"));
+        assert_eq!(v["bytes_total"], content.len());
+        assert_eq!(v["bytes_returned"], content.len());
+        assert_eq!(v["truncated"], false);
+    }
+
+    #[test]
     fn list_reports_items_and_service_total() {
         let ex = fixture();
-        let v: serde_json::Value = serde_json::from_str(&ex.list("mail", None).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.list("mail", None, None, None).unwrap()).unwrap();
         assert_eq!(v["service_total"], 2);
         assert_eq!(v["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_pages_flat_service_items_with_count() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ex = RetrievalExecutor::new(RoutingArchive::new(calls.clone()));
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.list("onedrive", None, Some(1), Some(1)).unwrap()).unwrap();
+        assert_eq!(*calls.borrow(), vec!["list_page:1:1"]);
+        assert_eq!(v["service"], "onedrive");
+        assert_eq!(v["parent"], serde_json::Value::Null);
+        assert_eq!(v["limit"], 1);
+        assert_eq!(v["offset"], 1);
+        assert_eq!(v["service_total"], 123);
+        assert_eq!(v["returned"], 1);
+        assert_eq!(v["results"][0]["id"], "flat-1");
+        assert_eq!(v["results"][0]["path"], "onedrive/flat-1.bin");
+        assert_eq!(v["results"][0]["source"]["id"], "flat-1");
+        assert_eq!(v["results"][0]["source"]["path"], "onedrive/flat-1.bin");
+    }
+
+    #[test]
+    fn list_root_uses_roots_not_whole_service() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ex = RetrievalExecutor::new(RoutingArchive::new(calls.clone()));
+        let v: serde_json::Value = serde_json::from_str(
+            &ex.list("onedrive", Some("root"), Some(10), Some(0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["roots"]);
+        assert_eq!(v["parent"], "root");
+        assert_eq!(v["results"][0]["id"], "root-only");
+    }
+
+    #[test]
+    fn list_parent_uses_children() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ex = RetrievalExecutor::new(RoutingArchive::new(calls.clone()));
+        let v: serde_json::Value = serde_json::from_str(
+            &ex.list("onedrive", Some("folder-1"), Some(10), Some(0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["children:folder-1"]);
+        assert_eq!(v["parent"], "folder-1");
+        assert_eq!(v["results"][0]["id"], "child-only");
+    }
+
+    #[test]
+    fn list_limit_and_offset_are_applied() {
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![
+                FakeArchive::item("mail", "m0", "Mail 0", Some("body 0")),
+                FakeArchive::item("mail", "m1", "Mail 1", Some("body 1")),
+                FakeArchive::item("mail", "m2", "Mail 2", Some("body 2")),
+            ],
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.list("mail", None, Some(1), Some(2)).unwrap()).unwrap();
+        assert_eq!(v["limit"], 1);
+        assert_eq!(v["offset"], 2);
+        assert_eq!(v["service_total"], 3);
+        assert_eq!(v["returned"], 1);
+        assert_eq!(v["results"][0]["id"], "m2");
+    }
+
+    #[test]
+    fn deep_search_still_scans_candidates_after_list_refactor() {
+        let items: Vec<_> = (0..(DEFAULT_LIST_LIMIT + 5))
+            .map(|i| {
+                FakeArchive::item(
+                    "mail",
+                    &format!("bulk-{i}"),
+                    &format!("Bulk {i}"),
+                    Some(&format!("unmatched body {i}")),
+                )
+            })
+            .collect();
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items,
+        });
+        let out = ex
+            .deep_search(&["mail".into()], "zzzznomatch", None, Some(40), &mut |_| {})
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["candidates_total"], DEFAULT_LIST_LIMIT + 5);
+        assert_eq!(v["read"], MAX_DEEP_READS);
+        assert_eq!(v["budget_reached"], true);
     }
 
     #[test]
@@ -782,7 +1192,256 @@ mod tests {
         assert_eq!(v["format"], "raw"); // mail → raw without the connectors feature
         assert_eq!(v["service"], "mail");
         assert_eq!(v["id"], "m1");
+        assert_eq!(v["source"]["service"], "mail");
+        assert_eq!(v["source"]["id"], "m1");
+        assert_eq!(v["source"]["path"], "mail/m1.bin");
         assert!(v["content"].as_str().unwrap().contains("Spotify"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn export_calendar_returns_ics_with_source() {
+        let event = serde_json::json!({
+            "id": "cal-1",
+            "iCalUId": "uid-1",
+            "subject": "Q2 review",
+            "bodyPreview": "Agenda line",
+            "location": { "displayName": "Room 1" },
+            "start": { "dateTime": "2026-03-01T09:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-03-01T10:00:00.0000000", "timeZone": "UTC" },
+            "lastModifiedDateTime": "2026-02-20T08:00:00Z"
+        });
+        let body = event.to_string();
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item(
+                "calendar",
+                "cal-1",
+                "Q2 review",
+                Some(&body),
+            )],
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.export("calendar", "cal-1").unwrap()).unwrap();
+        assert_eq!(v["format"], "ics");
+        assert_eq!(v["source"]["service"], "calendar");
+        assert_eq!(v["source"]["id"], "cal-1");
+        let content = v["content"].as_str().unwrap();
+        assert!(content.starts_with("BEGIN:VCALENDAR\r\nVERSION:2.0"));
+        assert!(content.contains("BEGIN:VEVENT"));
+        assert!(content.contains("SUMMARY:Q2 review"));
+        assert!(content.contains("DTSTART:20260301T090000"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn export_contact_returns_vcard_with_source() {
+        let contact = serde_json::json!({
+            "displayName": "Ada Lovelace",
+            "givenName": "Ada",
+            "surname": "Lovelace",
+            "emailAddresses": [{ "address": "ada@example.com", "name": "Ada" }],
+            "mobilePhone": "+1 555 0100",
+            "companyName": "Analytical Engines",
+            "jobTitle": "Mathematician"
+        });
+        let body = contact.to_string();
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item(
+                "contacts",
+                "contact-1",
+                "Ada Lovelace",
+                Some(&body),
+            )],
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&ex.export("contacts", "contact-1").unwrap()).unwrap();
+        assert_eq!(v["format"], "vcard");
+        assert_eq!(v["source"]["service"], "contacts");
+        assert_eq!(v["source"]["id"], "contact-1");
+        let content = v["content"].as_str().unwrap();
+        assert!(content.starts_with("BEGIN:VCARD\r\nVERSION:3.0"));
+        assert!(content.contains("FN:Ada Lovelace"));
+        assert!(content.contains("EMAIL:ada@example.com"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn export_invalid_structured_body_is_tool_error() {
+        let ex = RetrievalExecutor::new(FakeArchive {
+            account: "me".into(),
+            items: vec![FakeArchive::item(
+                "calendar",
+                "bad-cal",
+                "Broken",
+                Some("not-json"),
+            )],
+        });
+        let err = ex.export("calendar", "bad-cal").unwrap_err();
+        assert!(err.to_string().contains("export parse"));
+    }
+
+    #[cfg(feature = "retrieval")]
+    #[test]
+    fn store_archive_executor_covers_search_read_list_export_shapes() {
+        let _guard = crate::archive::BodyKeyTestGuard::new();
+        isyncyou_core::envelope::set_body_key(618_090, [90u8; 32]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = isyncyou_store::Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "mail", "m1", "Visible mail", "message"),
+            "mail/aa/m1.eml",
+            concat!(
+                "Subject: Store runtime mail\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "\r\n",
+                "Hello archived mail text.\r\n"
+            )
+            .as_bytes(),
+        );
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "mail", "m2", "Body only mail", "message"),
+            "mail/aa/m2.eml",
+            b"needle618 appears only in the indexed body",
+        );
+        store
+            .index_body(
+                "me",
+                "mail",
+                "m2",
+                "needle618 appears only in the indexed body",
+            )
+            .unwrap();
+
+        let folder = isyncyou_store::Item::new("me", "onedrive", "folder", "Folder", "folder");
+        store.upsert_item(&folder).unwrap();
+        let mut child = isyncyou_store::Item::new("me", "onedrive", "child", "Child.txt", "file");
+        child.parent_remote_id = Some("folder".into());
+        store.upsert_item(&child).unwrap();
+
+        let event = serde_json::json!({
+            "id": "cal-1",
+            "iCalUId": "uid-1",
+            "subject": "Store event",
+            "start": { "dateTime": "2026-03-01T09:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-03-01T10:00:00.0000000", "timeZone": "UTC" }
+        })
+        .to_string();
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "calendar", "cal-1", "Store event", "event"),
+            "calendar/cal-1.json",
+            event.as_bytes(),
+        );
+
+        let contact = serde_json::json!({
+            "displayName": "Ada Lovelace",
+            "givenName": "Ada",
+            "surname": "Lovelace",
+            "emailAddresses": [{ "address": "ada@example.com" }]
+        })
+        .to_string();
+        upsert_store_body(
+            &store,
+            dir.path(),
+            isyncyou_store::Item::new("me", "contacts", "contact-1", "Ada Lovelace", "contact"),
+            "contacts/contact-1.json",
+            contact.as_bytes(),
+        );
+        drop(store);
+
+        let ex = RetrievalExecutor::new(crate::archive::StoreArchive::new("me", dir.path()));
+
+        let search = ToolAction::Search {
+            account: "me".into(),
+            services: vec!["mail".into()],
+            query: "needle618".into(),
+            limit: Some(10),
+        };
+        let search_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&search).unwrap()).unwrap();
+        assert_eq!(search_out["results"][0]["id"], "m2");
+        assert_eq!(search_out["results"][0]["source"]["service"], "mail");
+        assert!(search_out["results"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("needle618"));
+
+        let read = ToolAction::Read {
+            account: "me".into(),
+            service: "mail".into(),
+            id: "m1".into(),
+            max_bytes: None,
+        };
+        let read_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&read).unwrap()).unwrap();
+        assert_eq!(read_out["content_kind"], "mail-text");
+        assert_eq!(read_out["source"]["path"], "mail/aa/m1.eml");
+        assert!(read_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("Hello archived mail text."));
+        assert!(!read_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("Content-Type:"));
+
+        let list_root = ToolAction::List {
+            account: "me".into(),
+            service: "onedrive".into(),
+            parent: Some("root".into()),
+            limit: Some(10),
+            offset: Some(0),
+        };
+        let root_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&list_root).unwrap()).unwrap();
+        assert_eq!(root_out["results"][0]["id"], "folder");
+        assert_eq!(root_out["results"][0]["source"]["id"], "folder");
+
+        let list_child = ToolAction::List {
+            account: "me".into(),
+            service: "onedrive".into(),
+            parent: Some("folder".into()),
+            limit: Some(10),
+            offset: Some(0),
+        };
+        let child_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&list_child).unwrap()).unwrap();
+        assert_eq!(child_out["results"][0]["id"], "child");
+
+        let calendar = ToolAction::Export {
+            account: "me".into(),
+            service: "calendar".into(),
+            id: "cal-1".into(),
+        };
+        let calendar_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&calendar).unwrap()).unwrap();
+        assert_eq!(calendar_out["format"], "ics");
+        assert!(calendar_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN:VCALENDAR"));
+
+        let contacts = ToolAction::Export {
+            account: "me".into(),
+            service: "contacts".into(),
+            id: "contact-1".into(),
+        };
+        let contacts_out: serde_json::Value =
+            serde_json::from_str(&ex.execute_read(&contacts).unwrap()).unwrap();
+        assert_eq!(contacts_out["format"], "vcard");
+        assert!(contacts_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("EMAIL:ada@example.com"));
     }
 
     #[test]
@@ -807,5 +1466,18 @@ mod tests {
         };
         let out = ex.execute_read(&action).unwrap();
         assert!(out.contains("total_matches"));
+    }
+
+    #[test]
+    fn execute_read_rejects_account_mismatch() {
+        let ex = fixture();
+        let action = ToolAction::Search {
+            account: "other".into(),
+            services: vec![],
+            query: "spotify".into(),
+            limit: None,
+        };
+        let err = ex.execute_read(&action).unwrap_err();
+        assert!(err.to_string().contains("account mismatch"));
     }
 }
