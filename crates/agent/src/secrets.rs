@@ -252,6 +252,107 @@ impl AgentCredentialStore {
     }
 }
 
+const DEFAULT_PROVIDER_ACCOUNT_ID: &str = "default";
+
+fn normalize_provider_id(provider: &str) -> Result<&'static str, AgentError> {
+    if provider.is_empty() || provider != provider.trim() {
+        return Err(credential_err("unsupported provider credential provider"));
+    }
+    match provider.to_ascii_lowercase().as_str() {
+        "anthropic" => Ok("anthropic"),
+        "openai" => Ok("openai"),
+        "codex" => Ok("codex"),
+        "subscription" => Ok("subscription"),
+        _ => Err(credential_err("unsupported provider credential provider")),
+    }
+}
+
+fn normalize_provider_account(account: Option<&str>) -> Result<String, AgentError> {
+    let account = match account {
+        Some(value) if !value.is_empty() => value,
+        _ => DEFAULT_PROVIDER_ACCOUNT_ID,
+    };
+    validate_provider_secret_segment("provider account", account)?;
+    Ok(account.to_ascii_lowercase())
+}
+
+fn validate_provider_secret_segment(kind: &str, value: &str) -> Result<(), AgentError> {
+    if value == "." || value == ".." {
+        return Err(credential_err(&format!(
+            "invalid {kind} credential segment"
+        )));
+    }
+    if value.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return Err(credential_err(&format!(
+            "invalid {kind} credential segment"
+        )));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
+    {
+        return Err(credential_err(&format!(
+            "invalid {kind} credential segment"
+        )));
+    }
+    Ok(())
+}
+
+pub fn provider_api_key_secret_id(
+    provider: &str,
+    account: Option<&str>,
+) -> Result<String, AgentError> {
+    let provider = normalize_provider_id(provider)?;
+    let account = normalize_provider_account(account)?;
+    Ok(format!("api-key:{provider}:{account}"))
+}
+
+pub fn provider_oauth_refresh_secret_id(
+    provider: &str,
+    account: Option<&str>,
+) -> Result<String, AgentError> {
+    let provider = normalize_provider_id(provider)?;
+    let account = normalize_provider_account(account)?;
+    Ok(format!("oauth-refresh:{provider}:{account}"))
+}
+
+/// Store-backed provider credential reader for runtime callers.
+///
+/// Raw-key provider constructors stay available for pure unit tests. Runtime provider
+/// wiring should resolve through this seam so #623/#627 do not invent file paths or
+/// stringly credential ids.
+pub struct ProviderCredentialResolver {
+    store: AgentCredentialStore,
+}
+
+impl ProviderCredentialResolver {
+    pub fn new(store: AgentCredentialStore) -> Self {
+        Self { store }
+    }
+
+    pub fn api_key(
+        &self,
+        provider: &str,
+        account: Option<&str>,
+    ) -> Result<Option<Secret>, AgentError> {
+        let id = provider_api_key_secret_id(provider, account)?;
+        self.store.get(SecretClass::ProviderApiKey, &id)
+    }
+
+    pub fn oauth_refresh(
+        &self,
+        provider: &str,
+        account: Option<&str>,
+    ) -> Result<Option<Secret>, AgentError> {
+        let id = provider_oauth_refresh_secret_id(provider, account)?;
+        self.store.get(SecretClass::ProviderOAuthRefresh, &id)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     v: u32,
@@ -710,6 +811,85 @@ mod tests {
         assert!(!err.contains(leaked_env_value));
         assert!(!err.contains("resolver-secret"));
         assert!(!format!("{:?}", CredentialKeySource::Provided).contains("super-secret"));
+    }
+
+    #[test]
+    fn provider_api_key_secret_id_is_stable() {
+        assert_eq!(
+            provider_api_key_secret_id("anthropic", None).unwrap(),
+            "api-key:anthropic:default"
+        );
+        assert_eq!(
+            provider_api_key_secret_id("OpenAI", Some("ME@Example.COM")).unwrap(),
+            "api-key:openai:me@example.com"
+        );
+    }
+
+    #[test]
+    fn provider_oauth_refresh_secret_id_is_stable() {
+        assert_eq!(
+            provider_oauth_refresh_secret_id("codex", None).unwrap(),
+            "oauth-refresh:codex:default"
+        );
+        assert_eq!(
+            provider_oauth_refresh_secret_id("subscription", Some("acct_123")).unwrap(),
+            "oauth-refresh:subscription:acct_123"
+        );
+    }
+
+    #[test]
+    fn provider_secret_id_rejects_path_segments_or_control_chars() {
+        for provider in ["", "../anthropic", "anthropic\n", "anthropic:prod", "evil"] {
+            assert!(
+                provider_api_key_secret_id(provider, None).is_err(),
+                "provider {provider:?} should be rejected"
+            );
+        }
+        for account in [
+            ".",
+            "..",
+            "../default",
+            "default/other",
+            "default\\other",
+            "default:other",
+            "default\nother",
+            "default other",
+            "default💥",
+        ] {
+            assert!(
+                provider_oauth_refresh_secret_id("codex", Some(account)).is_err(),
+                "account {account:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn official_provider_resolver_reads_provider_api_key_from_store() {
+        let _env = lock_cred_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CredentialStoreResolver::new(CredentialStoreConfig::new(tmp.path()))
+            .with_provided_key([11u8; KEY_LEN])
+            .resolve()
+            .unwrap();
+        let id = provider_api_key_secret_id("anthropic", None).unwrap();
+        store
+            .put(
+                SecretClass::ProviderApiKey,
+                &id,
+                &Secret::new(b"anthropic-runtime-key".as_slice()),
+            )
+            .unwrap();
+
+        let resolver = ProviderCredentialResolver::new(store);
+        assert_eq!(
+            resolver
+                .api_key("anthropic", None)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            b"anthropic-runtime-key"
+        );
+        assert!(resolver.api_key("openai", None).unwrap().is_none());
     }
 
     #[test]
