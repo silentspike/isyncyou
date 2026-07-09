@@ -95,9 +95,25 @@ requirements:
       - A device-local-only key cannot decrypt the session.
       - Only ciphertext is written to OneDrive (no plaintext M365 content).
     verified_by:
-      - test: round_trips_with_the_pairing_secret
-      - test: a_different_device_local_key_cannot_decrypt
+      - test: pairing_payload_derives_same_session_key_on_two_devices
+      - test: device_local_key_cannot_decrypt_pairing_session
+      - test: ciphertext_contains_no_plaintext_m365_sentinel
       - test: only_ciphertext_is_stored_no_plaintext
+      - test: active_turn_records_observed_head_and_lease_state
+      - test: put_turn_if_absent_is_idempotent_for_same_bytes
+      - test: put_turn_if_absent_rejects_same_ulid_different_bytes
+      - test: graph_turn_put_conflict_same_bytes_is_idempotent
+      - test: graph_lease_create_conflict_returns_busy
+      - test: graph_lease_takeover_uses_if_match
+      - test: graph_lease_release_checks_holder_and_lease_id
+      - test: filesystem_cache_persists_offline_pending_restart
+      - test: file_session_cache_pending_files_are_owner_only
+      - test: sync_pending_removes_files_after_success_and_is_idempotent
+      - test: sync_pending_remote_different_bytes_errors_and_keeps_pending
+      - test: load_reports_two_heads_as_fork
+      - test: forced_offline_concurrent_turns_surface_fork_on_reconnect
+      - test: agent_session_kdf_benchmark_json_is_structured_and_redacted
+      - test: live_onedrive_session_roundtrip_ciphertext_and_cleanup
   - id: REQ-AGENT-007
     title: Streaming is a typed AgentStreamHub with cancel and backpressure
     statement: >

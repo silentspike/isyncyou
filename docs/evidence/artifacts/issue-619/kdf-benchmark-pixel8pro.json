@@ -1,0 +1,24 @@
+{
+  "benchmark": "agent_session_argon2id_hkdf",
+  "device": "Pixel 8 Pro",
+  "source": "android instrumentation NativeEngine.nativeAgentSessionKdfBenchmark",
+  "iterations": 5,
+  "kdf": {
+    "alg": "argon2id-hkdf-sha256",
+    "version": 1,
+    "memory_kib": 65536,
+    "iterations": 3,
+    "lanes": 4
+  },
+  "median_ms": 213.001,
+  "p95_ms": 218.6,
+  "samples_us": [
+    206006,
+    206236,
+    213001,
+    218377,
+    218600
+  ],
+  "scope": "jni_only_feature_gated",
+  "captured_at": "2026-07-09T09:42:16+02:00"
+}
