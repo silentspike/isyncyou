@@ -1,6 +1,7 @@
 # Issue #620 Host And Device Gates
 
-Commit under test: 3699bc40a7404ca9e5310f32e451ea9dcc048893
+Evidence commit under test: b50bd143c001ceac5090c0dbebcdb3da97e2ff8a
+Final runtime/test code commit audited: 99d1e3c70ad33631ad9804064440af55957800d4
 Captured: 2026-07-09
 
 PASS cargo +1.95.0 test -p isyncyou-agent secrets -- --nocapture
@@ -35,10 +36,16 @@ PASS Pixel 8 Pro instrumentation
 - Result:
   tests=1 failures=0 errors=0 skipped=0
 - Extracted evidence is stored in docs/evidence/artifacts/issue-620/android-keystore.json.
+- Fresh rerun during final review:
+  tests=1 failures=0 errors=0 skipped=0 on Pixel 8 Pro at b50bd14.
+- Android fallback decision:
+  the mobile path deliberately has no default encrypted-file fallback for the
+  agent credential key. If Android Keystore unwrap or JNI install is unavailable,
+  startup fails closed before nativeStart opens local data.
 
 ## Final Plan Audit
 
-Final code commit audited: 99d1e3c test(mobile): serialize key installer tests
+Final runtime/test code commit audited: 99d1e3c test(mobile): serialize key installer tests
 
 Finding during Task 8:
 - The first final `cargo +1.95.0 test -p isyncyou-mobile --features agent-credential-store-self-test -- --nocapture`
@@ -64,6 +71,20 @@ Final rerun results after the fix:
 - PASS python3 tools/check_traceability.py
 - PASS python3 tools/check_evidence.py --manifest docs/evidence/issue-620-manifest.json
 - PASS git diff --check origin/dev...HEAD
+- PASS (final review) cargo +1.95.0 test -p isyncyou-agent --features http,agent-subscription-experimental secrets -- --nocapture
+  - 23 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 test -p isyncyou-agent --features http,agent-subscription-experimental credential -- --nocapture
+  - 6 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental credential -- --nocapture
+  - 4 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 test -p isyncyou-mobile --features agent-credential-store-self-test -- --nocapture
+  - 24 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+- PASS (final review) cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS (final review) cargo +1.95.0 clippy -p isyncyou-mobile --all-targets --features agent-credential-store-self-test -- -D warnings
+- PASS (final review) (cd android && ./gradlew :app:testDebugUnitTest)
+- PASS (final review) (cd android && ISY_CARGO_FEATURES=agent-credential-store-self-test ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentCredentialKeyStoreInstrumentedTest)
+  - 1 test on Pixel 8 Pro; 0 failures, 0 errors, 0 skipped.
 
 Final scope checks:
 - Branch: feature/ag-620
