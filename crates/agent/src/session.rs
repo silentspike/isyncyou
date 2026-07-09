@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const ACTIVE_TURN_LEASE_TTL_MS: u64 = 120_000;
+
 /// One conversation turn (the plaintext that gets sealed per file).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
@@ -56,6 +58,10 @@ pub struct LeaseRecord {
     pub holder_device_id: DeviceId,
     pub lease_id: LeaseId,
     pub observed_head: Option<TurnId>,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub cloud_item_id: Option<String>,
+    pub cloud_etag: Option<String>,
 }
 
 pub struct ActiveTurn<'a, T: SessionTransport, C: LocalSessionCache = MemorySessionCache> {
@@ -116,6 +122,32 @@ pub fn new_ulid() -> Result<String, AgentError> {
     Ok(new_turn_id()?.into_string())
 }
 
+fn now_ms() -> Result<u64, AgentError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| AgentError::Provider(e.to_string()))?
+        .as_millis() as u64)
+}
+
+fn new_lease_record(
+    session_id: &SessionId,
+    holder: &DeviceId,
+    observed_head: Option<TurnId>,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> Result<LeaseRecord, AgentError> {
+    Ok(LeaseRecord {
+        session_id: session_id.clone(),
+        holder_device_id: holder.clone(),
+        lease_id: LeaseId::new(new_ulid()?)?,
+        observed_head,
+        created_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(ttl_ms),
+        cloud_item_id: None,
+        cloud_etag: None,
+    })
+}
+
 /// Increment a 26-char Crockford ULID by 1 (with carry). Used for ULID **monotonicity**:
 /// when two turns are created in the same millisecond, the next is derived from the last
 /// so ordering still equals creation order.
@@ -156,7 +188,10 @@ fn onedrive_turn_file(session_id: &SessionId, turn_id: &TurnId) -> String {
 
 #[cfg(any(test, feature = "onedrive"))]
 fn onedrive_lease_file(session_id: &SessionId) -> String {
-    format!("{}/.lease", onedrive_session_dir(session_id))
+    format!(
+        "{}/.active_turn_lease.json",
+        onedrive_session_dir(session_id)
+    )
 }
 
 // ----- transport -----
@@ -169,11 +204,23 @@ pub trait SessionTransport {
     fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError>;
     /// ULIDs present for the session.
     fn list(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError>;
-    /// Try to acquire the single active-turn lease; `true` if acquired.
-    fn acquire_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError>;
-    fn renew_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError>;
-    fn release_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<(), AgentError>;
-    fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError>;
+    /// Try to acquire the single active-turn lease; `None` means another valid lease is busy.
+    fn acquire_lease(
+        &self,
+        session_id: &SessionId,
+        holder: &DeviceId,
+        observed_head: Option<TurnId>,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Option<LeaseRecord>, AgentError>;
+    fn renew_lease(
+        &self,
+        lease: &LeaseRecord,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Option<LeaseRecord>, AgentError>;
+    fn release_lease(&self, lease: &LeaseRecord) -> Result<bool, AgentError>;
+    fn current_lease(&self, session_id: &SessionId) -> Result<Option<LeaseRecord>, AgentError>;
 }
 
 pub trait LocalSessionCache {
@@ -417,14 +464,15 @@ impl<T: SessionTransport, C: LocalSessionCache> Session<T, C> {
         device_id: &DeviceId,
     ) -> Result<Option<ActiveTurn<'_, T, C>>, AgentError> {
         let observed_head = self.head.borrow().clone();
-        if !self.transport.acquire_lease(&self.session_id, device_id)? {
-            return Ok(None);
-        }
-        let lease = LeaseRecord {
-            session_id: self.session_id.clone(),
-            holder_device_id: device_id.clone(),
-            lease_id: LeaseId::new(new_ulid()?)?,
+        let lease = match self.transport.acquire_lease(
+            &self.session_id,
+            device_id,
             observed_head,
+            now_ms()?,
+            ACTIVE_TURN_LEASE_TTL_MS,
+        )? {
+            Some(lease) => lease,
+            None => return Ok(None),
         };
         Ok(Some(ActiveTurn {
             session: self,
@@ -554,12 +602,30 @@ impl<T: SessionTransport, C: LocalSessionCache> Session<T, C> {
 
     /// Acquire the active-turn lease (anti-fork) for `holder`.
     pub fn begin_turn(&self, holder: &DeviceId) -> Result<bool, AgentError> {
-        self.transport.acquire_lease(&self.session_id, holder)
+        self.transport
+            .acquire_lease(
+                &self.session_id,
+                holder,
+                self.head.borrow().clone(),
+                now_ms()?,
+                ACTIVE_TURN_LEASE_TTL_MS,
+            )
+            .map(|lease| lease.is_some())
     }
 
     /// Release the active-turn lease.
     pub fn end_turn(&self, holder: &DeviceId) -> Result<(), AgentError> {
-        self.transport.release_lease(&self.session_id, holder)
+        if let Some(lease) = self.transport.current_lease(&self.session_id)? {
+            if lease.holder_device_id == *holder {
+                if self.transport.release_lease(&lease)? {
+                    return Ok(());
+                }
+                return Err(AgentError::Transport(
+                    "active-turn lease was not released".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -585,15 +651,25 @@ impl<T: SessionTransport, C: LocalSessionCache> ActiveTurn<'_, T, C> {
     }
 
     pub fn renew(&mut self) -> Result<bool, AgentError> {
-        self.session
-            .transport
-            .renew_lease(&self.lease.session_id, &self.lease.holder_device_id)
+        match self.session.transport.renew_lease(
+            &self.lease,
+            now_ms()?,
+            ACTIVE_TURN_LEASE_TTL_MS,
+        )? {
+            Some(lease) => {
+                self.lease = lease;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     pub fn finish(mut self) -> Result<(), AgentError> {
-        self.session
-            .transport
-            .release_lease(&self.lease.session_id, &self.lease.holder_device_id)?;
+        if !self.session.transport.release_lease(&self.lease)? {
+            return Err(AgentError::Transport(
+                "active-turn lease was not released".into(),
+            ));
+        }
         self.finished = true;
         Ok(())
     }
@@ -605,7 +681,7 @@ impl<T: SessionTransport, C: LocalSessionCache> ActiveTurn<'_, T, C> {
 #[derive(Default)]
 pub struct InMemoryTransport {
     files: std::cell::RefCell<std::collections::HashMap<(SessionId, TurnId), Vec<u8>>>,
-    lease: std::cell::RefCell<std::collections::HashMap<SessionId, DeviceId>>,
+    lease: std::cell::RefCell<std::collections::HashMap<SessionId, LeaseRecord>>,
     offline: std::cell::Cell<bool>,
     put_count: std::cell::Cell<usize>,
 }
@@ -669,34 +745,62 @@ impl SessionTransport for InMemoryTransport {
             .map(|(_, u)| u.clone())
             .collect())
     }
-    fn acquire_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError> {
+    fn acquire_lease(
+        &self,
+        session_id: &SessionId,
+        holder: &DeviceId,
+        observed_head: Option<TurnId>,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Option<LeaseRecord>, AgentError> {
         self.guard()?;
         let mut lease = self.lease.borrow_mut();
         match lease.get(session_id) {
-            Some(h) if h != holder => Ok(false),
+            Some(existing) if existing.expires_at_ms > now_ms => Ok(None),
             _ => {
-                lease.insert(session_id.clone(), holder.clone());
-                Ok(true)
+                let next = new_lease_record(session_id, holder, observed_head, now_ms, ttl_ms)?;
+                lease.insert(session_id.clone(), next.clone());
+                Ok(Some(next))
             }
         }
     }
-    fn renew_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError> {
+    fn renew_lease(
+        &self,
+        lease_record: &LeaseRecord,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Option<LeaseRecord>, AgentError> {
         self.guard()?;
-        Ok(self
-            .lease
-            .borrow()
-            .get(session_id)
-            .map(|h| h == holder)
-            .unwrap_or(false))
-    }
-    fn release_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<(), AgentError> {
         let mut lease = self.lease.borrow_mut();
-        if lease.get(session_id).map(|h| h == holder).unwrap_or(false) {
-            lease.remove(session_id);
+        let Some(existing) = lease.get(&lease_record.session_id) else {
+            return Ok(None);
+        };
+        if existing.holder_device_id != lease_record.holder_device_id
+            || existing.lease_id != lease_record.lease_id
+        {
+            return Ok(None);
         }
-        Ok(())
+        let mut next = existing.clone();
+        next.expires_at_ms = now_ms.saturating_add(ttl_ms);
+        lease.insert(lease_record.session_id.clone(), next.clone());
+        Ok(Some(next))
     }
-    fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError> {
+    fn release_lease(&self, lease_record: &LeaseRecord) -> Result<bool, AgentError> {
+        let mut lease = self.lease.borrow_mut();
+        if lease
+            .get(&lease_record.session_id)
+            .map(|existing| {
+                existing.holder_device_id == lease_record.holder_device_id
+                    && existing.lease_id == lease_record.lease_id
+            })
+            .unwrap_or(false)
+        {
+            lease.remove(&lease_record.session_id);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    fn current_lease(&self, session_id: &SessionId) -> Result<Option<LeaseRecord>, AgentError> {
         Ok(self.lease.borrow().get(session_id).cloned())
     }
 }
@@ -706,11 +810,85 @@ impl SessionTransport for InMemoryTransport {
 #[cfg(feature = "onedrive")]
 mod onedrive {
     use super::{
-        onedrive_lease_file, onedrive_session_dir, onedrive_turn_file, DeviceId, SessionId,
-        SessionTransport, TurnId,
+        new_lease_record, onedrive_lease_file, onedrive_session_dir, onedrive_turn_file, DeviceId,
+        LeaseId, LeaseRecord, SessionId, SessionTransport, TurnId,
     };
     use crate::AgentError;
-    use isyncyou_graph::http::GraphClient;
+    use isyncyou_graph::http::{ConflictBehavior, GraphClient, UploadError};
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct LeaseFileBody {
+        v: u8,
+        session_id: String,
+        holder_device_id: String,
+        lease_id: String,
+        observed_head: Option<String>,
+        created_at_ms: u64,
+        expires_at_ms: u64,
+    }
+
+    impl LeaseFileBody {
+        fn from_record(record: &LeaseRecord) -> Self {
+            Self {
+                v: 1,
+                session_id: record.session_id.to_string(),
+                holder_device_id: record.holder_device_id.to_string(),
+                lease_id: record.lease_id.to_string(),
+                observed_head: record.observed_head.as_ref().map(ToString::to_string),
+                created_at_ms: record.created_at_ms,
+                expires_at_ms: record.expires_at_ms,
+            }
+        }
+
+        fn into_record(
+            self,
+            cloud_item_id: Option<String>,
+            cloud_etag: Option<String>,
+        ) -> Result<LeaseRecord, AgentError> {
+            if self.v != 1 {
+                return Err(AgentError::Transport(
+                    "unsupported agent lease version".into(),
+                ));
+            }
+            Ok(LeaseRecord {
+                session_id: SessionId::new(&self.session_id)?,
+                holder_device_id: DeviceId::new(&self.holder_device_id)?,
+                lease_id: LeaseId::new(&self.lease_id)?,
+                observed_head: self.observed_head.map(TurnId::new).transpose()?,
+                created_at_ms: self.created_at_ms,
+                expires_at_ms: self.expires_at_ms,
+                cloud_item_id,
+                cloud_etag,
+            })
+        }
+    }
+
+    fn attach_remote_fields(mut lease: LeaseRecord, value: &serde_json::Value) -> LeaseRecord {
+        lease.cloud_item_id = value
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(ToString::to_string)
+            .or(lease.cloud_item_id);
+        lease.cloud_etag = value
+            .get("eTag")
+            .or_else(|| value.get("@odata.etag"))
+            .and_then(|etag| etag.as_str())
+            .map(ToString::to_string)
+            .or(lease.cloud_etag);
+        lease
+    }
+
+    fn required_remote_field<'a>(
+        lease: &'a LeaseRecord,
+        field: &'static str,
+    ) -> Result<&'a str, AgentError> {
+        match field {
+            "id" => lease.cloud_item_id.as_deref(),
+            "etag" => lease.cloud_etag.as_deref(),
+            _ => None,
+        }
+        .ok_or_else(|| AgentError::Transport(format!("lease had no remote {field}")))
+    }
 
     /// Real OneDrive transport. The caller supplies a pre-resolved `Files.ReadWrite`
     /// token (e.g. via `engine::resolve_cached_sync_token`), so this needs no engine dep.
@@ -724,6 +902,51 @@ mod onedrive {
                 client: GraphClient::new(token),
             }
         }
+
+        #[cfg(test)]
+        pub(crate) fn with_base_url(token: impl Into<String>, base_url: &str) -> Self {
+            Self {
+                client: GraphClient::new(token).with_base_url(base_url),
+            }
+        }
+
+        fn lease_bytes(lease: &LeaseRecord) -> Result<Vec<u8>, AgentError> {
+            serde_json::to_vec(&LeaseFileBody::from_record(lease))
+                .map_err(|e| AgentError::Provider(e.to_string()))
+        }
+
+        fn read_lease(&self, session_id: &SessionId) -> Result<Option<LeaseRecord>, AgentError> {
+            let path = onedrive_lease_file(session_id);
+            let Some(item) = self
+                .client
+                .get_drive_item_by_path(&path, &["id", "eTag", "name"])
+                .map_err(|e| AgentError::Transport(e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let item_id = item
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(ToString::to_string);
+            let etag = item
+                .get("eTag")
+                .or_else(|| item.get("@odata.etag"))
+                .and_then(|etag| etag.as_str())
+                .map(ToString::to_string);
+            let url = format!("/me/drive/root:/{}:/content", path);
+            let body = match self.client.get_bytes(&url) {
+                Ok(bytes) => bytes,
+                Err(UploadError::Http { status: 404, .. }) => return Ok(None),
+                Err(err) => return Err(AgentError::Transport(err.to_string())),
+            };
+            let file: LeaseFileBody =
+                serde_json::from_slice(&body).map_err(|e| AgentError::Transport(e.to_string()))?;
+            let lease = file.into_record(item_id, etag)?;
+            if lease.session_id != *session_id {
+                return Err(AgentError::Transport("lease session id mismatch".into()));
+            }
+            Ok(Some(lease))
+        }
     }
 
     impl SessionTransport for OneDriveTransport {
@@ -733,10 +956,20 @@ mod onedrive {
             turn_id: &TurnId,
             bytes: &[u8],
         ) -> Result<(), AgentError> {
-            self.client
-                .simple_upload(&onedrive_turn_file(session_id, turn_id), bytes)
-                .map(|_| ())
-                .map_err(|e| AgentError::Transport(e.to_string()))
+            let created = self
+                .client
+                .upload_content_with_conflict_behavior(
+                    &onedrive_turn_file(session_id, turn_id),
+                    bytes,
+                    ConflictBehavior::Fail,
+                )
+                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            if created.is_none() {
+                return Err(AgentError::Transport(format!(
+                    "turn already exists: {turn_id}"
+                )));
+            }
+            Ok(())
         }
         fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError> {
             let url = format!(
@@ -752,17 +985,18 @@ mod onedrive {
                 "/me/drive/root:/{}:/children?$select=name",
                 onedrive_session_dir(session_id)
             );
-            let v = self
+            let items = self
                 .client
-                .get_json(&url)
+                .get_json_paged(&url)
                 .map_err(|e| AgentError::Transport(e.to_string()))?;
             let mut ulids = Vec::new();
-            if let Some(items) = v.get("value").and_then(|x| x.as_array()) {
-                for it in items {
-                    if let Some(name) = it.get("name").and_then(|n| n.as_str()) {
-                        if let Some(ulid) = name.strip_suffix(".json") {
-                            ulids.push(TurnId::new(ulid)?);
-                        }
+            for it in items {
+                if let Some(name) = it.get("name").and_then(|n| n.as_str()) {
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    if let Some(ulid) = name.strip_suffix(".json") {
+                        ulids.push(TurnId::new(ulid)?);
                     }
                 }
             }
@@ -772,37 +1006,90 @@ mod onedrive {
             &self,
             session_id: &SessionId,
             holder: &DeviceId,
-        ) -> Result<bool, AgentError> {
-            // Best-effort lease via a marker file. (A stronger ETag/If-Match lease is a
-            // follow-up; the per-turn ULID files keep storage conflict-free regardless.)
-            self.client
-                .simple_upload(&onedrive_lease_file(session_id), holder.as_str().as_bytes())
-                .map(|_| true)
-                .map_err(|e| AgentError::Transport(e.to_string()))
+            observed_head: Option<TurnId>,
+            now_ms: u64,
+            ttl_ms: u64,
+        ) -> Result<Option<LeaseRecord>, AgentError> {
+            let proposed = new_lease_record(session_id, holder, observed_head, now_ms, ttl_ms)?;
+            let bytes = Self::lease_bytes(&proposed)?;
+            if let Some(item) = self
+                .client
+                .upload_content_with_conflict_behavior(
+                    &onedrive_lease_file(session_id),
+                    &bytes,
+                    ConflictBehavior::Fail,
+                )
+                .map_err(|e| AgentError::Transport(e.to_string()))?
+            {
+                return Ok(Some(attach_remote_fields(proposed, &item)));
+            }
+
+            let Some(existing) = self.read_lease(session_id)? else {
+                return Ok(None);
+            };
+            if existing.expires_at_ms > now_ms {
+                return Ok(None);
+            }
+
+            let item_id = required_remote_field(&existing, "id")?;
+            let etag = required_remote_field(&existing, "etag")?;
+            let takeover =
+                new_lease_record(session_id, holder, proposed.observed_head, now_ms, ttl_ms)?;
+            let bytes = Self::lease_bytes(&takeover)?;
+            match self
+                .client
+                .replace_content_if_match(item_id, &bytes, etag)
+                .map_err(|e| AgentError::Transport(e.to_string()))?
+            {
+                Some(item) => Ok(Some(attach_remote_fields(takeover, &item))),
+                None => Ok(None),
+            }
         }
         fn renew_lease(
             &self,
-            session_id: &SessionId,
-            holder: &DeviceId,
-        ) -> Result<bool, AgentError> {
-            Ok(self.current_lease(session_id)?.as_ref() == Some(holder))
-        }
-        fn release_lease(
-            &self,
-            _session_id: &SessionId,
-            _holder: &DeviceId,
-        ) -> Result<(), AgentError> {
-            Ok(())
-        }
-        fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError> {
-            let url = format!(
-                "/me/drive/root:/{}:/content",
-                onedrive_lease_file(session_id)
-            );
-            match self.client.get_bytes(&url) {
-                Ok(b) => Ok(Some(DeviceId::new(String::from_utf8_lossy(&b))?)),
-                Err(_) => Ok(None),
+            lease: &LeaseRecord,
+            now_ms: u64,
+            ttl_ms: u64,
+        ) -> Result<Option<LeaseRecord>, AgentError> {
+            let Some(current) = self.read_lease(&lease.session_id)? else {
+                return Ok(None);
+            };
+            if current.holder_device_id != lease.holder_device_id
+                || current.lease_id != lease.lease_id
+            {
+                return Ok(None);
             }
+            let item_id = required_remote_field(&current, "id")?;
+            let etag = required_remote_field(&current, "etag")?;
+            let mut renewed = current.clone();
+            renewed.expires_at_ms = now_ms.saturating_add(ttl_ms);
+            let bytes = Self::lease_bytes(&renewed)?;
+            match self
+                .client
+                .replace_content_if_match(item_id, &bytes, etag)
+                .map_err(|e| AgentError::Transport(e.to_string()))?
+            {
+                Some(item) => Ok(Some(attach_remote_fields(renewed, &item))),
+                None => Ok(None),
+            }
+        }
+        fn release_lease(&self, lease: &LeaseRecord) -> Result<bool, AgentError> {
+            let Some(current) = self.read_lease(&lease.session_id)? else {
+                return Ok(false);
+            };
+            if current.holder_device_id != lease.holder_device_id
+                || current.lease_id != lease.lease_id
+            {
+                return Ok(false);
+            }
+            let item_id = required_remote_field(&current, "id")?;
+            let etag = required_remote_field(&current, "etag")?;
+            self.client
+                .delete_item_if_match(item_id, etag)
+                .map_err(|e| AgentError::Transport(e.to_string()))
+        }
+        fn current_lease(&self, session_id: &SessionId) -> Result<Option<LeaseRecord>, AgentError> {
+            self.read_lease(session_id)
         }
     }
 }
@@ -990,11 +1277,13 @@ mod tests {
         let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
         let mut active = s.begin_active_turn(&did("deviceA")).unwrap().unwrap();
         assert!(active.renew().unwrap());
+        let lease = active.lease().clone();
         active.finish().unwrap();
-        assert!(!s
+        assert!(s
             .transport
-            .renew_lease(&sid("sess1"), &did("deviceA"))
-            .unwrap());
+            .renew_lease(&lease, now_ms().unwrap(), ACTIVE_TURN_LEASE_TTL_MS)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1159,7 +1448,7 @@ mod tests {
         );
         assert_eq!(
             onedrive_lease_file(&session),
-            "Apps/iSyncYou/agent/sess1/.lease"
+            "Apps/iSyncYou/agent/sess1/.active_turn_lease.json"
         );
         assert!(SessionId::new("../evil").is_err());
         assert!(TurnId::new("../evil").is_err());
@@ -1195,6 +1484,264 @@ mod tests {
         assert!(err.contains("turn id mismatch"), "{err}");
     }
 
+    #[cfg(feature = "onedrive")]
+    fn read_request(sock: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            if sock.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&buf).to_string();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::to_owned)
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            sock.read_exact(&mut body).unwrap();
+        }
+        if body.is_empty() {
+            head
+        } else {
+            format!("{head}\n{}", String::from_utf8_lossy(&body))
+        }
+    }
+
+    #[cfg(feature = "onedrive")]
+    fn serve(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for response in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                seen.push(read_request(&mut sock));
+                use std::io::Write;
+                sock.write_all(response.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[cfg(feature = "onedrive")]
+    fn http_response(status: u16, reason: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[cfg(feature = "onedrive")]
+    fn lease_body(holder: &str, lease_id: &str, expires_at_ms: u64) -> String {
+        serde_json::json!({
+            "v": 1,
+            "session_id": "sess1",
+            "holder_device_id": holder,
+            "lease_id": lease_id,
+            "observed_head": null,
+            "created_at_ms": 1,
+            "expires_at_ms": expires_at_ms
+        })
+        .to_string()
+    }
+
+    #[cfg(feature = "onedrive")]
+    #[test]
+    fn graph_lease_create_conflict_returns_busy() {
+        let (base, server) = serve(vec![
+            http_response(409, "Conflict", "", "exists"),
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"e1\\\"\"}",
+            ),
+            http_response(200, "OK", "", &lease_body("deviceB", "lease-b", 10_000)),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        let acquired = transport
+            .acquire_lease(&sid("sess1"), &did("deviceA"), None, 5_000, 120_000)
+            .unwrap();
+        assert!(acquired.is_none());
+        let seen = server.join().unwrap();
+        assert!(seen[0].contains(
+            "PUT /me/drive/root:/Apps/iSyncYou/agent/sess1/.active_turn_lease.json:/content?@microsoft.graph.conflictBehavior=fail "
+        ));
+        assert!(seen[1].contains(
+            "GET /me/drive/root:/Apps/iSyncYou/agent/sess1/.active_turn_lease.json:?$select=id,eTag,name "
+        ));
+        assert!(seen[2].contains(
+            "GET /me/drive/root:/Apps/iSyncYou/agent/sess1/.active_turn_lease.json:/content "
+        ));
+    }
+
+    #[cfg(feature = "onedrive")]
+    #[test]
+    fn graph_lease_takeover_uses_if_match() {
+        let (base, server) = serve(vec![
+            http_response(409, "Conflict", "", "exists"),
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"old-etag\\\"\"}",
+            ),
+            http_response(200, "OK", "", &lease_body("deviceB", "lease-b", 4_000)),
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"new-etag\\\"\"}",
+            ),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        let acquired = transport
+            .acquire_lease(&sid("sess1"), &did("deviceA"), None, 5_000, 120_000)
+            .unwrap()
+            .expect("expired lease should be taken over");
+        assert_eq!(acquired.holder_device_id, did("deviceA"));
+        assert_eq!(acquired.cloud_etag.as_deref(), Some("\"new-etag\""));
+        let seen = server.join().unwrap();
+        assert!(seen[3].contains("PUT /me/drive/items/lease-item/content "));
+        assert!(seen[3].contains("if-match: \"old-etag\""));
+        assert!(seen[3].contains("\"holder_device_id\":\"deviceA\""));
+    }
+
+    #[cfg(feature = "onedrive")]
+    #[test]
+    fn graph_lease_takeover_lost_race_does_not_acquire() {
+        let (base, server) = serve(vec![
+            http_response(409, "Conflict", "", "exists"),
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"old-etag\\\"\"}",
+            ),
+            http_response(200, "OK", "", &lease_body("deviceB", "lease-b", 4_000)),
+            http_response(412, "Precondition Failed", "", ""),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        let acquired = transport
+            .acquire_lease(&sid("sess1"), &did("deviceA"), None, 5_000, 120_000)
+            .unwrap();
+        assert!(acquired.is_none());
+        let seen = server.join().unwrap();
+        assert!(seen[3].contains("if-match: \"old-etag\""));
+    }
+
+    #[cfg(feature = "onedrive")]
+    #[test]
+    fn graph_turn_put_uses_create_if_absent() {
+        let (base, server) = serve(vec![http_response(409, "Conflict", "", "exists")]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        let err = transport
+            .put(&sid("sess1"), &tid(TURN_A), b"sealed")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("turn already exists"), "{err}");
+        let seen = server.join().unwrap();
+        assert!(seen[0].contains(&format!(
+            "PUT /me/drive/root:/Apps/iSyncYou/agent/sess1/{TURN_A}.json:/content?@microsoft.graph.conflictBehavior=fail "
+        )));
+    }
+
+    #[cfg(feature = "onedrive")]
+    #[test]
+    fn graph_lease_renew_checks_holder_and_lease_id() {
+        let mut lease =
+            new_lease_record(&sid("sess1"), &did("deviceA"), None, 5_000, 120_000).unwrap();
+        lease.lease_id = LeaseId::new("lease-a").unwrap();
+
+        let (base, server) = serve(vec![
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"e1\\\"\"}",
+            ),
+            http_response(200, "OK", "", &lease_body("deviceB", "lease-b", 125_000)),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        assert!(transport
+            .renew_lease(&lease, 10_000, 120_000)
+            .unwrap()
+            .is_none());
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let (base, server) = serve(vec![
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"e2\\\"\"}",
+            ),
+            http_response(200, "OK", "", &lease_body("deviceA", "lease-a", 125_000)),
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"e3\\\"\"}",
+            ),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        let renewed = transport
+            .renew_lease(&lease, 10_000, 120_000)
+            .unwrap()
+            .expect("matching lease should renew");
+        assert_eq!(renewed.cloud_etag.as_deref(), Some("\"e3\""));
+        let seen = server.join().unwrap();
+        assert!(seen[2].contains("PUT /me/drive/items/lease-item/content "));
+        assert!(seen[2].contains("if-match: \"e2\""));
+        assert!(seen[2].contains("\"expires_at_ms\":130000"));
+    }
+
+    #[cfg(feature = "onedrive")]
+    #[test]
+    fn graph_lease_release_checks_holder_and_lease_id() {
+        let mut lease =
+            new_lease_record(&sid("sess1"), &did("deviceA"), None, 5_000, 120_000).unwrap();
+        lease.lease_id = LeaseId::new("lease-a").unwrap();
+        let (base, server) = serve(vec![
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"e1\\\"\"}",
+            ),
+            http_response(200, "OK", "", &lease_body("deviceB", "lease-b", 125_000)),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        assert!(!transport.release_lease(&lease).unwrap());
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let (base, server) = serve(vec![
+            http_response(
+                200,
+                "OK",
+                "",
+                "{\"id\":\"lease-item\",\"eTag\":\"\\\"e2\\\"\"}",
+            ),
+            http_response(200, "OK", "", &lease_body("deviceA", "lease-a", 125_000)),
+            http_response(204, "No Content", "", ""),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        assert!(transport.release_lease(&lease).unwrap());
+        let seen = server.join().unwrap();
+        assert!(seen[2].contains("DELETE /me/drive/items/lease-item "));
+        assert!(seen[2].contains("if-match: \"e2\""));
+    }
+
     /// Test shim so a test can hold the transport AND give one to the session.
     struct RcTransport(std::rc::Rc<InMemoryTransport>);
     impl SessionTransport for RcTransport {
@@ -1207,16 +1754,28 @@ mod tests {
         fn list(&self, s: &SessionId) -> Result<Vec<TurnId>, AgentError> {
             self.0.list(s)
         }
-        fn acquire_lease(&self, s: &SessionId, h: &DeviceId) -> Result<bool, AgentError> {
-            self.0.acquire_lease(s, h)
+        fn acquire_lease(
+            &self,
+            s: &SessionId,
+            h: &DeviceId,
+            head: Option<TurnId>,
+            now_ms: u64,
+            ttl_ms: u64,
+        ) -> Result<Option<LeaseRecord>, AgentError> {
+            self.0.acquire_lease(s, h, head, now_ms, ttl_ms)
         }
-        fn renew_lease(&self, s: &SessionId, h: &DeviceId) -> Result<bool, AgentError> {
-            self.0.renew_lease(s, h)
+        fn renew_lease(
+            &self,
+            lease: &LeaseRecord,
+            now_ms: u64,
+            ttl_ms: u64,
+        ) -> Result<Option<LeaseRecord>, AgentError> {
+            self.0.renew_lease(lease, now_ms, ttl_ms)
         }
-        fn release_lease(&self, s: &SessionId, h: &DeviceId) -> Result<(), AgentError> {
-            self.0.release_lease(s, h)
+        fn release_lease(&self, lease: &LeaseRecord) -> Result<bool, AgentError> {
+            self.0.release_lease(lease)
         }
-        fn current_lease(&self, s: &SessionId) -> Result<Option<DeviceId>, AgentError> {
+        fn current_lease(&self, s: &SessionId) -> Result<Option<LeaseRecord>, AgentError> {
             self.0.current_lease(s)
         }
     }
