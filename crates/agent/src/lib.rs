@@ -43,7 +43,10 @@ pub use confirm::{ConfirmError, PendingAction, PendingRegistry};
 pub use error::AgentError;
 pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
-pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
+pub use secrets::{
+    AgentCredentialStore, AtRestKey, CredentialKeySource, CredentialStore, CredentialStoreConfig,
+    CredentialStoreResolver, LocalKey, ProvidedKey, Secret, SecretClass,
+};
 pub use session::{
     detect_fork, new_ulid, ActiveTurn, FileSessionCache, InMemoryTransport, LeaseRecord,
     LoadedSession, LocalSessionCache, MemorySessionCache, PutTurnOutcome, Session, SessionFork,

@@ -17,6 +17,7 @@ use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::{aead, digest, hkdf};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 const ENVELOPE_VERSION: u32 = 2;
@@ -74,6 +75,7 @@ pub const CRED_KEY_ENV: &str = "ISYNCYOU_AGENT_CRED_KEY";
 
 /// Resolves the at-rest key from `ISYNCYOU_AGENT_CRED_KEY`, else an owner-only key file
 /// beside the store (auto-generated on first use — encrypted-at-rest by default).
+#[derive(Clone)]
 pub struct LocalKey {
     key_file: PathBuf,
 }
@@ -118,11 +120,135 @@ impl AtRestKey for LocalKey {
 }
 
 /// An at-rest key supplied by the caller (e.g. unwrapped from the Android Keystore).
+#[derive(Clone, Copy)]
 pub struct ProvidedKey(pub [u8; KEY_LEN]);
 
 impl AtRestKey for ProvidedKey {
     fn key(&self) -> Result<[u8; KEY_LEN], AgentError> {
         Ok(self.0)
+    }
+}
+
+/// Standard locations for the agent credential store under a caller-owned base dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialStoreConfig {
+    store_dir: PathBuf,
+    local_key_file: PathBuf,
+}
+
+impl CredentialStoreConfig {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        let base_dir = base_dir.into();
+        Self {
+            store_dir: base_dir.join("agent-credentials"),
+            local_key_file: base_dir.join("agent-credentials.key"),
+        }
+    }
+
+    pub fn with_paths(store_dir: impl Into<PathBuf>, local_key_file: impl Into<PathBuf>) -> Self {
+        Self {
+            store_dir: store_dir.into(),
+            local_key_file: local_key_file.into(),
+        }
+    }
+
+    pub fn store_dir(&self) -> &Path {
+        &self.store_dir
+    }
+
+    pub fn local_key_file(&self) -> &Path {
+        &self.local_key_file
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum CredentialKeySource {
+    Provided,
+    EnvOrLocalFile,
+}
+
+impl fmt::Debug for CredentialKeySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CredentialKeySource::Provided => write!(f, "CredentialKeySource::Provided"),
+            CredentialKeySource::EnvOrLocalFile => write!(f, "CredentialKeySource::EnvOrLocalFile"),
+        }
+    }
+}
+
+/// Resolves the agent credential store without exposing key material to callers.
+#[derive(Debug, Clone)]
+pub struct CredentialStoreResolver {
+    config: CredentialStoreConfig,
+    provided_key: Option<[u8; KEY_LEN]>,
+}
+
+impl CredentialStoreResolver {
+    pub fn new(config: CredentialStoreConfig) -> Self {
+        Self {
+            config,
+            provided_key: None,
+        }
+    }
+
+    pub fn with_provided_key(mut self, key: [u8; KEY_LEN]) -> Self {
+        self.provided_key = Some(key);
+        self
+    }
+
+    pub fn config(&self) -> &CredentialStoreConfig {
+        &self.config
+    }
+
+    pub fn key_source(&self) -> CredentialKeySource {
+        match self.provided_key {
+            Some(_) => CredentialKeySource::Provided,
+            None => CredentialKeySource::EnvOrLocalFile,
+        }
+    }
+
+    pub fn resolve(&self) -> Result<AgentCredentialStore, AgentError> {
+        std::fs::create_dir_all(&self.config.store_dir)
+            .map_err(|e| AgentError::Provider(e.to_string()))?;
+        Ok(match self.provided_key {
+            Some(key) => AgentCredentialStore::Provided(CredentialStore::new(
+                self.config.store_dir.clone(),
+                ProvidedKey(key),
+            )),
+            None => AgentCredentialStore::Local(CredentialStore::new(
+                self.config.store_dir.clone(),
+                LocalKey::new(self.config.local_key_file.clone()),
+            )),
+        })
+    }
+}
+
+/// A resolved credential store, backed either by a caller-provided key or LocalKey.
+pub enum AgentCredentialStore {
+    Provided(CredentialStore<ProvidedKey>),
+    Local(CredentialStore<LocalKey>),
+}
+
+impl AgentCredentialStore {
+    pub fn put(&self, class: SecretClass, id: &str, secret: &Secret) -> Result<(), AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => store.put(class, id, secret),
+            AgentCredentialStore::Local(store) => store.put(class, id, secret),
+        }
+    }
+
+    pub fn get(&self, class: SecretClass, id: &str) -> Result<Option<Secret>, AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => store.get(class, id),
+            AgentCredentialStore::Local(store) => store.get(class, id),
+        }
+    }
+
+    pub fn delete(&self, class: SecretClass, id: &str) -> Result<(), AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => store.delete(class, id),
+            AgentCredentialStore::Local(store) => store.delete(class, id),
+        }
     }
 }
 
@@ -403,7 +529,11 @@ impl<K: AtRestKey> CredentialStore<K> {
 mod tests {
     use super::*;
 
-    fn store(dir: &Path) -> CredentialStore<LocalKey> {
+    fn store(dir: &Path) -> CredentialStore<ProvidedKey> {
+        CredentialStore::new(dir, ProvidedKey([42u8; KEY_LEN]))
+    }
+
+    fn local_store(dir: &Path) -> CredentialStore<LocalKey> {
         CredentialStore::new(dir, LocalKey::new(dir.join(".cred.key")))
     }
 
@@ -425,6 +555,161 @@ mod tests {
             !haystack.windows(needle.len()).any(|w| w == needle),
             "plaintext sentinel must not be present"
         );
+    }
+
+    struct CredEnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl Drop for CredEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(CRED_KEY_ENV, value),
+                None => std::env::remove_var(CRED_KEY_ENV),
+            }
+        }
+    }
+
+    fn lock_cred_env() -> CredEnvGuard {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let previous = std::env::var(CRED_KEY_ENV).ok();
+        std::env::remove_var(CRED_KEY_ENV);
+        CredEnvGuard {
+            _guard: guard,
+            previous,
+        }
+    }
+
+    #[test]
+    fn credential_resolver_derives_standard_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = CredentialStoreConfig::new(tmp.path());
+        assert_eq!(cfg.store_dir(), tmp.path().join("agent-credentials"));
+        assert_eq!(
+            cfg.local_key_file(),
+            tmp.path().join("agent-credentials.key")
+        );
+        let custom = CredentialStoreConfig::with_paths(tmp.path().join("s"), tmp.path().join("k"));
+        assert_eq!(custom.store_dir(), tmp.path().join("s"));
+        assert_eq!(custom.local_key_file(), tmp.path().join("k"));
+    }
+
+    #[test]
+    fn credential_resolver_prefers_provided_key() {
+        let _env = lock_cred_env();
+        std::env::set_var(CRED_KEY_ENV, B64.encode([4u8; KEY_LEN]));
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = CredentialStoreConfig::new(tmp.path());
+        let store = CredentialStoreResolver::new(cfg.clone())
+            .with_provided_key([7u8; KEY_LEN])
+            .resolve()
+            .unwrap();
+        assert!(matches!(store, AgentCredentialStore::Provided(_)));
+        assert_eq!(
+            CredentialStoreResolver::new(cfg.clone()).key_source(),
+            CredentialKeySource::EnvOrLocalFile
+        );
+        store
+            .put(
+                SecretClass::ProviderApiKey,
+                "a",
+                &Secret::new(b"provided-key-secret".as_slice()),
+            )
+            .unwrap();
+        let env_store = CredentialStoreResolver::new(cfg).resolve().unwrap();
+        let err = err_text(env_store.get(SecretClass::ProviderApiKey, "a"));
+        assert!(err.contains("decryption failed"));
+        assert!(!err.contains("provided-key-secret"));
+    }
+
+    #[test]
+    fn credential_resolver_uses_env_key_for_tests() {
+        let _env = lock_cred_env();
+        std::env::set_var(CRED_KEY_ENV, B64.encode([5u8; KEY_LEN]));
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = CredentialStoreConfig::new(tmp.path());
+        let store = CredentialStoreResolver::new(cfg.clone()).resolve().unwrap();
+        assert!(matches!(store, AgentCredentialStore::Local(_)));
+        store
+            .put(
+                SecretClass::ProviderOAuthRefresh,
+                "codex",
+                &Secret::new(b"env-key-secret".as_slice()),
+            )
+            .unwrap();
+        let reopened = CredentialStoreResolver::new(cfg.clone()).resolve().unwrap();
+        assert_eq!(
+            reopened
+                .get(SecretClass::ProviderOAuthRefresh, "codex")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            b"env-key-secret"
+        );
+        assert!(
+            !cfg.local_key_file().exists(),
+            "env-key resolution must not create a local key file"
+        );
+    }
+
+    #[test]
+    fn credential_resolver_generates_owner_only_local_key() {
+        let _env = lock_cred_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = CredentialStoreConfig::new(tmp.path());
+        let store = CredentialStoreResolver::new(cfg.clone()).resolve().unwrap();
+        store
+            .put(
+                SecretClass::SessionPairingKey,
+                "session",
+                &Secret::new(b"local-key-secret".as_slice()),
+            )
+            .unwrap();
+        assert_eq!(
+            CredentialStoreResolver::new(cfg.clone())
+                .resolve()
+                .unwrap()
+                .get(SecretClass::SessionPairingKey, "session")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            b"local-key-secret"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(cfg.local_key_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn credential_resolver_errors_are_redacted() {
+        let _env = lock_cred_env();
+        let leaked_env_value = "super-secret-env-value";
+        std::env::set_var(CRED_KEY_ENV, leaked_env_value);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CredentialStoreResolver::new(CredentialStoreConfig::new(tmp.path()))
+            .resolve()
+            .unwrap();
+        let err = err_text(store.put(
+            SecretClass::ProviderApiKey,
+            "a",
+            &Secret::new(b"resolver-secret".as_slice()),
+        ));
+        assert!(err.contains(CRED_KEY_ENV));
+        assert!(!err.contains(leaked_env_value));
+        assert!(!err.contains("resolver-secret"));
+        assert!(!format!("{:?}", CredentialKeySource::Provided).contains("super-secret"));
     }
 
     #[test]
@@ -605,8 +890,9 @@ mod tests {
     #[test]
     fn secrets_files_are_owner_only_on_create_and_rewrite() {
         use std::os::unix::fs::PermissionsExt;
+        let _env = lock_cred_env();
         let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path());
+        let s = local_store(tmp.path());
         s.put(
             SecretClass::ProviderApiKey,
             "a",
@@ -668,7 +954,8 @@ mod tests {
     #[test]
     fn secrets_local_key_persists_across_opens() {
         let tmp = tempfile::tempdir().unwrap();
-        store(tmp.path())
+        let _env = lock_cred_env();
+        local_store(tmp.path())
             .put(
                 SecretClass::ProviderApiKey,
                 "a",
@@ -676,7 +963,7 @@ mod tests {
             )
             .unwrap();
         // A fresh store over the same dir reuses the auto-generated key file.
-        let reopened = store(tmp.path());
+        let reopened = local_store(tmp.path());
         assert_eq!(
             reopened
                 .get(SecretClass::ProviderApiKey, "a")
