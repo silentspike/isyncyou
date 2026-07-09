@@ -80,6 +80,7 @@ pub fn new_ulid() -> Result<String, AgentError> {
 /// Increment a 26-char Crockford ULID by 1 (with carry). Used for ULID **monotonicity**:
 /// when two turns are created in the same millisecond, the next is derived from the last
 /// so ordering still equals creation order.
+#[cfg(test)]
 fn increment_turn_id(id: &TurnId) -> Result<TurnId, AgentError> {
     let mut chars: Vec<u8> = id.as_str().bytes().collect();
     for i in (0..chars.len()).rev() {
@@ -164,6 +165,7 @@ pub struct Session<T: SessionTransport> {
     transport: T,
     /// Sealed turns not yet confirmed on the transport (offline cache).
     pending: std::cell::RefCell<Vec<SealedTurn>>,
+    #[cfg(test)]
     head: std::cell::RefCell<Option<TurnId>>,
 }
 
@@ -190,13 +192,16 @@ impl<T: SessionTransport> Session<T> {
             session_key,
             transport,
             pending: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
             head: std::cell::RefCell::new(None),
         })
     }
 
-    /// Append a turn: seal it, write it to the transport (or keep it pending if offline),
-    /// and advance the local head.
-    pub fn append(&self, role: &str, content: &str) -> Result<Turn, AgentError> {
+    /// Temporary internal helper until the public ActiveTurn/offline APIs are wired.
+    /// This intentionally stays non-public so external callers cannot write turns without
+    /// either a lease or an explicit offline-pending path.
+    #[cfg(test)]
+    fn append_lease_free_for_test(&self, role: &str, content: &str) -> Result<Turn, AgentError> {
         let observed_head = self.head.borrow().clone();
         // Monotonic ULID: strictly increasing even within one millisecond, so load order
         // equals append order.
@@ -538,8 +543,10 @@ mod tests {
     #[test]
     fn append_then_load_roundtrips() {
         let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
-        s.append("user", "find the spotify invoice").unwrap();
-        s.append("assistant", "it is item-42").unwrap();
+        s.append_lease_free_for_test("user", "find the spotify invoice")
+            .unwrap();
+        s.append_lease_free_for_test("assistant", "it is item-42")
+            .unwrap();
         let turns = s.load().unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -557,7 +564,9 @@ mod tests {
         let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
         let mut prev = String::new();
         for i in 0..50 {
-            let t = s.append("user", &format!("turn {i}")).unwrap();
+            let t = s
+                .append_lease_free_for_test("user", &format!("turn {i}"))
+                .unwrap();
             assert!(
                 t.ulid > prev,
                 "ulid must strictly increase: {} !> {}",
@@ -607,8 +616,8 @@ mod tests {
         let t = std::rc::Rc::new(InMemoryTransport::new());
         let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone())).unwrap();
         t.set_offline(true);
-        s.append("user", "a").unwrap(); // queue locally
-        s.append("assistant", "b").unwrap();
+        s.append_lease_free_for_test("user", "a").unwrap(); // queue locally
+        s.append_lease_free_for_test("assistant", "b").unwrap();
         t.set_offline(false);
         assert_eq!(s.sync().unwrap(), 2); // two uploaded
         assert_eq!(s.sync().unwrap(), 0); // idempotent — no duplicates
@@ -647,7 +656,9 @@ mod tests {
     fn only_ciphertext_is_stored_no_plaintext() {
         let t = std::rc::Rc::new(InMemoryTransport::new());
         let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone())).unwrap();
-        let turn = s.append("user", "VERY-SECRET-MAIL-CONTENT").unwrap();
+        let turn = s
+            .append_lease_free_for_test("user", "VERY-SECRET-MAIL-CONTENT")
+            .unwrap();
         let raw = t.raw(&sid("sess1"), &tid(&turn.ulid)).unwrap();
         assert!(!String::from_utf8_lossy(&raw).contains("VERY-SECRET-MAIL-CONTENT"));
     }

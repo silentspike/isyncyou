@@ -54,14 +54,14 @@ pub struct SessionCryptoConfig {
 /// Derived session key. This is the expensive Argon2id output after HKDF expansion; turns
 /// use it without re-running Argon2id for every append/load.
 #[derive(Clone)]
-pub struct SessionKey {
+pub(crate) struct SessionKey {
     bytes: [u8; KEY_LEN],
 }
 
 /// One encrypted turn file. Envelope fields are cleartext metadata; `ct` is the
 /// AES-256-GCM ciphertext+tag of the turn JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SealedTurn {
+pub(crate) struct SealedTurn {
     pub v: u32,
     pub alg: String,
     pub kdf: KdfProfile,
@@ -111,7 +111,10 @@ impl SessionCryptoConfig {
 }
 
 impl SessionKey {
-    pub fn derive(pairing_secret: &[u8], config: &SessionCryptoConfig) -> Result<Self, AgentError> {
+    pub(crate) fn derive(
+        pairing_secret: &[u8],
+        config: &SessionCryptoConfig,
+    ) -> Result<Self, AgentError> {
         let salt = session_salt(config.profile())?;
         let params = Params::new(
             config.profile.memory_kib,
@@ -224,7 +227,8 @@ fn ensure_envelope_matches_config(
 }
 
 /// Seal a turn's plaintext into a [`SealedTurn`] envelope.
-pub fn seal(
+#[cfg(test)]
+pub(crate) fn seal(
     session_key: &SessionKey,
     config: &SessionCryptoConfig,
     session_id: &SessionId,
@@ -263,7 +267,7 @@ pub fn seal(
 
 /// Open a [`SealedTurn`] back to plaintext. The active `config` must already be trusted
 /// local session state; envelope KDF data is only checked for exact equality.
-pub fn open(
+pub(crate) fn open(
     session_key: &SessionKey,
     config: &SessionCryptoConfig,
     sealed: &SealedTurn,

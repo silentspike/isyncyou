@@ -32,7 +32,7 @@ pub mod provider;
 pub mod retrieval;
 pub mod secrets;
 pub mod session;
-pub mod session_crypto;
+mod session_crypto;
 mod session_ids;
 pub mod stream;
 pub mod tool;
@@ -45,7 +45,7 @@ pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage
 pub use retrieval::RetrievalExecutor;
 pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
 pub use session::{detect_fork, new_ulid, InMemoryTransport, Session, SessionTransport, Turn};
-pub use session_crypto::{open, seal, KdfProfile, SealedTurn, SessionCryptoConfig, SessionKey};
+pub use session_crypto::{KdfProfile, SessionCryptoConfig};
 pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
 pub use stream::AgentStreamHub;
 pub use tool::{
@@ -65,3 +65,24 @@ pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn agent_public_api_does_not_export_raw_session_crypto() {
+        let lib = include_str!("lib.rs");
+        let production_exports = lib.split("#[cfg(test)]").next().unwrap_or(lib);
+        assert!(!production_exports.contains("pub mod session_crypto"));
+        assert!(!production_exports.contains("pub use session_crypto::{open"));
+        assert!(!production_exports.contains("pub use session_crypto::{seal"));
+        assert!(!production_exports.contains("SealedTurn"));
+        assert!(!production_exports.contains("SessionKey"));
+    }
+
+    #[test]
+    fn public_session_api_has_no_lease_free_cloud_append() {
+        let session = include_str!("session.rs");
+        assert!(!session.contains("pub fn append("));
+        assert!(session.contains("fn append_lease_free_for_test("));
+    }
+}
