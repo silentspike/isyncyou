@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent encrypted sessions**
+- `agent`+`graph`+`mobile`: hardened #619 cross-device OneDrive session storage with
+  Argon2id/HKDF pairing-key derivation, immutable per-turn ULID files, ETag-aware
+  active-turn leases, durable sealed offline pending cache, explicit fork metadata,
+  a JNI-only Pixel KDF benchmark hook, and live OneDrive ciphertext/lease/cleanup
+  evidence. #620 still owns Android Keystore persistence.
+
 **OneDrive on Mobile (Phase 1 — modes foundation)**
 - `graph`: `GraphClient::list_children` — live, fully paged (`@odata.nextLink` to
   completion) folder listing over the central retry policy; no store write (#647).

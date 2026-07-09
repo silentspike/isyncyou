@@ -72,6 +72,7 @@ android {
         targetSdk = 34
         versionCode = (System.getenv("ISY_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("ISY_VERSION_NAME") ?: "0.1"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // arm64 by default; ISY_ANDROID_ABIS lets CI build an x86_64 emulator variant.
         ndk {
             abiFilters += androidAbis
@@ -127,6 +128,8 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }
 
 // #89: build the embedded Rust engine (libisyncyou_mobile.so) with cargo-ndk into
