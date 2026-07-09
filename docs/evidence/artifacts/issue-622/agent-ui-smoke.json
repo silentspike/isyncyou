@@ -1,7 +1,7 @@
 {
   "ok": true,
-  "generated_at": "2026-07-09T20:20:35.974Z",
-  "fixture_origin": "http://127.0.0.1:40317",
+  "generated_at": "2026-07-09T20:27:24.580Z",
+  "fixture_origin": "http://127.0.0.1:36795",
   "assertions": [
     {
       "name": "desktop Assistant nav visible",
@@ -35,7 +35,7 @@
         "version": 1,
         "accepted": true,
         "provider": "claude",
-        "timestamp": "2026-07-09T20:20:37.701Z"
+        "timestamp": "2026-07-09T20:27:25.587Z"
       }
     },
     {
@@ -45,7 +45,7 @@
         "version": 1,
         "accepted": true,
         "provider": "claude",
-        "timestamp": "2026-07-09T20:20:37.701Z"
+        "timestamp": "2026-07-09T20:27:25.587Z"
       }
     },
     {
@@ -54,7 +54,7 @@
       "details": [
         {
           "provider": "anthropic",
-          "redirect": "http://localhost:40317/callback"
+          "redirect": "http://localhost:36795/callback"
         }
       ]
     },
@@ -68,7 +68,7 @@
       "status": "pass",
       "details": [
         {
-          "url": "http://127.0.0.1:40317/fixture-auth-complete",
+          "url": "http://127.0.0.1:36795/fixture-auth-complete",
           "target": "same-tab"
         }
       ]
@@ -89,7 +89,7 @@
       "name": "citation click opens fixture view",
       "status": "pass",
       "details": {
-        "popup": "http://127.0.0.1:40317/api/v1/view?account=fixture&service=mail&id=mail-1"
+        "popup": "http://127.0.0.1:36795/api/v1/view?account=fixture&service=mail&id=mail-1"
       }
     },
     {
@@ -211,309 +211,309 @@
   "browser_requests": [
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/",
+      "url": "http://127.0.0.1:36795/",
       "resource_type": "document"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/app.css",
+      "url": "http://127.0.0.1:36795/app.css",
       "resource_type": "stylesheet"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/app.js",
+      "url": "http://127.0.0.1:36795/app.js",
       "resource_type": "script"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/accounts",
+      "url": "http://127.0.0.1:36795/api/v1/accounts",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/sync/state",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/status?account=fixture",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/activity?account=fixture&limit=200",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=200",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/settings",
+      "url": "http://127.0.0.1:36795/api/v1/settings",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/sync/state",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/events",
+      "url": "http://127.0.0.1:36795/api/v1/events",
       "resource_type": "eventsource"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/app.woff2",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.woff2",
       "resource_type": "font"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/activity?account=fixture&limit=60",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/status?account=fixture",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/sync/state",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/activity?account=fixture&limit=60",
-      "resource_type": "fetch"
-    },
-    {
-      "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/status?account=fixture",
-      "resource_type": "fetch"
-    },
-    {
-      "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/oauth/start?provider=anthropic&redirect=http%3A%2F%2Flocalhost%3A40317%2Fcallback",
+      "url": "http://127.0.0.1:36795/api/v1/agent/oauth/start?provider=anthropic&redirect=http%3A%2F%2Flocalhost%3A36795%2Fcallback",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/fixture-auth-complete",
+      "url": "http://127.0.0.1:36795/fixture-auth-complete",
       "resource_type": "document"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/",
+      "url": "http://127.0.0.1:36795/",
       "resource_type": "document"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/app.css",
+      "url": "http://127.0.0.1:36795/app.css",
       "resource_type": "stylesheet"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/app.js",
+      "url": "http://127.0.0.1:36795/app.js",
       "resource_type": "script"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/accounts",
+      "url": "http://127.0.0.1:36795/api/v1/accounts",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/sync/state",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/events",
+      "url": "http://127.0.0.1:36795/api/v1/events",
       "resource_type": "eventsource"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/activity?account=fixture&limit=60",
-      "resource_type": "fetch"
-    },
-    {
-      "method": "GET",
-      "url": "http://127.0.0.1:40317/app.woff2",
+      "url": "http://127.0.0.1:36795/app.woff2",
       "resource_type": "font"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/status?account=fixture",
-      "resource_type": "fetch"
-    },
-    {
-      "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/turn?account=fixture&prompt=Find%20the%20quarterly%20brief",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/stream?turn=turn-1",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=Find%20the%20quarterly%20brief",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-1",
       "resource_type": "eventsource"
     },
     {
       "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/model?provider=claude&model=claude-opus-4",
+      "url": "http://127.0.0.1:36795/api/v1/agent/model?provider=claude&model=claude-opus-4",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/turn?account=fixture&prompt=Please%20delete%20the%20stale%20fixture%20item",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=Please%20delete%20the%20stale%20fixture%20item",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/stream?turn=turn-2",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-2",
       "resource_type": "eventsource"
     },
     {
       "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/confirm?pending=pending-turn-2&token=fixture-token-turn-2&action_hash=fixture-hash-turn-2",
+      "url": "http://127.0.0.1:36795/api/v1/agent/confirm?pending=pending-turn-2&token=fixture-token-turn-2&action_hash=fixture-hash-turn-2",
       "resource_type": "fetch"
     },
     {
       "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/turn?account=fixture&prompt=Please%20cancel%20the%20delete%20fixture%20item",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=Please%20cancel%20the%20delete%20fixture%20item",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/stream?turn=turn-3",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-3",
       "resource_type": "eventsource"
     },
     {
       "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/cancel?turn=turn-3",
+      "url": "http://127.0.0.1:36795/api/v1/agent/cancel?turn=turn-3",
       "resource_type": "fetch"
     },
     {
       "method": "POST",
-      "url": "http://127.0.0.1:40317/api/v1/agent/turn?account=fixture&prompt=trigger%20error",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=trigger%20error",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/stream?turn=turn-4",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-4",
       "resource_type": "eventsource"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/?mobile-smoke=1",
+      "url": "http://127.0.0.1:36795/?mobile-smoke=1",
       "resource_type": "document"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/app.css",
+      "url": "http://127.0.0.1:36795/app.css",
       "resource_type": "stylesheet"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/app.js",
+      "url": "http://127.0.0.1:36795/app.js",
       "resource_type": "script"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/accounts",
+      "url": "http://127.0.0.1:36795/api/v1/accounts",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/sync/state",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/events",
-      "resource_type": "eventsource"
-    },
-    {
-      "method": "GET",
-      "url": "http://127.0.0.1:40317/app.woff2",
+      "url": "http://127.0.0.1:36795/app.woff2",
       "resource_type": "font"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/activity?account=fixture&limit=60",
+      "url": "http://127.0.0.1:36795/api/v1/events",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
       "resource_type": "fetch"
     },
     {
       "method": "GET",
-      "url": "http://127.0.0.1:40317/api/v1/status?account=fixture",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
       "resource_type": "fetch"
     }
   ],
   "runtime_transports": [
     {
       "kind": "fetch",
-      "url": "http://127.0.0.1:40317/api/v1/accounts"
+      "url": "http://127.0.0.1:36795/api/v1/accounts"
     },
     {
       "kind": "fetch",
-      "url": "http://127.0.0.1:40317/api/v1/sync/state"
+      "url": "http://127.0.0.1:36795/api/v1/sync/state"
     },
     {
       "kind": "fetch",
-      "url": "http://127.0.0.1:40317/api/v1/agent/status"
+      "url": "http://127.0.0.1:36795/api/v1/agent/status"
     },
     {
       "kind": "EventSource",
-      "url": "http://127.0.0.1:40317/api/v1/events"
+      "url": "http://127.0.0.1:36795/api/v1/events"
     },
     {
       "kind": "fetch",
-      "url": "http://127.0.0.1:40317/api/v1/activity?account=fixture&limit=60"
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60"
     },
     {
       "kind": "fetch",
-      "url": "http://127.0.0.1:40317/api/v1/status?account=fixture"
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture"
     }
   ],
   "external_launches": [
     {
-      "url": "http://127.0.0.1:40317/fixture-auth-complete",
+      "url": "http://127.0.0.1:36795/fixture-auth-complete",
       "target": "same-tab"
     }
   ],
@@ -524,7 +524,7 @@
     "oauthStarts": [
       {
         "provider": "anthropic",
-        "redirect": "http://localhost:40317/callback"
+        "redirect": "http://localhost:36795/callback"
       }
     ],
     "modelPosts": [
