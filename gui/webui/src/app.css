@@ -61,6 +61,7 @@
   --svc-contacts: #3fb950;
   --svc-todo: #d29922;
   --svc-onenote: #a371f7;
+  --svc-assistant: #8b8cf6;
   --svc-shared: #768390;
 
   /* typography — embedded Inter variable */
@@ -1071,6 +1072,12 @@ a.note-meta-chip:hover { color: var(--accent); }
   .nav-item.active::before { display: none; }
   .view { padding: var(--sp-4); padding-bottom: 76px; }
   .view-title { font-size: var(--fs-xl); }
+  .assistant-view { min-height: calc(100dvh - 76px - (2 * var(--sp-4))); }
+  .assistant-toolbar { gap: var(--sp-1); margin-bottom: var(--sp-2); }
+  .assistant-transcript { min-height: 220px; }
+  .assistant-message .asst-bubble { max-width: 92%; }
+  .assistant-composer { bottom: 0; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .asst-inputrow { align-items: flex-end; }
   /* the topbar (route name + global-search + settings) duplicates the per-view
      content + bottom nav on a phone — hide it. Settings is reachable from the
      Overview tab's Settings button; each view has its own search. */
@@ -1285,6 +1292,117 @@ a.note-meta-chip:hover { color: var(--accent); }
   touch-action: none;
 }
 /* movement is touch-drag (mobile) or ← → (desktop); fire is automatic */
+
+/* ── Assistant shell ─────────────────────────────────────────────────────── */
+.assistant-view {
+  display: flex;
+  flex-direction: column;
+  min-height: min(760px, calc(100dvh - var(--topbar-h) - (2 * var(--sp-5))));
+}
+.assistant-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+.assistant-loading {
+  width: min(36rem, 100%);
+  margin: var(--sp-4) auto;
+  padding: var(--sp-4);
+}
+.assistant-setup {
+  width: min(36rem, 100%);
+  margin: var(--sp-4) auto;
+  text-align: center;
+  padding: var(--sp-6) var(--sp-5);
+}
+.assistant-setup-icon {
+  width: 56px; height: 56px; border-radius: var(--r-lg);
+  margin: 0 auto var(--sp-4);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent-2);
+  background: color-mix(in oklab, var(--accent) 12%, var(--bg-2));
+  border: 1px solid var(--accent-line);
+}
+.assistant-setup-copy {
+  line-height: 1.55;
+  margin: 0 auto var(--sp-4);
+  max-width: 29rem;
+}
+.assistant-setup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: min(21rem, 100%);
+  margin: 0 auto;
+}
+.assistant-setup-note {
+  margin-top: var(--sp-4);
+  font-size: var(--fs-sm);
+}
+.assistant-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  width: min(46rem, 100%);
+  margin: var(--sp-1) auto var(--sp-3);
+}
+.assistant-usage .icon { width: 13px; height: 13px; }
+.assistant-transcript {
+  flex: 1;
+  min-height: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  width: min(46rem, 100%);
+  margin: 0 auto;
+  overflow-y: auto;
+  padding-bottom: var(--sp-3);
+}
+.assistant-pending-host {
+  width: min(46rem, 100%);
+  margin: 0 auto;
+}
+.assistant-message {
+  display: flex;
+  min-width: 0;
+}
+.assistant-message.user {
+  justify-content: flex-end;
+}
+.assistant-message .asst-bubble {
+  max-width: min(82%, 42rem);
+  padding: .7rem .9rem;
+}
+.assistant-message.user .asst-bubble {
+  background: color-mix(in oklab, var(--accent) 24%, var(--bg-2));
+  color: var(--text-hi);
+  border-color: var(--accent-line);
+}
+.assistant-composer {
+  position: sticky;
+  bottom: 0;
+  width: min(46rem, 100%);
+  margin: 0 auto;
+  padding: var(--sp-2) 0 0;
+  background: linear-gradient(180deg, transparent, var(--bg-0) 32%);
+}
+.asst-inputrow {
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+}
+.assistant-input {
+  flex: 1;
+  resize: none;
+  min-height: 46px;
+  max-height: 160px;
+}
+.assistant-composer-note {
+  font-size: var(--fs-sm);
+  padding-bottom: var(--sp-1);
+}
 
 /* ── Assistant model picker: in-UI dropdown with spring unfold ───────────── */
 .mdl { position: relative; display: inline-block; }
