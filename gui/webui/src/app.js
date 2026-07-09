@@ -1101,18 +1101,22 @@ async function renderSyncWidget() {
   const days = 14, now = Date.now(), buckets = new Array(days).fill(0);
   runs.forEach(r => { const t = toDate(r.finished_at || r.started_at); if (!t) return; const d = Math.floor((now - t.getTime()) / 864e5); if (d >= 0 && d < days) buckets[days - 1 - d]++; });
   clear(box);
-  box.append(
-    el("div", { class: "sw-head" },
-      el("span", { class: "sw-title", text: "System health" }),
-      (st.enabled && CAP.sync) ? el("div", { class: "sw-actions" },
-        el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
-        st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
-          : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))) : null),
+  const syncHead = el("div", { class: "sw-head" },
+    el("span", { class: "sw-title", text: "System health" }));
+  if (st.enabled && CAP.sync) {
+    syncHead.append(el("div", { class: "sw-actions" },
+      el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
+      st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
+        : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))));
+  }
+  const syncNodes = [
+    syncHead,
     el("div", { class: "sw-health " + (runs.length ? (healthy ? "ok" : "warn") : "") },
       el("span", { class: "dot" }), el("b", { text: !runs.length ? "Ready" : healthy ? "Healthy" : `${failed} alert${failed > 1 ? "s" : ""}` })),
-    runs.length ? el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)) : null,
-    el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }),
-  );
+  ];
+  if (runs.length) syncNodes.push(el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)));
+  syncNodes.push(el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }));
+  box.append(...syncNodes);
 }
 async function syncCmd(cmd) {
   try { await post(`/api/v1/sync/${cmd}`, CAP.sync); toast(`sync ${cmd}`); renderSyncWidget(); }
@@ -4734,7 +4738,7 @@ function renderAssistantSetup(body, st) {
 function renderAssistantChat(body, st) {
   const provider = agentActiveProvider(st);
   const hasConsent = agentPrivacyConsentAccepted(provider);
-  body.append(
+  const chatNodes = [
     el("div", { class: "assistant-toolbar" },
       el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
       agentModelSwitcher(st),
@@ -4742,11 +4746,12 @@ function renderAssistantChat(body, st) {
       el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
         icon("shield", "icon-sm"), "Privacy"),
     ),
-    hasConsent ? null : renderAssistantConsentPanel([provider]),
     el("div", { id: "asst-log", class: "assistant-transcript", "data-agent-transcript": "1", "data-testid": "agent-transcript" }),
     el("div", { class: "assistant-pending-host", "data-agent-pending": "1", "data-testid": "agent-pending-actions" }),
     renderAssistantComposer(st),
-  );
+  ];
+  if (!hasConsent) chatNodes.splice(1, 0, renderAssistantConsentPanel([provider]));
+  body.append(...chatNodes);
   const log = $("#asst-log");
   if (!AssistantState.transcript.length) {
     log.append(el("div", { class: "dim", style: "text-align:center;padding:2.5rem 1rem", text: "Ask me anything about your Microsoft 365 — I'll read your archive and answer with sources." }));

@@ -1073,10 +1073,12 @@ a.note-meta-chip:hover { color: var(--accent); }
   .view { padding: var(--sp-4); padding-bottom: 76px; }
   .view-title { font-size: var(--fs-xl); }
   .assistant-view { min-height: calc(100dvh - 76px - (2 * var(--sp-4))); }
+  .assistant-body { min-height: auto; }
   .assistant-toolbar { gap: var(--sp-1); margin-bottom: var(--sp-2); }
-  .assistant-transcript { min-height: 220px; }
+  .assistant-transcript { flex: none; min-height: 220px; overflow: visible; padding-bottom: 5.5rem; }
+  .assistant-pending-host { padding-bottom: 5.5rem; }
   .assistant-message .asst-bubble { max-width: 92%; }
-  .assistant-composer { bottom: 0; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .assistant-composer { position: static; bottom: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
   .asst-inputrow { align-items: flex-end; }
   /* the topbar (route name + global-search + settings) duplicates the per-view
      content + bottom nav on a phone — hide it. Settings is reachable from the
