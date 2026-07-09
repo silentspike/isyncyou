@@ -12,6 +12,7 @@ use crate::session_ids::{DeviceId, LeaseId, SessionId, TurnId};
 use crate::AgentError;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -212,9 +213,19 @@ fn onedrive_lease_file(session_id: &SessionId) -> String {
 
 /// Storage for per-turn files + the active-turn lease. Account/session scoping is by
 /// `session_id`. Implemented over OneDrive (feature `onedrive`) and an in-memory fake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutTurnOutcome {
+    Stored,
+    AlreadyPresentSame,
+}
+
 pub trait SessionTransport {
-    fn put(&self, session_id: &SessionId, turn_id: &TurnId, bytes: &[u8])
-        -> Result<(), AgentError>;
+    fn put_turn_if_absent(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        bytes: &[u8],
+    ) -> Result<PutTurnOutcome, AgentError>;
     fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError>;
     /// ULIDs present for the session.
     fn list(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError>;
@@ -338,7 +349,20 @@ impl LocalSessionCache for FileSessionCache {
         let pending_dir = self.ensure_safe_parent(session_id)?;
         let final_path = self.pending_path(session_id, turn_id);
         let tmp_path = pending_dir.join(format!("{}.{}.tmp", turn_id.as_str(), new_ulid()?));
-        std::fs::write(&tmp_path, bytes).map_err(|e| AgentError::Provider(e.to_string()))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp_path)
+            .map_err(|e| AgentError::Provider(e.to_string()))?;
+        file.write_all(bytes)
+            .map_err(|e| AgentError::Provider(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| AgentError::Provider(e.to_string()))?;
         std::fs::rename(&tmp_path, &final_path).map_err(|e| AgentError::Provider(e.to_string()))?;
         Ok(())
     }
@@ -611,21 +635,36 @@ impl<T: SessionTransport, C: LocalSessionCache> Session<T, C> {
         Ok((turn_id, turn, sealed))
     }
 
-    /// Upload any pending (offline-written) turns that the transport does not yet have.
-    /// Idempotent: ULIDs already present are skipped. Returns how many were uploaded.
+    /// Upload any pending offline turns. If the remote ULID already exists, it is
+    /// idempotent only when the remote envelope bytes match exactly.
     pub fn sync(&self) -> Result<usize, AgentError> {
         let present: std::collections::HashSet<TurnId> =
             self.transport.list(&self.session_id)?.into_iter().collect();
         let mut uploaded = 0;
         for turn_id in self.cache.list_pending(&self.session_id)? {
-            if present.contains(&turn_id) {
-                self.cache.remove_pending(&self.session_id, &turn_id)?;
-                continue; // already there — no duplicate
-            }
             let bytes = self.cache.get_pending(&self.session_id, &turn_id)?;
-            if let Ok(()) = self.transport.put(&self.session_id, &turn_id, &bytes) {
+            if present.contains(&turn_id) {
+                let remote = self.transport.get(&self.session_id, &turn_id)?;
+                if remote != bytes {
+                    return Err(AgentError::Transport(format!(
+                        "pending turn {turn_id} conflicts with different remote bytes"
+                    )));
+                }
                 self.cache.remove_pending(&self.session_id, &turn_id)?;
-                uploaded += 1;
+                continue;
+            }
+            match self
+                .transport
+                .put_turn_if_absent(&self.session_id, &turn_id, &bytes)
+            {
+                Ok(PutTurnOutcome::Stored) => {
+                    self.cache.remove_pending(&self.session_id, &turn_id)?;
+                    uploaded += 1;
+                }
+                Ok(PutTurnOutcome::AlreadyPresentSame) => {
+                    self.cache.remove_pending(&self.session_id, &turn_id)?;
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(uploaded)
@@ -724,7 +763,7 @@ impl<T: SessionTransport, C: LocalSessionCache> ActiveTurn<'_, T, C> {
         let bytes = serde_json::to_vec(&sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
         self.session
             .transport
-            .put(&self.lease.session_id, &turn_id, &bytes)?;
+            .put_turn_if_absent(&self.lease.session_id, &turn_id, &bytes)?;
         *self.session.head.borrow_mut() = Some(turn_id);
         self.next_observed_head = Some(TurnId::new(&turn.ulid)?);
         Ok(turn)
@@ -794,18 +833,26 @@ impl InMemoryTransport {
 }
 
 impl SessionTransport for InMemoryTransport {
-    fn put(
+    fn put_turn_if_absent(
         &self,
         session_id: &SessionId,
         turn_id: &TurnId,
         bytes: &[u8],
-    ) -> Result<(), AgentError> {
+    ) -> Result<PutTurnOutcome, AgentError> {
         self.guard()?;
+        let key = (session_id.clone(), turn_id.clone());
+        let mut files = self.files.borrow_mut();
+        if let Some(existing) = files.get(&key) {
+            if existing == bytes {
+                return Ok(PutTurnOutcome::AlreadyPresentSame);
+            }
+            return Err(AgentError::Transport(format!(
+                "turn already exists with different bytes: {session_id}/{turn_id}"
+            )));
+        }
         self.put_count.set(self.put_count.get() + 1);
-        self.files
-            .borrow_mut()
-            .insert((session_id.clone(), turn_id.clone()), bytes.to_vec());
-        Ok(())
+        files.insert(key, bytes.to_vec());
+        Ok(PutTurnOutcome::Stored)
     }
     fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError> {
         self.guard()?;
@@ -891,7 +938,7 @@ impl SessionTransport for InMemoryTransport {
 mod onedrive {
     use super::{
         new_lease_record, onedrive_lease_file, onedrive_session_dir, onedrive_turn_file, DeviceId,
-        LeaseId, LeaseRecord, SessionId, SessionTransport, TurnId,
+        LeaseId, LeaseRecord, PutTurnOutcome, SessionId, SessionTransport, TurnId,
     };
     use crate::AgentError;
     use isyncyou_graph::http::{ConflictBehavior, GraphClient, UploadError};
@@ -1030,12 +1077,12 @@ mod onedrive {
     }
 
     impl SessionTransport for OneDriveTransport {
-        fn put(
+        fn put_turn_if_absent(
             &self,
             session_id: &SessionId,
             turn_id: &TurnId,
             bytes: &[u8],
-        ) -> Result<(), AgentError> {
+        ) -> Result<PutTurnOutcome, AgentError> {
             let created = self
                 .client
                 .upload_content_with_conflict_behavior(
@@ -1045,11 +1092,15 @@ mod onedrive {
                 )
                 .map_err(|e| AgentError::Transport(e.to_string()))?;
             if created.is_none() {
+                let remote = self.get(session_id, turn_id)?;
+                if remote == bytes {
+                    return Ok(PutTurnOutcome::AlreadyPresentSame);
+                }
                 return Err(AgentError::Transport(format!(
-                    "turn already exists: {turn_id}"
+                    "turn already exists with different bytes: {session_id}/{turn_id}"
                 )));
             }
-            Ok(())
+            Ok(PutTurnOutcome::Stored)
         }
         fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError> {
             let url = format!(
@@ -1228,6 +1279,18 @@ mod tests {
         }
     }
 
+    fn sealed_fixture_bytes_with_key(
+        config: &SessionCryptoConfig,
+        key: &SessionKey,
+        turn: Turn,
+    ) -> Vec<u8> {
+        let turn_id = tid(&turn.ulid);
+        let plaintext = serde_json::to_vec(&turn).unwrap();
+        let sealed =
+            session_crypto::seal(key, config, &sid("sess1"), &turn_id, &plaintext).unwrap();
+        serde_json::to_vec(&sealed).unwrap()
+    }
+
     fn put_fixture_turn_with_key(
         transport: &InMemoryTransport,
         config: &SessionCryptoConfig,
@@ -1235,15 +1298,9 @@ mod tests {
         turn: Turn,
     ) {
         let turn_id = tid(&turn.ulid);
-        let plaintext = serde_json::to_vec(&turn).unwrap();
-        let sealed =
-            session_crypto::seal(key, config, &sid("sess1"), &turn_id, &plaintext).unwrap();
+        let bytes = sealed_fixture_bytes_with_key(config, key, turn);
         transport
-            .put(
-                &sid("sess1"),
-                &turn_id,
-                &serde_json::to_vec(&sealed).unwrap(),
-            )
+            .put_turn_if_absent(&sid("sess1"), &turn_id, &bytes)
             .unwrap();
     }
 
@@ -1254,6 +1311,45 @@ mod tests {
         let a = String::from_utf8(encode_time(1_000).to_vec()).unwrap();
         let b = String::from_utf8(encode_time(2_000).to_vec()).unwrap();
         assert!(a < b);
+    }
+
+    #[test]
+    fn put_turn_if_absent_is_idempotent_for_same_bytes() {
+        let transport = InMemoryTransport::new();
+        assert_eq!(
+            transport
+                .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), b"sealed")
+                .unwrap(),
+            PutTurnOutcome::Stored
+        );
+        assert_eq!(
+            transport
+                .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), b"sealed")
+                .unwrap(),
+            PutTurnOutcome::AlreadyPresentSame
+        );
+        assert_eq!(transport.put_count(), 1);
+        assert_eq!(
+            transport.raw(&sid("sess1"), &tid(TURN_A)).unwrap(),
+            b"sealed"
+        );
+    }
+
+    #[test]
+    fn put_turn_if_absent_rejects_same_ulid_different_bytes() {
+        let transport = InMemoryTransport::new();
+        transport
+            .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), b"first")
+            .unwrap();
+        let err = transport
+            .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), b"second")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different bytes"), "{err}");
+        assert_eq!(
+            transport.raw(&sid("sess1"), &tid(TURN_A)).unwrap(),
+            b"first"
+        );
     }
 
     #[test]
@@ -1604,6 +1700,89 @@ mod tests {
     }
 
     #[test]
+    fn sync_pending_remote_same_bytes_removes_pending_without_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = std::rc::Rc::new(InMemoryTransport::new());
+        let cache = FileSessionCache::new(dir.path());
+        let config = crypto_config();
+        let key = crypto_key(&config);
+        let bytes = sealed_fixture_bytes_with_key(
+            &config,
+            &key,
+            fixture_turn(TURN_A, None, vec![], "same"),
+        );
+        transport
+            .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), &bytes)
+            .unwrap();
+        cache
+            .put_pending(&sid("sess1"), &tid(TURN_A), &bytes)
+            .unwrap();
+        let session = Session::new_with_cache(
+            "sess1",
+            KEY.to_vec(),
+            RcTransport(transport.clone()),
+            config,
+            cache,
+        )
+        .unwrap();
+
+        assert_eq!(session.sync().unwrap(), 0);
+        assert_eq!(transport.put_count(), 1);
+        assert!(session
+            .cache
+            .list_pending(&sid("sess1"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn sync_pending_remote_different_bytes_errors_and_keeps_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = std::rc::Rc::new(InMemoryTransport::new());
+        let cache = FileSessionCache::new(dir.path());
+        let config = crypto_config();
+        let key = crypto_key(&config);
+        let remote = sealed_fixture_bytes_with_key(
+            &config,
+            &key,
+            fixture_turn(TURN_A, None, vec![], "remote"),
+        );
+        let pending = sealed_fixture_bytes_with_key(
+            &config,
+            &key,
+            fixture_turn(TURN_A, None, vec![], "pending"),
+        );
+        transport
+            .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), &remote)
+            .unwrap();
+        cache
+            .put_pending(&sid("sess1"), &tid(TURN_A), &pending)
+            .unwrap();
+        let session =
+            Session::new_with_cache("sess1", KEY.to_vec(), RcTransport(transport), config, cache)
+                .unwrap();
+
+        let err = session.sync().unwrap_err().to_string();
+        assert!(err.contains("different remote bytes"), "{err}");
+        assert_eq!(session.cache.list_pending(&sid("sess1")).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_session_cache_pending_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileSessionCache::new(dir.path());
+        cache
+            .put_pending(&sid("sess1"), &tid(TURN_A), b"sealed")
+            .unwrap();
+        let path = cache.pending_path(&sid("sess1"), &tid(TURN_A));
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
     fn filesystem_cache_rejects_symlink_and_traversal_hazards() {
         let dir = tempfile::tempdir().unwrap();
         let cache = FileSessionCache::new(dir.path());
@@ -1693,7 +1872,7 @@ mod tests {
         let sealed =
             session_crypto::seal(&key, &config, &sid("sess1"), &tid(TURN_B), &plaintext).unwrap();
         transport
-            .put(
+            .put_turn_if_absent(
                 &sid("sess1"),
                 &tid(TURN_A),
                 &serde_json::to_vec(&sealed).unwrap(),
@@ -1863,17 +2042,51 @@ mod tests {
 
     #[cfg(feature = "onedrive")]
     #[test]
-    fn graph_turn_put_uses_create_if_absent() {
-        let (base, server) = serve(vec![http_response(409, "Conflict", "", "exists")]);
+    fn graph_turn_put_conflict_same_bytes_is_idempotent() {
+        let (base, server) = serve(vec![
+            http_response(409, "Conflict", "", "exists"),
+            http_response(
+                200,
+                "OK",
+                "content-type: application/octet-stream",
+                "sealed",
+            ),
+        ]);
         let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
-        let err = transport
-            .put(&sid("sess1"), &tid(TURN_A), b"sealed")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("turn already exists"), "{err}");
+        assert_eq!(
+            transport
+                .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), b"sealed")
+                .unwrap(),
+            PutTurnOutcome::AlreadyPresentSame
+        );
         let seen = server.join().unwrap();
         assert!(seen[0].contains(&format!(
             "PUT /me/drive/root:/Apps/iSyncYou/agent/sess1/{TURN_A}.json:/content?@microsoft.graph.conflictBehavior=fail "
+        )));
+        assert!(seen[1].contains(&format!(
+            "GET /me/drive/root:/Apps/iSyncYou/agent/sess1/{TURN_A}.json:/content "
+        )));
+    }
+
+    #[cfg(feature = "onedrive")]
+    #[test]
+    fn graph_turn_put_conflict_different_bytes_is_error() {
+        let (base, server) = serve(vec![
+            http_response(409, "Conflict", "", "exists"),
+            http_response(200, "OK", "content-type: application/octet-stream", "other"),
+        ]);
+        let transport = super::onedrive::OneDriveTransport::with_base_url("tok", &base);
+        let err = transport
+            .put_turn_if_absent(&sid("sess1"), &tid(TURN_A), b"sealed")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different bytes"), "{err}");
+        let seen = server.join().unwrap();
+        assert!(seen[0].contains(&format!(
+            "PUT /me/drive/root:/Apps/iSyncYou/agent/sess1/{TURN_A}.json:/content?@microsoft.graph.conflictBehavior=fail "
+        )));
+        assert!(seen[1].contains(&format!(
+            "GET /me/drive/root:/Apps/iSyncYou/agent/sess1/{TURN_A}.json:/content "
         )));
     }
 
@@ -1966,8 +2179,13 @@ mod tests {
     /// Test shim so a test can hold the transport AND give one to the session.
     struct RcTransport(std::rc::Rc<InMemoryTransport>);
     impl SessionTransport for RcTransport {
-        fn put(&self, s: &SessionId, u: &TurnId, b: &[u8]) -> Result<(), AgentError> {
-            self.0.put(s, u, b)
+        fn put_turn_if_absent(
+            &self,
+            s: &SessionId,
+            u: &TurnId,
+            b: &[u8],
+        ) -> Result<PutTurnOutcome, AgentError> {
+            self.0.put_turn_if_absent(s, u, b)
         }
         fn get(&self, s: &SessionId, u: &TurnId) -> Result<Vec<u8>, AgentError> {
             self.0.get(s, u)

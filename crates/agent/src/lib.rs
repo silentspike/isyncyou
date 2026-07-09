@@ -46,8 +46,8 @@ pub use retrieval::RetrievalExecutor;
 pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
 pub use session::{
     detect_fork, new_ulid, ActiveTurn, FileSessionCache, InMemoryTransport, LeaseRecord,
-    LoadedSession, LocalSessionCache, MemorySessionCache, Session, SessionFork, SessionTransport,
-    Turn, TurnLeaseState,
+    LoadedSession, LocalSessionCache, MemorySessionCache, PutTurnOutcome, Session, SessionFork,
+    SessionTransport, Turn, TurnLeaseState,
 };
 pub use session_crypto::{KdfProfile, PairingPayload, SessionCryptoConfig};
 pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
