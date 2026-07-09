@@ -135,10 +135,19 @@ requirements:
       Retrieval results carry Store-item source IDs (service/id/path) so answers cite
       their sources, not just free text; reads respect a max_bytes budget (truncate +
       flag). (S-AG.3, #618)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - A search/read result carries a {service, id, path} source reference.
       - A read over budget is truncated and flagged.
+      - List and export results carry source identifiers for returned items.
+      - The app-host experimental agent build binds read-class actions to the real StoreArchive executor.
     verified_by:
-      - test: retrieval_results_carry_source_ids
+      - test: search_returns_source_tagged_hits_across_names_and_bodies
+      - test: read_includes_source_object
+      - test: read_respects_byte_budget_and_flags_truncation
+      - test: list_pages_flat_service_items_with_count
+      - test: export_raw_passthrough_carries_source_ids
+      - test: store_archive_reads_sealed_body_with_envelope_reader
+      - test: store_archive_executor_covers_search_read_list_export_shapes
+      - test: experimental_agent_executor_reads_store_archive_fixture
