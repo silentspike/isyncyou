@@ -74,8 +74,6 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
     }
 }
 
-/// A read-class tool executor placeholder until S-AG.8/#623 wires the real archive
-/// retrieval executor. A canned text turn never calls it.
 /// Fallback read executor for builds without the experimental agent (no store/SQLCipher
 /// pull): returns a placeholder so the turn loop still runs in CI/release shapes.
 #[cfg(not(feature = "agent-subscription-experimental"))]
@@ -91,8 +89,9 @@ impl isyncyou_agent::ToolExecutor for StubExecutor {
 }
 
 /// Build the read-class tool executor for a turn. The experimental agent build binds the
-/// real `StoreArchive` retrieval executor (searches the encrypted store + on-disk body
-/// files for `account` under `archive_root`, S-AG.18/#643); other builds get the stub.
+/// real `StoreArchive` retrieval executor (S-AG.3/#618: search/read/list/export over the
+/// encrypted store + on-disk body files for `account` under `archive_root`); other builds
+/// get the stub. S-AG.18/#643 is the progressive/deep-search behavior layered on top.
 #[cfg(feature = "agent-subscription-experimental")]
 fn make_executor(
     account: &str,
@@ -171,7 +170,8 @@ type ProviderBuilder =
 const AGENT_SYSTEM_PROMPT: &str = "You are the iSyncYou in-app assistant. You help the user with \
 their own Microsoft 365 data that iSyncYou manages — mail, OneDrive files and photos, calendar, \
 contacts, tasks and notes — plus iSyncYou's backup and restore. Your only tool is `isyncyou`; you \
-never touch anything outside the user's M365 domain. Read with the tool before answering. The app \
+never touch anything outside the user's M365 domain. Read with the tool before answering, and \
+ground factual claims in the returned source fields (`service`, `id`, and `path` or `source`). The app \
 already renders every search hit as a rich, typed, clickable card (header + body + a link to the \
 item), so DO NOT re-list the found items in your reply and DO NOT use markdown (no **bold**, no \
 bullet lists) — answer in one or two short plain-language sentences about what you found. \
@@ -2458,14 +2458,105 @@ mod tests {
                 .lock()
                 .unwrap();
             isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
+            isyncyou_core::envelope::reset_body_keys_for_tests();
             Self { _guard: guard }
         }
     }
 
     impl Drop for EnvelopeRequirementGuard {
         fn drop(&mut self) {
+            isyncyou_core::envelope::reset_body_keys_for_tests();
             isyncyou_core::envelope::reset_body_envelope_requirement_for_tests();
         }
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn experimental_agent_executor_reads_store_archive_fixture() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(618_070, [70u8; 32]);
+
+        let root = std::env::temp_dir().join(format!(
+            "isy-apphost-agent-retrieval-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("mail/aa")).unwrap();
+
+        let store = isyncyou_store::Store::open(root.join(".isyncyou-store.db")).unwrap();
+        let mut item =
+            isyncyou_store::Item::new("me", "mail", "m-runtime", "Runtime fixture mail", "message");
+        item.local_path = Some("mail/aa/m-runtime.eml".into());
+        store.upsert_item(&item).unwrap();
+        store
+            .index_body("me", "mail", "m-runtime", "Runtime body indexed text")
+            .unwrap();
+        drop(store);
+
+        isyncyou_core::envelope::write_body_atomic(
+            &root.join("mail/aa/m-runtime.eml"),
+            b"Runtime body archived text",
+        )
+        .unwrap();
+
+        let exec = make_executor("me", root.clone());
+
+        let search = isyncyou_agent::ToolAction::Search {
+            account: "me".into(),
+            services: vec!["mail".into()],
+            query: "Runtime".into(),
+            limit: Some(5),
+        };
+        let search_out: serde_json::Value =
+            serde_json::from_str(&exec.execute_read(&search).unwrap()).unwrap();
+        assert_eq!(search_out["results"][0]["id"], "m-runtime");
+        assert_eq!(search_out["results"][0]["service"], "mail");
+
+        let read = isyncyou_agent::ToolAction::Read {
+            account: "me".into(),
+            service: "mail".into(),
+            id: "m-runtime".into(),
+            max_bytes: None,
+        };
+        let read_out: serde_json::Value =
+            serde_json::from_str(&exec.execute_read(&read).unwrap()).unwrap();
+        assert_eq!(read_out["source"]["id"], "m-runtime");
+        assert!(read_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime body archived text"));
+
+        let list = isyncyou_agent::ToolAction::List {
+            account: "me".into(),
+            service: "mail".into(),
+            parent: None,
+            limit: Some(10),
+            offset: Some(0),
+        };
+        let list_out: serde_json::Value =
+            serde_json::from_str(&exec.execute_read(&list).unwrap()).unwrap();
+        assert_eq!(list_out["service_total"], 1);
+        assert_eq!(list_out["results"][0]["id"], "m-runtime");
+
+        let export = isyncyou_agent::ToolAction::Export {
+            account: "me".into(),
+            service: "mail".into(),
+            id: "m-runtime".into(),
+        };
+        let export_out: serde_json::Value =
+            serde_json::from_str(&exec.execute_read(&export).unwrap()).unwrap();
+        assert_eq!(export_out["format"], "raw");
+        assert_eq!(export_out["source"]["path"], "mail/aa/m-runtime.eml");
+        assert!(export_out["content"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime body archived text"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

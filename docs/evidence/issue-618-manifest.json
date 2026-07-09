@@ -1,0 +1,37 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-08T21:04:51Z",
+  "commit": "96834a98b650d1aa58cdac246880dc53adecc9c5",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-009",
+      "claim": "Search, read, list, and export payloads carry source identifiers, and reads report byte-budget truncation over model-facing UTF-8 content.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent retrieval -- --nocapture",
+      "result": "pass",
+      "evidence": "22 retrieval tests passed, including search_returns_source_tagged_hits_across_names_and_bodies, read_includes_source_object, read_respects_byte_budget_and_flags_truncation, list_pages_flat_service_items_with_count, and export_raw_passthrough_carries_source_ids.",
+      "test": "read_includes_source_object"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-009",
+      "claim": "The real StoreArchive path reads encrypted/sealed archived bodies and supports Search, Read, List, and Export through ToolExecutor over a populated temp archive fixture.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features retrieval retrieval -- --nocapture && cargo +1.95.0 test -p isyncyou-agent --features retrieval store_archive -- --nocapture",
+      "result": "pass",
+      "evidence": "The retrieval feature run passed 27 retrieval tests, including store_archive_executor_covers_search_read_list_export_shapes and calendar/contact export source coverage; the store_archive run passed 8 tests, including store_archive_reads_sealed_body_with_envelope_reader.",
+      "test": "store_archive_executor_covers_search_read_list_export_shapes"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-009",
+      "claim": "The app-host experimental agent build binds read-class actions to a real StoreArchive-backed RetrievalExecutor.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental -- --nocapture",
+      "result": "pass",
+      "evidence": "18 app-host feature tests passed, including experimental_agent_executor_reads_store_archive_fixture, which executed Search, Read, List, and Export through make_executor against a temp StoreArchive fixture with a sealed body.",
+      "test": "experimental_agent_executor_reads_store_archive_fixture"
+    }
+  ]
+}

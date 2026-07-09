@@ -15,8 +15,8 @@ isyncyou-connectors = { path = "../connectors", features = ["http"], default-fea
 isyncyou-engine = { path = "../engine", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
 # Agent harness (S-AG.6/#621). Default features only — no store/SQLCipher pull, so it
-# adds no bundling-feature pressure to the encrypted/plain chains. The real retrieval
-# executor + official providers (the store/http/onedrive features) land with S-AG.8/#623.
+# adds no bundling-feature pressure to the encrypted/plain chains. StoreArchive-backed
+# basic retrieval is S-AG.3/#618 and is enabled only by the app-host experimental feature.
 isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 
@@ -45,8 +45,8 @@ plain-store = [
 # OAuth login + provider in the agent harness. Never enabled in CI/release artifacts;
 # the operator opts in for their own Desktop/Android build. Pulls the agent's http
 # stack (reqwest/rustls) AND the real retrieval executor (`StoreArchive` over the
-# encrypted store + body files, S-AG.18/#643) so the assistant actually searches the
-# archive instead of the stub.
+# encrypted store + body files, S-AG.3/#618) so the assistant actually searches the
+# archive instead of the stub. S-AG.18/#643 is only the progressive/deep-search layer.
 agent-subscription-experimental = [
     "isyncyou-agent/agent-subscription-experimental",
     "isyncyou-agent/retrieval",

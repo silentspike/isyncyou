@@ -52,6 +52,10 @@ pub enum ToolAction {
         service: String,
         #[serde(default)]
         parent: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+        #[serde(default)]
+        offset: Option<u32>,
     },
     /// Export an item to a portable file (ics/vcard/raw).
     Export {
@@ -142,7 +146,7 @@ pub fn help_text() -> String {
      search {account, services?, query, limit?} · \
      deep-search {account, services?, query, cursor?, max_reads?} · \
      read {account, service, id, max_bytes?} · \
-     list {account, service, parent?} · \
+     list {account, service, parent?, limit?, offset?} · \
      export {account, service, id} · \
      restore-local {account, service, id} · \
      backup {account, services?} [confirm] · \
@@ -191,6 +195,7 @@ pub fn tool_schema() -> serde_json::Value {
                 "query": { "type": "string" },
                 "services": { "type": "array", "items": { "type": "string" } },
                 "limit": { "type": "integer" },
+                "offset": { "type": "integer" },
                 "cursor": { "type": "integer" },
                 "max_reads": { "type": "integer" },
                 "max_bytes": { "type": "integer" },
@@ -237,6 +242,30 @@ mod tests {
 
         let missing = json!({"op": "read", "account": "me"}); // missing service/id
         assert!(parse_action(&missing).is_err());
+    }
+
+    #[test]
+    fn parse_list_accepts_pagination_args() {
+        let v = json!({
+            "op": "list",
+            "account": "me",
+            "service": "onedrive",
+            "parent": "root",
+            "limit": 25,
+            "offset": 50
+        });
+        let action = parse_action(&v).expect("should parse paged list");
+        assert_eq!(
+            action,
+            ToolAction::List {
+                account: "me".into(),
+                service: "onedrive".into(),
+                parent: Some("root".into()),
+                limit: Some(25),
+                offset: Some(50),
+            }
+        );
+        assert_eq!(action.class(), ToolClass::Read);
     }
 
     #[test]
