@@ -1,0 +1,17 @@
+{
+  "test": "live_onedrive_session_roundtrip_ciphertext_and_cleanup",
+  "source": "cargo +1.95.0 test -p isyncyou-agent --features onedrive --test live_session_onedrive -- --ignored --nocapture live_onedrive_session_roundtrip_ciphertext_and_cleanup",
+  "session_id": "ag619-01KX2XHRZ7G0DM1XC6Q1FG55E4",
+  "turn_count": 3,
+  "heads": [
+    "01KX2XJD5562QJATPZQ2YJCH38"
+  ],
+  "ciphertext_only": true,
+  "lease_blocked_second_holder": true,
+  "cleanup_path": "Apps/iSyncYou/agent/ag619-01KX2XHRZ7G0DM1XC6Q1FG55E4",
+  "cleanup_verify": {
+    "status": 404,
+    "result": "deleted"
+  },
+  "captured_at": "2026-07-09T09:45:00+02:00"
+}
