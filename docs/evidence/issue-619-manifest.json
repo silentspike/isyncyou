@@ -1,0 +1,59 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-09T09:52:28+02:00",
+  "commit": "22412825dd7c24edce67f2d58e67edf0f0f1e4ee",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-006",
+      "claim": "Pairing payloads derive the same cross-device session key on paired devices, reject weak or mismatched KDF profiles, and cannot be opened with a device-local-only key.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent -- --nocapture session_crypto",
+      "result": "pass",
+      "evidence": "Session crypto tests passed, including Argon2id/HKDF pairing-key derivation, weak-KDF rejection, envelope/profile mismatch rejection, downgrade resistance, and device-local key rejection.",
+      "test": "pairing_payload_derives_same_session_key_on_two_devices"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-006",
+      "claim": "Stored turns and offline pending writes are sealed ciphertext, durable across restart, and report forks instead of silently choosing a divergent head.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent -- --nocapture session",
+      "result": "pass",
+      "evidence": "Session tests passed, including only_ciphertext_is_stored_no_plaintext, filesystem_cache_persists_offline_pending_restart, sync_pending_removes_files_after_success_and_is_idempotent, load_reports_two_heads_as_fork, and forced_offline_concurrent_turns_surface_fork_on_reconnect.",
+      "test": "only_ciphertext_is_stored_no_plaintext"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-006",
+      "claim": "The OneDrive transport enforces an exclusive active-turn lease with create-conflict, If-Match takeover, holder/lease-id checked renewal, and holder/lease-id checked release semantics.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features onedrive -- --nocapture graph_lease",
+      "result": "pass",
+      "evidence": "Graph lease tests passed, including graph_lease_create_conflict_returns_busy, graph_lease_takeover_uses_if_match, graph_lease_takeover_lost_race_does_not_acquire, graph_lease_renew_checks_holder_and_lease_id, and graph_lease_release_checks_holder_and_lease_id.",
+      "test": "graph_lease_takeover_uses_if_match"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-006",
+      "claim": "The Android JNI-only KDF benchmark path is feature-gated and produces redacted structured Pixel 8 Pro Argon2id/HKDF timing evidence.",
+      "method": "probe",
+      "command": "ISY_CARGO_FEATURES=agent-session-kdf-bench ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentSessionKdfBenchmarkInstrumentedTest",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-619/kdf-benchmark-pixel8pro.json",
+      "evidence": "Pixel 8 Pro JNI benchmark recorded median_ms=213.001 and p95_ms=218.6 for Argon2id/HKDF with memory_kib=65536, iterations=3, lanes=4.",
+      "notes": "Feature-gated JNI benchmark only; #620 still owns Android Keystore persistence."
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-006",
+      "claim": "A live OneDrive session roundtrip stores ciphertext-only turn files, blocks a second active lease holder, and deletes the fixture during cleanup.",
+      "method": "probe",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features onedrive --test live_session_onedrive -- --ignored --nocapture live_onedrive_session_roundtrip_ciphertext_and_cleanup",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-619/live-onedrive-session-roundtrip.json",
+      "evidence": "Live OneDrive evidence recorded ciphertext_only=true, lease_blocked_second_holder=true, turn_count=3, and cleanup_verify=DELETED status=404.",
+      "notes": "The test used a fresh M365 write token from the local MSAL cache without printing the token."
+    }
+  ]
+}
