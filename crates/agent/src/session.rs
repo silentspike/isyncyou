@@ -7,7 +7,7 @@
 //! tested over an in-memory fake; [`OneDriveTransport`] (feature `onedrive`) is the real
 //! one. An **active-turn lease** prevents forks; **fork detection** is the fallback.
 
-use crate::session_crypto::{self, SealedTurn};
+use crate::session_crypto::{self, SealedTurn, SessionCryptoConfig, SessionKey};
 use crate::session_ids::{DeviceId, SessionId, TurnId};
 use crate::AgentError;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -159,7 +159,8 @@ pub fn detect_fork(turns: &[Turn]) -> Vec<String> {
 /// An encrypted, conflict-safe session over a [`SessionTransport`].
 pub struct Session<T: SessionTransport> {
     pub session_id: SessionId,
-    pairing_secret: Vec<u8>,
+    crypto_config: SessionCryptoConfig,
+    session_key: SessionKey,
     transport: T,
     /// Sealed turns not yet confirmed on the transport (offline cache).
     pending: std::cell::RefCell<Vec<SealedTurn>>,
@@ -172,9 +173,21 @@ impl<T: SessionTransport> Session<T> {
         pairing_secret: Vec<u8>,
         transport: T,
     ) -> Result<Self, AgentError> {
+        let crypto_config = SessionCryptoConfig::generate_default()?;
+        Self::new_with_crypto_config(session_id, pairing_secret, transport, crypto_config)
+    }
+
+    pub fn new_with_crypto_config(
+        session_id: impl AsRef<str>,
+        pairing_secret: Vec<u8>,
+        transport: T,
+        crypto_config: SessionCryptoConfig,
+    ) -> Result<Self, AgentError> {
+        let session_key = SessionKey::derive(&pairing_secret, &crypto_config)?;
         Ok(Self {
             session_id: SessionId::new(session_id.as_ref())?,
-            pairing_secret,
+            crypto_config,
+            session_key,
             transport,
             pending: std::cell::RefCell::new(Vec::new()),
             head: std::cell::RefCell::new(None),
@@ -207,8 +220,13 @@ impl<T: SessionTransport> Session<T> {
         };
         let plaintext =
             serde_json::to_vec(&turn).map_err(|e| AgentError::Provider(e.to_string()))?;
-        let sealed =
-            session_crypto::seal(&self.pairing_secret, &self.session_id, &turn_id, &plaintext)?;
+        let sealed = session_crypto::seal(
+            &self.session_key,
+            &self.crypto_config,
+            &self.session_id,
+            &turn_id,
+            &plaintext,
+        )?;
         let bytes = serde_json::to_vec(&sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
         if self
             .transport
@@ -270,7 +288,7 @@ impl<T: SessionTransport> Session<T> {
         }
         let mut turns = Vec::with_capacity(sealed_by_ulid.len());
         for (_ulid, sealed) in sealed_by_ulid {
-            let plaintext = session_crypto::open(&self.pairing_secret, &sealed)?;
+            let plaintext = session_crypto::open(&self.session_key, &self.crypto_config, &sealed)?;
             let turn: Turn = serde_json::from_slice(&plaintext)
                 .map_err(|e| AgentError::Provider(e.to_string()))?;
             turns.push(turn);
@@ -499,6 +517,15 @@ mod tests {
         DeviceId::new(value).unwrap()
     }
 
+    fn crypto_config() -> SessionCryptoConfig {
+        SessionCryptoConfig::new(session_crypto::KdfProfile::production(*b"0123456789ABCDEF"))
+            .unwrap()
+    }
+
+    fn crypto_key(config: &SessionCryptoConfig) -> SessionKey {
+        SessionKey::derive(KEY, config).unwrap()
+    }
+
     #[test]
     fn ulid_is_26_chars_and_time_ordered() {
         assert_eq!(new_ulid().unwrap().len(), 26);
@@ -547,6 +574,8 @@ mod tests {
     #[test]
     fn load_returns_turns_sorted_by_ulid() {
         let t = InMemoryTransport::new();
+        let config = crypto_config();
+        let key = crypto_key(&config);
         // Insert out of order; load must sort by ULID.
         for ulid in [TURN_C, TURN_A, TURN_B] {
             let turn = Turn {
@@ -558,7 +587,8 @@ mod tests {
                 ts_ms: 0,
             };
             let pt = serde_json::to_vec(&turn).unwrap();
-            let sealed = session_crypto::seal(KEY, &sid("sess1"), &tid(ulid), &pt).unwrap();
+            let sealed =
+                session_crypto::seal(&key, &config, &sid("sess1"), &tid(ulid), &pt).unwrap();
             t.put(
                 &sid("sess1"),
                 &tid(ulid),
@@ -566,7 +596,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = Session::new("sess1", KEY.to_vec(), t).unwrap();
+        let s = Session::new_with_crypto_config("sess1", KEY.to_vec(), t, config).unwrap();
         let ulids: Vec<String> = s.load().unwrap().into_iter().map(|t| t.ulid).collect();
         assert_eq!(ulids, vec![TURN_A, TURN_B, TURN_C]);
     }
@@ -649,6 +679,8 @@ mod tests {
     #[test]
     fn load_rejects_turn_file_envelope_id_mismatch() {
         let transport = InMemoryTransport::new();
+        let config = crypto_config();
+        let key = crypto_key(&config);
         let turn = Turn {
             ulid: TURN_B.into(),
             role: "user".into(),
@@ -658,7 +690,8 @@ mod tests {
             ts_ms: 0,
         };
         let plaintext = serde_json::to_vec(&turn).unwrap();
-        let sealed = session_crypto::seal(KEY, &sid("sess1"), &tid(TURN_B), &plaintext).unwrap();
+        let sealed =
+            session_crypto::seal(&key, &config, &sid("sess1"), &tid(TURN_B), &plaintext).unwrap();
         transport
             .put(
                 &sid("sess1"),
@@ -666,7 +699,8 @@ mod tests {
                 &serde_json::to_vec(&sealed).unwrap(),
             )
             .unwrap();
-        let session = Session::new("sess1", KEY.to_vec(), transport).unwrap();
+        let session =
+            Session::new_with_crypto_config("sess1", KEY.to_vec(), transport, config).unwrap();
         let err = session.load().unwrap_err().to_string();
         assert!(err.contains("turn id mismatch"), "{err}");
     }
