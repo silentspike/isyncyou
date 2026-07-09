@@ -17,7 +17,7 @@ isyncyou-store = { path = "../store", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-app-host = { path = "../app-host", default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
-isyncyou-agent = { path = "../agent", optional = true }
+isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 jni = "0.22"
 
@@ -47,7 +47,10 @@ agent-subscription-experimental = ["isyncyou-app-host/agent-subscription-experim
 # TEST/EVIDENCE ONLY, default-OFF: exposes a JNI-only Argon2id/HKDF session-key
 # benchmark for Pixel evidence in #619. It is not wired to WebView, HTTP, or the normal
 # bridge, and release/CI builds leave ISY_CARGO_FEATURES unset.
-agent-session-kdf-bench = ["dep:isyncyou-agent"]
+agent-session-kdf-bench = []
+# TEST/EVIDENCE ONLY, default-OFF: exposes a JNI-only provider credential store self-test
+# for #620. It is not wired to WebView, HTTP, bridge, or production UI.
+agent-credential-store-self-test = []
 
 [dev-dependencies]
 tempfile = "3"

@@ -167,3 +167,47 @@ requirements:
       - test: store_archive_reads_sealed_body_with_envelope_reader
       - test: store_archive_executor_covers_search_read_list_export_shapes
       - test: experimental_agent_executor_reads_store_archive_fixture
+  - id: REQ-AGENT-010
+    title: Agent secrets are typed, encrypted at rest, and separated by class
+    statement: >
+      Provider API keys, provider OAuth refresh tokens, and agent session pairing keys
+      are persisted through one typed CredentialStore. Each stored envelope is
+      AES-256-GCM encrypted at rest, bound to version/class/id metadata with canonical
+      AAD, written owner-only on Unix, and keyed by a dedicated agent credential key.
+      On Android that key is a separate Android Keystore-wrapped data key installed
+      into Rust before nativeStart; it is not the body encryption key, a WebView token,
+      a session token, or a provider token. (S-AG.5, #620)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - ProviderApiKey, ProviderOAuthRefresh, and SessionPairingKey round-trip only under the requested class and id.
+      - Empty secrets, wrong-class copies, envelope metadata mutation, and wrong-key opens fail closed without leaking secret bytes.
+      - Credential and local key files are ciphertext and owner-only on Unix create/rewrite paths.
+      - App-host credential consumers use the central resolver/helper rather than ad hoc LocalKey construction.
+      - Android installs a separate Keystore-wrapped agent credential key before nativeStart and proves the provider credential store with a JNI-only self-test.
+      - If the Android agent credential key cannot be unwrapped or installed, mobile startup fails closed before local data is opened; no default mobile encrypted-file fallback is used for this key.
+    verified_by:
+      - test: secrets_each_class_round_trips
+      - test: secrets_empty_secret_is_rejected
+      - test: secrets_wrong_class_file_copy_is_rejected
+      - test: secrets_envelope_class_mutation_is_rejected
+      - test: secrets_envelope_id_mutation_is_rejected
+      - test: secrets_envelope_version_mutation_is_rejected
+      - test: secrets_id_delimiter_collision_does_not_decrypt
+      - test: secrets_ciphertext_does_not_contain_plaintext_sentinel
+      - test: secrets_files_are_owner_only_on_create_and_rewrite
+      - test: secrets_debug_and_error_redact_secret_values
+      - test: credential_resolver_prefers_process_key_over_env_or_local
+      - test: credential_resolver_generates_owner_only_local_key
+      - test: provider_api_key_secret_id_is_stable
+      - test: provider_oauth_refresh_secret_id_is_stable
+      - test: provider_secret_id_rejects_path_segments_or_control_chars
+      - test: official_provider_resolver_reads_provider_api_key_from_store
+      - test: subscription_credential_round_trips_through_agent_credential_store
+      - test: codex_credential_round_trips_through_agent_credential_store
+      - test: credential_store_preferred_over_desktop_cli_fallback
+      - test: stored_credential_error_redaction_does_not_leak_tokens
+      - file: android/app/src/main/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStore.kt
+      - file: android/app/src/test/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStorePolicyTest.kt
+      - file: android/app/src/androidTest/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStoreInstrumentedTest.kt
+      - file: docs/evidence/artifacts/issue-620/android-keystore.json

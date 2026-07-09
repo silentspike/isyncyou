@@ -46,6 +46,24 @@ object EngineBootstrap {
             java.util.Arrays.fill(r.key, 0) // wipe the data key from the JVM heap
         }
 
+        // Install the separate provider-credential key before nativeStart (#620). App-host
+        // credential consumers in Rust resolve through this process-installed key on Android,
+        // never through a WebView/API path or accidental local fallback.
+        val agentCredential = AgentCredentialKeyStore.getOrCreate(filesDir)
+        try {
+            if (NativeEngine.nativeSetAgentCredentialKey(agentCredential.key) != 1) {
+                throw EncryptedStorageSetupException("Agent credential storage key install failed")
+            }
+            Log.i(
+                TAG,
+                "agent credential key installed: file=${agentCredential.evidence.keyFile} " +
+                    "hardware=${agentCredential.evidence.insideSecureHardware ?: "unknown"} " +
+                    "security=${agentCredential.evidence.securityLevel ?: "unknown"}",
+            )
+        } finally {
+            java.util.Arrays.fill(agentCredential.key, 0)
+        }
+
         Log.i(TAG, "EngineBootstrap: calling nativeStart")
         val port = NativeEngine.nativeStart(filesDir.absolutePath)
         Log.i(TAG, "EngineBootstrap: nativeStart returned port=$port")
