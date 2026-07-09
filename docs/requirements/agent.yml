@@ -45,7 +45,7 @@ requirements:
       On confirmation, the server mints and checks a one-time token bound to
       hash(action)+account+service+item-id+TTL. It is single-use (a replay is rejected),
       and a token that does not match the confirmed action is refused. (S-AG.6, #621)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Confirming a destructive action runs exactly one audited operation.
@@ -53,19 +53,28 @@ requirements:
       - A token bound to a different action/account/service/item is rejected.
     verified_by:
       - test: confirmation_token_is_single_use_and_action_bound
+      - test: confirm_rejects_action_hash_mismatch_without_consuming
+      - test: confirm_rejects_token_from_another_pending
+      - test: expired_confirmation_token_is_rejected_and_swept
+      - test: agent_confirm_audits_once_and_calls_executor_once
+      - test: agent_confirm_replay_rejected_and_executor_not_called_twice
+      - test: daemon_agent_confirm_runs_executor_once_and_replay_fails
   - id: REQ-AGENT-004
     title: The model never receives a capability or confirmation token
     statement: >
       No capability token or confirmation token ever appears in the model's prompt,
       tool inputs, or the streamed `token` events. The human-confirm path mints the
       token out of band on the server. (S-AG.6, #621)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - The assembled model context contains no capability/confirmation token.
       - Streamed `token` events contain no capability/confirmation token.
     verified_by:
       - test: agent_context_contains_no_capability_token
+      - test: confirmation_required_event_not_in_provider_history
+      - test: agent_stream_token_events_contain_no_confirmation_token
+      - test: agent_error_and_audit_redact_confirmation_token
   - id: REQ-AGENT-005
     title: Prompt-injection boundary — retrieved content cannot trigger a tool action
     statement: >
@@ -121,7 +130,7 @@ requirements:
       (token/tool_call/tool_result/confirmation_required/error/done), with a cancel
       endpoint and backpressure/timeout — not the existing `change`-only SSE ping.
       On mobile every agent route is session-token gated. (S-AG.6, #621)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - The hub emits the typed event set for a turn.
@@ -129,6 +138,16 @@ requirements:
       - A slow consumer is bounded (no unbounded buffer).
     verified_by:
       - test: agent_stream_hub_emits_typed_events_and_cancels
+      - test: agent_stream_hub_slow_consumer_times_out_without_unbounded_buffer
+      - test: agent_stream_event_json_is_single_line_and_stable
+      - test: daemon_agent_fake_turn_streams_tokens_to_subscriber
+      - test: daemon_agent_pending_turn_stream_closes_with_pending_confirmation_done
+      - test: daemon_agent_cancel_ends_stream_with_cancelled_done
+      - test: daemon_agent_unopened_stream_is_swept
+      - test: agent_chat_alias_matches_turn_route
+      - test: mobile_agent_routes_require_session_token_even_with_cap_token
+      - test: agent_stream_sse_requires_session_token_on_mobile
+      - test: open_bridge_stream_gates_events_and_agent
   - id: REQ-AGENT-008
     title: Provider policy — official default, FakeProvider-only CI, subscription experimental
     statement: >
