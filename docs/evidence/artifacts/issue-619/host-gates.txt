@@ -1,9 +1,9 @@
 # Issue #619 Host Gates
 
-Generated: 2026-07-09T10:07:32+02:00
+Generated: 2026-07-09T10:28:16+02:00
 Branch: feature/ag-619
 Base: origin/dev
-Commit under test: fffc6896164a12a86912156f5e335a6ee9267992
+Commit under test: 2c49b651d84808ba674bd7437ff99576d4558c1f
 
 Commands and observed results:
 
@@ -11,7 +11,8 @@ Commands and observed results:
 - PASS: cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features onedrive,retrieval -- -D warnings
 - PASS: cargo +1.95.0 clippy -p isyncyou-graph --all-targets --features http -- -D warnings
 - PASS: cargo +1.95.0 test -p isyncyou-agent --features onedrive,retrieval -- --nocapture
-  - Result: 117 passed, 0 failed, 1 ignored live OneDrive integration test.
+  - Result: 123 passed, 0 failed, 1 ignored live OneDrive integration test.
+  - Includes put_turn_if_absent_is_idempotent_for_same_bytes, put_turn_if_absent_rejects_same_ulid_different_bytes, graph_turn_put_conflict_same_bytes_is_idempotent, graph_turn_put_conflict_different_bytes_is_error, sync_pending_remote_same_bytes_removes_pending_without_upload, sync_pending_remote_different_bytes_errors_and_keeps_pending, and file_session_cache_pending_files_are_owner_only.
 - PASS: cargo +1.95.0 test -p isyncyou-graph --features http -- --nocapture
   - Result: 108 passed, 0 failed, 7 ignored live tests.
 - PASS: python3 tools/check_traceability.py
