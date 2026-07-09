@@ -1231,6 +1231,13 @@ mod tests {
         u16::from_be_bytes([framed[0], framed[1]])
     }
 
+    fn mobile_key_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
     #[cfg(feature = "agent-session-kdf-bench")]
     #[test]
     fn agent_session_kdf_benchmark_json_is_structured_and_redacted() {
@@ -1252,6 +1259,7 @@ mod tests {
     #[cfg(feature = "agent-credential-store-self-test")]
     #[test]
     fn agent_credential_store_self_test_json_is_structured_and_redacted() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_agent_credential_ready_for_tests();
         assert!(install_mobile_agent_credential_key(&[8u8; 32]));
         let dir = tempfile::tempdir().unwrap();
@@ -1301,6 +1309,7 @@ mod tests {
 
     #[test]
     fn mobile_start_inner_fails_closed_without_encryption_ready() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();
         reset_mobile_agent_credential_ready_for_tests();
         let dir = tempfile::tempdir().unwrap();
@@ -1325,6 +1334,7 @@ mod tests {
 
     #[test]
     fn mobile_start_inner_fails_closed_without_agent_credential_key() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();
         reset_mobile_agent_credential_ready_for_tests();
         assert!(install_mobile_body_key(1, &[7u8; 32]));
@@ -1350,6 +1360,7 @@ mod tests {
 
     #[test]
     fn mobile_body_key_install_rejects_bad_length_and_panic() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();
         assert!(!install_mobile_body_key(1, &[1, 2, 3]));
         assert!(!mobile_encryption_ready());
@@ -1361,6 +1372,7 @@ mod tests {
 
     #[test]
     fn mobile_body_key_install_marks_encryption_ready_on_success() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();
 
         assert!(install_mobile_body_key(1, &[7u8; 32]));
@@ -1370,6 +1382,7 @@ mod tests {
 
     #[test]
     fn mobile_agent_credential_key_install_rejects_bad_length_and_panic() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_agent_credential_ready_for_tests();
         assert!(!install_mobile_agent_credential_key(&[1, 2, 3]));
         assert!(!mobile_agent_credential_ready());
@@ -1381,6 +1394,7 @@ mod tests {
 
     #[test]
     fn mobile_agent_credential_key_install_marks_ready_on_success() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_agent_credential_ready_for_tests();
 
         assert!(install_mobile_agent_credential_key(&[7u8; 32]));
