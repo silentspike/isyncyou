@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-09T10:00:46+02:00",
-  "commit": "ed66467768508d034746915f4604899529fcb475",
+  "generated_at": "2026-07-09T10:07:32+02:00",
+  "commit": "fffc6896164a12a86912156f5e335a6ee9267992",
   "entries": [
     {
       "id": "EV-001",
@@ -47,12 +47,12 @@
     {
       "id": "EV-005",
       "requirement": "REQ-AGENT-006",
-      "claim": "A live OneDrive session roundtrip stores ciphertext-only turn files, blocks a second active lease holder, and deletes the fixture during cleanup.",
+      "claim": "A live OneDrive session roundtrip stores ciphertext-only turn files, blocks a second active lease holder, reports a forced offline fork, and deletes the fixture during cleanup.",
       "method": "probe",
       "command": "cargo +1.95.0 test -p isyncyou-agent --features onedrive --test live_session_onedrive -- --ignored --nocapture live_onedrive_session_roundtrip_ciphertext_and_cleanup",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-619/live-onedrive-session-roundtrip.json",
-      "evidence": "Live OneDrive evidence recorded ciphertext_only=true, lease_blocked_second_holder=true, turn_count=3, and cleanup_verify=DELETED status=404.",
+      "evidence": "Live OneDrive evidence recorded ciphertext_only=true, lease_blocked_second_holder=true, fork_reported=true with two fork heads, turn_count=5, and cleanup_verify=DELETED status=404.",
       "notes": "The test used a fresh M365 write token from the local MSAL cache without printing the token."
     },
     {

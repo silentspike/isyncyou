@@ -1,9 +1,9 @@
 # Issue #619 Host Gates
 
-Generated: 2026-07-09T10:00:46+02:00
+Generated: 2026-07-09T10:07:32+02:00
 Branch: feature/ag-619
 Base: origin/dev
-Commit under test: ed66467768508d034746915f4604899529fcb475
+Commit under test: fffc6896164a12a86912156f5e335a6ee9267992
 
 Commands and observed results:
 
@@ -23,7 +23,7 @@ Commands and observed results:
 Separate live/device evidence:
 
 - PASS: Pixel 8 Pro JNI KDF benchmark, saved as docs/evidence/artifacts/issue-619/kdf-benchmark-pixel8pro.json.
-- PASS: Live OneDrive ciphertext/lease/cleanup probe, saved as docs/evidence/artifacts/issue-619/live-onedrive-session-roundtrip.json.
+- PASS: Live OneDrive ciphertext/lease/fork/cleanup probe, saved as docs/evidence/artifacts/issue-619/live-onedrive-session-roundtrip.json.
 
 Release boundary:
 
