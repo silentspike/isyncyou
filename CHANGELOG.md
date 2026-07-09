@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent credential storage**
+- `agent`+`app-host`+`mobile`+`android`: added #620 typed encrypted
+  CredentialStore coverage for provider API keys, provider OAuth refresh tokens, and
+  session pairing keys, with canonical envelope metadata binding, owner-only Unix
+  writes, app-host resolver usage, provider credential seams, and a separate Android
+  Keystore-wrapped agent credential key proven by a JNI-only Pixel 8 Pro self-test.
+
 **Agent encrypted sessions**
 - `agent`+`graph`+`mobile`: hardened #619 cross-device OneDrive session storage with
   Argon2id/HKDF pairing-key derivation, immutable per-turn ULID files, ETag-aware

@@ -1,0 +1,37 @@
+# Issue #620 Host And Device Gates
+
+Commit under test: 3699bc40a7404ca9e5310f32e451ea9dcc048893
+Captured: 2026-07-09
+
+PASS cargo +1.95.0 test -p isyncyou-agent secrets -- --nocapture
+- Final Task 5 run passed 23 secret-store tests.
+- Covered typed class round-trips, empty-secret rejection, envelope class/id/version
+  mutation rejection, delimiter-safe AAD, ciphertext sentinel scan, owner-only
+  create/rewrite, resolver ordering, provider secret ids, and redaction.
+
+PASS cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental credential -- --nocapture
+- Passed app-host credential helper tests including subscription/codex round-trips,
+  credential-store precedence over desktop CLI fallback, and stored credential error
+  redaction.
+
+PASS cargo +1.95.0 test -p isyncyou-mobile --features agent-credential-store-self-test -- --nocapture
+- Passed mobile tests for agent credential key install success/failure, fail-closed
+  mobile startup when the key is absent, and the feature-gated JNI-only self-test JSON.
+
+PASS cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+PASS cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+PASS cargo +1.95.0 clippy -p isyncyou-mobile --all-targets --features agent-credential-store-self-test -- -D warnings
+PASS cargo +1.95.0 fmt --all --check
+PASS (cd android && ./gradlew :app:testDebugUnitTest)
+
+PASS exposure grep
+- No WebView/gui/app-host/bridge production path exposes nativeSetAgentCredentialKey,
+  nativeAgentCredentialStoreSelfTest, AgentCredentialKeyStore, agent_credential.key,
+  or ISYNCYOU_AGENT_CRED_KEY.
+
+PASS Pixel 8 Pro instrumentation
+- Command:
+  (cd android && ISY_CARGO_FEATURES=agent-credential-store-self-test ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentCredentialKeyStoreInstrumentedTest)
+- Result:
+  tests=1 failures=0 errors=0 skipped=0
+- Extracted evidence is stored in docs/evidence/artifacts/issue-620/android-keystore.json.
