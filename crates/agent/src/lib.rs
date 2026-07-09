@@ -33,6 +33,7 @@ pub mod retrieval;
 pub mod secrets;
 pub mod session;
 pub mod session_crypto;
+mod session_ids;
 pub mod stream;
 pub mod tool;
 pub mod turn;
@@ -45,6 +46,7 @@ pub use retrieval::RetrievalExecutor;
 pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
 pub use session::{detect_fork, new_ulid, InMemoryTransport, Session, SessionTransport, Turn};
 pub use session_crypto::{open, seal, SealedTurn};
+pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
 pub use stream::AgentStreamHub;
 pub use tool::{
     help_text, parse_action, registry_tool_names, tool_schema, ToolAction, ToolClass, TOOL_NAME,

@@ -11,6 +11,7 @@
 //! **Recoverability:** the pairing secret is the only way to decrypt. Lose it on every
 //! device and the history is unrecoverable by design (privacy over recoverability).
 
+use crate::session_ids::{SessionId, TurnId};
 use crate::AgentError;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -48,8 +49,19 @@ fn crypto_err(what: &str) -> AgentError {
     AgentError::Provider(format!("session crypto: {what}"))
 }
 
-fn aad_string(v: u32, session_id: &str, ulid: &str) -> String {
-    format!("{v}|{session_id}|{ulid}")
+fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).expect("session AAD field length fits u32");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn aad_bytes(v: u32, session_id: &SessionId, turn_id: &TurnId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(b"isyncyou-agent-session-aad-v1");
+    out.extend_from_slice(&v.to_be_bytes());
+    push_len_prefixed(&mut out, session_id.as_str().as_bytes());
+    push_len_prefixed(&mut out, turn_id.as_str().as_bytes());
+    out
 }
 
 fn derive_key(pairing_secret: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN], AgentError> {
@@ -66,8 +78,8 @@ fn derive_key(pairing_secret: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN], Agent
 /// Seal a turn's plaintext into a [`SealedTurn`] envelope.
 pub fn seal(
     pairing_secret: &[u8],
-    session_id: &str,
-    ulid: &str,
+    session_id: &SessionId,
+    turn_id: &TurnId,
     plaintext: &[u8],
 ) -> Result<SealedTurn, AgentError> {
     let rng = SystemRandom::new();
@@ -80,12 +92,12 @@ pub fn seal(
     let unbound =
         aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| crypto_err("aead key"))?;
     let sealing = aead::LessSafeKey::new(unbound);
-    let aad = aad_string(SCHEMA_VERSION, session_id, ulid);
+    let aad = aad_bytes(SCHEMA_VERSION, session_id, turn_id);
     let mut in_out = plaintext.to_vec();
     sealing
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(aad.as_bytes()),
+            aead::Aad::from(aad.as_slice()),
             &mut in_out,
         )
         .map_err(|_| crypto_err("seal"))?;
@@ -93,7 +105,7 @@ pub fn seal(
     Ok(SealedTurn {
         v: SCHEMA_VERSION,
         session_id: session_id.to_string(),
-        ulid: ulid.to_string(),
+        ulid: turn_id.to_string(),
         salt: B64.encode(salt),
         nonce: B64.encode(nonce),
         ct: B64.encode(&in_out),
@@ -103,6 +115,8 @@ pub fn seal(
 /// Open a [`SealedTurn`] back to plaintext. Fails if the pairing secret is wrong or any
 /// AAD-bound field (`v`/`session_id`/`ulid`) was tampered.
 pub fn open(pairing_secret: &[u8], sealed: &SealedTurn) -> Result<Vec<u8>, AgentError> {
+    let session_id = SessionId::new(&sealed.session_id)?;
+    let turn_id = TurnId::new(&sealed.ulid)?;
     let salt = B64
         .decode(&sealed.salt)
         .map_err(|_| crypto_err("b64 salt"))?;
@@ -118,11 +132,11 @@ pub fn open(pairing_secret: &[u8], sealed: &SealedTurn) -> Result<Vec<u8>, Agent
         aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| crypto_err("aead key"))?;
     let opening = aead::LessSafeKey::new(unbound);
     let nonce: [u8; NONCE_LEN] = nonce_v.try_into().map_err(|_| crypto_err("nonce"))?;
-    let aad = aad_string(sealed.v, &sealed.session_id, &sealed.ulid);
+    let aad = aad_bytes(sealed.v, &session_id, &turn_id);
     let plaintext = opening
         .open_in_place(
             aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(aad.as_bytes()),
+            aead::Aad::from(aad.as_slice()),
             &mut ct,
         )
         .map_err(|_| crypto_err("decryption failed (wrong pairing key or tampered)"))?;
@@ -133,10 +147,21 @@ pub fn open(pairing_secret: &[u8], sealed: &SealedTurn) -> Result<Vec<u8>, Agent
 mod tests {
     use super::*;
 
+    fn sid(value: &str) -> SessionId {
+        SessionId::new(value).unwrap()
+    }
+
+    fn tid(value: &str) -> TurnId {
+        TurnId::new(value).unwrap()
+    }
+
+    const TURN_A: &str = "0000000000000000000000000A";
+    const TURN_B: &str = "0000000000000000000000000B";
+
     #[test]
     fn round_trips_with_the_pairing_secret() {
         let key = b"a-high-entropy-pairing-secret-32b";
-        let sealed = seal(key, "sess1", "01ULID", b"hello M365 excerpt").unwrap();
+        let sealed = seal(key, &sid("sess1"), &tid(TURN_A), b"hello M365 excerpt").unwrap();
         assert_eq!(open(key, &sealed).unwrap(), b"hello M365 excerpt");
     }
 
@@ -144,16 +169,16 @@ mod tests {
     fn a_different_device_local_key_cannot_decrypt() {
         let paired = b"the-shared-pairing-secret-value!!";
         let device_local = b"some-other-device-local-only-key!";
-        let sealed = seal(paired, "sess1", "01ULID", b"secret body").unwrap();
+        let sealed = seal(paired, &sid("sess1"), &tid(TURN_A), b"secret body").unwrap();
         assert!(open(device_local, &sealed).is_err());
     }
 
     #[test]
     fn tampering_aad_fields_fails_decryption() {
         let key = b"a-high-entropy-pairing-secret-32b";
-        let sealed = seal(key, "sess1", "01ULID", b"body").unwrap();
+        let sealed = seal(key, &sid("sess1"), &tid(TURN_A), b"body").unwrap();
         let mut t = sealed.clone();
-        t.ulid = "02OTHER".into(); // AAD bind broken
+        t.ulid = TURN_B.into(); // AAD bind broken
         assert!(open(key, &t).is_err());
         let mut t2 = sealed.clone();
         t2.session_id = "other".into();
@@ -166,8 +191,31 @@ mod tests {
     #[test]
     fn ciphertext_contains_no_plaintext() {
         let key = b"a-high-entropy-pairing-secret-32b";
-        let sealed = seal(key, "sess1", "01ULID", b"SENSITIVE-MAIL-BODY").unwrap();
+        let sealed = seal(key, &sid("sess1"), &tid(TURN_A), b"SENSITIVE-MAIL-BODY").unwrap();
         let blob = serde_json::to_string(&sealed).unwrap();
         assert!(!blob.contains("SENSITIVE-MAIL-BODY"));
+    }
+
+    #[test]
+    fn aad_is_length_prefixed_and_mutation_sensitive() {
+        let a = aad_bytes(SCHEMA_VERSION, &sid("sess1"), &tid(TURN_A));
+        let b = aad_bytes(SCHEMA_VERSION, &sid("sess2"), &tid(TURN_A));
+        let c = aad_bytes(SCHEMA_VERSION, &sid("sess1"), &tid(TURN_B));
+        assert!(a.starts_with(b"isyncyou-agent-session-aad-v1"));
+        assert!(!String::from_utf8_lossy(&a).contains('|'));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn invalid_envelope_ids_fail_before_decryption() {
+        let key = b"a-high-entropy-pairing-secret-32b";
+        let sealed = seal(key, &sid("sess1"), &tid(TURN_A), b"body").unwrap();
+        let mut bad_session = sealed.clone();
+        bad_session.session_id = "../sess".into();
+        assert!(open(key, &bad_session).is_err());
+        let mut bad_turn = sealed;
+        bad_turn.ulid = "not-a-ulid".into();
+        assert!(open(key, &bad_turn).is_err());
     }
 }

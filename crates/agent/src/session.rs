@@ -8,6 +8,7 @@
 //! one. An **active-turn lease** prevents forks; **fork detection** is the fallback.
 
 use crate::session_crypto::{self, SealedTurn};
+use crate::session_ids::{DeviceId, SessionId, TurnId};
 use crate::AgentError;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -54,7 +55,7 @@ fn encode_rand(r: &[u8; 10]) -> [u8; 16] {
 
 /// A fresh ULID: 48-bit ms timestamp + 80-bit randomness, 26 Crockford chars. Sorts
 /// lexicographically in creation order.
-pub fn new_ulid() -> Result<String, AgentError> {
+fn new_turn_id() -> Result<TurnId, AgentError> {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| AgentError::Provider(e.to_string()))?
@@ -69,14 +70,18 @@ pub fn new_ulid() -> Result<String, AgentError> {
     // SAFETY: ALPHABET is ASCII, so both arrays are valid UTF-8.
     s.push_str(std::str::from_utf8(&t).expect("ascii"));
     s.push_str(std::str::from_utf8(&rr).expect("ascii"));
-    Ok(s)
+    TurnId::new(s)
+}
+
+pub fn new_ulid() -> Result<String, AgentError> {
+    Ok(new_turn_id()?.into_string())
 }
 
 /// Increment a 26-char Crockford ULID by 1 (with carry). Used for ULID **monotonicity**:
 /// when two turns are created in the same millisecond, the next is derived from the last
 /// so ordering still equals creation order.
-fn increment_ulid(s: &str) -> Result<String, AgentError> {
-    let mut chars: Vec<u8> = s.bytes().collect();
+fn increment_turn_id(id: &TurnId) -> Result<TurnId, AgentError> {
+    let mut chars: Vec<u8> = id.as_str().bytes().collect();
     for i in (0..chars.len()).rev() {
         let v = ALPHABET
             .iter()
@@ -86,10 +91,33 @@ fn increment_ulid(s: &str) -> Result<String, AgentError> {
             chars[i] = ALPHABET[0]; // carry
         } else {
             chars[i] = ALPHABET[v + 1];
-            return String::from_utf8(chars).map_err(|e| AgentError::Provider(e.to_string()));
+            let next = String::from_utf8(chars).map_err(|e| AgentError::Provider(e.to_string()))?;
+            return TurnId::new(next);
         }
     }
     Err(AgentError::Provider("ulid overflow".into()))
+}
+
+#[cfg(any(test, feature = "onedrive"))]
+const ONEDRIVE_AGENT_PREFIX: &str = "Apps/iSyncYou/agent";
+
+#[cfg(any(test, feature = "onedrive"))]
+fn onedrive_session_dir(session_id: &SessionId) -> String {
+    format!("{ONEDRIVE_AGENT_PREFIX}/{}", session_id.as_str())
+}
+
+#[cfg(any(test, feature = "onedrive"))]
+fn onedrive_turn_file(session_id: &SessionId, turn_id: &TurnId) -> String {
+    format!(
+        "{}/{}.json",
+        onedrive_session_dir(session_id),
+        turn_id.as_str()
+    )
+}
+
+#[cfg(any(test, feature = "onedrive"))]
+fn onedrive_lease_file(session_id: &SessionId) -> String {
+    format!("{}/.lease", onedrive_session_dir(session_id))
 }
 
 // ----- transport -----
@@ -97,14 +125,15 @@ fn increment_ulid(s: &str) -> Result<String, AgentError> {
 /// Storage for per-turn files + the active-turn lease. Account/session scoping is by
 /// `session_id`. Implemented over OneDrive (feature `onedrive`) and an in-memory fake.
 pub trait SessionTransport {
-    fn put(&self, session_id: &str, ulid: &str, bytes: &[u8]) -> Result<(), AgentError>;
-    fn get(&self, session_id: &str, ulid: &str) -> Result<Vec<u8>, AgentError>;
+    fn put(&self, session_id: &SessionId, turn_id: &TurnId, bytes: &[u8])
+        -> Result<(), AgentError>;
+    fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError>;
     /// ULIDs present for the session.
-    fn list(&self, session_id: &str) -> Result<Vec<String>, AgentError>;
+    fn list(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError>;
     /// Try to acquire the single active-turn lease; `true` if acquired.
-    fn acquire_lease(&self, session_id: &str, holder: &str) -> Result<bool, AgentError>;
-    fn release_lease(&self, session_id: &str, holder: &str) -> Result<(), AgentError>;
-    fn current_lease(&self, session_id: &str) -> Result<Option<String>, AgentError>;
+    fn acquire_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError>;
+    fn release_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<(), AgentError>;
+    fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError>;
 }
 
 // ----- session -----
@@ -129,23 +158,27 @@ pub fn detect_fork(turns: &[Turn]) -> Vec<String> {
 
 /// An encrypted, conflict-safe session over a [`SessionTransport`].
 pub struct Session<T: SessionTransport> {
-    pub session_id: String,
+    pub session_id: SessionId,
     pairing_secret: Vec<u8>,
     transport: T,
     /// Sealed turns not yet confirmed on the transport (offline cache).
     pending: std::cell::RefCell<Vec<SealedTurn>>,
-    head: std::cell::RefCell<Option<String>>,
+    head: std::cell::RefCell<Option<TurnId>>,
 }
 
 impl<T: SessionTransport> Session<T> {
-    pub fn new(session_id: impl Into<String>, pairing_secret: Vec<u8>, transport: T) -> Self {
-        Self {
-            session_id: session_id.into(),
+    pub fn new(
+        session_id: impl AsRef<str>,
+        pairing_secret: Vec<u8>,
+        transport: T,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            session_id: SessionId::new(session_id.as_ref())?,
             pairing_secret,
             transport,
             pending: std::cell::RefCell::new(Vec::new()),
             head: std::cell::RefCell::new(None),
-        }
+        })
     }
 
     /// Append a turn: seal it, write it to the transport (or keep it pending if offline),
@@ -154,10 +187,10 @@ impl<T: SessionTransport> Session<T> {
         let observed_head = self.head.borrow().clone();
         // Monotonic ULID: strictly increasing even within one millisecond, so load order
         // equals append order.
-        let mut ulid = new_ulid()?;
+        let mut turn_id = new_turn_id()?;
         if let Some(last) = observed_head.as_ref() {
-            if ulid <= *last {
-                ulid = increment_ulid(last)?;
+            if turn_id <= *last {
+                turn_id = increment_turn_id(last)?;
             }
         }
         let ts_ms = SystemTime::now()
@@ -165,40 +198,45 @@ impl<T: SessionTransport> Session<T> {
             .map_err(|e| AgentError::Provider(e.to_string()))?
             .as_millis() as u64;
         let turn = Turn {
-            ulid: ulid.clone(),
+            ulid: turn_id.to_string(),
             role: role.to_string(),
             content: content.to_string(),
-            observed_head: observed_head.clone(),
-            parent_turn_ids: observed_head.into_iter().collect(),
+            observed_head: observed_head.as_ref().map(ToString::to_string),
+            parent_turn_ids: observed_head.into_iter().map(|id| id.to_string()).collect(),
             ts_ms,
         };
         let plaintext =
             serde_json::to_vec(&turn).map_err(|e| AgentError::Provider(e.to_string()))?;
         let sealed =
-            session_crypto::seal(&self.pairing_secret, &self.session_id, &ulid, &plaintext)?;
+            session_crypto::seal(&self.pairing_secret, &self.session_id, &turn_id, &plaintext)?;
         let bytes = serde_json::to_vec(&sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
-        if self.transport.put(&self.session_id, &ulid, &bytes).is_err() {
+        if self
+            .transport
+            .put(&self.session_id, &turn_id, &bytes)
+            .is_err()
+        {
             // Offline: keep locally and sync later (idempotent by ULID).
             self.pending.borrow_mut().push(sealed);
         }
-        *self.head.borrow_mut() = Some(ulid);
+        *self.head.borrow_mut() = Some(turn_id);
         Ok(turn)
     }
 
     /// Upload any pending (offline-written) turns that the transport does not yet have.
     /// Idempotent: ULIDs already present are skipped. Returns how many were uploaded.
     pub fn sync(&self) -> Result<usize, AgentError> {
-        let present: std::collections::HashSet<String> =
+        let present: std::collections::HashSet<TurnId> =
             self.transport.list(&self.session_id)?.into_iter().collect();
         let mut uploaded = 0;
         let mut still_pending = Vec::new();
         for sealed in self.pending.borrow().iter() {
-            if present.contains(&sealed.ulid) {
+            let turn_id = TurnId::new(&sealed.ulid)?;
+            if present.contains(&turn_id) {
                 continue; // already there — no duplicate
             }
             let bytes =
                 serde_json::to_vec(sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
-            match self.transport.put(&self.session_id, &sealed.ulid, &bytes) {
+            match self.transport.put(&self.session_id, &turn_id, &bytes) {
                 Ok(()) => uploaded += 1,
                 Err(_) => still_pending.push(sealed.clone()),
             }
@@ -211,16 +249,23 @@ impl<T: SessionTransport> Session<T> {
     /// Merges transport files with any still-pending local turns.
     pub fn load(&self) -> Result<Vec<Turn>, AgentError> {
         use std::collections::BTreeMap;
-        let mut sealed_by_ulid: BTreeMap<String, SealedTurn> = BTreeMap::new();
-        for ulid in self.transport.list(&self.session_id)? {
-            let bytes = self.transport.get(&self.session_id, &ulid)?;
+        let mut sealed_by_ulid: BTreeMap<TurnId, SealedTurn> = BTreeMap::new();
+        for turn_id in self.transport.list(&self.session_id)? {
+            let bytes = self.transport.get(&self.session_id, &turn_id)?;
             let sealed: SealedTurn =
                 serde_json::from_slice(&bytes).map_err(|e| AgentError::Provider(e.to_string()))?;
-            sealed_by_ulid.insert(ulid, sealed);
+            if sealed.ulid != turn_id.as_str() {
+                return Err(AgentError::Provider(format!(
+                    "turn id mismatch: file {} envelope {}",
+                    turn_id, sealed.ulid
+                )));
+            }
+            sealed_by_ulid.insert(turn_id, sealed);
         }
         for sealed in self.pending.borrow().iter() {
+            let turn_id = TurnId::new(&sealed.ulid)?;
             sealed_by_ulid
-                .entry(sealed.ulid.clone())
+                .entry(turn_id)
                 .or_insert_with(|| sealed.clone());
         }
         let mut turns = Vec::with_capacity(sealed_by_ulid.len());
@@ -234,12 +279,12 @@ impl<T: SessionTransport> Session<T> {
     }
 
     /// Acquire the active-turn lease (anti-fork) for `holder`.
-    pub fn begin_turn(&self, holder: &str) -> Result<bool, AgentError> {
+    pub fn begin_turn(&self, holder: &DeviceId) -> Result<bool, AgentError> {
         self.transport.acquire_lease(&self.session_id, holder)
     }
 
     /// Release the active-turn lease.
-    pub fn end_turn(&self, holder: &str) -> Result<(), AgentError> {
+    pub fn end_turn(&self, holder: &DeviceId) -> Result<(), AgentError> {
         self.transport.release_lease(&self.session_id, holder)
     }
 }
@@ -249,8 +294,8 @@ impl<T: SessionTransport> Session<T> {
 /// In-memory [`SessionTransport`] with an `offline` switch, for tests.
 #[derive(Default)]
 pub struct InMemoryTransport {
-    files: std::cell::RefCell<std::collections::HashMap<(String, String), Vec<u8>>>,
-    lease: std::cell::RefCell<std::collections::HashMap<String, String>>,
+    files: std::cell::RefCell<std::collections::HashMap<(SessionId, TurnId), Vec<u8>>>,
+    lease: std::cell::RefCell<std::collections::HashMap<SessionId, DeviceId>>,
     offline: std::cell::Cell<bool>,
 }
 
@@ -269,31 +314,36 @@ impl InMemoryTransport {
         }
     }
     /// Raw stored bytes for a ULID (test inspection).
-    pub fn raw(&self, session_id: &str, ulid: &str) -> Option<Vec<u8>> {
+    pub fn raw(&self, session_id: &SessionId, turn_id: &TurnId) -> Option<Vec<u8>> {
         self.files
             .borrow()
-            .get(&(session_id.to_string(), ulid.to_string()))
+            .get(&(session_id.clone(), turn_id.clone()))
             .cloned()
     }
 }
 
 impl SessionTransport for InMemoryTransport {
-    fn put(&self, session_id: &str, ulid: &str, bytes: &[u8]) -> Result<(), AgentError> {
+    fn put(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        bytes: &[u8],
+    ) -> Result<(), AgentError> {
         self.guard()?;
         self.files
             .borrow_mut()
-            .insert((session_id.to_string(), ulid.to_string()), bytes.to_vec());
+            .insert((session_id.clone(), turn_id.clone()), bytes.to_vec());
         Ok(())
     }
-    fn get(&self, session_id: &str, ulid: &str) -> Result<Vec<u8>, AgentError> {
+    fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError> {
         self.guard()?;
         self.files
             .borrow()
-            .get(&(session_id.to_string(), ulid.to_string()))
+            .get(&(session_id.clone(), turn_id.clone()))
             .cloned()
-            .ok_or_else(|| AgentError::Provider(format!("no turn {session_id}/{ulid}")))
+            .ok_or_else(|| AgentError::Provider(format!("no turn {session_id}/{turn_id}")))
     }
-    fn list(&self, session_id: &str) -> Result<Vec<String>, AgentError> {
+    fn list(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError> {
         self.guard()?;
         Ok(self
             .files
@@ -303,25 +353,25 @@ impl SessionTransport for InMemoryTransport {
             .map(|(_, u)| u.clone())
             .collect())
     }
-    fn acquire_lease(&self, session_id: &str, holder: &str) -> Result<bool, AgentError> {
+    fn acquire_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError> {
         self.guard()?;
         let mut lease = self.lease.borrow_mut();
         match lease.get(session_id) {
             Some(h) if h != holder => Ok(false),
             _ => {
-                lease.insert(session_id.to_string(), holder.to_string());
+                lease.insert(session_id.clone(), holder.clone());
                 Ok(true)
             }
         }
     }
-    fn release_lease(&self, session_id: &str, holder: &str) -> Result<(), AgentError> {
+    fn release_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<(), AgentError> {
         let mut lease = self.lease.borrow_mut();
         if lease.get(session_id).map(|h| h == holder).unwrap_or(false) {
             lease.remove(session_id);
         }
         Ok(())
     }
-    fn current_lease(&self, session_id: &str) -> Result<Option<String>, AgentError> {
+    fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError> {
         Ok(self.lease.borrow().get(session_id).cloned())
     }
 }
@@ -330,7 +380,10 @@ impl SessionTransport for InMemoryTransport {
 
 #[cfg(feature = "onedrive")]
 mod onedrive {
-    use super::SessionTransport;
+    use super::{
+        onedrive_lease_file, onedrive_session_dir, onedrive_turn_file, DeviceId, SessionId,
+        SessionTransport, TurnId,
+    };
     use crate::AgentError;
     use isyncyou_graph::http::GraphClient;
 
@@ -346,31 +399,33 @@ mod onedrive {
                 client: GraphClient::new(token),
             }
         }
-        fn dir(session_id: &str) -> String {
-            format!("Apps/iSyncYou/agent/{session_id}")
-        }
-        fn file(session_id: &str, ulid: &str) -> String {
-            format!("Apps/iSyncYou/agent/{session_id}/{ulid}.json")
-        }
     }
 
     impl SessionTransport for OneDriveTransport {
-        fn put(&self, session_id: &str, ulid: &str, bytes: &[u8]) -> Result<(), AgentError> {
+        fn put(
+            &self,
+            session_id: &SessionId,
+            turn_id: &TurnId,
+            bytes: &[u8],
+        ) -> Result<(), AgentError> {
             self.client
-                .simple_upload(&Self::file(session_id, ulid), bytes)
+                .simple_upload(&onedrive_turn_file(session_id, turn_id), bytes)
                 .map(|_| ())
                 .map_err(|e| AgentError::Transport(e.to_string()))
         }
-        fn get(&self, session_id: &str, ulid: &str) -> Result<Vec<u8>, AgentError> {
-            let url = format!("/me/drive/root:/{}:/content", Self::file(session_id, ulid));
+        fn get(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError> {
+            let url = format!(
+                "/me/drive/root:/{}:/content",
+                onedrive_turn_file(session_id, turn_id)
+            );
             self.client
                 .get_bytes(&url)
                 .map_err(|e| AgentError::Transport(e.to_string()))
         }
-        fn list(&self, session_id: &str) -> Result<Vec<String>, AgentError> {
+        fn list(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError> {
             let url = format!(
                 "/me/drive/root:/{}:/children?$select=name",
-                Self::dir(session_id)
+                onedrive_session_dir(session_id)
             );
             let v = self
                 .client
@@ -381,29 +436,39 @@ mod onedrive {
                 for it in items {
                     if let Some(name) = it.get("name").and_then(|n| n.as_str()) {
                         if let Some(ulid) = name.strip_suffix(".json") {
-                            ulids.push(ulid.to_string());
+                            ulids.push(TurnId::new(ulid)?);
                         }
                     }
                 }
             }
             Ok(ulids)
         }
-        fn acquire_lease(&self, session_id: &str, holder: &str) -> Result<bool, AgentError> {
+        fn acquire_lease(
+            &self,
+            session_id: &SessionId,
+            holder: &DeviceId,
+        ) -> Result<bool, AgentError> {
             // Best-effort lease via a marker file. (A stronger ETag/If-Match lease is a
             // follow-up; the per-turn ULID files keep storage conflict-free regardless.)
-            let file = format!("Apps/iSyncYou/agent/{session_id}/.lease");
             self.client
-                .simple_upload(&file, holder.as_bytes())
+                .simple_upload(&onedrive_lease_file(session_id), holder.as_str().as_bytes())
                 .map(|_| true)
                 .map_err(|e| AgentError::Transport(e.to_string()))
         }
-        fn release_lease(&self, _session_id: &str, _holder: &str) -> Result<(), AgentError> {
+        fn release_lease(
+            &self,
+            _session_id: &SessionId,
+            _holder: &DeviceId,
+        ) -> Result<(), AgentError> {
             Ok(())
         }
-        fn current_lease(&self, session_id: &str) -> Result<Option<String>, AgentError> {
-            let url = format!("/me/drive/root:/Apps/iSyncYou/agent/{session_id}/.lease:/content");
+        fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError> {
+            let url = format!(
+                "/me/drive/root:/{}:/content",
+                onedrive_lease_file(session_id)
+            );
             match self.client.get_bytes(&url) {
-                Ok(b) => Ok(Some(String::from_utf8_lossy(&b).into_owned())),
+                Ok(b) => Ok(Some(DeviceId::new(String::from_utf8_lossy(&b))?)),
                 Err(_) => Ok(None),
             }
         }
@@ -418,6 +483,21 @@ mod tests {
     use super::*;
 
     const KEY: &[u8] = b"a-high-entropy-pairing-secret-32b";
+    const TURN_A: &str = "0000000000000000000000000A";
+    const TURN_B: &str = "0000000000000000000000000B";
+    const TURN_C: &str = "0000000000000000000000000C";
+
+    fn sid(value: &str) -> SessionId {
+        SessionId::new(value).unwrap()
+    }
+
+    fn tid(value: &str) -> TurnId {
+        TurnId::new(value).unwrap()
+    }
+
+    fn did(value: &str) -> DeviceId {
+        DeviceId::new(value).unwrap()
+    }
 
     #[test]
     fn ulid_is_26_chars_and_time_ordered() {
@@ -430,7 +510,7 @@ mod tests {
 
     #[test]
     fn append_then_load_roundtrips() {
-        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new());
+        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
         s.append("user", "find the spotify invoice").unwrap();
         s.append("assistant", "it is item-42").unwrap();
         let turns = s.load().unwrap();
@@ -447,7 +527,7 @@ mod tests {
     #[test]
     fn appends_are_strictly_monotonic_even_within_one_ms() {
         // 50 rapid appends almost certainly share a millisecond; monotonicity must hold.
-        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new());
+        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
         let mut prev = String::new();
         for i in 0..50 {
             let t = s.append("user", &format!("turn {i}")).unwrap();
@@ -468,7 +548,7 @@ mod tests {
     fn load_returns_turns_sorted_by_ulid() {
         let t = InMemoryTransport::new();
         // Insert out of order; load must sort by ULID.
-        for ulid in ["02BBB", "00AAA", "01ABC"] {
+        for ulid in [TURN_C, TURN_A, TURN_B] {
             let turn = Turn {
                 ulid: ulid.into(),
                 role: "user".into(),
@@ -478,20 +558,24 @@ mod tests {
                 ts_ms: 0,
             };
             let pt = serde_json::to_vec(&turn).unwrap();
-            let sealed = session_crypto::seal(KEY, "sess1", ulid, &pt).unwrap();
-            t.put("sess1", ulid, &serde_json::to_vec(&sealed).unwrap())
-                .unwrap();
+            let sealed = session_crypto::seal(KEY, &sid("sess1"), &tid(ulid), &pt).unwrap();
+            t.put(
+                &sid("sess1"),
+                &tid(ulid),
+                &serde_json::to_vec(&sealed).unwrap(),
+            )
+            .unwrap();
         }
-        let s = Session::new("sess1", KEY.to_vec(), t);
+        let s = Session::new("sess1", KEY.to_vec(), t).unwrap();
         let ulids: Vec<String> = s.load().unwrap().into_iter().map(|t| t.ulid).collect();
-        assert_eq!(ulids, vec!["00AAA", "01ABC", "02BBB"]);
+        assert_eq!(ulids, vec![TURN_A, TURN_B, TURN_C]);
     }
 
     #[test]
     fn offline_writes_then_sync_is_idempotent() {
         // RcTransport lets the test toggle offline on the same transport the session uses.
         let t = std::rc::Rc::new(InMemoryTransport::new());
-        let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone()));
+        let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone())).unwrap();
         t.set_offline(true);
         s.append("user", "a").unwrap(); // queue locally
         s.append("assistant", "b").unwrap();
@@ -503,11 +587,11 @@ mod tests {
 
     #[test]
     fn lease_prevents_concurrent_turns() {
-        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new());
-        assert!(s.begin_turn("deviceA").unwrap());
-        assert!(!s.begin_turn("deviceB").unwrap()); // A holds it
-        s.end_turn("deviceA").unwrap();
-        assert!(s.begin_turn("deviceB").unwrap()); // now free
+        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
+        assert!(s.begin_turn(&did("deviceA")).unwrap());
+        assert!(!s.begin_turn(&did("deviceB")).unwrap()); // A holds it
+        s.end_turn(&did("deviceA")).unwrap();
+        assert!(s.begin_turn(&did("deviceB")).unwrap()); // now free
     }
 
     #[test]
@@ -532,31 +616,80 @@ mod tests {
     #[test]
     fn only_ciphertext_is_stored_no_plaintext() {
         let t = std::rc::Rc::new(InMemoryTransport::new());
-        let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone()));
+        let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone())).unwrap();
         let turn = s.append("user", "VERY-SECRET-MAIL-CONTENT").unwrap();
-        let raw = t.raw("sess1", &turn.ulid).unwrap();
+        let raw = t.raw(&sid("sess1"), &tid(&turn.ulid)).unwrap();
         assert!(!String::from_utf8_lossy(&raw).contains("VERY-SECRET-MAIL-CONTENT"));
+    }
+
+    #[test]
+    fn session_rejects_unsafe_session_ids_before_path_use() {
+        assert!(Session::new("../sess", KEY.to_vec(), InMemoryTransport::new()).is_err());
+        assert!(Session::new("sess:one", KEY.to_vec(), InMemoryTransport::new()).is_err());
+        assert!(Session::new("sess/one", KEY.to_vec(), InMemoryTransport::new()).is_err());
+    }
+
+    #[test]
+    fn onedrive_session_paths_are_under_agent_prefix() {
+        let session = sid("sess1");
+        let turn = tid(TURN_A);
+        assert_eq!(onedrive_session_dir(&session), "Apps/iSyncYou/agent/sess1");
+        assert_eq!(
+            onedrive_turn_file(&session, &turn),
+            format!("Apps/iSyncYou/agent/sess1/{TURN_A}.json")
+        );
+        assert_eq!(
+            onedrive_lease_file(&session),
+            "Apps/iSyncYou/agent/sess1/.lease"
+        );
+        assert!(SessionId::new("../evil").is_err());
+        assert!(TurnId::new("../evil").is_err());
+    }
+
+    #[test]
+    fn load_rejects_turn_file_envelope_id_mismatch() {
+        let transport = InMemoryTransport::new();
+        let turn = Turn {
+            ulid: TURN_B.into(),
+            role: "user".into(),
+            content: "mismatch".into(),
+            observed_head: None,
+            parent_turn_ids: vec![],
+            ts_ms: 0,
+        };
+        let plaintext = serde_json::to_vec(&turn).unwrap();
+        let sealed = session_crypto::seal(KEY, &sid("sess1"), &tid(TURN_B), &plaintext).unwrap();
+        transport
+            .put(
+                &sid("sess1"),
+                &tid(TURN_A),
+                &serde_json::to_vec(&sealed).unwrap(),
+            )
+            .unwrap();
+        let session = Session::new("sess1", KEY.to_vec(), transport).unwrap();
+        let err = session.load().unwrap_err().to_string();
+        assert!(err.contains("turn id mismatch"), "{err}");
     }
 
     /// Test shim so a test can hold the transport AND give one to the session.
     struct RcTransport(std::rc::Rc<InMemoryTransport>);
     impl SessionTransport for RcTransport {
-        fn put(&self, s: &str, u: &str, b: &[u8]) -> Result<(), AgentError> {
+        fn put(&self, s: &SessionId, u: &TurnId, b: &[u8]) -> Result<(), AgentError> {
             self.0.put(s, u, b)
         }
-        fn get(&self, s: &str, u: &str) -> Result<Vec<u8>, AgentError> {
+        fn get(&self, s: &SessionId, u: &TurnId) -> Result<Vec<u8>, AgentError> {
             self.0.get(s, u)
         }
-        fn list(&self, s: &str) -> Result<Vec<String>, AgentError> {
+        fn list(&self, s: &SessionId) -> Result<Vec<TurnId>, AgentError> {
             self.0.list(s)
         }
-        fn acquire_lease(&self, s: &str, h: &str) -> Result<bool, AgentError> {
+        fn acquire_lease(&self, s: &SessionId, h: &DeviceId) -> Result<bool, AgentError> {
             self.0.acquire_lease(s, h)
         }
-        fn release_lease(&self, s: &str, h: &str) -> Result<(), AgentError> {
+        fn release_lease(&self, s: &SessionId, h: &DeviceId) -> Result<(), AgentError> {
             self.0.release_lease(s, h)
         }
-        fn current_lease(&self, s: &str) -> Result<Option<String>, AgentError> {
+        fn current_lease(&self, s: &SessionId) -> Result<Option<DeviceId>, AgentError> {
             self.0.current_lease(s)
         }
     }
