@@ -4876,16 +4876,126 @@ function asstSearchBlock(stages, results) {
   return frag;
 }
 
+function agentCompactValue(v, max = 140) {
+  if (v == null) return "";
+  let s;
+  try { s = typeof v === "string" ? v : JSON.stringify(v); } catch (_) { s = String(v); }
+  s = s.replace(/\s+/g, " ").trim();
+  s = s.replace(/("?)(token|session|capability|action_hash)\1\s*[:=]\s*"?[^,"\s}]+/ig, "$2=[redacted]");
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+function summarizeAgentToolInput(input) {
+  if (!input || typeof input !== "object") return "";
+  const deny = new Set(["token", "session", "session_token", "capability", "capability_token", "action_hash"]);
+  const bits = [];
+  Object.entries(input).forEach(([k, v]) => {
+    if (bits.length >= 4 || deny.has(String(k).toLowerCase())) return;
+    if (v == null || typeof v === "object") return;
+    bits.push(`${k}: ${agentCompactValue(v, 42)}`);
+  });
+  return bits.join(" · ");
+}
+
+function renderAgentToolRow(row) {
+  return el("div", { class: "asst-tool-row " + row.kind, "data-agent-tool-row": row.kind },
+    icon(row.kind === "tool_call" ? "corner-up-right" : "corner-up-left", "icon-sm"),
+    el("span", { class: "asst-tool-title", text: row.title }),
+    row.detail ? el("span", { class: "asst-tool-detail", text: row.detail }) : null,
+    row.untrusted ? el("span", { class: "chip muted asst-tool-boundary", text: "Source content" }) : null);
+}
+
+function renderAgentError(message) {
+  return el("div", { class: "asst-inline-error", "data-agent-stream-error": "1" },
+    icon("shield", "icon-sm"),
+    el("span", { text: message || "Stream error" }));
+}
+
+function renderAgentPendingPlaceholder(pending) {
+  const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
+  return el("div", {
+    class: "asst-pending-card",
+    "data-agent-pending-card": pending.pending_id || "",
+  },
+    el("div", { class: "asst-pending-head" },
+      icon("shield-check", "icon-sm"),
+      el("span", { class: "asst-pending-title", text: pending.preview || "Action requires confirmation" })),
+    el("div", { class: "dim asst-pending-meta", text: risk }));
+}
+
 function renderAssistantMessage(m) {
   const isUser = m.role === "user";
   const bubble = el("div", {
     class: "card asst-bubble",
   }, el("div", { class: "asst-text", style: "white-space:pre-wrap;line-height:1.5", text: m.text || (isUser ? "" : "…") }));
   (m.chips || []).forEach(c => bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: c })));
+  (m.tools || []).forEach(t => bubble.append(renderAgentToolRow(t)));
+  (m.errors || []).forEach(e => bubble.append(renderAgentError(e)));
+  if (m.pending) bubble.append(renderAgentPendingPlaceholder(m.pending));
   // Re-render the turn's search stages + result cards (persisted in the message), so a view
   // switch brings the whole conversation back — not just the text (#644).
   if ((m.stages && m.stages.length) || (m.results && m.results.length)) bubble.append(asstSearchBlock(m.stages, m.results));
   return el("div", { class: "assistant-message" + (isUser ? " user" : ""), "data-agent-message": m.role || "assistant" }, bubble);
+}
+
+function handleAgentEvent(message, turnState) {
+  const d = message || {};
+  switch (d.event) {
+    case "token":
+      turnState.setText(turnState.message.text + (d.text || ""));
+      break;
+    case "tool_call":
+      turnState.addToolRow({
+        kind: "tool_call",
+        title: d.name || "Tool call",
+        detail: summarizeAgentToolInput(d.input),
+      });
+      break;
+    case "tool_result":
+      turnState.addToolRow({
+        kind: "tool_result",
+        title: "Tool result",
+        detail: agentCompactValue(d.content, 120),
+        untrusted: !!d.untrusted,
+      });
+      break;
+    case "search_stage":
+      turnState.onSearchStage(d);
+      break;
+    case "partial_result":
+      turnState.onPartialResult(d);
+      break;
+    case "confirmation_required": {
+      const pending = {
+        pending_id: d.pending_id || d.id || d.tool_id || "",
+        preview: d.preview || "Action requires confirmation",
+        risk: d.risk || "",
+        expires_at_ms: d.expires_at_ms || null,
+      };
+      if (pending.pending_id) {
+        AssistantState.pendingCardsById.set(pending.pending_id, {
+          ...pending,
+          token: d.token || "",
+          action_hash: d.action_hash || "",
+        });
+      }
+      turnState.setPending(pending);
+      break;
+    }
+    case "error":
+      turnState.addError(d.message || "Stream error");
+      break;
+    case "done": {
+      const reason = d.reason || "complete";
+      const fallback = reason === "pending_confirmation" ? "Waiting for confirmation"
+        : reason === "cancelled" ? "Cancelled"
+        : reason === "error" ? "Turn ended with an error"
+        : "(no response)";
+      turnState.message.doneReason = reason;
+      turnState.finish(fallback, reason);
+      break;
+    }
+  }
 }
 
 function agentKeydown(e) {
@@ -4907,7 +5017,7 @@ async function agentSend(text) {
 
   AssistantState.transcript.push({ role: "user", text });
   log.append(renderAssistantMessage(AssistantState.transcript[AssistantState.transcript.length - 1]));
-  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [] };
+  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [], tools: [], errors: [], pending: null, doneReason: null };
   AssistantState.transcript.push(asst);
   AssistantState.busy = true;
   AssistantState.draft = "";
@@ -4927,7 +5037,26 @@ async function agentSend(text) {
   const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
   log.scrollTop = log.scrollHeight;
   const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; log.scrollTop = log.scrollHeight; };
-  const addChip = (label) => { asst.chips.push(label); bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: label })); log.scrollTop = log.scrollHeight; };
+  const addToolRow = (row) => {
+    clearThinking();
+    asst.tools.push(row);
+    bubble.append(renderAgentToolRow(row));
+    log.scrollTop = log.scrollHeight;
+  };
+  const addError = (message) => {
+    clearThinking();
+    asst.errors.push(message);
+    bubble.append(renderAgentError(message));
+    log.scrollTop = log.scrollHeight;
+  };
+  const setPending = (pending) => {
+    clearThinking();
+    asst.pending = pending;
+    const old = bubble.querySelector("[data-agent-pending-card]");
+    if (old) old.remove();
+    bubble.append(renderAgentPendingPlaceholder(pending));
+    log.scrollTop = log.scrollHeight;
+  };
 
   // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
   // and a result list that grows as PartialResult events arrive.
@@ -4996,21 +5125,27 @@ async function agentSend(text) {
     else { try { stream.close(); } catch (_) {} }
     if (!asst.text && msg) setText(msg);
   };
+  const turnState = {
+    message: asst,
+    setText,
+    addToolRow,
+    addError,
+    setPending,
+    onSearchStage,
+    onPartialResult,
+    finish,
+  };
   stream = openEventStream(url, (name, data) => {
-    if (name === "done") { finish("(no response)"); return; }
+    if (name === "done") { handleAgentEvent({ event: "done", reason: "complete" }, turnState); return; }
     if (name !== "message") return; // ignore ping heartbeats
-    let d; try { d = JSON.parse(data); } catch (_) { return; }
-    switch (d.event) {
-      case "token": setText(asst.text + (d.text || "")); break;
-      case "search_stage": onSearchStage(d); break;
-      case "partial_result": onPartialResult(d); break;
-      // Raw tool calls (search/read/…) are internal — the stage checkmarks + result cards
-      // already show what's happening, so we don't surface "→ isyncyou read" noise.
-      case "tool_call": break;
-      case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
-      case "error": clearThinking(); setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
-      case "done": finish("(no response)"); break;
+    let d;
+    try { d = JSON.parse(data); }
+    catch (_) {
+      addError("Invalid stream payload");
+      finish("Stream error");
+      return;
     }
+    handleAgentEvent(d, turnState);
   }, () => finish("⚠ connection lost"));
   AssistantState.activeStream = stream;
 }

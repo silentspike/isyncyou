@@ -8496,6 +8496,55 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_stream_renderer_handles_full_event_contract() {
+        for needle in [
+            "function handleAgentEvent(message, turnState)",
+            "case \"token\":",
+            "case \"tool_call\":",
+            "case \"tool_result\":",
+            "case \"search_stage\":",
+            "case \"partial_result\":",
+            "case \"confirmation_required\":",
+            "case \"error\":",
+            "case \"done\":",
+            "AssistantState.pendingCardsById.set(pending.pending_id",
+            "token: d.token || \"\"",
+            "action_hash: d.action_hash || \"\"",
+            "renderAgentPendingPlaceholder(pending)",
+            "renderAgentToolRow(row)",
+            "renderAgentError(message)",
+            "Invalid stream payload",
+            "handleAgentEvent(d, turnState);",
+            "handleAgentEvent({ event: \"done\", reason: \"complete\" }, turnState)",
+            "reason === \"pending_confirmation\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 stream renderer invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("case \"tool_call\": break"),
+            "tool_call events must render a compact row, not be ignored"
+        );
+        assert!(
+            !APP_JS.contains("case \"confirmation_required\": addChip"),
+            "confirmation_required must render/store a PendingAction placeholder, not a text chip"
+        );
+        let start = APP_JS
+            .find("function agentCompactValue")
+            .expect("assistant stream renderer start");
+        let end = APP_JS
+            .find("function agentKeydown")
+            .expect("assistant stream renderer end");
+        let assistant_renderer = &APP_JS[start..end];
+        assert!(
+            !assistant_renderer.contains("innerHTML"),
+            "Assistant stream renderer helpers must keep event content text-only"
+        );
+    }
+
+    #[test]
     fn app_js_biometric_labels_cover_onedrive_risk_ops() {
         for needle in [
             "\"move-out-of-protected\"",

@@ -1380,6 +1380,65 @@ a.note-meta-chip:hover { color: var(--accent); }
   color: var(--text-hi);
   border-color: var(--accent-line);
 }
+.asst-tool-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+  font-size: var(--fs-sm);
+}
+.asst-tool-title {
+  font-weight: 650;
+}
+.asst-tool-detail {
+  min-width: 0;
+  color: var(--text-mid);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asst-tool-boundary {
+  margin-left: auto;
+}
+.asst-inline-error {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-2);
+  border: 1px solid color-mix(in oklab, var(--err) 35%, transparent);
+  border-radius: var(--r-md);
+  background: var(--err-soft);
+  color: var(--text-hi);
+  font-size: var(--fs-sm);
+}
+.asst-pending-card {
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid color-mix(in oklab, var(--warn) 38%, transparent);
+  border-radius: var(--r-md);
+  background: var(--warn-soft);
+}
+.asst-pending-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-weight: 650;
+}
+.asst-pending-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.asst-pending-meta {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-sm);
+}
 .assistant-composer {
   position: sticky;
   bottom: 0;
