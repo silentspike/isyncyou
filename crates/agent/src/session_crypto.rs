@@ -9,7 +9,7 @@
 use crate::session_ids::{SessionId, TurnId};
 use crate::AgentError;
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -20,10 +20,12 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: u32 = 2;
 pub const KDF_ALG: &str = "argon2id-hkdf-sha256";
 pub const KDF_PROFILE_VERSION: u32 = 1;
+pub const PAIRING_PAYLOAD_PREFIX: &str = "isy-agent-pair-v1.";
 
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const SESSION_SALT_LEN: usize = 16;
+const PAIRING_SECRET_LEN: usize = 32;
 const HKDF_SALT: &[u8] = b"isyncyou-agent-session-root-salt-v1";
 const HKDF_INFO: &[u8] = b"isyncyou-agent-session-root-v1";
 const MIN_MEMORY_KIB: u32 = 65_536;
@@ -56,6 +58,26 @@ pub struct SessionCryptoConfig {
 #[derive(Clone)]
 pub(crate) struct SessionKey {
     bytes: [u8; KEY_LEN],
+}
+
+/// In-memory setup payload that can be encoded for pairing another device. Storage of
+/// the secret is intentionally out of scope for #619; #620 owns Keystore/CredentialStore.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PairingPayload {
+    pub version: u32,
+    pub session_id: SessionId,
+    session_salt: [u8; SESSION_SALT_LEN],
+    pairing_secret: [u8; PAIRING_SECRET_LEN],
+    pub kdf_profile: KdfProfile,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PairingPayloadWire {
+    version: u32,
+    session_id: String,
+    session_salt: String,
+    pairing_secret: String,
+    kdf_profile: KdfProfile,
 }
 
 /// One encrypted turn file. Envelope fields are cleartext metadata; `ct` is the
@@ -138,10 +160,115 @@ impl SessionKey {
         okm.fill(&mut bytes).map_err(|_| crypto_err("hkdf fill"))?;
         Ok(Self { bytes })
     }
+
+    #[cfg(test)]
+    fn bytes_for_test(&self) -> &[u8; KEY_LEN] {
+        &self.bytes
+    }
+}
+
+impl PairingPayload {
+    pub fn generate(session_id: SessionId) -> Result<Self, AgentError> {
+        let rng = SystemRandom::new();
+        let mut session_salt = [0u8; SESSION_SALT_LEN];
+        rng.fill(&mut session_salt)
+            .map_err(|_| crypto_err("rng session salt"))?;
+        let mut pairing_secret = [0u8; PAIRING_SECRET_LEN];
+        rng.fill(&mut pairing_secret)
+            .map_err(|_| crypto_err("rng pairing secret"))?;
+        let kdf_profile = KdfProfile::production(session_salt);
+        Ok(Self {
+            version: 1,
+            session_id,
+            session_salt,
+            pairing_secret,
+            kdf_profile,
+        })
+    }
+
+    pub fn encode(&self) -> Result<String, AgentError> {
+        let wire = self.wire();
+        let json = serde_json::to_vec(&wire).map_err(|e| AgentError::Provider(e.to_string()))?;
+        Ok(format!("{PAIRING_PAYLOAD_PREFIX}{}", B64URL.encode(json)))
+    }
+
+    pub fn parse(encoded: &str) -> Result<Self, AgentError> {
+        let Some(body) = encoded.strip_prefix(PAIRING_PAYLOAD_PREFIX) else {
+            return Err(crypto_err("bad pairing payload prefix"));
+        };
+        let json = B64URL
+            .decode(body)
+            .map_err(|_| crypto_err("b64 pairing payload"))?;
+        let wire: PairingPayloadWire =
+            serde_json::from_slice(&json).map_err(|_| crypto_err("pairing payload json"))?;
+        Self::from_wire(wire)
+    }
+
+    pub fn crypto_config(&self) -> Result<SessionCryptoConfig, AgentError> {
+        SessionCryptoConfig::new(self.kdf_profile.clone())
+    }
+
+    pub fn pairing_secret(&self) -> &[u8; PAIRING_SECRET_LEN] {
+        &self.pairing_secret
+    }
+
+    fn wire(&self) -> PairingPayloadWire {
+        PairingPayloadWire {
+            version: self.version,
+            session_id: self.session_id.to_string(),
+            session_salt: B64.encode(self.session_salt),
+            pairing_secret: B64.encode(self.pairing_secret),
+            kdf_profile: self.kdf_profile.clone(),
+        }
+    }
+
+    fn from_wire(wire: PairingPayloadWire) -> Result<Self, AgentError> {
+        if wire.version != 1 {
+            return Err(crypto_err("unsupported pairing payload version"));
+        }
+        let session_id = SessionId::new(&wire.session_id)?;
+        let session_salt = fixed_b64::<SESSION_SALT_LEN>(&wire.session_salt, "session salt")?;
+        let pairing_secret =
+            fixed_b64::<PAIRING_SECRET_LEN>(&wire.pairing_secret, "pairing secret")?;
+        let config = SessionCryptoConfig::new(wire.kdf_profile.clone())?;
+        let profile_salt =
+            fixed_b64::<SESSION_SALT_LEN>(&config.profile().session_salt, "profile session salt")?;
+        if profile_salt != session_salt {
+            return Err(crypto_err("pairing payload salt mismatch"));
+        }
+        Ok(Self {
+            version: wire.version,
+            session_id,
+            session_salt,
+            pairing_secret,
+            kdf_profile: wire.kdf_profile,
+        })
+    }
+}
+
+impl std::fmt::Debug for PairingPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingPayload")
+            .field("version", &self.version)
+            .field("session_id", &self.session_id)
+            .field("session_salt", &"<redacted>")
+            .field("pairing_secret", &"<redacted>")
+            .field("kdf_profile", &self.kdf_profile)
+            .finish()
+    }
 }
 
 fn crypto_err(what: &str) -> AgentError {
     AgentError::Provider(format!("session crypto: {what}"))
+}
+
+fn fixed_b64<const N: usize>(encoded: &str, name: &str) -> Result<[u8; N], AgentError> {
+    let bytes = B64
+        .decode(encoded)
+        .map_err(|_| crypto_err(&format!("b64 {name}")))?;
+    bytes
+        .try_into()
+        .map_err(|_| crypto_err(&format!("bad {name} length")))
 }
 
 fn validate_profile(profile: &KdfProfile) -> Result<(), AgentError> {
@@ -473,5 +600,81 @@ mod tests {
         let mut bad_turn = sealed;
         bad_turn.ulid = "not-a-ulid".into();
         assert!(open(&key, &config, &bad_turn).is_err());
+    }
+
+    #[test]
+    fn pairing_payload_round_trips_and_redacts_secret() {
+        let payload = PairingPayload::generate(sid("sess1")).unwrap();
+        let encoded = payload.encode().unwrap();
+        assert!(encoded.starts_with(PAIRING_PAYLOAD_PREFIX));
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        assert!(!encoded.contains('='));
+
+        let parsed = PairingPayload::parse(&encoded).unwrap();
+        assert_eq!(parsed.session_id, sid("sess1"));
+        assert_eq!(parsed.pairing_secret(), payload.pairing_secret());
+        assert_eq!(parsed.kdf_profile, payload.kdf_profile);
+
+        let debug = format!("{payload:?}");
+        let secret_b64 = B64.encode(payload.pairing_secret());
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&secret_b64));
+    }
+
+    #[test]
+    fn pairing_payload_rejects_wrong_version_or_short_secret() {
+        let payload = PairingPayload::generate(sid("sess1")).unwrap();
+        let mut wire = payload.wire();
+        wire.version = 2;
+        let encoded = format!(
+            "{PAIRING_PAYLOAD_PREFIX}{}",
+            B64URL.encode(serde_json::to_vec(&wire).unwrap())
+        );
+        assert!(PairingPayload::parse(&encoded).is_err());
+
+        let mut wire = payload.wire();
+        wire.pairing_secret = B64.encode([7u8; PAIRING_SECRET_LEN - 1]);
+        let encoded = format!(
+            "{PAIRING_PAYLOAD_PREFIX}{}",
+            B64URL.encode(serde_json::to_vec(&wire).unwrap())
+        );
+        assert!(PairingPayload::parse(&encoded).is_err());
+    }
+
+    #[test]
+    fn pairing_payload_rejects_salt_or_kdf_mismatch() {
+        let payload = PairingPayload::generate(sid("sess1")).unwrap();
+        let mut wire = payload.wire();
+        wire.session_salt = B64.encode(*b"FEDCBA9876543210");
+        let encoded = format!(
+            "{PAIRING_PAYLOAD_PREFIX}{}",
+            B64URL.encode(serde_json::to_vec(&wire).unwrap())
+        );
+        assert!(PairingPayload::parse(&encoded).is_err());
+
+        let mut wire = payload.wire();
+        wire.kdf_profile.memory_kib = MIN_MEMORY_KIB - 1;
+        let encoded = format!(
+            "{PAIRING_PAYLOAD_PREFIX}{}",
+            B64URL.encode(serde_json::to_vec(&wire).unwrap())
+        );
+        assert!(PairingPayload::parse(&encoded).is_err());
+    }
+
+    #[test]
+    fn pairing_payload_derives_same_session_key_on_two_devices() {
+        let payload_a = PairingPayload::generate(sid("sess1")).unwrap();
+        let encoded = payload_a.encode().unwrap();
+        let payload_b = PairingPayload::parse(&encoded).unwrap();
+        let config_a = payload_a.crypto_config().unwrap();
+        let config_b = payload_b.crypto_config().unwrap();
+        assert_eq!(config_a, config_b);
+        let key_a = SessionKey::derive(payload_a.pairing_secret(), &config_a).unwrap();
+        let key_b = SessionKey::derive(payload_b.pairing_secret(), &config_b).unwrap();
+        assert_eq!(key_a.bytes_for_test(), key_b.bytes_for_test());
+
+        let sealed = seal(&key_a, &config_a, &sid("sess1"), &tid(TURN_A), b"paired").unwrap();
+        assert_eq!(open(&key_b, &config_b, &sealed).unwrap(), b"paired");
     }
 }

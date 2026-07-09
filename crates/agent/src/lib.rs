@@ -45,7 +45,7 @@ pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage
 pub use retrieval::RetrievalExecutor;
 pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
 pub use session::{detect_fork, new_ulid, InMemoryTransport, Session, SessionTransport, Turn};
-pub use session_crypto::{KdfProfile, SessionCryptoConfig};
+pub use session_crypto::{KdfProfile, PairingPayload, SessionCryptoConfig};
 pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
 pub use stream::AgentStreamHub;
 pub use tool::{
