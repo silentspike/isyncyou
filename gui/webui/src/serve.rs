@@ -1032,6 +1032,104 @@ mod tests {
     }
 
     #[test]
+    fn agent_stream_sse_requires_session_token_on_mobile() {
+        use isyncyou_core::Config;
+
+        struct StreamAgent;
+        impl crate::AgentHandler for StreamAgent {
+            fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+                Ok("turn-123".into())
+            }
+
+            fn confirm(
+                &self,
+                _pending_id: &str,
+                _token: &str,
+                _action_hash: &str,
+            ) -> Result<String, String> {
+                Ok("{}".into())
+            }
+
+            fn cancel(&self, _turn_id: &str) {}
+
+            fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+                if turn_id != "turn-123" {
+                    return None;
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send("{\"event\":\"token\",\"text\":\"hi\"}".to_string())
+                    .unwrap();
+                Some(rx)
+            }
+        }
+
+        let router = Arc::new(
+            Router::new(Config::default())
+                .with_session_token("sess-http-tok".into())
+                .with_agent(Arc::new(StreamAgent), "agentsecret".into()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                spawn_conn(
+                    stream.unwrap(),
+                    Arc::clone(&router),
+                    AccessPolicy::TcpLoopback,
+                );
+            }
+        });
+        let req = |raw: &str| {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(raw.as_bytes()).unwrap();
+            read_http_response(&mut c)
+        };
+
+        let no_token =
+            req("GET /api/v1/agent/stream?turn=turn-123 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            no_token.starts_with("HTTP/1.1 401"),
+            "agent stream without session token must 401: {no_token}"
+        );
+
+        let mut sse = TcpStream::connect(addr).unwrap();
+        sse.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        sse.write_all(
+            b"GET /api/v1/agent/stream?turn=turn-123&_st=sess-http-tok HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        let mut tmp = [0u8; 512];
+        for _ in 0..8 {
+            match sse.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    if text.contains("data: {\"event\":\"token\",\"text\":\"hi\"}") {
+                        break;
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(e) => panic!("reading agent SSE: {e}"),
+            }
+        }
+        let with_token = String::from_utf8_lossy(&raw);
+        assert!(
+            with_token.starts_with("HTTP/1.1 200 OK"),
+            "agent stream with session token must connect: {with_token}"
+        );
+        assert!(with_token.contains("Content-Type: text/event-stream"));
+        assert!(with_token.contains("data: {\"event\":\"token\",\"text\":\"hi\"}"));
+    }
+
+    #[test]
     fn sse_streams_change_frame_and_serves_concurrently() {
         use isyncyou_core::Config;
         use std::time::Duration;

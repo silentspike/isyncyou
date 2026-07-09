@@ -1,0 +1,58 @@
+{
+  "issue": 621,
+  "commit": "98d946a102569ce542cb15a576f6d90286a739fe",
+  "generated_at": "2026-07-09T20:44:02+02:00",
+  "routes": {
+    "POST /api/v1/agent/turn": {
+      "cap_token_required": true,
+      "mobile_session_required": true,
+      "result": "starts a turn and returns {turn}"
+    },
+    "POST /api/v1/agent/chat": {
+      "cap_token_required": true,
+      "mobile_session_required": true,
+      "result": "alias of /api/v1/agent/turn"
+    },
+    "POST /api/v1/agent/confirm": {
+      "cap_token_required": true,
+      "mobile_session_required": true,
+      "required_query": ["pending", "token", "action_hash"],
+      "pending_conflict_status": 409,
+      "execution_or_audit_error_status": 500
+    },
+    "POST /api/v1/agent/cancel": {
+      "cap_token_required": true,
+      "mobile_session_required": true,
+      "result": "emits done.reason=cancelled when the turn is open"
+    },
+    "GET /api/v1/agent/status": {
+      "cap_token_required": false,
+      "mobile_session_required": true
+    },
+    "GET /api/v1/agent/stream": {
+      "cap_token_required": false,
+      "mobile_session_required": true,
+      "transports": ["HTTP SSE", "Android bridge stream"]
+    }
+  },
+  "stream_events": [
+    "token",
+    "tool_call",
+    "tool_result",
+    "confirmation_required",
+    "error",
+    "done"
+  ],
+  "done_reasons": [
+    "complete",
+    "pending_confirmation",
+    "cancelled",
+    "error"
+  ],
+  "token_leakage_assertions": [
+    "model/provider history contains no capability/session/confirmation/OAuth/provider/bridge sentinel tokens",
+    "confirmation_required metadata is not replayed into provider history",
+    "stream token events do not contain the later confirmation token",
+    "executor errors and audit entries redact confirmation tokens"
+  ]
+}
