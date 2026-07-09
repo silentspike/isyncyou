@@ -199,6 +199,7 @@ mod tests {
     use crate::provider::FakeProvider;
     use serde_json::json;
     use std::cell::Cell;
+    use std::collections::VecDeque;
 
     /// Records how often a read executor ran, and returns a canned (or configured) body.
     struct CountingExecutor {
@@ -217,6 +218,41 @@ mod tests {
         fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
             self.reads.set(self.reads.get() + 1);
             Ok(self.reply.clone())
+        }
+    }
+
+    struct HistoryCaptureProvider {
+        script: VecDeque<Vec<AssistantBlock>>,
+        seen: Vec<String>,
+    }
+
+    impl HistoryCaptureProvider {
+        fn new(script: Vec<Vec<AssistantBlock>>) -> Self {
+            Self {
+                script: script.into_iter().collect(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl LlmProvider for HistoryCaptureProvider {
+        fn name(&self) -> &str {
+            "history-capture"
+        }
+
+        fn next(
+            &mut self,
+            history: &[Message],
+            emit: &mut dyn FnMut(StreamEvent),
+        ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+            self.seen.push(format!("{history:?}"));
+            let blocks = self.script.pop_front().unwrap_or_default();
+            for b in &blocks {
+                if let AssistantBlock::Text(t) = b {
+                    emit(StreamEvent::Token(t.clone()));
+                }
+            }
+            Ok(blocks)
         }
     }
 
@@ -317,6 +353,80 @@ mod tests {
             !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
             "a pending turn is not Done"
         );
+    }
+
+    #[test]
+    fn agent_context_contains_no_capability_token() {
+        let forbidden = [
+            "cap-secret-621",
+            "session-secret-621",
+            "confirm-secret-621",
+            "oauth-secret-621",
+            "provider-secret-621",
+            "bridge-secret-621",
+        ];
+        let mut provider = HistoryCaptureProvider::new(vec![
+            vec![tool_use(
+                "t1",
+                json!({"op": "search", "account": "me", "query": "invoice"}),
+            )],
+            vec![AssistantBlock::Text("Found one invoice.".into())],
+        ]);
+        let exec = CountingExecutor::new("hit: invoice-1");
+        let mut history = vec![Message::user("find invoice")];
+        let mut events = Vec::new();
+
+        let outcome =
+            run_turn(&mut provider, &exec, &mut history, &mut |e| events.push(e)).unwrap();
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        let provider_context = provider.seen.join("\n");
+        let final_history = format!("{history:?}");
+        for secret in forbidden {
+            assert!(
+                !provider_context.contains(secret),
+                "provider history leaked {secret}: {provider_context}"
+            );
+            assert!(
+                !final_history.contains(secret),
+                "turn history leaked {secret}: {final_history}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_required_event_not_in_provider_history() {
+        let mut provider = HistoryCaptureProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({"op": "backup", "account": "me", "services": ["mail"]}),
+        )]]);
+        let exec = CountingExecutor::new("should never run");
+        let mut history = vec![Message::user("back up my mail")];
+        let mut events = Vec::new();
+
+        let outcome =
+            run_turn(&mut provider, &exec, &mut history, &mut |e| events.push(e)).unwrap();
+        assert!(matches!(outcome, TurnOutcome::PendingConfirmation { .. }));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })));
+        let provider_context = provider.seen.join("\n");
+        let final_history = format!("{history:?}");
+        for forbidden in [
+            "confirmation_required",
+            "pending_id",
+            "action_hash",
+            "expires_at_ms",
+            "confirm-secret-621",
+        ] {
+            assert!(
+                !provider_context.contains(forbidden),
+                "provider context leaked {forbidden}: {provider_context}"
+            );
+            assert!(
+                !final_history.contains(forbidden),
+                "turn history leaked {forbidden}: {final_history}"
+            );
+        }
     }
 
     #[test]

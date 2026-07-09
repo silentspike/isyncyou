@@ -3360,6 +3360,97 @@ mod tests {
     }
 
     #[test]
+    fn agent_stream_token_events_contain_no_confirmation_token() {
+        let script = vec![vec![
+            isyncyou_agent::AssistantBlock::Text("Preparing backup ".into()),
+            isyncyou_agent::AssistantBlock::ToolUse {
+                id: "tool-1".into(),
+                input: serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+            },
+        ]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("stream-token-redaction");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "back up mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut token_text = String::new();
+        let mut confirmation_token = String::new();
+        for _ in 0..10 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("token") => token_text.push_str(event["text"].as_str().unwrap()),
+                Some("confirmation_required") => {
+                    confirmation_token = event["token"].as_str().unwrap().to_string();
+                }
+                Some("done") => break,
+                _ => {}
+            }
+        }
+        assert!(!confirmation_token.is_empty());
+        assert!(token_text.contains("Preparing backup"));
+        assert!(
+            !token_text.contains(&confirmation_token),
+            "token stream leaked confirmation token"
+        );
+        assert!(!token_text.contains("confirmation_required"));
+        assert!(!token_text.contains("action_hash"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_error_and_audit_redact_confirmation_token() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::err("placeholder", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-redact-token");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+        executor.set_error(format!(
+            "raw executor failure includes confirmation token {token}"
+        ));
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+        assert_eq!(err, "backup failed: execution_failed");
+        assert!(!err.contains(&token));
+        let audit_text = serde_json::to_string(&audit.events()).unwrap();
+        assert!(!audit_text.contains(&token));
+        assert!(!audit_text.contains("raw executor failure"));
+        assert!(audit_text.contains("execution_failed"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn daemon_agent_pending_turn_outcome_is_registered_and_confirmable() {
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
             id: "tool-1".into(),
