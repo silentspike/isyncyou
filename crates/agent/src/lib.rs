@@ -45,8 +45,8 @@ pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage
 pub use retrieval::RetrievalExecutor;
 pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
 pub use session::{
-    detect_fork, new_ulid, ActiveTurn, InMemoryTransport, LeaseRecord, Session, SessionTransport,
-    Turn, TurnLeaseState,
+    detect_fork, new_ulid, ActiveTurn, FileSessionCache, InMemoryTransport, LeaseRecord,
+    LocalSessionCache, MemorySessionCache, Session, SessionTransport, Turn, TurnLeaseState,
 };
 pub use session_crypto::{KdfProfile, PairingPayload, SessionCryptoConfig};
 pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
@@ -86,9 +86,12 @@ mod tests {
     fn public_session_api_has_no_lease_free_cloud_append() {
         let session = include_str!("session.rs");
         let session_impl = session
-            .split("impl<T: SessionTransport> Session<T>")
+            .split("impl<T: SessionTransport, C: LocalSessionCache> Session<T, C>")
             .nth(1)
-            .and_then(|s| s.split("impl<T: SessionTransport> ActiveTurn").next())
+            .and_then(|s| {
+                s.split("impl<T: SessionTransport, C: LocalSessionCache> ActiveTurn")
+                    .next()
+            })
             .expect("session impl block");
         assert!(!session_impl.contains("pub fn append("));
         assert!(!session.contains("append_lease_free_for_test"));

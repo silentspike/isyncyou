@@ -12,6 +12,7 @@ use crate::session_ids::{DeviceId, LeaseId, SessionId, TurnId};
 use crate::AgentError;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One conversation turn (the plaintext that gets sealed per file).
@@ -57,8 +58,8 @@ pub struct LeaseRecord {
     pub observed_head: Option<TurnId>,
 }
 
-pub struct ActiveTurn<'a, T: SessionTransport> {
-    session: &'a Session<T>,
+pub struct ActiveTurn<'a, T: SessionTransport, C: LocalSessionCache = MemorySessionCache> {
+    session: &'a Session<T, C>,
     lease: LeaseRecord,
     next_observed_head: Option<TurnId>,
     finished: bool,
@@ -175,6 +176,167 @@ pub trait SessionTransport {
     fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError>;
 }
 
+pub trait LocalSessionCache {
+    fn put_pending(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        bytes: &[u8],
+    ) -> Result<(), AgentError>;
+    fn list_pending(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError>;
+    fn get_pending(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError>;
+    fn remove_pending(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<(), AgentError>;
+}
+
+#[derive(Default)]
+pub struct MemorySessionCache {
+    pending: std::cell::RefCell<std::collections::HashMap<(SessionId, TurnId), Vec<u8>>>,
+}
+
+impl MemorySessionCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl LocalSessionCache for MemorySessionCache {
+    fn put_pending(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        bytes: &[u8],
+    ) -> Result<(), AgentError> {
+        self.pending
+            .borrow_mut()
+            .insert((session_id.clone(), turn_id.clone()), bytes.to_vec());
+        Ok(())
+    }
+
+    fn list_pending(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError> {
+        Ok(self
+            .pending
+            .borrow()
+            .keys()
+            .filter(|(s, _)| s == session_id)
+            .map(|(_, t)| t.clone())
+            .collect())
+    }
+
+    fn get_pending(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError> {
+        self.pending
+            .borrow()
+            .get(&(session_id.clone(), turn_id.clone()))
+            .cloned()
+            .ok_or_else(|| AgentError::Provider(format!("no pending turn {session_id}/{turn_id}")))
+    }
+
+    fn remove_pending(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<(), AgentError> {
+        self.pending
+            .borrow_mut()
+            .remove(&(session_id.clone(), turn_id.clone()));
+        Ok(())
+    }
+}
+
+pub struct FileSessionCache {
+    root: PathBuf,
+}
+
+impl FileSessionCache {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn pending_dir(&self, session_id: &SessionId) -> PathBuf {
+        self.root.join(session_id.as_str()).join("pending")
+    }
+
+    fn pending_path(&self, session_id: &SessionId, turn_id: &TurnId) -> PathBuf {
+        self.pending_dir(session_id)
+            .join(format!("{}.json", turn_id.as_str()))
+    }
+
+    fn ensure_safe_parent(&self, session_id: &SessionId) -> Result<PathBuf, AgentError> {
+        reject_symlink(&self.root)?;
+        let session_dir = self.root.join(session_id.as_str());
+        reject_symlink(&session_dir)?;
+        let pending_dir = session_dir.join("pending");
+        reject_symlink(&pending_dir)?;
+        std::fs::create_dir_all(&pending_dir).map_err(|e| AgentError::Provider(e.to_string()))?;
+        Ok(pending_dir)
+    }
+}
+
+impl LocalSessionCache for FileSessionCache {
+    fn put_pending(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        bytes: &[u8],
+    ) -> Result<(), AgentError> {
+        let pending_dir = self.ensure_safe_parent(session_id)?;
+        let final_path = self.pending_path(session_id, turn_id);
+        let tmp_path = pending_dir.join(format!("{}.{}.tmp", turn_id.as_str(), new_ulid()?));
+        std::fs::write(&tmp_path, bytes).map_err(|e| AgentError::Provider(e.to_string()))?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| AgentError::Provider(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_pending(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError> {
+        let pending_dir = self.pending_dir(session_id);
+        reject_symlink(&pending_dir)?;
+        if !pending_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for entry in
+            std::fs::read_dir(&pending_dir).map_err(|e| AgentError::Provider(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| AgentError::Provider(e.to_string()))?;
+            if entry
+                .file_type()
+                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .is_file()
+            {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(id) = name.strip_suffix(".json") {
+                        ids.push(TurnId::new(id)?);
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    fn get_pending(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<Vec<u8>, AgentError> {
+        let path = self.pending_path(session_id, turn_id);
+        reject_symlink(&path)?;
+        std::fs::read(path).map_err(|e| AgentError::Provider(e.to_string()))
+    }
+
+    fn remove_pending(&self, session_id: &SessionId, turn_id: &TurnId) -> Result<(), AgentError> {
+        let path = self.pending_path(session_id, turn_id);
+        reject_symlink(&path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AgentError::Provider(e.to_string())),
+        }
+    }
+}
+
+fn reject_symlink(path: &Path) -> Result<(), AgentError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(AgentError::Provider(format!(
+            "session cache path is symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AgentError::Provider(e.to_string())),
+    }
+}
+
 // ----- session -----
 
 /// Detect a fork: two or more turns authored against the same `observed_head`.
@@ -196,17 +358,16 @@ pub fn detect_fork(turns: &[Turn]) -> Vec<String> {
 }
 
 /// An encrypted, conflict-safe session over a [`SessionTransport`].
-pub struct Session<T: SessionTransport> {
+pub struct Session<T: SessionTransport, C: LocalSessionCache = MemorySessionCache> {
     pub session_id: SessionId,
     crypto_config: SessionCryptoConfig,
     session_key: SessionKey,
     transport: T,
-    /// Sealed turns not yet confirmed on the transport (offline cache).
-    pending: std::cell::RefCell<Vec<SealedTurn>>,
+    cache: C,
     head: std::cell::RefCell<Option<TurnId>>,
 }
 
-impl<T: SessionTransport> Session<T> {
+impl<T: SessionTransport> Session<T, MemorySessionCache> {
     pub fn new(
         session_id: impl AsRef<str>,
         pairing_secret: Vec<u8>,
@@ -222,13 +383,31 @@ impl<T: SessionTransport> Session<T> {
         transport: T,
         crypto_config: SessionCryptoConfig,
     ) -> Result<Self, AgentError> {
+        Self::new_with_cache(
+            session_id,
+            pairing_secret,
+            transport,
+            crypto_config,
+            MemorySessionCache::new(),
+        )
+    }
+}
+
+impl<T: SessionTransport, C: LocalSessionCache> Session<T, C> {
+    pub fn new_with_cache(
+        session_id: impl AsRef<str>,
+        pairing_secret: Vec<u8>,
+        transport: T,
+        crypto_config: SessionCryptoConfig,
+        cache: C,
+    ) -> Result<Self, AgentError> {
         let session_key = SessionKey::derive(&pairing_secret, &crypto_config)?;
         Ok(Self {
             session_id: SessionId::new(session_id.as_ref())?,
             crypto_config,
             session_key,
             transport,
-            pending: std::cell::RefCell::new(Vec::new()),
+            cache,
             head: std::cell::RefCell::new(None),
         })
     }
@@ -236,7 +415,7 @@ impl<T: SessionTransport> Session<T> {
     pub fn begin_active_turn(
         &self,
         device_id: &DeviceId,
-    ) -> Result<Option<ActiveTurn<'_, T>>, AgentError> {
+    ) -> Result<Option<ActiveTurn<'_, T, C>>, AgentError> {
         let observed_head = self.head.borrow().clone();
         if !self.transport.acquire_lease(&self.session_id, device_id)? {
             return Ok(None);
@@ -268,7 +447,8 @@ impl<T: SessionTransport> Session<T> {
             content,
             TurnLeaseState::offline_unleased(device_id),
         )?;
-        self.pending.borrow_mut().push(sealed);
+        let bytes = serde_json::to_vec(&sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
+        self.cache.put_pending(&self.session_id, &turn_id, &bytes)?;
         *self.head.borrow_mut() = Some(turn_id);
         Ok(turn)
     }
@@ -319,20 +499,17 @@ impl<T: SessionTransport> Session<T> {
         let present: std::collections::HashSet<TurnId> =
             self.transport.list(&self.session_id)?.into_iter().collect();
         let mut uploaded = 0;
-        let mut still_pending = Vec::new();
-        for sealed in self.pending.borrow().iter() {
-            let turn_id = TurnId::new(&sealed.ulid)?;
+        for turn_id in self.cache.list_pending(&self.session_id)? {
             if present.contains(&turn_id) {
+                self.cache.remove_pending(&self.session_id, &turn_id)?;
                 continue; // already there — no duplicate
             }
-            let bytes =
-                serde_json::to_vec(sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
-            match self.transport.put(&self.session_id, &turn_id, &bytes) {
-                Ok(()) => uploaded += 1,
-                Err(_) => still_pending.push(sealed.clone()),
+            let bytes = self.cache.get_pending(&self.session_id, &turn_id)?;
+            if let Ok(()) = self.transport.put(&self.session_id, &turn_id, &bytes) {
+                self.cache.remove_pending(&self.session_id, &turn_id)?;
+                uploaded += 1;
             }
         }
-        *self.pending.borrow_mut() = still_pending;
         Ok(uploaded)
     }
 
@@ -353,11 +530,17 @@ impl<T: SessionTransport> Session<T> {
             }
             sealed_by_ulid.insert(turn_id, sealed);
         }
-        for sealed in self.pending.borrow().iter() {
-            let turn_id = TurnId::new(&sealed.ulid)?;
-            sealed_by_ulid
-                .entry(turn_id)
-                .or_insert_with(|| sealed.clone());
+        for turn_id in self.cache.list_pending(&self.session_id)? {
+            let bytes = self.cache.get_pending(&self.session_id, &turn_id)?;
+            let sealed: SealedTurn =
+                serde_json::from_slice(&bytes).map_err(|e| AgentError::Provider(e.to_string()))?;
+            if sealed.ulid != turn_id.as_str() {
+                return Err(AgentError::Provider(format!(
+                    "pending turn id mismatch: file {} envelope {}",
+                    turn_id, sealed.ulid
+                )));
+            }
+            sealed_by_ulid.entry(turn_id).or_insert(sealed);
         }
         let mut turns = Vec::with_capacity(sealed_by_ulid.len());
         for (_ulid, sealed) in sealed_by_ulid {
@@ -380,7 +563,7 @@ impl<T: SessionTransport> Session<T> {
     }
 }
 
-impl<T: SessionTransport> ActiveTurn<'_, T> {
+impl<T: SessionTransport, C: LocalSessionCache> ActiveTurn<'_, T, C> {
     pub fn lease(&self) -> &LeaseRecord {
         &self.lease
     }
@@ -828,6 +1011,103 @@ mod tests {
                 device_id: "deviceA".into()
             }
         );
+    }
+
+    #[test]
+    fn filesystem_cache_persists_offline_pending_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crypto_config();
+        let first = Session::new_with_cache(
+            "sess1",
+            KEY.to_vec(),
+            InMemoryTransport::new(),
+            config.clone(),
+            FileSessionCache::new(dir.path()),
+        )
+        .unwrap();
+        let turn = first
+            .append_offline_pending(&did("deviceA"), "user", "restart-sentinel")
+            .unwrap();
+        drop(first);
+
+        let second = Session::new_with_cache(
+            "sess1",
+            KEY.to_vec(),
+            InMemoryTransport::new(),
+            config,
+            FileSessionCache::new(dir.path()),
+        )
+        .unwrap();
+        let loaded = second.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].ulid, turn.ulid);
+        assert_eq!(loaded[0].content, "restart-sentinel");
+    }
+
+    #[test]
+    fn filesystem_cache_stores_sealed_pending_bytes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileSessionCache::new(dir.path());
+        let session = Session::new_with_cache(
+            "sess1",
+            KEY.to_vec(),
+            InMemoryTransport::new(),
+            crypto_config(),
+            cache,
+        )
+        .unwrap();
+        let turn = session
+            .append_offline_pending(&did("deviceA"), "user", "PLAINTEXT-PENDING-SENTINEL")
+            .unwrap();
+        let path = session.cache.pending_path(&sid("sess1"), &tid(&turn.ulid));
+        let raw = std::fs::read(path).unwrap();
+        let raw_text = String::from_utf8_lossy(&raw);
+        assert!(!raw_text.contains("PLAINTEXT-PENDING-SENTINEL"));
+        assert!(raw_text.contains("\"ct\""));
+    }
+
+    #[test]
+    fn sync_pending_removes_files_after_success_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = std::rc::Rc::new(InMemoryTransport::new());
+        let cache = FileSessionCache::new(dir.path());
+        let session = Session::new_with_cache(
+            "sess1",
+            KEY.to_vec(),
+            RcTransport(transport.clone()),
+            crypto_config(),
+            cache,
+        )
+        .unwrap();
+        let turn = session
+            .append_offline_pending(&did("deviceA"), "user", "sync-me")
+            .unwrap();
+        assert_eq!(session.cache.list_pending(&sid("sess1")).unwrap().len(), 1);
+        assert_eq!(session.sync().unwrap(), 1);
+        assert!(session
+            .cache
+            .list_pending(&sid("sess1"))
+            .unwrap()
+            .is_empty());
+        assert!(transport.raw(&sid("sess1"), &tid(&turn.ulid)).is_some());
+        assert_eq!(session.sync().unwrap(), 0);
+    }
+
+    #[test]
+    fn filesystem_cache_rejects_symlink_and_traversal_hazards() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileSessionCache::new(dir.path());
+        assert!(SessionId::new("../bad").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path(), dir.path().join("sess1")).unwrap();
+            let err = cache
+                .put_pending(&sid("sess1"), &tid(TURN_A), b"sealed")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("symlink"), "{err}");
+        }
     }
 
     #[test]
