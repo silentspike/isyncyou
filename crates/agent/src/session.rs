@@ -8,7 +8,7 @@
 //! one. An **active-turn lease** prevents forks; **fork detection** is the fallback.
 
 use crate::session_crypto::{self, SealedTurn, SessionCryptoConfig, SessionKey};
-use crate::session_ids::{DeviceId, SessionId, TurnId};
+use crate::session_ids::{DeviceId, LeaseId, SessionId, TurnId};
 use crate::AgentError;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,45 @@ pub struct Turn {
     /// The head this turn was authored against (for fork detection).
     pub observed_head: Option<String>,
     pub parent_turn_ids: Vec<String>,
+    pub lease_state: TurnLeaseState,
     pub ts_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TurnLeaseState {
+    Active { device_id: String, lease_id: String },
+    OfflineUnleased { device_id: String },
+}
+
+impl TurnLeaseState {
+    fn active(device_id: &DeviceId, lease_id: &LeaseId) -> Self {
+        Self::Active {
+            device_id: device_id.to_string(),
+            lease_id: lease_id.to_string(),
+        }
+    }
+
+    fn offline_unleased(device_id: &DeviceId) -> Self {
+        Self::OfflineUnleased {
+            device_id: device_id.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRecord {
+    pub session_id: SessionId,
+    pub holder_device_id: DeviceId,
+    pub lease_id: LeaseId,
+    pub observed_head: Option<TurnId>,
+}
+
+pub struct ActiveTurn<'a, T: SessionTransport> {
+    session: &'a Session<T>,
+    lease: LeaseRecord,
+    next_observed_head: Option<TurnId>,
+    finished: bool,
 }
 
 // ----- ULID (timestamp-ordered, Crockford base32) -----
@@ -80,7 +118,6 @@ pub fn new_ulid() -> Result<String, AgentError> {
 /// Increment a 26-char Crockford ULID by 1 (with carry). Used for ULID **monotonicity**:
 /// when two turns are created in the same millisecond, the next is derived from the last
 /// so ordering still equals creation order.
-#[cfg(test)]
 fn increment_turn_id(id: &TurnId) -> Result<TurnId, AgentError> {
     let mut chars: Vec<u8> = id.as_str().bytes().collect();
     for i in (0..chars.len()).rev() {
@@ -133,6 +170,7 @@ pub trait SessionTransport {
     fn list(&self, session_id: &SessionId) -> Result<Vec<TurnId>, AgentError>;
     /// Try to acquire the single active-turn lease; `true` if acquired.
     fn acquire_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError>;
+    fn renew_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError>;
     fn release_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<(), AgentError>;
     fn current_lease(&self, session_id: &SessionId) -> Result<Option<DeviceId>, AgentError>;
 }
@@ -165,7 +203,6 @@ pub struct Session<T: SessionTransport> {
     transport: T,
     /// Sealed turns not yet confirmed on the transport (offline cache).
     pending: std::cell::RefCell<Vec<SealedTurn>>,
-    #[cfg(test)]
     head: std::cell::RefCell<Option<TurnId>>,
 }
 
@@ -192,17 +229,57 @@ impl<T: SessionTransport> Session<T> {
             session_key,
             transport,
             pending: std::cell::RefCell::new(Vec::new()),
-            #[cfg(test)]
             head: std::cell::RefCell::new(None),
         })
     }
 
-    /// Temporary internal helper until the public ActiveTurn/offline APIs are wired.
-    /// This intentionally stays non-public so external callers cannot write turns without
-    /// either a lease or an explicit offline-pending path.
-    #[cfg(test)]
-    fn append_lease_free_for_test(&self, role: &str, content: &str) -> Result<Turn, AgentError> {
+    pub fn begin_active_turn(
+        &self,
+        device_id: &DeviceId,
+    ) -> Result<Option<ActiveTurn<'_, T>>, AgentError> {
         let observed_head = self.head.borrow().clone();
+        if !self.transport.acquire_lease(&self.session_id, device_id)? {
+            return Ok(None);
+        }
+        let lease = LeaseRecord {
+            session_id: self.session_id.clone(),
+            holder_device_id: device_id.clone(),
+            lease_id: LeaseId::new(new_ulid()?)?,
+            observed_head,
+        };
+        Ok(Some(ActiveTurn {
+            session: self,
+            next_observed_head: lease.observed_head.clone(),
+            lease,
+            finished: false,
+        }))
+    }
+
+    pub fn append_offline_pending(
+        &self,
+        device_id: &DeviceId,
+        role: &str,
+        content: &str,
+    ) -> Result<Turn, AgentError> {
+        let observed_head = self.head.borrow().clone();
+        let (turn_id, turn, sealed) = self.prepare_turn(
+            observed_head,
+            role,
+            content,
+            TurnLeaseState::offline_unleased(device_id),
+        )?;
+        self.pending.borrow_mut().push(sealed);
+        *self.head.borrow_mut() = Some(turn_id);
+        Ok(turn)
+    }
+
+    fn prepare_turn(
+        &self,
+        observed_head: Option<TurnId>,
+        role: &str,
+        content: &str,
+        lease_state: TurnLeaseState,
+    ) -> Result<(TurnId, Turn, SealedTurn), AgentError> {
         // Monotonic ULID: strictly increasing even within one millisecond, so load order
         // equals append order.
         let mut turn_id = new_turn_id()?;
@@ -221,6 +298,7 @@ impl<T: SessionTransport> Session<T> {
             content: content.to_string(),
             observed_head: observed_head.as_ref().map(ToString::to_string),
             parent_turn_ids: observed_head.into_iter().map(|id| id.to_string()).collect(),
+            lease_state,
             ts_ms,
         };
         let plaintext =
@@ -232,17 +310,7 @@ impl<T: SessionTransport> Session<T> {
             &turn_id,
             &plaintext,
         )?;
-        let bytes = serde_json::to_vec(&sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
-        if self
-            .transport
-            .put(&self.session_id, &turn_id, &bytes)
-            .is_err()
-        {
-            // Offline: keep locally and sync later (idempotent by ULID).
-            self.pending.borrow_mut().push(sealed);
-        }
-        *self.head.borrow_mut() = Some(turn_id);
-        Ok(turn)
+        Ok((turn_id, turn, sealed))
     }
 
     /// Upload any pending (offline-written) turns that the transport does not yet have.
@@ -312,6 +380,42 @@ impl<T: SessionTransport> Session<T> {
     }
 }
 
+impl<T: SessionTransport> ActiveTurn<'_, T> {
+    pub fn lease(&self) -> &LeaseRecord {
+        &self.lease
+    }
+
+    pub fn append(&mut self, role: &str, content: &str) -> Result<Turn, AgentError> {
+        let (turn_id, turn, sealed) = self.session.prepare_turn(
+            self.next_observed_head.clone(),
+            role,
+            content,
+            TurnLeaseState::active(&self.lease.holder_device_id, &self.lease.lease_id),
+        )?;
+        let bytes = serde_json::to_vec(&sealed).map_err(|e| AgentError::Provider(e.to_string()))?;
+        self.session
+            .transport
+            .put(&self.lease.session_id, &turn_id, &bytes)?;
+        *self.session.head.borrow_mut() = Some(turn_id);
+        self.next_observed_head = Some(TurnId::new(&turn.ulid)?);
+        Ok(turn)
+    }
+
+    pub fn renew(&mut self) -> Result<bool, AgentError> {
+        self.session
+            .transport
+            .renew_lease(&self.lease.session_id, &self.lease.holder_device_id)
+    }
+
+    pub fn finish(mut self) -> Result<(), AgentError> {
+        self.session
+            .transport
+            .release_lease(&self.lease.session_id, &self.lease.holder_device_id)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
 // ----- in-memory transport (tests + offline simulation) -----
 
 /// In-memory [`SessionTransport`] with an `offline` switch, for tests.
@@ -320,6 +424,7 @@ pub struct InMemoryTransport {
     files: std::cell::RefCell<std::collections::HashMap<(SessionId, TurnId), Vec<u8>>>,
     lease: std::cell::RefCell<std::collections::HashMap<SessionId, DeviceId>>,
     offline: std::cell::Cell<bool>,
+    put_count: std::cell::Cell<usize>,
 }
 
 impl InMemoryTransport {
@@ -343,6 +448,10 @@ impl InMemoryTransport {
             .get(&(session_id.clone(), turn_id.clone()))
             .cloned()
     }
+
+    pub fn put_count(&self) -> usize {
+        self.put_count.get()
+    }
 }
 
 impl SessionTransport for InMemoryTransport {
@@ -353,6 +462,7 @@ impl SessionTransport for InMemoryTransport {
         bytes: &[u8],
     ) -> Result<(), AgentError> {
         self.guard()?;
+        self.put_count.set(self.put_count.get() + 1);
         self.files
             .borrow_mut()
             .insert((session_id.clone(), turn_id.clone()), bytes.to_vec());
@@ -386,6 +496,15 @@ impl SessionTransport for InMemoryTransport {
                 Ok(true)
             }
         }
+    }
+    fn renew_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<bool, AgentError> {
+        self.guard()?;
+        Ok(self
+            .lease
+            .borrow()
+            .get(session_id)
+            .map(|h| h == holder)
+            .unwrap_or(false))
     }
     fn release_lease(&self, session_id: &SessionId, holder: &DeviceId) -> Result<(), AgentError> {
         let mut lease = self.lease.borrow_mut();
@@ -478,6 +597,13 @@ mod onedrive {
                 .map(|_| true)
                 .map_err(|e| AgentError::Transport(e.to_string()))
         }
+        fn renew_lease(
+            &self,
+            session_id: &SessionId,
+            holder: &DeviceId,
+        ) -> Result<bool, AgentError> {
+            Ok(self.current_lease(session_id)?.as_ref() == Some(holder))
+        }
         fn release_lease(
             &self,
             _session_id: &SessionId,
@@ -531,6 +657,10 @@ mod tests {
         SessionKey::derive(KEY, config).unwrap()
     }
 
+    fn test_lease_state() -> TurnLeaseState {
+        TurnLeaseState::offline_unleased(&did("fixture"))
+    }
+
     #[test]
     fn ulid_is_26_chars_and_time_ordered() {
         assert_eq!(new_ulid().unwrap().len(), 26);
@@ -543,10 +673,10 @@ mod tests {
     #[test]
     fn append_then_load_roundtrips() {
         let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
-        s.append_lease_free_for_test("user", "find the spotify invoice")
-            .unwrap();
-        s.append_lease_free_for_test("assistant", "it is item-42")
-            .unwrap();
+        let mut active = s.begin_active_turn(&did("deviceA")).unwrap().unwrap();
+        active.append("user", "find the spotify invoice").unwrap();
+        active.append("assistant", "it is item-42").unwrap();
+        active.finish().unwrap();
         let turns = s.load().unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -562,11 +692,10 @@ mod tests {
     fn appends_are_strictly_monotonic_even_within_one_ms() {
         // 50 rapid appends almost certainly share a millisecond; monotonicity must hold.
         let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
+        let mut active = s.begin_active_turn(&did("deviceA")).unwrap().unwrap();
         let mut prev = String::new();
         for i in 0..50 {
-            let t = s
-                .append_lease_free_for_test("user", &format!("turn {i}"))
-                .unwrap();
+            let t = active.append("user", &format!("turn {i}")).unwrap();
             assert!(
                 t.ulid > prev,
                 "ulid must strictly increase: {} !> {}",
@@ -575,6 +704,7 @@ mod tests {
             );
             prev = t.ulid;
         }
+        active.finish().unwrap();
         let contents: Vec<String> = s.load().unwrap().into_iter().map(|t| t.content).collect();
         let expected: Vec<String> = (0..50).map(|i| format!("turn {i}")).collect();
         assert_eq!(contents, expected); // load order == append order
@@ -593,6 +723,7 @@ mod tests {
                 content: format!("c-{ulid}"),
                 observed_head: None,
                 parent_turn_ids: vec![],
+                lease_state: test_lease_state(),
                 ts_ms: 0,
             };
             let pt = serde_json::to_vec(&turn).unwrap();
@@ -615,9 +746,11 @@ mod tests {
         // RcTransport lets the test toggle offline on the same transport the session uses.
         let t = std::rc::Rc::new(InMemoryTransport::new());
         let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone())).unwrap();
-        t.set_offline(true);
-        s.append_lease_free_for_test("user", "a").unwrap(); // queue locally
-        s.append_lease_free_for_test("assistant", "b").unwrap();
+        s.append_offline_pending(&did("deviceA"), "user", "a")
+            .unwrap();
+        s.append_offline_pending(&did("deviceA"), "assistant", "b")
+            .unwrap();
+        assert_eq!(t.put_count(), 0);
         t.set_offline(false);
         assert_eq!(s.sync().unwrap(), 2); // two uploaded
         assert_eq!(s.sync().unwrap(), 0); // idempotent — no duplicates
@@ -627,10 +760,74 @@ mod tests {
     #[test]
     fn lease_prevents_concurrent_turns() {
         let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
-        assert!(s.begin_turn(&did("deviceA")).unwrap());
-        assert!(!s.begin_turn(&did("deviceB")).unwrap()); // A holds it
-        s.end_turn(&did("deviceA")).unwrap();
-        assert!(s.begin_turn(&did("deviceB")).unwrap()); // now free
+        let active = s.begin_active_turn(&did("deviceA")).unwrap();
+        assert!(active.is_some());
+        assert!(s.begin_active_turn(&did("deviceB")).unwrap().is_none()); // A holds it
+        active.unwrap().finish().unwrap();
+        assert!(s.begin_active_turn(&did("deviceB")).unwrap().is_some()); // now free
+    }
+
+    #[test]
+    fn active_turn_records_observed_head_and_lease_state() {
+        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
+        let mut first = s.begin_active_turn(&did("deviceA")).unwrap().unwrap();
+        assert!(first.lease().observed_head.is_none());
+        let first_turn = first.append("user", "first").unwrap();
+        first.finish().unwrap();
+
+        let mut second = s.begin_active_turn(&did("deviceA")).unwrap().unwrap();
+        assert_eq!(
+            second
+                .lease()
+                .observed_head
+                .as_ref()
+                .map(ToString::to_string),
+            Some(first_turn.ulid.clone())
+        );
+        let second_turn = second.append("assistant", "second").unwrap();
+        assert_eq!(
+            second_turn.observed_head.as_deref(),
+            Some(first_turn.ulid.as_str())
+        );
+        match second_turn.lease_state {
+            TurnLeaseState::Active {
+                device_id,
+                lease_id,
+            } => {
+                assert_eq!(device_id, "deviceA");
+                assert_eq!(lease_id, second.lease().lease_id.to_string());
+            }
+            other => panic!("unexpected lease state: {other:?}"),
+        }
+        second.finish().unwrap();
+    }
+
+    #[test]
+    fn active_turn_renew_succeeds_only_for_current_holder() {
+        let s = Session::new("sess1", KEY.to_vec(), InMemoryTransport::new()).unwrap();
+        let mut active = s.begin_active_turn(&did("deviceA")).unwrap().unwrap();
+        assert!(active.renew().unwrap());
+        active.finish().unwrap();
+        assert!(!s
+            .transport
+            .renew_lease(&sid("sess1"), &did("deviceA"))
+            .unwrap());
+    }
+
+    #[test]
+    fn offline_append_records_unleased_fork_risk_and_skips_transport_put() {
+        let t = std::rc::Rc::new(InMemoryTransport::new());
+        let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone())).unwrap();
+        let turn = s
+            .append_offline_pending(&did("deviceA"), "user", "offline")
+            .unwrap();
+        assert_eq!(t.put_count(), 0);
+        assert_eq!(
+            turn.lease_state,
+            TurnLeaseState::OfflineUnleased {
+                device_id: "deviceA".into()
+            }
+        );
     }
 
     #[test]
@@ -641,6 +838,7 @@ mod tests {
             content: "x".into(),
             observed_head: head.map(|h| h.into()),
             parent_turn_ids: head.into_iter().map(|h| h.to_string()).collect(),
+            lease_state: test_lease_state(),
             ts_ms: 0,
         };
         let linear = vec![mk("01", None), mk("02", Some("01"))];
@@ -656,9 +854,9 @@ mod tests {
     fn only_ciphertext_is_stored_no_plaintext() {
         let t = std::rc::Rc::new(InMemoryTransport::new());
         let s = Session::new("sess1", KEY.to_vec(), RcTransport(t.clone())).unwrap();
-        let turn = s
-            .append_lease_free_for_test("user", "VERY-SECRET-MAIL-CONTENT")
-            .unwrap();
+        let mut active = s.begin_active_turn(&did("deviceA")).unwrap().unwrap();
+        let turn = active.append("user", "VERY-SECRET-MAIL-CONTENT").unwrap();
+        active.finish().unwrap();
         let raw = t.raw(&sid("sess1"), &tid(&turn.ulid)).unwrap();
         assert!(!String::from_utf8_lossy(&raw).contains("VERY-SECRET-MAIL-CONTENT"));
     }
@@ -698,6 +896,7 @@ mod tests {
             content: "mismatch".into(),
             observed_head: None,
             parent_turn_ids: vec![],
+            lease_state: test_lease_state(),
             ts_ms: 0,
         };
         let plaintext = serde_json::to_vec(&turn).unwrap();
@@ -730,6 +929,9 @@ mod tests {
         }
         fn acquire_lease(&self, s: &SessionId, h: &DeviceId) -> Result<bool, AgentError> {
             self.0.acquire_lease(s, h)
+        }
+        fn renew_lease(&self, s: &SessionId, h: &DeviceId) -> Result<bool, AgentError> {
+            self.0.renew_lease(s, h)
         }
         fn release_lease(&self, s: &SessionId, h: &DeviceId) -> Result<(), AgentError> {
             self.0.release_lease(s, h)

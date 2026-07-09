@@ -354,7 +354,6 @@ fn ensure_envelope_matches_config(
 }
 
 /// Seal a turn's plaintext into a [`SealedTurn`] envelope.
-#[cfg(test)]
 pub(crate) fn seal(
     session_key: &SessionKey,
     config: &SessionCryptoConfig,
