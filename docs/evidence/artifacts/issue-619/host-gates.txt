@@ -1,0 +1,32 @@
+# Issue #619 Host Gates
+
+Generated: 2026-07-09T10:00:46+02:00
+Branch: feature/ag-619
+Base: origin/dev
+Commit under test: ed66467768508d034746915f4604899529fcb475
+
+Commands and observed results:
+
+- PASS: cargo +1.95.0 fmt --all --check
+- PASS: cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features onedrive,retrieval -- -D warnings
+- PASS: cargo +1.95.0 clippy -p isyncyou-graph --all-targets --features http -- -D warnings
+- PASS: cargo +1.95.0 test -p isyncyou-agent --features onedrive,retrieval -- --nocapture
+  - Result: 117 passed, 0 failed, 1 ignored live OneDrive integration test.
+- PASS: cargo +1.95.0 test -p isyncyou-graph --features http -- --nocapture
+  - Result: 108 passed, 0 failed, 7 ignored live tests.
+- PASS: python3 tools/check_traceability.py
+  - Result: 65 total requirements, 60 implemented, 5 planned; every implemented requirement is traceable to existing tests.
+- PASS: python3 tools/check_evidence.py --manifest docs/evidence/issue-619-manifest.json
+  - Result: issue-619 manifest is schema-valid; manifest commit exists; every cited requirement exists; every test entry names a real test; every artifact exists.
+- PASS: git diff --check origin/dev...HEAD
+
+Separate live/device evidence:
+
+- PASS: Pixel 8 Pro JNI KDF benchmark, saved as docs/evidence/artifacts/issue-619/kdf-benchmark-pixel8pro.json.
+- PASS: Live OneDrive ciphertext/lease/cleanup probe, saved as docs/evidence/artifacts/issue-619/live-onedrive-session-roundtrip.json.
+
+Release boundary:
+
+- No release workflow was run.
+- No manual tag was created.
+- No public RC artifact was created.
