@@ -1439,6 +1439,38 @@ a.note-meta-chip:hover { color: var(--accent); }
   margin-top: var(--sp-1);
   font-size: var(--fs-sm);
 }
+.asst-citations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.asst-citation {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--bg-2);
+  color: var(--text-mid);
+  font-size: var(--fs-sm);
+  text-decoration: none;
+}
+.asst-citation:hover {
+  color: var(--text-hi);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  text-decoration: none;
+}
+.asst-citation span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .assistant-composer {
   position: sticky;
   bottom: 0;

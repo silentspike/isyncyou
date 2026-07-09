@@ -8545,6 +8545,51 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_citations_are_typed_same_origin_and_deduped() {
+        for needle in [
+            "function normalizeAgentSource(value)",
+            "function extractAgentSources(event)",
+            "function sourceViewHref(source)",
+            "function renderAgentCitation(source)",
+            "function renderAgentCitationBar(sources)",
+            "function dedupeAgentSources(sources)",
+            "return JSON.stringify([source.service, source.id || \"\", source.path || \"\"]);",
+            "if (event.event === \"partial_result\") visit(event.items || [], 0);",
+            "else if (event.event === \"tool_result\" && typeof event.content === \"string\")",
+            "try { visit(JSON.parse(event.content), 0); } catch (_) {}",
+            "return q ? \"/api/v1/view?\" + qs(q) : null;",
+            "\"data-agent-citation\": \"view\"",
+            "\"data-agent-citation\": \"route\"",
+            "turnState.addCitations(extractAgentSources(d));",
+            "if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 citation invariant: {needle}"
+            );
+        }
+        let start = APP_JS
+            .find("function normalizeAgentSource")
+            .expect("citation helper start");
+        let end = APP_JS
+            .find("function asstResultCard")
+            .expect("citation helper end");
+        let citation_helpers = &APP_JS[start..end];
+        assert!(
+            !citation_helpers.contains("http://") && !citation_helpers.contains("https://"),
+            "Assistant citation helpers must not introduce external citation URLs"
+        );
+        assert!(
+            !citation_helpers.contains("innerHTML"),
+            "Assistant citation helpers must render text-only DOM"
+        );
+        assert!(
+            !citation_helpers.contains("token") && !citation_helpers.contains("action_hash"),
+            "Assistant citation helpers must not inspect pending secrets"
+        );
+    }
+
+    #[test]
     fn app_js_biometric_labels_cover_onedrive_risk_ops() {
         for needle in [
             "\"move-out-of-protected\"",

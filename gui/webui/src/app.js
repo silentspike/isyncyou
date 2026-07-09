@@ -4826,10 +4826,86 @@ function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calend
 function asstViewerFrame(q) {
   return el("iframe", { class: "asst-result-frame", src: `/api/v1/view?${qs(q)}`, title: "Item preview", sandbox: "allow-same-origin" });
 }
+function normalizeAgentSource(value) {
+  if (!value || typeof value !== "object") return null;
+  const raw = value.source && typeof value.source === "object" ? value.source : value;
+  const service = String(raw.service || value.service || "").trim();
+  if (!service || !archiveServices().some(s => s.id === service)) return null;
+  const id = String(raw.id || raw.remote_id || value.id || value.remote_id || "").trim();
+  const path = raw.path || value.path || "";
+  if (!id && !path) return null;
+  return {
+    service,
+    id,
+    path: path ? String(path) : "",
+    name: String(raw.name || value.name || value.displayName || id || service),
+    item_type: String(raw.item_type || value.item_type || value.type || service),
+  };
+}
+function sourceViewQuery(source) {
+  if (!source || !App.account || !source.service || !source.id || !source.path) return null;
+  return { account: App.account, service: source.service, id: source.id };
+}
+function sourceViewHref(source) {
+  const q = sourceViewQuery(source);
+  return q ? "/api/v1/view?" + qs(q) : null;
+}
+function agentSourceKey(source) {
+  return JSON.stringify([source.service, source.id || "", source.path || ""]);
+}
+function dedupeAgentSources(sources) {
+  const seen = new Set();
+  const out = [];
+  (sources || []).forEach((s) => {
+    if (!s) return;
+    const key = agentSourceKey(s);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(s);
+  });
+  return out;
+}
+function extractAgentSources(event) {
+  const found = [];
+  const visit = (value, depth) => {
+    if (depth > 6 || value == null) return;
+    if (Array.isArray(value)) { value.forEach(v => visit(v, depth + 1)); return; }
+    if (typeof value !== "object") return;
+    const src = normalizeAgentSource(value);
+    if (src) found.push(src);
+    Object.entries(value).forEach(([k, v]) => {
+      if (["source", "sources", "results", "items", "result", "data"].includes(k)) visit(v, depth + 1);
+    });
+  };
+  if (!event || typeof event !== "object") return [];
+  if (event.event === "partial_result") visit(event.items || [], 0);
+  else if (event.event === "tool_result" && typeof event.content === "string") {
+    try { visit(JSON.parse(event.content), 0); } catch (_) {}
+  }
+  return dedupeAgentSources(found);
+}
+function renderAgentCitation(source) {
+  const label = source.name || source.id || source.service;
+  const href = sourceViewHref(source);
+  if (href) {
+    return el("a", { class: "asst-citation", href, target: "_blank", rel: "noopener", "data-agent-citation": "view" },
+      icon(asstSvcIcon(source.service), "icon-sm"),
+      el("span", { text: label }));
+  }
+  return el("button", { class: "asst-citation", type: "button", onclick: () => go(source.service), "data-agent-citation": "route" },
+    icon(asstSvcIcon(source.service), "icon-sm"),
+    el("span", { text: label }));
+}
+function renderAgentCitationBar(sources) {
+  const bar = el("div", { class: "asst-citations", "data-agent-citations": "1" });
+  dedupeAgentSources(sources).forEach(source => bar.append(renderAgentCitation(source)));
+  return bar;
+}
 // One typed result: header (name) + one-line preview; click → animated pull-down that
 // lazily embeds the real viewer for the body + a link to open it full-screen.
 function asstResultCard(it) {
-  const q = { account: App.account, service: it.service, id: it.id };
+  const source = normalizeAgentSource(it) || { service: it.service, id: it.id, path: it.path || "", name: it.name || "", item_type: it.item_type || it.service };
+  const viewQ = sourceViewQuery(source);
   const snip = (it.snippet || "").trim();
   const head = el("div", { class: "asst-result-head" },
     el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
@@ -4846,10 +4922,15 @@ function asstResultCard(it) {
     row.classList.toggle("open");
     if (opening && !loaded) {   // lazy: only load the viewer when the user opens the card
       loaded = true;
-      panel.append(
-        asstViewerFrame(q),
-        el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
-          icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+      if (viewQ) {
+        panel.append(
+          asstViewerFrame(viewQ),
+          el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(viewQ), target: "_blank", rel: "noopener" },
+            icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+      } else {
+        panel.append(el("button", { class: "asst-result-open", type: "button", onclick: () => go(source.service) },
+          icon("chevron-right", "icon-sm"), el("span", { text: "Open " + (source.service || "service") })));
+      }
     }
   });
   return row;
@@ -4932,6 +5013,7 @@ function renderAssistantMessage(m) {
   (m.tools || []).forEach(t => bubble.append(renderAgentToolRow(t)));
   (m.errors || []).forEach(e => bubble.append(renderAgentError(e)));
   if (m.pending) bubble.append(renderAgentPendingPlaceholder(m.pending));
+  if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));
   // Re-render the turn's search stages + result cards (persisted in the message), so a view
   // switch brings the whole conversation back — not just the text (#644).
   if ((m.stages && m.stages.length) || (m.results && m.results.length)) bubble.append(asstSearchBlock(m.stages, m.results));
@@ -4958,12 +5040,14 @@ function handleAgentEvent(message, turnState) {
         detail: agentCompactValue(d.content, 120),
         untrusted: !!d.untrusted,
       });
+      turnState.addCitations(extractAgentSources(d));
       break;
     case "search_stage":
       turnState.onSearchStage(d);
       break;
     case "partial_result":
       turnState.onPartialResult(d);
+      turnState.addCitations(extractAgentSources(d));
       break;
     case "confirmation_required": {
       const pending = {
@@ -5017,7 +5101,7 @@ async function agentSend(text) {
 
   AssistantState.transcript.push({ role: "user", text });
   log.append(renderAssistantMessage(AssistantState.transcript[AssistantState.transcript.length - 1]));
-  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [], tools: [], errors: [], pending: null, doneReason: null };
+  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [], tools: [], errors: [], citations: [], pending: null, doneReason: null };
   AssistantState.transcript.push(asst);
   AssistantState.busy = true;
   AssistantState.draft = "";
@@ -5055,6 +5139,16 @@ async function agentSend(text) {
     const old = bubble.querySelector("[data-agent-pending-card]");
     if (old) old.remove();
     bubble.append(renderAgentPendingPlaceholder(pending));
+    log.scrollTop = log.scrollHeight;
+  };
+  let citationsBox = null;
+  const addCitations = (sources) => {
+    const merged = dedupeAgentSources([...(asst.citations || []), ...(sources || [])]);
+    if (merged.length === (asst.citations || []).length) return;
+    asst.citations = merged;
+    if (citationsBox) citationsBox.remove();
+    citationsBox = renderAgentCitationBar(asst.citations);
+    bubble.append(citationsBox);
     log.scrollTop = log.scrollHeight;
   };
 
@@ -5131,6 +5225,7 @@ async function agentSend(text) {
     addToolRow,
     addError,
     setPending,
+    addCitations,
     onSearchStage,
     onPartialResult,
     finish,
