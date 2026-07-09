@@ -9,7 +9,7 @@
 //! The at-rest key comes from an [`AtRestKey`]: [`LocalKey`] resolves it from an env var
 //! or an auto-generated owner-only key file; [`ProvidedKey`] takes a key handed in by the
 //! caller — the seam for Android, where the key is unwrapped by the Android Keystore on
-//! the Kotlin side (#626) and passed to Rust.
+//! the Kotlin side (#620) and passed to Rust.
 
 use crate::AgentError;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -72,6 +72,38 @@ pub trait AtRestKey {
 
 /// Env var holding a base64 32-byte at-rest key (highest precedence).
 pub const CRED_KEY_ENV: &str = "ISYNCYOU_AGENT_CRED_KEY";
+
+/// Process-installed credential key (mobile: Android Keystore-unwrapped data key).
+static INSTALLED_CREDENTIAL_KEY: std::sync::OnceLock<std::sync::Mutex<Option<[u8; KEY_LEN]>>> =
+    std::sync::OnceLock::new();
+
+fn installed_credential_key() -> Option<[u8; KEY_LEN]> {
+    INSTALLED_CREDENTIAL_KEY
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .copied()
+}
+
+/// Install the process credential key (mobile: from the Android Keystore, #620).
+///
+/// This overrides env/local-file resolution for every subsequent resolver so app-host
+/// consumers do not accidentally fall back to a different local key path on Android.
+pub fn set_process_credential_key(secret: [u8; KEY_LEN]) {
+    *INSTALLED_CREDENTIAL_KEY
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(secret);
+}
+
+#[cfg(test)]
+fn reset_process_credential_key_for_tests() {
+    *INSTALLED_CREDENTIAL_KEY
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
 
 /// Resolves the at-rest key from `ISYNCYOU_AGENT_CRED_KEY`, else an owner-only key file
 /// beside the store (auto-generated on first use — encrypted-at-rest by default).
@@ -164,6 +196,7 @@ impl CredentialStoreConfig {
 #[derive(Clone, PartialEq, Eq)]
 pub enum CredentialKeySource {
     Provided,
+    ProcessInstalled,
     EnvOrLocalFile,
 }
 
@@ -171,6 +204,9 @@ impl fmt::Debug for CredentialKeySource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CredentialKeySource::Provided => write!(f, "CredentialKeySource::Provided"),
+            CredentialKeySource::ProcessInstalled => {
+                write!(f, "CredentialKeySource::ProcessInstalled")
+            }
             CredentialKeySource::EnvOrLocalFile => write!(f, "CredentialKeySource::EnvOrLocalFile"),
         }
     }
@@ -203,6 +239,7 @@ impl CredentialStoreResolver {
     pub fn key_source(&self) -> CredentialKeySource {
         match self.provided_key {
             Some(_) => CredentialKeySource::Provided,
+            None if installed_credential_key().is_some() => CredentialKeySource::ProcessInstalled,
             None => CredentialKeySource::EnvOrLocalFile,
         }
     }
@@ -210,7 +247,7 @@ impl CredentialStoreResolver {
     pub fn resolve(&self) -> Result<AgentCredentialStore, AgentError> {
         std::fs::create_dir_all(&self.config.store_dir)
             .map_err(|e| AgentError::Provider(e.to_string()))?;
-        Ok(match self.provided_key {
+        Ok(match self.provided_key.or_else(installed_credential_key) {
             Some(key) => AgentCredentialStore::Provided(CredentialStore::new(
                 self.config.store_dir.clone(),
                 ProvidedKey(key),
@@ -665,6 +702,7 @@ mod tests {
 
     impl Drop for CredEnvGuard {
         fn drop(&mut self) {
+            reset_process_credential_key_for_tests();
             match &self.previous {
                 Some(value) => std::env::set_var(CRED_KEY_ENV, value),
                 None => std::env::remove_var(CRED_KEY_ENV),
@@ -680,6 +718,7 @@ mod tests {
             .unwrap();
         let previous = std::env::var(CRED_KEY_ENV).ok();
         std::env::remove_var(CRED_KEY_ENV);
+        reset_process_credential_key_for_tests();
         CredEnvGuard {
             _guard: guard,
             previous,
@@ -704,6 +743,7 @@ mod tests {
     fn credential_resolver_prefers_provided_key() {
         let _env = lock_cred_env();
         std::env::set_var(CRED_KEY_ENV, B64.encode([4u8; KEY_LEN]));
+        set_process_credential_key([6u8; KEY_LEN]);
         let tmp = tempfile::tempdir().unwrap();
         let cfg = CredentialStoreConfig::new(tmp.path());
         let store = CredentialStoreResolver::new(cfg.clone())
@@ -713,7 +753,7 @@ mod tests {
         assert!(matches!(store, AgentCredentialStore::Provided(_)));
         assert_eq!(
             CredentialStoreResolver::new(cfg.clone()).key_source(),
-            CredentialKeySource::EnvOrLocalFile
+            CredentialKeySource::ProcessInstalled
         );
         store
             .put(
@@ -726,6 +766,38 @@ mod tests {
         let err = err_text(env_store.get(SecretClass::ProviderApiKey, "a"));
         assert!(err.contains("decryption failed"));
         assert!(!err.contains("provided-key-secret"));
+    }
+
+    #[test]
+    fn credential_resolver_prefers_process_key_over_env_or_local() {
+        let _env = lock_cred_env();
+        std::env::set_var(CRED_KEY_ENV, B64.encode([4u8; KEY_LEN]));
+        set_process_credential_key([8u8; KEY_LEN]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = CredentialStoreConfig::new(tmp.path());
+        let store = CredentialStoreResolver::new(cfg.clone()).resolve().unwrap();
+        assert!(matches!(store, AgentCredentialStore::Provided(_)));
+        assert_eq!(
+            CredentialStoreResolver::new(cfg.clone()).key_source(),
+            CredentialKeySource::ProcessInstalled
+        );
+        store
+            .put(
+                SecretClass::ProviderApiKey,
+                "android",
+                &Secret::new(b"process-key-secret".as_slice()),
+            )
+            .unwrap();
+
+        reset_process_credential_key_for_tests();
+        let env_store = CredentialStoreResolver::new(cfg.clone()).resolve().unwrap();
+        let err = err_text(env_store.get(SecretClass::ProviderApiKey, "android"));
+        assert!(err.contains("decryption failed"));
+        assert!(!err.contains("process-key-secret"));
+        assert!(
+            !cfg.local_key_file().exists(),
+            "process/env key resolution must not create a local key file"
+        );
     }
 
     #[test]

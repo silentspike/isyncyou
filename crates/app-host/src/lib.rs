@@ -8,7 +8,9 @@ use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::Item;
 use isyncyou_webui::{OfflineModeRisk, OneDriveMoveRisk};
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "agent-subscription-experimental")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

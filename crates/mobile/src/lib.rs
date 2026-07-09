@@ -80,12 +80,17 @@ const HOST: &str = "phone";
 static DEVICE_STATE: OnceLock<Mutex<isyncyou_core::policy::DeviceState>> = OnceLock::new();
 #[cfg(not(test))]
 static MOBILE_ENCRYPTION_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static MOBILE_AGENT_CREDENTIAL_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
     static TEST_MOBILE_ENCRYPTION_READY: Cell<bool> = const { Cell::new(false) };
+    static TEST_MOBILE_AGENT_CREDENTIAL_READY: Cell<bool> = const { Cell::new(false) };
 }
 #[cfg(test)]
 static TEST_FAIL_NEXT_MOBILE_KEY_INSTALL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FAIL_NEXT_MOBILE_AGENT_CREDENTIAL_KEY_INSTALL: AtomicBool = AtomicBool::new(false);
 
 fn device_state_cell() -> &'static Mutex<isyncyou_core::policy::DeviceState> {
     DEVICE_STATE.get_or_init(|| Mutex::new(isyncyou_core::policy::DeviceState::always_on(u64::MAX)))
@@ -117,6 +122,13 @@ fn mark_mobile_encryption_ready() {
     TEST_MOBILE_ENCRYPTION_READY.with(|ready| ready.set(true));
 }
 
+fn mark_mobile_agent_credential_ready() {
+    #[cfg(not(test))]
+    MOBILE_AGENT_CREDENTIAL_READY.store(true, Ordering::SeqCst);
+    #[cfg(test)]
+    TEST_MOBILE_AGENT_CREDENTIAL_READY.with(|ready| ready.set(true));
+}
+
 fn mobile_encryption_ready() -> bool {
     #[cfg(not(test))]
     {
@@ -128,9 +140,25 @@ fn mobile_encryption_ready() -> bool {
     }
 }
 
+fn mobile_agent_credential_ready() -> bool {
+    #[cfg(not(test))]
+    {
+        MOBILE_AGENT_CREDENTIAL_READY.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    {
+        TEST_MOBILE_AGENT_CREDENTIAL_READY.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 fn reset_mobile_encryption_ready_for_tests() {
     TEST_MOBILE_ENCRYPTION_READY.with(|ready| ready.set(false));
+}
+
+#[cfg(test)]
+fn reset_mobile_agent_credential_ready_for_tests() {
+    TEST_MOBILE_AGENT_CREDENTIAL_READY.with(|ready| ready.set(false));
 }
 
 #[cfg(test)]
@@ -140,7 +168,9 @@ fn install_test_mobile_encryption() {
     isyncyou_core::envelope::require_body_envelope_for_process();
     isyncyou_store::set_store_key(key.to_vec());
     isyncyou_store::require_store_key_for_process();
+    isyncyou_agent::set_process_credential_key(key);
     mark_mobile_encryption_ready();
+    mark_mobile_agent_credential_ready();
 }
 
 fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
@@ -162,6 +192,23 @@ fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
         isyncyou_store::set_store_key(k.to_vec());
         isyncyou_store::require_store_key_for_process();
         mark_mobile_encryption_ready();
+    }))
+    .is_ok()
+}
+
+fn install_mobile_agent_credential_key(bytes: &[u8]) -> bool {
+    if bytes.len() != 32 {
+        return false;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(bytes);
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if TEST_FAIL_NEXT_MOBILE_AGENT_CREDENTIAL_KEY_INSTALL.swap(false, Ordering::SeqCst) {
+            panic!("injected mobile agent credential key install failure");
+        }
+        isyncyou_agent::set_process_credential_key(k);
+        mark_mobile_agent_credential_ready();
     }))
     .is_ok()
 }
@@ -277,6 +324,91 @@ pub fn agent_session_kdf_benchmark_json(iterations: usize) -> Result<String, Str
             "iterations": profile.iterations,
             "lanes": profile.lanes
         }
+    }))
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "agent-credential-store-self-test")]
+fn tree_contains_bytes(root: &Path, needle: &[u8]) -> Result<(bool, usize), String> {
+    if !root.exists() {
+        return Ok((false, 0));
+    }
+    let mut found = false;
+    let mut files = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
+                stack.push(entry.map_err(|e| e.to_string())?.path());
+            }
+        } else if meta.is_file() {
+            files += 1;
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                found = true;
+            }
+        }
+    }
+    Ok((found, files))
+}
+
+#[cfg(feature = "agent-credential-store-self-test")]
+fn file_contains_bytes(path: &Path, needle: &[u8]) -> Result<bool, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes.windows(needle.len()).any(|w| w == needle)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(feature = "agent-credential-store-self-test")]
+pub fn agent_credential_store_self_test_json(
+    files_dir: &str,
+    sentinel: &str,
+) -> Result<String, String> {
+    if !mobile_agent_credential_ready() {
+        return Err("agent credential key is not installed".into());
+    }
+    if sentinel.is_empty() {
+        return Err("sentinel must not be empty".into());
+    }
+    let base = PathBuf::from(files_dir);
+    let cfg = isyncyou_agent::CredentialStoreConfig::new(&base);
+    let store = isyncyou_agent::CredentialStoreResolver::new(cfg.clone())
+        .resolve()
+        .map_err(|e| e.to_string())?;
+    let id = isyncyou_agent::provider_api_key_secret_id("anthropic", Some("self-test"))
+        .map_err(|e| e.to_string())?;
+    store
+        .put(
+            isyncyou_agent::SecretClass::ProviderApiKey,
+            &id,
+            &isyncyou_agent::Secret::new(sentinel.as_bytes()),
+        )
+        .map_err(|e| e.to_string())?;
+    let round_trip = store
+        .get(isyncyou_agent::SecretClass::ProviderApiKey, &id)
+        .map_err(|e| e.to_string())?
+        .map(|secret| secret.expose() == sentinel.as_bytes())
+        .unwrap_or(false);
+    let (store_plaintext_found, store_file_count) =
+        tree_contains_bytes(cfg.store_dir(), sentinel.as_bytes())?;
+    let wrapped_key_file = base.join("agent_credential.key");
+    let wrapped_plaintext_found = file_contains_bytes(&wrapped_key_file, sentinel.as_bytes())?;
+    let _ = store.delete(isyncyou_agent::SecretClass::ProviderApiKey, &id);
+
+    serde_json::to_string(&serde_json::json!({
+        "self_test": "agent_credential_store",
+        "scope": "jni_only_feature_gated",
+        "status": if round_trip && !store_plaintext_found && !wrapped_plaintext_found { "ok" } else { "failed" },
+        "key_source": "android_installed",
+        "round_trip": round_trip,
+        "plaintext_sentinel_in_credential_store": store_plaintext_found,
+        "plaintext_sentinel_in_wrapped_key_file": wrapped_plaintext_found,
+        "credential_store_file_count": store_file_count,
+        "credential_store_dir": cfg.store_dir().file_name().and_then(|s| s.to_str()).unwrap_or("agent-credentials"),
+        "wrapped_key_file": wrapped_key_file.file_name().and_then(|s| s.to_str()).unwrap_or("agent_credential.key")
     }))
     .map_err(|e| e.to_string())
 }
@@ -567,6 +699,9 @@ pub fn confirm_action(pending_id: &str) -> bool {
 fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
     if !mobile_encryption_ready() {
         return Err("encrypted storage setup failed; local data was not opened".into());
+    }
+    if !mobile_agent_credential_ready() {
+        return Err("agent credential storage setup failed; local data was not opened".into());
     }
     isyncyou_core::envelope::require_body_envelope_for_process();
     isyncyou_store::require_store_key_for_process();
@@ -979,6 +1114,29 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyK
     }
 }
 
+/// JNI: install the agent credential at-rest key (#620) — the 32-byte data key the
+/// Android Keystore unwrapped for provider credentials. MUST be called before
+/// [`nativeStart`] so app-host credential consumers use the Android-installed key instead
+/// of env/local fallback. SECURITY: the key bytes are never logged.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetAgentCredentialKey<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    key: jni::objects::JByteArray<'local>,
+) -> jni::sys::jint {
+    let bytes = match jni_convert_byte_array(&mut env, &key) {
+        Some(b) => b,
+        None => return 0,
+    };
+    if install_mobile_agent_credential_key(&bytes) {
+        1
+    } else {
+        0
+    }
+}
+
 /// JNI test/evidence hook for #619. Built only with
 /// `ISY_CARGO_FEATURES=agent-session-kdf-bench`; there is deliberately no WebView,
 /// bridge, HTTP, or normal app UI path to this method.
@@ -1003,6 +1161,43 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAgentSes
     .unwrap_or_else(|error| {
         serde_json::json!({
             "benchmark": "agent_session_argon2id_hkdf",
+            "error": isyncyou_core::obs::redact(&error)
+        })
+        .to_string()
+    });
+    jni_new_string(&mut env, out)
+}
+
+/// JNI test/evidence hook for #620. Built only with
+/// `ISY_CARGO_FEATURES=agent-credential-store-self-test`; there is deliberately no
+/// WebView, bridge, HTTP, or normal app UI path to this method.
+#[cfg(feature = "agent-credential-store-self-test")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAgentCredentialStoreSelfTest<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+    sentinel: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let files_dir = match jni_get_string(&mut env, &files_dir) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let sentinel = match jni_get_string(&mut env, &sentinel) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        agent_credential_store_self_test_json(&files_dir, &sentinel)
+    }))
+    .unwrap_or_else(|_| Err("panic".into()))
+    .unwrap_or_else(|error| {
+        serde_json::json!({
+            "self_test": "agent_credential_store",
+            "scope": "jni_only_feature_gated",
+            "status": "error",
             "error": isyncyou_core::obs::redact(&error)
         })
         .to_string()
@@ -1054,6 +1249,40 @@ mod tests {
         assert_eq!(value["kdf"]["lanes"].as_u64(), Some(4));
     }
 
+    #[cfg(feature = "agent-credential-store-self-test")]
+    #[test]
+    fn agent_credential_store_self_test_json_is_structured_and_redacted() {
+        reset_mobile_agent_credential_ready_for_tests();
+        assert!(install_mobile_agent_credential_key(&[8u8; 32]));
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "agent-credential-self-test-sentinel";
+        let out = agent_credential_store_self_test_json(dir.path().to_str().unwrap(), sentinel)
+            .expect("self-test json");
+        assert!(!out.contains(sentinel));
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["self_test"].as_str(), Some("agent_credential_store"));
+        assert_eq!(value["scope"].as_str(), Some("jni_only_feature_gated"));
+        assert_eq!(value["status"].as_str(), Some("ok"));
+        assert_eq!(value["key_source"].as_str(), Some("android_installed"));
+        assert_eq!(value["round_trip"].as_bool(), Some(true));
+        assert_eq!(
+            value["plaintext_sentinel_in_credential_store"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            value["plaintext_sentinel_in_wrapped_key_file"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            value["credential_store_dir"].as_str(),
+            Some("agent-credentials")
+        );
+        assert_eq!(
+            value["wrapped_key_file"].as_str(),
+            Some("agent_credential.key")
+        );
+    }
+
     #[test]
     fn start_engine_is_idempotent_and_mints_a_session_token() {
         // Host test of the non-JNI core (#89 P4 / #0A): start succeeds, mints a session
@@ -1073,6 +1302,7 @@ mod tests {
     #[test]
     fn mobile_start_inner_fails_closed_without_encryption_ready() {
         reset_mobile_encryption_ready_for_tests();
+        reset_mobile_agent_credential_ready_for_tests();
         let dir = tempfile::tempdir().unwrap();
 
         let err = match start_inner(dir.path().to_str().unwrap()) {
@@ -1094,6 +1324,31 @@ mod tests {
     }
 
     #[test]
+    fn mobile_start_inner_fails_closed_without_agent_credential_key() {
+        reset_mobile_encryption_ready_for_tests();
+        reset_mobile_agent_credential_ready_for_tests();
+        assert!(install_mobile_body_key(1, &[7u8; 32]));
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = match start_inner(dir.path().to_str().unwrap()) {
+            Ok(_) => panic!("start_inner must fail without the agent credential key"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("agent credential storage setup failed"),
+            "startup must fail closed before opening local data without the agent credential key: {err}"
+        );
+        assert!(
+            !dir.path()
+                .join("archive")
+                .join(".isyncyou-store.db")
+                .exists(),
+            "no store is created when agent credential setup failed"
+        );
+    }
+
+    #[test]
     fn mobile_body_key_install_rejects_bad_length_and_panic() {
         reset_mobile_encryption_ready_for_tests();
         assert!(!install_mobile_body_key(1, &[1, 2, 3]));
@@ -1111,6 +1366,26 @@ mod tests {
         assert!(install_mobile_body_key(1, &[7u8; 32]));
 
         assert!(mobile_encryption_ready());
+    }
+
+    #[test]
+    fn mobile_agent_credential_key_install_rejects_bad_length_and_panic() {
+        reset_mobile_agent_credential_ready_for_tests();
+        assert!(!install_mobile_agent_credential_key(&[1, 2, 3]));
+        assert!(!mobile_agent_credential_ready());
+
+        TEST_FAIL_NEXT_MOBILE_AGENT_CREDENTIAL_KEY_INSTALL.store(true, Ordering::SeqCst);
+        assert!(!install_mobile_agent_credential_key(&[7u8; 32]));
+        assert!(!mobile_agent_credential_ready());
+    }
+
+    #[test]
+    fn mobile_agent_credential_key_install_marks_ready_on_success() {
+        reset_mobile_agent_credential_ready_for_tests();
+
+        assert!(install_mobile_agent_credential_key(&[7u8; 32]));
+
+        assert!(mobile_agent_credential_ready());
     }
 
     #[test]

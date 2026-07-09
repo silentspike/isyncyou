@@ -44,9 +44,10 @@ pub use error::AgentError;
 pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
 pub use secrets::{
-    provider_api_key_secret_id, provider_oauth_refresh_secret_id, AgentCredentialStore, AtRestKey,
-    CredentialKeySource, CredentialStore, CredentialStoreConfig, CredentialStoreResolver, LocalKey,
-    ProvidedKey, ProviderCredentialResolver, Secret, SecretClass,
+    provider_api_key_secret_id, provider_oauth_refresh_secret_id, set_process_credential_key,
+    AgentCredentialStore, AtRestKey, CredentialKeySource, CredentialStore, CredentialStoreConfig,
+    CredentialStoreResolver, LocalKey, ProvidedKey, ProviderCredentialResolver, Secret,
+    SecretClass,
 };
 pub use session::{
     detect_fork, new_ulid, ActiveTurn, FileSessionCache, InMemoryTransport, LeaseRecord,
