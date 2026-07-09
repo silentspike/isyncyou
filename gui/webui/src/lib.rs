@@ -8670,6 +8670,59 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_setup_consent_is_required_and_non_secret() {
+        for needle in [
+            "const AGENT_PRIVACY_CONSENT_KEY = \"isy_agent_privacy_consent_v1\";",
+            "const AGENT_PRIVACY_CONSENT_VERSION = 1;",
+            "function agentPrivacyConsentAccepted(provider)",
+            "function acceptAgentPrivacyConsent(provider)",
+            "version: AGENT_PRIVACY_CONSENT_VERSION",
+            "accepted: true",
+            "provider: agentProviderConsentId(provider)",
+            "timestamp: new Date().toISOString()",
+            "localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record))",
+            "function renderAssistantConsentPanel(providers)",
+            "\"data-agent-consent\": \"1\"",
+            "\"data-agent-consent-accept\": provider",
+            "\"data-agent-consent-reset\": \"1\"",
+            "function renderAssistantByoKeyUnavailable()",
+            "\"data-agent-byo-key\": \"unavailable\"",
+            "if (!agentPrivacyConsentAccepted(consentProvider))",
+            "if (!agentPrivacyConsentAccepted(provider))",
+            "if (!agentPrivacyConsentAccepted(\"codex\"))",
+            "if (!agentPrivacyConsentAccepted(provider)) {",
+            "Review privacy consent first",
+            "renderAssistantConsentPanel([provider])",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 setup-consent invariant: {needle}"
+            );
+        }
+        let start = APP_JS
+            .find("const AGENT_PRIVACY_CONSENT_KEY")
+            .expect("consent helper start");
+        let end = APP_JS
+            .find("async function renderAssistantView")
+            .expect("consent helper end");
+        let consent_helpers = &APP_JS[start..end];
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "session_token",
+            "confirmation",
+            "m365",
+            "type: \"password\"",
+            "type=\"password\"",
+        ] {
+            assert!(
+                !consent_helpers.to_lowercase().contains(forbidden),
+                "consent helpers must not store/capture secret/content field: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn app_js_biometric_labels_cover_onedrive_risk_ops() {
         for needle in [
             "\"move-out-of-protected\"",

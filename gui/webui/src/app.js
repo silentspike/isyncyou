@@ -4507,6 +4507,12 @@ function localCallbackRedirect(host) {
 }
 
 async function startAiLogin(provider) {
+  const consentProvider = agentProviderConsentId(provider);
+  if (!agentPrivacyConsentAccepted(consentProvider)) {
+    toast("Review privacy consent for " + agentProviderLabel(consentProvider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   let guardId = null;
   try {
     const params = { provider };
@@ -4616,6 +4622,63 @@ function assistantCanUse() {
   return !!CAP.agent && !!App.account;
 }
 
+const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
+const AGENT_PRIVACY_CONSENT_VERSION = 1;
+function agentProviderConsentId(provider) {
+  if (provider === "anthropic" || provider === "claude") return "claude";
+  if (provider === "openai" || provider === "codex") return "codex";
+  return provider || "claude";
+}
+function agentActiveProvider(st) {
+  if (st && st.provider) return agentProviderConsentId(st.provider);
+  if (st && st.claude) return "claude";
+  if (st && st.codex) return "codex";
+  return "claude";
+}
+function readAgentPrivacyConsent() {
+  try { return JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {}; }
+  catch (_) { return {}; }
+}
+function agentPrivacyConsentAccepted(provider) {
+  const c = readAgentPrivacyConsent();
+  return c.version === AGENT_PRIVACY_CONSENT_VERSION
+    && c.accepted === true
+    && c.provider === agentProviderConsentId(provider);
+}
+function acceptAgentPrivacyConsent(provider) {
+  const record = {
+    version: AGENT_PRIVACY_CONSENT_VERSION,
+    accepted: true,
+    provider: agentProviderConsentId(provider),
+    timestamp: new Date().toISOString(),
+  };
+  try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
+  renderAssistantView($("#view"));
+}
+function resetAgentPrivacyConsent() {
+  try { localStorage.removeItem(AGENT_PRIVACY_CONSENT_KEY); } catch (_) {}
+  renderAssistantView($("#view"));
+}
+
+function renderAssistantConsentPanel(providers) {
+  const ids = (providers || ["claude"]).map(agentProviderConsentId);
+  return el("div", { class: "assistant-consent", "data-agent-consent": "1", "data-testid": "agent-consent" },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Privacy consent" }),
+      el("p", { class: "dim", text: "The assistant sends selected Microsoft 365 content to the selected provider to answer your question. Continue only if you want that provider to process the selected content." })),
+    el("div", { class: "assistant-consent-actions" },
+      ids.map(provider => el("button", { class: "btn sm", type: "button", onclick: () => acceptAgentPrivacyConsent(provider), "data-agent-consent-accept": provider },
+        icon("shield-check", "icon-sm"), "Allow " + agentProviderLabel(provider))),
+      el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
+        icon("x", "icon-sm"), "Reset")));
+}
+
+function renderAssistantByoKeyUnavailable() {
+  return el("div", { class: "assistant-setup-locked", "data-agent-byo-key": "unavailable" },
+    icon("shield", "icon-sm"),
+    el("span", { text: "BYO API key setup is unavailable until encrypted provider credentials land." }));
+}
+
 async function renderAssistantView(view) {
   clear(view).append(
     el("section", { id: "assistant-view", class: "assistant-view", "data-testid": "assistant-view" },
@@ -4637,6 +4700,8 @@ async function renderAssistantView(view) {
 // The connect card (shown until an AI account is connected).
 function renderAssistantSetup(body, st) {
   const unavailable = !CAP.agent;
+  const claudeAllowed = agentPrivacyConsentAccepted("claude");
+  const codexAllowed = agentPrivacyConsentAccepted("codex");
   const hint = unavailable
     ? "Assistant is not available in this build."
     : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login.";
@@ -4644,8 +4709,10 @@ function renderAssistantSetup(body, st) {
     icon("sparkles", "icon-sm"), "Connect Claude");
   const openai = el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai"), "data-testid": "agent-connect-openai" },
     icon("sparkles", "icon-sm"), "Connect ChatGPT");
-  if (unavailable) {
+  if (unavailable || !claudeAllowed) {
     anthropic.setAttribute("disabled", "disabled");
+  }
+  if (unavailable || !codexAllowed) {
     openai.setAttribute("disabled", "disabled");
   }
   body.append(
@@ -4654,7 +4721,9 @@ function renderAssistantSetup(body, st) {
       el("div", { class: "assistant-setup-icon" }, icon("sparkles")),
       el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
       el("p", { class: "dim assistant-setup-copy", text: hint }),
+      renderAssistantConsentPanel(["claude", "codex"]),
       el("div", { class: "assistant-setup-actions" }, anthropic, openai),
+      renderAssistantByoKeyUnavailable(),
       st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,
       el("p", { class: "dim assistant-setup-note", text: "Experimental — uses your own subscription. You can disconnect any time." }),
     ),
@@ -4663,12 +4732,17 @@ function renderAssistantSetup(body, st) {
 
 // The chat surface (shown once connected). Streams tokens over the per-turn SSE.
 function renderAssistantChat(body, st) {
+  const provider = agentActiveProvider(st);
+  const hasConsent = agentPrivacyConsentAccepted(provider);
   body.append(
     el("div", { class: "assistant-toolbar" },
       el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
       agentModelSwitcher(st),
       renderAssistantUsageChip(st),
+      el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
+        icon("shield", "icon-sm"), "Privacy"),
     ),
+    hasConsent ? null : renderAssistantConsentPanel([provider]),
     el("div", { id: "asst-log", class: "assistant-transcript", "data-agent-transcript": "1", "data-testid": "agent-transcript" }),
     el("div", { class: "assistant-pending-host", "data-agent-pending": "1", "data-testid": "agent-pending-actions" }),
     renderAssistantComposer(st),
@@ -4683,7 +4757,10 @@ function renderAssistantChat(body, st) {
 }
 
 function renderAssistantComposer(_st) {
-  const disabledReason = !CAP.agent ? "Assistant unavailable" : (!App.account ? "Select an account first" : "");
+  const provider = agentActiveProvider(_st || AssistantState.status);
+  const disabledReason = !CAP.agent ? "Assistant unavailable"
+    : (!App.account ? "Select an account first"
+      : (!agentPrivacyConsentAccepted(provider) ? "Review privacy consent first" : ""));
   const input = el("textarea", {
     id: "asst-input",
     class: "input assistant-input",
@@ -4790,6 +4867,11 @@ function agentModelSwitcher(st) {
   return wrap;
 }
 async function pickModel(provider, model) {
+  if (!agentPrivacyConsentAccepted(provider)) {
+    toast("Review privacy consent for " + agentProviderLabel(provider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   try {
     await post("/api/v1/agent/model?" + qs({ provider, model }), CAP.agent);
     const st = await api("/api/v1/agent/status");
@@ -4801,6 +4883,11 @@ async function pickModel(provider, model) {
   }
 }
 async function connectCodex() {
+  if (!agentPrivacyConsentAccepted("codex")) {
+    toast("Review privacy consent for ChatGPT", "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   let guardId = null;
   try {
     const params = { provider: "codex" };
@@ -5193,6 +5280,12 @@ function agentSendFromInput() {
 async function agentSend(text) {
   const log = $("#asst-log"); if (!log) return;
   if (!assistantCanUse()) { toast("Assistant is unavailable for this account", "err"); return; }
+  const provider = agentActiveProvider(AssistantState.status);
+  if (!agentPrivacyConsentAccepted(provider)) {
+    toast("Review privacy consent for " + agentProviderLabel(provider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   closeAssistantStream("new-turn");
   if (!AssistantState.transcript.length) clear(log);   // drop the empty-state hint
 
