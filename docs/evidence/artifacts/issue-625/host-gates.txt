@@ -1,6 +1,6 @@
 # Issue #625 Host Evidence
 
-Code anchor before evidence-only/doc follow-up: 95db60176a19428e1299f4ec07018cc2fe781f18
+Code anchor before evidence-only/doc follow-up: d8b36cc7e12932ce0155e09b63c4e5a22c15601f
 Branch: feature/ag-625
 Scope: mobile full-node server/router/job contract. Native Android BiometricPrompt,
 Keystore, foreground-service/job presentation, and physical device closeout remain #626.
@@ -71,13 +71,31 @@ Post-static-string cleanup rerun:
 - PASS: python3 tools/check_evidence.py --manifest docs/evidence/issue-625-manifest.json
 - PASS: git diff --check origin/dev...HEAD
 
+Post-review hardening rerun:
+
+- PASS: cargo remote -c -- test -p isyncyou-store -- mobile_job_late_failure_after_lease_reclaim_does_not_override_new_owner --nocapture
+  - Result: command exited 0; proves late failure from an expired lease owner cannot overwrite a reclaimed running job.
+- PASS: cargo remote -c -- test -p isyncyou-store -- mobile_job --nocapture
+  - Result: command exited 0; reruns the full Store mobile job group after the lease-owner failure guard.
+- PASS: cargo remote -c -- test -p isyncyou-webui -- backup_route_rejects_unknown_service_before_biometric_token --nocapture
+  - Result: command exited 0; proves unsupported backup services are rejected before minting a per-action biometric-token challenge.
+- PASS: cargo remote -c -- test -p isyncyou-webui -- backup_route --nocapture
+  - Result: command exited 0; reruns the backup route suite after the gate-order parser change.
+- PASS: cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- mobile_job --nocapture
+  - Result: command exited 0; recompiles and reruns AppHost mobile job runtime tests against the owner-guarded failure path.
+- PASS: cargo remote -c -- clippy -p isyncyou-store --all-targets -- -D warnings
+- PASS: cargo remote -c -- clippy -p isyncyou-webui --all-targets -- -D warnings
+- PASS: cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings
+- PASS: cargo-remote-fmt --check
+  - Result: CLEAN; CI fmt will pass.
+
 Static/no-go interpretation:
 
 - `MobileDisabled` remains as a regression/fallback policy, but `crates/mobile::start_inner`
   now passes `AgentOperationPolicy::MobileFullNode`.
 - The stale "restore absent on mobile" contract is now scoped to the shared base router;
-  full-node mobile restore-cloud is gated and jobbed. The stale
-  `mobile_agent_operations_land_in_625_626` marker is no longer present.
+  full-node mobile restore-cloud is gated and jobbed. The old mobile-disabled
+  placeholder string from the #624 handoff is no longer present.
 - No shell/OS/free-form HTTP tool was added to the Agent or AppHost paths.
 - Evidence contains no provider secret, OAuth query string, confirmation secret, cap secret,
   share URL, raw email, or item body.

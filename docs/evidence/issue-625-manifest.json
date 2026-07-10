@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-10T19:25:06+02:00",
-  "commit": "95db60176a19428e1299f4ec07018cc2fe781f18",
+  "generated_at": "2026-07-10T20:04:59+02:00",
+  "commit": "d8b36cc7e12932ce0155e09b63c4e5a22c15601f",
   "entries": [
     {
       "id": "EV-001",
@@ -44,7 +44,7 @@
       "command": "cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- mobile_job --nocapture",
       "result": "pass",
       "test": "mobile_job_worker_does_not_duplicate_restore_after_restart",
-      "evidence": "The AppHost mobile_job tests cover enqueue-only backup behavior, worker execution, expired running lease recovery, and restore-ledger reuse after restart recovery.",
+      "evidence": "The AppHost mobile_job tests cover enqueue-only backup behavior, worker execution, expired running lease recovery, lease-owner-guarded failure, and restore-ledger reuse after restart recovery.",
       "artifact": "docs/evidence/artifacts/issue-625/mobile-job-contract.json"
     },
     {

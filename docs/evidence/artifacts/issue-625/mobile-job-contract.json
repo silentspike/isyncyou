@@ -1,6 +1,6 @@
 {
   "issue": 625,
-  "commit_under_test": "95db60176a19428e1299f4ec07018cc2fe781f18",
+  "commit_under_test": "d8b36cc7e12932ce0155e09b63c4e5a22c15601f",
   "scope": "mobile_full_node_server_router_job_contract",
   "native_android_scope": {
     "physical_biometric_prompt": "pending_issue_626",
@@ -65,7 +65,8 @@
     "lease_recovery": "queued and expired running jobs are recoverable",
     "dedupe": "open jobs are deduped by account/kind/idempotency_key",
     "terminal_retry": "terminal jobs do not block a later user retry",
-    "cancel_semantics": "cancel marks queued/running jobs cancelled; late worker success is reconciled before accepting final state"
+    "cancel_semantics": "cancel marks queued/running jobs cancelled; late worker success is reconciled before accepting final state",
+    "failure_semantics": "late worker failure is accepted only while the same worker still owns the running lease"
   },
   "proof_tests": [
     "mobile_full_node_router_exposes_gated_restore_and_backup",
@@ -74,6 +75,7 @@
     "mobile_full_node_job_recovery_runs_on_start",
     "mobile_backup_job_enqueue_only_worker_executes_later",
     "mobile_restore_cloud_job_recovery_after_running_lease_expiry_reconciles",
+    "mobile_job_late_failure_after_lease_reclaim_does_not_override_new_owner",
     "mobile_job_worker_does_not_duplicate_restore_after_restart",
     "mobile_agent_confirm_requires_biometric_before_agent_token_consumption",
     "mobile_live_write_allowlist_accepts_only_metadata_verbs",
