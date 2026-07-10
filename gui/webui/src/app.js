@@ -4785,6 +4785,20 @@ function renderAssistantComposer(_st) {
     disabledReason ? el("div", { class: "dim assistant-composer-note", text: disabledReason }) : null);
 }
 
+function formatAssistantRateLimit(rateLimit) {
+  if (!rateLimit) return "";
+  if (typeof rateLimit === "string" || typeof rateLimit === "number") return String(rateLimit);
+  if (typeof rateLimit !== "object" || Array.isArray(rateLimit)) return "";
+  const entries = Object.entries(rateLimit).filter(([, value]) => value != null && value !== "");
+  if (!entries.length) return "";
+  const status = entries.find(([key, value]) => /status$/i.test(key) && typeof value === "string");
+  const utilization = entries.find(([key, value]) => /utilization$/i.test(key) && Number.isFinite(Number(value)));
+  const parts = [];
+  if (status) parts.push("limit " + status[1]);
+  if (utilization) parts.push(Math.round(Number(utilization[1]) * 100) + "%");
+  return parts.join(" · ");
+}
+
 function renderAssistantUsageChip(st) {
   const usage = st && st.usage ? st.usage : AssistantState.lastUsage;
   if (!usage) {
@@ -4795,7 +4809,8 @@ function renderAssistantUsageChip(st) {
   if (usage.request_id) parts.push("Request " + agentCompactValue(usage.request_id, 28));
   if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);
   if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);
-  if (usage.rate_limit) parts.push(String(usage.rate_limit));
+  const rateLimit = formatAssistantRateLimit(usage.rate_limit);
+  if (rateLimit) parts.push(rateLimit);
   return el("span", { class: "chip assistant-usage", "data-agent-usage": "1", "data-testid": "agent-usage" },
     icon("info", "icon-sm"), parts.join(" · ") || "Usage");
 }

@@ -8662,10 +8662,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn assistant_model_picker_and_usage_chip_are_status_driven() {
         for needle in [
             "function renderAssistantUsageChip(st)",
+            "function formatAssistantRateLimit(rateLimit)",
             "Usage unavailable",
             "if (usage.request_id) parts.push(\"Request \" + agentCompactValue(usage.request_id, 28));",
             "if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);",
             "if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);",
+            "const rateLimit = formatAssistantRateLimit(usage.rate_limit);",
+            "if (rateLimit) parts.push(rateLimit);",
             "function agentProviderLabel(provider)",
             "if (provider === \"claude\") return \"Claude\";",
             "if (provider === \"codex\") return \"ChatGPT\";",
@@ -8686,6 +8689,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(
             !APP_JS.contains("request_id:") && !APP_JS.contains("rate_limit: \"ok\""),
             "production UI must not fabricate usage fields"
+        );
+        assert!(
+            !APP_JS.contains("String(usage.rate_limit)"),
+            "usage chip must not render rate_limit objects as [object Object]"
         );
     }
 

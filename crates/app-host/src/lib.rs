@@ -3912,6 +3912,7 @@ mod tests {
         let mut saw_tool_result = false;
         let mut done_reason = None::<String>;
         let mut final_text = String::new();
+        let mut trace_events = Vec::new();
 
         for _ in 0..256 {
             let now = std::time::Instant::now();
@@ -3930,6 +3931,11 @@ mod tests {
                 Some("tool_call") => {
                     saw_tool_call = true;
                     assert_eq!(event["name"].as_str(), Some(isyncyou_agent::TOOL_NAME));
+                    trace_events.push(serde_json::json!({
+                        "event": "tool_call",
+                        "name": event["name"].as_str().unwrap_or_default(),
+                        "input": event["input"],
+                    }));
                 }
                 Some("tool_result") => {
                     let content = event["content"].as_str().unwrap_or_default();
@@ -3938,9 +3944,19 @@ mod tests {
                     {
                         saw_tool_result = true;
                     }
+                    trace_events.push(serde_json::json!({
+                        "event": "tool_result",
+                        "contains_m_live": content.contains("m-live"),
+                        "contains_fixture_sentinel": content.contains("isyncyou623productlivesentinel"),
+                        "untrusted": event["untrusted"].as_bool().unwrap_or(false),
+                    }));
                 }
                 Some("done") => {
                     done_reason = event["reason"].as_str().map(|s| s.to_string());
+                    trace_events.push(serde_json::json!({
+                        "event": "done",
+                        "reason": event["reason"].as_str().unwrap_or_default(),
+                    }));
                     break;
                 }
                 Some("error") => panic!(
@@ -3972,6 +3988,33 @@ mod tests {
             status["usage"]["model"].as_str().is_some(),
             "{provider} usage must include a model"
         );
+        if let Ok(dir) = std::env::var("ISY623_LIVE_TRACE_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let trace = serde_json::json!({
+                "artifact": format!("issue-623-{provider}-oauth-live-storearchive-trace"),
+                "provider": provider,
+                "source": "ignored product OAuth live gate with local credential seed persisted through encrypted CredentialStore",
+                "events": trace_events,
+                "assertions": {
+                    "saw_provider_tool_call": saw_tool_call,
+                    "saw_storearchive_tool_result": saw_tool_result,
+                    "done_reason": done_reason,
+                    "final_contains_m_live": final_text.contains("m-live"),
+                    "final_contains_fixture_sentinel": final_text.contains("isyncyou623productlivesentinel")
+                },
+                "usage": {
+                    "provider": status["usage"]["provider"],
+                    "model": status["usage"]["model"],
+                    "input_tokens_present": status["usage"]["input_tokens"].is_number(),
+                    "output_tokens_present": status["usage"]["output_tokens"].is_number(),
+                    "request_id_present": status["usage"]["request_id"].as_str().is_some()
+                },
+                "secrets_included": false
+            });
+            let path = dir.join(format!("{provider}-oauth-live-storearchive-trace.json"));
+            std::fs::write(path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+        }
     }
 
     #[cfg(feature = "agent-oauth-providers")]
