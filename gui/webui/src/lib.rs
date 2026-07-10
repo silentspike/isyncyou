@@ -3408,6 +3408,7 @@ impl Router {
                     "restored": id,
                     "service": service,
                     "job_id": job_id,
+                    "kind": "restore-cloud",
                     "state": state,
                 }))
             }

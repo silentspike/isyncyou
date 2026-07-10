@@ -484,6 +484,50 @@ fn sync_report_changed(r: &isyncyou_engine::SyncReport) -> bool {
             > 0
 }
 
+fn run_mobile_job_recovery_once(jobs: &isyncyou_app_host::MobileJobRuntime) -> bool {
+    match jobs.recover_and_run_available_jobs(Some(ACCOUNT)) {
+        Ok(outcomes) => {
+            let changed = outcomes.iter().any(|outcome| {
+                !matches!(
+                    outcome,
+                    isyncyou_app_host::MobileJobRunOutcome::Skipped { .. }
+                )
+            });
+            if changed {
+                android_info(&format!(
+                    "mobile job recovery processed {} job(s)",
+                    outcomes.len()
+                ));
+            }
+            changed
+        }
+        Err(e) => {
+            android_info(&format!(
+                "mobile job recovery failed: {}",
+                isyncyou_core::obs::redact(&e)
+            ));
+            false
+        }
+    }
+}
+
+fn spawn_mobile_job_recovery_loop(
+    jobs: Arc<isyncyou_app_host::MobileJobRuntime>,
+    events: Arc<isyncyou_webui::EventBus>,
+    interval: Arc<AtomicU64>,
+) {
+    std::thread::spawn(move || loop {
+        let changed =
+            std::panic::catch_unwind(AssertUnwindSafe(|| run_mobile_job_recovery_once(&jobs)))
+                .unwrap_or(false);
+        if changed {
+            events.notify();
+        }
+        let secs = interval.load(Ordering::Relaxed).max(5);
+        std::thread::sleep(Duration::from_secs(secs));
+    });
+}
+
 /// Start the embedded engine if not already running. Idempotent. Host-testable (no JNI):
 /// the JNI entry is a thin wrapper. No loopback port is bound in the default build (#0A);
 /// the UI reaches the engine only in-process (bridge + asset path).
@@ -739,18 +783,28 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     // The Mode-3 offline pass (refresh loop) writes per-file progress here; the router reads
     // the same handle at GET /api/v1/onedrive/transfers (#655). One shared instance, cloned.
     let transfer_progress = isyncyou_app_host::SharedProgress::new();
+    let mobile_jobs = Arc::new(isyncyou_app_host::MobileJobRuntime::new(
+        cfg.clone(),
+        gate.clone(),
+        events.clone(),
+    ));
     let config_path_for_router = config_path.clone();
     let config_path_for_loop = config_path.clone();
 
     let router = Arc::new(
-        isyncyou_app_host::build_live_router(
-            cfg.clone(),
-            Some(gate.clone()),
-            events.clone(),
-            config_path_for_router,
-            live_interval.clone(),
-            transfer_progress.clone(),
-            isyncyou_app_host::AgentOperationPolicy::MobileDisabled,
+        isyncyou_app_host::with_mobile_full_node_jobs(
+            isyncyou_app_host::build_live_router(
+                cfg.clone(),
+                Some(gate.clone()),
+                events.clone(),
+                config_path_for_router,
+                live_interval.clone(),
+                transfer_progress.clone(),
+                isyncyou_app_host::AgentOperationPolicy::MobileFullNode {
+                    mobile_jobs: mobile_jobs.clone(),
+                },
+            ),
+            mobile_jobs.clone(),
         )
         .with_session_token(session_token.clone())
         // #onedrive-mobile 0.6: only the standalone Android app arms the biometric gate.
@@ -758,6 +812,8 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
         // native BiometricPrompt (confirmed over `nativeConfirmAction`, below).
         .with_biometric_gate(),
     );
+
+    spawn_mobile_job_recovery_loop(mobile_jobs, events.clone(), live_interval.clone());
 
     // #0A: NO loopback TCP port in the default build — the WebView reaches the engine only
     // in-process (the message bridge for data, `shouldInterceptRequest`→`asset_request` for
@@ -783,13 +839,13 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     // UI refreshes. Skips silently until a token is cached.
     std::thread::spawn(move || {
         refresh_loop(
-            cfg,
+            cfg.clone(),
             base,
             config_path_for_loop,
             gate,
             events,
             live_interval,
-            transfer_progress,
+            transfer_progress.clone(),
         )
     });
 
@@ -1227,9 +1283,36 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConfirmA
 mod tests {
     use super::*;
 
+    fn api_json(resp: isyncyou_webui::ApiResponse) -> serde_json::Value {
+        serde_json::from_slice(&resp.body).expect("json response")
+    }
+
     fn frame_status(framed: &[u8]) -> u16 {
         assert!(framed.len() >= 2, "framed response has status bytes");
         u16::from_be_bytes([framed[0], framed[1]])
+    }
+
+    fn cap_from_app_js(router: &isyncyou_webui::Router, key: &str) -> String {
+        let resp = router.route(&isyncyou_webui::ApiRequest::get("/app.js"));
+        assert_eq!(resp.status, 200, "app.js served");
+        let js = String::from_utf8(resp.body).unwrap();
+        let needle = format!("{key}: \"");
+        let start = js.find(&needle).expect("cap key in app.js") + needle.len();
+        let end = js[start..].find('"').expect("cap end") + start;
+        let cap = js[start..end].to_string();
+        assert!(!cap.is_empty(), "{key} cap must be populated");
+        assert!(
+            !cap.starts_with("__"),
+            "{key} cap placeholder must be replaced"
+        );
+        cap
+    }
+
+    fn restore_enabled_mobile_config(files_dir: &std::path::Path) {
+        let mut cfg = Config::default();
+        cfg.restore.cloud_restore_enabled = true;
+        prepare_mobile_config_for_files_dir(&mut cfg, files_dir).unwrap();
+        cfg.save(files_dir.join("isyncyou.toml")).unwrap();
     }
 
     fn mobile_key_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1770,13 +1853,14 @@ mod tests {
     }
 
     #[test]
-    fn standalone_serves_ui_and_gates_the_api_in_process() {
+    fn standalone_full_node_serves_ui_and_gates_restore_backup() {
         // #89 P7 / #0A (host slice): the embedded engine — the exact code that runs on the
         // phone — serves the UI shell and fully session-token gates the data API **entirely
         // in-process**, with NO loopback TCP port. `asset_request` serves the shell (as the
         // WebView's shouldInterceptRequest does); `bridge_request` carries the data API.
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
 
@@ -1805,13 +1889,199 @@ mod tests {
             !with_tok.contains("\"status\":401"),
             "valid token must pass: {with_tok}"
         );
-        // Restore is absent in the mobile profile (cache, not backup-of-record) → 404.
-        let restore = bridge_request(&format!(
+        // Restore/backup are now present in the mobile full-node profile, but still gated by
+        // the injected cap token and then the native per-action biometric token.
+        let restore_no_cap = bridge_request(&format!(
             r#"{{"method":"POST","path":"/api/v1/restore?account=me&service=mail&id=x","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
-            restore.contains("\"status\":404"),
-            "restore must be absent on mobile: {restore}"
+            restore_no_cap.contains("\"status\":401"),
+            "restore must be wired and cap-gated, not absent: {restore_no_cap}"
+        );
+        let backup_no_cap = bridge_request(&format!(
+            r#"{{"method":"POST","path":"/api/v1/backup?account=me&services=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+        ));
+        assert!(
+            backup_no_cap.contains("\"status\":401"),
+            "backup must be wired and cap-gated, not absent: {backup_no_cap}"
+        );
+    }
+
+    #[test]
+    fn mobile_full_node_router_exposes_gated_restore_and_backup() {
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
+        let (tok, router) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+
+        for path in [
+            "/api/v1/restore?account=me&service=mail&id=x",
+            "/api/v1/backup?account=me&services=mail",
+            "/api/v1/jobs?account=me",
+            "/api/v1/jobs/cancel?account=me&job_id=job-1",
+        ] {
+            let method = if path == "/api/v1/jobs?account=me" {
+                "GET"
+            } else {
+                "POST"
+            };
+            let no_session = router.route(&isyncyou_webui::ApiRequest::new(method, path));
+            assert_eq!(no_session.status, 401, "session-gated: {path}");
+            let with_session = router.route(
+                &isyncyou_webui::ApiRequest::new(method, path)
+                    .with_session_token(Some(tok.clone())),
+            );
+            assert_eq!(with_session.status, 401, "cap-gated, not absent: {path}");
+        }
+
+        assert!(!cap_from_app_js(&router, "restore").is_empty());
+        assert!(!cap_from_app_js(&router, "backup").is_empty());
+        assert!(!cap_from_app_js(&router, "mobileJobs").is_empty());
+    }
+
+    #[test]
+    fn mobile_full_node_restore_backup_do_not_run_without_biometric_token() {
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
+        let (tok, router) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+        let restore_cap = cap_from_app_js(&router, "restore");
+        let backup_cap = cap_from_app_js(&router, "backup");
+        let jobs_cap = cap_from_app_js(&router, "mobileJobs");
+
+        let list_jobs = || {
+            api_json(
+                router.route(
+                    &isyncyou_webui::ApiRequest::get("/api/v1/jobs?account=me")
+                        .with_session_token(Some(tok.clone()))
+                        .with_cap_token(Some(jobs_cap.clone())),
+                ),
+            )
+        };
+
+        let restore_challenge = api_json(
+            router.route(
+                &isyncyou_webui::ApiRequest::new(
+                    "POST",
+                    "/api/v1/restore?account=me&service=mail&id=restore-src-1",
+                )
+                .with_session_token(Some(tok.clone()))
+                .with_cap_token(Some(restore_cap.clone())),
+            ),
+        );
+        assert_eq!(
+            restore_challenge["status"].as_str(),
+            Some("confirmation_required")
+        );
+        assert_eq!(
+            list_jobs()["jobs"].as_array().unwrap().len(),
+            0,
+            "restore must not enqueue before biometric token"
+        );
+        let restore_pat = restore_challenge["pending_action_id"].as_str().unwrap();
+        assert!(router.confirm_biometric(restore_pat));
+        let restore_ok = api_json(
+            router.route(
+                &isyncyou_webui::ApiRequest::new(
+                    "POST",
+                    &format!(
+                    "/api/v1/restore?account=me&service=mail&id=restore-src-1&_pat={restore_pat}"
+                ),
+                )
+                .with_session_token(Some(tok.clone()))
+                .with_cap_token(Some(restore_cap)),
+            ),
+        );
+        assert_eq!(restore_ok["queued"].as_bool(), Some(true));
+        assert_eq!(restore_ok["kind"].as_str(), Some("restore-cloud"));
+        assert_eq!(restore_ok["state"].as_str(), Some("queued"));
+
+        let backup_challenge = api_json(
+            router.route(
+                &isyncyou_webui::ApiRequest::new("POST", "/api/v1/backup?account=me&services=mail")
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(backup_cap.clone())),
+            ),
+        );
+        assert_eq!(
+            backup_challenge["status"].as_str(),
+            Some("confirmation_required")
+        );
+        assert_eq!(
+            list_jobs()["jobs"].as_array().unwrap().len(),
+            1,
+            "backup must not enqueue before biometric token"
+        );
+        let backup_pat = backup_challenge["pending_action_id"].as_str().unwrap();
+        assert!(router.confirm_biometric(backup_pat));
+        let backup_ok = api_json(
+            router.route(
+                &isyncyou_webui::ApiRequest::new(
+                    "POST",
+                    &format!("/api/v1/backup?account=me&services=mail&_pat={backup_pat}"),
+                )
+                .with_session_token(Some(tok.clone()))
+                .with_cap_token(Some(backup_cap)),
+            ),
+        );
+        assert_eq!(backup_ok["queued"].as_bool(), Some(true));
+        assert_eq!(backup_ok["kind"].as_str(), Some("backup"));
+        assert_eq!(backup_ok["state"].as_str(), Some("queued"));
+        assert_eq!(
+            list_jobs()["jobs"].as_array().unwrap().len(),
+            2,
+            "both confirmed jobs are visible in the mobile job list"
+        );
+    }
+
+    #[test]
+    fn mobile_full_node_job_recovery_runs_on_start() {
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
+        let cfg = Config::load(dir.path().join("isyncyou.toml")).unwrap();
+        let archive = dir.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        {
+            let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+            store
+                .create_mobile_job(
+                    "start-recovery-job",
+                    "me",
+                    isyncyou_store::MobileJobKind::Backup,
+                    None,
+                    None,
+                    "backup:me:mail",
+                    r#"{"op":"backup","account":"me","services":["mail"]}"#,
+                    1,
+                )
+                .unwrap();
+        }
+
+        let runtime = isyncyou_app_host::MobileJobRuntime::new(
+            cfg,
+            Arc::new(Mutex::new(())),
+            Arc::new(isyncyou_webui::EventBus::new()),
+        );
+        assert!(
+            run_mobile_job_recovery_once(&runtime),
+            "start recovery body should process queued mobile jobs"
+        );
+
+        let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+        let job = store
+            .get_mobile_job("start-recovery-job")
+            .unwrap()
+            .expect("job remains recorded");
+        assert_eq!(
+            job.state,
+            isyncyou_store::MobileJobState::Failed,
+            "without cached tokens, recovery should run and fail redacted"
+        );
+        assert!(
+            !job.last_error.as_deref().unwrap_or("").is_empty(),
+            "failure should come from real worker path: {:?}",
+            job.last_error
         );
     }
 

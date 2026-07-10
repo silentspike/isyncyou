@@ -1,7 +1,7 @@
 //! Shared web-UI router assembly + the live request handlers, reused by the
 //! desktop daemon (`isyncyoud`) and the standalone mobile client (#89). The daemon
-//! calls [`build_live_router`] for the shared base and adds its daemon-only
-//! restore/share/push on top; the mobile client uses the base as-is.
+//! calls [`build_live_router`] for the shared base; the mobile client adds its
+//! full-node job handlers with [`with_mobile_full_node_jobs`].
 
 mod agent_ops;
 mod mobile_jobs;
@@ -73,8 +73,9 @@ pub fn mint_cap_token() -> String {
     }
 }
 
-/// The daemon's destructive-action handler: re-create an archived item in the
-/// cloud using the cached `login --write` (restore-scoped) token.
+/// The desktop daemon's destructive-action handler: re-create an archived item
+/// in the cloud using the cached `login --write` (restore-scoped) token. Mobile
+/// wires `MobileJobRuntime` instead, so the route enqueues a durable job.
 pub struct DaemonRestore {
     cfg: Config,
 }
@@ -2626,7 +2627,7 @@ impl isyncyou_webui::OneDriveOpenHandler for DaemonOneDriveOpen {
 }
 
 impl DaemonRestore {
-    /// Construct the restore handler (daemon-only; the mobile profile never wires it).
+    /// Construct the desktop restore handler. Mobile uses a queued job handler.
     pub fn new(cfg: Config) -> Self {
         Self { cfg }
     }
@@ -2928,7 +2929,7 @@ pub fn build_live_router(
         // #onedrive-mobile 0.9: outbound sharing is wired here (was daemon-only) so the
         // mobile profile gets it too. On mobile it is additionally biometric-gated (op
         // "share" is in the per-action-token catalogue); the cap token is the CSRF gate.
-        // restore-cloud stays daemon-only (excluded on mobile).
+        // restore-cloud is added by the mobile full-node job wrapper (#625), not here.
         .with_share(
             Arc::new(DaemonShare::new(cfg.clone())) as Arc<dyn isyncyou_webui::ShareHandler>,
             mint_cap_token(),
@@ -2957,6 +2958,26 @@ pub fn build_live_router(
             mint_cap_token(),
         )
         .with_events(events)
+}
+
+/// Attach the #625 mobile full-node job surface to a shared live router.
+///
+/// Backup and restore-cloud are queue-only on mobile: the HTTP request thread
+/// only creates durable `mobile_jobs`; the worker/recovery path performs the
+/// cloud mutation under a job lease. Each route still receives its own cap token
+/// and is additionally per-action biometric-token gated by `with_biometric_gate`
+/// in `crates/mobile`.
+pub fn with_mobile_full_node_jobs(
+    router: isyncyou_webui::Router,
+    mobile_jobs: Arc<MobileJobRuntime>,
+) -> isyncyou_webui::Router {
+    let restore: Arc<dyn isyncyou_webui::RestoreHandler> = mobile_jobs.clone();
+    let backup: Arc<dyn isyncyou_webui::BackupHandler> = mobile_jobs.clone();
+    let jobs: Arc<dyn isyncyou_webui::MobileJobHandler> = mobile_jobs;
+    router
+        .with_restore(restore, mint_cap_token())
+        .with_backup(backup, mint_cap_token())
+        .with_mobile_jobs(jobs, mint_cap_token())
 }
 
 #[cfg(test)]
@@ -6525,12 +6546,12 @@ mod tests {
     }
 
     #[test]
-    fn mobile_live_router_wires_share_but_omits_restore() {
+    fn base_live_router_wires_share_but_omits_restore_until_mobile_job_wrapper() {
         // #89 + #onedrive-mobile 0.9 profile contract: build_live_router wires the live
-        // handlers AND (now) share, but NOT the daemon-only restore-cloud. restore POSTs
-        // are refused 404 (absent); share + a live-write route are reached and cap-gated
-        // (401, not 404). On mobile share is additionally biometric-gated by the app's
-        // with_biometric_gate (not exercised here — this builds the base router only).
+        // handlers AND share. restore-cloud is attached by the #625 mobile job wrapper,
+        // not by the shared base router. share + a live-write route are reached and
+        // cap-gated (401, not 404). On mobile share is additionally biometric-gated by
+        // the app's with_biometric_gate (not exercised here — this builds the base router only).
         let events = Arc::new(isyncyou_webui::EventBus::new());
         let router = build_live_router(
             Config::default(),
@@ -6565,5 +6586,57 @@ mod tests {
             401,
             "mail write must be wired (cap-gated, not absent)"
         );
+    }
+
+    #[test]
+    fn mobile_full_node_router_exposes_gated_restore_and_backup() {
+        let root = temp_agent_root("mobile-full-node-router");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "me".into(),
+                username: "me@example.invalid".into(),
+                sync_root: root.join("sync"),
+                archive_root: root.join("archive"),
+                cache_root: root.join("cache"),
+                mount_point: None,
+            }],
+            ..Config::default()
+        };
+        let events = Arc::new(isyncyou_webui::EventBus::new());
+        let gate = Arc::new(Mutex::new(()));
+        let jobs = Arc::new(MobileJobRuntime::new(
+            cfg.clone(),
+            gate.clone(),
+            events.clone(),
+        ));
+        let router = with_mobile_full_node_jobs(
+            build_live_router(
+                cfg,
+                Some(gate),
+                events,
+                root.join("isyncyou.toml"),
+                Arc::new(AtomicU64::new(5)),
+                SharedProgress::new(),
+                AgentOperationPolicy::MobileFullNode {
+                    mobile_jobs: jobs.clone(),
+                },
+            ),
+            jobs,
+        );
+
+        for path in [
+            "/api/v1/restore?account=me&service=mail&id=m1",
+            "/api/v1/backup?account=me&services=mail",
+            "/api/v1/jobs?account=me",
+            "/api/v1/jobs/cancel?account=me&job_id=job-1",
+        ] {
+            let method = if path == "/api/v1/jobs?account=me" {
+                "GET"
+            } else {
+                "POST"
+            };
+            let resp = router.route(&ApiRequest::new(method, path));
+            assert_eq!(resp.status, 401, "wired + cap-gated (not 404): {path}");
+        }
     }
 }
