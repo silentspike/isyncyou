@@ -9658,6 +9658,18 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_biometric_bridge_sends_no_webview_controlled_label() {
+        assert!(
+            APP_JS.contains("BRIDGE.postMessage(JSON.stringify({ t: \"bio\", id, pat }))"),
+            "biometric bridge request must carry only the opaque pending handle"
+        );
+        assert!(
+            !APP_JS.contains("JSON.stringify({ t: \"bio\", id, pat, label })"),
+            "WebView labels must not be trusted by the native prompt"
+        );
+    }
+
+    #[test]
     fn bridge_isolation_app_js_has_no_legacy_mobile_session_path() {
         for needle in [
             "AndroidSession",
