@@ -122,12 +122,15 @@ dependencies {
     // Biometric per-action confirmation for destructive ops (#onedrive-mobile 0.6).
     // Pulls androidx.fragment; MainActivity is a FragmentActivity for BiometricPrompt.
     implementation("androidx.biometric:biometric:1.1.0")
+    // WorkManager is the only production executor for durable mobile jobs (#626).
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
     // Firebase Cloud Messaging via the BoM (#575) — version-aligned, messaging only.
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("androidx.work:work-runtime-ktx:2.9.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
 }
