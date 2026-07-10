@@ -3,6 +3,10 @@
 //! calls [`build_live_router`] for the shared base and adds its daemon-only
 //! restore/share/push on top; the mobile client uses the base as-is.
 
+mod agent_ops;
+
+pub use agent_ops::AgentOperationPolicy;
+
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
@@ -209,20 +213,6 @@ pub trait AgentAuditSink: Send + Sync {
     ) -> Result<(), String>;
 }
 
-struct NotImplementedConfirmedActionExecutor;
-
-impl AgentConfirmedActionExecutor for NotImplementedConfirmedActionExecutor {
-    fn execute_confirmed(
-        &self,
-        action: &isyncyou_agent::ToolAction,
-    ) -> Result<ConfirmedActionResult, String> {
-        Err(format!(
-            "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
-            action.op()
-        ))
-    }
-}
-
 struct StoreAgentAuditSink {
     cfg: Config,
 }
@@ -291,6 +281,10 @@ fn agent_audit_summary(summary: &str) -> String {
 fn agent_safe_executor_error(error: &str) -> &'static str {
     if error.contains("not_implemented") {
         "not_implemented"
+    } else if error.contains("not_available_on_mobile")
+        || error.contains("mobile_agent_operations_land_in_625_626")
+    {
+        "not_available_on_mobile"
     } else {
         "execution_failed"
     }
@@ -353,12 +347,22 @@ pub struct DaemonAgent {
 
 impl DaemonAgent {
     pub fn new(cfg: Config, oauth_dir: PathBuf) -> Self {
+        Self::new_with_policy(cfg, oauth_dir, AgentOperationPolicy::DesktopEnabled)
+    }
+
+    pub fn new_with_policy(
+        cfg: Config,
+        oauth_dir: PathBuf,
+        operation_policy: AgentOperationPolicy,
+    ) -> Self {
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let confirmed_executor =
+            agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone());
         Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
             pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
-            confirmed_executor: Arc::new(NotImplementedConfirmedActionExecutor),
+            confirmed_executor,
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
             last_usage: Arc::new(Mutex::new(None)),
@@ -2766,6 +2770,7 @@ pub fn build_live_router(
     config_path: PathBuf,
     live_interval: Arc<AtomicU64>,
     progress: isyncyou_connectors::SharedProgress,
+    agent_policy: AgentOperationPolicy,
 ) -> isyncyou_webui::Router {
     // Agent OAuth credentials live next to the config file (on mobile, app-private
     // filesDir). #627-only local fallback/capture uses the same directory for overrides.
@@ -2835,8 +2840,11 @@ pub fn build_live_router(
             mint_cap_token(),
         )
         .with_agent(
-            Arc::new(DaemonAgent::new(cfg.clone(), oauth_dir))
-                as Arc<dyn isyncyou_webui::AgentHandler>,
+            Arc::new(DaemonAgent::new_with_policy(
+                cfg.clone(),
+                oauth_dir,
+                agent_policy,
+            )) as Arc<dyn isyncyou_webui::AgentHandler>,
             mint_cap_token(),
         )
         // #onedrive-mobile 0.9: outbound sharing is wired here (was daemon-only) so the
@@ -3321,6 +3329,48 @@ mod tests {
         assert_eq!(err, "audit_start_failed");
         assert_eq!(executor.call_count(), 0);
         assert_eq!(order.lock().unwrap().as_slice(), ["audit:started"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_mobile_policy_refuses_before_mutation() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let audit = RecordingAuditSink::new(order.clone());
+        let root = temp_agent_root("confirm-mobile-disabled");
+        let mut agent = DaemonAgent::new_with_policy(
+            Config::default(),
+            root.clone(),
+            AgentOperationPolicy::MobileDisabled,
+        );
+        agent.audit_sink = Arc::new(audit.clone());
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "backup failed: not_available_on_mobile");
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["audit:started", "audit:error"]
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, "started");
+        assert_eq!(events[1].1, "error");
+        assert!(events[1].2.contains("not_available_on_mobile"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4823,6 +4873,7 @@ mod tests {
             PathBuf::from("/x/isyncyou.toml"),
             Arc::new(AtomicU64::new(5)),
             progress.clone(),
+            AgentOperationPolicy::DesktopEnabled,
         );
         let resp = router.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
         assert_eq!(resp.status, 200);
@@ -5144,6 +5195,7 @@ mod tests {
             PathBuf::from("/x/isyncyou.toml"),
             Arc::new(AtomicU64::new(5)),
             SharedProgress::new(),
+            AgentOperationPolicy::DesktopEnabled,
         );
         for path in [
             "/api/v1/onedrive/free-up?account=a&id=i1",
@@ -5176,6 +5228,7 @@ mod tests {
             PathBuf::from("/x/isyncyou.toml"),
             Arc::new(AtomicU64::new(5)),
             SharedProgress::new(),
+            AgentOperationPolicy::MobileDisabled,
         );
         assert_eq!(
             router
