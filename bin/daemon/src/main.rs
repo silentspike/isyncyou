@@ -291,6 +291,7 @@ fn run(args: &Args) -> Result<(), String> {
         // Desktop runs the whole-tree sync_once, not the mobile offline pass, so this stays
         // idle (GET /onedrive/transfers reports empty) — the wiring is for the mobile profile.
         isyncyou_app_host::SharedProgress::new(),
+        isyncyou_app_host::AgentOperationPolicy::DesktopEnabled,
     )
     .with_restore(
         Arc::new(isyncyou_app_host::DaemonRestore::new(cfg.clone()))
@@ -663,12 +664,12 @@ fn sync_loop(
             // Keep the per-service archive fresh too (live client, #563 AC-5): an
             // incremental mail pass so new cloud mail lands in the store and the
             // SSE notify below surfaces it without a manual reload.
-            match backup_account(&cfg, &acc.id, &gate) {
-                Ok((summary, delta)) => {
-                    eprintln!("isyncyoud: backup {} -> {summary}", acc.id);
+            match isyncyou_app_host::run_backup_account(&cfg, &acc.id, &gate, &[]) {
+                Ok(run) => {
+                    eprintln!("isyncyoud: backup {} -> {}", acc.id, run.summary);
                     // Push (#576): notify the phone when new content was archived. The
                     // FCM token must have been registered by the UI; otherwise no-op.
-                    if let Some(body) = delta.notification() {
+                    if let Some(body) = run.delta.notification() {
                         let n = push.notify("iSyncYou — backup complete", &body);
                         if n > 0 {
                             eprintln!("isyncyoud: push '{body}' sent to {n} device(s)");
@@ -756,105 +757,6 @@ fn sync_account(
         eprintln!("isyncyoud: could not record run for {account}: {e}");
     }
     result.map(|_| summary)
-}
-
-/// One incremental **mail backup** pass for the live client (#563 AC-5). Uses the
-/// cached **read** token (`Mail.Read` + `MailboxSettings.Read`, S-P4.1), runs the
-/// per-folder delta (cheap when idle), downloads bodies for newly-seen messages
-/// (capped per pass so a burst can't stall the loop), and refreshes the mailbox
-/// flank snapshots. Keeps the store/archive current so the SSE notify surfaces new
-/// mail. Read-only; a missing token is a clean skip (logged, never fatal). Mail is
-/// the pilot — other services follow their own rollout stories.
-/// What a backup pass newly archived, for the push notification (#576). Only the
-/// counts the user wants to be told about ("3 new emails backed up").
-#[derive(Default)]
-struct BackupDelta {
-    mail: u64,
-    calendar: u64,
-    contacts: u64,
-    todo: u64,
-    onenote: u64,
-}
-impl BackupDelta {
-    fn total(&self) -> u64 {
-        self.mail + self.calendar + self.contacts + self.todo + self.onenote
-    }
-    /// A short human notification body, or `None` when nothing new was archived.
-    fn notification(&self) -> Option<String> {
-        if self.total() == 0 {
-            return None;
-        }
-        let one_or_many =
-            |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-        let mut parts = Vec::new();
-        if self.mail > 0 {
-            parts.push(one_or_many(self.mail, "email", "emails"));
-        }
-        if self.calendar > 0 {
-            parts.push(one_or_many(self.calendar, "event", "events"));
-        }
-        if self.contacts > 0 {
-            parts.push(one_or_many(self.contacts, "contact", "contacts"));
-        }
-        if self.todo > 0 {
-            parts.push(one_or_many(self.todo, "task", "tasks"));
-        }
-        if self.onenote > 0 {
-            parts.push(one_or_many(self.onenote, "note", "notes"));
-        }
-        Some(format!("{} backed up", parts.join(", ")))
-    }
-}
-
-fn backup_account(
-    cfg: &Config,
-    account: &str,
-    gate: &Arc<Mutex<()>>,
-) -> Result<(String, BackupDelta), String> {
-    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-    // Read-only cache fill across the five non-file services. Shared with the
-    // standalone mobile client via `engine::refresh_cache_account` (#89). The read
-    // token drives the pass; the restore token (best-effort) is used only for the
-    // ToDo attachments endpoint, which denies the read scope.
-    let read = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)?;
-    let write = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account).ok();
-    let c = isyncyou_engine::refresh_cache_account(cfg, account, read, write)?;
-    // Notification delta (#576): new mail bodies (not delta upserts, which include
-    // flag/read changes) is the user-relevant "new mail" signal; same per service.
-    let delta = BackupDelta {
-        mail: c.mail_bodies as u64,
-        calendar: c.calendar_bodies as u64,
-        contacts: c.contacts_bodies as u64,
-        todo: c.todo_bodies as u64,
-        onenote: c.onenote_bodies as u64,
-    };
-    let summary = format!(
-        "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
-         calendar: {} events, {} bodies, {} flanks | \
-         contacts: {} upserted, {} bodies, {} photos | \
-         todo: {} indexed, {} bodies, {} flanks, {} sub | \
-         onenote: {} pages, {} bodies, {} resources, {} containers",
-        c.mail_folders,
-        c.mail_upserted,
-        c.mail_deleted,
-        c.mail_bodies,
-        c.mail_flanks,
-        c.calendar_events,
-        c.calendar_bodies,
-        c.calendar_flanks,
-        c.contacts_upserted,
-        c.contacts_bodies,
-        c.contacts_photos,
-        c.todo_indexed,
-        c.todo_bodies,
-        c.todo_flanks,
-        c.todo_sub,
-        c.onenote_pages,
-        c.onenote_bodies,
-        c.onenote_resources,
-        c.onenote_containers,
-    );
-    Ok((summary, delta))
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {
@@ -1292,10 +1194,13 @@ mod tests {
     #[test]
     fn backup_delta_notification_text() {
         // Nothing new → no notification (the loop stays silent).
-        assert_eq!(BackupDelta::default().notification(), None);
+        assert_eq!(
+            isyncyou_app_host::BackupDelta::default().notification(),
+            None
+        );
         // Singular vs plural per service.
         assert_eq!(
-            BackupDelta {
+            isyncyou_app_host::BackupDelta {
                 mail: 1,
                 ..Default::default()
             }
@@ -1304,7 +1209,7 @@ mod tests {
             Some("1 email backed up")
         );
         assert_eq!(
-            BackupDelta {
+            isyncyou_app_host::BackupDelta {
                 mail: 3,
                 ..Default::default()
             }
@@ -1314,7 +1219,7 @@ mod tests {
         );
         // Multiple services join in a stable order.
         assert_eq!(
-            BackupDelta {
+            isyncyou_app_host::BackupDelta {
                 mail: 2,
                 calendar: 1,
                 onenote: 4,

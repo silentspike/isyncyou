@@ -59,7 +59,12 @@ The constraints that force the shape of this decision:
    mints/checks a **one-time confirmation token** bound to `action-hash + account +
    service + item-id + TTL`. The model/agent **never** receives a capability token. Tool
    results carrying mail/document bodies are marked `untrusted_content`; the system prompt
-   states content can never override policy.
+   states content can never override policy. On desktop, confirmed operations reuse the
+   existing daemon/app-host/engine runtime paths: backup uses the shared refresh runner,
+   restore-cloud uses the ledger restore path, live-write uses the service writer traits,
+   share uses the ledger-backed share handler, and restore-local writes only to a controlled
+   local restore root. Mobile destructive Agent execution remains fail-closed until the
+   Android security/job stories land (REQ-AGENT-012).
 
 7. **Encrypted, conflict-safe cross-device session.** Per-turn ULID files under
    `/Apps/iSyncYou/agent/<session>/<ulid>.json`, AES-256-GCM with a key derived

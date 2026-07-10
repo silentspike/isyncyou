@@ -750,6 +750,7 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
             config_path_for_router,
             live_interval.clone(),
             transfer_progress.clone(),
+            isyncyou_app_host::AgentOperationPolicy::MobileDisabled,
         )
         .with_session_token(session_token.clone())
         // #onedrive-mobile 0.6: only the standalone Android app arms the biometric gate.
