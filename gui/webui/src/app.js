@@ -4629,8 +4629,8 @@ function assistantCanUse() {
 const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
 const AGENT_PRIVACY_CONSENT_VERSION = 1;
 function agentProviderConsentId(provider) {
-  if (provider === "anthropic" || provider === "claude") return "claude";
-  if (provider === "openai" || provider === "codex") return "codex";
+  if (provider === "claude") return "claude";
+  if (provider === "codex") return "codex";
   return provider || "claude";
 }
 function agentActiveProvider(st) {
@@ -4677,12 +4677,6 @@ function renderAssistantConsentPanel(providers) {
         icon("x", "icon-sm"), "Reset")));
 }
 
-function renderAssistantByoKeyUnavailable() {
-  return el("div", { class: "assistant-setup-locked", "data-agent-byo-key": "unavailable" },
-    icon("shield", "icon-sm"),
-    el("span", { text: "BYO API key setup is unavailable until encrypted provider credentials land." }));
-}
-
 async function renderAssistantView(view) {
   clear(view).append(
     el("section", { id: "assistant-view", class: "assistant-view", "data-testid": "assistant-view" },
@@ -4709,15 +4703,15 @@ function renderAssistantSetup(body, st) {
   const hint = unavailable
     ? "Assistant is not available in this build."
     : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login.";
-  const anthropic = el("button", { id: "asst-connect-anthropic", class: "btn primary", onclick: () => startAiLogin("anthropic"), "data-testid": "agent-connect-anthropic" },
+  const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => startAiLogin("claude"), "data-testid": "agent-connect-claude" },
     icon("sparkles", "icon-sm"), "Connect Claude");
-  const openai = el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai"), "data-testid": "agent-connect-openai" },
+  const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => startAiLogin("codex"), "data-testid": "agent-connect-codex" },
     icon("sparkles", "icon-sm"), "Connect ChatGPT");
   if (unavailable || !claudeAllowed) {
-    anthropic.setAttribute("disabled", "disabled");
+    claude.setAttribute("disabled", "disabled");
   }
   if (unavailable || !codexAllowed) {
-    openai.setAttribute("disabled", "disabled");
+    codex.setAttribute("disabled", "disabled");
   }
   body.append(
     el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
@@ -4726,8 +4720,7 @@ function renderAssistantSetup(body, st) {
       el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
       el("p", { class: "dim assistant-setup-copy", text: hint }),
       renderAssistantConsentPanel(["claude", "codex"]),
-      el("div", { class: "assistant-setup-actions" }, anthropic, openai),
-      renderAssistantByoKeyUnavailable(),
+      el("div", { class: "assistant-setup-actions" }, claude, codex),
       st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,
       el("p", { class: "dim assistant-setup-note", text: "Experimental — uses your own subscription. You can disconnect any time." }),
     ),
@@ -4811,14 +4804,13 @@ function renderAssistantUsageChip(st) {
 function agentProviderLabel(provider) {
   if (provider === "claude") return "Claude";
   if (provider === "codex") return "ChatGPT";
-  if (provider === "openai") return "OpenAI";
   return "Assistant";
 }
 function agentModelSwitcher(st) {
   const models = st.models || {};
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
-    for (const prov of ["claude", "codex", "openai"]) {
+    for (const prov of ["claude", "codex"]) {
       const tag = agentProviderLabel(prov);
       const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
       if (m) return tag + " · " + m.label;
@@ -4841,7 +4833,6 @@ function agentModelSwitcher(st) {
   };
   addGroup("claude", st.claude);
   addGroup("codex", st.codex);
-  addGroup("openai", st.openai);
   if (!st.codex) {
     rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectCodex() },
       el("span", { class: "mdl-plus" }, "＋"),

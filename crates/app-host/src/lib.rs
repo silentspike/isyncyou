@@ -1384,22 +1384,25 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn oauth_start(&self, provider: &str, redirect_uri: &str) -> Result<String, String> {
-        if provider == "codex" {
-            return self.codex_oauth_start();
+        match provider {
+            "codex" => self.codex_oauth_start(),
+            "claude" => {
+                let cfg = self.load_oauth_config()?;
+                // Loopback-primary (matches the real claude client): use the client's loopback
+                // redirect when supplied; fall back to the manual (copy-paste) redirect otherwise.
+                let redirect = if redirect_uri.is_empty() {
+                    cfg.manual_redirect_url.as_str()
+                } else {
+                    redirect_uri
+                };
+                let started = self
+                    .oauth
+                    .start(&cfg, redirect)
+                    .map_err(|e| e.to_string())?;
+                Ok(started.authorize_url)
+            }
+            _ => Err("unknown provider".into()),
         }
-        let cfg = self.load_oauth_config()?;
-        // Loopback-primary (matches the real claude client): use the client's loopback
-        // redirect when supplied; fall back to the manual (copy-paste) redirect otherwise.
-        let redirect = if redirect_uri.is_empty() {
-            cfg.manual_redirect_url.as_str()
-        } else {
-            redirect_uri
-        };
-        let started = self
-            .oauth
-            .start(&cfg, redirect)
-            .map_err(|e| e.to_string())?;
-        Ok(started.authorize_url)
     }
 
     /// Complete the Claude manual login: the operator pastes the
@@ -3980,6 +3983,26 @@ mod tests {
         let provider = agent.build_turn_provider("system");
 
         assert_eq!(provider.name(), "fake");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_oauth_start_rejects_legacy_provider_ids() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("agent-oauth-legacy-provider");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        let err = isyncyou_webui::AgentHandler::oauth_start(&agent, "openai", "")
+            .expect_err("legacy OpenAI provider id must be rejected");
+        assert!(err.contains("unknown provider"));
+        let err = isyncyou_webui::AgentHandler::oauth_start(&agent, "anthropic", "")
+            .expect_err("legacy Anthropic provider id must be rejected");
+        assert!(err.contains("unknown provider"));
         let _ = std::fs::remove_dir_all(root);
     }
 

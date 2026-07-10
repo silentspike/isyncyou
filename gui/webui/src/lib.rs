@@ -187,6 +187,15 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn agent_oauth_provider_param(provider: &str) -> Result<&'static str, &'static str> {
+    match provider {
+        "claude" => Ok("claude"),
+        "codex" => Ok("codex"),
+        "" => Err("provider is required"),
+        _ => Err("unknown provider"),
+    }
+}
+
 /// A response ready to be written by any server adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiResponse {
@@ -299,7 +308,7 @@ pub trait AgentHandler: Send + Sync {
     }
 
     /// Manual-login completion: the operator pastes the `code#state`
-    /// that claude.ai showed; the handler exchanges it and stores the token.
+    /// that the provider showed; the handler exchanges it and stores the token.
     fn oauth_complete(&self, _pasted: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
@@ -4090,7 +4099,10 @@ impl Router {
         // redirect is optional: the manual (copy-paste) flow uses the provider's manual
         // redirect, so the client need not supply a loopback origin.
         let redirect = req.q("redirect").unwrap_or("");
-        let provider = req.q("provider").unwrap_or("default");
+        let provider = match agent_oauth_provider_param(req.q("provider").unwrap_or("")) {
+            Ok(p) => p,
+            Err(e) => return ApiResponse::error(400, e),
+        };
         match handler.oauth_start(provider, redirect) {
             Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
             Err(e) => ApiResponse::error(500, &e),
@@ -6215,7 +6227,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
         let redir = "http%3A%2F%2F127.0.0.1%3A5000%2Fagent%2Foauth%2Fcallback";
-        let q = format!("/api/v1/agent/oauth/start?provider=anthropic&redirect={redir}");
+        let q = format!("/api/v1/agent/oauth/start?provider=claude&redirect={redir}");
         // no cap token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", &q)).status, 401);
         // with cap token -> 200 + an authorize URL the UI opens in the system browser
@@ -6224,9 +6236,19 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
         // redirect is optional now (manual flow) -> still 200 without it
-        let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=anthropic")
+        let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=codex")
             .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&noredir).status, 200);
+        let unknown = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=openai")
+            .with_cap_token(Some("agentsecret".into()));
+        let unknown = router.route(&unknown);
+        assert_eq!(unknown.status, 400);
+        assert!(String::from_utf8_lossy(&unknown.body).contains("unknown provider"));
+        let missing = ApiRequest::new("POST", "/api/v1/agent/oauth/start")
+            .with_cap_token(Some("agentsecret".into()));
+        let missing = router.route(&missing);
+        assert_eq!(missing.status, 400);
+        assert!(String::from_utf8_lossy(&missing.body).contains("provider is required"));
     }
 
     #[test]
@@ -8647,7 +8669,6 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "function agentProviderLabel(provider)",
             "if (provider === \"claude\") return \"Claude\";",
             "if (provider === \"codex\") return \"ChatGPT\";",
-            "if (provider === \"openai\") return \"OpenAI\";",
             "const list = models[prov] || [];",
             "if (!connected || !list.length) return;",
             "\"data-agent-model-option\": val",
@@ -8684,8 +8705,6 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "\"data-agent-consent\": \"1\"",
             "\"data-agent-consent-accept\": provider",
             "\"data-agent-consent-reset\": \"1\"",
-            "function renderAssistantByoKeyUnavailable()",
-            "\"data-agent-byo-key\": \"unavailable\"",
             "if (!agentPrivacyConsentAccepted(consentProvider))",
             "if (!agentPrivacyConsentAccepted(provider))",
             "if (!agentPrivacyConsentAccepted(\"codex\"))",
@@ -8717,6 +8736,33 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             assert!(
                 !consent_helpers.to_lowercase().contains(forbidden),
                 "consent helpers must not store/capture secret/content field: {forbidden}"
+            );
+        }
+        for needle in [
+            "id: \"asst-connect-claude\"",
+            "onclick: () => startAiLogin(\"claude\")",
+            "\"data-testid\": \"agent-connect-claude\"",
+            "id: \"asst-connect-codex\"",
+            "onclick: () => startAiLogin(\"codex\")",
+            "\"data-testid\": \"agent-connect-codex\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #623 product OAuth setup invariant: {needle}"
+            );
+        }
+        for forbidden in [
+            "startAiLogin(\"anthropic\")",
+            "startAiLogin(\"openai\")",
+            "agent-connect-anthropic",
+            "agent-connect-openai",
+            "data-agent-byo-key",
+            "BYO API key",
+            "subscription/import",
+        ] {
+            assert!(
+                !APP_JS.contains(forbidden),
+                "Assistant product setup must not expose stale provider/BYO affordance: {forbidden}"
             );
         }
     }

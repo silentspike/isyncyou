@@ -211,7 +211,7 @@ function makeFixtureServer(evidence) {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         state.oauthStarts.push(Object.fromEntries(url.searchParams.entries()));
         agentConnected = true;
-        agentProvider = url.searchParams.get("provider") === "openai" ? "codex" : "claude";
+        agentProvider = url.searchParams.get("provider") === "codex" ? "codex" : "claude";
         json(res, 200, { authorize_url: `http://${req.headers.host}/fixture-auth-complete` });
       } else if (req.method === "GET" && url.pathname === "/fixture-auth-complete") {
         text(
@@ -376,8 +376,8 @@ async function main() {
     await page.locator('.nav-item[data-service="assistant"]').first().click();
     await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
     assert(evidence, "setup consent panel visible", await page.locator('[data-testid="agent-consent"]').isVisible());
-    assert(evidence, "connect disabled before consent", await page.locator('[data-testid="agent-connect-openai"]').isDisabled());
-    assert(evidence, "BYO key row unavailable", await page.locator('[data-agent-byo-key="unavailable"]').isVisible());
+    assert(evidence, "connect disabled before consent", await page.locator('[data-testid="agent-connect-codex"]').isDisabled());
+    assert(evidence, "BYO key row absent", await page.locator('[data-agent-byo-key="unavailable"]').count() === 0);
     assert(evidence, "no editable secret input in setup", await page.locator('input[type="password"], input[name*="key" i], textarea[name*="key" i]').count() === 0);
     evidence.screenshots.setup_consent = await screenshot(page, "setup-consent.png");
     evidence.screenshots.desktop_assistant = await screenshot(page, "desktop-assistant.png");
@@ -388,7 +388,7 @@ async function main() {
     assert(evidence, "consent localStorage contains no secrets", !JSON.stringify(consent).match(/token|secret|key|code|content|refresh|access/i), consent);
 
     const authPopupPromise = page.waitForEvent("popup", { timeout: 2000 }).catch(() => null);
-    await page.locator('#asst-connect-anthropic').click();
+    await page.locator('#asst-connect-claude').click();
     const authPopup = await authPopupPromise;
     if (authPopup) {
       await authPopup.waitForLoadState("domcontentloaded");
