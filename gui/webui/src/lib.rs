@@ -1259,6 +1259,20 @@ impl Router {
             .confirm_biometric(pending_id, isyncyou_core::pending::now_ms())
     }
 
+    /// Return the bounded Rust-owned descriptor for native prompt rendering. This
+    /// lookup does not arm or consume the pending action and never exposes the
+    /// action hash or destructive payload.
+    pub fn describe_biometric(
+        &self,
+        pending_id: &str,
+    ) -> Result<
+        isyncyou_core::pending::PendingActionDescriptor,
+        isyncyou_core::pending::DescribeError,
+    > {
+        self.pending
+            .describe(pending_id, isyncyou_core::pending::now_ms())
+    }
+
     /// The mobile biometric gate for one destructive op. Returns:
     /// - `None` — proceed (desktop profile, op not in the gate catalogue, or a valid
     ///   single-use token rode in on `_pat` and was consumed);
@@ -1285,27 +1299,37 @@ impl Router {
                     &format!("biometric confirmation invalid: {e:?}"),
                 )),
             },
-            None => match self.pending.register(
-                op,
-                account,
-                service,
-                item,
-                now,
-                isyncyou_core::pending::DEFAULT_TTL_MS,
-            ) {
-                Some(id) => Some(ApiResponse::ok_json(&json!({
-                    "status": "confirmation_required",
-                    "pending_action_id": id,
-                    "op": op,
-                    "account": account,
-                    "service": service,
-                    "item": item,
-                }))),
-                None => Some(ApiResponse::error(
-                    500,
-                    "could not create confirmation token",
-                )),
-            },
+            None => {
+                match self.pending.register(
+                    op,
+                    account,
+                    service,
+                    item,
+                    now,
+                    isyncyou_core::pending::DEFAULT_TTL_MS,
+                ) {
+                    Ok(id) => Some(ApiResponse::ok_json(&json!({
+                        "status": "confirmation_required",
+                        "pending_action_id": id,
+                        "op": op,
+                        "account": account,
+                        "service": service,
+                        "item": item,
+                    }))),
+                    Err(e) => {
+                        let status = match e {
+                        isyncyou_core::pending::RegistrationError::RandomnessUnavailable => 500,
+                        isyncyou_core::pending::RegistrationError::UnknownOperation
+                        | isyncyou_core::pending::RegistrationError::UnknownService
+                        | isyncyou_core::pending::RegistrationError::InvalidServiceForOperation => 400,
+                    };
+                        Some(ApiResponse::error(
+                            status,
+                            "invalid biometric action descriptor",
+                        ))
+                    }
+                }
+            }
         }
     }
 

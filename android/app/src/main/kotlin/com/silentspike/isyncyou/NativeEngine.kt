@@ -86,6 +86,13 @@ object NativeEngine {
     external fun nativeAgentCredentialStoreSelfTest(filesDir: String, sentinel: String): String
 
     /**
+     * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
+     * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,
+     * or `not_found`.
+     */
+    external fun nativeDescribePendingAction(pendingId: String): String
+
+    /**
      * Record a successful native `BiometricPrompt` for a pending destructive action
      * (#onedrive-mobile 0.6). Called ONLY from the biometric success callback — the WebView
      * has no path to it, which makes the per-action token a real second factor. Returns true

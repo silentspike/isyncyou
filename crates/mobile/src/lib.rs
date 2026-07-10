@@ -740,6 +740,39 @@ pub fn confirm_action(pending_id: &str) -> bool {
     }
 }
 
+/// Return the fixed Rust-owned descriptor for native prompt rendering. The WebView
+/// can carry the opaque handle but cannot ask this function through its bridge.
+pub fn describe_action(
+    pending_id: &str,
+) -> Result<isyncyou_core::pending::PendingActionDescriptor, isyncyou_core::pending::DescribeError>
+{
+    let router = {
+        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| Arc::clone(&s.router))
+    };
+    match router {
+        Some(r) => r.describe_biometric(pending_id),
+        None => Err(isyncyou_core::pending::DescribeError::NotFound),
+    }
+}
+
+fn describe_action_json(pending_id: &str) -> String {
+    match describe_action(pending_id) {
+        Ok(descriptor) => serde_json::json!({
+            "status": "ok",
+            "op": descriptor.op.as_str(),
+            "service": descriptor.service.as_str(),
+        })
+        .to_string(),
+        Err(isyncyou_core::pending::DescribeError::Expired) => {
+            r#"{"status":"expired"}"#.to_string()
+        }
+        Err(isyncyou_core::pending::DescribeError::NotFound) => {
+            r#"{"status":"not_found"}"#.to_string()
+        }
+    }
+}
+
 fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
     if !mobile_encryption_ready() {
         return Err("encrypted storage setup failed; local data was not opened".into());
@@ -1277,6 +1310,23 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConfirmA
         None => return false,
     };
     std::panic::catch_unwind(AssertUnwindSafe(|| confirm_action(&id))).unwrap_or(false)
+}
+
+/// JNI: return only the bounded Rust-owned operation/service descriptor for a pending
+/// action. Kotlin maps these enum names to fixed resources. The handle, action hash,
+/// account, item, and destructive payload are never returned or logged.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribePendingAction<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    pending_id: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let id = jni_get_string(&mut env, &pending_id).unwrap_or_default();
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| describe_action_json(&id)))
+        .unwrap_or_else(|_| r#"{"status":"internal_error"}"#.to_string());
+    jni_new_string(&mut env, out)
 }
 
 #[cfg(test)]
