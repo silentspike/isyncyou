@@ -81,6 +81,8 @@ const STATUS_SERVICES: &[&str] = &[
     "onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared",
 ];
 
+const BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
+
 /// A parsed inbound request (method + path + decoded query pairs + an optional
 /// capability token captured from the `X-Capability-Token` header).
 #[derive(Debug, Clone)]
@@ -3443,10 +3445,13 @@ impl Router {
             Some(a) => a,
             None => return ApiResponse::error(400, "account is required"),
         };
+        let services = match parse_backup_services_param(req.q("services")) {
+            Ok(services) => services,
+            Err(e) => return ApiResponse::error(400, &e),
+        };
         if let Some(r) = self.biometric_challenge("backup", account, "backup", account, req) {
             return r;
         }
-        let services = parse_services_param(req.q("services"));
         match handler.enqueue_backup(account, &services) {
             Ok(job) => ApiResponse::ok_json(&json!({
                 "queued": true,
@@ -5288,6 +5293,18 @@ fn parse_services_param(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+fn parse_backup_services_param(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let mut services = parse_services_param(raw);
+    services.sort();
+    services.dedup();
+    for service in &services {
+        if !BACKUP_SERVICES.contains(&service.as_str()) {
+            return Err(format!("unsupported backup service: {service}"));
+        }
+    }
+    Ok(services)
+}
+
 fn restore_cloud_pending_item(service: &str, id: &str) -> String {
     format!(
         "service:{}:{}:id:{}:{}",
@@ -6572,6 +6589,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         )));
         assert_eq!(ok.status, 200);
         assert_eq!(backup.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backup_route_rejects_unknown_service_before_biometric_token() {
+        let (_d, router) = setup();
+        let backup = std::sync::Arc::new(RecordingBackup::default());
+        let mobile = router
+            .with_backup(backup.clone(), "cap".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let req = ApiRequest::new("POST", "/api/v1/backup?account=a&services=mail,shell")
+            .with_cap_token(Some("cap".into()))
+            .with_session_token(Some("sess".into()));
+
+        let resp = mobile.route(&req);
+
+        assert_eq!(resp.status, 400);
+        let body = body_json(&resp);
+        assert_eq!(body["error"], "unsupported backup service: shell");
+        assert!(backup.calls.lock().unwrap().is_empty());
     }
 
     #[test]

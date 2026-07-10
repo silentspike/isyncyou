@@ -267,15 +267,9 @@ impl MobileJobRuntime {
             }
             Err(raw_error) => {
                 let error = agent_ops::redact_agent_operation_text(&raw_error);
-                match store.transition_mobile_job(
-                    &job.job_id,
-                    MobileJobState::Failed,
-                    now_secs(),
-                    None,
-                    None,
-                    Some(&error),
-                ) {
-                    Ok(()) => {
+                match store.fail_mobile_job_if_running(&job.job_id, &self.owner, now_secs(), &error)
+                {
+                    Ok(true) => {
                         self.record_job_activity(&store, &job, "failed", &error)?;
                         self.events.notify();
                         Ok(MobileJobRunOutcome::Failed {
@@ -284,7 +278,7 @@ impl MobileJobRuntime {
                             error,
                         })
                     }
-                    Err(isyncyou_store::StoreError::IllegalMobileJobTransition(_)) => {
+                    Ok(false) => {
                         self.events.notify();
                         Ok(MobileJobRunOutcome::Skipped {
                             job_id: job.job_id,

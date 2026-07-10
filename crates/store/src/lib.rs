@@ -1458,6 +1458,31 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Fail a running job only if the same worker still owns it. A late failure
+    /// from an expired lease must not overwrite a newer owner that already
+    /// reclaimed the job.
+    pub fn fail_mobile_job_if_running(
+        &self,
+        job_id: &str,
+        owner: &str,
+        now: i64,
+        last_error: &str,
+    ) -> Result<bool> {
+        let last_error = redact_mobile_job_error(Some(last_error));
+        let n = self.conn.execute(
+            "UPDATE mobile_jobs
+                SET state='failed',
+                    last_error=?3,
+                    updated_at=?4,
+                    finished_at=?4,
+                    lease_owner=NULL,
+                    lease_expires_at=NULL
+              WHERE job_id=?1 AND lease_owner=?2 AND state='running'",
+            params![job_id, owner, last_error.as_deref(), now],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn get_item(&self, account: &str, service: &str, remote_id: &str) -> Result<Option<Item>> {
         let it = self
             .conn
@@ -4132,6 +4157,44 @@ mod tests {
         assert_eq!(job.state, MobileJobState::Cancelled);
         assert_eq!(job.result_json, None);
         assert_eq!(job.progress_json.as_deref(), Some(r#"{"cancelled":true}"#));
+    }
+
+    #[test]
+    fn mobile_job_late_failure_after_lease_reclaim_does_not_override_new_owner() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_mobile_job(
+            "job-1",
+            "me",
+            MobileJobKind::Backup,
+            None,
+            None,
+            "backup-key",
+            r#"{"op":"backup"}"#,
+            100,
+        )
+        .unwrap();
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-a", 110, 10)
+            .unwrap());
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-b", 121, 30)
+            .unwrap());
+
+        assert!(!s
+            .fail_mobile_job_if_running("job-1", "worker-a", 122, "late error")
+            .unwrap());
+        let job = s.get_mobile_job("job-1").unwrap().unwrap();
+        assert_eq!(job.state, MobileJobState::Running);
+        assert_eq!(job.lease_owner.as_deref(), Some("worker-b"));
+        assert_eq!(job.last_error, None);
+
+        assert!(s
+            .fail_mobile_job_if_running("job-1", "worker-b", 123, "refresh_token=abc")
+            .unwrap());
+        let failed = s.get_mobile_job("job-1").unwrap().unwrap();
+        assert_eq!(failed.state, MobileJobState::Failed);
+        assert_eq!(failed.lease_owner, None);
+        assert_eq!(failed.last_error.as_deref(), Some("[redacted]"));
     }
 
     // --- restore operation ledger (ADR-001) ---
