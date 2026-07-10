@@ -1877,7 +1877,10 @@ impl AgentConfirmedActionExecutor for MobileDisabledAgentOperations {
         &self,
         _action: &isyncyou_agent::ToolAction,
     ) -> Result<ConfirmedActionResult, String> {
-        Err("not_available_on_mobile: mobile_agent_operations_land_in_625_626".to_string())
+        Err(
+            "not_available_on_mobile: mobile disabled policy refused this confirmed operation"
+                .to_string(),
+        )
     }
 }
 

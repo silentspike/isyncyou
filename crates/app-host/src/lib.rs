@@ -304,9 +304,7 @@ fn agent_audit_summary(summary: &str) -> String {
 fn agent_safe_executor_error(error: &str) -> &'static str {
     if error.contains("not_implemented") {
         "not_implemented"
-    } else if error.contains("not_available_on_mobile")
-        || error.contains("mobile_agent_operations_land_in_625_626")
-    {
+    } else if error.contains("not_available_on_mobile") {
         "not_available_on_mobile"
     } else {
         "execution_failed"

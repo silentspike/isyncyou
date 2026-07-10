@@ -1,0 +1,83 @@
+# Issue #625 Host Evidence
+
+Code anchor before evidence-only/doc follow-up: 95db60176a19428e1299f4ec07018cc2fe781f18
+Branch: feature/ag-625
+Scope: mobile full-node server/router/job contract. Native Android BiometricPrompt,
+Keystore, foreground-service/job presentation, and physical device closeout remain #626.
+Release actions: no release workflow, no tag, no RC, no staging/main promotion.
+
+Task 7 code gates:
+
+- PASS: cargo remote -c -- test -p isyncyou-app-host -- mobile_live_write --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host -- mobile_full_node_router_exposes_gated_restore_and_backup --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-mobile -- mobile_full_node --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-mobile -- standalone_full_node --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host -- base_live_router_wires_share_but_omits_restore_until_mobile_job_wrapper --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-webui -- mobile_restore_route --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-webui -- backup_route --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-webui -- mobile_job_routes --nocapture
+- PASS: cargo remote -c -- clippy -p isyncyou-mobile -p isyncyou-app-host -p isyncyou-webui --all-targets -- -D warnings
+- PASS: cargo-remote-fmt --check
+- PASS: git diff --check origin/dev...HEAD
+- PASS: node --check gui/webui/src/app.js
+- PASS: (cd android && ./gradlew :app:assembleDebug)
+  - Result: BUILD SUCCESSFUL in 3m 33s; 40 actionable tasks: 6 executed, 34 up-to-date.
+
+Final Task 8 host gates:
+
+- PASS: cargo remote -c -- test -p isyncyou-store -- mobile_job --nocapture
+  - Result: 9 passed; 0 failed; 45 filtered out.
+- PASS: cargo remote -c -- test -p isyncyou-core -- pending --nocapture
+  - Result: 9 passed; 0 failed; 75 filtered out.
+- PASS: cargo remote -c -- test -p isyncyou-agent -- --nocapture
+  - Result: 140 passed; 0 failed.
+- PASS: cargo remote -c -- test -p isyncyou-webui -- mobile_full_node --nocapture
+  - Result: 1 passed; 0 failed.
+- PASS: cargo remote -c -- test -p isyncyou-webui -- agent_confirm --nocapture
+  - Result: 5 passed; 0 failed.
+- PASS: cargo remote -c -- test -p isyncyou-webui -- mobile_restore_route --nocapture
+  - Result: 4 passed; 0 failed.
+- PASS: cargo remote -c -- test -p isyncyou-webui -- backup_route --nocapture
+  - Result: 4 passed; 0 failed.
+- PASS: cargo remote -c -- test -p isyncyou-webui -- mobile_job_routes --nocapture
+  - Result: 1 passed; 0 failed.
+- PASS: cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- mobile_job --nocapture
+  - Result: 8 passed; 0 failed; 96 filtered out.
+- PASS: cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- mobile_full_node --nocapture
+  - Result: 1 passed; 0 failed; 103 filtered out.
+- PASS: cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- agent_ --nocapture
+  - Result: 58 passed; 0 failed; 4 ignored; 42 filtered out.
+- PASS: cargo remote -c -- clippy -p isyncyou-store --all-targets -- -D warnings
+- PASS: cargo remote -c -- clippy -p isyncyou-core --all-targets -- -D warnings
+- PASS: cargo remote -c -- clippy -p isyncyou-agent --all-targets -- -D warnings
+- PASS: cargo remote -c -- clippy -p isyncyou-webui --all-targets -- -D warnings
+- PASS: cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings
+- PASS: cargo-remote-fmt --check
+  - Result: CLEAN; CI fmt will pass.
+- PASS: node --check gui/webui/src/app.js
+- PASS: python3 tools/check_traceability.py
+  - Result: requirements: 68 total; 66 implemented; 2 planned; every implemented requirement is traceable to existing tests.
+- PASS: python3 tools/check_evidence.py --manifest docs/evidence/issue-625-manifest.json
+  - Result: evidence manifest: 8 entries; schema-valid; commit exists; every cited requirement exists; every test entry names a real test; every artifact exists.
+- PASS: git diff --check origin/dev...HEAD
+
+Post-static-string cleanup rerun:
+
+- PASS: cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- agent_confirm_mobile_policy_refuses_before_mutation --nocapture
+  - Result: 1 passed; 0 failed; 103 filtered out.
+- PASS: cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings
+- PASS: cargo-remote-fmt --check
+- PASS: python3 tools/check_traceability.py
+- PASS: python3 tools/check_evidence.py --manifest docs/evidence/issue-625-manifest.json
+- PASS: git diff --check origin/dev...HEAD
+
+Static/no-go interpretation:
+
+- `MobileDisabled` remains as a regression/fallback policy, but `crates/mobile::start_inner`
+  now passes `AgentOperationPolicy::MobileFullNode`.
+- The stale "restore absent on mobile" contract is now scoped to the shared base router;
+  full-node mobile restore-cloud is gated and jobbed. The stale
+  `mobile_agent_operations_land_in_625_626` marker is no longer present.
+- No shell/OS/free-form HTTP tool was added to the Agent or AppHost paths.
+- Evidence contains no provider secret, OAuth query string, confirmation secret, cap secret,
+  share URL, raw email, or item body.
