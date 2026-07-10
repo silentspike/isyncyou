@@ -1,6 +1,6 @@
 # Issue #625 Host Evidence
 
-Code anchor before evidence-only/doc follow-up: d237e2c1515cb634e5e741559faf99ffc9c514d6
+Code anchor before evidence-only/doc follow-up: 783e1b562d06db0c4704974530dc7800257df2f3
 Branch: feature/ag-625
 Scope: mobile full-node server/router/job contract. Native Android BiometricPrompt,
 Keystore, foreground-service/job presentation, and physical device closeout remain #626.
@@ -110,6 +110,22 @@ Post-PR dev-check schema-current fix rerun:
 - PASS: git diff --check origin/dev...HEAD
 - PASS: stale restore-contract no-go scan
 - PASS: issue-625 evidence secret-shaped scan
+
+Post-PR mobile parallel key-state fix rerun:
+
+- Context: PR #767 `dev-checks` then failed in the full `isyncyou-mobile` lib
+  suite because tests that install process-wide Store, archived-body, and Agent
+  credential keys could run concurrently with full-node tests. The resulting
+  key replacement caused SQLCipher HMAC failures in an unrelated temp store.
+- Fix: Mobile tests that install encryption state and start or open the embedded
+  engine/store now hold the existing `mobile_key_test_guard` for their lifetime.
+- PASS: cargo remote -c -- test -p isyncyou-mobile --lib mobile_full_node_restore_backup_do_not_run_without_biometric_token -- --nocapture
+  - Result: command exited 0.
+- PASS: cargo remote -c -- test -p isyncyou-mobile --lib -- --nocapture
+  - Result: 26 passed; 0 failed.
+- PASS: cargo remote -c -- clippy -p isyncyou-mobile --all-targets -- -D warnings
+- PASS: cargo-remote-fmt --check
+  - Result: CLEAN; CI fmt will pass.
 
 Static/no-go interpretation:
 
