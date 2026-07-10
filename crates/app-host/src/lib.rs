@@ -3384,6 +3384,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_live_write_body_html_is_not_audited() {
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "live-write",
+            "account": "owner@example.com",
+            "service": "mail",
+            "change": {
+                "verb": "create_draft",
+                "subject": "private subject",
+                "body_html": "<html>raw-body-sentinel recipient@example.com</html>",
+                "to": ["recipient@example.com"]
+            }
+        }))
+        .unwrap();
+
+        let summary = agent_action_summary(&action);
+
+        assert!(summary.contains("op=live-write"));
+        assert!(summary.contains("service=mail"));
+        assert!(!summary.contains("owner@example.com"));
+        assert!(!summary.contains("recipient@example.com"));
+        assert!(!summary.contains("raw-body-sentinel"));
+        assert!(!summary.contains("private subject"));
+        assert!(summary.contains("<redacted-email>"));
+    }
+
+    #[test]
     fn agent_confirm_unknown_or_expired_pending_does_not_audit_execution() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());

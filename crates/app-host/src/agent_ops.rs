@@ -56,10 +56,14 @@ impl PendingOperationPreview {
 
 const BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 const RESTORE_CLOUD_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
+const LIVE_WRITE_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 const SHARE_SERVICES: &[&str] = &["onedrive"];
 const SHARE_LINK_TYPES: &[&str] = &["view", "edit", "embed"];
 const SHARE_LINK_SCOPES: &[&str] = &["anonymous", "organization", "users"];
 const SHARE_INVITE_ROLES: &[&str] = &["read", "write"];
+const LIVE_WRITE_MAX_STRING: usize = 16 * 1024;
+const LIVE_WRITE_MAX_BODY: usize = 128 * 1024;
+const LIVE_WRITE_MAX_ARRAY: usize = 50;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BackupDelta {
@@ -389,6 +393,706 @@ fn run_restore_cloud_with_runtime<R: RestoreCloudRuntime>(
     })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum AgentLiveWriteIntent {
+    Mail(MailLiveWrite),
+    Calendar(CalendarLiveWrite),
+    Contacts(ContactLiveWrite),
+    Todo(TodoLiveWrite),
+    OneNote(OneNoteLiveWrite),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MailLiveWrite {
+    SetRead {
+        target: String,
+        is_read: bool,
+    },
+    SetFlag {
+        target: String,
+        flag_status: String,
+        due: Option<String>,
+        tz: String,
+    },
+    SetCategories {
+        target: String,
+        categories: Vec<String>,
+    },
+    Move {
+        target: String,
+        destination_id: String,
+    },
+    CreateDraft {
+        subject: String,
+        body_html: String,
+        to: Vec<String>,
+    },
+    SendDraft {
+        target: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CalendarLiveWrite {
+    Create {
+        event: serde_json::Value,
+    },
+    Update {
+        target: String,
+        event: serde_json::Value,
+    },
+    Delete {
+        target: String,
+    },
+    Respond {
+        target: String,
+        response: String,
+        comment: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ContactLiveWrite {
+    Create {
+        contact: serde_json::Value,
+    },
+    Update {
+        target: String,
+        contact: serde_json::Value,
+    },
+    Delete {
+        target: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TodoLiveWrite {
+    Create {
+        list_id: String,
+        task: serde_json::Value,
+    },
+    Update {
+        list_id: String,
+        target: String,
+        task: serde_json::Value,
+    },
+    Complete {
+        list_id: String,
+        target: String,
+    },
+    Delete {
+        list_id: String,
+        target: String,
+    },
+    ChecklistAdd {
+        list_id: String,
+        target: String,
+        title: String,
+    },
+    ChecklistToggle {
+        list_id: String,
+        target: String,
+        item_id: String,
+        checked: bool,
+    },
+    ChecklistDelete {
+        list_id: String,
+        target: String,
+        item_id: String,
+    },
+    ListCreate {
+        name: String,
+    },
+    ListDelete {
+        list_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OneNoteLiveWrite {
+    Create { section_id: String, html: Vec<u8> },
+    Delete { target: String },
+    Append { target: String, text: String },
+}
+
+impl AgentLiveWriteIntent {
+    fn service(&self) -> &'static str {
+        match self {
+            Self::Mail(_) => "mail",
+            Self::Calendar(_) => "calendar",
+            Self::Contacts(_) => "contacts",
+            Self::Todo(_) => "todo",
+            Self::OneNote(_) => "onenote",
+        }
+    }
+
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Mail(MailLiveWrite::SetRead { .. }) => "set_read",
+            Self::Mail(MailLiveWrite::SetFlag { .. }) => "set_flag",
+            Self::Mail(MailLiveWrite::SetCategories { .. }) => "set_categories",
+            Self::Mail(MailLiveWrite::Move { .. }) => "move",
+            Self::Mail(MailLiveWrite::CreateDraft { .. }) => "create_draft",
+            Self::Mail(MailLiveWrite::SendDraft { .. }) => "send_draft",
+            Self::Calendar(CalendarLiveWrite::Create { .. }) => "create",
+            Self::Calendar(CalendarLiveWrite::Update { .. }) => "update",
+            Self::Calendar(CalendarLiveWrite::Delete { .. }) => "delete",
+            Self::Calendar(CalendarLiveWrite::Respond { .. }) => "respond",
+            Self::Contacts(ContactLiveWrite::Create { .. }) => "create",
+            Self::Contacts(ContactLiveWrite::Update { .. }) => "update",
+            Self::Contacts(ContactLiveWrite::Delete { .. }) => "delete",
+            Self::Todo(TodoLiveWrite::Create { .. }) => "create",
+            Self::Todo(TodoLiveWrite::Update { .. }) => "update",
+            Self::Todo(TodoLiveWrite::Complete { .. }) => "complete",
+            Self::Todo(TodoLiveWrite::Delete { .. }) => "delete",
+            Self::Todo(TodoLiveWrite::ChecklistAdd { .. }) => "checklist_add",
+            Self::Todo(TodoLiveWrite::ChecklistToggle { .. }) => "checklist_toggle",
+            Self::Todo(TodoLiveWrite::ChecklistDelete { .. }) => "checklist_delete",
+            Self::Todo(TodoLiveWrite::ListCreate { .. }) => "list_create",
+            Self::Todo(TodoLiveWrite::ListDelete { .. }) => "list_delete",
+            Self::OneNote(OneNoteLiveWrite::Create { .. }) => "create",
+            Self::OneNote(OneNoteLiveWrite::Delete { .. }) => "delete",
+            Self::OneNote(OneNoteLiveWrite::Append { .. }) => "append",
+        }
+    }
+
+    fn target_label(&self) -> &'static str {
+        match self {
+            Self::Mail(MailLiveWrite::CreateDraft { .. })
+            | Self::Calendar(CalendarLiveWrite::Create { .. })
+            | Self::Contacts(ContactLiveWrite::Create { .. })
+            | Self::Todo(TodoLiveWrite::Create { .. })
+            | Self::Todo(TodoLiveWrite::ListCreate { .. })
+            | Self::OneNote(OneNoteLiveWrite::Create { .. }) => "new item",
+            Self::Todo(TodoLiveWrite::ListDelete { .. }) => "list",
+            _ => "existing item",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveWriteRun {
+    service: String,
+    verb: String,
+    target: String,
+    result_id: Option<String>,
+    summary: String,
+}
+
+fn run_live_write(
+    cfg: &Config,
+    action: &isyncyou_agent::ToolAction,
+    gate: &Arc<Mutex<()>>,
+) -> Result<LiveWriteRun, String> {
+    run_live_write_with_runtime(cfg, action, gate, &LiveLiveWriteRuntime)
+}
+
+trait LiveWriteRuntime {
+    fn execute_live_write(
+        &self,
+        cfg: &Config,
+        account: &str,
+        intent: &AgentLiveWriteIntent,
+    ) -> Result<Option<String>, String>;
+}
+
+struct LiveLiveWriteRuntime;
+
+impl LiveWriteRuntime for LiveLiveWriteRuntime {
+    fn execute_live_write(
+        &self,
+        cfg: &Config,
+        account: &str,
+        intent: &AgentLiveWriteIntent,
+    ) -> Result<Option<String>, String> {
+        match intent {
+            AgentLiveWriteIntent::Mail(op) => {
+                let writer = crate::DaemonMailWrite { cfg: cfg.clone() };
+                match op {
+                    MailLiveWrite::SetRead { target, is_read } => {
+                        isyncyou_webui::MailWriteHandler::set_read(
+                            &writer, account, target, *is_read,
+                        )?;
+                        Ok(None)
+                    }
+                    MailLiveWrite::SetFlag {
+                        target,
+                        flag_status,
+                        due,
+                        tz,
+                    } => {
+                        isyncyou_webui::MailWriteHandler::set_flag(
+                            &writer,
+                            account,
+                            target,
+                            flag_status,
+                            due.as_deref(),
+                            tz,
+                        )?;
+                        Ok(None)
+                    }
+                    MailLiveWrite::SetCategories { target, categories } => {
+                        isyncyou_webui::MailWriteHandler::set_categories(
+                            &writer, account, target, categories,
+                        )?;
+                        Ok(None)
+                    }
+                    MailLiveWrite::Move {
+                        target,
+                        destination_id,
+                    } => isyncyou_webui::MailWriteHandler::move_to(
+                        &writer,
+                        account,
+                        target,
+                        destination_id,
+                    )
+                    .map(Some),
+                    MailLiveWrite::CreateDraft {
+                        subject,
+                        body_html,
+                        to,
+                    } => isyncyou_webui::MailWriteHandler::create_draft(
+                        &writer, account, subject, body_html, to,
+                    )
+                    .map(Some),
+                    MailLiveWrite::SendDraft { target } => {
+                        isyncyou_webui::MailWriteHandler::send_draft(&writer, account, target)?;
+                        Ok(None)
+                    }
+                }
+            }
+            AgentLiveWriteIntent::Calendar(op) => {
+                let writer = crate::DaemonCalendarWrite { cfg: cfg.clone() };
+                match op {
+                    CalendarLiveWrite::Create { event } => {
+                        isyncyou_webui::CalendarWriteHandler::create(&writer, account, event)
+                            .map(Some)
+                    }
+                    CalendarLiveWrite::Update { target, event } => {
+                        isyncyou_webui::CalendarWriteHandler::update(
+                            &writer, account, target, event,
+                        )?;
+                        Ok(None)
+                    }
+                    CalendarLiveWrite::Delete { target } => {
+                        isyncyou_webui::CalendarWriteHandler::delete(&writer, account, target)?;
+                        Ok(None)
+                    }
+                    CalendarLiveWrite::Respond {
+                        target,
+                        response,
+                        comment,
+                    } => {
+                        isyncyou_webui::CalendarWriteHandler::respond(
+                            &writer, account, target, response, comment,
+                        )?;
+                        Ok(None)
+                    }
+                }
+            }
+            AgentLiveWriteIntent::Contacts(op) => {
+                let writer = crate::DaemonContactWrite { cfg: cfg.clone() };
+                match op {
+                    ContactLiveWrite::Create { contact } => {
+                        isyncyou_webui::ContactWriteHandler::create(&writer, account, contact)
+                            .map(Some)
+                    }
+                    ContactLiveWrite::Update { target, contact } => {
+                        isyncyou_webui::ContactWriteHandler::update(
+                            &writer, account, target, contact,
+                        )?;
+                        Ok(None)
+                    }
+                    ContactLiveWrite::Delete { target } => {
+                        isyncyou_webui::ContactWriteHandler::delete(&writer, account, target)?;
+                        Ok(None)
+                    }
+                }
+            }
+            AgentLiveWriteIntent::Todo(op) => {
+                let writer = crate::DaemonTaskWrite { cfg: cfg.clone() };
+                match op {
+                    TodoLiveWrite::Create { list_id, task } => {
+                        isyncyou_webui::TaskWriteHandler::create(&writer, account, list_id, task)
+                            .map(Some)
+                    }
+                    TodoLiveWrite::Update {
+                        list_id,
+                        target,
+                        task,
+                    } => {
+                        isyncyou_webui::TaskWriteHandler::update(
+                            &writer, account, list_id, target, task,
+                        )?;
+                        Ok(None)
+                    }
+                    TodoLiveWrite::Complete { list_id, target } => {
+                        isyncyou_webui::TaskWriteHandler::complete(
+                            &writer, account, list_id, target,
+                        )?;
+                        Ok(None)
+                    }
+                    TodoLiveWrite::Delete { list_id, target } => {
+                        isyncyou_webui::TaskWriteHandler::delete(
+                            &writer, account, list_id, target,
+                        )?;
+                        Ok(None)
+                    }
+                    TodoLiveWrite::ChecklistAdd {
+                        list_id,
+                        target,
+                        title,
+                    } => isyncyou_webui::TaskWriteHandler::checklist_add(
+                        &writer, account, list_id, target, title,
+                    )
+                    .map(Some),
+                    TodoLiveWrite::ChecklistToggle {
+                        list_id,
+                        target,
+                        item_id,
+                        checked,
+                    } => {
+                        isyncyou_webui::TaskWriteHandler::checklist_toggle(
+                            &writer, account, list_id, target, item_id, *checked,
+                        )?;
+                        Ok(None)
+                    }
+                    TodoLiveWrite::ChecklistDelete {
+                        list_id,
+                        target,
+                        item_id,
+                    } => {
+                        isyncyou_webui::TaskWriteHandler::checklist_delete(
+                            &writer, account, list_id, target, item_id,
+                        )?;
+                        Ok(None)
+                    }
+                    TodoLiveWrite::ListCreate { name } => {
+                        isyncyou_webui::TaskWriteHandler::list_create(&writer, account, name)
+                            .map(Some)
+                    }
+                    TodoLiveWrite::ListDelete { list_id } => {
+                        isyncyou_webui::TaskWriteHandler::list_delete(&writer, account, list_id)?;
+                        Ok(None)
+                    }
+                }
+            }
+            AgentLiveWriteIntent::OneNote(op) => {
+                let writer = crate::DaemonOneNoteWrite { cfg: cfg.clone() };
+                match op {
+                    OneNoteLiveWrite::Create { section_id, html } => {
+                        isyncyou_webui::OneNoteWriteHandler::create(
+                            &writer, account, section_id, html,
+                        )
+                        .map(Some)
+                    }
+                    OneNoteLiveWrite::Delete { target } => {
+                        isyncyou_webui::OneNoteWriteHandler::delete(&writer, account, target)?;
+                        Ok(None)
+                    }
+                    OneNoteLiveWrite::Append { target, text } => {
+                        isyncyou_webui::OneNoteWriteHandler::append(
+                            &writer, account, target, text,
+                        )?;
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_live_write_with_runtime<R: LiveWriteRuntime>(
+    cfg: &Config,
+    action: &isyncyou_agent::ToolAction,
+    gate: &Arc<Mutex<()>>,
+    runtime: &R,
+) -> Result<LiveWriteRun, String> {
+    let isyncyou_agent::ToolAction::LiveWrite { account, .. } = action else {
+        return Err(format!("not_live_write_action: {}", action.op()));
+    };
+    let intent = validate_live_write_action(action)?;
+    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let result_id = runtime.execute_live_write(cfg, account, &intent)?;
+    let service = intent.service().to_string();
+    let verb = intent.verb().to_string();
+    let target = intent.target_label().to_string();
+    let summary = match &result_id {
+        Some(id) => format!("{service} {verb} ok id={}", redact_agent_operation_text(id)),
+        None => format!("{service} {verb} ok"),
+    };
+    Ok(LiveWriteRun {
+        service,
+        verb,
+        target,
+        result_id: result_id.map(|id| redact_agent_operation_text(&id)),
+        summary,
+    })
+}
+
+fn validate_live_write_action(
+    action: &isyncyou_agent::ToolAction,
+) -> Result<AgentLiveWriteIntent, String> {
+    let isyncyou_agent::ToolAction::LiveWrite {
+        service,
+        target,
+        change,
+        ..
+    } = action
+    else {
+        return Err(format!("not_live_write_action: {}", action.op()));
+    };
+    validate_service("live_write", service, LIVE_WRITE_SERVICES)?;
+    let verb = required_change_str(change, "verb")?;
+    match (service.as_str(), verb.as_str()) {
+        ("mail", "set_read") => Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead {
+            target: required_target(target, change)?,
+            is_read: required_change_bool(change, "is_read")?,
+        })),
+        ("mail", "set_flag") => {
+            let flag_status = required_change_str(change, "flag_status")?;
+            validate_named_value(
+                "live_write_flag_status",
+                &flag_status,
+                &["notFlagged", "flagged", "complete"],
+            )?;
+            Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetFlag {
+                target: required_target(target, change)?,
+                flag_status,
+                due: optional_change_str(change, "due")?,
+                tz: optional_change_str(change, "tz")?.unwrap_or_else(|| "UTC".to_string()),
+            }))
+        }
+        ("mail", "set_categories") => {
+            Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetCategories {
+                target: required_target(target, change)?,
+                categories: optional_string_array(change, "categories")?.unwrap_or_default(),
+            }))
+        }
+        ("mail", "move") => Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::Move {
+            target: required_target(target, change)?,
+            destination_id: required_change_str(change, "destination_id")?,
+        })),
+        ("mail", "create_draft") => Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::CreateDraft {
+            subject: optional_change_str(change, "subject")?.unwrap_or_default(),
+            body_html: required_body_str(change, &["body_html", "body"])?,
+            to: required_string_array(change, "to")?,
+        })),
+        ("mail", "send_draft") => Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SendDraft {
+            target: required_target(target, change)?,
+        })),
+        ("calendar", "create") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Create {
+            event: required_object(change, "event")?,
+        })),
+        ("calendar", "update") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Update {
+            target: required_target(target, change)?,
+            event: required_object(change, "event")?,
+        })),
+        ("calendar", "delete") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Delete {
+            target: required_target(target, change)?,
+        })),
+        ("calendar", "respond") => {
+            let response = required_change_str(change, "response")?;
+            validate_named_value(
+                "live_write_calendar_response",
+                &response,
+                &["accept", "decline", "tentative"],
+            )?;
+            Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Respond {
+                target: required_target(target, change)?,
+                response,
+                comment: optional_change_str(change, "comment")?.unwrap_or_default(),
+            }))
+        }
+        ("contacts", "create") => Ok(AgentLiveWriteIntent::Contacts(ContactLiveWrite::Create {
+            contact: required_object(change, "contact")?,
+        })),
+        ("contacts", "update") => Ok(AgentLiveWriteIntent::Contacts(ContactLiveWrite::Update {
+            target: required_target(target, change)?,
+            contact: required_object(change, "contact")?,
+        })),
+        ("contacts", "delete") => Ok(AgentLiveWriteIntent::Contacts(ContactLiveWrite::Delete {
+            target: required_target(target, change)?,
+        })),
+        ("todo", "create") => Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::Create {
+            list_id: required_change_str(change, "list_id")?,
+            task: required_object(change, "task")?,
+        })),
+        ("todo", "update") => Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::Update {
+            list_id: required_change_str(change, "list_id")?,
+            target: required_target(target, change)?,
+            task: required_object(change, "task")?,
+        })),
+        ("todo", "complete") => Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::Complete {
+            list_id: required_change_str(change, "list_id")?,
+            target: required_target(target, change)?,
+        })),
+        ("todo", "delete") => Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::Delete {
+            list_id: required_change_str(change, "list_id")?,
+            target: required_target(target, change)?,
+        })),
+        ("todo", "checklist_add") => Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::ChecklistAdd {
+            list_id: required_change_str(change, "list_id")?,
+            target: required_target(target, change)?,
+            title: required_change_str(change, "title")?,
+        })),
+        ("todo", "checklist_toggle") => {
+            Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::ChecklistToggle {
+                list_id: required_change_str(change, "list_id")?,
+                target: required_target(target, change)?,
+                item_id: required_change_str(change, "item_id")?,
+                checked: required_change_bool(change, "checked")?,
+            }))
+        }
+        ("todo", "checklist_delete") => {
+            Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::ChecklistDelete {
+                list_id: required_change_str(change, "list_id")?,
+                target: required_target(target, change)?,
+                item_id: required_change_str(change, "item_id")?,
+            }))
+        }
+        ("todo", "list_create") => Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::ListCreate {
+            name: required_change_str(change, "name")?,
+        })),
+        ("todo", "list_delete") => Ok(AgentLiveWriteIntent::Todo(TodoLiveWrite::ListDelete {
+            list_id: required_change_str(change, "list_id")?,
+        })),
+        ("onenote", "create") => Ok(AgentLiveWriteIntent::OneNote(OneNoteLiveWrite::Create {
+            section_id: required_change_str(change, "section_id")?,
+            html: required_body_str(change, &["html", "body_html"])?.into_bytes(),
+        })),
+        ("onenote", "delete") => Ok(AgentLiveWriteIntent::OneNote(OneNoteLiveWrite::Delete {
+            target: required_target(target, change)?,
+        })),
+        ("onenote", "append") => Ok(AgentLiveWriteIntent::OneNote(OneNoteLiveWrite::Append {
+            target: required_target(target, change)?,
+            text: required_body_str(change, &["text"])?,
+        })),
+        _ => Err(format!(
+            "unsupported_live_write_verb: {}",
+            redact_agent_operation_text(&verb)
+        )),
+    }
+}
+
+fn required_target(
+    top_target: &Option<String>,
+    change: &serde_json::Value,
+) -> Result<String, String> {
+    if let Some(target) = top_target.as_deref().filter(|s| !s.trim().is_empty()) {
+        return validate_bounded_string("target", target, LIVE_WRITE_MAX_STRING);
+    }
+    required_change_str(change, "target")
+}
+
+fn change_object(
+    change: &serde_json::Value,
+) -> Result<&serde_json::Map<String, serde_json::Value>, String> {
+    change
+        .as_object()
+        .ok_or_else(|| "invalid_live_write: change must be an object".to_string())
+}
+
+fn required_change_str(change: &serde_json::Value, key: &str) -> Result<String, String> {
+    let value = change_object(change)?
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("invalid_live_write: missing {key}"))?;
+    validate_bounded_string(key, value, LIVE_WRITE_MAX_STRING)
+}
+
+fn optional_change_str(change: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    match change_object(change)?.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("invalid_live_write: {key} must be a string"))?;
+            validate_bounded_string(key, s, LIVE_WRITE_MAX_STRING).map(Some)
+        }
+    }
+}
+
+fn required_body_str(change: &serde_json::Value, keys: &[&str]) -> Result<String, String> {
+    for key in keys {
+        if let Some(value) = change_object(change)?.get(*key) {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("invalid_live_write: {key} must be a string"))?;
+            return validate_bounded_string(key, s, LIVE_WRITE_MAX_BODY);
+        }
+    }
+    Err(format!("invalid_live_write: missing {}", keys.join("|")))
+}
+
+fn validate_bounded_string(key: &str, value: &str, max: usize) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err(format!("invalid_live_write: {key} is empty"));
+    }
+    if value.len() > max {
+        return Err(format!("invalid_live_write: {key} is too long"));
+    }
+    if value.chars().any(char::is_control) && key != "body" && key != "body_html" && key != "text" {
+        return Err(format!(
+            "invalid_live_write: {key} contains control characters"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn required_change_bool(change: &serde_json::Value, key: &str) -> Result<bool, String> {
+    change_object(change)?
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("invalid_live_write: missing bool {key}"))
+}
+
+fn required_object(change: &serde_json::Value, key: &str) -> Result<serde_json::Value, String> {
+    let value = change_object(change)?
+        .get(key)
+        .ok_or_else(|| format!("invalid_live_write: missing {key}"))?;
+    if !value.is_object() {
+        return Err(format!("invalid_live_write: {key} must be an object"));
+    }
+    let text = value.to_string();
+    if text.len() > LIVE_WRITE_MAX_BODY {
+        return Err(format!("invalid_live_write: {key} is too large"));
+    }
+    Ok(value.clone())
+}
+
+fn required_string_array(change: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
+    let values = optional_string_array(change, key)?
+        .ok_or_else(|| format!("invalid_live_write: missing {key}"))?;
+    if values.is_empty() {
+        return Err(format!("invalid_live_write: {key} is empty"));
+    }
+    Ok(values)
+}
+
+fn optional_string_array(
+    change: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = change_object(change)?.get(key) else {
+        return Ok(None);
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("invalid_live_write: {key} must be an array"))?;
+    if array.len() > LIVE_WRITE_MAX_ARRAY {
+        return Err(format!("invalid_live_write: {key} has too many values"));
+    }
+    let mut out = Vec::with_capacity(array.len());
+    for value in array {
+        let s = value
+            .as_str()
+            .ok_or_else(|| format!("invalid_live_write: {key} values must be strings"))?;
+        out.push(validate_bounded_string(key, s, LIVE_WRITE_MAX_STRING)?);
+    }
+    Ok(Some(out))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentShareIntent {
     Link {
@@ -653,15 +1357,14 @@ pub(crate) fn preview_for_pending_action(
             )))
         }
         isyncyou_agent::ToolAction::LiveWrite {
-            account,
-            service,
-            target,
-            change,
+            account, service, ..
         } => {
-            let verb = validate_live_write(service, change)?;
-            let target = target.as_deref().unwrap_or("new item");
+            let intent = validate_live_write_action(action)?;
+            let verb = intent.verb();
+            let target = intent.target_label();
             Ok(PendingOperationPreview::destructive(format!(
-                "Apply {service} {verb} to {target} for account {account}"
+                "Apply {service} {verb} to {target} for account {}",
+                redact_agent_operation_text(account)
             )))
         }
         isyncyou_agent::ToolAction::Share { account, id, .. } => {
@@ -705,51 +1408,6 @@ fn validate_service(kind: &str, service: &str, allowed: &[&str]) -> Result<(), S
         Err(format!(
             "unsupported_{kind}_service: {}",
             redact_agent_operation_text(service)
-        ))
-    }
-}
-
-fn validate_live_write(service: &str, change: &serde_json::Value) -> Result<String, String> {
-    let verb = change
-        .get("verb")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "invalid_live_write: missing verb".to_string())?;
-    let allowed = match service {
-        "mail" => &[
-            "set_read",
-            "set_flag",
-            "set_categories",
-            "move",
-            "create_draft",
-            "send_draft",
-        ][..],
-        "calendar" => &["create", "update", "delete", "respond"][..],
-        "contacts" => &["create", "update", "delete"][..],
-        "todo" => &[
-            "create",
-            "update",
-            "complete",
-            "delete",
-            "checklist_add",
-            "checklist_toggle",
-            "checklist_delete",
-            "list_create",
-            "list_delete",
-        ][..],
-        "onenote" => &["create", "delete", "append"][..],
-        _ => {
-            return Err(format!(
-                "unsupported_live_write_service: {}",
-                redact_agent_operation_text(service)
-            ))
-        }
-    };
-    if allowed.contains(&verb) {
-        Ok(verb.to_string())
-    } else {
-        Err(format!(
-            "unsupported_live_write_verb: {}",
-            redact_agent_operation_text(verb)
         ))
     }
 }
@@ -1135,6 +1793,21 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
                     .to_string(),
                 ))
             }
+            isyncyou_agent::ToolAction::LiveWrite { account, .. } => {
+                let run = run_live_write(&self.cfg, action, &self.gate)?;
+                Ok(ConfirmedActionResult::new(
+                    serde_json::json!({
+                        "op": "live-write",
+                        "account": redact_agent_operation_text(account),
+                        "service": run.service,
+                        "verb": run.verb,
+                        "target": run.target,
+                        "result_id": run.result_id,
+                        "summary": run.summary,
+                    })
+                    .to_string(),
+                ))
+            }
             isyncyou_agent::ToolAction::Share { account, .. } => {
                 let run = run_share(&self.cfg, action, &self.gate)?;
                 Ok(ConfirmedActionResult::new(
@@ -1324,6 +1997,53 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct LiveWriteRuntimeState {
+        calls: Vec<(String, AgentLiveWriteIntent)>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingLiveWriteRuntime {
+        state: Arc<StdMutex<LiveWriteRuntimeState>>,
+        result: Result<Option<String>, String>,
+    }
+
+    impl RecordingLiveWriteRuntime {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(LiveWriteRuntimeState::default())),
+                result: Ok(None),
+            }
+        }
+
+        fn with_result(result: Option<&str>) -> Self {
+            Self {
+                result: Ok(result.map(str::to_string)),
+                ..Self::new()
+            }
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, LiveWriteRuntimeState> {
+            self.state.lock().unwrap()
+        }
+    }
+
+    impl LiveWriteRuntime for RecordingLiveWriteRuntime {
+        fn execute_live_write(
+            &self,
+            _cfg: &Config,
+            account: &str,
+            intent: &AgentLiveWriteIntent,
+        ) -> Result<Option<String>, String> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push((account.to_string(), intent.clone()));
+            self.result.clone()
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct ShareRuntimeState {
         link_calls: Vec<(String, String, String, String, String)>,
         invite_calls: Vec<(String, String, String, Vec<String>, String)>,
@@ -1396,6 +2116,253 @@ mod tests {
         let mut cfg = Config::default();
         cfg.restore.cloud_restore_enabled = true;
         cfg
+    }
+
+    fn run_recorded_live_write(
+        action: &isyncyou_agent::ToolAction,
+        runtime: &RecordingLiveWriteRuntime,
+    ) -> LiveWriteRun {
+        let gate = Arc::new(Mutex::new(()));
+        run_live_write_with_runtime(&Config::default(), action, &gate, runtime).unwrap()
+    }
+
+    #[test]
+    fn agent_live_write_mail_set_read_routes_existing_writer() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "mail",
+            "target": "msg-1",
+            "change": { "verb": "set_read", "is_read": true }
+        }))
+        .unwrap();
+        let runtime = RecordingLiveWriteRuntime::new();
+
+        let run = run_recorded_live_write(&action, &runtime);
+
+        assert_eq!(run.service, "mail");
+        assert_eq!(run.verb, "set_read");
+        assert_eq!(
+            runtime.state().calls,
+            vec![(
+                "me".to_string(),
+                AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead {
+                    target: "msg-1".to_string(),
+                    is_read: true,
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_live_write_mail_move_routes_existing_writer() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "mail",
+            "target": "msg-1",
+            "change": { "verb": "move", "destination_id": "archive-folder" }
+        }))
+        .unwrap();
+        let runtime = RecordingLiveWriteRuntime::with_result(Some("msg-1-moved"));
+
+        let run = run_recorded_live_write(&action, &runtime);
+
+        assert_eq!(run.result_id.as_deref(), Some("msg-1-moved"));
+        assert_eq!(
+            runtime.state().calls,
+            vec![(
+                "me".to_string(),
+                AgentLiveWriteIntent::Mail(MailLiveWrite::Move {
+                    target: "msg-1".to_string(),
+                    destination_id: "archive-folder".to_string(),
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_live_write_calendar_update_routes_existing_writer() {
+        let event = json!({ "subject": "Renamed" });
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "calendar",
+            "target": "event-1",
+            "change": { "verb": "update", "event": event }
+        }))
+        .unwrap();
+        let runtime = RecordingLiveWriteRuntime::new();
+
+        let run = run_recorded_live_write(&action, &runtime);
+
+        assert_eq!(run.service, "calendar");
+        assert_eq!(
+            runtime.state().calls,
+            vec![(
+                "me".to_string(),
+                AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Update {
+                    target: "event-1".to_string(),
+                    event,
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_live_write_contact_update_routes_existing_writer() {
+        let contact = json!({ "displayName": "Updated Name" });
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "contacts",
+            "target": "contact-1",
+            "change": { "verb": "update", "contact": contact }
+        }))
+        .unwrap();
+        let runtime = RecordingLiveWriteRuntime::new();
+
+        let run = run_recorded_live_write(&action, &runtime);
+
+        assert_eq!(run.service, "contacts");
+        assert_eq!(
+            runtime.state().calls,
+            vec![(
+                "me".to_string(),
+                AgentLiveWriteIntent::Contacts(ContactLiveWrite::Update {
+                    target: "contact-1".to_string(),
+                    contact,
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_live_write_todo_complete_routes_existing_writer() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "todo",
+            "target": "task-1",
+            "change": { "verb": "complete", "list_id": "list-1" }
+        }))
+        .unwrap();
+        let runtime = RecordingLiveWriteRuntime::new();
+
+        let run = run_recorded_live_write(&action, &runtime);
+
+        assert_eq!(run.service, "todo");
+        assert_eq!(
+            runtime.state().calls,
+            vec![(
+                "me".to_string(),
+                AgentLiveWriteIntent::Todo(TodoLiveWrite::Complete {
+                    list_id: "list-1".to_string(),
+                    target: "task-1".to_string(),
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_live_write_onenote_append_routes_existing_writer() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "onenote",
+            "target": "page-1",
+            "change": { "verb": "append", "text": "Append this paragraph" }
+        }))
+        .unwrap();
+        let runtime = RecordingLiveWriteRuntime::new();
+
+        let run = run_recorded_live_write(&action, &runtime);
+
+        assert_eq!(run.service, "onenote");
+        assert_eq!(
+            runtime.state().calls,
+            vec![(
+                "me".to_string(),
+                AgentLiveWriteIntent::OneNote(OneNoteLiveWrite::Append {
+                    target: "page-1".to_string(),
+                    text: "Append this paragraph".to_string(),
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_live_write_rejects_unknown_service_or_verb_before_pending() {
+        let bad_service = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "onedrive",
+            "target": "item-1",
+            "change": { "verb": "rename" }
+        }))
+        .unwrap();
+        let err = preview_for_pending_action(&bad_service).unwrap_err();
+        assert!(err.contains("unsupported_live_write_service"));
+
+        let bad_verb = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "mail",
+            "target": "msg-1",
+            "change": { "verb": "delete_forever" }
+        }))
+        .unwrap();
+        let err = preview_for_pending_action(&bad_verb).unwrap_err();
+        assert!(err.contains("unsupported_live_write_verb"));
+
+        let runtime = RecordingLiveWriteRuntime::new();
+        let gate = Arc::new(Mutex::new(()));
+        let err = run_live_write_with_runtime(&Config::default(), &bad_verb, &gate, &runtime)
+            .unwrap_err();
+        assert!(err.contains("unsupported_live_write_verb"));
+        assert!(runtime.state().calls.is_empty());
+    }
+
+    #[test]
+    fn agent_live_write_body_html_is_not_audited() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "owner@example.com",
+            "service": "mail",
+            "change": {
+                "verb": "create_draft",
+                "subject": "private subject",
+                "body_html": "<html>raw-body-sentinel recipient@example.com</html>",
+                "to": ["recipient@example.com"]
+            }
+        }))
+        .unwrap();
+        let preview = preview_for_pending_action(&action).unwrap();
+        let runtime = RecordingLiveWriteRuntime::with_result(Some("draft-1"));
+        let run = run_recorded_live_write(&action, &runtime);
+        let text = format!("{} {}", preview.text, run.summary);
+
+        assert!(preview.text.contains("create_draft"));
+        assert!(!text.contains("raw-body-sentinel"));
+        assert!(!text.contains("recipient@example.com"));
+        assert!(!text.contains("private subject"));
+        assert!(text.contains("<redacted-email>"));
+    }
+
+    #[test]
+    fn desktop_agent_operations_impl_does_not_call_graphclient_mutations_directly() {
+        let source = include_str!("agent_ops.rs");
+        let start = source
+            .find("impl AgentConfirmedActionExecutor for DesktopAgentOperations")
+            .expect("desktop executor impl");
+        let end = source[start..]
+            .find("impl AgentConfirmedActionExecutor for MobileDisabledAgentOperations")
+            .expect("mobile executor impl");
+        let block = &source[start..start + end];
+
+        assert!(!block.contains("GraphClient"));
+        assert!(!block.contains(".create_link("));
+        assert!(!block.contains(".invite("));
     }
 
     #[test]
