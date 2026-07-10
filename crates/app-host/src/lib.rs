@@ -7,7 +7,10 @@ mod agent_ops;
 mod mobile_jobs;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
-pub use mobile_jobs::{MobileJobRunOutcome, MobileJobRuntime};
+pub use mobile_jobs::{
+    MobileJobExecutionError, MobileJobFailureCode, MobileJobRetryCode, MobileJobRunOutcome,
+    MobileJobRuntime,
+};
 
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};

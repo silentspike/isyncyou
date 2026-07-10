@@ -1593,6 +1593,7 @@ dependencies = [
  "isyncyou-graph",
  "isyncyou-store",
  "isyncyou-webui",
+ "ring",
  "serde_json",
 ]
 
