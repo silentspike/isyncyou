@@ -1,0 +1,137 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-10T07:07:51Z",
+  "commit": "8f739b2b9c8835b707a0022494f3e3d094e8fbc5",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The product OAuth feature does not export the legacy BYO API-key provider types.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features agent-oauth-providers product_oauth_feature_does_not_export_byo_api_providers -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::product_oauth_feature_does_not_export_byo_api_providers ... ok",
+      "test": "product_oauth_feature_does_not_export_byo_api_providers"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-008",
+      "claim": "App-host product code cannot instantiate the quarantined BYO Anthropic/OpenAI providers.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers app_host_product_code_does_not_reference_legacy_byo_provider_types -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::app_host_product_code_does_not_reference_legacy_byo_provider_types ... ok",
+      "test": "app_host_product_code_does_not_reference_legacy_byo_provider_types"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Product provider selection ignores local Claude/Codex CLI credential files.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers product_oauth_provider_does_not_read_desktop_cli_fallbacks -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::product_oauth_provider_does_not_read_desktop_cli_fallbacks ... ok",
+      "test": "product_oauth_provider_does_not_read_desktop_cli_fallbacks"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Non-live product tests clear public provider keys and provider override env vars.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers non_live_provider_tests_clear_public_api_key_env -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::non_live_provider_tests_clear_public_api_key_env ... ok",
+      "test": "non_live_provider_tests_clear_public_api_key_env"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Unexpected provider network POSTs fail closed when the non-live test guard is active.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers non_live_provider_tests_fail_on_unexpected_network -- --nocapture",
+      "result": "pass",
+      "evidence": "test http::tests::non_live_provider_tests_fail_on_unexpected_network ... ok",
+      "test": "non_live_provider_tests_fail_on_unexpected_network"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Encrypted stored Claude OAuth credentials select the Claude-compatible product provider.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers agent_provider_selection_uses_stored_claude_oauth_credential -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::agent_provider_selection_uses_stored_claude_oauth_credential ... ok",
+      "test": "agent_provider_selection_uses_stored_claude_oauth_credential"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Encrypted stored Codex OAuth credentials select the Codex product provider.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers agent_provider_selection_uses_stored_codex_oauth_credential -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::agent_provider_selection_uses_stored_codex_oauth_credential ... ok",
+      "test": "agent_provider_selection_uses_stored_codex_oauth_credential"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-009",
+      "claim": "The product provider executor binds read-class tool calls to the real StoreArchive fixture.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_provider_agent_executor_reads_store_archive_fixture -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::live_provider_agent_executor_reads_store_archive_fixture ... ok",
+      "test": "live_provider_agent_executor_reads_store_archive_fixture"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Claude-compatible provider SSE emits text deltas before stream completion.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers claude_sse_event_returns_text_delta_immediately -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::subscription::tests::claude_sse_event_returns_text_delta_immediately ... ok",
+      "test": "claude_sse_event_returns_text_delta_immediately"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Codex provider request shape keeps stream=true and store=false.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers build_request_uses_responses_shape_with_instructions_and_tool -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::codex::tests::build_request_uses_responses_shape_with_instructions_and_tool ... ok",
+      "test": "build_request_uses_responses_shape_with_instructions_and_tool"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The WebUI setup uses claude/codex product provider IDs and exposes no BYO API-key setup row.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_setup_consent_is_required_and_non_secret -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::assistant_setup_consent_is_required_and_non_secret ... ok",
+      "test": "assistant_setup_consent_is_required_and_non_secret"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Assistant status exposes sanitized provider/model/usage metadata without auth material.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers daemon_agent_status_reports_sanitized_last_provider_usage -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::daemon_agent_status_reports_sanitized_last_provider_usage ... ok",
+      "test": "daemon_agent_status_reports_sanitized_last_provider_usage"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Codex provider SSE emits text deltas before stream completion.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers apply_sse_event_returns_text_delta_immediately -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::codex::tests::apply_sse_event_returns_text_delta_immediately ... ok",
+      "test": "apply_sse_event_returns_text_delta_immediately"
+    }
+  ]
+}

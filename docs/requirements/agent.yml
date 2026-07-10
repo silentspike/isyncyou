@@ -149,21 +149,45 @@ requirements:
       - test: agent_stream_sse_requires_session_token_on_mobile
       - test: open_bridge_stream_gates_events_and_agent
   - id: REQ-AGENT-008
-    title: Provider policy — official default, FakeProvider-only CI, subscription experimental
+    title: Provider policy — Claude/Codex app OAuth product path, FakeProvider CI fallback
     statement: >
-      Official providers (Anthropic Messages, OpenAI Responses with store:false) are the
-      default; FakeProvider is the only provider built/used in CI (no real LLM tokens);
-      the Claude/Codex subscription provider exists only behind the default-off
-      `agent-subscription-experimental` feature, absent from release artifacts, CI, and
-      the README. (S-AG.2/#617, S-AG.8/#623, S-AG.12/#627)
+      The product provider path is app-authorized Claude/Codex OAuth with tokens
+      loaded from encrypted host/mobile credential storage. Product builds must not
+      ask for BYO Anthropic/OpenAI API keys, must not use `ProviderApiKey` as the
+      product setup path, and must not read local `~/.claude` or `~/.codex` CLI auth.
+      FakeProvider remains the deterministic CI/unconfigured fallback only. The
+      local CLI credential fallback and private wire-drift capture stay separated
+      under #627/default-off `agent-subscription-experimental`. (S-AG.2/#617,
+      S-AG.8/#623, S-AG.12/#627)
     status: planned
     design: docs/adr/007-agent-architecture.md
     acceptance:
-      - CI builds and tests use FakeProvider only (no real LLM token).
-      - The subscription feature is off by default and absent from release artifacts.
-      - The subscription provider is not referenced in the README.
+      - Desktop and mobile product feature wiring includes the app-OAuth provider runtime without requiring #627's local CLI fallback.
+      - Claude/Codex product auth loads encrypted CredentialStore OAuth material first and ignores local CLI auth files in non-experimental builds.
+      - Non-live provider tests isolate HOME, CODEX_HOME, CLAUDE_CONFIG_DIR, API-key env vars, provider overrides, and unexpected provider network access.
+      - Claude/Codex provider streams emit tokens before completion; Codex requests keep `store:false`.
+      - The WebUI setup posts product provider IDs (`claude`, `codex`) and exposes no BYO API-key setup row.
+      - #627 remains separate for local CLI fallback/capture and cannot be counted as #623 product-auth evidence.
+      - Closing #623 still requires live product OAuth StoreArchive roundtrip evidence or an honest blocked state; FakeProvider is not acceptable live evidence.
     verified_by:
-      - test: ci_uses_fake_provider_only
+      - test: product_oauth_feature_does_not_export_byo_api_providers
+      - test: app_host_product_code_does_not_reference_legacy_byo_provider_types
+      - test: product_oauth_provider_does_not_enable_subscription_import
+      - test: product_oauth_provider_does_not_read_desktop_cli_fallbacks
+      - test: non_live_provider_tests_ignore_real_claude_home
+      - test: non_live_provider_tests_ignore_real_codex_home
+      - test: non_live_provider_tests_clear_public_api_key_env
+      - test: non_live_provider_tests_fail_on_unexpected_network
+      - test: agent_provider_selection_uses_stored_claude_oauth_credential
+      - test: agent_provider_selection_uses_stored_codex_oauth_credential
+      - test: live_provider_agent_executor_reads_store_archive_fixture
+      - test: claude_sse_event_returns_text_delta_immediately
+      - test: apply_sse_event_returns_text_delta_immediately
+      - test: build_request_uses_responses_shape_with_instructions_and_tool
+      - test: agent_oauth_start_is_cap_gated_and_returns_authorize_url
+      - test: assistant_setup_consent_is_required_and_non_secret
+      - test: agent_oauth_start_rejects_legacy_provider_ids
+      - test: daemon_agent_status_reports_sanitized_last_provider_usage
   - id: REQ-AGENT-009
     title: Answers carry source citations and respect byte budgets
     statement: >
@@ -176,7 +200,7 @@ requirements:
       - A search/read result carries a {service, id, path} source reference.
       - A read over budget is truncated and flagged.
       - List and export results carry source identifiers for returned items.
-      - The app-host experimental agent build binds read-class actions to the real StoreArchive executor.
+      - The app-host product OAuth provider path binds read-class actions to the real StoreArchive executor.
     verified_by:
       - test: search_returns_source_tagged_hits_across_names_and_bodies
       - test: read_includes_source_object
@@ -185,7 +209,7 @@ requirements:
       - test: export_raw_passthrough_carries_source_ids
       - test: store_archive_reads_sealed_body_with_envelope_reader
       - test: store_archive_executor_covers_search_read_list_export_shapes
-      - test: experimental_agent_executor_reads_store_archive_fixture
+      - test: live_provider_agent_executor_reads_store_archive_fixture
   - id: REQ-AGENT-010
     title: Agent secrets are typed, encrypted at rest, and separated by class
     statement: >
