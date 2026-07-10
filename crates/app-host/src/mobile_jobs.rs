@@ -5,15 +5,25 @@ use std::time::Duration;
 use ring::rand::SecureRandom;
 
 use isyncyou_core::{AccountConfig, Config};
+pub use isyncyou_store::MobileJobKind;
 use isyncyou_store::{
-    mobile_backup_idempotency_key, mobile_restore_cloud_idempotency_key, MobileJob, MobileJobKind,
-    MobileJobState, Store,
+    mobile_backup_idempotency_key, mobile_restore_cloud_idempotency_key, MobileJob, MobileJobState,
+    Store,
 };
 
 use crate::{agent_ops, BackupRun};
 
 const MOBILE_BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 const MOBILE_JOB_LEASE_TTL_SECS: i64 = 300;
+const MOBILE_JOB_PLAN_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MobileWorkerDeviceSnapshot {
+    pub network_validated: bool,
+    pub metered: bool,
+    pub charging: bool,
+    pub free_bytes: u64,
+}
 
 pub trait MobileJobExecutor: Send + Sync {
     fn run_backup(
@@ -168,6 +178,7 @@ pub enum MobileJobRunOutcome {
     Failed {
         job_id: String,
         kind: MobileJobKind,
+        code: MobileJobFailureCode,
         error: String,
     },
     Retrying {
@@ -190,6 +201,7 @@ pub struct MobileJobRuntime {
     owner: String,
     seq: Arc<AtomicU64>,
     executor: Arc<dyn MobileJobExecutor>,
+    execution_guard: Arc<Mutex<()>>,
 }
 
 impl MobileJobRuntime {
@@ -202,6 +214,7 @@ impl MobileJobRuntime {
             owner,
             seq: Arc::new(AtomicU64::new(0)),
             executor: Arc::new(LiveMobileJobExecutor),
+            execution_guard: Arc::new(Mutex::new(())),
         }
     }
 
@@ -315,6 +328,77 @@ impl MobileJobRuntime {
         Ok(outcomes)
     }
 
+    pub fn mobile_worker_plan(
+        &self,
+        account: &str,
+    ) -> Result<(Vec<(String, MobileJobKind)>, bool), String> {
+        let store = self.open_store(account)?;
+        let now = now_secs();
+        store
+            .reclaim_mobile_jobs_from_foreign_process(&self.owner, now)
+            .map_err(|e| format!("reclaim mobile jobs for {account}: {e}"))?;
+        let jobs = store
+            .recoverable_mobile_jobs(account, now)
+            .map_err(|e| format!("list mobile jobs for {account}: {e}"))?;
+        let truncated = jobs.len() > MOBILE_JOB_PLAN_LIMIT;
+        Ok((
+            jobs.into_iter()
+                .take(MOBILE_JOB_PLAN_LIMIT)
+                .map(|job| (job.job_id, job.kind))
+                .collect(),
+            truncated,
+        ))
+    }
+
+    pub fn mobile_worker_constraints(&self) -> (bool, bool, u64) {
+        (
+            self.cfg.sync.wifi_only,
+            self.cfg.sync.charging_only,
+            self.cfg.sync.min_free_bytes,
+        )
+    }
+
+    pub fn run_mobile_job_for_worker(
+        &self,
+        job_id: &str,
+        expected_kind: MobileJobKind,
+        device: MobileWorkerDeviceSnapshot,
+    ) -> Result<MobileJobRunOutcome, String> {
+        if !device.network_validated {
+            return Ok(MobileJobRunOutcome::Skipped {
+                job_id: job_id.to_string(),
+                reason: "device_state_unavailable".to_string(),
+            });
+        }
+        if device.metered && self.cfg.sync.wifi_only {
+            return Ok(MobileJobRunOutcome::Skipped {
+                job_id: job_id.to_string(),
+                reason: "wifi_only".to_string(),
+            });
+        }
+        if !device.charging && self.cfg.sync.charging_only {
+            return Ok(MobileJobRunOutcome::Skipped {
+                job_id: job_id.to_string(),
+                reason: "charging_only".to_string(),
+            });
+        }
+        if device.free_bytes < self.cfg.sync.min_free_bytes {
+            return Ok(MobileJobRunOutcome::Skipped {
+                job_id: job_id.to_string(),
+                reason: "insufficient_storage".to_string(),
+            });
+        }
+        let _guard = self
+            .execution_guard
+            .try_lock()
+            .map_err(|_| "worker_busy".to_string())?;
+        let (_, job) = self.find_job(job_id)?;
+        if job.kind != expected_kind {
+            return Err("job_kind_mismatch".to_string());
+        }
+        self.run_one_job(job_id)
+    }
+
     pub fn run_one_job(&self, job_id: &str) -> Result<MobileJobRunOutcome, String> {
         let job = {
             let (store, job) = self.find_job(job_id)?;
@@ -426,6 +510,7 @@ impl MobileJobRuntime {
                             Ok(MobileJobRunOutcome::Failed {
                                 job_id: job.job_id,
                                 kind: job.kind,
+                                code,
                                 error,
                             })
                         }

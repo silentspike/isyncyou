@@ -8,8 +8,8 @@ mod mobile_jobs;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
 pub use mobile_jobs::{
-    MobileJobExecutionError, MobileJobFailureCode, MobileJobRetryCode, MobileJobRunOutcome,
-    MobileJobRuntime,
+    MobileJobExecutionError, MobileJobFailureCode, MobileJobKind, MobileJobRetryCode,
+    MobileJobRunOutcome, MobileJobRuntime, MobileWorkerDeviceSnapshot,
 };
 
 use isyncyou_connectors::ProgressSink;

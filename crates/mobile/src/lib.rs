@@ -59,6 +59,7 @@ struct EngineState {
     /// **only** under the experimental agent-subscription feature (whose OAuth flow needs a
     /// `http://127.0.0.1/callback` redirect target); its port is not retained here.
     router: Arc<isyncyou_webui::Router>,
+    mobile_jobs: Arc<isyncyou_app_host::MobileJobRuntime>,
 }
 
 /// Process-global engine handle. `start` is idempotent (Activity recreation must not
@@ -484,50 +485,6 @@ fn sync_report_changed(r: &isyncyou_engine::SyncReport) -> bool {
             > 0
 }
 
-fn run_mobile_job_recovery_once(jobs: &isyncyou_app_host::MobileJobRuntime) -> bool {
-    match jobs.recover_and_run_available_jobs(Some(ACCOUNT)) {
-        Ok(outcomes) => {
-            let changed = outcomes.iter().any(|outcome| {
-                !matches!(
-                    outcome,
-                    isyncyou_app_host::MobileJobRunOutcome::Skipped { .. }
-                )
-            });
-            if changed {
-                android_info(&format!(
-                    "mobile job recovery processed {} job(s)",
-                    outcomes.len()
-                ));
-            }
-            changed
-        }
-        Err(e) => {
-            android_info(&format!(
-                "mobile job recovery failed: {}",
-                isyncyou_core::obs::redact(&e)
-            ));
-            false
-        }
-    }
-}
-
-fn spawn_mobile_job_recovery_loop(
-    jobs: Arc<isyncyou_app_host::MobileJobRuntime>,
-    events: Arc<isyncyou_webui::EventBus>,
-    interval: Arc<AtomicU64>,
-) {
-    std::thread::spawn(move || loop {
-        let changed =
-            std::panic::catch_unwind(AssertUnwindSafe(|| run_mobile_job_recovery_once(&jobs)))
-                .unwrap_or(false);
-        if changed {
-            events.notify();
-        }
-        let secs = interval.load(Ordering::Relaxed).max(5);
-        std::thread::sleep(Duration::from_secs(secs));
-    });
-}
-
 /// Start the embedded engine if not already running. Idempotent. Host-testable (no JNI):
 /// the JNI entry is a thin wrapper. No loopback port is bound in the default build (#0A);
 /// the UI reaches the engine only in-process (bridge + asset path).
@@ -536,10 +493,11 @@ pub fn start_engine(files_dir: &str) -> Result<(), String> {
     if guard.is_some() {
         return Ok(()); // already running — idempotent
     }
-    let (session_token, router) = start_inner(files_dir)?;
+    let (session_token, router, mobile_jobs) = start_inner(files_dir)?;
     *guard = Some(EngineState {
         session_token,
         router,
+        mobile_jobs,
     });
     Ok(())
 }
@@ -773,7 +731,16 @@ fn describe_action_json(pending_id: &str) -> String {
     }
 }
 
-fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
+fn start_inner(
+    files_dir: &str,
+) -> Result<
+    (
+        String,
+        Arc<isyncyou_webui::Router>,
+        Arc<isyncyou_app_host::MobileJobRuntime>,
+    ),
+    String,
+> {
     if !mobile_encryption_ready() {
         return Err("encrypted storage setup failed; local data was not opened".into());
     }
@@ -846,8 +813,6 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
         .with_biometric_gate(),
     );
 
-    spawn_mobile_job_recovery_loop(mobile_jobs, events.clone(), live_interval.clone());
-
     // #0A: NO loopback TCP port in the default build — the WebView reaches the engine only
     // in-process (the message bridge for data, `shouldInterceptRequest`→`asset_request` for
     // GET assets), so nothing is reachable by another app on the device. A loopback server
@@ -882,7 +847,7 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
         )
     });
 
-    Ok((session_token, router))
+    Ok((session_token, router, mobile_jobs))
 }
 
 /// One mobile scoped OneDrive pass under the store-access gate (#655/#718): Sync scopes ingest
@@ -969,6 +934,172 @@ fn refresh_loop(
 // `com.silentspike.isyncyou.NativeEngine.nativeStart(filesDir)` -> bound port (or -1)
 // `com.silentspike.isyncyou.NativeEngine.nativeSessionToken()` -> token string
 
+#[derive(Debug)]
+struct NativeMobileJobRunRequest {
+    v: u32,
+    job_id: String,
+    kind: String,
+    device: NativeMobileDeviceSnapshot,
+}
+
+#[derive(Debug)]
+struct NativeMobileDeviceSnapshot {
+    network_validated: bool,
+    metered: bool,
+    charging: bool,
+    free_bytes: u64,
+}
+
+fn valid_mobile_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn mobile_job_kind_from_wire(kind: &str) -> Option<isyncyou_app_host::MobileJobKind> {
+    match kind {
+        "backup" => Some(isyncyou_app_host::MobileJobKind::Backup),
+        "restore-cloud" => Some(isyncyou_app_host::MobileJobKind::RestoreCloud),
+        _ => None,
+    }
+}
+
+fn mobile_jobs_handle() -> Option<Arc<isyncyou_app_host::MobileJobRuntime>> {
+    cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|state| state.mobile_jobs.clone())
+}
+
+fn native_mobile_job_plan_json() -> String {
+    let Some(jobs) = mobile_jobs_handle() else {
+        return r#"{"v":1,"status":"not_started"}"#.to_string();
+    };
+    match jobs.mobile_worker_plan(ACCOUNT) {
+        Ok((entries, truncated)) => {
+            let (wifi_only, charging_only, min_free_bytes) = jobs.mobile_worker_constraints();
+            let jobs = entries
+                .into_iter()
+                .map(|(job_id, kind)| serde_json::json!({"job_id": job_id, "kind": kind.as_str()}))
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "v": 1,
+                "status": "ok",
+                "jobs": jobs,
+                "truncated": truncated,
+                "constraints": {
+                    "wifi_only": wifi_only,
+                    "charging_only": charging_only,
+                    "min_free_bytes": min_free_bytes,
+                },
+            })
+            .to_string()
+        }
+        Err(_) => r#"{"v":1,"status":"error","code":"internal"}"#.to_string(),
+    }
+}
+
+fn native_mobile_job_run_json(request_json: &str) -> String {
+    let value = match serde_json::from_str::<serde_json::Value>(request_json) {
+        Ok(value) => value,
+        Err(_) => return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string(),
+    };
+    let device = match value.get("device").and_then(|v| v.as_object()) {
+        Some(device) => device,
+        None => return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string(),
+    };
+    let (
+        Some(v),
+        Some(job_id),
+        Some(kind),
+        Some(network_validated),
+        Some(metered),
+        Some(charging),
+        Some(free_bytes),
+    ) = (
+        value.get("v").and_then(|v| v.as_u64()),
+        value.get("job_id").and_then(|v| v.as_str()),
+        value.get("kind").and_then(|v| v.as_str()),
+        device.get("network_validated").and_then(|v| v.as_bool()),
+        device.get("metered").and_then(|v| v.as_bool()),
+        device.get("charging").and_then(|v| v.as_bool()),
+        device.get("free_bytes").and_then(|v| v.as_u64()),
+    )
+    else {
+        return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string();
+    };
+    let request = NativeMobileJobRunRequest {
+        v: v as u32,
+        job_id: job_id.to_string(),
+        kind: kind.to_string(),
+        device: NativeMobileDeviceSnapshot {
+            network_validated,
+            metered,
+            charging,
+            free_bytes,
+        },
+    };
+    if request.v != 1 {
+        return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string();
+    }
+    let Some(kind) = mobile_job_kind_from_wire(&request.kind) else {
+        return r#"{"v":1,"status":"failed","code":"invalid_kind"}"#.to_string();
+    };
+    if !valid_mobile_job_id(&request.job_id) {
+        return r#"{"v":1,"status":"failed","code":"invalid_job_id"}"#.to_string();
+    }
+    let Some(jobs) = mobile_jobs_handle() else {
+        return r#"{"v":1,"status":"failed","code":"not_started"}"#.to_string();
+    };
+    let device = isyncyou_app_host::MobileWorkerDeviceSnapshot {
+        network_validated: request.device.network_validated,
+        metered: request.device.metered,
+        charging: request.device.charging,
+        free_bytes: request.device.free_bytes,
+    };
+    let outcome = jobs.run_mobile_job_for_worker(&request.job_id, kind, device);
+    match outcome {
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Succeeded { .. }) => {
+            r#"{"v":1,"status":"succeeded"}"#.to_string()
+        }
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Retrying {
+            code,
+            retry_after_secs,
+            ..
+        }) => serde_json::json!({
+            "v": 1,
+            "status": "retry",
+            "code": code.as_str(),
+            "retry_after_secs": retry_after_secs,
+        })
+        .to_string(),
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Failed { code, .. }) => {
+            serde_json::json!({"v": 1, "status": "failed", "code": code.as_str()}).to_string()
+        }
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Skipped { reason, .. }) => {
+            let status = if reason == "worker_busy" {
+                "retry"
+            } else {
+                "skipped"
+            };
+            serde_json::json!({"v": 1, "status": status, "code": reason}).to_string()
+        }
+        Err(error) => {
+            let code = if error == "worker_busy" {
+                "worker_busy"
+            } else if error == "job_kind_mismatch" {
+                "kind_mismatch"
+            } else {
+                "internal"
+            };
+            serde_json::json!({"v": 1, "status": "failed", "code": code}).to_string()
+        }
+    }
+}
+
 fn jni_get_string<'local>(
     env: &mut jni::EnvUnowned<'local>,
     value: &jni::objects::JString<'local>,
@@ -1041,6 +1172,40 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart<'l
         Ok(()) => 1,
         Err(_) => -1,
     }
+}
+
+/// JNI: return the bounded list of recoverable mobile jobs for WorkManager. The
+/// response contains only opaque job IDs, kinds, and truncation metadata.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeMobileJobPlan<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+) -> jni::sys::jstring {
+    let response = std::panic::catch_unwind(native_mobile_job_plan_json)
+        .unwrap_or_else(|_| r#"{"v":1,"status":"failed","code":"internal"}"#.to_string());
+    jni_new_string(&mut env, response)
+}
+
+/// JNI: validate and run one WorkManager-selected mobile job using a strict
+/// versioned request. No account, target, cloud result, or raw error is returned.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeRunMobileJob<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    request_json: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let request = match jni_get_string(&mut env, &request_json) {
+        Some(request) if request.len() <= 16 * 1024 => request,
+        _ => {
+            return jni_new_string(
+                &mut env,
+                r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string(),
+            )
+        }
+    };
+    let response = std::panic::catch_unwind(|| native_mobile_job_run_json(&request))
+        .unwrap_or_else(|_| r#"{"v":1,"status":"failed","code":"internal"}"#.to_string());
+    jni_new_string(&mut env, response)
 }
 
 /// JNI: the per-process session token Kotlin hands to the WebView (header + cookie).
@@ -1332,6 +1497,29 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_mobile_job_run_rejects_malformed_and_unbounded_requests() {
+        assert!(native_mobile_job_run_json("not-json").contains("invalid_request"));
+        assert!(native_mobile_job_run_json(
+            r#"{"v":1,"job_id":"bad/id","kind":"backup","device":{"network_validated":true,"metered":false,"charging":true,"free_bytes":999999999}}"#
+        )
+        .contains("invalid_job_id"));
+        assert!(native_mobile_job_run_json(
+            r#"{"v":1,"job_id":"job-1","kind":"backup","device":{"network_validated":true}}"#
+        )
+        .contains("invalid_request"));
+    }
+
+    #[test]
+    fn native_mobile_job_kind_and_id_policy_is_bounded() {
+        assert!(valid_mobile_job_id("mobile-backup-123"));
+        assert!(!valid_mobile_job_id("mobile/job"));
+        assert!(!valid_mobile_job_id(&"x".repeat(129)));
+        assert!(mobile_job_kind_from_wire("backup").is_some());
+        assert!(mobile_job_kind_from_wire("restore-cloud").is_some());
+        assert!(mobile_job_kind_from_wire("unknown").is_none());
+    }
 
     fn api_json(resp: isyncyou_webui::ApiResponse) -> serde_json::Value {
         serde_json::from_slice(&resp.body).expect("json response")
@@ -1967,7 +2155,7 @@ mod tests {
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         restore_enabled_mobile_config(dir.path());
-        let (tok, router) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+        let (tok, router, _) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
 
         for path in [
             "/api/v1/restore?account=me&service=mail&id=x",
@@ -2000,7 +2188,7 @@ mod tests {
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         restore_enabled_mobile_config(dir.path());
-        let (tok, router) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+        let (tok, router, _) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
         let restore_cap = cap_from_app_js(&router, "restore");
         let backup_cap = cap_from_app_js(&router, "backup");
         let jobs_cap = cap_from_app_js(&router, "mobileJobs");
@@ -2120,9 +2308,16 @@ mod tests {
             Arc::new(Mutex::new(())),
             Arc::new(isyncyou_webui::EventBus::new()),
         );
-        assert!(
-            run_mobile_job_recovery_once(&runtime),
-            "start recovery body should process queued mobile jobs"
+        let (jobs, truncated) = runtime
+            .mobile_worker_plan("me")
+            .expect("worker plan should list queued jobs");
+        assert!(!truncated);
+        assert_eq!(
+            jobs,
+            vec![(
+                "start-recovery-job".to_string(),
+                isyncyou_store::MobileJobKind::Backup
+            )]
         );
 
         let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
@@ -2130,16 +2325,7 @@ mod tests {
             .get_mobile_job("start-recovery-job")
             .unwrap()
             .expect("job remains recorded");
-        assert_eq!(
-            job.state,
-            isyncyou_store::MobileJobState::Failed,
-            "without cached tokens, recovery should run and fail redacted"
-        );
-        assert!(
-            !job.last_error.as_deref().unwrap_or("").is_empty(),
-            "failure should come from real worker path: {:?}",
-            job.last_error
-        );
+        assert_eq!(job.state, isyncyou_store::MobileJobState::Queued);
     }
 
     #[test]

@@ -18,6 +18,12 @@ object NativeEngine {
      */
     external fun nativeStart(filesDir: String): Int
 
+    /** Return the bounded recoverable mobile-job plan for WorkManager. */
+    external fun nativeMobileJobPlan(): String
+
+    /** Validate and execute one versioned WorkManager mobile-job request. */
+    external fun nativeRunMobileJob(requestJson: String): String
+
     /** The per-process session token held by trusted native callers, never by WebView JS. */
     external fun nativeSessionToken(): String
 
