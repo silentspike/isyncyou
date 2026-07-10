@@ -263,13 +263,22 @@ impl AgentAuditSink for StoreAgentAuditSink {
 fn agent_action_summary(action: &isyncyou_agent::ToolAction) -> String {
     let mut parts = vec![
         format!("op={}", action.op()),
-        format!("account={}", action.account()),
+        format!(
+            "account={}",
+            agent_ops::redact_agent_operation_text(action.account())
+        ),
     ];
     if let Some(service) = action.service() {
-        parts.push(format!("service={service}"));
+        parts.push(format!(
+            "service={}",
+            agent_ops::redact_agent_operation_text(service)
+        ));
     }
     if let Some(item) = action.item_or_target() {
-        parts.push(format!("item={item}"));
+        parts.push(format!(
+            "item={}",
+            agent_ops::redact_agent_operation_text(item)
+        ));
     }
     parts.join(" ")
 }
@@ -3296,6 +3305,56 @@ mod tests {
         assert!(!audit_text.contains(&token));
         assert!(!audit_text.contains("cap-secret"));
         assert!(!audit_text.contains("provider token leaked"));
+        assert!(audit_text.contains("execution_failed"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_restore_cloud_error_is_redacted_in_api_and_audit() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::err(
+            "restore failed for https://tenant.example/path?code=oauth-code and user@example.com",
+            order.clone(),
+        );
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-restore-redaction");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor),
+            Arc::new(audit.clone()),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "restore-cloud",
+            "account": "owner@example.com",
+            "service": "mail",
+            "id": "https://tenant.example/item?code=secret user@example.com"
+        }))
+        .unwrap();
+        let (pending, token) = agent
+            .pending
+            .register(action, "restore cloud", unix_now_ms(), AGENT_CONFIRM_TTL_MS)
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "restore-cloud failed: execution_failed");
+        assert!(!err.contains("tenant.example"));
+        assert!(!err.contains("user@example.com"));
+        let audit_text = serde_json::to_string(&audit.events()).unwrap();
+        assert!(!audit_text.contains("tenant.example"));
+        assert!(!audit_text.contains("owner@example.com"));
+        assert!(!audit_text.contains("user@example.com"));
+        assert!(!audit_text.contains("oauth-code"));
+        assert!(!audit_text.contains("restore failed for"));
+        assert!(audit_text.contains("<redacted-url>"));
+        assert!(audit_text.contains("<redacted-email>"));
         assert!(audit_text.contains("execution_failed"));
         let _ = std::fs::remove_dir_all(root);
     }

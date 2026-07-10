@@ -623,6 +623,13 @@ pub fn unsupported_cloud_restore_service_error(service: &str) -> String {
     )
 }
 
+pub fn cloud_restore_disabled_error() -> String {
+    "cloud restore is disabled (set restore.cloud_restore_enabled = true to \
+     opt in). It re-creates items in the cloud. Use `restore --to-local` to \
+     recover an archived body to a file instead."
+        .to_string()
+}
+
 /// Open the account's store and read one archived item's body bytes. Shared by the
 /// cloud restore and the (read-only) restore preview. Error messages are stable —
 /// the CLI tests assert on them.
@@ -667,12 +674,7 @@ pub fn restore_cloud(
     // a real mailbox. Recovering an archived body to a local file goes through a
     // different path and is never gated here.
     if !cfg.restore.cloud_restore_enabled {
-        return Err(
-            "cloud restore is disabled (set restore.cloud_restore_enabled = true to \
-             opt in). It re-creates items in the cloud. Use `restore --to-local` to \
-             recover an archived body to a file instead."
-                .to_string(),
-        );
+        return Err(cloud_restore_disabled_error());
     }
     if !RESTORE_SERVICES.contains(&service) {
         return Err(format!(

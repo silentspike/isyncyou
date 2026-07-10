@@ -311,6 +311,80 @@ fn backup_run_from_counts(c: isyncyou_engine::RefreshCounts) -> BackupRun {
     BackupRun { summary, delta }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreCloudRun {
+    service: String,
+    source_id: String,
+    new_id: String,
+}
+
+fn run_restore_cloud(
+    cfg: &Config,
+    account: &str,
+    service: &str,
+    id: &str,
+    gate: &Arc<Mutex<()>>,
+) -> Result<RestoreCloudRun, String> {
+    run_restore_cloud_with_runtime(cfg, account, service, id, gate, &LiveRestoreCloudRuntime)
+}
+
+trait RestoreCloudRuntime {
+    fn resolve_restore_token(&self, cfg: &Config, account: &str) -> Result<String, String>;
+    fn restore_cloud(
+        &self,
+        cfg: &Config,
+        account: &str,
+        service: &str,
+        id: &str,
+        token: String,
+    ) -> Result<String, String>;
+}
+
+struct LiveRestoreCloudRuntime;
+
+impl RestoreCloudRuntime for LiveRestoreCloudRuntime {
+    fn resolve_restore_token(&self, cfg: &Config, account: &str) -> Result<String, String> {
+        isyncyou_engine::auth::resolve_cached_restore_token(cfg, account)
+    }
+
+    fn restore_cloud(
+        &self,
+        cfg: &Config,
+        account: &str,
+        service: &str,
+        id: &str,
+        token: String,
+    ) -> Result<String, String> {
+        isyncyou_engine::restore_cloud(cfg, account, service, id, token)
+    }
+}
+
+fn run_restore_cloud_with_runtime<R: RestoreCloudRuntime>(
+    cfg: &Config,
+    account: &str,
+    service: &str,
+    id: &str,
+    gate: &Arc<Mutex<()>>,
+    runtime: &R,
+) -> Result<RestoreCloudRun, String> {
+    if !isyncyou_engine::cloud_restore_service_supported(service) {
+        return Err(isyncyou_engine::unsupported_cloud_restore_service_error(
+            service,
+        ));
+    }
+    if !cfg.restore.cloud_restore_enabled {
+        return Err(isyncyou_engine::cloud_restore_disabled_error());
+    }
+    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let token = runtime.resolve_restore_token(cfg, account)?;
+    let new_id = runtime.restore_cloud(cfg, account, service, id, token)?;
+    Ok(RestoreCloudRun {
+        service: service.to_string(),
+        source_id: id.to_string(),
+        new_id,
+    })
+}
+
 pub(crate) fn preview_for_pending_action(
     action: &isyncyou_agent::ToolAction,
 ) -> Result<PendingOperationPreview, String> {
@@ -815,6 +889,23 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
                     .to_string(),
                 ))
             }
+            isyncyou_agent::ToolAction::RestoreCloud {
+                account,
+                service,
+                id,
+            } => {
+                let run = run_restore_cloud(&self.cfg, account, service, id, &self.gate)?;
+                Ok(ConfirmedActionResult::new(
+                    serde_json::json!({
+                        "op": "restore-cloud",
+                        "account": redact_agent_operation_text(account),
+                        "service": run.service,
+                        "source_id": redact_agent_operation_text(&run.source_id),
+                        "new_id": redact_agent_operation_text(&run.new_id),
+                    })
+                    .to_string(),
+                ))
+            }
             _ => Err(format!(
                 "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
                 action.op()
@@ -931,6 +1022,64 @@ mod tests {
                 .push((status.to_string(), summary.to_string()));
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct RestoreCloudRuntimeState {
+        token_calls: usize,
+        restore_calls: Vec<(String, String, String, String, String)>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingRestoreCloudRuntime {
+        state: Arc<StdMutex<RestoreCloudRuntimeState>>,
+        token_result: Result<String, String>,
+        restore_result: Result<String, String>,
+    }
+
+    impl RecordingRestoreCloudRuntime {
+        fn new(new_id: &str) -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(RestoreCloudRuntimeState::default())),
+                token_result: Ok("restore-token".to_string()),
+                restore_result: Ok(new_id.to_string()),
+            }
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, RestoreCloudRuntimeState> {
+            self.state.lock().unwrap()
+        }
+    }
+
+    impl RestoreCloudRuntime for RecordingRestoreCloudRuntime {
+        fn resolve_restore_token(&self, _cfg: &Config, _account: &str) -> Result<String, String> {
+            self.state.lock().unwrap().token_calls += 1;
+            self.token_result.clone()
+        }
+
+        fn restore_cloud(
+            &self,
+            _cfg: &Config,
+            account: &str,
+            service: &str,
+            id: &str,
+            token: String,
+        ) -> Result<String, String> {
+            self.state.lock().unwrap().restore_calls.push((
+                account.to_string(),
+                service.to_string(),
+                id.to_string(),
+                token,
+                self.restore_result.clone().unwrap_or_default(),
+            ));
+            self.restore_result.clone()
+        }
+    }
+
+    fn restore_enabled_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.restore.cloud_restore_enabled = true;
+        cfg
     }
 
     #[test]
@@ -1078,5 +1227,62 @@ mod tests {
                 onenote: false,
             }]
         );
+    }
+
+    #[test]
+    fn agent_restore_cloud_confirm_routes_to_ledger_restore() {
+        let cfg = restore_enabled_config();
+        let gate = Arc::new(Mutex::new(()));
+        let runtime = RecordingRestoreCloudRuntime::new("new-cloud-id");
+
+        let run = run_restore_cloud_with_runtime(&cfg, "me", "mail", "source-id", &gate, &runtime)
+            .unwrap();
+
+        assert_eq!(run.service, "mail");
+        assert_eq!(run.source_id, "source-id");
+        assert_eq!(run.new_id, "new-cloud-id");
+        let state = runtime.state();
+        assert_eq!(state.token_calls, 1);
+        assert_eq!(
+            state.restore_calls,
+            vec![(
+                "me".to_string(),
+                "mail".to_string(),
+                "source-id".to_string(),
+                "restore-token".to_string(),
+                "new-cloud-id".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_restore_cloud_disabled_refuses_before_token_lookup() {
+        let cfg = Config::default();
+        let gate = Arc::new(Mutex::new(()));
+        let runtime = RecordingRestoreCloudRuntime::new("new-cloud-id");
+
+        let err = run_restore_cloud_with_runtime(&cfg, "me", "mail", "source-id", &gate, &runtime)
+            .unwrap_err();
+
+        assert!(err.contains("cloud restore is disabled"));
+        let state = runtime.state();
+        assert_eq!(state.token_calls, 0);
+        assert!(state.restore_calls.is_empty());
+    }
+
+    #[test]
+    fn agent_restore_cloud_unsupported_service_refuses_before_token_lookup() {
+        let cfg = restore_enabled_config();
+        let gate = Arc::new(Mutex::new(()));
+        let runtime = RecordingRestoreCloudRuntime::new("new-cloud-id");
+
+        let err =
+            run_restore_cloud_with_runtime(&cfg, "me", "onedrive", "source-id", &gate, &runtime)
+                .unwrap_err();
+
+        assert!(err.contains("not crash-safe yet"));
+        let state = runtime.state();
+        assert_eq!(state.token_calls, 0);
+        assert!(state.restore_calls.is_empty());
     }
 }
