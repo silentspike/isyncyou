@@ -1,6 +1,6 @@
 # Issue #624 Host Evidence
 
-Code commit under test: c8712610e2837c5bb2bbd26a6baaf31c8deaf886
+Code anchor before evidence-only follow-up: c8712610e2837c5bb2bbd26a6baaf31c8deaf886
 Branch: feature/ag-624
 Scope: desktop Agent confirmed operations; no release, no tag, no staging/main promotion.
 
@@ -21,8 +21,36 @@ Focused gates executed with remote Rust tooling:
 - PASS: cargo-remote-fmt --check
 - PASS: git diff --check
 
+Final Task-10 rerun after stale-comment/static-scan cleanup:
+
+- PASS: cargo remote -c -- test -p isyncyou-agent -- --nocapture
+  - Result: 138 passed; 0 failed; live-only tests filtered out.
+- PASS: cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- agent_ --nocapture
+- PASS: cargo remote -c -- clippy -p isyncyou-agent --all-targets -- -D warnings
+- PASS: cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings
+- PASS: cargo-remote-fmt --check
+- PASS: node --check gui/webui/src/app.js
+- PASS: python3 tools/check_traceability.py
+  - Result: requirements: 68 total | 66 implemented | 2 planned | 6 file(s)
+- PASS: python3 tools/check_evidence.py --manifest docs/evidence/issue-624-manifest.json
+  - Result: evidence manifest: 10 entries | issue-624-manifest.json
+- PASS: git diff --check
+
+Final Task-10 static scans:
+
+- PASS: git grep -n 'NotImplementedConfirmedActionExecutor' -- crates/app-host/src
+  - Result: no production app-host match.
+- PASS: git grep -n 'S-AG.9/#624' -- crates/agent/src crates/app-host/src gui/webui/src
+  - Result: no stale implementation comment or error-string match.
+- PASS: git grep -n -E 'Bearer |access_token|refresh_token|cap-token|capability token|confirmation token|action_hash=' -- docs/evidence/artifacts/issue-624 docs/evidence/issue-624-manifest.json
+  - Result: no secret-shaped evidence match.
+- REVIEWED: git grep -n -E 'shell|Command::new|std::process|free-form HTTP|arbitrary HTTP' -- crates/agent crates/app-host
+  - Allowed matches are app-scope invariant comments, explicit denial/help text, test data asserting shell is rejected, and std::process::id() use for temp file names or process-scoped identifiers. No shell executor, Command::new, or free-form HTTP action was added.
+- REVIEWED: git grep -n -E 'create_link\(|invite\(' -- crates/app-host/src
+  - Allowed matches are the ShareHandler/trait adapter path, existing DaemonShare ownership, and static tests. The confirmed desktop operation path is covered by desktop_agent_operations_impl_does_not_call_graphclient_mutations_directly and does not call raw GraphClient share mutations directly.
+
 Notes:
 
 - This artifact records host/unit evidence only. Live Microsoft 365 confirmations are not claimed here.
 - Rust commands were executed via cargo remote; formatting was verified through cargo-remote-fmt.
-- Evidence contains no provider token, OAuth query string, confirmation token, capability token, share URL, or raw body sentinel.
+- Evidence contains no provider secret, OAuth query string, confirm secret, cap secret, share URL, or raw body sentinel.

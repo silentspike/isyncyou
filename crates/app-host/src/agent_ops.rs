@@ -1827,7 +1827,7 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
                 ))
             }
             _ => Err(format!(
-                "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
+                "not_confirmable: confirmed agent action '{}' is not a supported desktop operation",
                 action.op()
             )),
         }
