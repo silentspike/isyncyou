@@ -286,3 +286,29 @@ requirements:
       - file: docs/evidence/artifacts/issue-622/agent-ui-smoke.json
       - file: docs/evidence/artifacts/issue-622/desktop-assistant.png
       - file: docs/evidence/artifacts/issue-622/mobile-assistant.png
+  - id: REQ-AGENT-012
+    title: Confirmed desktop Agent operations reuse existing M365 runtime paths
+    statement: >
+      On desktop, restore-local runs as a controlled local restore, while backup,
+      restore-cloud, live-write, and share execute only after a valid PendingAction
+      confirmation. Confirmed operations reuse the existing daemon, engine, writer,
+      store, and ledger-backed M365 paths; mobile destructive Agent execution remains
+      disabled until the mobile security/job stories land. (S-AG.9, #624)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - RestoreLocal writes archived bytes only under a controlled restore root.
+      - Destructive operations do not run before one-time confirmation.
+      - Confirmed backup, restore-cloud, live-write, and share route through existing app-host/engine runtime paths.
+      - Mobile destructive Agent confirmation fails closed for #624.
+      - Audit/API/evidence summaries are redacted and do not contain raw bodies, share URLs, OAuth material, or provider tokens.
+    verified_by:
+      - test: restore_local_writes_archived_body_to_controlled_restore_root
+      - test: agent_backup_confirm_runs_refresh_cache_and_records_backup_run
+      - test: agent_restore_cloud_confirm_routes_to_ledger_restore
+      - test: agent_live_write_mail_set_read_routes_existing_writer
+      - test: agent_share_link_confirm_routes_through_ledger_handler
+      - test: agent_confirm_mobile_policy_refuses_before_mutation
+      - test: agent_confirm_revalidates_action_before_execution
+      - test: agent_confirm_result_summary_is_json_and_redacted
+      - file: docs/evidence/issue-624-manifest.json

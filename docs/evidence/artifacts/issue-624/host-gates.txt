@@ -1,0 +1,28 @@
+# Issue #624 Host Evidence
+
+Code commit under test: c8712610e2837c5bb2bbd26a6baaf31c8deaf886
+Branch: feature/ag-624
+Scope: desktop Agent confirmed operations; no release, no tag, no staging/main promotion.
+
+Focused gates executed with remote Rust tooling:
+
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers restore_local -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_backup_ -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-engine restore_cloud -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_restore_cloud -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-agent share -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_share -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-engine share -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-webui share -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_live_write -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers desktop_agent_operations_impl_does_not_call_graphclient_mutations_directly -- --nocapture
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_confirm_ -- --nocapture
+- PASS: cargo remote -c -- clippy -p isyncyou-app-host --features agent-oauth-providers --all-targets -- -D warnings
+- PASS: cargo-remote-fmt --check
+- PASS: git diff --check
+
+Notes:
+
+- This artifact records host/unit evidence only. Live Microsoft 365 confirmations are not claimed here.
+- Rust commands were executed via cargo remote; formatting was verified through cargo-remote-fmt.
+- Evidence contains no provider token, OAuth query string, confirmation token, capability token, share URL, or raw body sentinel.
