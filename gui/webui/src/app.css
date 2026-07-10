@@ -61,6 +61,7 @@
   --svc-contacts: #3fb950;
   --svc-todo: #d29922;
   --svc-onenote: #a371f7;
+  --svc-assistant: #8b8cf6;
   --svc-shared: #768390;
 
   /* typography — embedded Inter variable */
@@ -1071,6 +1072,14 @@ a.note-meta-chip:hover { color: var(--accent); }
   .nav-item.active::before { display: none; }
   .view { padding: var(--sp-4); padding-bottom: 76px; }
   .view-title { font-size: var(--fs-xl); }
+  .assistant-view { min-height: calc(100dvh - 76px - (2 * var(--sp-4))); }
+  .assistant-body { min-height: auto; }
+  .assistant-toolbar { gap: var(--sp-1); margin-bottom: var(--sp-2); }
+  .assistant-transcript { flex: none; min-height: 220px; overflow: visible; padding-bottom: 5.5rem; }
+  .assistant-pending-host { padding-bottom: 5.5rem; }
+  .assistant-message .asst-bubble { max-width: 92%; }
+  .assistant-composer { position: static; bottom: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .asst-inputrow { align-items: flex-end; }
   /* the topbar (route name + global-search + settings) duplicates the per-view
      content + bottom nav on a phone — hide it. Settings is reachable from the
      Overview tab's Settings button; each view has its own search. */
@@ -1286,6 +1295,269 @@ a.note-meta-chip:hover { color: var(--accent); }
 }
 /* movement is touch-drag (mobile) or ← → (desktop); fire is automatic */
 
+/* ── Assistant shell ─────────────────────────────────────────────────────── */
+.assistant-view {
+  display: flex;
+  flex-direction: column;
+  min-height: min(760px, calc(100dvh - var(--topbar-h) - (2 * var(--sp-5))));
+}
+.assistant-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+.assistant-loading {
+  width: min(36rem, 100%);
+  margin: var(--sp-4) auto;
+  padding: var(--sp-4);
+}
+.assistant-setup {
+  width: min(36rem, 100%);
+  margin: var(--sp-4) auto;
+  text-align: center;
+  padding: var(--sp-6) var(--sp-5);
+}
+.assistant-setup-icon {
+  width: 56px; height: 56px; border-radius: var(--r-lg);
+  margin: 0 auto var(--sp-4);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent-2);
+  background: color-mix(in oklab, var(--accent) 12%, var(--bg-2));
+  border: 1px solid var(--accent-line);
+}
+.assistant-setup-copy {
+  line-height: 1.55;
+  margin: 0 auto var(--sp-4);
+  max-width: 29rem;
+}
+.assistant-setup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: min(21rem, 100%);
+  margin: 0 auto;
+}
+.assistant-setup-note {
+  margin-top: var(--sp-4);
+  font-size: var(--fs-sm);
+}
+.assistant-consent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  width: min(31rem, 100%);
+  margin: var(--sp-4) auto;
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+  text-align: left;
+}
+.assistant-consent-text p {
+  margin-top: var(--sp-1);
+  line-height: 1.45;
+}
+.assistant-consent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.assistant-setup-locked {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: min(31rem, 100%);
+  margin: var(--sp-3) auto 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  color: var(--text-mid);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.assistant-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  width: min(46rem, 100%);
+  margin: var(--sp-1) auto var(--sp-3);
+}
+.assistant-usage .icon { width: 13px; height: 13px; }
+.assistant-transcript {
+  flex: 1;
+  min-height: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  width: min(46rem, 100%);
+  margin: 0 auto;
+  overflow-y: auto;
+  padding-bottom: var(--sp-3);
+}
+.assistant-pending-host {
+  width: min(46rem, 100%);
+  margin: 0 auto;
+}
+.assistant-message {
+  display: flex;
+  min-width: 0;
+}
+.assistant-message.user {
+  justify-content: flex-end;
+}
+.assistant-message .asst-bubble {
+  max-width: min(82%, 42rem);
+  padding: .7rem .9rem;
+}
+.assistant-message.user .asst-bubble {
+  background: color-mix(in oklab, var(--accent) 24%, var(--bg-2));
+  color: var(--text-hi);
+  border-color: var(--accent-line);
+}
+.asst-tool-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+  font-size: var(--fs-sm);
+}
+.asst-tool-title {
+  font-weight: 650;
+}
+.asst-tool-detail {
+  min-width: 0;
+  color: var(--text-mid);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asst-tool-boundary {
+  margin-left: auto;
+}
+.asst-inline-error {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-2);
+  border: 1px solid color-mix(in oklab, var(--err) 35%, transparent);
+  border-radius: var(--r-md);
+  background: var(--err-soft);
+  color: var(--text-hi);
+  font-size: var(--fs-sm);
+}
+.asst-pending-card {
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid color-mix(in oklab, var(--warn) 38%, transparent);
+  border-radius: var(--r-md);
+  background: var(--warn-soft);
+}
+.asst-pending-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-weight: 650;
+}
+.asst-pending-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.asst-pending-meta {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-sm);
+}
+.asst-pending-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.asst-pending-card.confirmed {
+  border-color: color-mix(in oklab, var(--ok) 35%, transparent);
+  background: var(--ok-soft);
+}
+.asst-pending-card.cancelled,
+.asst-pending-card.expired {
+  background: var(--bg-2);
+}
+.asst-pending-card.error {
+  border-color: color-mix(in oklab, var(--err) 35%, transparent);
+  background: var(--err-soft);
+}
+.asst-pending-result,
+.asst-pending-error {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+.asst-pending-error {
+  color: var(--text-hi);
+}
+.asst-citations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.asst-citation {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--bg-2);
+  color: var(--text-mid);
+  font-size: var(--fs-sm);
+  text-decoration: none;
+}
+.asst-citation:hover {
+  color: var(--text-hi);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  text-decoration: none;
+}
+.asst-citation span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.assistant-composer {
+  position: sticky;
+  bottom: 0;
+  width: min(46rem, 100%);
+  margin: 0 auto;
+  padding: var(--sp-2) 0 0;
+  background: linear-gradient(180deg, transparent, var(--bg-0) 32%);
+}
+.asst-inputrow {
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+}
+.assistant-input {
+  flex: 1;
+  resize: none;
+  min-height: 46px;
+  max-height: 160px;
+}
+.assistant-composer-note {
+  font-size: var(--fs-sm);
+  padding-bottom: var(--sp-1);
+}
+
 /* ── Assistant model picker: in-UI dropdown with spring unfold ───────────── */
 .mdl { position: relative; display: inline-block; }
 .mdl-trigger {
@@ -1316,7 +1588,9 @@ a.note-meta-chip:hover { color: var(--accent); }
 }
 .mdl-item {
   display: flex; align-items: center; gap: var(--sp-2);
+  width: 100%; border: 0; text-align: left;
   padding: 8px 9px; border-radius: var(--r-md);
+  background: transparent;
   color: var(--text-mid); font-size: var(--fs-base); cursor: pointer;
   transition: background .13s, color .13s;
 }

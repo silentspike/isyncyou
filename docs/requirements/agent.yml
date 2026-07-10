@@ -230,3 +230,33 @@ requirements:
       - file: android/app/src/test/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStorePolicyTest.kt
       - file: android/app/src/androidTest/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStoreInstrumentedTest.kt
       - file: docs/evidence/artifacts/issue-620/android-keystore.json
+  - id: REQ-AGENT-011
+    title: Assistant UI streams answers, cites sources, and gates destructive actions
+    statement: >
+      The WebUI Assistant tab is available on desktop and mobile when the agent
+      capability is enabled. It streams typed AgentStreamHub events into a
+      transcript, renders source-ID citations as same-origin item links, renders
+      confirmation_required events as PendingAction cards whose Confirm request
+      includes the one-time token and action_hash, exposes model and usage
+      status, and requires explicit provider-egress consent before setup or use.
+      (S-AG.7, #622)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Assistant appears in desktop and mobile primary navigation only when the agent capability is enabled.
+      - Streaming token, tool, result, search, pending, error, and done events render as typed UI rows without external WebView network requests.
+      - Source citations are source-ID based and same-origin clickable.
+      - PendingAction cards are the only UI path to destructive confirmation, and Confirm posts pending/token/action_hash exactly once after the user clicks.
+      - Setup requires explicit provider-egress consent and stores no secrets in browser storage.
+      - Model selection is status-driven, and the usage chip is honest when usage data is unavailable.
+    verified_by:
+      - test: assistant_nav_is_services_entry_and_cap_gated
+      - test: assistant_stream_renderer_handles_full_event_contract
+      - test: assistant_citations_are_typed_same_origin_and_deduped
+      - test: assistant_pending_action_cards_post_confirm_cancel_without_dom_secrets
+      - test: assistant_model_picker_and_usage_chip_are_status_driven
+      - test: assistant_setup_consent_is_required_and_non_secret
+      - file: tools/agent-ui-smoke.mjs
+      - file: docs/evidence/artifacts/issue-622/agent-ui-smoke.json
+      - file: docs/evidence/artifacts/issue-622/desktop-assistant.png
+      - file: docs/evidence/artifacts/issue-622/mobile-assistant.png

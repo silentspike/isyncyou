@@ -8467,6 +8467,262 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_nav_is_services_entry_and_cap_gated() {
+        for needle in [
+            "{ id: \"assistant\", label: \"Assistant\", icon: \"sparkles\", cap: \"agent\", appOnly: true }",
+            "const serviceVisible = (s) => !s.cap || !!CAP[s.cap];",
+            "const visibleServices = () => SERVICES.filter(serviceVisible);",
+            "const archiveServices = () => SERVICES.filter(s => !s.appOnly);",
+            "visibleServices().map(s => {",
+            "const routeLabel = (r) => (visibleServices().find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || \"iSyncYou\";",
+            "if (!visibleServices().find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = \"overview\";",
+            "archiveServices().forEach(s => {",
+            "...visibleServices().map(s => ({ label: \"Go to \" + s.label",
+            "const order = visibleServices().map((s) => s.id);",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 assistant nav invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("id: \"nav-assistant\""),
+            "Assistant must be a primary SERVICES tab, not a separate System nav button"
+        );
+        assert!(
+            !APP_JS.contains("assistant: \"Assistant\""),
+            "Assistant must not remain an EXTRA_ROUTES bypass around the capability gate"
+        );
+    }
+
+    #[test]
+    fn assistant_stream_renderer_handles_full_event_contract() {
+        for needle in [
+            "function handleAgentEvent(message, turnState)",
+            "case \"token\":",
+            "case \"tool_call\":",
+            "case \"tool_result\":",
+            "case \"search_stage\":",
+            "case \"partial_result\":",
+            "case \"confirmation_required\":",
+            "case \"error\":",
+            "case \"done\":",
+            "AssistantState.pendingCardsById.set(pending.pending_id",
+            "token: d.token || \"\"",
+            "action_hash: d.action_hash || \"\"",
+            "renderAgentPendingCard(pending)",
+            "renderAgentToolRow(row)",
+            "renderAgentError(message)",
+            "Invalid stream payload",
+            "handleAgentEvent(d, turnState);",
+            "handleAgentEvent({ event: \"done\", reason: \"complete\" }, turnState)",
+            "reason === \"pending_confirmation\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 stream renderer invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("case \"tool_call\": break"),
+            "tool_call events must render a compact row, not be ignored"
+        );
+        assert!(
+            !APP_JS.contains("case \"confirmation_required\": addChip"),
+            "confirmation_required must render/store a PendingAction placeholder, not a text chip"
+        );
+        let start = APP_JS
+            .find("function agentCompactValue")
+            .expect("assistant stream renderer start");
+        let end = APP_JS
+            .find("function agentKeydown")
+            .expect("assistant stream renderer end");
+        let assistant_renderer = &APP_JS[start..end];
+        assert!(
+            !assistant_renderer.contains("innerHTML"),
+            "Assistant stream renderer helpers must keep event content text-only"
+        );
+    }
+
+    #[test]
+    fn assistant_citations_are_typed_same_origin_and_deduped() {
+        for needle in [
+            "function normalizeAgentSource(value)",
+            "function extractAgentSources(event)",
+            "function sourceViewHref(source)",
+            "function renderAgentCitation(source)",
+            "function renderAgentCitationBar(sources)",
+            "function dedupeAgentSources(sources)",
+            "return JSON.stringify([source.service, source.id || \"\", source.path || \"\"]);",
+            "if (event.event === \"partial_result\") visit(event.items || [], 0);",
+            "else if (event.event === \"tool_result\" && typeof event.content === \"string\")",
+            "try { visit(JSON.parse(event.content), 0); } catch (_) {}",
+            "return q ? \"/api/v1/view?\" + qs(q) : null;",
+            "\"data-agent-citation\": \"view\"",
+            "\"data-agent-citation\": \"route\"",
+            "turnState.addCitations(extractAgentSources(d));",
+            "if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 citation invariant: {needle}"
+            );
+        }
+        let start = APP_JS
+            .find("function normalizeAgentSource")
+            .expect("citation helper start");
+        let end = APP_JS
+            .find("function asstResultCard")
+            .expect("citation helper end");
+        let citation_helpers = &APP_JS[start..end];
+        assert!(
+            !citation_helpers.contains("http://") && !citation_helpers.contains("https://"),
+            "Assistant citation helpers must not introduce external citation URLs"
+        );
+        assert!(
+            !citation_helpers.contains("innerHTML"),
+            "Assistant citation helpers must render text-only DOM"
+        );
+        assert!(
+            !citation_helpers.contains("token") && !citation_helpers.contains("action_hash"),
+            "Assistant citation helpers must not inspect pending secrets"
+        );
+    }
+
+    #[test]
+    fn assistant_pending_action_cards_post_confirm_cancel_without_dom_secrets() {
+        for needle in [
+            "function confirmAgentPending(pendingId)",
+            "function cancelAgentPending(pendingId)",
+            "function renderAgentPendingCard(pending)",
+            "AssistantState.pendingCardsById.set(pending.pending_id",
+            "token: d.token || \"\"",
+            "action_hash: d.action_hash || \"\"",
+            "post(\"/api/v1/agent/confirm?\" + qs({ pending: pendingId, token: record.token, action_hash: record.action_hash }), CAP.agent)",
+            "post(\"/api/v1/agent/cancel?\" + qs({ turn }), CAP.agent)",
+            "record.status = \"confirming\"",
+            "record.status = \"confirmed\"",
+            "record.status = \"cancelling\"",
+            "record.status = \"cancelled\"",
+            "pending.status = \"expired\"",
+            "record.status = \"error\"",
+            "confirm.setAttribute(\"disabled\", \"disabled\")",
+            "cancel.setAttribute(\"disabled\", \"disabled\")",
+            "\"data-agent-pending-confirm\": pending.pending_id || \"\"",
+            "\"data-agent-pending-cancel\": pending.pending_id || \"\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 PendingAction invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.to_lowercase().contains("run anyway")
+                && !APP_JS.to_lowercase().contains("run-anyway"),
+            "Assistant must not expose a run-anyway bypass"
+        );
+        let start = APP_JS
+            .find("function renderAgentPendingCard")
+            .expect("pending renderer start");
+        let end = APP_JS
+            .find("function renderAssistantMessage")
+            .expect("pending renderer end");
+        let pending_renderer = &APP_JS[start..end];
+        assert!(
+            !pending_renderer.contains("token")
+                && !pending_renderer.contains("action_hash")
+                && !pending_renderer.contains("localStorage")
+                && !pending_renderer.contains("sessionStorage"),
+            "PendingAction renderer must not expose or persist secrets"
+        );
+    }
+
+    #[test]
+    fn assistant_model_picker_and_usage_chip_are_status_driven() {
+        for needle in [
+            "function renderAssistantUsageChip(st)",
+            "Usage unavailable",
+            "if (usage.request_id) parts.push(\"Request \" + agentCompactValue(usage.request_id, 28));",
+            "if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);",
+            "if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);",
+            "function agentProviderLabel(provider)",
+            "if (provider === \"claude\") return \"Claude\";",
+            "if (provider === \"codex\") return \"ChatGPT\";",
+            "if (provider === \"openai\") return \"OpenAI\";",
+            "const list = models[prov] || [];",
+            "if (!connected || !list.length) return;",
+            "\"data-agent-model-option\": val",
+            "\"data-agent-model-connect\": \"codex\"",
+            "await post(\"/api/v1/agent/model?\" + qs({ provider, model }), CAP.agent);",
+            "const st = await api(\"/api/v1/agent/status\");",
+            "rememberAssistantStatus(st);",
+            "renderAssistantView($(\"#view\"));",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 model/usage invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("request_id:") && !APP_JS.contains("rate_limit: \"ok\""),
+            "production UI must not fabricate usage fields"
+        );
+    }
+
+    #[test]
+    fn assistant_setup_consent_is_required_and_non_secret() {
+        for needle in [
+            "const AGENT_PRIVACY_CONSENT_KEY = \"isy_agent_privacy_consent_v1\";",
+            "const AGENT_PRIVACY_CONSENT_VERSION = 1;",
+            "function agentPrivacyConsentAccepted(provider)",
+            "function acceptAgentPrivacyConsent(provider)",
+            "version: AGENT_PRIVACY_CONSENT_VERSION",
+            "accepted: true",
+            "provider: agentProviderConsentId(provider)",
+            "timestamp: new Date().toISOString()",
+            "localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record))",
+            "function renderAssistantConsentPanel(providers)",
+            "\"data-agent-consent\": \"1\"",
+            "\"data-agent-consent-accept\": provider",
+            "\"data-agent-consent-reset\": \"1\"",
+            "function renderAssistantByoKeyUnavailable()",
+            "\"data-agent-byo-key\": \"unavailable\"",
+            "if (!agentPrivacyConsentAccepted(consentProvider))",
+            "if (!agentPrivacyConsentAccepted(provider))",
+            "if (!agentPrivacyConsentAccepted(\"codex\"))",
+            "if (!agentPrivacyConsentAccepted(provider)) {",
+            "Review privacy consent first",
+            "renderAssistantConsentPanel([provider])",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #622 setup-consent invariant: {needle}"
+            );
+        }
+        let start = APP_JS
+            .find("const AGENT_PRIVACY_CONSENT_KEY")
+            .expect("consent helper start");
+        let end = APP_JS
+            .find("async function renderAssistantView")
+            .expect("consent helper end");
+        let consent_helpers = &APP_JS[start..end];
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "session_token",
+            "confirmation",
+            "m365",
+            "type: \"password\"",
+            "type=\"password\"",
+        ] {
+            assert!(
+                !consent_helpers.to_lowercase().contains(forbidden),
+                "consent helpers must not store/capture secret/content field: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn app_js_biometric_labels_cover_onedrive_risk_ops() {
         for needle in [
             "\"move-out-of-protected\"",

@@ -1,0 +1,93 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-09T22:22:41+02:00",
+  "commit": "fa6f8283f8ca20860579a4b6d96aa4cdc0d25438",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-011",
+      "claim": "The Assistant tab is a capability-gated primary navigation service and direct routing is blocked when CAP.agent is absent.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_nav_is_services_entry_and_cap_gated -- --nocapture",
+      "result": "pass",
+      "test": "assistant_nav_is_services_entry_and_cap_gated",
+      "evidence": "Static APP_JS test passed during Task 1, proving Assistant is a SERVICES entry gated by cap: agent, the old System-nav button is gone, and visibleServices() drives route validation and nav rendering.",
+      "artifact": "docs/evidence/artifacts/issue-622/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-011",
+      "claim": "The Assistant stream renderer handles the full #621 typed event contract and keeps untrusted event content text-only.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_stream_renderer_handles_full_event_contract -- --nocapture",
+      "result": "pass",
+      "test": "assistant_stream_renderer_handles_full_event_contract",
+      "evidence": "Static APP_JS test passed during Task 3, covering token, tool_call, tool_result, search_stage, partial_result, confirmation_required, error, and done dispatch through handleAgentEvent without direct innerHTML rendering.",
+      "artifact": "docs/evidence/artifacts/issue-622/host-gates.txt"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-011",
+      "claim": "Assistant citations are extracted only from typed source-bearing results, deduped by service/id/path, and rendered as same-origin /api/v1/view links or in-app route fallbacks.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_citations_are_typed_same_origin_and_deduped -- --nocapture",
+      "result": "pass",
+      "test": "assistant_citations_are_typed_same_origin_and_deduped",
+      "evidence": "Static citation test passed during Task 4 and the Playwright smoke clicked a same-origin citation popup for /api/v1/view?account=fixture&service=mail&id=mail-1.",
+      "artifact": "docs/evidence/artifacts/issue-622/stream-citations.png"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-011",
+      "claim": "PendingAction cards keep token/action_hash out of the DOM while Confirm posts pending/token/action_hash exactly once and Cancel posts the separate turn id.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_pending_action_cards_post_confirm_cancel_without_dom_secrets -- --nocapture",
+      "result": "pass",
+      "test": "assistant_pending_action_cards_post_confirm_cancel_without_dom_secrets",
+      "evidence": "Static PendingAction test passed during Task 5. The smoke JSON records no confirm before click, one confirm POST with pending/token/action_hash, one cancel POST for turn-3, and DOM exclusion of fixture token/hash sentinels.",
+      "artifact": "docs/evidence/artifacts/issue-622/pending-confirm.png"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-011",
+      "claim": "The model picker is driven by /api/v1/agent/status, only switches after a successful POST, and the usage chip honestly reports unavailable when no usage exists.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_model_picker_and_usage_chip_are_status_driven -- --nocapture",
+      "result": "pass",
+      "test": "assistant_model_picker_and_usage_chip_are_status_driven",
+      "evidence": "Static model/usage test passed during Task 6. The smoke JSON records a POST to /api/v1/agent/model?provider=claude&model=claude-opus-4 and a visible Usage unavailable chip.",
+      "artifact": "docs/evidence/artifacts/issue-622/agent-ui-smoke.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-011",
+      "claim": "Assistant setup and use require explicit provider-egress consent, store only a non-secret versioned consent record, and keep BYO-key setup unavailable without encrypted credential support.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_setup_consent_is_required_and_non_secret -- --nocapture",
+      "result": "pass",
+      "test": "assistant_setup_consent_is_required_and_non_secret",
+      "evidence": "Static consent test passed during Task 7/8. The smoke records consent localStorage with version/accepted/provider/timestamp only, disabled setup before consent, same-origin oauth-start fixture POST, and no editable BYO secret input.",
+      "artifact": "docs/evidence/artifacts/issue-622/setup-consent.png"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-011",
+      "claim": "The deterministic Playwright smoke proves desktop/mobile Assistant visibility, stream/citation rendering, PendingAction confirm/cancel, model/usage UI, setup consent, no console/page errors, and no non-fixture-origin WebView network.",
+      "method": "command",
+      "command": "npm run agent-ui-smoke",
+      "result": "pass",
+      "evidence": "agent-ui-smoke.json reports ok=true, 28 assertions, console_errors=[], page_errors=[], non_fixture_origin_requests=[], fixture404=[], and stream scenarios normal, pending-confirm, pending-cancel, and error.",
+      "artifact": "docs/evidence/artifacts/issue-622/agent-ui-smoke.json"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-011",
+      "claim": "The #622 task-level host gates passed for JavaScript syntax, smoke syntax, whitespace, and the focused consent regression after the smoke-found layout/null-rendering fixes.",
+      "method": "command",
+      "command": "node --check gui/webui/src/app.js && node --check tools/agent-ui-smoke.mjs && git diff --check && cargo +1.95.0 test -p isyncyou-webui assistant_setup_consent_is_required_and_non_secret -- --nocapture",
+      "result": "pass",
+      "evidence": "The post-fix Task 8 verification commands passed, and screenshots were regenerated from the final smoke run.",
+      "artifact": "docs/evidence/artifacts/issue-622/host-gates.txt"
+    }
+  ]
+}
