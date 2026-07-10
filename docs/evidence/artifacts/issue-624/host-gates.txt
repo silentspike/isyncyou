@@ -68,3 +68,24 @@ Notes:
 - Backup and RestoreCloud live confirmations are not claimed here; they remain covered by host/unit evidence unless separately executed.
 - Rust commands were executed via cargo remote; formatting was verified through cargo-remote-fmt.
 - Evidence contains no provider secret, OAuth query string, confirm secret, cap secret, share URL, or raw body sentinel.
+
+Task-13 live-matrix gap closure attempt:
+
+- Code anchor before Task-13 edits: 5ff2bfd5fc4efac98ab5818cc141278e167aaa0f
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers live_issue_624_agent_confirm_ --no-run
+  - Purpose: compile-check all ignored live #624 Agent confirmation probes, including the newly added Backup and RestoreCloud probes.
+  - Covered at build time:
+    - live_issue_624_agent_confirm_create_draft_and_cleanup
+    - live_issue_624_agent_confirm_share_link_and_cleanup
+    - live_issue_624_agent_confirm_backup_mail_records_run
+    - live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup
+- BLOCKED: executing the Backup and RestoreCloud live probes in this shell.
+  - ISY624_M365_WRITE_TOKEN_FILE=unset.
+  - ISY624_M365_WRITE_TOKEN=unset.
+  - ISY624_M365_DRAFT_TO=unset.
+  - No local #624 Microsoft 365 token seed file was found in checked config/tmp/workspace locations.
+- Required unblock command shape:
+  cargo remote -b ISY624_M365_WRITE_TOKEN=<redacted> -c -- test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_
+- Interpretation:
+  - Do not claim Backup or RestoreCloud live AC completion from this Task-13 session.
+  - The missing live probes now exist and build; they still need a controlled Microsoft 365 token run and refreshed redacted evidence.

@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-07-10T14:25:42+02:00",
+  "generated_at": "2026-07-10T15:10:55+02:00",
   "branch": "feature/ag-624",
-  "code_commit": "407095875b821282988ee21485c77dfe08756429",
+  "code_commit": "5ff2bfd5fc4efac98ab5818cc141278e167aaa0f",
   "scope": "ignored live Microsoft 365 probes for #624 Agent PendingAction confirmation",
   "token_handling": {
     "source": "~/.config/m365-write/token_cache.json via local MSAL silent acquisition",
@@ -46,8 +46,45 @@
     }
   ],
   "not_claimed_live": [
-    "Backup live confirmation was not rerun in this Task-11 pass; host/unit evidence remains the proof for backup.",
-    "RestoreCloud live confirmation was not rerun in this Task-11 pass; host/unit evidence remains the proof for restore-cloud.",
+    "Backup live confirmation was not run in this session. A live ignored probe now exists and compile-checks, but ISY624_M365_WRITE_TOKEN_FILE and ISY624_M365_WRITE_TOKEN were unset.",
+    "RestoreCloud live confirmation was not run in this session. A live ignored probe now exists and compile-checks, but ISY624_M365_WRITE_TOKEN_FILE and ISY624_M365_WRITE_TOKEN were unset.",
     "RestoreLocal live proof remains host-fixture based; no personal restored content is recorded."
+  ],
+  "additional_harnesses_added_after_task_11": [
+    {
+      "operation": "backup",
+      "service": "mail",
+      "test": "live_issue_624_agent_confirm_backup_mail_records_run",
+      "build_status": "pass",
+      "live_status": "blocked_missing_token_seed",
+      "proof_when_seeded": [
+        "TestProviderScript emits a destructive backup action.",
+        "Public tool_call input is redacted before PendingAction registration.",
+        "AgentHandler::confirm executes through DesktopAgentOperations.",
+        "The shared backup runner performs a real mail refresh using cached token material.",
+        "The Store run log contains a backup run with ok status."
+      ]
+    },
+    {
+      "operation": "restore-cloud",
+      "service": "mail",
+      "test": "live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup",
+      "build_status": "pass",
+      "live_status": "blocked_missing_token_seed",
+      "proof_when_seeded": [
+        "Test seeds a synthetic archived mail body in the temporary Store archive.",
+        "TestProviderScript emits a destructive restore-cloud action.",
+        "AgentHandler::confirm executes through DesktopAgentOperations and the existing engine restore_cloud path.",
+        "Graph readback verifies the newly created restored message.",
+        "Cleanup deletes the restored message.",
+        "The Store restore_operations row is committed and carries the new cloud id."
+      ]
+    }
+  ],
+  "current_blocker": [
+    "ISY624_M365_WRITE_TOKEN_FILE=unset",
+    "ISY624_M365_WRITE_TOKEN=unset",
+    "No local #624 Microsoft 365 token seed file was found in checked config/tmp/workspace locations.",
+    "Do not count Backup or RestoreCloud live ACs as complete until the added ignored probes are executed with a controlled token and redacted evidence is refreshed."
   ]
 }

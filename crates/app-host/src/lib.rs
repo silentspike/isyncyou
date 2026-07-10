@@ -3926,9 +3926,15 @@ mod tests {
             "refresh_token": null,
             "expires_at": unix_now().parse::<u64>().unwrap_or(0).saturating_add(1800),
         });
+        let token_cache_bytes = serde_json::to_vec_pretty(&token_cache).unwrap();
         std::fs::write(
             archive.join(isyncyou_engine::auth::WRITE_CACHE_FILE),
-            serde_json::to_vec_pretty(&token_cache).unwrap(),
+            &token_cache_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            archive.join(isyncyou_engine::auth::READ_CACHE_FILE),
+            &token_cache_bytes,
         )
         .unwrap();
         let cfg = Config {
@@ -3944,6 +3950,57 @@ mod tests {
         };
         cfg.validate().unwrap();
         cfg
+    }
+
+    fn issue_624_collect_pending(
+        agent: &DaemonAgent,
+        prompt: &str,
+        expected_op: &str,
+    ) -> (String, String, String) {
+        let turn = isyncyou_webui::AgentHandler::start_turn(agent, "me", prompt).unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        let mut confirm_token = String::new();
+        let mut action_hash = String::new();
+        let mut saw_redacted_tool_call = false;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => {
+                    saw_redacted_tool_call = true;
+                    assert_eq!(event["input"]["op"].as_str(), Some(expected_op));
+                    assert!(event["input"]["redacted"].as_bool().unwrap_or(false));
+                }
+                Some("confirmation_required") => {
+                    pending_id = event["pending_id"].as_str().unwrap().to_string();
+                    confirm_token = event["token"].as_str().unwrap().to_string();
+                    action_hash = event["action_hash"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+        assert!(saw_redacted_tool_call);
+        assert!(!pending_id.is_empty());
+        assert!(!confirm_token.is_empty());
+        assert!(!action_hash.is_empty());
+        (pending_id, confirm_token, action_hash)
+    }
+
+    fn issue_624_url_segment(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
     }
 
     struct Issue624DraftCleanup {
@@ -4206,6 +4263,179 @@ mod tests {
             })
             .expect("confirmed share creates a direct anonymous view link");
         cleanup.add_permission(created.id.clone());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 token with Mail.Read via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_backup_mail_records_run() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-backup");
+        let cfg = issue_624_live_config(&root, &access_token);
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"backup",
+                "account":"me",
+                "services":["mail"]
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg.clone(),
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let (pending_id, confirm_token, action_hash) =
+            issue_624_collect_pending(&agent, "run a controlled mail backup", "backup");
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "backup");
+        let summary = body["summary"].as_str().unwrap();
+        assert!(summary.contains("mail:"));
+        assert!(!summary.contains("Bearer "));
+        assert!(!summary.contains("access_token"));
+
+        let store =
+            isyncyou_store::Store::open(cfg.accounts[0].archive_root.join(".isyncyou-store.db"))
+                .unwrap();
+        let runs = store.recent_runs("me", 3).unwrap();
+        let latest = runs
+            .iter()
+            .find(|run| run.kind == "backup")
+            .expect("confirmed backup records a backup run");
+        assert_eq!(latest.status, "ok");
+        assert!(latest.summary.contains("mail:"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 token with Mail.ReadWrite via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-restore-cloud");
+        let mut cfg = issue_624_live_config(&root, &access_token);
+        cfg.restore.cloud_restore_enabled = true;
+        let archive = cfg.accounts[0].archive_root.clone();
+        std::fs::create_dir_all(archive.join("mail/live-restore")).unwrap();
+        let source_id = format!("issue-624-restore-{}", unix_now());
+        let rel = format!("mail/live-restore/{source_id}.eml");
+        let subject = format!("isyncyou issue 624 restore cloud {}", unix_now());
+        let mime = format!(
+            "From: iSyncYou Probe <isyncyou-probe@example.invalid>\r\n\
+             To: iSyncYou Probe <isyncyou-probe@example.invalid>\r\n\
+             Subject: {subject}\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             isyncyou issue 624 restore-cloud controlled probe\r\n"
+        );
+        {
+            let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+            let mut item = isyncyou_store::Item::new(
+                "me",
+                "mail",
+                &source_id,
+                "Issue 624 restore-cloud probe.eml",
+                "message",
+            );
+            item.local_path = Some(rel.clone());
+            store.upsert_item(&item).unwrap();
+        }
+        isyncyou_core::envelope::write_body_atomic(&archive.join(&rel), mime.as_bytes()).unwrap();
+
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"restore-cloud",
+                "account":"me",
+                "service":"mail",
+                "id": source_id
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg.clone(),
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let (pending_id, confirm_token, action_hash) =
+            issue_624_collect_pending(&agent, "restore controlled archived mail", "restore-cloud");
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "restore-cloud");
+        let summary: serde_json::Value =
+            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["op"], "restore-cloud");
+        assert_eq!(summary["service"], "mail");
+        assert_eq!(summary["source_id"], source_id);
+        let new_id = summary["new_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .expect("restore-cloud returns new message id")
+            .to_string();
+        let mut cleanup = Issue624DraftCleanup {
+            token: access_token,
+            draft_id: None,
+        };
+        cleanup.set(new_id.clone());
+
+        let graph = isyncyou_graph::GraphClient::new(cleanup.token.clone());
+        let restored = graph
+            .get_json(&format!(
+                "/me/messages/{}?$select=id,subject",
+                issue_624_url_segment(&new_id)
+            ))
+            .unwrap();
+        assert_eq!(restored["id"].as_str(), Some(new_id.as_str()));
+        assert_eq!(restored["subject"].as_str(), Some(subject.as_str()));
+
+        let bytes = isyncyou_core::envelope::read_body(&archive.join(&rel)).unwrap();
+        let secret =
+            isyncyou_engine::load_or_create_secret(&archive.join(".isyncyou-restore-secret"))
+                .unwrap();
+        let key = isyncyou_engine::idempotency_key(&secret, "me", "mail", &source_id, &bytes);
+        let op_id = format!("me:{key}");
+        let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+        let op = store
+            .get_restore_operation(&op_id)
+            .unwrap()
+            .expect("restore-cloud records a ledger operation");
+        assert_eq!(op.state, isyncyou_store::RestoreState::Committed);
+        assert_eq!(op.new_cloud_id.as_deref(), Some(new_id.as_str()));
         let _ = std::fs::remove_dir_all(root);
     }
 
