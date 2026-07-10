@@ -1,0 +1,61 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-10T23:38:00+02:00",
+  "commit": "271779f79486c09eb5bc3c52f2bcb3dc25430ebf",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AND-016",
+      "claim": "The Android worker accepts only bounded job_id/kind input and executes notification, device snapshot, encrypted bootstrap, and native run in that order.",
+      "method": "test",
+      "command": "(cd android && ./gradlew :app:testDebugUnitTest --console=plain --no-daemon)",
+      "result": "pass",
+      "test": "worker_policy_never_starts_native_before_foreground_and_snapshot",
+      "evidence": "Android unit suite passed; injected controller recorded foreground, snapshot, start, run order.",
+      "artifact": "docs/evidence/artifacts/issue-626/host-gates.json"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AND-016",
+      "claim": "Notification denial stops before device snapshot and native startup and does not create an automatic retry loop.",
+      "method": "test",
+      "command": "(cd android && ./gradlew :app:testDebugUnitTest --tests com.silentspike.isyncyou.MobileJobWorkerPolicyTest --console=plain --no-daemon)",
+      "result": "pass",
+      "test": "notification_failure_never_reaches_device_or_native",
+      "evidence": "The injected foreground controller returns false; snapshot and native event lists remain empty and the result code is notifications_required.",
+      "artifact": "docs/evidence/artifacts/issue-626/host-gates.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AND-016",
+      "claim": "Only exact successful queue-producing POST routes reconcile the Rust mobile-job plan.",
+      "method": "test",
+      "command": "(cd android && ./gradlew :app:testDebugUnitTest --tests com.silentspike.isyncyou.MobileJobWakeupPolicyTest --console=plain --no-daemon)",
+      "result": "pass",
+      "test": "accepts_only_exact_post_paths_and_success_status",
+      "evidence": "The policy accepts backup, restore, and agent confirm with 2xx only; near-match, GET, external, and error paths are rejected.",
+      "artifact": "docs/evidence/artifacts/issue-626/host-gates.json"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AND-016",
+      "claim": "Default-off recovery hooks are bounded and absent from the separately rebuilt default APK.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features mobile-job-device-test-hooks mobile_job_test_hook_is_bounded -- --nocapture",
+      "result": "pass",
+      "test": "mobile_job_test_hook_is_bounded",
+      "evidence": "Hook and default APKs were clean-built separately; default strings scan is clean and hashes are recorded.",
+      "artifact": "docs/evidence/artifacts/issue-626/apk-builds.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AND-016",
+      "claim": "The device-state probe writes a bounded snapshot and restores state through an outer cleanup path.",
+      "method": "command",
+      "command": "python3 -m unittest tools/test_android_mobile_job_probe.py",
+      "result": "pass",
+      "evidence": "Probe unit tests passed; Pixel snapshot and restore passed. Validated network-loss was conservatively skipped because the device retained VALIDATED.",
+      "artifact": "docs/evidence/artifacts/issue-626/device-probe.json"
+    }
+  ]
+}

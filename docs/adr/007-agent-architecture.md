@@ -87,7 +87,10 @@ The constraints that force the shape of this decision:
   #625 implements the Rust/server contract (session/cap/per-action-token gates, durable
   backup/restore jobs, restart recovery, and mobile live-write allowlist), while #626 owns
   the native Android proof (Keystore, physical BiometricPrompt, foreground-service/
-  WorkManager presentation, and device evidence). Tracked in
+  WorkManager presentation, and device evidence). #626 now supplies the WorkManager
+  contract, strict notification/device gates, bounded native hooks, and probe tooling;
+  physical biometric/Keystore and validated network-loss proof remain closeout gates.
+  Tracked in
   `docs/requirements/android.yml` (REQ-AND-016) and the agent threat model.
 - **Governance:** the invariants above are tracked as `REQ-AGENT-*` in
   `docs/requirements/agent.yml`, the mobile-write surface in

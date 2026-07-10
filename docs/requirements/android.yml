@@ -273,7 +273,9 @@ requirements:
       - Mobile Agent confirm checks the PendingAction binding, then the per-action biometric token, before consuming the Agent one-time token.
       - Mobile Agent live-write is limited to the explicit D4 metadata allowlist; all other verbs fail closed.
       - A backup/restore-cloud job recovers after app restart or expired lease without duplicate cloud mutation.
-      - Physical BiometricPrompt, foreground-service status, and Android Keystore proof remain pending #626.
+      - WorkManager is the only production mobile-job executor; it receives only bounded job_id/kind input and publishes a visible foreground notification before engine/JNI work.
+      - Missing notification permission/channel, invalid device state, or encrypted bootstrap failure prevents engine start and Graph work; the valid Rust job remains queued for reconciliation.
+      - Physical BiometricPrompt interaction, Android Keystore hardware evidence, and a validated network-loss/recovery run remain pending until the device closeout completes.
     verified_by:
       - test: mobile_full_node_router_exposes_gated_restore_and_backup
       - test: standalone_full_node_serves_ui_and_gates_restore_backup
@@ -287,3 +289,8 @@ requirements:
       - test: mobile_job_worker_does_not_duplicate_restore_after_restart
       - test: mobile_live_write_allowlist_accepts_only_metadata_verbs
       - test: mobile_live_write_disallowed_create_send_delete_append_verbs_fail_closed
+      - test: accepts_only_bounded_job_id_and_known_kind
+      - test: worker_policy_never_starts_native_before_foreground_and_snapshot
+      - test: notification_failure_never_reaches_device_or_native
+      - test: accepts_only_exact_post_paths_and_success_status
+      - test: mobile_job_test_hook_is_bounded

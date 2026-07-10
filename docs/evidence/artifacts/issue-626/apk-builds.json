@@ -1,0 +1,15 @@
+{
+  "issue": 626,
+  "hook_apk": {
+    "path": "/tmp/isyncyou-626-apks/isyncyou-626-hook.apk",
+    "features": "mobile-job-device-test-hooks",
+    "sha256": "1c4240eae7ea19067c7f162d2b53a27be66c28fd201056e7a289b62944abaab3"
+  },
+  "default_apk": {
+    "path": "/tmp/isyncyou-626-apks/isyncyou-626-default.apk",
+    "features": "",
+    "sha256": "aebc00fca9a620b8d21120916fdcf95982ca318ef46c1c9ad90b40b50fa6696e",
+    "hook_string_scan": "pass"
+  },
+  "build_rule": "Each APK was built after clean in a separate no-daemon Gradle invocation; no previous app-debug.apk was reused."
+}

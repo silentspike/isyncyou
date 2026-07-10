@@ -1,0 +1,19 @@
+{
+  "issue": 626,
+  "source_head_at_capture": "271779f79486c09eb5bc3c52f2bcb3dc25430ebf",
+  "tests": {
+    "android_unit": "pass",
+    "python_probe_tests": "pass",
+    "traceability": "pass",
+    "evidence_validator": "pass",
+    "cargo_remote_fmt": "pass",
+    "app_host_mobile_clippy": "pass"
+  },
+  "claims": [
+    "WorkManager input is bounded to job_id and kind",
+    "foreground notification precedes device snapshot and native startup",
+    "notification failure does not reach native or Graph work",
+    "wake-up policy accepts only exact successful queue routes",
+    "default-off recovery hooks are isolated from the product build"
+  ]
+}

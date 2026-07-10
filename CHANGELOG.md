@@ -8,6 +8,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Android mobile-job execution boundary (#626)**
+- `android`: added a WorkManager-backed foreground worker for durable mobile jobs.
+  Work requests carry only bounded `job_id` and `kind`; notification, strict device
+  snapshot, encrypted engine bootstrap, and native execution happen in that order.
+  Notification denial fails closed without a retry loop, and exact successful queue
+  routes reconcile the durable Rust plan. Default-off recovery hooks and a state-safe
+  ADB probe support process-death evidence. Physical BiometricPrompt and complete
+  device network-loss proof remain explicitly pending until on-device closeout.
+
 **Agent mobile full-node server contract**
 - `mobile`+`app-host`+`webui`+`store`: added #625's server-side mobile
   full-node contract. Mobile now wires restore-cloud, backup, share, and the

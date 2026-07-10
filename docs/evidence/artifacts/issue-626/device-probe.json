@@ -1,0 +1,19 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro via USB",
+  "probe": "tools/android-mobile-job-probe.py",
+  "snapshot": {
+    "airplane_mode": false,
+    "wifi_enabled": false,
+    "mobile_data_enabled": true,
+    "stay_awake": "15",
+    "notifications_allowed": true,
+    "validated_network": true
+  },
+  "state_restore": "pass",
+  "network_loss": {
+    "result": "skip",
+    "reason": "device still reported a validated network after airplane, Wi-Fi, and mobile-data commands; no offline PASS claimed"
+  },
+  "secrets": "No account, token, URL, notification dump, or native response was recorded."
+}
