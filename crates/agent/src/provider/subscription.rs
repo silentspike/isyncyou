@@ -191,27 +191,27 @@ fn apply_claude_sse_event(
                 state.usage.output_tokens = g("output_tokens");
             }
         }
-        Some("content_block_start") => {
+        Some("content_block_start")
             if v.get("content_block")
                 .and_then(|b| b.get("type"))
                 .and_then(|t| t.as_str())
-                == Some("tool_use")
-            {
-                let index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
-                let block = &v["content_block"];
-                let id = block
-                    .get("id")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let args = block
-                    .get("input")
-                    .filter(|input| input.as_object().map(|o| !o.is_empty()).unwrap_or(true))
-                    .map(Value::to_string)
-                    .unwrap_or_default();
-                state.active_tools.insert(index, (id, args));
-            }
+                == Some("tool_use") =>
+        {
+            let index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+            let block = &v["content_block"];
+            let id = block
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let args = block
+                .get("input")
+                .filter(|input| input.as_object().map(|o| !o.is_empty()).unwrap_or(true))
+                .map(Value::to_string)
+                .unwrap_or_default();
+            state.active_tools.insert(index, (id, args));
         }
+        Some("content_block_start") => {}
         Some("content_block_delta") => {
             let delta = &v["delta"];
             match delta.get("type").and_then(|t| t.as_str()) {

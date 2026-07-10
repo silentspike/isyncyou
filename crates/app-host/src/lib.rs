@@ -3834,6 +3834,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(feature = "agent-oauth-providers")]
+    fn product_live_seed_env(name: &str) -> String {
+        match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => panic!("{name} is required for the ignored #623 product OAuth live gate"),
+        }
+    }
+
+    #[cfg(feature = "agent-oauth-providers")]
+    fn product_live_expires_at_ms(name: &str) -> u64 {
+        match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => value
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{name} must be a millisecond Unix timestamp")),
+            _ => now_ms() + 3_600_000,
+        }
+    }
+
+    #[cfg(feature = "agent-oauth-providers")]
+    fn seed_product_live_storearchive_fixture(name: &str) -> (PathBuf, Config) {
+        let root = temp_agent_root(name);
+        let archive = root.join("archive");
+        let sync = root.join("sync");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(archive.join("mail/live")).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+        let mut item = isyncyou_store::Item::new(
+            "me",
+            "mail",
+            "m-live",
+            "Issue 623 product live fixture",
+            "message",
+        );
+        item.local_path = Some("mail/live/m-live.eml".into());
+        store.upsert_item(&item).unwrap();
+        store
+            .index_body("me", "mail", "m-live", "isyncyou-623-product-live-sentinel")
+            .unwrap();
+        drop(store);
+        isyncyou_core::envelope::write_body_atomic(
+            &archive.join("mail/live/m-live.eml"),
+            b"Subject: Issue 623 product live fixture\r\n\r\nisyncyou-623-product-live-sentinel",
+        )
+        .unwrap();
+
+        (
+            root,
+            Config {
+                accounts: vec![isyncyou_core::AccountConfig {
+                    id: "me".into(),
+                    username: "me".into(),
+                    sync_root: sync,
+                    archive_root: archive,
+                    cache_root: cache,
+                    mount_point: None,
+                }],
+                ..Default::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "agent-oauth-providers")]
+    fn assert_product_live_storearchive_roundtrip(agent: &DaemonAgent, provider: &str) {
+        let prompt = concat!(
+            "Use the isyncyou tool before answering. Search account me, service mail, ",
+            "query \"isyncyou-623-product-live-sentinel\", then read item id \"m-live\". ",
+            "Answer exactly: m-live isyncyou-623-product-live-sentinel"
+        );
+        let turn = isyncyou_webui::AgentHandler::start_turn(agent, "me", prompt).unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(agent, &turn).expect("turn stream");
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let mut saw_tool_call = false;
+        let mut saw_tool_result = false;
+        let mut done_reason = None::<String>;
+        let mut final_text = String::new();
+
+        for _ in 0..256 {
+            let now = std::time::Instant::now();
+            assert!(
+                now < deadline,
+                "{provider} product OAuth live turn timed out before done"
+            );
+            let line = rx
+                .recv_timeout(deadline.saturating_duration_since(now))
+                .expect("agent live stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("token") => {
+                    final_text.push_str(event["text"].as_str().unwrap_or_default());
+                }
+                Some("tool_call") => {
+                    saw_tool_call = true;
+                    assert_eq!(event["name"].as_str(), Some(isyncyou_agent::TOOL_NAME));
+                }
+                Some("tool_result") => {
+                    saw_tool_result = true;
+                    let content = event["content"].as_str().unwrap_or_default();
+                    assert!(
+                        content.contains("m-live")
+                            || content.contains("isyncyou-623-product-live-sentinel"),
+                        "tool_result must come from the seeded StoreArchive fixture: {content}"
+                    );
+                }
+                Some("done") => {
+                    done_reason = event["reason"].as_str().map(|s| s.to_string());
+                    break;
+                }
+                Some("error") => panic!(
+                    "{provider} product OAuth live turn failed: {}",
+                    event["message"].as_str().unwrap_or("unknown error")
+                ),
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_tool_call,
+            "{provider} live gate must include a real provider tool_call"
+        );
+        assert!(
+            saw_tool_result,
+            "{provider} live gate must include a StoreArchive tool_result"
+        );
+        assert_eq!(done_reason.as_deref(), Some("complete"));
+        assert!(
+            final_text.contains("m-live")
+                || final_text.contains("isyncyou-623-product-live-sentinel"),
+            "{provider} final answer must cite the seeded StoreArchive fixture: {final_text}"
+        );
+
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(agent)).unwrap();
+        assert_eq!(status["usage"]["provider"].as_str(), Some(provider));
+        assert!(
+            status["usage"]["model"].as_str().is_some(),
+            "{provider} usage must include a model"
+        );
+    }
+
+    #[cfg(feature = "agent-oauth-providers")]
+    #[test]
+    #[ignore = "requires explicit ISY623_CLAUDE_OAUTH_ACCESS product OAuth seed; local CLI auth must not be used"]
+    fn live_claude_oauth_storearchive_tool_roundtrip() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let _body_guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(623_120, [120u8; 32]);
+        let (root, cfg) = seed_product_live_storearchive_fixture("live-claude-storearchive");
+        let oauth_dir = root.join("oauth");
+        let agent = DaemonAgent::new(cfg, oauth_dir.clone());
+        agent
+            .store_credential(&StoredCredential {
+                access_token: product_live_seed_env("ISY623_CLAUDE_OAUTH_ACCESS"),
+                refresh_token: std::env::var("ISY623_CLAUDE_OAUTH_REFRESH").unwrap_or_default(),
+                expires_at_ms: product_live_expires_at_ms("ISY623_CLAUDE_OAUTH_EXPIRES_AT_MS"),
+            })
+            .unwrap();
+        agent.set_agent_settings("claude", DEFAULT_MODEL).unwrap();
+
+        assert_product_live_storearchive_roundtrip(&agent, "claude");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-oauth-providers")]
+    #[test]
+    #[ignore = "requires explicit ISY623_CODEX_OAUTH_ACCESS and ISY623_CODEX_ACCOUNT_ID product OAuth seeds; local CLI auth must not be used"]
+    fn live_codex_oauth_storearchive_tool_roundtrip() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let _body_guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(623_120, [120u8; 32]);
+        let (root, cfg) = seed_product_live_storearchive_fixture("live-codex-storearchive");
+        let oauth_dir = root.join("oauth");
+        let agent = DaemonAgent::new(cfg, oauth_dir.clone());
+        store_codex_blob(
+            &oauth_dir,
+            &CodexStoredCredential {
+                access_token: product_live_seed_env("ISY623_CODEX_OAUTH_ACCESS"),
+                refresh_token: std::env::var("ISY623_CODEX_OAUTH_REFRESH").unwrap_or_default(),
+                account_id: product_live_seed_env("ISY623_CODEX_ACCOUNT_ID"),
+                expires_at_ms: product_live_expires_at_ms("ISY623_CODEX_OAUTH_EXPIRES_AT_MS"),
+            },
+        )
+        .unwrap();
+        agent.set_agent_settings("codex", "gpt-5.5").unwrap();
+
+        assert_product_live_storearchive_roundtrip(&agent, "codex");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(any(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"

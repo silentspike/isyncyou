@@ -1,0 +1,89 @@
+{
+  "artifact": "issue-623-product-live-gates",
+  "captured_at": "2026-07-10T07:27:50Z",
+  "branch_head_at_probe": "7523c8f5fb09f52ceff2130eb1fb97f38e590335",
+  "product_live_status": "blocked",
+  "blocker": "No app/host product OAuth CredentialStore was present and the explicit ISY623_* product OAuth seed variables were unset. Local Claude/Codex CLI auth was deliberately not used as #623 product-auth evidence.",
+  "credential_probe": {
+    "config_dir": "$HOME/.config/isyncyou",
+    "files_found_under_config_dir": [],
+    "local_cli_auth_used": false
+  },
+  "required_seed_env_probe": {
+    "ISY623_CLAUDE_OAUTH_ACCESS": "unset",
+    "ISY623_CLAUDE_OAUTH_REFRESH": "unset",
+    "ISY623_CLAUDE_OAUTH_EXPIRES_AT_MS": "unset",
+    "ISY623_CODEX_OAUTH_ACCESS": "unset",
+    "ISY623_CODEX_OAUTH_REFRESH": "unset",
+    "ISY623_CODEX_ACCOUNT_ID": "unset",
+    "ISY623_CODEX_OAUTH_EXPIRES_AT_MS": "unset"
+  },
+  "live_harness": {
+    "tests": [
+      "live_claude_oauth_storearchive_tool_roundtrip",
+      "live_codex_oauth_storearchive_tool_roundtrip"
+    ],
+    "seed_source": "explicit environment variables persisted through the same encrypted app-host CredentialStore load path used by product OAuth",
+    "must_observe": [
+      "provider tool_call",
+      "StoreArchive tool_result from seeded fixture m-live",
+      "done.reason=complete",
+      "usage.provider and usage.model in agent status"
+    ],
+    "compile_list_command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_ -- --list",
+    "compile_list_result": "pass",
+    "workspace_test_observation": "cargo +1.95.0 test --workspace --no-fail-fast passed; app-host reported 47 passed and 2 ignored, with the ignored tests being the two product OAuth live gates"
+  },
+  "host_gates": [
+    {
+      "command": "cargo +1.95.0 fmt --all --check",
+      "result": "pass"
+    },
+    {
+      "command": "cargo +1.95.0 clippy -p isyncyou-app-host --all-targets -- -D warnings",
+      "result": "pass"
+    },
+    {
+      "command": "cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-oauth-providers -- -D warnings",
+      "result": "pass"
+    },
+    {
+      "command": "cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings",
+      "result": "pass"
+    },
+    {
+      "command": "cargo +1.95.0 clippy -p isyncyou-webui --all-targets -- -D warnings",
+      "result": "pass"
+    },
+    {
+      "command": "cargo +1.95.0 test --workspace --no-fail-fast",
+      "result": "pass"
+    },
+    {
+      "command": "python3 tools/check_traceability.py",
+      "result": "pass"
+    },
+    {
+      "command": "python3 tools/check_evidence.py --manifest docs/evidence/issue-623-manifest.json",
+      "result": "pass"
+    },
+    {
+      "command": "node --check gui/webui/src/app.js",
+      "result": "pass"
+    },
+    {
+      "command": "git diff --check",
+      "result": "pass"
+    }
+  ],
+  "live_gates_not_run": [
+    {
+      "test": "live_claude_oauth_storearchive_tool_roundtrip",
+      "reason": "ISY623_CLAUDE_OAUTH_ACCESS unset"
+    },
+    {
+      "test": "live_codex_oauth_storearchive_tool_roundtrip",
+      "reason": "ISY623_CODEX_OAUTH_ACCESS and ISY623_CODEX_ACCOUNT_ID unset"
+    }
+  ]
+}

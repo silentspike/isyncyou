@@ -188,6 +188,8 @@ requirements:
       - test: assistant_setup_consent_is_required_and_non_secret
       - test: agent_oauth_start_rejects_legacy_provider_ids
       - test: daemon_agent_status_reports_sanitized_last_provider_usage
+      - test: live_claude_oauth_storearchive_tool_roundtrip
+      - test: live_codex_oauth_storearchive_tool_roundtrip
   - id: REQ-AGENT-009
     title: Answers carry source citations and respect byte budgets
     statement: >
