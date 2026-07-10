@@ -266,4 +266,15 @@ object MobileJobScheduler {
         )
         return true
     }
+
+    /** Reconcile Rust's durable plan after an exact successful queue-producing POST. */
+    fun reconcile(context: Context) {
+        val plan = runCatching { JSONObject(NativeEngine.nativeMobileJobPlan()) }.getOrNull() ?: return
+        if (plan.optInt("v", -1) != 1 || plan.optString("status") != "ok") return
+        val jobs = plan.optJSONArray("jobs") ?: return
+        for (index in 0 until jobs.length()) {
+            val job = jobs.optJSONObject(index) ?: continue
+            enqueue(context, job.optString("job_id", ""), job.optString("kind", ""))
+        }
+    }
 }

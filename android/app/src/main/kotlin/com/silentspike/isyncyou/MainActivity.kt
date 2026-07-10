@@ -271,6 +271,20 @@ class MainActivity : FragmentActivity() {
         // Refresh the device conditions on return to the foreground (cheap; the engine's offline
         // pass reads the latest each cycle). Safe before the engine is up — it only sets a global.
         pushDeviceState()
+        if (sessionToken.isNotEmpty()) bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1 && sessionToken.isNotEmpty()) {
+            // Notification denial leaves jobs queued; a later permission callback is
+            // an explicit reconciliation point, not an automatic retry loop.
+            bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+        }
     }
 
     private fun currentPushToken(): String {
@@ -401,6 +415,7 @@ class MainActivity : FragmentActivity() {
                         JSONObject().put("error", "internal_error"),
                     )
                 }
+                reconcileMobileJobsAfterSuccess(obj, resp)
                 reply.postMessage(resp)
             }
             "sub" -> {
@@ -423,6 +438,15 @@ class MainActivity : FragmentActivity() {
             "native" -> {
                 handleNativeMessage(obj, validation.id, reply)
             }
+        }
+    }
+
+    private fun reconcileMobileJobsAfterSuccess(request: JSONObject, response: String) {
+        val method = request.optString("method", "")
+        val path = request.optString("path", "")
+        val status = runCatching { JSONObject(response).optInt("status", -1) }.getOrDefault(-1)
+        if (MobileJobWakeupPolicy.shouldReconcile(method, path, status)) {
+            MobileJobScheduler.reconcile(this)
         }
     }
 
