@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent Assistant UI**
+- `webui`: added #622's capability-gated Assistant tab with streaming
+  transcript rendering, source citations, PendingAction confirm/cancel cards,
+  model and usage status, provider-egress consent, and deterministic
+  desktop/mobile Playwright evidence with no external WebView network.
+
 **Agent API and confirmation backend**
 - `agent`+`app-host`+`webui`: completed #621's AgentStreamHub/PendingAction
   backend with typed per-turn events (`token`, `tool_call`, `tool_result`,

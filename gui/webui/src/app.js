@@ -621,7 +621,11 @@ const SERVICES = [
   { id: "contacts", label: "Contacts", icon: "users" },
   { id: "todo", label: "To Do", icon: "check-square" },
   { id: "onenote", label: "OneNote", icon: "notebook" },
+  { id: "assistant", label: "Assistant", icon: "sparkles", cap: "agent", appOnly: true },
 ];
+const serviceVisible = (s) => !s.cap || !!CAP[s.cap];
+const visibleServices = () => SERVICES.filter(serviceVisible);
+const archiveServices = () => SERVICES.filter(s => !s.appOnly);
 const RESTORABLE = new Set(["mail", "calendar", "contacts", "todo", "onenote"]);
 const SHAREABLE = new Set(["onedrive"]);
 
@@ -1000,7 +1004,7 @@ function invadersGame(canvas) {
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const nav = el("nav", { class: "nav" },
-    SERVICES.map(s => {
+    visibleServices().map(s => {
       const cnt = App.counts[s.id];
       const connected = cnt != null && cnt > 0;
       const item = el("button", {
@@ -1053,8 +1057,6 @@ function renderShell() {
         el("span", { class: "nav-meta" }, el("span", { id: "alerts-badge", class: "count", text: "·" }))),
       el("button", { id: "nav-settings", class: "nav-item" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") },
         icon("settings"), el("span", { class: "label", text: "Settings" })),
-      CAP.agent ? el("button", { id: "nav-assistant", class: "nav-item" + (App.route === "assistant" ? " active" : ""), title: "AI Assistant", onclick: () => go("assistant") },
-        icon("sparkles"), el("span", { class: "label", text: "Assistant" })) : null,
       eggOn() ? el("button", { id: "nav-ufo", class: "nav-item" + (App.route === "invaders" ? " active" : ""), title: "Invaders", onclick: () => go("invaders") },
         ufoGlyph(), el("span", { class: "label", text: "Invaders" })) : null),
     el("div", { id: "sync-widget", class: "sync-widget" }),
@@ -1099,18 +1101,22 @@ async function renderSyncWidget() {
   const days = 14, now = Date.now(), buckets = new Array(days).fill(0);
   runs.forEach(r => { const t = toDate(r.finished_at || r.started_at); if (!t) return; const d = Math.floor((now - t.getTime()) / 864e5); if (d >= 0 && d < days) buckets[days - 1 - d]++; });
   clear(box);
-  box.append(
-    el("div", { class: "sw-head" },
-      el("span", { class: "sw-title", text: "System health" }),
-      (st.enabled && CAP.sync) ? el("div", { class: "sw-actions" },
-        el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
-        st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
-          : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))) : null),
+  const syncHead = el("div", { class: "sw-head" },
+    el("span", { class: "sw-title", text: "System health" }));
+  if (st.enabled && CAP.sync) {
+    syncHead.append(el("div", { class: "sw-actions" },
+      el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
+      st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
+        : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))));
+  }
+  const syncNodes = [
+    syncHead,
     el("div", { class: "sw-health " + (runs.length ? (healthy ? "ok" : "warn") : "") },
       el("span", { class: "dot" }), el("b", { text: !runs.length ? "Ready" : healthy ? "Healthy" : `${failed} alert${failed > 1 ? "s" : ""}` })),
-    runs.length ? el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)) : null,
-    el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }),
-  );
+  ];
+  if (runs.length) syncNodes.push(el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)));
+  syncNodes.push(el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }));
+  box.append(...syncNodes);
 }
 async function syncCmd(cmd) {
   try { await post(`/api/v1/sync/${cmd}`, CAP.sync); toast(`sync ${cmd}`); renderSyncWidget(); }
@@ -1126,8 +1132,8 @@ function updateNavCounts() {
 
 /* ---------------------------------------------------------------- router */
 function go(route) { location.hash = "#/" + route; }
-const EXTRA_ROUTES = { search: "Search", settings: "Settings", assistant: "Assistant", invaders: "Invaders" };
-const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
+const EXTRA_ROUTES = { search: "Search", settings: "Settings", invaders: "Invaders" };
+const routeLabel = (r) => (visibleServices().find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
   // Each navigation rebuilds the view from scratch; the view's render re-registers its
   // own live-update handler (or leaves it null). Reset it here so a stale handler from
@@ -1142,14 +1148,14 @@ function onRoute() {
   const raw = location.hash.replace(/^#\//, "") || "overview";
   App.route = raw.split("?")[0];
   App.query = (raw.split("?")[1] || "").replace(/^q=/, "");
-  if (!SERVICES.find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
+  if (!visibleServices().find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
   if (App.route === "invaders" && !eggOn()) App.route = "overview";   // egg-gated route
   // Close any open overlay (detail sheet / command palette) on a real navigation
   // so it can't leak across routes; a same-route refresh keeps it open.
   if (App.route !== prevRoute) {
     closeSheet(); closePalette();
     // Leaving the assistant: close any live token stream so it can't leak across routes.
-    if (prevRoute === "assistant" && AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
+    if (prevRoute === "assistant") closeAssistantStream("route-exit");
   }
   renderShell();
   const view = $("#view");
@@ -4341,7 +4347,7 @@ async function doSearch(q) {
     const groups = {};
     hits.forEach(h => (groups[h.service] = groups[h.service] || []).push(h));
     box.append(el("div", { class: "dim", style: "margin-bottom:12px", text: `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”` }));
-    SERVICES.forEach(s => {
+    archiveServices().forEach(s => {
       const g = groups[s.id]; if (!g || !g.length) return;
       box.append(el("h3", { class: "sb-section", style: "display:flex;align-items:center;gap:8px" }, icon(s.icon, "icon-sm"), `${s.label} (${g.length})`));
       const list = el("div", { class: "card", style: "padding:0;overflow:hidden;margin-bottom:16px" });
@@ -4505,6 +4511,12 @@ function localCallbackRedirect(host) {
 }
 
 async function startAiLogin(provider) {
+  const consentProvider = agentProviderConsentId(provider);
+  if (!agentPrivacyConsentAccepted(consentProvider)) {
+    toast("Review privacy consent for " + agentProviderLabel(consentProvider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   let guardId = null;
   try {
     const params = { provider };
@@ -4578,63 +4590,217 @@ async function completeAiLogin() {
   }
 }
 
-let AGENT_ES = null;     // the active per-turn token stream (EventSource)
-let ASST_LOG = [];       // in-view transcript: [{role:'user'|'assistant', text, chips:[]}]
+const AssistantState = {
+  status: null,
+  transcript: [],       // [{role:'user'|'assistant', text, chips, stages, results}]
+  activeTurnId: null,
+  activeStream: null,
+  pendingCardsById: new Map(),
+  lastUsage: null,
+  model: null,
+  draft: "",
+  busy: false,
+  activeMessage: null,
+};
+
+function closeAssistantStream(_reason) {
+  const stream = AssistantState.activeStream;
+  AssistantState.activeStream = null;
+  AssistantState.activeTurnId = null;
+  AssistantState.activeMessage = null;
+  AssistantState.busy = false;
+  if (stream) {
+    try { stream.close(); } catch (_) {}
+  }
+}
+
+function rememberAssistantStatus(st) {
+  AssistantState.status = st || {};
+  AssistantState.lastUsage = st && st.usage ? st.usage : null;
+  AssistantState.model = st && (st.provider || st.model)
+    ? { provider: st.provider || "", model: st.model || "" }
+    : null;
+}
+
+function assistantCanUse() {
+  return !!CAP.agent && !!App.account;
+}
+
+const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
+const AGENT_PRIVACY_CONSENT_VERSION = 1;
+function agentProviderConsentId(provider) {
+  if (provider === "anthropic" || provider === "claude") return "claude";
+  if (provider === "openai" || provider === "codex") return "codex";
+  return provider || "claude";
+}
+function agentActiveProvider(st) {
+  if (st && st.provider) return agentProviderConsentId(st.provider);
+  if (st && st.claude) return "claude";
+  if (st && st.codex) return "codex";
+  return "claude";
+}
+function readAgentPrivacyConsent() {
+  try { return JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {}; }
+  catch (_) { return {}; }
+}
+function agentPrivacyConsentAccepted(provider) {
+  const c = readAgentPrivacyConsent();
+  return c.version === AGENT_PRIVACY_CONSENT_VERSION
+    && c.accepted === true
+    && c.provider === agentProviderConsentId(provider);
+}
+function acceptAgentPrivacyConsent(provider) {
+  const record = {
+    version: AGENT_PRIVACY_CONSENT_VERSION,
+    accepted: true,
+    provider: agentProviderConsentId(provider),
+    timestamp: new Date().toISOString(),
+  };
+  try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
+  renderAssistantView($("#view"));
+}
+function resetAgentPrivacyConsent() {
+  try { localStorage.removeItem(AGENT_PRIVACY_CONSENT_KEY); } catch (_) {}
+  renderAssistantView($("#view"));
+}
+
+function renderAssistantConsentPanel(providers) {
+  const ids = (providers || ["claude"]).map(agentProviderConsentId);
+  return el("div", { class: "assistant-consent", "data-agent-consent": "1", "data-testid": "agent-consent" },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Privacy consent" }),
+      el("p", { class: "dim", text: "The assistant sends selected Microsoft 365 content to the selected provider to answer your question. Continue only if you want that provider to process the selected content." })),
+    el("div", { class: "assistant-consent-actions" },
+      ids.map(provider => el("button", { class: "btn sm", type: "button", onclick: () => acceptAgentPrivacyConsent(provider), "data-agent-consent-accept": provider },
+        icon("shield-check", "icon-sm"), "Allow " + agentProviderLabel(provider))),
+      el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
+        icon("x", "icon-sm"), "Reset")));
+}
+
+function renderAssistantByoKeyUnavailable() {
+  return el("div", { class: "assistant-setup-locked", "data-agent-byo-key": "unavailable" },
+    icon("shield", "icon-sm"),
+    el("span", { text: "BYO API key setup is unavailable until encrypted provider credentials land." }));
+}
 
 async function renderAssistantView(view) {
   clear(view).append(
-    el("h1", { class: "view-title", text: "AI Assistant" }),
-    el("div", { id: "asst-body" }),
+    el("section", { id: "assistant-view", class: "assistant-view", "data-testid": "assistant-view" },
+      el("h1", { class: "view-title", text: "Assistant" }),
+      el("div", { id: "asst-body", class: "assistant-body" }),
+    ),
   );
   const body = $("#asst-body");
-  body.append(el("div", { class: "card", style: "max-width:36rem;margin:1.25rem auto;padding:1.4rem" },
+  body.append(el("div", { class: "assistant-loading" },
     el("div", { class: "skel", style: "height:20px;width:50%" })));
   let st = {};
   try { st = await api("/api/v1/agent/status"); } catch (_) { st = {}; }
+  rememberAssistantStatus(st);
   clear(body);
   if (st && st.connected) renderAssistantChat(body, st);
-  else renderAssistantConnect(body);
+  else renderAssistantSetup(body, st);
 }
 
 // The connect card (shown until an AI account is connected).
-function renderAssistantConnect(body) {
+function renderAssistantSetup(body, st) {
+  const unavailable = !CAP.agent;
+  const claudeAllowed = agentPrivacyConsentAccepted("claude");
+  const codexAllowed = agentPrivacyConsentAccepted("codex");
+  const hint = unavailable
+    ? "Assistant is not available in this build."
+    : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login.";
+  const anthropic = el("button", { id: "asst-connect-anthropic", class: "btn primary", onclick: () => startAiLogin("anthropic"), "data-testid": "agent-connect-anthropic" },
+    icon("sparkles", "icon-sm"), "Connect Claude");
+  const openai = el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai"), "data-testid": "agent-connect-openai" },
+    icon("sparkles", "icon-sm"), "Connect ChatGPT");
+  if (unavailable || !claudeAllowed) {
+    anthropic.setAttribute("disabled", "disabled");
+  }
+  if (unavailable || !codexAllowed) {
+    openai.setAttribute("disabled", "disabled");
+  }
   body.append(
     el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
-    el("div", { id: "asst-connect-card", class: "card", style: "max-width:36rem;margin:1.25rem auto;text-align:center;padding:2.5rem 2rem" },
-      el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff;box-shadow:0 8px 24px rgba(99,102,241,.35)" }, icon("sparkles")),
+    el("div", { id: "asst-connect-card", class: "assistant-setup", "data-agent-setup": "1", "data-testid": "agent-setup" },
+      el("div", { class: "assistant-setup-icon" }, icon("sparkles")),
       el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
-      el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.6rem;max-width:27rem", text: "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login — your credentials go only to the provider — and this device is then authorized." }),
-      el("div", { style: "display:flex;flex-direction:column;gap:.6rem;max-width:21rem;margin:0 auto" },
-        el("button", { id: "asst-connect-anthropic", class: "btn primary", onclick: () => startAiLogin("anthropic") }, icon("sparkles", "icon-sm"), "Connect Claude (Anthropic)"),
-        el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai") }, icon("sparkles", "icon-sm"), "Connect ChatGPT (OpenAI)"),
-      ),
-      el("p", { class: "dim", style: "margin:1.3rem 0 0;font-size:.8rem", text: "Experimental — uses your own subscription. You can disconnect any time." }),
+      el("p", { class: "dim assistant-setup-copy", text: hint }),
+      renderAssistantConsentPanel(["claude", "codex"]),
+      el("div", { class: "assistant-setup-actions" }, anthropic, openai),
+      renderAssistantByoKeyUnavailable(),
+      st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,
+      el("p", { class: "dim assistant-setup-note", text: "Experimental — uses your own subscription. You can disconnect any time." }),
     ),
   );
 }
 
 // The chat surface (shown once connected). Streams tokens over the per-turn SSE.
 function renderAssistantChat(body, st) {
-  body.append(
-    el("div", { style: "display:flex;align-items:center;gap:.5rem;max-width:46rem;margin:.1rem auto .9rem" },
+  const provider = agentActiveProvider(st);
+  const hasConsent = agentPrivacyConsentAccepted(provider);
+  const chatNodes = [
+    el("div", { class: "assistant-toolbar" },
       el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
       agentModelSwitcher(st),
+      renderAssistantUsageChip(st),
+      el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
+        icon("shield", "icon-sm"), "Privacy"),
     ),
-    el("div", { id: "asst-log", style: "display:flex;flex-direction:column;gap:.8rem;max-width:46rem;margin:0 auto;width:100%;padding-bottom:1rem" }),
-    el("div", { style: "position:sticky;bottom:0;max-width:46rem;margin:0 auto;width:100%" },
-      el("div", { style: "display:flex;gap:.5rem;padding:.5rem 0", class: "asst-inputrow" },
-        el("textarea", { id: "asst-input", class: "input", rows: "1", placeholder: "Ask about your mail, files, calendar…", style: "flex:1;resize:none;min-height:46px;max-height:160px", onkeydown: agentKeydown }),
-        el("button", { class: "btn primary", title: "Send", onclick: agentSendFromInput }, icon("send", "icon-sm")),
-      ),
-    ),
-  );
+    el("div", { id: "asst-log", class: "assistant-transcript", "data-agent-transcript": "1", "data-testid": "agent-transcript" }),
+    el("div", { class: "assistant-pending-host", "data-agent-pending": "1", "data-testid": "agent-pending-actions" }),
+    renderAssistantComposer(st),
+  ];
+  if (!hasConsent) chatNodes.splice(1, 0, renderAssistantConsentPanel([provider]));
+  body.append(...chatNodes);
   const log = $("#asst-log");
-  if (!ASST_LOG.length) {
+  if (!AssistantState.transcript.length) {
     log.append(el("div", { class: "dim", style: "text-align:center;padding:2.5rem 1rem", text: "Ask me anything about your Microsoft 365 — I'll read your archive and answer with sources." }));
   } else {
-    ASST_LOG.forEach(m => log.append(renderAsstMsg(m)));
+    AssistantState.transcript.forEach(m => log.append(renderAssistantMessage(m)));
     requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
   }
+}
+
+function renderAssistantComposer(_st) {
+  const provider = agentActiveProvider(_st || AssistantState.status);
+  const disabledReason = !CAP.agent ? "Assistant unavailable"
+    : (!App.account ? "Select an account first"
+      : (!agentPrivacyConsentAccepted(provider) ? "Review privacy consent first" : ""));
+  const input = el("textarea", {
+    id: "asst-input",
+    class: "input assistant-input",
+    rows: "1",
+    placeholder: disabledReason || "Ask about your mail, files, calendar…",
+    onkeydown: agentKeydown,
+    oninput: (e) => { AssistantState.draft = e.target.value; },
+    "data-agent-input": "1",
+    "data-testid": "agent-input",
+  });
+  input.value = AssistantState.draft || "";
+  const send = el("button", { class: "btn primary", title: disabledReason || "Send", onclick: agentSendFromInput, "data-testid": "agent-send" },
+    icon("send", "icon-sm"));
+  if (disabledReason) {
+    input.setAttribute("disabled", "disabled");
+    send.setAttribute("disabled", "disabled");
+  }
+  return el("div", { class: "assistant-composer", "data-agent-composer": "1", "data-testid": "agent-composer" },
+    el("div", { class: "asst-inputrow" }, input, send),
+    disabledReason ? el("div", { class: "dim assistant-composer-note", text: disabledReason }) : null);
+}
+
+function renderAssistantUsageChip(st) {
+  const usage = st && st.usage ? st.usage : AssistantState.lastUsage;
+  if (!usage) {
+    return el("span", { class: "chip muted assistant-usage", "data-agent-usage": "1", "data-testid": "agent-usage", title: "Usage unavailable" },
+      icon("info", "icon-sm"), "Usage unavailable");
+  }
+  const parts = [];
+  if (usage.request_id) parts.push("Request " + agentCompactValue(usage.request_id, 28));
+  if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);
+  if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);
+  if (usage.rate_limit) parts.push(String(usage.rate_limit));
+  return el("span", { class: "chip assistant-usage", "data-agent-usage": "1", "data-testid": "agent-usage" },
+    icon("info", "icon-sm"), parts.join(" · ") || "Usage");
 }
 
 // Model switcher: pick any available Claude/Codex model. The choice is persisted
@@ -4642,38 +4808,56 @@ function renderAssistantChat(body, st) {
 // Custom in-UI model picker (no native <select>): a glass panel that unfolds with a
 // spring animation, models grouped by provider, active one highlighted. Falls back to a
 // plain label when nothing is connected.
+function agentProviderLabel(provider) {
+  if (provider === "claude") return "Claude";
+  if (provider === "codex") return "ChatGPT";
+  if (provider === "openai") return "OpenAI";
+  return "Assistant";
+}
 function agentModelSwitcher(st) {
   const models = st.models || {};
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
-    for (const [prov, tag] of [["claude", "Claude"], ["codex", "ChatGPT"]]) {
+    for (const prov of ["claude", "codex", "openai"]) {
+      const tag = agentProviderLabel(prov);
       const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
       if (m) return tag + " · " + m.label;
     }
-    return st.model || "Select model";
+    return st.model ? agentProviderLabel(st.provider) + " · " + st.model : "Select model";
   };
   const rows = [];
-  const addGroup = (prov, connected, tag) => {
-    if (!connected) return;
+  const addGroup = (prov, connected) => {
+    const list = models[prov] || [];
+    if (!connected || !list.length) return;
+    const tag = agentProviderLabel(prov);
     rows.push(el("div", { class: "mdl-group" }, tag));
-    (models[prov] || []).forEach((m) => {
+    list.forEach((m) => {
       const val = prov + "|" + m.id;
-      rows.push(el("div",
-        { class: "mdl-item" + (val === cur ? " active" : ""), role: "option", onclick: () => pickModel(prov, m.id) },
+      rows.push(el("button",
+        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", "data-agent-model-option": val, onclick: () => pickModel(prov, m.id) },
         el("span", { class: "mdl-dot" }),
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
   };
-  addGroup("claude", st.claude, "Claude");
-  addGroup("codex", st.codex, "ChatGPT");
+  addGroup("claude", st.claude);
+  addGroup("codex", st.codex);
+  addGroup("openai", st.openai);
   if (!st.codex) {
-    rows.push(el("div", { class: "mdl-item mdl-connect", onclick: () => connectCodex() },
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectCodex() },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
   }
-  if (!rows.length) return el("span", { class: "dim", style: "font-size:.85rem", text: st.model || "" });
+  if (!rows.length) {
+    return el("span", {
+      class: "dim mdl-empty",
+      style: "font-size:.85rem",
+      "data-agent-model-picker": "1",
+      "data-testid": "agent-model-picker",
+      text: st.model || "No model available",
+    });
+  }
 
-  const wrap = el("div", { class: "mdl" });
+  const wrap = el("div", { class: "mdl", "data-agent-model-picker": "1", "data-testid": "agent-model-picker" });
   const closeOutside = (ev) => { if (!wrap.contains(ev.target)) close(); };
   const close = () => { wrap.classList.remove("open"); document.removeEventListener("pointerdown", closeOutside, true); };
   const trigger = el("button",
@@ -4688,15 +4872,27 @@ function agentModelSwitcher(st) {
   return wrap;
 }
 async function pickModel(provider, model) {
+  if (!agentPrivacyConsentAccepted(provider)) {
+    toast("Review privacy consent for " + agentProviderLabel(provider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   try {
     await post("/api/v1/agent/model?" + qs({ provider, model }), CAP.agent);
-    toast("Model: " + model);
+    const st = await api("/api/v1/agent/status");
+    rememberAssistantStatus(st);
+    toast("Model: " + agentProviderLabel(provider) + " · " + model);
     renderAssistantView($("#view"));
   } catch (err) {
     toast("Could not switch model: " + (err.message || err));
   }
 }
 async function connectCodex() {
+  if (!agentPrivacyConsentAccepted("codex")) {
+    toast("Review privacy consent for ChatGPT", "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   let guardId = null;
   try {
     const params = { provider: "codex" };
@@ -4725,7 +4921,7 @@ async function pollCodexStatus(n) {
 }
 
 // Progressive-search rendering (S-AG.18/#643, S-AG.19/#644). Module-level so BOTH the live
-// stream (agentSend) and a re-render from ASST_LOG (renderAsstMsg, after a view switch) build
+// stream (agentSend) and a re-render from AssistantState.transcript build
 // identical cards — the transcript keeps its search stages + result cards, not just the text.
 const ASST_STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
 function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" })[s] || "file"; }
@@ -4736,10 +4932,86 @@ function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calend
 function asstViewerFrame(q) {
   return el("iframe", { class: "asst-result-frame", src: `/api/v1/view?${qs(q)}`, title: "Item preview", sandbox: "allow-same-origin" });
 }
+function normalizeAgentSource(value) {
+  if (!value || typeof value !== "object") return null;
+  const raw = value.source && typeof value.source === "object" ? value.source : value;
+  const service = String(raw.service || value.service || "").trim();
+  if (!service || !archiveServices().some(s => s.id === service)) return null;
+  const id = String(raw.id || raw.remote_id || value.id || value.remote_id || "").trim();
+  const path = raw.path || value.path || "";
+  if (!id && !path) return null;
+  return {
+    service,
+    id,
+    path: path ? String(path) : "",
+    name: String(raw.name || value.name || value.displayName || id || service),
+    item_type: String(raw.item_type || value.item_type || value.type || service),
+  };
+}
+function sourceViewQuery(source) {
+  if (!source || !App.account || !source.service || !source.id || !source.path) return null;
+  return { account: App.account, service: source.service, id: source.id };
+}
+function sourceViewHref(source) {
+  const q = sourceViewQuery(source);
+  return q ? "/api/v1/view?" + qs(q) : null;
+}
+function agentSourceKey(source) {
+  return JSON.stringify([source.service, source.id || "", source.path || ""]);
+}
+function dedupeAgentSources(sources) {
+  const seen = new Set();
+  const out = [];
+  (sources || []).forEach((s) => {
+    if (!s) return;
+    const key = agentSourceKey(s);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(s);
+  });
+  return out;
+}
+function extractAgentSources(event) {
+  const found = [];
+  const visit = (value, depth) => {
+    if (depth > 6 || value == null) return;
+    if (Array.isArray(value)) { value.forEach(v => visit(v, depth + 1)); return; }
+    if (typeof value !== "object") return;
+    const src = normalizeAgentSource(value);
+    if (src) found.push(src);
+    Object.entries(value).forEach(([k, v]) => {
+      if (["source", "sources", "results", "items", "result", "data"].includes(k)) visit(v, depth + 1);
+    });
+  };
+  if (!event || typeof event !== "object") return [];
+  if (event.event === "partial_result") visit(event.items || [], 0);
+  else if (event.event === "tool_result" && typeof event.content === "string") {
+    try { visit(JSON.parse(event.content), 0); } catch (_) {}
+  }
+  return dedupeAgentSources(found);
+}
+function renderAgentCitation(source) {
+  const label = source.name || source.id || source.service;
+  const href = sourceViewHref(source);
+  if (href) {
+    return el("a", { class: "asst-citation", href, target: "_blank", rel: "noopener", "data-agent-citation": "view" },
+      icon(asstSvcIcon(source.service), "icon-sm"),
+      el("span", { text: label }));
+  }
+  return el("button", { class: "asst-citation", type: "button", onclick: () => go(source.service), "data-agent-citation": "route" },
+    icon(asstSvcIcon(source.service), "icon-sm"),
+    el("span", { text: label }));
+}
+function renderAgentCitationBar(sources) {
+  const bar = el("div", { class: "asst-citations", "data-agent-citations": "1" });
+  dedupeAgentSources(sources).forEach(source => bar.append(renderAgentCitation(source)));
+  return bar;
+}
 // One typed result: header (name) + one-line preview; click → animated pull-down that
 // lazily embeds the real viewer for the body + a link to open it full-screen.
 function asstResultCard(it) {
-  const q = { account: App.account, service: it.service, id: it.id };
+  const source = normalizeAgentSource(it) || { service: it.service, id: it.id, path: it.path || "", name: it.name || "", item_type: it.item_type || it.service };
+  const viewQ = sourceViewQuery(source);
   const snip = (it.snippet || "").trim();
   const head = el("div", { class: "asst-result-head" },
     el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
@@ -4756,10 +5028,15 @@ function asstResultCard(it) {
     row.classList.toggle("open");
     if (opening && !loaded) {   // lazy: only load the viewer when the user opens the card
       loaded = true;
-      panel.append(
-        asstViewerFrame(q),
-        el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
-          icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+      if (viewQ) {
+        panel.append(
+          asstViewerFrame(viewQ),
+          el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(viewQ), target: "_blank", rel: "noopener" },
+            icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+      } else {
+        panel.append(el("button", { class: "asst-result-open", type: "button", onclick: () => go(source.service) },
+          icon("chevron-right", "icon-sm"), el("span", { text: "Open " + (source.service || "service") })));
+      }
     }
   });
   return row;
@@ -4786,17 +5063,212 @@ function asstSearchBlock(stages, results) {
   return frag;
 }
 
-function renderAsstMsg(m) {
+function agentCompactValue(v, max = 140) {
+  if (v == null) return "";
+  let s;
+  try { s = typeof v === "string" ? v : JSON.stringify(v); } catch (_) { s = String(v); }
+  s = s.replace(/\s+/g, " ").trim();
+  s = s.replace(/("?)(token|session|capability|action_hash)\1\s*[:=]\s*"?[^,"\s}]+/ig, "$2=[redacted]");
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+function summarizeAgentToolInput(input) {
+  if (!input || typeof input !== "object") return "";
+  const deny = new Set(["token", "session", "session_token", "capability", "capability_token", "action_hash"]);
+  const bits = [];
+  Object.entries(input).forEach(([k, v]) => {
+    if (bits.length >= 4 || deny.has(String(k).toLowerCase())) return;
+    if (v == null || typeof v === "object") return;
+    bits.push(`${k}: ${agentCompactValue(v, 42)}`);
+  });
+  return bits.join(" · ");
+}
+
+function renderAgentToolRow(row) {
+  return el("div", { class: "asst-tool-row " + row.kind, "data-agent-tool-row": row.kind },
+    icon(row.kind === "tool_call" ? "corner-up-right" : "corner-up-left", "icon-sm"),
+    el("span", { class: "asst-tool-title", text: row.title }),
+    row.detail ? el("span", { class: "asst-tool-detail", text: row.detail }) : null,
+    row.untrusted ? el("span", { class: "chip muted asst-tool-boundary", text: "Source content" }) : null);
+}
+
+function renderAgentError(message) {
+  return el("div", { class: "asst-inline-error", "data-agent-stream-error": "1" },
+    icon("shield", "icon-sm"),
+    el("span", { text: message || "Stream error" }));
+}
+
+function pendingRecord(pendingId) {
+  return pendingId ? AssistantState.pendingCardsById.get(pendingId) : null;
+}
+
+function rerenderPendingCards(pendingId) {
+  document.querySelectorAll("[data-agent-pending-card]").forEach((node) => {
+    if (node.getAttribute("data-agent-pending-card") !== pendingId) return;
+    const record = pendingRecord(pendingId);
+    if (record) node.replaceWith(renderAgentPendingCard(record));
+  });
+}
+
+function pendingStatus(pending) {
+  const status = pending.status || "pending";
+  if (status === "pending" && pending.expires_at_ms && Date.now() >= Number(pending.expires_at_ms)) {
+    pending.status = "expired";
+    return "expired";
+  }
+  return status;
+}
+
+async function confirmAgentPending(pendingId) {
+  const record = pendingRecord(pendingId);
+  if (!record || !record.token || !record.action_hash) return;
+  record.status = "confirming";
+  record.error = "";
+  rerenderPendingCards(pendingId);
+  try {
+    const d = await post("/api/v1/agent/confirm?" + qs({ pending: pendingId, token: record.token, action_hash: record.action_hash }), CAP.agent);
+    record.status = "confirmed";
+    record.result = d && d.result ? d.result : "Confirmed";
+    record.token = "";
+    record.action_hash = "";
+  } catch (e) {
+    record.status = "error";
+    record.error = agentCompactValue(e.message || e, 180);
+  }
+  rerenderPendingCards(pendingId);
+}
+
+async function cancelAgentPending(pendingId) {
+  const record = pendingRecord(pendingId);
+  if (!record) return;
+  const turn = record.turn_id || AssistantState.activeTurnId;
+  if (!turn) {
+    record.status = "error";
+    record.error = "Missing turn id";
+    rerenderPendingCards(pendingId);
+    return;
+  }
+  record.status = "cancelling";
+  record.error = "";
+  rerenderPendingCards(pendingId);
+  try {
+    await post("/api/v1/agent/cancel?" + qs({ turn }), CAP.agent);
+    record.status = "cancelled";
+    record.token = "";
+    record.action_hash = "";
+    closeAssistantStream("pending-cancel");
+  } catch (e) {
+    record.status = "error";
+    record.error = agentCompactValue(e.message || e, 180);
+  }
+  rerenderPendingCards(pendingId);
+}
+
+function renderAgentPendingCard(pending) {
+  const status = pendingStatus(pending);
+  const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
+  const done = status === "confirmed" || status === "cancelled";
+  const waiting = status === "confirming" || status === "cancelling";
+  const confirmDisabled = waiting || done || status === "expired";
+  const cancelDisabled = waiting || done;
+  const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": pending.pending_id || "" },
+    icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
+  const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": pending.pending_id || "" },
+    icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
+  if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
+  if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
+  return el("div", {
+    class: "asst-pending-card " + status,
+    "data-agent-pending-card": pending.pending_id || "",
+  },
+    el("div", { class: "asst-pending-head" },
+      icon("shield-check", "icon-sm"),
+      el("span", { class: "asst-pending-title", text: pending.preview || "Action requires confirmation" })),
+    el("div", { class: "dim asst-pending-meta", text: risk }),
+    pending.expires_at_ms ? el("div", { class: "dim asst-pending-meta", text: status === "expired" ? "Expired" : "Expires " + fmtDate(pending.expires_at_ms) }) : null,
+    pending.result ? el("div", { class: "asst-pending-result", text: pending.result }) : null,
+    pending.error ? el("div", { class: "asst-pending-error", text: pending.error }) : null,
+    el("div", { class: "asst-pending-actions" }, confirm, cancel));
+}
+
+function renderAssistantMessage(m) {
   const isUser = m.role === "user";
   const bubble = el("div", {
     class: "card asst-bubble",
-    style: `max-width:82%;padding:.7rem .9rem;${isUser ? "background:linear-gradient(135deg,#6366f1,#7c5cff);color:#fff" : ""}`,
   }, el("div", { class: "asst-text", style: "white-space:pre-wrap;line-height:1.5", text: m.text || (isUser ? "" : "…") }));
   (m.chips || []).forEach(c => bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: c })));
+  (m.tools || []).forEach(t => bubble.append(renderAgentToolRow(t)));
+  (m.errors || []).forEach(e => bubble.append(renderAgentError(e)));
+  if (m.pending) bubble.append(renderAgentPendingCard(m.pending));
+  if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));
   // Re-render the turn's search stages + result cards (persisted in the message), so a view
   // switch brings the whole conversation back — not just the text (#644).
   if ((m.stages && m.stages.length) || (m.results && m.results.length)) bubble.append(asstSearchBlock(m.stages, m.results));
-  return el("div", { style: `display:flex;${isUser ? "justify-content:flex-end" : ""}` }, bubble);
+  return el("div", { class: "assistant-message" + (isUser ? " user" : ""), "data-agent-message": m.role || "assistant" }, bubble);
+}
+
+function handleAgentEvent(message, turnState) {
+  const d = message || {};
+  switch (d.event) {
+    case "token":
+      turnState.setText(turnState.message.text + (d.text || ""));
+      break;
+    case "tool_call":
+      turnState.addToolRow({
+        kind: "tool_call",
+        title: d.name || "Tool call",
+        detail: summarizeAgentToolInput(d.input),
+      });
+      break;
+    case "tool_result":
+      turnState.addToolRow({
+        kind: "tool_result",
+        title: "Tool result",
+        detail: agentCompactValue(d.content, 120),
+        untrusted: !!d.untrusted,
+      });
+      turnState.addCitations(extractAgentSources(d));
+      break;
+    case "search_stage":
+      turnState.onSearchStage(d);
+      break;
+    case "partial_result":
+      turnState.onPartialResult(d);
+      turnState.addCitations(extractAgentSources(d));
+      break;
+    case "confirmation_required": {
+      const pending = {
+        pending_id: d.pending_id || d.id || d.tool_id || "",
+        preview: d.preview || "Action requires confirmation",
+        risk: d.risk || "",
+        expires_at_ms: d.expires_at_ms || null,
+        turn_id: AssistantState.activeTurnId || "",
+        status: "pending",
+        result: "",
+        error: "",
+        token: d.token || "",
+        action_hash: d.action_hash || "",
+      };
+      if (pending.pending_id) {
+        AssistantState.pendingCardsById.set(pending.pending_id, pending);
+      }
+      turnState.setPending(pending);
+      break;
+    }
+    case "error":
+      turnState.addError(d.message || "Stream error");
+      break;
+    case "done": {
+      const reason = d.reason || "complete";
+      const fallback = reason === "pending_confirmation" ? "Waiting for confirmation"
+        : reason === "cancelled" ? "Cancelled"
+        : reason === "error" ? "Turn ended with an error"
+        : "(no response)";
+      turnState.message.doneReason = reason;
+      turnState.finish(fallback, reason);
+      break;
+    }
+  }
 }
 
 function agentKeydown(e) {
@@ -4812,13 +5284,24 @@ function agentSendFromInput() {
 // Start a turn and stream its tokens into a fresh assistant bubble.
 async function agentSend(text) {
   const log = $("#asst-log"); if (!log) return;
-  if (!ASST_LOG.length) clear(log);   // drop the empty-state hint
+  if (!assistantCanUse()) { toast("Assistant is unavailable for this account", "err"); return; }
+  const provider = agentActiveProvider(AssistantState.status);
+  if (!agentPrivacyConsentAccepted(provider)) {
+    toast("Review privacy consent for " + agentProviderLabel(provider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
+  closeAssistantStream("new-turn");
+  if (!AssistantState.transcript.length) clear(log);   // drop the empty-state hint
 
-  ASST_LOG.push({ role: "user", text });
-  log.append(renderAsstMsg(ASST_LOG[ASST_LOG.length - 1]));
-  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [] };
-  ASST_LOG.push(asst);
-  const asstEl = renderAsstMsg(asst);
+  AssistantState.transcript.push({ role: "user", text });
+  log.append(renderAssistantMessage(AssistantState.transcript[AssistantState.transcript.length - 1]));
+  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [], tools: [], errors: [], citations: [], pending: null, doneReason: null };
+  AssistantState.transcript.push(asst);
+  AssistantState.busy = true;
+  AssistantState.draft = "";
+  AssistantState.activeMessage = asst;
+  const asstEl = renderAssistantMessage(asst);
   log.append(asstEl);
   const textEl = asstEl.querySelector(".asst-text");
   const bubble = asstEl.querySelector(".asst-bubble");
@@ -4833,7 +5316,36 @@ async function agentSend(text) {
   const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
   log.scrollTop = log.scrollHeight;
   const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; log.scrollTop = log.scrollHeight; };
-  const addChip = (label) => { asst.chips.push(label); bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: label })); log.scrollTop = log.scrollHeight; };
+  const addToolRow = (row) => {
+    clearThinking();
+    asst.tools.push(row);
+    bubble.append(renderAgentToolRow(row));
+    log.scrollTop = log.scrollHeight;
+  };
+  const addError = (message) => {
+    clearThinking();
+    asst.errors.push(message);
+    bubble.append(renderAgentError(message));
+    log.scrollTop = log.scrollHeight;
+  };
+  const setPending = (pending) => {
+    clearThinking();
+    asst.pending = pending;
+    const old = bubble.querySelector("[data-agent-pending-card]");
+    if (old) old.remove();
+    bubble.append(renderAgentPendingCard(pending));
+    log.scrollTop = log.scrollHeight;
+  };
+  let citationsBox = null;
+  const addCitations = (sources) => {
+    const merged = dedupeAgentSources([...(asst.citations || []), ...(sources || [])]);
+    if (merged.length === (asst.citations || []).length) return;
+    asst.citations = merged;
+    if (citationsBox) citationsBox.remove();
+    citationsBox = renderAgentCitationBar(asst.citations);
+    bubble.append(citationsBox);
+    log.scrollTop = log.scrollHeight;
+  };
 
   // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
   // and a result list that grows as PartialResult events arrive.
@@ -4873,37 +5385,59 @@ async function agentSend(text) {
     log.scrollTop = log.scrollHeight;
   };
 
-  if (AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
   let turn;
   try {
     const r = await post("/api/v1/agent/turn?" + qs({ account: App.account, prompt: text }), CAP.agent);
     turn = r && r.turn;
-  } catch (e) { setText("Error: " + (e.message || e)); return; }
-  if (!turn) { setText("Error: could not start the turn"); return; }
+  } catch (e) {
+    AssistantState.busy = false;
+    AssistantState.activeMessage = null;
+    setText("Error: " + (e.message || e));
+    return;
+  }
+  if (!turn) {
+    AssistantState.busy = false;
+    AssistantState.activeMessage = null;
+    setText("Error: could not start the turn");
+    return;
+  }
+  AssistantState.activeTurnId = turn;
 
   const url = "/api/v1/agent/stream?" + qs({ turn });
   // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
   // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
   // event or a stream drop ends the turn.
   let stream;
-  const finish = (msg) => { clearThinking(); try { stream.close(); } catch (_) {} if (AGENT_ES === stream) AGENT_ES = null; if (!asst.text && msg) setText(msg); };
+  const finish = (msg) => {
+    clearThinking();
+    if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
+    else { try { stream.close(); } catch (_) {} }
+    if (!asst.text && msg) setText(msg);
+  };
+  const turnState = {
+    message: asst,
+    setText,
+    addToolRow,
+    addError,
+    setPending,
+    addCitations,
+    onSearchStage,
+    onPartialResult,
+    finish,
+  };
   stream = openEventStream(url, (name, data) => {
-    if (name === "done") { finish("(no response)"); return; }
+    if (name === "done") { handleAgentEvent({ event: "done", reason: "complete" }, turnState); return; }
     if (name !== "message") return; // ignore ping heartbeats
-    let d; try { d = JSON.parse(data); } catch (_) { return; }
-    switch (d.event) {
-      case "token": setText(asst.text + (d.text || "")); break;
-      case "search_stage": onSearchStage(d); break;
-      case "partial_result": onPartialResult(d); break;
-      // Raw tool calls (search/read/…) are internal — the stage checkmarks + result cards
-      // already show what's happening, so we don't surface "→ isyncyou read" noise.
-      case "tool_call": break;
-      case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
-      case "error": clearThinking(); setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
-      case "done": finish("(no response)"); break;
+    let d;
+    try { d = JSON.parse(data); }
+    catch (_) {
+      addError("Invalid stream payload");
+      finish("Stream error");
+      return;
     }
+    handleAgentEvent(d, turnState);
   }, () => finish("⚠ connection lost"));
-  AGENT_ES = stream;
+  AssistantState.activeStream = stream;
 }
 
 function renderAccountMenu(body) {
@@ -4985,7 +5519,7 @@ function openPalette() {
     });
   };
   const jumps = [
-    ...SERVICES.map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } })),
+    ...visibleServices().map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } })),
     { label: "Go to Settings", icon: "settings", run: () => { closePalette(); go("settings"); } },
     { label: "Sync now", icon: "refresh-cw", run: () => { closePalette(); syncCmd("now"); } },
     { label: "Pause sync", icon: "pause", run: () => { closePalette(); syncCmd("pause"); } },
@@ -5073,7 +5607,7 @@ function setupSwipe() {
     if (dt > 600 || Math.abs(dx) < 64 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
     if (sheetEl || palette) return;                       // overlay owns the gesture
     if (dx > 0 && mobileBack()) return;                   // right-swipe → back from detail
-    const order = SERVICES.map((s) => s.id);
+    const order = visibleServices().map((s) => s.id);
     const i = order.indexOf(App.route);
     if (i < 0) return;
     if (dx < 0 && i < order.length - 1) go(order[i + 1]); // left → next tab

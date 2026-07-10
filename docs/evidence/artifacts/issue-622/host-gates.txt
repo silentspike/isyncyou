@@ -1,0 +1,58 @@
+Issue #622 host gates
+Generated: 2026-07-09T22:22:41+02:00
+Implementation/evidence commit: fa6f8283f8ca20860579a4b6d96aa4cdc0d25438
+
+Commands run during Task 8/9:
+
+1. node --check gui/webui/src/app.js
+   Result: pass
+
+2. node --check tools/agent-ui-smoke.mjs
+   Result: pass
+
+3. git diff --check
+   Result: pass
+
+4. cargo +1.95.0 test -p isyncyou-webui assistant_setup_consent_is_required_and_non_secret -- --nocapture
+   Result: pass
+   Output excerpt:
+     running 1 test
+     test tests::assistant_setup_consent_is_required_and_non_secret ... ok
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 174 filtered out
+
+5. npm run agent-ui-smoke
+   Result: pass
+   Output excerpt:
+     agent-ui-smoke: 28 assertions passed
+
+6. docs/evidence/artifacts/issue-622/agent-ui-smoke.json sanity check
+   Result: pass
+   Observed:
+     ok=true
+     assertions=28
+     console_errors=[]
+     page_errors=[]
+     non_fixture_origin_requests=[]
+     fixture stream scenarios=["normal","pending-confirm","pending-cancel","error"]
+
+7. python3 tools/check_traceability.py
+   Result: pass
+   Output excerpt:
+     requirements: 67 total | 65 implemented | 2 planned | 6 file(s)
+     OK - every requirement is well-formed and every implemented requirement is traceable to existing tests.
+
+8. python3 tools/check_evidence.py --manifest docs/evidence/issue-622-manifest.json
+   Result: pass
+   Output excerpt:
+     evidence manifest: 8 entries | issue-622-manifest.json
+     OK - manifest is schema-valid; manifest commit exists; every cited requirement exists; every test entry names a real test; every artifact exists.
+
+Generated artifacts:
+
+- docs/evidence/artifacts/issue-622/agent-ui-smoke.json
+- docs/evidence/artifacts/issue-622/desktop-assistant.png
+- docs/evidence/artifacts/issue-622/mobile-assistant.png
+- docs/evidence/artifacts/issue-622/stream-citations.png
+- docs/evidence/artifacts/issue-622/pending-confirm.png
+- docs/evidence/artifacts/issue-622/pending-cancel.png
+- docs/evidence/artifacts/issue-622/setup-consent.png
