@@ -398,6 +398,76 @@ impl MobileJobRuntime {
     }
 }
 
+impl isyncyou_webui::BackupHandler for MobileJobRuntime {
+    fn enqueue_backup(
+        &self,
+        account: &str,
+        services: &[String],
+    ) -> Result<isyncyou_webui::BackupJobQueued, String> {
+        let job = MobileJobRuntime::enqueue_backup(self, account, services)?;
+        Ok(isyncyou_webui::BackupJobQueued {
+            job_id: job.job_id,
+            state: job.state.as_str().to_string(),
+        })
+    }
+}
+
+impl isyncyou_webui::MobileJobHandler for MobileJobRuntime {
+    fn list_jobs(
+        &self,
+        account: &str,
+        limit: u32,
+    ) -> Result<Vec<isyncyou_webui::MobileJobSummary>, String> {
+        let store = self.open_store(account)?;
+        store
+            .list_mobile_jobs(account, limit)
+            .map_err(|e| format!("list mobile jobs: {e}"))
+            .map(|jobs| {
+                jobs.into_iter()
+                    .map(|job| isyncyou_webui::MobileJobSummary {
+                        job_id: job.job_id,
+                        kind: job.kind.as_str().to_string(),
+                        state: job.state.as_str().to_string(),
+                        service: job.service,
+                        target_id: job.target_id,
+                        created_at: job.created_at,
+                        updated_at: job.updated_at,
+                        finished_at: job.finished_at,
+                        last_error: job.last_error,
+                    })
+                    .collect()
+            })
+    }
+
+    fn cancel_job(&self, account: &str, job_id: &str) -> Result<bool, String> {
+        let store = self.open_store(account)?;
+        let Some(job) = store
+            .get_mobile_job(job_id)
+            .map_err(|e| format!("get mobile job: {e}"))?
+        else {
+            return Ok(false);
+        };
+        if job.state.is_terminal() {
+            return Ok(false);
+        }
+        match store.transition_mobile_job(
+            job_id,
+            MobileJobState::Cancelled,
+            now_secs(),
+            Some(r#"{"cancelled":true}"#),
+            None,
+            None,
+        ) {
+            Ok(()) => {
+                self.events.notify();
+                Ok(true)
+            }
+            Err(isyncyou_store::StoreError::IllegalMobileJobTransition(_)) => Ok(false),
+            Err(e) => Err(format!("cancel mobile job: {e}")),
+        }
+    }
+}
+
 fn open_account_store(account: &AccountConfig) -> Result<Store, String> {
     std::fs::create_dir_all(&account.archive_root)
         .map_err(|e| format!("create archive root for {}: {e}", account.id))?;

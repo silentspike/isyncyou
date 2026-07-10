@@ -302,6 +302,8 @@ function activityChart(runs, days = 14) {
 /* ---------------------------------------------------------------- api + util */
 const CAP = {
   restore: "__RESTORE_CAP_TOKEN__",
+  backup: "__BACKUP_CAP_TOKEN__",
+  mobileJobs: "__MOBILE_JOB_CAP_TOKEN__",
   sync: "__SYNC_CAP_TOKEN__",
   share: "__SHARE_CAP_TOKEN__",
   verify: "__VERIFY_CAP_TOKEN__",
