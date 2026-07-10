@@ -187,6 +187,15 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn agent_oauth_provider_param(provider: &str) -> Result<&'static str, &'static str> {
+    match provider {
+        "claude" => Ok("claude"),
+        "codex" => Ok("codex"),
+        "" => Err("provider is required"),
+        _ => Err("unknown provider"),
+    }
+}
+
 /// A response ready to be written by any server adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiResponse {
@@ -284,22 +293,22 @@ pub trait AgentHandler: Send + Sync {
     /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
 
-    /// EXPERIMENTAL subscription login (S-AG.12). Begin a device OAuth login for
+    /// Agent provider OAuth login. Begin a device OAuth login for
     /// `provider`; `redirect_uri` is the loopback callback the browser returns to
     /// (the client supplies its own origin). Returns the authorize URL the UI opens
     /// in the **system browser**. Default: not available (handler opted out).
     fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
-    /// EXPERIMENTAL subscription login callback. The system browser returns here with
+    /// Agent provider OAuth callback. The system browser returns here with
     /// the authorization `code` and the CSRF `state`; the handler exchanges the code
     /// and stores the token, then returns a human-facing success page (HTML).
     fn oauth_callback(&self, _code: &str, _state: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
 
-    /// EXPERIMENTAL manual-login completion (S-AG.12): the operator pastes the `code#state`
-    /// that claude.ai showed; the handler exchanges it and stores the token.
+    /// Manual-login completion: the operator pastes the `code#state`
+    /// that the provider showed; the handler exchanges it and stores the token.
     fn oauth_complete(&self, _pasted: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
@@ -310,9 +319,8 @@ pub trait AgentHandler: Send + Sync {
         "{\"connected\":false}".to_string()
     }
 
-    /// EXPERIMENTAL subscription credential import (S-AG.12): store an access token +
-    /// refresh token obtained on another device (where the OAuth consent works), so this
-    /// device can run + self-refresh the subscription. Default: not available.
+    /// #627-only subscription credential import: store an access token + refresh token
+    /// obtained outside the product OAuth flow. Default: not available.
     fn subscription_import(
         &self,
         _access: &str,
@@ -1644,7 +1652,7 @@ impl Router {
         match req.path.as_str() {
             // The shell is static; the strict app CSP header locks it to our assets.
             "/" => ApiResponse::html_with_csp(INDEX_HTML, APP_SHELL_CSP),
-            // EXPERIMENTAL subscription OAuth callback (S-AG.12). The **system browser**
+            // Agent provider OAuth callback. The **system browser**
             // returns here after the operator's login; deliberately NOT under `/api/v1/`
             // so it is exempt from the session-token gate (the browser has no token).
             // CSRF-protected by the `state` minted at oauth/start (single-use). The path
@@ -4080,7 +4088,7 @@ impl Router {
         }
     }
 
-    /// Begin the EXPERIMENTAL subscription OAuth login (S-AG.12). Cap+session gated
+    /// Begin the agent provider OAuth login. Cap+session gated
     /// (the app initiates it); returns the authorize URL the UI opens in the system
     /// browser. `redirect` is the loopback callback the client supplies (its origin).
     fn agent_oauth_start(&self, req: &ApiRequest) -> ApiResponse {
@@ -4091,7 +4099,10 @@ impl Router {
         // redirect is optional: the manual (copy-paste) flow uses the provider's manual
         // redirect, so the client need not supply a loopback origin.
         let redirect = req.q("redirect").unwrap_or("");
-        let provider = req.q("provider").unwrap_or("default");
+        let provider = match agent_oauth_provider_param(req.q("provider").unwrap_or("")) {
+            Ok(p) => p,
+            Err(e) => return ApiResponse::error(400, e),
+        };
         match handler.oauth_start(provider, redirect) {
             Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
             Err(e) => ApiResponse::error(500, &e),
@@ -6216,7 +6227,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
         let redir = "http%3A%2F%2F127.0.0.1%3A5000%2Fagent%2Foauth%2Fcallback";
-        let q = format!("/api/v1/agent/oauth/start?provider=anthropic&redirect={redir}");
+        let q = format!("/api/v1/agent/oauth/start?provider=claude&redirect={redir}");
         // no cap token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", &q)).status, 401);
         // with cap token -> 200 + an authorize URL the UI opens in the system browser
@@ -6225,9 +6236,19 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
         // redirect is optional now (manual flow) -> still 200 without it
-        let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=anthropic")
+        let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=codex")
             .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&noredir).status, 200);
+        let unknown = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=openai")
+            .with_cap_token(Some("agentsecret".into()));
+        let unknown = router.route(&unknown);
+        assert_eq!(unknown.status, 400);
+        assert!(String::from_utf8_lossy(&unknown.body).contains("unknown provider"));
+        let missing = ApiRequest::new("POST", "/api/v1/agent/oauth/start")
+            .with_cap_token(Some("agentsecret".into()));
+        let missing = router.route(&missing);
+        assert_eq!(missing.status, 400);
+        assert!(String::from_utf8_lossy(&missing.body).contains("provider is required"));
     }
 
     #[test]
@@ -8641,14 +8662,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn assistant_model_picker_and_usage_chip_are_status_driven() {
         for needle in [
             "function renderAssistantUsageChip(st)",
+            "function formatAssistantRateLimit(rateLimit)",
             "Usage unavailable",
             "if (usage.request_id) parts.push(\"Request \" + agentCompactValue(usage.request_id, 28));",
             "if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);",
             "if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);",
+            "const rateLimit = formatAssistantRateLimit(usage.rate_limit);",
+            "if (rateLimit) parts.push(rateLimit);",
             "function agentProviderLabel(provider)",
             "if (provider === \"claude\") return \"Claude\";",
             "if (provider === \"codex\") return \"ChatGPT\";",
-            "if (provider === \"openai\") return \"OpenAI\";",
             "const list = models[prov] || [];",
             "if (!connected || !list.length) return;",
             "\"data-agent-model-option\": val",
@@ -8666,6 +8689,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(
             !APP_JS.contains("request_id:") && !APP_JS.contains("rate_limit: \"ok\""),
             "production UI must not fabricate usage fields"
+        );
+        assert!(
+            !APP_JS.contains("String(usage.rate_limit)"),
+            "usage chip must not render rate_limit objects as [object Object]"
         );
     }
 
@@ -8685,8 +8712,6 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "\"data-agent-consent\": \"1\"",
             "\"data-agent-consent-accept\": provider",
             "\"data-agent-consent-reset\": \"1\"",
-            "function renderAssistantByoKeyUnavailable()",
-            "\"data-agent-byo-key\": \"unavailable\"",
             "if (!agentPrivacyConsentAccepted(consentProvider))",
             "if (!agentPrivacyConsentAccepted(provider))",
             "if (!agentPrivacyConsentAccepted(\"codex\"))",
@@ -8718,6 +8743,34 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             assert!(
                 !consent_helpers.to_lowercase().contains(forbidden),
                 "consent helpers must not store/capture secret/content field: {forbidden}"
+            );
+        }
+        for needle in [
+            "id: \"asst-connect-claude\"",
+            "onclick: () => startAiLogin(\"claude\")",
+            "\"data-testid\": \"agent-connect-claude\"",
+            "id: \"asst-connect-codex\"",
+            "onclick: () => startAiLogin(\"codex\")",
+            "\"data-testid\": \"agent-connect-codex\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #623 product OAuth setup invariant: {needle}"
+            );
+        }
+        for forbidden in [
+            "startAiLogin(\"anthropic\")",
+            "startAiLogin(\"openai\")",
+            "agent-connect-anthropic",
+            "agent-connect-openai",
+            "data-agent-byo-key",
+            "BYO API key",
+            "Experimental — uses your own subscription",
+            "subscription/import",
+        ] {
+            assert!(
+                !APP_JS.contains(forbidden),
+                "Assistant product setup must not expose stale provider/BYO affordance: {forbidden}"
             );
         }
     }
@@ -8827,6 +8880,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     "return location.port ? `http://${host}:${location.port}/callback` : \"\";"
                 ),
             "callback redirect must be omitted when location.port is empty"
+        );
+    }
+
+    #[test]
+    fn assistant_claude_oauth_uses_manual_code_step_without_loopback_redirect() {
+        assert!(
+            APP_JS.contains("const manualCodeFlow = provider === \"claude\" && !redirect;"),
+            "Claude on appassets must detect the manual code flow when no loopback redirect exists"
+        );
+        assert!(
+            APP_JS.contains("if (manualCodeFlow) showCodeStep();\n    else showWaitingStep();"),
+            "manual Claude OAuth must show the paste-code UI instead of a polling-only wait screen"
+        );
+        assert!(
+            APP_JS.contains("await finishAgentGuard();\n    toast(\"Connected!\");"),
+            "manual OAuth completion must clean up the network guard after a successful code exchange"
+        );
+        assert!(
+            APP_JS.contains("await finishAgentGuard(); renderAssistantView($(\"#view\"));"),
+            "manual OAuth cancellation must clean up the network guard"
         );
     }
 

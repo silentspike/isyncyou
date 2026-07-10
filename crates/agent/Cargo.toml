@@ -41,9 +41,14 @@ onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http"]
 # Match the desktop encrypted profile so store's rusqlite bundling resolves and unifies
 # with the rest of the workspace (everyone on encrypted-store → no bundling conflict).
 retrieval = ["dep:isyncyou-store", "dep:isyncyou-core", "dep:isyncyou-connectors", "isyncyou-store/encrypted-store"]
-# EXPERIMENTAL, UNSUPPORTED, personal-build only (S-AG.12/#627). Off by default; never in
-# CI/release artifacts or the README. The operator logs in via the official OAuth
-# device-code flow first; this harness then uses that legitimately-obtained token. The
-# wire details (endpoint, identity/billing headers, system prefix) come from a local,
-# uncommitted config — no reproducible recipe lives in the repo.
+# Product Claude/Codex OAuth-compatible provider runtime (#623). This enables the
+# agent-owned HTTP stack but does not by itself authorize local CLI credential
+# fallback; callers must load product credentials from their encrypted store.
+agent-oauth-providers = ["http"]
+# Legacy/future BYO public API-key provider surface. Kept default-off and deliberately
+# separate from #623 product OAuth so app-host/mobile cannot instantiate API-key providers.
+byo-api-providers = ["http"]
+# EXPERIMENTAL, UNSUPPORTED, personal-build only (#627). Off by default; not part of
+# #623 product acceptance. This keeps local CLI credential fallback/capture separated
+# from the product app-OAuth provider runtime above.
 agent-subscription-experimental = ["http"]

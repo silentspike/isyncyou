@@ -73,14 +73,14 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Mitigation** | `cargo deny` runs in the gate (advisories + licenses + bans); Dependabot tracks updates. The release workflow generates a CycloneDX SBOM from the locked Cargo graph and requests GitHub artifact attestations for the release archives, AppImage, Windows zip, SBOM, and checksum file. |
 | **Status** | **In progress** — `cargo deny`, Dependabot, SBOM generation, and signed GitHub artifact attestations are wired; deployed staging/full live-E2E evidence is still open. |
 
-## R8 — Experimental subscription provider is visible in a public repo
+## R8 — Claude/Codex OAuth provider compatibility and local fallback risk
 
 | | |
 |---|---|
-| **Risk** | The in-app agent (Epic #614) includes an experimental Claude/Codex *subscription* provider that mimics an official client's identity to ride the user's own consumer subscription. Even gated, its source is visible in a public repo, and a per-app consent dialog does not make the access provider-ToS-compliant — only the provider could. |
-| **Impact** | Medium — a reputational/compliance signal in an audit-clean public repo; brittle against provider header/wire drift. |
-| **Mitigation** | The official providers (Anthropic Messages, OpenAI Responses) are the default product path. The subscription provider is behind a default-off `agent-subscription-experimental` Cargo feature, **excluded from CI and release artifacts**, **absent from the README**, and documented only under `docs/experimental/` as `unsupported / personal-build only` (no product/marketing claim). The detailed subscription wire format stays in **private local evidence**; the public surface carries no reproducible recipe, token, or secret (S-AG.0/#615, S-AG.12/#627). The sole operator accepts the residual with eyes open. |
-| **Status** | **Accepted** — a deliberate, documented trade-off: the experimental path is fenced (feature-gated, non-release, non-README, private-evidence-only) so the public product path stays audit-clean while the operator retains a personal-build option. Design: [ADR-007](../adr/007-agent-architecture.md). |
+| **Risk** | The in-app agent (Epic #614) ships a Claude/Codex app-OAuth provider path whose runtime is compatible with the installed Claude Code / Codex clients. Provider wire shape can drift, and the default-off #627 local CLI fallback/capture path must not be confused with product auth. A per-app consent dialog and encrypted token storage reduce local risk but do not make any provider policy question disappear. |
+| **Impact** | Medium — brittle against provider header/wire drift and sensitive in audits if product auth, local CLI fallback, and BYO-key stories are blurred. |
+| **Mitigation** | #623 product builds use app-authorized Claude/Codex OAuth credentials loaded from the encrypted agent CredentialStore, not BYO Anthropic/OpenAI API keys and not `~/.claude` / `~/.codex` local CLI auth. Non-live tests isolate HOME/CODEX_HOME/CLAUDE_CONFIG_DIR, clear provider env vars, and fail unexpected provider network POSTs. `FakeProvider` remains CI/unconfigured fallback only. The local CLI fallback and private wire-drift captures stay default-off under #627 `agent-subscription-experimental`; committed evidence must be redacted and contain no tokens, refresh tokens, auth files, account IDs, or reusable credential material. |
+| **Status** | **Accepted / in progress** — accepted as a deliberate compatibility trade-off with strict product-vs-#627 boundaries. #623 cannot close on FakeProvider or local CLI auth; it still needs live product OAuth StoreArchive roundtrip evidence or an honest blocked state. Design: [ADR-007](../adr/007-agent-architecture.md). |
 
 ---
 

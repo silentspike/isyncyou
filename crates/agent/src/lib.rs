@@ -18,15 +18,19 @@
 //! REQ-AGENT-004).
 //!
 //! # Providers
-//! [`provider::FakeProvider`] is a deterministic, scripted provider — the only provider
-//! used in CI (no real LLM tokens, REQ-AGENT-008). Official + experimental providers
-//! implement [`provider::LlmProvider`] in later stories.
+//! [`provider::FakeProvider`] is a deterministic, scripted provider for isolated tests.
+//! The product Claude/Codex OAuth provider runtime is compiled by
+//! `agent-oauth-providers`; #627's local CLI fallback/capture surface remains behind
+//! `agent-subscription-experimental`.
 
 pub mod archive;
 pub mod confirm;
 mod error;
 pub mod http;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub mod oauth;
 pub mod provider;
 pub mod retrieval;
@@ -64,13 +68,22 @@ pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use oauth::{AgentOAuth, OAuthConfig, StartedLogin};
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use provider::codex::{CodexConfig, CodexProvider};
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
@@ -101,5 +114,23 @@ mod tests {
             .expect("session impl block");
         assert!(!session_impl.contains("pub fn append("));
         assert!(!session.contains("append_lease_free_for_test"));
+    }
+
+    #[test]
+    fn product_oauth_feature_does_not_export_byo_api_providers() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains(
+            "#[cfg(feature = \"byo-api-providers\")]\npub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};"
+        ));
+        assert!(
+            !lib.contains(
+                "#[cfg(feature = \"http\")]\npub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};"
+            ),
+            "http/agent-oauth-providers must not re-export BYO API-key provider types"
+        );
+
+        let provider = include_str!("provider.rs");
+        assert!(provider
+            .contains("#[cfg(any(feature = \"byo-api-providers\", test))]\npub mod openai;"));
     }
 }
