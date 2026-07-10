@@ -3900,6 +3900,315 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    fn issue_624_live_write_token() -> Option<String> {
+        if let Ok(path) = std::env::var("ISY624_M365_WRITE_TOKEN_FILE") {
+            let token = std::fs::read_to_string(path).ok()?;
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+        std::env::var("ISY624_M365_WRITE_TOKEN")
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    fn issue_624_live_config(root: &std::path::Path, access_token: &str) -> Config {
+        let archive = root.join("archive");
+        let sync = root.join("sync");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let token_cache = serde_json::json!({
+            "access_token": access_token,
+            "refresh_token": null,
+            "expires_at": unix_now().parse::<u64>().unwrap_or(0).saturating_add(1800),
+        });
+        std::fs::write(
+            archive.join(isyncyou_engine::auth::WRITE_CACHE_FILE),
+            serde_json::to_vec_pretty(&token_cache).unwrap(),
+        )
+        .unwrap();
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "me".to_string(),
+                username: "redacted-live-account".to_string(),
+                sync_root: sync,
+                archive_root: archive,
+                cache_root: cache,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    struct Issue624DraftCleanup {
+        token: String,
+        draft_id: Option<String>,
+    }
+
+    impl Issue624DraftCleanup {
+        fn set(&mut self, draft_id: String) {
+            self.draft_id = Some(draft_id);
+        }
+    }
+
+    impl Drop for Issue624DraftCleanup {
+        fn drop(&mut self) {
+            if let Some(id) = self.draft_id.take() {
+                let graph = isyncyou_graph::GraphClient::new(self.token.clone());
+                let _ = graph.delete_message(&id);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 write token via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_create_draft_and_cleanup() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-draft");
+        let cfg = issue_624_live_config(&root, &access_token);
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let subject = format!("isyncyou issue 624 live confirm {}", unix_now());
+        let recipient = std::env::var("ISY624_M365_DRAFT_TO")
+            .unwrap_or_else(|_| "recipient@example.invalid".to_string());
+        let recipient_for_assert = recipient.clone();
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"live-write",
+                "account":"me",
+                "service":"mail",
+                "change":{
+                    "verb":"create_draft",
+                    "subject": subject,
+                    "body_html": "<p>isyncyou issue 624 live confirmation probe</p>",
+                    "to": [recipient]
+                }
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg,
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let turn =
+            isyncyou_webui::AgentHandler::start_turn(&agent, "me", "create a controlled draft")
+                .unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        let mut confirm_token = String::new();
+        let mut action_hash = String::new();
+        let mut saw_redacted_tool_call = false;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => {
+                    saw_redacted_tool_call = true;
+                    let text = event["input"].to_string();
+                    assert!(event["input"]["redacted"].as_bool().unwrap_or(false));
+                    assert!(!text.contains(&recipient_for_assert));
+                    assert!(!text.contains("live confirmation probe"));
+                }
+                Some("confirmation_required") => {
+                    pending_id = event["pending_id"].as_str().unwrap().to_string();
+                    confirm_token = event["token"].as_str().unwrap().to_string();
+                    action_hash = event["action_hash"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+        assert!(saw_redacted_tool_call);
+        assert!(!pending_id.is_empty());
+        assert!(!confirm_token.is_empty());
+        assert!(!action_hash.is_empty());
+
+        let mut cleanup = Issue624DraftCleanup {
+            token: access_token,
+            draft_id: None,
+        };
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "live-write");
+        let summary: serde_json::Value =
+            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["op"], "live-write");
+        assert_eq!(summary["service"], "mail");
+        assert_eq!(summary["verb"], "create_draft");
+        let draft_id = summary["result_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(String::from)
+            .expect("confirmed create_draft returns a draft id");
+        cleanup.set(draft_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct Issue624DriveCleanup {
+        token: String,
+        item_id: Option<String>,
+        permission_ids: Vec<String>,
+    }
+
+    impl Issue624DriveCleanup {
+        fn set_item(&mut self, item_id: String) {
+            self.item_id = Some(item_id);
+        }
+
+        fn add_permission(&mut self, permission_id: String) {
+            self.permission_ids.push(permission_id);
+        }
+    }
+
+    impl Drop for Issue624DriveCleanup {
+        fn drop(&mut self) {
+            let graph = isyncyou_graph::GraphClient::new(self.token.clone());
+            if let Some(item_id) = self.item_id.as_deref() {
+                for permission_id in self.permission_ids.drain(..) {
+                    let _ = graph.delete_permission(item_id, &permission_id);
+                }
+                let _ = graph.delete_item(item_id);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 write token with Files.ReadWrite via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_share_link_and_cleanup() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-share");
+        let cfg = issue_624_live_config(&root, &access_token);
+        let graph = isyncyou_graph::GraphClient::new(access_token.clone());
+        let name = format!("isyncyou-issue-624-live-{}.txt", unix_now());
+        let uploaded = graph
+            .upload_content_with_conflict_behavior(
+                &name,
+                b"isyncyou issue 624 controlled share probe",
+                isyncyou_graph::http::ConflictBehavior::Fail,
+            )
+            .unwrap()
+            .expect("temporary OneDrive fixture must not already exist");
+        let item_id = uploaded["id"].as_str().unwrap().to_string();
+        let mut cleanup = Issue624DriveCleanup {
+            token: access_token,
+            item_id: None,
+            permission_ids: Vec::new(),
+        };
+        cleanup.set_item(item_id.clone());
+
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"share",
+                "account":"me",
+                "service":"onedrive",
+                "id": item_id,
+                "mode":"link",
+                "link_type":"view",
+                "scope":"anonymous"
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg,
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let turn =
+            isyncyou_webui::AgentHandler::start_turn(&agent, "me", "share temporary file").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        let mut confirm_token = String::new();
+        let mut action_hash = String::new();
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => {
+                    assert!(event["input"]["redacted"].as_bool().unwrap_or(false));
+                    assert_eq!(event["input"]["mode"], "link");
+                    assert_eq!(event["input"]["link_type"], "view");
+                    assert_eq!(event["input"]["scope"], "anonymous");
+                }
+                Some("confirmation_required") => {
+                    pending_id = event["pending_id"].as_str().unwrap().to_string();
+                    confirm_token = event["token"].as_str().unwrap().to_string();
+                    action_hash = event["action_hash"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+        assert!(!pending_id.is_empty());
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "share");
+        let summary: serde_json::Value =
+            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["op"], "share");
+        assert_eq!(summary["mode"], "link");
+        assert_eq!(summary["link_type"], "view");
+        assert_eq!(summary["scope"], "anonymous");
+
+        let permissions = graph
+            .list_permissions_detailed(cleanup.item_id.as_ref().unwrap())
+            .unwrap();
+        let created = permissions
+            .iter()
+            .find(|permission| {
+                permission.link_type.as_deref() == Some("view")
+                    && permission.link_scope.as_deref() == Some("anonymous")
+                    && !permission.inherited
+            })
+            .expect("confirmed share creates a direct anonymous view link");
+        cleanup.add_permission(created.id.clone());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn daemon_agent_pending_turn_stream_closes_with_pending_confirmation_done() {
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
