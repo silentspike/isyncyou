@@ -4,8 +4,10 @@
 //! restore/share/push on top; the mobile client uses the base as-is.
 
 mod agent_ops;
+mod mobile_jobs;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
+pub use mobile_jobs::{MobileJobRunOutcome, MobileJobRuntime};
 
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
