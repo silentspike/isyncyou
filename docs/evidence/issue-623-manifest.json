@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-10T07:07:51Z",
-  "commit": "8f739b2b9c8835b707a0022494f3e3d094e8fbc5",
+  "generated_at": "2026-07-10T07:48:39Z",
+  "commit": "eac2d2777b08f05d7212da56612909c0d61821dd",
   "entries": [
     {
       "id": "EV-001",
@@ -141,7 +141,8 @@
       "command": "claude -p --model sonnet --output-format stream-json --include-partial-messages --verbose --debug api --debug-file /tmp/isyncyou-623-captures/claude-debug.raw.log <controlled-smoke-prompt>",
       "result": "pass",
       "evidence": "controlled prompt returned isyncyou-623-claude-smoke; value-only secret scan passed; artifact scope=local_cli_drift_only_not_product_auth",
-      "artifact": "docs/evidence/artifacts/issue-623/claude-code-2.1.206-capture.json"
+      "artifact": "docs/evidence/artifacts/issue-623/claude-code-2.1.206-capture.json",
+      "notes": "Partial drift evidence only: the reduced artifact records visible_header_names=[], so installed-client request headers are not fully proven by this capture."
     },
     {
       "id": "EV-015",
@@ -151,18 +152,30 @@
       "command": "codex exec --json --ephemeral --skip-git-repo-check -C /tmp <controlled-smoke-prompt>; codex debug models; codex debug models --bundled",
       "result": "pass",
       "evidence": "controlled prompt returned isyncyou-623-codex-smoke; model catalog captured; value-only secret scan passed; artifact scope=local_cli_drift_only_not_product_auth",
-      "artifact": "docs/evidence/artifacts/issue-623/codex-cli-0.144.1-capture.json"
+      "artifact": "docs/evidence/artifacts/issue-623/codex-cli-0.144.1-capture.json",
+      "notes": "Partial drift evidence only: codex exec --json did not expose raw request headers; request shape remains covered by in-repo tests, not installed-client header extraction."
     },
     {
       "id": "EV-016",
       "requirement": "REQ-AGENT-008",
-      "claim": "The #623 product OAuth live StoreArchive gates are implemented but not passed on this host because no product OAuth credentials or explicit ISY623_* live seeds are available.",
+      "claim": "The #623 product OAuth live StoreArchive gates are implemented but not passed on this host because no product OAuth credentials or explicit ISY623_* live seeds are available; the full device/app OAuth flow is also not live-proven.",
       "method": "probe",
       "command": "find \"$HOME/.config/isyncyou\" -maxdepth 3 -type f; env probe for ISY623_*; cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_ -- --list; cargo +1.95.0 test --workspace --no-fail-fast",
       "result": "fail",
-      "evidence": "$HOME/.config/isyncyou contained no product credential files; all required ISY623_* product OAuth seed variables were unset; workspace host tests passed with the two product live gates reported as ignored.",
+      "evidence": "$HOME/.config/isyncyou contained no product credential files; all required ISY623_* product OAuth seed variables were unset; workspace host tests passed with the two product live gates reported as ignored; no device/UI OAuth callback-to-store live proof was produced.",
       "artifact": "docs/evidence/artifacts/issue-623/product-live-gates.json",
       "notes": "Honest blocked state: local Claude/Codex CLI auth was intentionally not used as #623 product-auth evidence."
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The #623 evidence bundle is not PR-ready final-head-bound after the latest code commit; strict final evidence must be regenerated after the final content commit.",
+      "method": "probe",
+      "command": "git rev-parse HEAD; python3 tools/check_evidence.py --manifest docs/evidence/issue-623-manifest.json; note: --require-head is intentionally not claimed for this blocked handoff",
+      "result": "fail",
+      "evidence": "Manifest commit was refreshed to the latest verified code head eac2d2777b08f05d7212da56612909c0d61821dd, but any subsequent tracked evidence correction changes HEAD. This is blocked handoff evidence, not final PR-ready --require-head evidence.",
+      "artifact": "docs/evidence/artifacts/issue-623/product-live-gates.json",
+      "notes": "Before PR, regenerate the manifest/artifacts after the final content commit or attach CI-generated evidence and run check_evidence.py with --require-head."
     }
   ]
 }

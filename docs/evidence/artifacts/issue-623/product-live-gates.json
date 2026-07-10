@@ -1,9 +1,29 @@
 {
   "artifact": "issue-623-product-live-gates",
-  "captured_at": "2026-07-10T07:27:50Z",
-  "branch_head_at_probe": "7523c8f5fb09f52ceff2130eb1fb97f38e590335",
+  "captured_at": "2026-07-10T07:48:39Z",
+  "latest_verified_code_head": "eac2d2777b08f05d7212da56612909c0d61821dd",
   "product_live_status": "blocked",
   "blocker": "No app/host product OAuth CredentialStore was present and the explicit ISY623_* product OAuth seed variables were unset. Local Claude/Codex CLI auth was deliberately not used as #623 product-auth evidence.",
+  "additional_blockers": [
+    "Real Device/App OAuth UI/system-browser/callback to encrypted CredentialStore to StoreArchive roundtrip evidence is missing. The ignored live gates seed encrypted CredentialStore entries and prove the product load path once credentials exist, but they do not prove the full user OAuth flow.",
+    "Local Claude/Codex client header drift evidence is partial. The committed Claude capture exposes no visible header names and the committed Codex capture does not expose raw request headers; current header tests validate in-repo recipe constants, not headers extracted from the installed clients.",
+    "This committed manifest/artifact set is not final-head-bound by construction. A PR-ready evidence bundle must be regenerated after the final content commit or produced by CI/external artifact with --require-head."
+  ],
+  "head_binding": {
+    "status": "not_final_head_bound",
+    "reason": "A tracked manifest cannot contain the hash of the commit that also changes it. Use this as blocked handoff evidence; regenerate after the final commit for PR-ready evidence.",
+    "strict_check_required_before_pr": "python3 tools/check_evidence.py --manifest docs/evidence/issue-623-manifest.json --require-head"
+  },
+  "local_client_header_drift": {
+    "status": "partial_not_product_blocker",
+    "claude_visible_header_names": [],
+    "codex_raw_request_headers_visible": false,
+    "required_to_close": "Add a redacted capture helper or live acceptance proof that ties installed-client header/body drift to the product provider recipe without committing secrets."
+  },
+  "device_app_oauth_flow": {
+    "status": "not_live_proven",
+    "required_to_close": "Run a real app/device OAuth start/callback/complete flow that writes encrypted credentials, then prove provider stream + StoreArchive tool roundtrip from that stored credential."
+  },
   "credential_probe": {
     "config_dir": "$HOME/.config/isyncyou",
     "files_found_under_config_dir": [],
