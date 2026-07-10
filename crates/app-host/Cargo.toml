@@ -56,3 +56,6 @@ agent-subscription-experimental = [
     "agent-oauth-providers",
     "isyncyou-agent/agent-subscription-experimental",
 ]
+# TEST/EVIDENCE ONLY, default-OFF: bounded app-private hold points for mobile
+# process-death recovery evidence. Never reachable from the product router.
+mobile-job-device-test-hooks = []

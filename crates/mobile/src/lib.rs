@@ -788,6 +788,8 @@ fn start_inner(
         gate.clone(),
         events.clone(),
     ));
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    mobile_jobs.set_device_test_hook_root(base.clone());
     let config_path_for_router = config_path.clone();
     let config_path_for_loop = config_path.clone();
 

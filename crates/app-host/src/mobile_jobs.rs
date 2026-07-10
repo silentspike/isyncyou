@@ -16,6 +16,8 @@ use crate::{agent_ops, BackupRun};
 const MOBILE_BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 const MOBILE_JOB_LEASE_TTL_SECS: i64 = 300;
 const MOBILE_JOB_PLAN_LIMIT: usize = 64;
+#[cfg(feature = "mobile-job-device-test-hooks")]
+const MOBILE_JOB_DEVICE_TEST_HOOK_MAX_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MobileWorkerDeviceSnapshot {
@@ -202,6 +204,8 @@ pub struct MobileJobRuntime {
     seq: Arc<AtomicU64>,
     executor: Arc<dyn MobileJobExecutor>,
     execution_guard: Arc<Mutex<()>>,
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    device_test_hook_root: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl MobileJobRuntime {
@@ -215,7 +219,35 @@ impl MobileJobRuntime {
             seq: Arc::new(AtomicU64::new(0)),
             executor: Arc::new(LiveMobileJobExecutor),
             execution_guard: Arc::new(Mutex::new(())),
+            #[cfg(feature = "mobile-job-device-test-hooks")]
+            device_test_hook_root: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    pub fn set_device_test_hook_root(&self, root: impl Into<std::path::PathBuf>) {
+        *self
+            .device_test_hook_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(root.into());
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    fn device_test_hook(&self, phase: &str) {
+        let root = self
+            .device_test_hook_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(root) = root else { return };
+        let marker = root.join(format!("mobile-job-hook-{phase}"));
+        if !marker.is_file() {
+            return;
+        }
+        eprintln!("mobile job device-test hold: {phase}");
+        std::thread::sleep(std::time::Duration::from_secs(
+            MOBILE_JOB_DEVICE_TEST_HOOK_MAX_SECS,
+        ));
     }
 
     #[cfg(test)]
@@ -423,7 +455,11 @@ impl MobileJobRuntime {
                 .unwrap_or(job)
         };
 
+        #[cfg(feature = "mobile-job-device-test-hooks")]
+        self.device_test_hook("after_lease");
         let execution = self.execute_job(&job);
+        #[cfg(feature = "mobile-job-device-test-hooks")]
+        self.device_test_hook("after_execute_before_finish");
         let store = self.open_store(&job.account_id)?;
         match execution {
             Ok((result_json, summary)) => {
@@ -1105,5 +1141,18 @@ mod tests {
         rt.run_one_job(&first.job_id).unwrap();
         let second = rt.enqueue_backup("me", &services).unwrap();
         assert_ne!(first.job_id, second.job_id);
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    #[test]
+    fn mobile_job_test_hook_is_bounded() {
+        assert_eq!(MOBILE_JOB_DEVICE_TEST_HOOK_MAX_SECS, 120);
+    }
+
+    #[cfg(not(feature = "mobile-job-device-test-hooks"))]
+    #[test]
+    fn mobile_job_test_hook_does_not_change_default_build() {
+        // The test itself is compiled only in the product's default feature set;
+        // the hook code is absent from that build by construction.
     }
 }
