@@ -122,8 +122,13 @@ fn make_executor(
     account: &str,
     archive_root: std::path::PathBuf,
 ) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
-    Box::new(isyncyou_agent::retrieval::RetrievalExecutor::new(
-        isyncyou_agent::archive::StoreArchive::new(account, archive_root),
+    let restore_root = archive_root.join(".isyncyou-agent").join("restore-local");
+    Box::new(agent_ops::RestoreLocalReadExecutor::new(
+        isyncyou_agent::archive::StoreArchive::new(account, archive_root.clone()),
+        isyncyou_agent::retrieval::RetrievalExecutor::new(
+            isyncyou_agent::archive::StoreArchive::new(account, archive_root),
+        ),
+        restore_root,
     ))
 }
 #[cfg(not(any(
@@ -4021,6 +4026,250 @@ mod tests {
             .unwrap()
             .contains("Runtime body archived text"));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn seed_restore_local_fixture(
+        name: &str,
+        service: &str,
+        id: &str,
+        item_name: &str,
+        rel: Option<&str>,
+        body: &[u8],
+    ) -> PathBuf {
+        let root = temp_agent_root(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = isyncyou_store::Store::open(root.join(".isyncyou-store.db")).unwrap();
+        let mut item = isyncyou_store::Item::new("me", service, id, item_name, "message");
+        if let Some(rel) = rel {
+            item.local_path = Some(rel.into());
+        }
+        store.upsert_item(&item).unwrap();
+        drop(store);
+
+        if let Some(rel) = rel {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            isyncyou_core::envelope::write_body_atomic(&path, body).unwrap();
+        }
+        root
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn restore_local_action(service: &str, id: &str) -> isyncyou_agent::ToolAction {
+        isyncyou_agent::ToolAction::RestoreLocal {
+            account: "me".into(),
+            service: service.into(),
+            id: id.into(),
+        }
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn restored_path(out: &serde_json::Value) -> PathBuf {
+        PathBuf::from(out["path"].as_str().unwrap())
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_writes_archived_body_to_controlled_restore_root() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_301, [31u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-write",
+            "mail",
+            "m1",
+            "Archived message.eml",
+            Some("mail/aa/m1.eml"),
+            b"restore-local plaintext",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m1"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+
+        assert!(path.starts_with(root.join(".isyncyou-agent/restore-local/mail")));
+        assert_eq!(std::fs::read(&path).unwrap(), b"restore-local plaintext");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_output_path_is_not_model_controlled() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_302, [32u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-path",
+            "mail",
+            "m-escape",
+            "../../escape.txt",
+            Some("mail/aa/m-escape.eml"),
+            b"safe output",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-escape"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+
+        assert!(path.starts_with(root.join(".isyncyou-agent/restore-local/mail")));
+        assert!(!path.to_string_lossy().contains("../"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"safe output");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_rejects_missing_archived_body() {
+        let _guard = EnvelopeRequirementGuard::new();
+        let root = seed_restore_local_fixture(
+            "restore-local-missing-body",
+            "mail",
+            "m-missing",
+            "Missing body",
+            None,
+            b"",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let err = exec
+            .execute_read(&restore_local_action("mail", "m-missing"))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("has no archived body"));
+        assert!(!root.join(".isyncyou-agent/restore-local").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_uses_envelope_reader_for_sealed_body() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_303, [33u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-sealed",
+            "mail",
+            "m-sealed",
+            "Sealed message.eml",
+            Some("mail/aa/m-sealed.eml"),
+            b"sealed restore bytes",
+        );
+        let raw_archive = std::fs::read(root.join("mail/aa/m-sealed.eml")).unwrap();
+        assert_ne!(raw_archive, b"sealed restore bytes");
+        assert!(raw_archive.starts_with(b"ISYE"));
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-sealed"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"sealed restore bytes");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )
+    ))]
+    #[test]
+    fn restore_local_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_304, [34u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-perms",
+            "mail",
+            "m-perms",
+            "Perms.eml",
+            Some("mail/aa/m-perms.eml"),
+            b"permission bytes",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-perms"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_response_carries_source_id_and_byte_count() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_305, [35u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-response",
+            "mail",
+            "m-response",
+            "Response.eml",
+            Some("mail/aa/m-response.eml"),
+            b"response bytes",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-response"))
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["service"], "mail");
+        assert_eq!(out["id"], "m-response");
+        assert_eq!(out["bytes"], b"response bytes".len());
+        assert_eq!(out["source"]["service"], "mail");
+        assert_eq!(out["source"]["id"], "m-response");
+        assert_eq!(out["source"]["path"], "mail/aa/m-response.eml");
         let _ = std::fs::remove_dir_all(root);
     }
 
