@@ -1,8 +1,8 @@
 # Issue #624 Plan Verification
 
-Generated at: 2026-07-10T15:10:55+02:00
+Generated at: 2026-07-10T15:41:55+02:00
 Branch: feature/ag-624
-Code anchor: 5ff2bfd5fc4efac98ab5818cc141278e167aaa0f
+Code anchor: 47264c00b7b51a6b6b46d5416986913febe06450
 Issue state checked with gh: OPEN
 
 Plan source reloaded:
@@ -29,20 +29,19 @@ Implemented plan coverage:
 - Share routes through the existing ledger-backed share handler path.
 - Destructive tool_call stream input is redacted before public emission.
 - Confirm replay, wrong-token/hash, read-class action, malformed action, and mobile-policy paths are covered by host tests.
-- Ignored live probes prove confirmed Agent execution against real Microsoft Graph for Mail create_draft and OneDrive share link, with cleanup.
-- Additional ignored live probes now exist for confirmed Mail backup and confirmed Mail restore-cloud; they compile, but this session had no token seed to run them.
+- Ignored live probes prove confirmed Agent execution against real Microsoft Graph for Mail create_draft, OneDrive share link, Mail backup, and Mail restore-cloud, with cleanup where applicable.
 
 Live AC honesty:
 
 - LiveWrite: PASS live probe, reverted by deleting created draft.
 - Share: PASS live probe, reverted by deleting created permission and temporary item.
-- Backup: live probe added and compile-checked; not executed because ISY624_M365_WRITE_TOKEN_FILE and ISY624_M365_WRITE_TOKEN were unset.
-- RestoreCloud: live probe added and compile-checked; not executed because ISY624_M365_WRITE_TOKEN_FILE and ISY624_M365_WRITE_TOKEN were unset.
+- Backup: PASS live probe; confirmed PendingAction ran the shared backup runner against real Microsoft Graph mail access and recorded an ok backup run.
+- RestoreCloud: PASS live probe; confirmed PendingAction restored a synthetic archived mail item, verified Graph readback, committed restore ledger evidence, and deleted the restored message.
 - RestoreLocal: host fixture evidence only.
 - Invite: not tested live; plan already treats controlled-recipient invite as optional.
 
 Residual status:
 
-- The branch has stronger live harness coverage than Task 11, but #624 should not be described as fully live-matrix-complete until the Backup and RestoreCloud ignored probes are executed with a controlled Microsoft 365 token and redacted evidence is refreshed, or the owner explicitly accepts host-evidence-only coverage for those rows.
+- The remaining live-evidence exception is deliberate: RestoreLocal is host-fixture backed because it is local file recovery, and invite is not live-claimed without a controlled recipient.
 - No push, RC, tag, release workflow, staging promotion, or main promotion was performed.
 - Untracked docs/security/issue-*.md plan files were not staged.

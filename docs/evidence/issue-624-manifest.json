@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-10T15:10:55+02:00",
-  "commit": "5ff2bfd5fc4efac98ab5818cc141278e167aaa0f",
+  "generated_at": "2026-07-10T15:41:55+02:00",
+  "commit": "47264c00b7b51a6b6b46d5416986913febe06450",
   "entries": [
     {
       "id": "EV-001",
@@ -118,7 +118,7 @@
       "requirement": "REQ-AGENT-012",
       "claim": "A confirmed Agent live-write can create and clean up a Microsoft Graph mail draft only after PendingAction confirmation, while public stream input is redacted.",
       "method": "test",
-      "command": "cargo remote -b ISY624_M365_WRITE_TOKEN=<redacted> -c -- test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
       "result": "pass",
       "test": "live_issue_624_agent_confirm_create_draft_and_cleanup",
       "evidence": "The ignored live test used a real Mail.ReadWrite token, observed a redacted public tool_call, confirmed the pending action, received a draft id, and deleted the draft in cleanup.",
@@ -129,7 +129,7 @@
       "requirement": "REQ-AGENT-012",
       "claim": "A confirmed Agent share action can create and clean up a direct OneDrive anonymous view link only after PendingAction confirmation, while public stream input remains redacted.",
       "method": "test",
-      "command": "cargo remote -b ISY624_M365_WRITE_TOKEN=<redacted> -c -- test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
       "result": "pass",
       "test": "live_issue_624_agent_confirm_share_link_and_cleanup",
       "evidence": "The ignored live test used a real Files.ReadWrite token, created a temporary OneDrive item, confirmed the pending share action, verified a direct non-inherited anonymous view permission, then deleted the permission and item.",
@@ -138,43 +138,33 @@
     {
       "id": "EV-013",
       "requirement": "REQ-AGENT-012",
-      "claim": "The missing Backup live confirmation probe has been added and compile-checked, but it was not executed because no live Microsoft 365 token seed was available in this shell.",
+      "claim": "A confirmed Agent backup can run the shared backup runner and record an ok backup run only after PendingAction confirmation.",
       "method": "test",
-      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers live_issue_624_agent_confirm_ --no-run",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
       "result": "pass",
       "test": "live_issue_624_agent_confirm_backup_mail_records_run",
-      "evidence": "The ignored live Backup probe builds. ISY624_M365_WRITE_TOKEN_FILE and ISY624_M365_WRITE_TOKEN were unset, and no local #624 token cache was found, so this is not counted as a live PASS.",
+      "evidence": "The ignored live Backup probe used a real Microsoft 365 token derived from the local MSAL cache, confirmed the PendingAction, executed DesktopAgentOperations, refreshed mail through the shared backup runner, and observed an ok backup run in the Store run log.",
       "artifact": "docs/evidence/artifacts/issue-624/live-agent-confirm.json"
     },
     {
       "id": "EV-014",
       "requirement": "REQ-AGENT-012",
-      "claim": "The missing RestoreCloud live confirmation probe has been added and compile-checked, but it was not executed because no live Microsoft 365 token seed was available in this shell.",
+      "claim": "A confirmed Agent restore-cloud can restore a synthetic archived mail item through the existing restore-cloud path only after PendingAction confirmation.",
       "method": "test",
-      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers live_issue_624_agent_confirm_ --no-run",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
       "result": "pass",
       "test": "live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup",
-      "evidence": "The ignored live RestoreCloud probe builds. It seeds a synthetic archived mail body, confirms restore-cloud through DesktopAgentOperations, verifies the new Graph message, deletes it, and checks the committed restore ledger row when executed with a real token.",
+      "evidence": "The ignored live RestoreCloud probe seeded a synthetic archived mail body, confirmed restore-cloud through DesktopAgentOperations and the existing engine restore_cloud path, verified the new Graph message, deleted it, and checked the committed restore ledger row.",
       "artifact": "docs/evidence/artifacts/issue-624/live-agent-confirm.json"
     },
     {
       "id": "EV-015",
       "requirement": "REQ-AGENT-012",
-      "claim": "The remaining Backup and RestoreCloud live confirmations are still blocked in this session by missing Microsoft 365 token seeds.",
-      "method": "command",
-      "command": "for v in ISY624_M365_WRITE_TOKEN_FILE ISY624_M365_WRITE_TOKEN ISY624_M365_DRAFT_TO; do if [ -n \"${!v:-}\" ]; then echo \"$v=set\"; else echo \"$v=unset\"; fi; done",
-      "result": "fail",
-      "evidence": "ISY624_M365_WRITE_TOKEN_FILE=unset; ISY624_M365_WRITE_TOKEN=unset; ISY624_M365_DRAFT_TO=unset. No .isyncyou-token-*.json or #624 M365 token seed was found under the checked local config/tmp/workspace paths. Do not claim Backup or RestoreCloud live AC completion from this session.",
-      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
-    },
-    {
-      "id": "EV-016",
-      "requirement": "REQ-AGENT-012",
-      "claim": "The saved #624 plan was reloaded and checked against the implemented branch; live-matrix gaps are documented rather than overclaimed.",
+      "claim": "The saved #624 plan was reloaded and checked against the implemented branch; live evidence boundaries are documented rather than overclaimed.",
       "method": "command",
       "command": "wc -l docs/security/issue-624-desktop-operations-agent-plan.md; gh issue view 624 --repo silentspike/isyncyou --json state,title,labels",
       "result": "pass",
-      "evidence": "The plan was re-read at 924 lines after implementation. LiveWrite and Share have live Graph confirmation probes. Backup and RestoreCloud now have ignored live probes that compile, but this session did not have token seeds to execute them.",
+      "evidence": "The plan was re-read at 924 lines after implementation. LiveWrite, Share, Backup, and RestoreCloud have live Graph confirmation probes. RestoreLocal remains host-fixture backed, and Invite is not live-claimed without a controlled recipient.",
       "artifact": "docs/evidence/artifacts/issue-624/plan-verification.txt"
     }
   ]

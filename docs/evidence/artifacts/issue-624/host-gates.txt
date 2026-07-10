@@ -69,7 +69,7 @@ Notes:
 - Rust commands were executed via cargo remote; formatting was verified through cargo-remote-fmt.
 - Evidence contains no provider secret, OAuth query string, confirm secret, cap secret, share URL, or raw body sentinel.
 
-Task-13 live-matrix gap closure attempt:
+Task-13 live-matrix gap closure:
 
 - Code anchor before Task-13 edits: 5ff2bfd5fc4efac98ab5818cc141278e167aaa0f
 - PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers live_issue_624_agent_confirm_ --no-run
@@ -79,13 +79,14 @@ Task-13 live-matrix gap closure attempt:
     - live_issue_624_agent_confirm_share_link_and_cleanup
     - live_issue_624_agent_confirm_backup_mail_records_run
     - live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup
-- BLOCKED: executing the Backup and RestoreCloud live probes in this shell.
-  - ISY624_M365_WRITE_TOKEN_FILE=unset.
-  - ISY624_M365_WRITE_TOKEN=unset.
-  - ISY624_M365_DRAFT_TO=unset.
-  - No local #624 Microsoft 365 token seed file was found in checked config/tmp/workspace locations.
-- Required unblock command shape:
-  cargo remote -b ISY624_M365_WRITE_TOKEN=<redacted> -c -- test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_
+- PASS: ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_
+  - Result: 4 passed; 0 failed; 0 ignored; 89 filtered out; finished in 14.97s.
+  - Covered: live_issue_624_agent_confirm_create_draft_and_cleanup.
+  - Covered: live_issue_624_agent_confirm_share_link_and_cleanup.
+  - Covered: live_issue_624_agent_confirm_backup_mail_records_run.
+  - Covered: live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup.
+  - Token source: ~/.config/m365-write/token_cache.json via local MSAL silent acquisition.
+  - Token handling: temporary 0600 token file was removed after the run; no token value was written to evidence.
 - Interpretation:
-  - Do not claim Backup or RestoreCloud live AC completion from this Task-13 session.
-  - The missing live probes now exist and build; they still need a controlled Microsoft 365 token run and refreshed redacted evidence.
+  - Backup and RestoreCloud live ACs are now covered by real ignored live probes, alongside LiveWrite and Share.
+  - RestoreLocal remains host-fixture backed; Invite remains intentionally not live-claimed without a controlled recipient.
