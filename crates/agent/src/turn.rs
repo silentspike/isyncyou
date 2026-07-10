@@ -92,7 +92,7 @@ pub enum TurnOutcome {
     /// confirmation token only after the human confirms (handled by a later story).
     PendingConfirmation {
         id: String,
-        action: ToolAction,
+        action: Box<ToolAction>,
         preview: String,
     },
 }
@@ -180,7 +180,7 @@ pub fn run_turn(
                     let preview = format!("Requires confirmation — {} {:?}", action.op(), action);
                     return Ok(TurnOutcome::PendingConfirmation {
                         id: tu.id,
-                        action,
+                        action: Box::new(action),
                         preview,
                     });
                 }
@@ -383,7 +383,7 @@ mod tests {
         match outcome {
             TurnOutcome::PendingConfirmation { action, .. } => {
                 assert_eq!(action.op(), "live-write");
-                if let ToolAction::LiveWrite { change, .. } = action {
+                if let ToolAction::LiveWrite { change, .. } = action.as_ref() {
                     assert!(change.to_string().contains("recipient@example.com"));
                     assert!(change.to_string().contains("raw-body-sentinel"));
                 } else {

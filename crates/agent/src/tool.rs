@@ -94,6 +94,23 @@ pub enum ToolAction {
         account: String,
         service: String,
         id: String,
+        /// Preferred shape: `link` creates a sharing link; `invite` emails named recipients.
+        /// Omitted mode keeps old callers working: `recipient`/`recipients` => invite, else link.
+        #[serde(default)]
+        mode: Option<String>,
+        /// Link mode: `view`, `edit`, or `embed`.
+        #[serde(default)]
+        link_type: Option<String>,
+        /// Link mode: `anonymous`, `organization`, or `users`.
+        #[serde(default)]
+        scope: Option<String>,
+        /// Invite mode: one or more recipient emails. Public output only shows a count.
+        #[serde(default)]
+        recipients: Vec<String>,
+        /// Invite mode: `read` or `write`.
+        #[serde(default)]
+        role: Option<String>,
+        /// Backwards-compatible single-recipient invite input.
         #[serde(default)]
         recipient: Option<String>,
     },
@@ -197,7 +214,7 @@ pub fn help_text() -> String {
      backup {account, services?} [confirm] · \
      restore-cloud {account, service, id} [confirm] · \
      live-write {account, service, target?, change} [confirm] · \
-     share {account, service, id, recipient?} [confirm]. \
+     share {account, service, id, mode?, link_type?, scope?, recipients?, role?, recipient?} [confirm]. \
      There is no shell/filesystem/OS/network op."
         .to_string()
 }
@@ -240,10 +257,30 @@ pub fn public_tool_call_input(
                 out.insert("verb".to_string(), serde_json::json!(verb));
             }
         }
-        ToolAction::Share { recipient, .. } => {
+        ToolAction::Share {
+            recipient,
+            recipients,
+            mode,
+            link_type,
+            scope,
+            role,
+            ..
+        } => {
+            if let Some(mode) = mode {
+                out.insert("mode".to_string(), serde_json::json!(mode));
+            }
+            if let Some(link_type) = link_type {
+                out.insert("link_type".to_string(), serde_json::json!(link_type));
+            }
+            if let Some(scope) = scope {
+                out.insert("scope".to_string(), serde_json::json!(scope));
+            }
+            if let Some(role) = role {
+                out.insert("role".to_string(), serde_json::json!(role));
+            }
             out.insert(
                 "recipient_count".to_string(),
-                serde_json::json!(usize::from(recipient.is_some())),
+                serde_json::json!(recipients.len() + usize::from(recipient.is_some())),
             );
         }
         ToolAction::RestoreCloud { .. } => {}
@@ -294,6 +331,11 @@ pub fn tool_schema() -> serde_json::Value {
                 "max_bytes": { "type": "integer" },
                 "parent": { "type": "string" },
                 "target": { "type": "string" },
+                "mode": { "type": "string", "enum": ["link", "invite"] },
+                "link_type": { "type": "string", "enum": ["view", "edit", "embed"] },
+                "scope": { "type": "string", "enum": ["anonymous", "organization", "users"] },
+                "recipients": { "type": "array", "items": { "type": "string" } },
+                "role": { "type": "string", "enum": ["read", "write"] },
                 "recipient": { "type": "string" },
                 "change": {}
             },
@@ -374,6 +416,49 @@ mod tests {
                 "{op} must be destructive"
             );
         }
+    }
+
+    #[test]
+    fn parse_share_accepts_explicit_link_and_invite_shapes() {
+        let link = parse_action(&json!({
+            "op": "share",
+            "account": "me",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "link",
+            "link_type": "edit",
+            "scope": "organization"
+        }))
+        .unwrap();
+        assert_eq!(
+            link,
+            ToolAction::Share {
+                account: "me".into(),
+                service: "onedrive".into(),
+                id: "item-1".into(),
+                mode: Some("link".into()),
+                link_type: Some("edit".into()),
+                scope: Some("organization".into()),
+                recipients: vec![],
+                role: None,
+                recipient: None,
+            }
+        );
+
+        let invite = parse_action(&json!({
+            "op": "share",
+            "account": "me",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "invite",
+            "recipients": ["alpha@example.com", "beta@example.com"],
+            "role": "write"
+        }))
+        .unwrap();
+        assert_eq!(invite.class(), ToolClass::Destructive);
+        let public = public_tool_call_input(&invite, &json!({}));
+        assert_eq!(public["recipient_count"], 2);
+        assert!(!public.to_string().contains("alpha@example.com"));
     }
 
     #[test]

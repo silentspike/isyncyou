@@ -1312,6 +1312,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             match outcome {
                 Ok(isyncyou_agent::TurnOutcome::Final { .. }) => {}
                 Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
+                    let action = *action;
                     let preview = match agent_ops::preview_for_pending_action(&action) {
                         Ok(preview) => preview,
                         Err(e) => {
@@ -1343,7 +1344,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                                 &tid,
                                 isyncyou_agent::StreamEvent::ConfirmationRequired {
                                     id: pending_action.id,
-                                    action: pending_action.action,
+                                    action: Box::new(pending_action.action),
                                     preview: pending_action.preview,
                                     action_hash: pending_action.action_hash,
                                     risk: pending_action.risk,
@@ -3357,6 +3358,29 @@ mod tests {
         assert!(audit_text.contains("<redacted-email>"));
         assert!(audit_text.contains("execution_failed"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_share_invite_audit_summary_redacts_recipient_emails() {
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "share",
+            "account": "owner@example.com",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "invite",
+            "recipients": ["recipient@example.com"],
+            "role": "read"
+        }))
+        .unwrap();
+
+        let summary = agent_action_summary(&action);
+
+        assert!(summary.contains("op=share"));
+        assert!(summary.contains("service=onedrive"));
+        assert!(summary.contains("item=item-1"));
+        assert!(!summary.contains("owner@example.com"));
+        assert!(!summary.contains("recipient@example.com"));
+        assert!(summary.contains("<redacted-email>"));
     }
 
     #[test]

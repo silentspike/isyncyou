@@ -56,6 +56,10 @@ impl PendingOperationPreview {
 
 const BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 const RESTORE_CLOUD_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
+const SHARE_SERVICES: &[&str] = &["onedrive"];
+const SHARE_LINK_TYPES: &[&str] = &["view", "edit", "embed"];
+const SHARE_LINK_SCOPES: &[&str] = &["anonymous", "organization", "users"];
+const SHARE_INVITE_ROLES: &[&str] = &["read", "write"];
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BackupDelta {
@@ -385,6 +389,241 @@ fn run_restore_cloud_with_runtime<R: RestoreCloudRuntime>(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentShareIntent {
+    Link {
+        link_type: String,
+        scope: String,
+    },
+    Invite {
+        recipients: Vec<String>,
+        role: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShareRun {
+    mode: String,
+    service: String,
+    item_id: String,
+    link_type: Option<String>,
+    scope: Option<String>,
+    role: Option<String>,
+    recipient_count: usize,
+    summary: String,
+}
+
+fn run_share(
+    cfg: &Config,
+    action: &isyncyou_agent::ToolAction,
+    gate: &Arc<Mutex<()>>,
+) -> Result<ShareRun, String> {
+    run_share_with_runtime(cfg, action, gate, &LiveShareRuntime)
+}
+
+trait ShareRuntime {
+    fn share_link(
+        &self,
+        cfg: &Config,
+        account: &str,
+        service: &str,
+        id: &str,
+        link_type: &str,
+        scope: &str,
+    ) -> Result<String, String>;
+
+    fn invite(
+        &self,
+        cfg: &Config,
+        account: &str,
+        service: &str,
+        id: &str,
+        recipients: &[String],
+        role: &str,
+    ) -> Result<String, String>;
+}
+
+struct LiveShareRuntime;
+
+impl ShareRuntime for LiveShareRuntime {
+    fn share_link(
+        &self,
+        cfg: &Config,
+        account: &str,
+        service: &str,
+        id: &str,
+        link_type: &str,
+        scope: &str,
+    ) -> Result<String, String> {
+        let handler = crate::DaemonShare::new(cfg.clone());
+        isyncyou_webui::ShareHandler::share(&handler, account, service, id, link_type, scope)
+    }
+
+    fn invite(
+        &self,
+        cfg: &Config,
+        account: &str,
+        service: &str,
+        id: &str,
+        recipients: &[String],
+        role: &str,
+    ) -> Result<String, String> {
+        let handler = crate::DaemonShare::new(cfg.clone());
+        isyncyou_webui::ShareHandler::invite(&handler, account, service, id, recipients, role)
+    }
+}
+
+fn run_share_with_runtime<R: ShareRuntime>(
+    cfg: &Config,
+    action: &isyncyou_agent::ToolAction,
+    gate: &Arc<Mutex<()>>,
+    runtime: &R,
+) -> Result<ShareRun, String> {
+    let isyncyou_agent::ToolAction::Share {
+        account,
+        service,
+        id,
+        ..
+    } = action
+    else {
+        return Err(format!("not_share_action: {}", action.op()));
+    };
+    let intent = validate_share_action(action)?;
+    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    match intent {
+        AgentShareIntent::Link { link_type, scope } => {
+            let _web_url = runtime.share_link(cfg, account, service, id, &link_type, &scope)?;
+            Ok(ShareRun {
+                mode: "link".to_string(),
+                service: service.to_string(),
+                item_id: id.to_string(),
+                link_type: Some(link_type),
+                scope: Some(scope),
+                role: None,
+                recipient_count: 0,
+                summary: "sharing link created".to_string(),
+            })
+        }
+        AgentShareIntent::Invite { recipients, role } => {
+            let summary = runtime.invite(cfg, account, service, id, &recipients, &role)?;
+            Ok(ShareRun {
+                mode: "invite".to_string(),
+                service: service.to_string(),
+                item_id: id.to_string(),
+                link_type: None,
+                scope: None,
+                role: Some(role),
+                recipient_count: recipients.len(),
+                summary: redact_agent_operation_text(&summary),
+            })
+        }
+    }
+}
+
+fn validate_share_action(action: &isyncyou_agent::ToolAction) -> Result<AgentShareIntent, String> {
+    let isyncyou_agent::ToolAction::Share {
+        service,
+        id,
+        mode,
+        link_type,
+        scope,
+        recipients,
+        role,
+        recipient,
+        ..
+    } = action
+    else {
+        return Err(format!("not_share_action: {}", action.op()));
+    };
+    validate_service("share", service, SHARE_SERVICES)?;
+    validate_share_item_id(id)?;
+
+    let mut invite_recipients = recipients.clone();
+    if let Some(recipient) = recipient {
+        invite_recipients.push(recipient.clone());
+    }
+    let effective_mode = mode.as_deref().unwrap_or(if invite_recipients.is_empty() {
+        "link"
+    } else {
+        "invite"
+    });
+
+    match effective_mode {
+        "link" => {
+            if !invite_recipients.is_empty() {
+                return Err("invalid_share_request: link mode cannot include recipients".into());
+            }
+            let link_type = link_type.as_deref().unwrap_or("view");
+            let scope = scope.as_deref().unwrap_or("anonymous");
+            validate_named_value("share_link_type", link_type, SHARE_LINK_TYPES)?;
+            validate_named_value("share_link_scope", scope, SHARE_LINK_SCOPES)?;
+            Ok(AgentShareIntent::Link {
+                link_type: link_type.to_string(),
+                scope: scope.to_string(),
+            })
+        }
+        "invite" => {
+            if link_type.is_some() || scope.is_some() {
+                return Err("invalid_share_request: invite mode cannot include link fields".into());
+            }
+            let role = role.as_deref().unwrap_or("read");
+            validate_named_value("invite_role", role, SHARE_INVITE_ROLES)?;
+            let recipients = normalize_share_recipients(&invite_recipients)?;
+            Ok(AgentShareIntent::Invite {
+                recipients,
+                role: role.to_string(),
+            })
+        }
+        _ => Err("invalid_share_request: unknown mode".to_string()),
+    }
+}
+
+fn validate_named_value(kind: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("invalid_{kind}"))
+    }
+}
+
+fn validate_share_item_id(item_id: &str) -> Result<(), String> {
+    if item_id.is_empty() {
+        return Err("share item id is empty".into());
+    }
+    if item_id.len() > 512 {
+        return Err("share item id is too long".into());
+    }
+    Ok(())
+}
+
+fn normalize_share_recipients(recipients: &[String]) -> Result<Vec<String>, String> {
+    if recipients.is_empty() {
+        return Err("invite requires at least one recipient".into());
+    }
+    if recipients.len() > 20 {
+        return Err("invite recipient count exceeds limit".into());
+    }
+    let mut normalized = Vec::new();
+    for recipient in recipients {
+        let trimmed = recipient.trim();
+        if trimmed.is_empty() {
+            return Err("invite recipient is empty".into());
+        }
+        if trimmed.len() > 320 {
+            return Err("invite recipient is too long".into());
+        }
+        if trimmed.chars().any(char::is_control) || !trimmed.contains('@') {
+            return Err("invite recipient is malformed".into());
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        if !normalized.contains(&lowered) {
+            normalized.push(lowered);
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
 pub(crate) fn preview_for_pending_action(
     action: &isyncyou_agent::ToolAction,
 ) -> Result<PendingOperationPreview, String> {
@@ -425,22 +664,20 @@ pub(crate) fn preview_for_pending_action(
                 "Apply {service} {verb} to {target} for account {account}"
             )))
         }
-        isyncyou_agent::ToolAction::Share {
-            account,
-            service,
-            id,
-            recipient,
-        } => {
-            validate_service("share", service, &["onedrive"])?;
-            if let Some(recipient) = recipient {
-                validate_recipient(recipient)?;
-                Ok(PendingOperationPreview::destructive(format!(
-                    "Invite 1 recipient to OneDrive item {id} for account {account}"
-                )))
-            } else {
-                Ok(PendingOperationPreview::destructive(format!(
-                    "Create a sharing link for OneDrive item {id} for account {account}"
-                )))
+        isyncyou_agent::ToolAction::Share { account, id, .. } => {
+            let intent = validate_share_action(action)?;
+            match intent {
+                AgentShareIntent::Invite { recipients, .. } => Ok(
+                    PendingOperationPreview::destructive(format!(
+                        "Invite {} recipient(s) to OneDrive item {id} for account {account}",
+                        recipients.len()
+                    )),
+                ),
+                AgentShareIntent::Link { link_type, scope } => Ok(
+                    PendingOperationPreview::destructive(format!(
+                        "Create {scope} {link_type} sharing link for OneDrive item {id} for account {account}"
+                    )),
+                ),
             }
         }
         isyncyou_agent::ToolAction::Search { .. }
@@ -515,14 +752,6 @@ fn validate_live_write(service: &str, change: &serde_json::Value) -> Result<Stri
             redact_agent_operation_text(verb)
         ))
     }
-}
-
-fn validate_recipient(recipient: &str) -> Result<(), String> {
-    let trimmed = recipient.trim();
-    if trimmed.is_empty() || trimmed.len() > 320 || !trimmed.contains('@') {
-        return Err("invalid_share_recipient".to_string());
-    }
-    Ok(())
 }
 
 pub(crate) fn redact_agent_operation_text(raw: &str) -> String {
@@ -906,6 +1135,24 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
                     .to_string(),
                 ))
             }
+            isyncyou_agent::ToolAction::Share { account, .. } => {
+                let run = run_share(&self.cfg, action, &self.gate)?;
+                Ok(ConfirmedActionResult::new(
+                    serde_json::json!({
+                        "op": "share",
+                        "account": redact_agent_operation_text(account),
+                        "service": run.service,
+                        "item_id": redact_agent_operation_text(&run.item_id),
+                        "mode": run.mode,
+                        "link_type": run.link_type,
+                        "scope": run.scope,
+                        "role": run.role,
+                        "recipient_count": run.recipient_count,
+                        "summary": run.summary,
+                    })
+                    .to_string(),
+                ))
+            }
             _ => Err(format!(
                 "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
                 action.op()
@@ -1076,6 +1323,75 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct ShareRuntimeState {
+        link_calls: Vec<(String, String, String, String, String)>,
+        invite_calls: Vec<(String, String, String, Vec<String>, String)>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingShareRuntime {
+        state: Arc<StdMutex<ShareRuntimeState>>,
+        link_result: Result<String, String>,
+        invite_result: Result<String, String>,
+    }
+
+    impl RecordingShareRuntime {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(ShareRuntimeState::default())),
+                link_result: Ok("https://tenant.sharepoint.com/:w:/r/sites/x?code=secret".into()),
+                invite_result: Ok(
+                    "invited alpha@example.com via https://tenant.example/link".into()
+                ),
+            }
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, ShareRuntimeState> {
+            self.state.lock().unwrap()
+        }
+    }
+
+    impl ShareRuntime for RecordingShareRuntime {
+        fn share_link(
+            &self,
+            _cfg: &Config,
+            account: &str,
+            service: &str,
+            id: &str,
+            link_type: &str,
+            scope: &str,
+        ) -> Result<String, String> {
+            self.state.lock().unwrap().link_calls.push((
+                account.to_string(),
+                service.to_string(),
+                id.to_string(),
+                link_type.to_string(),
+                scope.to_string(),
+            ));
+            self.link_result.clone()
+        }
+
+        fn invite(
+            &self,
+            _cfg: &Config,
+            account: &str,
+            service: &str,
+            id: &str,
+            recipients: &[String],
+            role: &str,
+        ) -> Result<String, String> {
+            self.state.lock().unwrap().invite_calls.push((
+                account.to_string(),
+                service.to_string(),
+                id.to_string(),
+                recipients.to_vec(),
+                role.to_string(),
+            ));
+            self.invite_result.clone()
+        }
+    }
+
     fn restore_enabled_config() -> Config {
         let mut cfg = Config::default();
         cfg.restore.cloud_restore_enabled = true;
@@ -1110,6 +1426,151 @@ mod tests {
         assert!(!redacted.contains("user@example.com"));
         assert!(redacted.contains("<redacted-url>"));
         assert!(redacted.contains("<redacted-email>"));
+    }
+
+    #[test]
+    fn agent_share_rejects_non_onedrive_before_pending() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "share",
+            "account": "me",
+            "service": "mail",
+            "id": "item-1",
+            "mode": "link"
+        }))
+        .unwrap();
+
+        let err = preview_for_pending_action(&action).unwrap_err();
+
+        assert!(err.contains("unsupported_share_service"));
+
+        let runtime = RecordingShareRuntime::new();
+        let gate = Arc::new(Mutex::new(()));
+        let err = run_share_with_runtime(&Config::default(), &action, &gate, &runtime).unwrap_err();
+        assert!(err.contains("unsupported_share_service"));
+        let state = runtime.state();
+        assert!(state.link_calls.is_empty());
+        assert!(state.invite_calls.is_empty());
+    }
+
+    #[test]
+    fn agent_share_link_accepts_organization_scope() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "share",
+            "account": "me",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "link",
+            "link_type": "edit",
+            "scope": "organization"
+        }))
+        .unwrap();
+
+        let preview = preview_for_pending_action(&action).unwrap();
+
+        assert!(preview.text.contains("organization edit sharing link"));
+        assert_eq!(preview.risk, "destructive");
+    }
+
+    #[test]
+    fn agent_share_link_confirm_routes_through_ledger_handler() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "share",
+            "account": "me",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "link",
+            "link_type": "view",
+            "scope": "organization"
+        }))
+        .unwrap();
+        let runtime = RecordingShareRuntime::new();
+        let gate = Arc::new(Mutex::new(()));
+
+        let run = run_share_with_runtime(&Config::default(), &action, &gate, &runtime).unwrap();
+
+        assert_eq!(run.mode, "link");
+        assert_eq!(run.link_type.as_deref(), Some("view"));
+        assert_eq!(run.scope.as_deref(), Some("organization"));
+        assert_eq!(run.summary, "sharing link created");
+        assert!(!run.summary.contains("sharepoint.com"));
+        let state = runtime.state();
+        assert_eq!(
+            state.link_calls,
+            vec![(
+                "me".to_string(),
+                "onedrive".to_string(),
+                "item-1".to_string(),
+                "view".to_string(),
+                "organization".to_string(),
+            )]
+        );
+        assert!(state.invite_calls.is_empty());
+    }
+
+    #[test]
+    fn agent_share_invite_confirm_routes_through_ledger_handler() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "share",
+            "account": "me",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "invite",
+            "recipients": ["Beta@example.com", "alpha@example.com", "ALPHA@example.com"],
+            "role": "write"
+        }))
+        .unwrap();
+        let runtime = RecordingShareRuntime::new();
+        let gate = Arc::new(Mutex::new(()));
+
+        let run = run_share_with_runtime(&Config::default(), &action, &gate, &runtime).unwrap();
+
+        assert_eq!(run.mode, "invite");
+        assert_eq!(run.role.as_deref(), Some("write"));
+        assert_eq!(run.recipient_count, 2);
+        assert!(!run.summary.contains("alpha@example.com"));
+        assert!(!run.summary.contains("tenant.example"));
+        assert!(run.summary.contains("<redacted-email>"));
+        assert!(run.summary.contains("<redacted-url>"));
+        let state = runtime.state();
+        assert!(state.link_calls.is_empty());
+        assert_eq!(
+            state.invite_calls,
+            vec![(
+                "me".to_string(),
+                "onedrive".to_string(),
+                "item-1".to_string(),
+                vec![
+                    "alpha@example.com".to_string(),
+                    "beta@example.com".to_string()
+                ],
+                "write".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_share_invite_preview_and_result_redact_emails() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "share",
+            "account": "me",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "invite",
+            "recipients": ["recipient@example.com"],
+            "role": "read"
+        }))
+        .unwrap();
+
+        let preview = preview_for_pending_action(&action).unwrap();
+        let runtime = RecordingShareRuntime::new();
+        let gate = Arc::new(Mutex::new(()));
+        let run = run_share_with_runtime(&Config::default(), &action, &gate, &runtime).unwrap();
+
+        assert!(preview.text.contains("Invite 1 recipient"));
+        assert!(!preview.text.contains("recipient@example.com"));
+        assert_eq!(run.recipient_count, 1);
+        assert!(!run.summary.contains("recipient@example.com"));
+        assert!(run.summary.contains("<redacted-email>"));
     }
 
     #[test]
