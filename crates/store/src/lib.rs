@@ -2989,7 +2989,7 @@ mod tests {
         // #0D: a mutating OneDrive op is recorded idempotently before it hits Graph, so a
         // crash mid-op is recoverable and a re-issued intent never causes a second effect.
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 15);
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
         let op = CloudWriteOp {
             op_id: "op1".into(),
             account_id: "a".into(),
