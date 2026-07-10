@@ -3911,6 +3911,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_provider_selection_uses_stored_claude_oauth_credential() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("agent-provider-claude");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "stored-claude-token".into(),
+                refresh_token: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+            })
+            .unwrap();
+
+        let provider = agent.build_turn_provider("system");
+
+        assert_eq!(provider.name(), "subscription");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_provider_selection_uses_stored_codex_oauth_credential() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("agent-provider-codex");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        store_codex_blob(
+            &root,
+            &CodexStoredCredential {
+                access_token: "stored-codex-token".into(),
+                refresh_token: String::new(),
+                account_id: "acct_123".into(),
+                expires_at_ms: now_ms() + 3_600_000,
+            },
+        )
+        .unwrap();
+        agent.set_agent_settings("codex", "gpt-5.5").unwrap();
+
+        let provider = agent.build_turn_provider("system");
+
+        assert_eq!(provider.name(), "codex");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_provider_selection_uses_fake_when_unconfigured() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("agent-provider-fake");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        env.set_home(&home);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        let provider = agent.build_turn_provider("system");
+
+        assert_eq!(provider.name(), "fake");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(all(
         feature = "agent-oauth-providers",
         not(feature = "agent-subscription-experimental")
