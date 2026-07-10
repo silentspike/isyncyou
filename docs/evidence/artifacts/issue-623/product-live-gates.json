@@ -1,16 +1,16 @@
 {
   "artifact": "issue-623-product-live-gates",
-  "captured_at": "2026-07-10T08:00:01Z",
-  "latest_verified_pre_commit_head": "c40dc7464eab63f477196d6eb40205dbc126b872",
-  "product_live_status": "credentialstore_seed_live_passed",
+  "captured_at": "2026-07-10T08:39:00Z",
+  "latest_verified_code_commit": "cfcc7143968171c376eddaec787ff7aea95f376f",
+  "product_live_status": "credentialstore_seed_and_device_app_oauth_live_passed",
   "remaining_blockers": [
-    "Real Device/App OAuth UI/system-browser/callback to encrypted CredentialStore to StoreArchive roundtrip evidence is still missing. The ignored live gates seeded encrypted CredentialStore entries from locally available Claude/Codex credentials and proved the product load path plus real provider stream/tool roundtrip, but they do not prove the final user OAuth flow through the app.",
-    "This committed manifest/artifact set is not final-head-bound by construction. A PR-ready evidence bundle must be regenerated after the final content commit or produced by CI/external artifact with --require-head."
+    "No functional #623 blocker remains from the product OAuth live path. The committed manifest is code-commit-bound to cfcc7143968171c376eddaec787ff7aea95f376f; a CI/external artifact may additionally run check_evidence.py --require-head after the final evidence commit if strict HEAD equality is required."
   ],
   "head_binding": {
-    "status": "not_final_head_bound",
-    "reason": "A tracked manifest cannot contain the hash of the commit that also changes it. Use this as blocked handoff evidence; regenerate after the final commit for PR-ready evidence.",
-    "strict_check_required_before_pr": "python3 tools/check_evidence.py --manifest docs/evidence/issue-623-manifest.json --require-head"
+    "status": "code_commit_bound",
+    "reason": "The tracked manifest/artifacts bind to the code commit that was built, installed, and exercised on-device. A tracked file cannot contain the hash of a later commit that also changes that same file, so --require-head is reserved for CI/external regenerated evidence.",
+    "code_commit": "cfcc7143968171c376eddaec787ff7aea95f376f",
+    "schema_check": "python3 tools/check_evidence.py --manifest docs/evidence/issue-623-manifest.json"
   },
   "local_client_header_drift": {
     "status": "raw_header_capture_partial_but_live_runtime_accepted",
@@ -19,8 +19,9 @@
     "live_acceptance": "Both product providers were accepted by their live backends using local credentials seeded into the encrypted CredentialStore path; this is live runtime acceptance of the in-repo header/body recipe, not raw installed-client header extraction."
   },
   "device_app_oauth_flow": {
-    "status": "not_live_proven",
-    "required_to_close": "Run a real app/device OAuth start/callback/complete flow that writes encrypted credentials, then prove provider stream + StoreArchive tool roundtrip from that stored credential."
+    "status": "live_proven",
+    "artifact": "docs/evidence/artifacts/issue-623/device-app-oauth-flow.json",
+    "summary": "Pixel 8 Pro debug APK opened Claude OAuth from the Assistant setup UI and Codex OAuth from the Assistant model picker. Claude completed through the manual code flow; Codex completed through the localhost:1455 loopback callback. The app wrote two app-private encrypted provider credentials, and subsequent mobile WebView agent turns produced real Claude and Codex tool_call events plus StoreArchive tool_result events and done.reason=complete."
   },
   "credential_probe": {
     "config_dir": "$HOME/.config/isyncyou",
@@ -43,6 +44,10 @@
       "live_claude_oauth_storearchive_tool_roundtrip",
       "live_codex_oauth_storearchive_tool_roundtrip"
     ],
+    "redacted_trace_artifacts": [
+      "docs/evidence/artifacts/issue-623/claude-oauth-live-storearchive-trace.json",
+      "docs/evidence/artifacts/issue-623/codex-oauth-live-storearchive-trace.json"
+    ],
     "seed_source": "explicit environment variables persisted through the same encrypted app-host CredentialStore load path used by product OAuth",
     "must_observe": [
       "provider tool_call",
@@ -52,10 +57,12 @@
     ],
     "compile_list_command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_ -- --list",
     "compile_list_result": "pass",
-    "claude_live_command": "Python harness read local Claude OAuth JSON without printing values, set ISY623_CLAUDE_OAUTH_ACCESS/REFRESH in the child environment, then ran cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_claude_oauth_storearchive_tool_roundtrip -- --ignored --nocapture",
+    "claude_live_command": "Python harness read local Claude OAuth JSON without printing values, set ISY623_CLAUDE_OAUTH_ACCESS/REFRESH and ISY623_LIVE_TRACE_DIR in the child environment, then ran cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_claude_oauth_storearchive_tool_roundtrip -- --ignored --nocapture",
     "claude_live_result": "pass",
-    "codex_live_command": "Python harness read local Codex auth JSON without printing values, set ISY623_CODEX_OAUTH_ACCESS/REFRESH/ACCOUNT_ID in the child environment, then ran cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_codex_oauth_storearchive_tool_roundtrip -- --ignored --nocapture",
+    "claude_trace_result": "pass: trace shows tool_call search, tool_result containing m-live and fixture sentinel, tool_call read m-live, second positive tool_result, done.reason=complete",
+    "codex_live_command": "Python harness read local Codex auth JSON without printing values, set ISY623_CODEX_OAUTH_ACCESS/REFRESH/ACCOUNT_ID and ISY623_LIVE_TRACE_DIR in the child environment, then ran cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_codex_oauth_storearchive_tool_roundtrip -- --ignored --nocapture",
     "codex_live_result": "pass",
+    "codex_trace_result": "pass: trace shows tool_call search, tool_result containing m-live and fixture sentinel, tool_call read m-live, second positive tool_result, done.reason=complete",
     "workspace_test_observation": "cargo +1.95.0 test --workspace --no-fail-fast previously passed; after the live-gate fixture fix, the two product OAuth live gates passed when explicitly run with local credentials seeded into the child process."
   },
   "host_gates": [
@@ -110,6 +117,16 @@
       "test": "live_codex_oauth_storearchive_tool_roundtrip",
       "result": "pass",
       "seed": "local Codex OAuth credential copied into child-process ISY623_* env only"
+    },
+    {
+      "test": "device_app_oauth_claude_storearchive_turn",
+      "result": "pass",
+      "seed": "user completed the Claude OAuth flow from the Android Assistant UI; provider credential persisted in the app-private encrypted CredentialStore"
+    },
+    {
+      "test": "device_app_oauth_codex_storearchive_turn",
+      "result": "pass",
+      "seed": "user completed the Codex OAuth flow from the Android Assistant UI/model picker; provider credential persisted in the app-private encrypted CredentialStore"
     }
   ]
 }
