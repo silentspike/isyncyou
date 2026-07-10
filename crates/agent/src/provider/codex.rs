@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_BETA: &str = "responses=experimental";
-const DEFAULT_CLI_VERSION: &str = "0.142.3";
+const DEFAULT_CLI_VERSION: &str = "0.144.1";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 
 /// The ChatGPT/Codex wire configuration. Defaults to the verified recipe; the product
@@ -248,7 +248,7 @@ mod live {
         }
 
         /// The Codex-CLI identity headers + Bearer (the legitimately-obtained token).
-        fn request_headers(&self) -> Vec<(String, String)> {
+        pub(crate) fn request_headers(&self) -> Vec<(String, String)> {
             vec![
                 (
                     "authorization".to_string(),
@@ -310,7 +310,7 @@ mod live {
             )?;
             if response.status == 401 || response.status == 403 {
                 return Err(AgentError::Provider(
-                    "codex: unauthorized — run the official `codex` login first".into(),
+                    "codex: unauthorized — connect ChatGPT again".into(),
                 ));
             }
             if response.status >= 400 {
@@ -351,6 +351,7 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(c.model, "gpt-5.5");
+        assert_eq!(c.cli_version, "0.144.1");
     }
 
     #[test]
@@ -361,10 +362,36 @@ mod tests {
         assert_eq!(body["instructions"], "be terse");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "isyncyou");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn headers_mimic_codex_cli() {
+        let p = CodexProvider::new(
+            "tok123",
+            "instructions",
+            CodexConfig {
+                account_id: "acct_123".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let h = p.request_headers();
+        let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+
+        assert_eq!(get("authorization").unwrap(), "Bearer tok123");
+        assert_eq!(get("chatgpt-account-id").unwrap(), "acct_123");
+        assert_eq!(get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(get("openai-beta").unwrap(), "responses=experimental");
+        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.1");
+        assert_eq!(get("accept").unwrap(), "text/event-stream");
+        assert!(get("content-type").is_none());
     }
 
     #[test]
