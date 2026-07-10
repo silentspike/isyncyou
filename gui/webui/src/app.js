@@ -4522,9 +4522,11 @@ async function startAiLogin(provider) {
     const params = { provider };
     const redirect = localCallbackRedirect("localhost");
     if (redirect) params.redirect = redirect;
+    const manualCodeFlow = provider === "claude" && !redirect;
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    showWaitingStep();               // waiting UI + poll; completes when /callback fires
+    if (manualCodeFlow) showCodeStep();
+    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
     guardId = await beginNetworkGuard();
     AGENT_GUARD_ID = guardId;
@@ -4572,7 +4574,7 @@ function showCodeStep() {
     el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
     el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
       el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
-      el("button", { class: "btn", onclick: () => renderAssistantView($("#view")) }, "Cancel"),
+      el("button", { class: "btn", onclick: async () => { await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
     ),
   );
 }
@@ -4583,9 +4585,11 @@ async function completeAiLogin() {
   if (!code) { toast("Paste the code first"); return; }
   try {
     await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    await finishAgentGuard();
     toast("Connected!");
     renderAssistantView($("#view"));   // re-fetch status -> switches to chat
   } catch (e) {
+    await finishAgentGuard();
     toast("Couldn't connect: " + (e.message || e));
   }
 }
@@ -4722,7 +4726,7 @@ function renderAssistantSetup(body, st) {
       renderAssistantConsentPanel(["claude", "codex"]),
       el("div", { class: "assistant-setup-actions" }, claude, codex),
       st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,
-      el("p", { class: "dim assistant-setup-note", text: "Experimental — uses your own subscription. You can disconnect any time." }),
+      el("p", { class: "dim assistant-setup-note", text: "Uses your Claude or ChatGPT subscription. You can disconnect any time." }),
     ),
   );
 }

@@ -8758,6 +8758,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "agent-connect-openai",
             "data-agent-byo-key",
             "BYO API key",
+            "Experimental — uses your own subscription",
             "subscription/import",
         ] {
             assert!(
@@ -8872,6 +8873,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     "return location.port ? `http://${host}:${location.port}/callback` : \"\";"
                 ),
             "callback redirect must be omitted when location.port is empty"
+        );
+    }
+
+    #[test]
+    fn assistant_claude_oauth_uses_manual_code_step_without_loopback_redirect() {
+        assert!(
+            APP_JS.contains("const manualCodeFlow = provider === \"claude\" && !redirect;"),
+            "Claude on appassets must detect the manual code flow when no loopback redirect exists"
+        );
+        assert!(
+            APP_JS.contains("if (manualCodeFlow) showCodeStep();\n    else showWaitingStep();"),
+            "manual Claude OAuth must show the paste-code UI instead of a polling-only wait screen"
+        );
+        assert!(
+            APP_JS.contains("await finishAgentGuard();\n    toast(\"Connected!\");"),
+            "manual OAuth completion must clean up the network guard after a successful code exchange"
+        );
+        assert!(
+            APP_JS.contains("await finishAgentGuard(); renderAssistantView($(\"#view\"));"),
+            "manual OAuth cancellation must clean up the network guard"
         );
     }
 
