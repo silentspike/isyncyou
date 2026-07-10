@@ -1,6 +1,6 @@
 {
   "issue": 625,
-  "commit_under_test": "d8b36cc7e12932ce0155e09b63c4e5a22c15601f",
+  "commit_under_test": "d237e2c1515cb634e5e741559faf99ffc9c514d6",
   "scope": "mobile_full_node_server_router_job_contract",
   "native_android_scope": {
     "physical_biometric_prompt": "pending_issue_626",

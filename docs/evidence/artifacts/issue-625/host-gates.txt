@@ -1,6 +1,6 @@
 # Issue #625 Host Evidence
 
-Code anchor before evidence-only/doc follow-up: d8b36cc7e12932ce0155e09b63c4e5a22c15601f
+Code anchor before evidence-only/doc follow-up: d237e2c1515cb634e5e741559faf99ffc9c514d6
 Branch: feature/ag-625
 Scope: mobile full-node server/router/job contract. Native Android BiometricPrompt,
 Keystore, foreground-service/job presentation, and physical device closeout remain #626.
@@ -88,6 +88,28 @@ Post-review hardening rerun:
 - PASS: cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings
 - PASS: cargo-remote-fmt --check
   - Result: CLEAN; CI fmt will pass.
+
+Post-PR dev-check schema-current fix rerun:
+
+- Context: PR #767 `dev-checks` failed in the existing Store cloud-write ledger
+  recovery test because that test asserted the previous hard-coded schema version
+  `15` after #625 correctly bumped the Store schema to `16`.
+- Fix: `cloud_write_ledger_is_idempotent_and_recovers_pending` now asserts
+  `SCHEMA_VERSION`, keeping the regression test current across future migrations.
+- PASS: cargo remote -c -- test -p isyncyou-store --lib cloud_write_ledger_is_idempotent_and_recovers_pending -- --nocapture
+  - Result: command exited 0.
+- PASS: cargo remote -c -- test -p isyncyou-store --lib -- --nocapture
+  - Result: command exited 0.
+- PASS: cargo remote -c -- clippy -p isyncyou-store --all-targets -- -D warnings
+- PASS: cargo-remote-fmt --check
+  - Result: CLEAN; CI fmt will pass.
+- PASS: python3 tools/check_traceability.py
+  - Result: requirements: 68 total; 66 implemented; 2 planned; every implemented requirement is traceable to existing tests.
+- PASS: python3 tools/check_evidence.py --manifest docs/evidence/issue-625-manifest.json
+  - Result: evidence manifest: 8 entries; schema-valid; commit exists; every cited requirement exists; every test entry names a real test; every artifact exists.
+- PASS: git diff --check origin/dev...HEAD
+- PASS: stale restore-contract no-go scan
+- PASS: issue-625 evidence secret-shaped scan
 
 Static/no-go interpretation:
 
