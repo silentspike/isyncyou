@@ -1,17 +1,19 @@
-//! Official Anthropic Messages API provider (REQ-AGENT-008). BYO API key (`x-api-key`).
-//! The request building + response parsing are pure (unit-tested, no network); the live
-//! call is behind the `http` feature and exercised only by a live-gated test — CI uses
-//! `FakeProvider` and never a real token.
+//! Anthropic Messages request/response helpers plus the legacy BYO API-key provider.
+//! The shared request building + response parsing are used by the Claude OAuth-compatible
+//! runtime; the `AnthropicProvider` API-key live type is quarantined behind
+//! `byo-api-providers`.
 
+#[cfg(any(feature = "byo-api-providers", test))]
 use super::{AssistantBlock, Usage};
 use crate::tool::{tool_schema, TOOL_NAME};
 use crate::turn::{Message, Role};
+#[cfg(any(feature = "byo-api-providers", test))]
 use crate::AgentError;
 use serde_json::{json, Value};
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
@@ -48,6 +50,7 @@ pub(crate) fn build_messages(history: &[Message]) -> Vec<Value> {
 
 /// Build the full Messages request body. `tool_schema()` already has Anthropic's
 /// `{name, description, input_schema}` shape.
+#[cfg(any(feature = "byo-api-providers", test))]
 pub(crate) fn build_request(model: &str, system: &str, history: &[Message]) -> Value {
     build_request_blocks(model, json!(system), history)
 }
@@ -66,7 +69,7 @@ pub(crate) fn build_request_blocks(model: &str, system: Value, history: &[Messag
     })
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 fn headers(api_key: &str) -> Vec<(String, String)> {
     vec![
         ("x-api-key".to_string(), api_key.to_string()),
@@ -80,6 +83,7 @@ fn headers(api_key: &str) -> Vec<(String, String)> {
 
 /// Parse a Messages response into assistant blocks + usage. Surfaces API errors clearly
 /// without leaking the key.
+#[cfg(any(feature = "byo-api-providers", test))]
 pub(crate) fn parse_response(v: &Value) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
     if let Some(err) = v.get("error") {
         let msg = err
@@ -123,11 +127,12 @@ pub(crate) fn parse_response(v: &Value) -> Result<(Vec<AssistantBlock>, Usage), 
         Usage {
             input_tokens: g("input_tokens"),
             output_tokens: g("output_tokens"),
+            ..Default::default()
         },
     ))
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 mod live {
     use super::*;
     use crate::provider::{LlmProvider, StreamEvent};
@@ -191,7 +196,7 @@ mod live {
     }
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 pub use live::AnthropicProvider;
 
 #[cfg(test)]
@@ -257,7 +262,8 @@ mod tests {
             usage,
             Usage {
                 input_tokens: 12,
-                output_tokens: 34
+                output_tokens: 34,
+                ..Default::default()
             }
         );
     }

@@ -14,9 +14,8 @@ isyncyou-graph = { path = "../graph", features = ["http"] }
 isyncyou-connectors = { path = "../connectors", features = ["http"], default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
-# Agent harness (S-AG.6/#621). Default features only — no store/SQLCipher pull, so it
-# adds no bundling-feature pressure to the encrypted/plain chains. StoreArchive-backed
-# basic retrieval is S-AG.3/#618 and is enabled only by the app-host experimental feature.
+# Agent harness (S-AG.6/#621). The app-host feature flags below decide whether to
+# compile the product OAuth provider/retrieval path or the #627 local fallback surface.
 isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 
@@ -27,7 +26,7 @@ filetime = "0.2"
 # Desktop default; the mobile crate depends with default-features = false so the
 # whole chain (store, engine, connectors, webui) builds plain (no SQLCipher/OpenSSL,
 # no D-Bus keyring) for Android. See #89 P0.
-default = ["encrypted-store", "desktop-keyring"]
+default = ["encrypted-store", "desktop-keyring", "agent-oauth-providers"]
 desktop-keyring = ["isyncyou-engine/desktop-keyring"]
 encrypted-store = [
     "isyncyou-store/encrypted-store",
@@ -41,13 +40,18 @@ plain-store = [
     "isyncyou-connectors/plain-store",
     "isyncyou-webui/plain-store",
 ]
-# EXPERIMENTAL, default-OFF, personal-build only (risk R8): enables the subscription
-# OAuth login + provider in the agent harness. Never enabled in CI/release artifacts;
-# the operator opts in for their own Desktop/Android build. Pulls the agent's http
-# stack (reqwest/rustls) AND the real retrieval executor (`StoreArchive` over the
-# encrypted store + body files, S-AG.3/#618) so the assistant actually searches the
-# archive instead of the stub. S-AG.18/#643 is only the progressive/deep-search layer.
-agent-subscription-experimental = [
-    "isyncyou-agent/agent-subscription-experimental",
+# Product Claude/Codex app-OAuth provider path (#623): provider runtime + encrypted
+# CredentialStore loading + real retrieval executor (`StoreArchive` over the encrypted
+# store + body files, S-AG.3/#618). Local CLI credential fallback is deliberately not
+# part of this feature.
+agent-oauth-providers = [
+    "isyncyou-agent/agent-oauth-providers",
     "isyncyou-agent/retrieval",
+]
+# EXPERIMENTAL, default-OFF, personal-build only (risk R8/#627): local CLI
+# fallback/capture surface. This is a superset of the product runtime plus the
+# agent's experimental wire/capture helpers; keep it out of release/CI product ACs.
+agent-subscription-experimental = [
+    "agent-oauth-providers",
+    "isyncyou-agent/agent-subscription-experimental",
 ]

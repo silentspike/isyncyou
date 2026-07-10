@@ -1,5 +1,4 @@
-//! EXPERIMENTAL device OAuth login (S-AG.12 / #627) — UNSUPPORTED, personal-build only,
-//! behind the default-off `agent-subscription-experimental` feature.
+//! Agent provider OAuth login support.
 //!
 //! Flow (RFC 8252 native-app, PKCE): the app asks [`start`] for an authorize URL; the
 //! WebView hands it to the **system browser**; the operator logs in to their own account
@@ -7,8 +6,8 @@
 //! engine's loopback `redirect_uri`; [`exchange`] swaps the code for a token (PKCE
 //! verifier), which is then stored in the [`crate::CredentialStore`].
 //!
-//! **Recipe-out-of-repo:** `authorize_url` / `token_url` / `client_id` / `scopes` come
-//! from a local, uncommitted [`OAuthConfig`]; nothing provider-specific is hardcoded here.
+//! Product defaults are non-secret public OAuth client metadata. Operator overrides may
+//! still come from a local, uncommitted [`OAuthConfig`] in development builds.
 
 use crate::AgentError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
@@ -297,8 +296,8 @@ pub fn refresh(
 }
 
 // ---------------------------------------------------------------------------------------
-// EXPERIMENTAL Codex/ChatGPT (OpenAI) device OAuth. Captured from the `codex` CLI
-// (auth.openai.com). Loopback flow on the fixed port the client registers; the token
+// Codex/ChatGPT (OpenAI) OAuth. Captured from the `codex` CLI (auth.openai.com).
+// Loopback flow on the fixed port the client registers; the token
 // endpoint wants form-urlencoding (not JSON), and the ChatGPT account id lives in the
 // id_token's `https://api.openai.com/auth` claim.
 // ---------------------------------------------------------------------------------------

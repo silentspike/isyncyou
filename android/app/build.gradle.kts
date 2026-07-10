@@ -146,9 +146,10 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     // One -t per ABI; cargo-ndk maps arm64-v8a -> aarch64-linux-android and
     // x86_64 -> x86_64-linux-android, building each requested target's .so.
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
-    // EXPERIMENTAL opt-in (risk R8): a personal build can enable extra cargo features
-    // (e.g. agent-subscription-experimental) via ISY_CARGO_FEATURES. Unset in CI/release,
-    // so the default artifact never carries the subscription login.
+    // Extra cargo features are reserved for explicit local/test builds (for example the
+    // #627-only agent-subscription-experimental local CLI fallback/capture surface).
+    // The #623 product Claude/Codex app-OAuth provider path is part of the Rust mobile
+    // default feature set, so it must not depend on ISY_CARGO_FEATURES.
     val extraFeatures = System.getenv("ISY_CARGO_FEATURES")
     val featureFlags = if (!extraFeatures.isNullOrBlank()) listOf("--features", extraFeatures) else emptyList()
     commandLine(

@@ -2,6 +2,7 @@
 //! [`FakeProvider`] is the deterministic CI provider (no real LLM tokens).
 
 use crate::tool::ToolAction;
+use std::collections::BTreeMap;
 
 /// Why a turn stream reached its terminal `done` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +174,10 @@ pub trait LlmProvider {
         history: &[crate::turn::Message],
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<Vec<AssistantBlock>, crate::AgentError>;
+
+    fn last_usage(&self) -> Option<Usage> {
+        None
+    }
 }
 
 /// Token usage reported by a provider (surfaced to the UI's usage chip).
@@ -180,19 +185,71 @@ pub trait LlmProvider {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub provider: String,
+    pub model: String,
+    pub request_id: Option<String>,
+    pub rate_limit: BTreeMap<String, String>,
 }
 
-// The official providers' pure request/parse logic is unit-tested without `http`; the
-// live structs need it. Compile the modules only when `http` is on or under test, so a
-// plain default build doesn't carry their (then-unused) helpers.
+impl Usage {
+    pub fn with_provider_response(
+        mut self,
+        provider: &str,
+        model: &str,
+        headers: &BTreeMap<String, String>,
+    ) -> Self {
+        self.provider = provider.to_string();
+        self.model = model.to_string();
+        self.request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("request-id"))
+            .cloned();
+        self.rate_limit = headers
+            .iter()
+            .filter(|(k, _)| k.contains("ratelimit") || k.as_str() == "retry-after")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.provider.is_empty()
+            && self.model.is_empty()
+            && self.request_id.is_none()
+            && self.rate_limit.is_empty()
+    }
+
+    pub fn to_public_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "provider": self.provider,
+            "model": self.model,
+            "request_id": self.request_id,
+            "rate_limit": self.rate_limit,
+        })
+    }
+}
+
+// Shared request/parse helpers are unit-tested without live provider features. The legacy
+// BYO API-key live providers are kept behind `byo-api-providers`; #623 product OAuth uses
+// `subscription`/`codex` instead.
 #[cfg(any(feature = "http", test))]
 pub mod anthropic;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub mod codex;
 pub mod fake;
-#[cfg(any(feature = "http", test))]
+#[cfg(any(feature = "byo-api-providers", test))]
 pub mod openai;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub mod subscription;
 pub use fake::FakeProvider;
 
@@ -249,5 +306,33 @@ mod tests {
                 assert_eq!(parsed["reason"], "cancelled");
             }
         }
+    }
+
+    #[test]
+    fn usage_public_json_keeps_only_provider_metadata() {
+        let headers = BTreeMap::from([
+            ("x-request-id".to_string(), "req-123".to_string()),
+            (
+                "x-ratelimit-remaining-requests".to_string(),
+                "12".to_string(),
+            ),
+            ("retry-after".to_string(), "7".to_string()),
+            ("authorization".to_string(), "Bearer secret".to_string()),
+            ("chatgpt-account-id".to_string(), "acct-secret".to_string()),
+        ]);
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 3,
+            ..Default::default()
+        }
+        .with_provider_response("codex", "gpt-5.5", &headers);
+        let public = usage.to_public_json();
+
+        assert_eq!(public["provider"], "codex");
+        assert_eq!(public["model"], "gpt-5.5");
+        assert_eq!(public["request_id"], "req-123");
+        assert_eq!(public["rate_limit"]["x-ratelimit-remaining-requests"], "12");
+        assert_eq!(public["rate_limit"]["retry-after"], "7");
+        assert!(!public.to_string().contains("secret"));
     }
 }

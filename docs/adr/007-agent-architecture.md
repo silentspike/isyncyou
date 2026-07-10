@@ -20,8 +20,8 @@ The constraints that force the shape of this decision:
   rustls behind its `http` feature). It is the wrong place for LLM duties.
 - The agent will read untrusted content (mail bodies, documents). A naive design that
   lets the model self-authorize actions is a prompt-injection hole.
-- This is a public repo with an audit-clean posture; provider authentication must be
-  the official, documented path by default.
+- This is a public repo with an audit-clean posture. Provider authentication must be
+  explicit, encrypted at rest, and separated from developer-local CLI credentials.
 
 ## Decision
 
@@ -44,12 +44,14 @@ The constraints that force the shape of this decision:
    free-form-HTTP tool. "Full power" is therefore bounded by the user's M365 data, not the
    system. A tool-registry snapshot test enforces it.
 
-5. **Provider strategy.** Official providers are the default and product path: Anthropic
-   Messages API + OpenAI Responses (BYO key; OpenAI `store: false` for M365 content).
-   `FakeProvider` is the only provider used in CI (no real LLM tokens). A Claude/Codex
-   **subscription** provider exists only as an experimental, feature-gated
-   (`agent-subscription-experimental`), default-off, personal-build-only path documented
-   under `docs/experimental/` — never in release artifacts, CI, or the README.
+5. **Provider strategy.** The product path is app-authorized Claude/Codex OAuth:
+   the Rust host/mobile process performs the provider call, stores OAuth material in
+   the encrypted agent CredentialStore, streams provider events into the AgentStreamHub,
+   and keeps Codex request retention disabled (`store:false`). `FakeProvider` is the
+   deterministic CI/unconfigured fallback only. BYO Anthropic/OpenAI API keys are not
+   the #623 product path. Local `claude`/`codex` CLI credential fallback and private
+   wire-drift capture remain a separate, default-off #627 surface
+   (`agent-subscription-experimental`) and are not product-auth evidence.
 
 6. **Confirmation without model authority.** Read/search/list/export/restore-local run
    immediately; `backup`/`restore-cloud`/`live-write`/`share` emit a **PendingAction**.
@@ -80,6 +82,6 @@ The constraints that force the shape of this decision:
   `docs/requirements/android.yml` (REQ-AND-016) and the agent threat model.
 - **Governance:** the invariants above are tracked as `REQ-AGENT-*` in
   `docs/requirements/agent.yml`, the mobile-write surface in
-  `docs/security/agent-threat-model.md`, and the subscription residual risk as an accepted
-  entry in the risk register.
+  `docs/security/agent-threat-model.md`, and the Claude/Codex OAuth plus #627 local
+  fallback residual risk as an accepted entry in the risk register.
 - **Supersedes:** none. **Superseded by:** none (yet).

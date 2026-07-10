@@ -4522,9 +4522,11 @@ async function startAiLogin(provider) {
     const params = { provider };
     const redirect = localCallbackRedirect("localhost");
     if (redirect) params.redirect = redirect;
+    const manualCodeFlow = provider === "claude" && !redirect;
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    showWaitingStep();               // waiting UI + poll; completes when /callback fires
+    if (manualCodeFlow) showCodeStep();
+    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
     guardId = await beginNetworkGuard();
     AGENT_GUARD_ID = guardId;
@@ -4572,7 +4574,7 @@ function showCodeStep() {
     el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
     el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
       el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
-      el("button", { class: "btn", onclick: () => renderAssistantView($("#view")) }, "Cancel"),
+      el("button", { class: "btn", onclick: async () => { await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
     ),
   );
 }
@@ -4583,9 +4585,11 @@ async function completeAiLogin() {
   if (!code) { toast("Paste the code first"); return; }
   try {
     await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    await finishAgentGuard();
     toast("Connected!");
     renderAssistantView($("#view"));   // re-fetch status -> switches to chat
   } catch (e) {
+    await finishAgentGuard();
     toast("Couldn't connect: " + (e.message || e));
   }
 }
@@ -4629,8 +4633,8 @@ function assistantCanUse() {
 const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
 const AGENT_PRIVACY_CONSENT_VERSION = 1;
 function agentProviderConsentId(provider) {
-  if (provider === "anthropic" || provider === "claude") return "claude";
-  if (provider === "openai" || provider === "codex") return "codex";
+  if (provider === "claude") return "claude";
+  if (provider === "codex") return "codex";
   return provider || "claude";
 }
 function agentActiveProvider(st) {
@@ -4677,12 +4681,6 @@ function renderAssistantConsentPanel(providers) {
         icon("x", "icon-sm"), "Reset")));
 }
 
-function renderAssistantByoKeyUnavailable() {
-  return el("div", { class: "assistant-setup-locked", "data-agent-byo-key": "unavailable" },
-    icon("shield", "icon-sm"),
-    el("span", { text: "BYO API key setup is unavailable until encrypted provider credentials land." }));
-}
-
 async function renderAssistantView(view) {
   clear(view).append(
     el("section", { id: "assistant-view", class: "assistant-view", "data-testid": "assistant-view" },
@@ -4709,15 +4707,15 @@ function renderAssistantSetup(body, st) {
   const hint = unavailable
     ? "Assistant is not available in this build."
     : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login.";
-  const anthropic = el("button", { id: "asst-connect-anthropic", class: "btn primary", onclick: () => startAiLogin("anthropic"), "data-testid": "agent-connect-anthropic" },
+  const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => startAiLogin("claude"), "data-testid": "agent-connect-claude" },
     icon("sparkles", "icon-sm"), "Connect Claude");
-  const openai = el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai"), "data-testid": "agent-connect-openai" },
+  const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => startAiLogin("codex"), "data-testid": "agent-connect-codex" },
     icon("sparkles", "icon-sm"), "Connect ChatGPT");
   if (unavailable || !claudeAllowed) {
-    anthropic.setAttribute("disabled", "disabled");
+    claude.setAttribute("disabled", "disabled");
   }
   if (unavailable || !codexAllowed) {
-    openai.setAttribute("disabled", "disabled");
+    codex.setAttribute("disabled", "disabled");
   }
   body.append(
     el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
@@ -4726,10 +4724,9 @@ function renderAssistantSetup(body, st) {
       el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
       el("p", { class: "dim assistant-setup-copy", text: hint }),
       renderAssistantConsentPanel(["claude", "codex"]),
-      el("div", { class: "assistant-setup-actions" }, anthropic, openai),
-      renderAssistantByoKeyUnavailable(),
+      el("div", { class: "assistant-setup-actions" }, claude, codex),
       st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,
-      el("p", { class: "dim assistant-setup-note", text: "Experimental — uses your own subscription. You can disconnect any time." }),
+      el("p", { class: "dim assistant-setup-note", text: "Uses your Claude or ChatGPT subscription. You can disconnect any time." }),
     ),
   );
 }
@@ -4788,6 +4785,20 @@ function renderAssistantComposer(_st) {
     disabledReason ? el("div", { class: "dim assistant-composer-note", text: disabledReason }) : null);
 }
 
+function formatAssistantRateLimit(rateLimit) {
+  if (!rateLimit) return "";
+  if (typeof rateLimit === "string" || typeof rateLimit === "number") return String(rateLimit);
+  if (typeof rateLimit !== "object" || Array.isArray(rateLimit)) return "";
+  const entries = Object.entries(rateLimit).filter(([, value]) => value != null && value !== "");
+  if (!entries.length) return "";
+  const status = entries.find(([key, value]) => /status$/i.test(key) && typeof value === "string");
+  const utilization = entries.find(([key, value]) => /utilization$/i.test(key) && Number.isFinite(Number(value)));
+  const parts = [];
+  if (status) parts.push("limit " + status[1]);
+  if (utilization) parts.push(Math.round(Number(utilization[1]) * 100) + "%");
+  return parts.join(" · ");
+}
+
 function renderAssistantUsageChip(st) {
   const usage = st && st.usage ? st.usage : AssistantState.lastUsage;
   if (!usage) {
@@ -4798,7 +4809,8 @@ function renderAssistantUsageChip(st) {
   if (usage.request_id) parts.push("Request " + agentCompactValue(usage.request_id, 28));
   if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);
   if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);
-  if (usage.rate_limit) parts.push(String(usage.rate_limit));
+  const rateLimit = formatAssistantRateLimit(usage.rate_limit);
+  if (rateLimit) parts.push(rateLimit);
   return el("span", { class: "chip assistant-usage", "data-agent-usage": "1", "data-testid": "agent-usage" },
     icon("info", "icon-sm"), parts.join(" · ") || "Usage");
 }
@@ -4811,14 +4823,13 @@ function renderAssistantUsageChip(st) {
 function agentProviderLabel(provider) {
   if (provider === "claude") return "Claude";
   if (provider === "codex") return "ChatGPT";
-  if (provider === "openai") return "OpenAI";
   return "Assistant";
 }
 function agentModelSwitcher(st) {
   const models = st.models || {};
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
-    for (const prov of ["claude", "codex", "openai"]) {
+    for (const prov of ["claude", "codex"]) {
       const tag = agentProviderLabel(prov);
       const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
       if (m) return tag + " · " + m.label;
@@ -4841,7 +4852,6 @@ function agentModelSwitcher(st) {
   };
   addGroup("claude", st.claude);
   addGroup("codex", st.codex);
-  addGroup("openai", st.openai);
   if (!st.codex) {
     rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectCodex() },
       el("span", { class: "mdl-plus" }, "＋"),

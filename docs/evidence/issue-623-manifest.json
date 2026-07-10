@@ -1,0 +1,233 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-10T08:39:00Z",
+  "commit": "cfcc7143968171c376eddaec787ff7aea95f376f",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The product OAuth feature does not export the legacy BYO API-key provider types.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features agent-oauth-providers product_oauth_feature_does_not_export_byo_api_providers -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::product_oauth_feature_does_not_export_byo_api_providers ... ok",
+      "test": "product_oauth_feature_does_not_export_byo_api_providers"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-008",
+      "claim": "App-host product code cannot instantiate the quarantined BYO Anthropic/OpenAI providers.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers app_host_product_code_does_not_reference_legacy_byo_provider_types -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::app_host_product_code_does_not_reference_legacy_byo_provider_types ... ok",
+      "test": "app_host_product_code_does_not_reference_legacy_byo_provider_types"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Product provider selection ignores local Claude/Codex CLI credential files.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers product_oauth_provider_does_not_read_desktop_cli_fallbacks -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::product_oauth_provider_does_not_read_desktop_cli_fallbacks ... ok",
+      "test": "product_oauth_provider_does_not_read_desktop_cli_fallbacks"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Non-live product tests clear public provider keys and provider override env vars.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers non_live_provider_tests_clear_public_api_key_env -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::non_live_provider_tests_clear_public_api_key_env ... ok",
+      "test": "non_live_provider_tests_clear_public_api_key_env"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Unexpected provider network POSTs fail closed when the non-live test guard is active.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers non_live_provider_tests_fail_on_unexpected_network -- --nocapture",
+      "result": "pass",
+      "evidence": "test http::tests::non_live_provider_tests_fail_on_unexpected_network ... ok",
+      "test": "non_live_provider_tests_fail_on_unexpected_network"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Encrypted stored Claude OAuth credentials select the Claude-compatible product provider.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers agent_provider_selection_uses_stored_claude_oauth_credential -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::agent_provider_selection_uses_stored_claude_oauth_credential ... ok",
+      "test": "agent_provider_selection_uses_stored_claude_oauth_credential"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Encrypted stored Codex OAuth credentials select the Codex product provider.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers agent_provider_selection_uses_stored_codex_oauth_credential -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::agent_provider_selection_uses_stored_codex_oauth_credential ... ok",
+      "test": "agent_provider_selection_uses_stored_codex_oauth_credential"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-009",
+      "claim": "The product provider executor binds read-class tool calls to the real StoreArchive fixture.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_provider_agent_executor_reads_store_archive_fixture -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::live_provider_agent_executor_reads_store_archive_fixture ... ok",
+      "test": "live_provider_agent_executor_reads_store_archive_fixture"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Claude-compatible provider SSE emits text deltas before stream completion.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers claude_sse_event_returns_text_delta_immediately -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::subscription::tests::claude_sse_event_returns_text_delta_immediately ... ok",
+      "test": "claude_sse_event_returns_text_delta_immediately"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Codex provider request shape keeps stream=true and store=false.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers build_request_uses_responses_shape_with_instructions_and_tool -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::codex::tests::build_request_uses_responses_shape_with_instructions_and_tool ... ok",
+      "test": "build_request_uses_responses_shape_with_instructions_and_tool"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The WebUI setup uses claude/codex product provider IDs and exposes no BYO API-key setup row.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_setup_consent_is_required_and_non_secret -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::assistant_setup_consent_is_required_and_non_secret ... ok",
+      "test": "assistant_setup_consent_is_required_and_non_secret"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Assistant status exposes sanitized provider/model/usage metadata without auth material.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers daemon_agent_status_reports_sanitized_last_provider_usage -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::daemon_agent_status_reports_sanitized_last_provider_usage ... ok",
+      "test": "daemon_agent_status_reports_sanitized_last_provider_usage"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Codex provider SSE emits text deltas before stream completion.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-agent --features http,agent-oauth-providers apply_sse_event_returns_text_delta_immediately -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::codex::tests::apply_sse_event_returns_text_delta_immediately ... ok",
+      "test": "apply_sse_event_returns_text_delta_immediately"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Local Claude Code 2.1.206 drift capture succeeded and the committed artifact is redacted and marked non-product-auth.",
+      "method": "probe",
+      "command": "claude -p --model sonnet --output-format stream-json --include-partial-messages --verbose --debug api --debug-file /tmp/isyncyou-623-captures/claude-debug.raw.log <controlled-smoke-prompt>",
+      "result": "pass",
+      "evidence": "controlled prompt returned isyncyou-623-claude-smoke; value-only secret scan passed; artifact scope=local_cli_drift_only_not_product_auth",
+      "artifact": "docs/evidence/artifacts/issue-623/claude-code-2.1.206-capture.json",
+      "notes": "Partial drift evidence only: the reduced artifact records visible_header_names=[], so installed-client request headers are not fully proven by this capture."
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Local Codex CLI 0.144.1 drift capture succeeded and the committed artifact is redacted and marked non-product-auth.",
+      "method": "probe",
+      "command": "codex exec --json --ephemeral --skip-git-repo-check -C /tmp <controlled-smoke-prompt>; codex debug models; codex debug models --bundled",
+      "result": "pass",
+      "evidence": "controlled prompt returned isyncyou-623-codex-smoke; model catalog captured; value-only secret scan passed; artifact scope=local_cli_drift_only_not_product_auth",
+      "artifact": "docs/evidence/artifacts/issue-623/codex-cli-0.144.1-capture.json",
+      "notes": "Partial drift evidence only: codex exec --json did not expose raw request headers; request shape remains covered by in-repo tests, not installed-client header extraction."
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The #623 product OAuth live StoreArchive gates pass when locally available Claude/Codex credentials are copied into child-process ISY623_* seed variables and then persisted through the encrypted product CredentialStore path.",
+      "method": "probe",
+      "command": "Python harness read local Claude/Codex auth JSON without printing values, set ISY623_* only in each cargo child environment, then ran cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_claude_oauth_storearchive_tool_roundtrip -- --ignored --nocapture and live_codex_oauth_storearchive_tool_roundtrip -- --ignored --nocapture",
+      "result": "pass",
+      "evidence": "Both ignored live gates passed: real provider stream, real StoreArchive tool_result from seeded m-live fixture, done.reason=complete, and usage provider/model status; secrets were not printed or committed.",
+      "artifact": "docs/evidence/artifacts/issue-623/product-live-gates.json",
+      "notes": "This proves the product CredentialStore load path with local credentials as seed material. EV-018 separately proves the final Device/App OAuth UI/system-browser/manual-code flow."
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The #623 evidence bundle is schema-valid and code-commit-bound to the Android-tested implementation commit.",
+      "method": "probe",
+      "command": "git rev-parse HEAD at Android build/test time; python3 tools/check_evidence.py --manifest docs/evidence/issue-623-manifest.json",
+      "result": "pass",
+      "evidence": "Manifest commit is cfcc7143968171c376eddaec787ff7aea95f376f, the current code commit whose app-host live trace writer, WebUI usage-chip fix, and Android APK reinstall were exercised. The normal evidence validator passed. A tracked in-repo manifest cannot also contain the hash of the later evidence commit that changes it, so --require-head remains a CI/external regenerated-evidence option rather than a claimed local gate.",
+      "artifact": "docs/evidence/artifacts/issue-623/product-live-gates.json",
+      "notes": "This entry avoids claiming --require-head for a committed in-repo manifest; it binds the evidence to the tested code commit instead."
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The final Device/App OAuth flows for Claude and Codex were live-proven on the Pixel 8 Pro and wrote app-private encrypted provider credentials.",
+      "method": "probe",
+      "command": "device-lock acquire ag-623; (cd android && ./gradlew :app:assembleDebug); adb install -r android/app/build/outputs/apk/debug/app-debug.apk; start app; trigger Assistant Claude OAuth from WebView; user authorizes in system browser; paste manual code in app; trigger Assistant Codex OAuth from model picker; browser completes localhost:1455 callback; query /api/v1/agent/status via WebView CDP; observe app-private CredentialStore files with run-as; run mobile WebView Claude and Codex turns that force isyncyou search tool calls",
+      "result": "pass",
+      "evidence": "After user OAuth, /api/v1/agent/status returned claude=true and codex=true. Claude status showed provider=claude/model=claude-sonnet-5 after manual code completion; Codex status showed provider=codex/model=gpt-5.5 after loopback callback. document.cookie was empty, run-as showed two 0600 provider .cred files plus agent_credential.key, and both mobile WebView turns emitted tool_call(isyncyou), StoreArchive tool_result(returned=0,total_matches=0), and done.reason=complete. Screenshots are redacted: no account email or OAuth callback code is visible. The current cfcc714 APK was reinstalled afterward and still saw both provider credentials.",
+      "artifact": "docs/evidence/artifacts/issue-623/device-app-oauth-flow.json",
+      "notes": "The live StoreArchive results are empty because the mobile archive had no matching mail row; the proof is the real provider tool_call/tool_result/done stream from the app-OAuth-stored credentials."
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-008",
+      "claim": "On Android appassets origin, Claude OAuth without a loopback port shows the manual paste-code step and cleans up the OAuth network guard.",
+      "method": "test",
+      "command": "cargo +1.95.0 test -p isyncyou-webui assistant_claude_oauth_uses_manual_code_step_without_loopback_redirect -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::assistant_claude_oauth_uses_manual_code_step_without_loopback_redirect ... ok",
+      "artifact": "docs/evidence/artifacts/issue-623/device-app-oauth-flow.json",
+      "test": "assistant_claude_oauth_uses_manual_code_step_without_loopback_redirect"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-009",
+      "claim": "Claude product live gate has a redacted positive StoreArchive trace for the seeded m-live fixture.",
+      "method": "probe",
+      "command": "ISY623_LIVE_TRACE_DIR=docs/evidence/artifacts/issue-623 cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_claude_oauth_storearchive_tool_roundtrip -- --ignored --nocapture",
+      "result": "pass",
+      "evidence": "Trace shows provider=claude, tool_call search for isyncyou623productlivesentinel, StoreArchive tool_result contains_m_live=true and contains_fixture_sentinel=true, tool_call read id=m-live, second positive StoreArchive tool_result, done.reason=complete, and usage provider/model present.",
+      "artifact": "docs/evidence/artifacts/issue-623/claude-oauth-live-storearchive-trace.json"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-AGENT-009",
+      "claim": "Codex product live gate has a redacted positive StoreArchive trace for the seeded m-live fixture.",
+      "method": "probe",
+      "command": "ISY623_LIVE_TRACE_DIR=docs/evidence/artifacts/issue-623 cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers live_codex_oauth_storearchive_tool_roundtrip -- --ignored --nocapture",
+      "result": "pass",
+      "evidence": "Trace shows provider=codex, tool_call search for isyncyou623productlivesentinel, StoreArchive tool_result contains_m_live=true and contains_fixture_sentinel=true, tool_call read id=m-live, second positive StoreArchive tool_result, done.reason=complete, and usage provider/model present.",
+      "artifact": "docs/evidence/artifacts/issue-623/codex-oauth-live-storearchive-trace.json"
+    },
+    {
+      "id": "EV-022",
+      "requirement": "REQ-AGENT-011",
+      "claim": "The Assistant usage chip formats rate-limit objects instead of rendering [object Object].",
+      "method": "probe",
+      "command": "After reinstalling the cfcc714 Android debug APK, evaluate renderAssistantUsageChip({ usage: { request_id, input_tokens, output_tokens, rate_limit: { anthropic-ratelimit-unified-status: 'allowed', anthropic-ratelimit-unified-utilization: '0.23' } } }) via WebView CDP",
+      "result": "pass",
+      "evidence": "Current APK returned text 'Request req_1234567890abcdef · 12 in · 3 out · limit allowed · 23%' and hasObjectObject=false; the live Assistant view after reinstall also rendered 'Usage unavailable' and had no [object Object].",
+      "artifact": "docs/evidence/artifacts/issue-623/device-app-oauth-flow.json"
+    }
+  ]
+}

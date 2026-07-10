@@ -8,6 +8,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent Claude/Codex OAuth providers**
+- `agent`+`app-host`+`webui`+`mobile`: advanced #623's Claude/Codex
+  app-OAuth provider path with product feature wiring, encrypted CredentialStore
+  provider selection, incremental Claude/Codex streaming, sanitized usage status,
+  StoreArchive executor binding, strict `claude`/`codex` WebUI provider IDs,
+  BYO API-key quarantine, and non-live test isolation from local CLI auth,
+  provider env vars, and unexpected provider network POSTs. Live product OAuth
+  StoreArchive roundtrip evidence still gates final #623 closeout.
+
 **Agent Assistant UI**
 - `webui`: added #622's capability-gated Assistant tab with streaming
   transcript rendering, source citations, PendingAction confirm/cancel cards,
