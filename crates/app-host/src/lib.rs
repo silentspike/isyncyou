@@ -3942,6 +3942,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn product_oauth_provider_does_not_enable_subscription_import() {
+        let root = apphost_credential_test_root("product-no-import");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        let err = isyncyou_webui::AgentHandler::subscription_import(
+            &agent,
+            "access-token",
+            "refresh-token",
+            123,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("subscription import is not enabled"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_host_product_code_does_not_reference_legacy_byo_provider_types() {
+        let src = include_str!("lib.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+
+        for needle in [
+            "AnthropicProvider",
+            "OpenAiProvider",
+            "ProviderCredentialResolver",
+            "provider_api_key_secret_id",
+        ] {
+            assert!(
+                !production.contains(needle),
+                "app-host product code must not reference legacy BYO provider surface: {needle}"
+            );
+        }
+    }
+
     #[cfg(any(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"

@@ -182,9 +182,9 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
-// The official providers' pure request/parse logic is unit-tested without `http`; the
-// live structs need it. Compile the modules only when `http` is on or under test, so a
-// plain default build doesn't carry their (then-unused) helpers.
+// Shared request/parse helpers are unit-tested without live provider features. The legacy
+// BYO API-key live providers are kept behind `byo-api-providers`; #623 product OAuth uses
+// `subscription`/`codex` instead.
 #[cfg(any(feature = "http", test))]
 pub mod anthropic;
 #[cfg(any(
@@ -193,7 +193,7 @@ pub mod anthropic;
 ))]
 pub mod codex;
 pub mod fake;
-#[cfg(any(feature = "http", test))]
+#[cfg(any(feature = "byo-api-providers", test))]
 pub mod openai;
 #[cfg(any(
     feature = "agent-oauth-providers",

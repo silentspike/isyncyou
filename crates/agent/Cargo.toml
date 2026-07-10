@@ -45,6 +45,9 @@ retrieval = ["dep:isyncyou-store", "dep:isyncyou-core", "dep:isyncyou-connectors
 # agent-owned HTTP stack but does not by itself authorize local CLI credential
 # fallback; callers must load product credentials from their encrypted store.
 agent-oauth-providers = ["http"]
+# Legacy/future BYO public API-key provider surface. Kept default-off and deliberately
+# separate from #623 product OAuth so app-host/mobile cannot instantiate API-key providers.
+byo-api-providers = ["http"]
 # EXPERIMENTAL, UNSUPPORTED, personal-build only (#627). Off by default; not part of
 # #623 product acceptance. This keeps local CLI credential fallback/capture separated
 # from the product app-OAuth provider runtime above.

@@ -83,7 +83,7 @@ pub use provider::codex::{CodexConfig, CodexProvider};
     feature = "agent-subscription-experimental"
 ))]
 pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
@@ -114,5 +114,23 @@ mod tests {
             .expect("session impl block");
         assert!(!session_impl.contains("pub fn append("));
         assert!(!session.contains("append_lease_free_for_test"));
+    }
+
+    #[test]
+    fn product_oauth_feature_does_not_export_byo_api_providers() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains(
+            "#[cfg(feature = \"byo-api-providers\")]\npub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};"
+        ));
+        assert!(
+            !lib.contains(
+                "#[cfg(feature = \"http\")]\npub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};"
+            ),
+            "http/agent-oauth-providers must not re-export BYO API-key provider types"
+        );
+
+        let provider = include_str!("provider.rs");
+        assert!(provider
+            .contains("#[cfg(any(feature = \"byo-api-providers\", test))]\npub mod openai;"));
     }
 }
