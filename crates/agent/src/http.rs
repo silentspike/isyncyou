@@ -360,6 +360,16 @@ mod live {
             Ok(Self { client })
         }
 
+        fn ensure_test_network_allowed() -> Result<(), AgentError> {
+            #[cfg(test)]
+            if std::env::var_os("ISYNCYOU_AGENT_TEST_BLOCK_NETWORK").is_some() {
+                return Err(AgentError::Transport(
+                    "unexpected provider network access blocked by test guard".into(),
+                ));
+            }
+            Ok(())
+        }
+
         /// Like [`new`], but pins `host` to the given IPs (from [`doh_resolve`]) so the
         /// platform resolver is bypassed. The TLS SNI/Host stays `host`, so the cert still
         /// validates. Use for hosts Android's app-thread resolver can't look up
@@ -390,6 +400,7 @@ mod live {
             headers: &[(String, String)],
             body: &serde_json::Value,
         ) -> Result<(u16, String), AgentError> {
+            Self::ensure_test_network_allowed()?;
             let mut req = self.client.post(url).json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
@@ -413,6 +424,7 @@ mod live {
             body: &serde_json::Value,
             on_event: &mut dyn FnMut(SseEvent),
         ) -> Result<ProviderHttpResponse, AgentError> {
+            Self::ensure_test_network_allowed()?;
             let mut req = self.client.post(url).json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
@@ -449,6 +461,7 @@ mod live {
             url: &str,
             form: &[(&str, &str)],
         ) -> Result<(u16, String), AgentError> {
+            Self::ensure_test_network_allowed()?;
             let resp = self.client.post(url).form(form).send().map_err(|e| {
                 use std::error::Error;
                 let mut msg = e.to_string();
@@ -476,6 +489,28 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, value: old }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn classify_maps_status_to_action() {
@@ -632,5 +667,22 @@ mod tests {
 
         assert_eq!(emitted[0], (1, "first".to_string()));
         assert_eq!(emitted[1], (2, "second".to_string()));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn non_live_provider_tests_fail_on_unexpected_network() {
+        let _env = EnvRestore::set("ISYNCYOU_AGENT_TEST_BLOCK_NETWORK", "1");
+        let http = HttpTransport::new().unwrap();
+        let err = http
+            .post_json(
+                "https://example.invalid/provider",
+                &[],
+                &serde_json::json!({}),
+            )
+            .expect_err("network guard must fail before opening a request");
+        assert!(err
+            .to_string()
+            .contains("unexpected provider network access"));
     }
 }

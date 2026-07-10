@@ -3025,8 +3025,8 @@ mod tests {
     ))]
     struct AppHostCredentialEnvGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
-        home: Option<std::ffi::OsString>,
-        cred_key: Option<std::ffi::OsString>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        root: PathBuf,
     }
 
     #[cfg(any(
@@ -3039,13 +3039,56 @@ mod tests {
                 .get_or_init(|| StdMutex::new(()))
                 .lock()
                 .unwrap();
-            let home = std::env::var_os("HOME");
-            let cred_key = std::env::var_os("ISYNCYOU_AGENT_CRED_KEY");
-            std::env::remove_var("ISYNCYOU_AGENT_CRED_KEY");
-            Self {
+            let saved = Self::env_keys()
+                .iter()
+                .copied()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect();
+            let root = apphost_credential_test_root("provider-test-env");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let this = Self {
                 _guard: guard,
-                home,
-                cred_key,
+                saved,
+                root,
+            };
+            this.isolate_provider_env();
+            this
+        }
+
+        fn env_keys() -> &'static [&'static str] {
+            &[
+                "HOME",
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "OPENAI_API_KEY",
+                "ISYNCYOU_AGENT_CRED_KEY",
+                "ISYNCYOU_AGENT_PROVIDER",
+                "ISYNCYOU_AGENT_MODEL",
+            ]
+        }
+
+        fn isolate_provider_env(&self) {
+            let home = self.root.join("home");
+            let codex = self.root.join("codex-home");
+            let claude = self.root.join("claude-config");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&codex).unwrap();
+            std::fs::create_dir_all(&claude).unwrap();
+            std::env::set_var("HOME", &home);
+            std::env::set_var("CODEX_HOME", &codex);
+            std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+            for key in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "OPENAI_API_KEY",
+                "ISYNCYOU_AGENT_CRED_KEY",
+                "ISYNCYOU_AGENT_PROVIDER",
+                "ISYNCYOU_AGENT_MODEL",
+            ] {
+                std::env::remove_var(key);
             }
         }
 
@@ -3060,14 +3103,13 @@ mod tests {
     ))]
     impl Drop for AppHostCredentialEnvGuard {
         fn drop(&mut self) {
-            match &self.home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
-            match &self.cred_key {
-                Some(value) => std::env::set_var("ISYNCYOU_AGENT_CRED_KEY", value),
-                None => std::env::remove_var("ISYNCYOU_AGENT_CRED_KEY"),
-            }
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -4004,6 +4046,89 @@ mod tests {
             .expect_err("legacy Anthropic provider id must be rejected");
         assert!(err.contains("unknown provider"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn non_live_provider_tests_ignore_real_claude_home() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("non-live-ignores-claude-home");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"must-not-be-read"}}"#,
+        )
+        .unwrap();
+        env.set_home(&home);
+        let agent = DaemonAgent::new(Config::default(), root.join("oauth"));
+
+        assert_eq!(agent.subscription_token(), None);
+        assert_eq!(agent.build_turn_provider("system").name(), "fake");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn non_live_provider_tests_ignore_real_codex_home() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("non-live-ignores-codex-home");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/auth.json"),
+            r#"{"tokens":{"access_token":"must-not-be-read","account_id":"acct-real"}}"#,
+        )
+        .unwrap();
+        env.set_home(&home);
+        let agent = DaemonAgent::new(Config::default(), root.join("oauth"));
+
+        assert_eq!(agent.codex_credentials(), None);
+        assert_eq!(agent.build_turn_provider("system").name(), "fake");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn non_live_provider_tests_clear_public_api_key_env() {
+        let env = AppHostCredentialEnvGuard::new();
+        std::env::set_var("ANTHROPIC_API_KEY", "leaked-anthropic-key");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "leaked-anthropic-token");
+        std::env::set_var("OPENAI_API_KEY", "leaked-openai-key");
+        std::env::set_var("ISYNCYOU_AGENT_CRED_KEY", "leaked-credential-key");
+        std::env::set_var("ISYNCYOU_AGENT_PROVIDER", "codex");
+        std::env::set_var("ISYNCYOU_AGENT_MODEL", "leaked-model");
+
+        env.isolate_provider_env();
+
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "ISYNCYOU_AGENT_CRED_KEY",
+            "ISYNCYOU_AGENT_PROVIDER",
+            "ISYNCYOU_AGENT_MODEL",
+        ] {
+            assert_eq!(std::env::var_os(key), None, "{key} must be cleared");
+        }
+        for key in ["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
+            let path = std::env::var_os(key).expect("isolated config env");
+            assert!(
+                PathBuf::from(path).starts_with(&env.root),
+                "{key} must point at the isolated test root"
+            );
+        }
     }
 
     #[cfg(all(
