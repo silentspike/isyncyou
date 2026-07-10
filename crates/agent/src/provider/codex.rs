@@ -109,78 +109,81 @@ pub(crate) fn build_request(model: &str, instructions: &str, history: &[Message]
     })
 }
 
-/// Parse the SSE Responses stream into assistant blocks + usage. Concatenates
-/// `response.output_text.delta` text and collects `function_call` output items.
-pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
-    let mut text = String::new();
-    let mut tools: Vec<(String, String)> = Vec::new(); // (call_id, arguments-json)
-    let mut usage = Usage::default();
-    let mut failure: Option<String> = None;
+type CodexToolArgs = (String, String);
 
-    for line in body.lines() {
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
-        if data == "[DONE]" {
-            break;
-        }
-        let v: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("response.output_text.delta") => {
-                if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
-                    text.push_str(d);
-                }
-            }
-            Some("response.output_item.done") => {
-                if let Some(item) = v.get("item") {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                        let id = item
-                            .get("call_id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let args = item
-                            .get("arguments")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("{}")
-                            .to_string();
-                        tools.push((id, args));
-                    }
-                }
-            }
-            Some("response.completed") => {
-                if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
-                    let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                    usage.input_tokens = g("input_tokens");
-                    usage.output_tokens = g("output_tokens");
-                }
-            }
-            Some("response.failed") => {
-                failure = Some(
-                    v.get("response")
-                        .and_then(|r| r.get("error"))
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("response failed")
-                        .to_string(),
-                );
-            }
-            Some("error") => {
-                failure = Some(
-                    v.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("stream error")
-                        .to_string(),
-                );
-            }
-            _ => {}
-        }
+fn apply_sse_event(
+    data: &str,
+    text: &mut String,
+    tools: &mut Vec<CodexToolArgs>,
+    usage: &mut Usage,
+    failure: &mut Option<String>,
+) -> Result<Option<String>, AgentError> {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
     }
+    let v: Value = serde_json::from_str(data)
+        .map_err(|e| AgentError::Provider(format!("codex: invalid SSE JSON: {e}")))?;
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("response.output_text.delta") => {
+            if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                text.push_str(d);
+                return Ok(Some(d.to_string()));
+            }
+        }
+        Some("response.output_item.done") => {
+            if let Some(item) = v.get("item") {
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    let id = item
+                        .get("call_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = item
+                        .get("arguments")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("{}")
+                        .to_string();
+                    tools.push((id, args));
+                }
+            }
+        }
+        Some("response.completed") => {
+            if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
+                let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                usage.input_tokens = g("input_tokens");
+                usage.output_tokens = g("output_tokens");
+            }
+        }
+        Some("response.failed") => {
+            *failure = Some(
+                v.get("response")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("response failed")
+                    .to_string(),
+            );
+        }
+        Some("error") => {
+            *failure = Some(
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("stream error")
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    Ok(None)
+}
 
+fn finish_sse_blocks(
+    text: String,
+    tools: Vec<CodexToolArgs>,
+    usage: Usage,
+    failure: Option<String>,
+) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
     if let Some(e) = failure {
         return Err(AgentError::Provider(format!("codex: {e}")));
     }
@@ -193,6 +196,26 @@ pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), Agen
         blocks.push(AssistantBlock::ToolUse { id, input });
     }
     Ok((blocks, usage))
+}
+
+/// Parse the SSE Responses stream into assistant blocks + usage. Concatenates
+/// `response.output_text.delta` text and collects `function_call` output items.
+#[cfg(test)]
+pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
+    let mut text = String::new();
+    let mut tools: Vec<CodexToolArgs> = Vec::new();
+    let mut usage = Usage::default();
+    let mut failure: Option<String> = None;
+
+    for line in body.lines() {
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d,
+            None => continue,
+        };
+        apply_sse_event(data, &mut text, &mut tools, &mut usage, &mut failure)?;
+    }
+
+    finish_sse_blocks(text, tools, usage, failure)
 }
 
 #[cfg(feature = "http")]
@@ -259,26 +282,54 @@ mod live {
             emit: &mut dyn FnMut(StreamEvent),
         ) -> Result<Vec<AssistantBlock>, AgentError> {
             let body = build_request(&self.cfg.model, &self.instructions, history);
-            let (status, text) =
-                self.http
-                    .post_json(&self.cfg.responses_url, &self.request_headers(), &body)?;
-            if status == 401 || status == 403 {
+            let mut text = String::new();
+            let mut tools: Vec<CodexToolArgs> = Vec::new();
+            let mut usage = Usage::default();
+            let mut failure: Option<String> = None;
+            let mut parse_error: Option<AgentError> = None;
+            let response = self.http.post_json_sse(
+                &self.cfg.responses_url,
+                &self.request_headers(),
+                &body,
+                &mut |event| {
+                    if parse_error.is_some() {
+                        return;
+                    }
+                    match apply_sse_event(
+                        &event.data,
+                        &mut text,
+                        &mut tools,
+                        &mut usage,
+                        &mut failure,
+                    ) {
+                        Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                        Ok(None) => {}
+                        Err(e) => parse_error = Some(e),
+                    }
+                },
+            )?;
+            if response.status == 401 || response.status == 403 {
                 return Err(AgentError::Provider(
                     "codex: unauthorized — run the official `codex` login first".into(),
                 ));
             }
-            if status >= 400 {
+            if response.status >= 400 {
+                let detail = response.body_preview.unwrap_or_default();
                 return Err(AgentError::Provider(format!(
-                    "codex: backend status {status}"
+                    "codex: backend status {}{}",
+                    response.status,
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    }
                 )));
             }
-            let (blocks, usage) = parse_sse(&text)?;
-            self.last_usage = usage;
-            for b in &blocks {
-                if let AssistantBlock::Text(t) = b {
-                    emit(StreamEvent::Token(t.clone()));
-                }
+            if let Some(e) = parse_error {
+                return Err(e);
             }
+            let (blocks, usage) = finish_sse_blocks(text, tools, usage, failure)?;
+            self.last_usage = usage;
             Ok(blocks)
         }
     }
@@ -353,6 +404,29 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         assert!(matches!(&blocks[0], AssistantBlock::Text(t) if t == "hello codex"));
         assert_eq!(usage.input_tokens, 22);
         assert_eq!(usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn apply_sse_event_returns_text_delta_immediately() {
+        let mut text = String::new();
+        let mut tools = Vec::new();
+        let mut usage = Usage::default();
+        let mut failure = None;
+
+        let delta = apply_sse_event(
+            "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
+            &mut text,
+            &mut tools,
+            &mut usage,
+            &mut failure,
+        )
+        .unwrap();
+
+        assert_eq!(delta.as_deref(), Some("hello"));
+        assert_eq!(text, "hello");
+        assert!(tools.is_empty());
+        assert_eq!(usage, Usage::default());
+        assert!(failure.is_none());
     }
 
     #[test]
