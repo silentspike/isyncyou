@@ -16,7 +16,6 @@ data class BiometricDecision(
 /** Pure policy decisions kept outside MainActivity so API-level behavior is unit-testable. */
 object BiometricPolicy {
     fun choose(
-        _apiLevel: Int,
         strongAvailable: Boolean,
         cryptoAvailable: Boolean,
         credentialAvailable: Boolean,

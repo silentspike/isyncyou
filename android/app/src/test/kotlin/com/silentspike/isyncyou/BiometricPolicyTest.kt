@@ -10,19 +10,19 @@ import org.junit.Test
 class BiometricPolicyTest {
     @Test
     fun strongEnrollmentWithCipherFailureFailsClosed() {
-        assertNull(BiometricPolicy.choose(Build.VERSION_CODES.TIRAMISU, true, false, true))
+        assertNull(BiometricPolicy.choose(true, false, true))
     }
 
     @Test
     fun deviceCredentialIsOnlyUsedWhenStrongBiometricIsUnavailable() {
-        val decision = BiometricPolicy.choose(Build.VERSION_CODES.Q, false, false, true)
+        val decision = BiometricPolicy.choose(false, false, true)
         assertEquals(BiometricMode.DeviceCredential, decision?.mode)
         assertEquals(BiometricManager.Authenticators.DEVICE_CREDENTIAL, decision?.authenticators)
     }
 
     @Test
     fun noAvailableFactorFailsClosed() {
-        assertNull(BiometricPolicy.choose(Build.VERSION_CODES.TIRAMISU, false, false, false))
+        assertNull(BiometricPolicy.choose(false, false, false))
     }
 
     @Test

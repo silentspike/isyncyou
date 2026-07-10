@@ -33,39 +33,26 @@ object EngineBootstrap {
         // Install the at-rest body key from the Keystore BEFORE the engine touches disk (#0B), so
         // the first body write/read is already sealed.
         val r = BodyKeyStore.getOrCreate(filesDir)
-        try {
-            if (r.justCreated) {
-                discardReproducibleLocalCache(filesDir)
-                Log.i(TAG, "body encryption on: discarded plaintext cache (kept auth)")
-            }
-            if (NativeEngine.nativeSetBodyKey(r.keyId, r.key) != 1) {
-                throw EncryptedStorageSetupException("Encrypted storage key install failed")
-            }
-            Log.i(TAG, "encrypted storage key installed")
-        } finally {
-            java.util.Arrays.fill(r.key, 0) // wipe the data key from the JVM heap
+        if (r.justCreated) {
+            discardReproducibleLocalCache(filesDir)
+            Log.i(TAG, "body encryption on: discarded plaintext cache (kept auth)")
         }
 
         // Install the separate provider-credential key before nativeStart (#620). App-host
         // credential consumers in Rust resolve through this process-installed key on Android,
         // never through a WebView/API path or accidental local fallback.
         val agentCredential = AgentCredentialKeyStore.getOrCreate(filesDir)
-        try {
-            if (NativeEngine.nativeSetAgentCredentialKey(agentCredential.key) != 1) {
-                throw EncryptedStorageSetupException("Agent credential storage key install failed")
-            }
-            Log.i(
-                TAG,
-                "agent credential key installed: file=${agentCredential.evidence.keyFile} " +
-                    "hardware=${agentCredential.evidence.insideSecureHardware ?: "unknown"} " +
-                    "security=${agentCredential.evidence.securityLevel ?: "unknown"}",
-            )
-        } finally {
-            java.util.Arrays.fill(agentCredential.key, 0)
-        }
-
-        Log.i(TAG, "EngineBootstrap: calling nativeStart")
-        val port = NativeEngine.nativeStart(filesDir.absolutePath)
+        val port = runNativeStartupSequence(
+            bodyKeyId = r.keyId,
+            bodyKey = r.key,
+            agentCredentialKey = agentCredential.key,
+            installBodyKey = { keyId, key -> NativeEngine.nativeSetBodyKey(keyId, key) == 1 },
+            installAgentCredentialKey = { key -> NativeEngine.nativeSetAgentCredentialKey(key) == 1 },
+            startEngine = {
+                Log.i(TAG, "EngineBootstrap: calling nativeStart")
+                NativeEngine.nativeStart(filesDir.absolutePath)
+            },
+        )
         Log.i(TAG, "EngineBootstrap: nativeStart returned port=$port")
         if (port > 0) {
             val t = NativeEngine.nativeSessionToken()
@@ -73,6 +60,29 @@ object EngineBootstrap {
             return t
         }
         return "" // don't cache failure; a later caller may retry
+    }
+
+    /** The only allowed native startup order, with an injectable seam for JVM tests. */
+    internal fun runNativeStartupSequence(
+        bodyKeyId: Int,
+        bodyKey: ByteArray,
+        agentCredentialKey: ByteArray,
+        installBodyKey: (Int, ByteArray) -> Boolean,
+        installAgentCredentialKey: (ByteArray) -> Boolean,
+        startEngine: () -> Int,
+    ): Int {
+        try {
+            if (!installBodyKey(bodyKeyId, bodyKey)) {
+                throw EncryptedStorageSetupException("Encrypted storage key install failed")
+            }
+            if (!installAgentCredentialKey(agentCredentialKey)) {
+                throw EncryptedStorageSetupException("Agent credential storage key install failed")
+            }
+            return startEngine()
+        } finally {
+            java.util.Arrays.fill(bodyKey, 0)
+            java.util.Arrays.fill(agentCredentialKey, 0)
+        }
     }
 
     private fun discardReproducibleLocalCache(filesDir: File) {

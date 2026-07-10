@@ -597,7 +597,7 @@ class MainActivity : FragmentActivity() {
         val cipher = if (strongAvailable) bioConfirmCipher() else null
         val credential = BiometricManager.Authenticators.DEVICE_CREDENTIAL
         val credentialAvailable = mgr.canAuthenticate(credential) == BiometricManager.BIOMETRIC_SUCCESS
-        val decision = BiometricPolicy.choose(Build.VERSION.SDK_INT, strongAvailable, cipher != null, credentialAvailable)
+        val decision = BiometricPolicy.choose(strongAvailable, cipher != null, credentialAvailable)
         if (decision == null) {
             android.util.Log.w(TAG, "biometric confirmation unavailable or strong cipher failed")
             reply.postMessage(bioReplyJson(reqId, false))
