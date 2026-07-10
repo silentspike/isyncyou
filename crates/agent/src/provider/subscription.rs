@@ -1,17 +1,11 @@
-//! EXPERIMENTAL Claude subscription provider — UNSUPPORTED, personal-build only
-//! (S-AG.12 / #627). Behind the default-off `agent-subscription-experimental` feature;
-//! never built into release artifacts, CI, or referenced in the README (risk R8).
+//! Claude OAuth-compatible provider runtime.
 //!
-//! Auth model (operator-decided, ToS rationale): the operator first performs the
-//! **normal, official login** to their own account — on desktop that is the existing
-//! `claude` CLI credential (`~/.claude/.credentials.json`), on mobile our device OAuth
-//! login. This provider then uses that legitimately-obtained access token and adapts the
-//! request to look like the official Claude Code client. The legitimate login happens
-//! first; the mimicry only shapes the subsequent request.
+//! Product auth is app OAuth plus encrypted credential storage. The #627 experimental
+//! build may additionally use local `claude` CLI credentials for private drift/capture
+//! work, but that fallback is outside the product boundary.
 //!
 //! The mimicry recipe (endpoint + the Claude-Code identity headers + the billing system
-//! block) is verified against the real client and lives here as an in-repo default — the
-//! legitimacy comes from the login-first sequence, not from hiding the recipe.
+//! block) is verified against the real client and lives here as an in-repo default.
 
 use super::{anthropic, AssistantBlock, LlmProvider, StreamEvent, Usage};
 use crate::turn::Message;
@@ -79,8 +73,8 @@ fn uuid_v4() -> String {
     )
 }
 
-/// The experimental subscription provider. Holds the legitimately-obtained OAuth token +
-/// the recipe config; shapes each request to mimic the Claude Code client.
+/// The Claude OAuth-compatible provider. Holds the app-obtained OAuth token and the
+/// recipe config; shapes each request to the Claude Code-compatible wire format.
 pub struct SubscriptionProvider {
     http: crate::http::HttpTransport,
     access_token: String,

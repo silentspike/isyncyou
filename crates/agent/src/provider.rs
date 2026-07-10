@@ -187,12 +187,18 @@ pub struct Usage {
 // plain default build doesn't carry their (then-unused) helpers.
 #[cfg(any(feature = "http", test))]
 pub mod anthropic;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub mod codex;
 pub mod fake;
 #[cfg(any(feature = "http", test))]
 pub mod openai;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub mod subscription;
 pub use fake::FakeProvider;
 

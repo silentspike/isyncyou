@@ -284,21 +284,21 @@ pub trait AgentHandler: Send + Sync {
     /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
 
-    /// EXPERIMENTAL subscription login (S-AG.12). Begin a device OAuth login for
+    /// Agent provider OAuth login. Begin a device OAuth login for
     /// `provider`; `redirect_uri` is the loopback callback the browser returns to
     /// (the client supplies its own origin). Returns the authorize URL the UI opens
     /// in the **system browser**. Default: not available (handler opted out).
     fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
-    /// EXPERIMENTAL subscription login callback. The system browser returns here with
+    /// Agent provider OAuth callback. The system browser returns here with
     /// the authorization `code` and the CSRF `state`; the handler exchanges the code
     /// and stores the token, then returns a human-facing success page (HTML).
     fn oauth_callback(&self, _code: &str, _state: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
 
-    /// EXPERIMENTAL manual-login completion (S-AG.12): the operator pastes the `code#state`
+    /// Manual-login completion: the operator pastes the `code#state`
     /// that claude.ai showed; the handler exchanges it and stores the token.
     fn oauth_complete(&self, _pasted: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
@@ -310,9 +310,8 @@ pub trait AgentHandler: Send + Sync {
         "{\"connected\":false}".to_string()
     }
 
-    /// EXPERIMENTAL subscription credential import (S-AG.12): store an access token +
-    /// refresh token obtained on another device (where the OAuth consent works), so this
-    /// device can run + self-refresh the subscription. Default: not available.
+    /// #627-only subscription credential import: store an access token + refresh token
+    /// obtained outside the product OAuth flow. Default: not available.
     fn subscription_import(
         &self,
         _access: &str,
@@ -1644,7 +1643,7 @@ impl Router {
         match req.path.as_str() {
             // The shell is static; the strict app CSP header locks it to our assets.
             "/" => ApiResponse::html_with_csp(INDEX_HTML, APP_SHELL_CSP),
-            // EXPERIMENTAL subscription OAuth callback (S-AG.12). The **system browser**
+            // Agent provider OAuth callback. The **system browser**
             // returns here after the operator's login; deliberately NOT under `/api/v1/`
             // so it is exempt from the session-token gate (the browser has no token).
             // CSRF-protected by the `state` minted at oauth/start (single-use). The path
@@ -4080,7 +4079,7 @@ impl Router {
         }
     }
 
-    /// Begin the EXPERIMENTAL subscription OAuth login (S-AG.12). Cap+session gated
+    /// Begin the agent provider OAuth login. Cap+session gated
     /// (the app initiates it); returns the authorize URL the UI opens in the system
     /// browser. `redirect` is the loopback callback the client supplies (its origin).
     fn agent_oauth_start(&self, req: &ApiRequest) -> ApiResponse {

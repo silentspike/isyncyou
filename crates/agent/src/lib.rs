@@ -18,15 +18,19 @@
 //! REQ-AGENT-004).
 //!
 //! # Providers
-//! [`provider::FakeProvider`] is a deterministic, scripted provider — the only provider
-//! used in CI (no real LLM tokens, REQ-AGENT-008). Official + experimental providers
-//! implement [`provider::LlmProvider`] in later stories.
+//! [`provider::FakeProvider`] is a deterministic, scripted provider for isolated tests.
+//! The product Claude/Codex OAuth provider runtime is compiled by
+//! `agent-oauth-providers`; #627's local CLI fallback/capture surface remains behind
+//! `agent-subscription-experimental`.
 
 pub mod archive;
 pub mod confirm;
 mod error;
 pub mod http;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub mod oauth;
 pub mod provider;
 pub mod retrieval;
@@ -64,11 +68,20 @@ pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use oauth::{AgentOAuth, OAuthConfig, StartedLogin};
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use provider::codex::{CodexConfig, CodexProvider};
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
 #[cfg(feature = "http")]
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};

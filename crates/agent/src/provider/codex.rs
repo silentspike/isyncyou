@@ -1,15 +1,12 @@
-//! EXPERIMENTAL OpenAI/ChatGPT (Codex) subscription provider — UNSUPPORTED, personal-build
-//! only (S-AG.12 / #627). Behind the default-off `agent-subscription-experimental` feature.
+//! ChatGPT/Codex OAuth-compatible provider runtime.
 //!
-//! Auth model (same rationale as the Claude provider): the operator first performs the
-//! normal `codex` login to their own ChatGPT account (`~/.codex/auth.json`), and this
-//! provider then uses the legitimately-obtained access token + account id, shaping the
-//! request to look like the official Codex CLI.
+//! Product auth is app OAuth plus encrypted credential storage. The #627 experimental
+//! build may additionally use local `codex` CLI credentials for private drift/capture
+//! work, but that fallback is outside the product boundary.
 //!
 //! Transport: the ChatGPT backend **Responses API over HTTP + SSE** (verified live — the
 //! backend accepts plain HTTP POST with `accept: text/event-stream`; no WebSocket needed,
-//! although the official client defaults to one). Recipe verified against the real client
-//! and may live in-repo (the legitimacy is the login-first sequence, not hiding the recipe).
+//! although the official client defaults to one). Recipe verified against the real client.
 
 use super::{AssistantBlock, Usage};
 use crate::tool::{tool_schema, TOOL_NAME};
@@ -25,9 +22,9 @@ const OPENAI_BETA: &str = "responses=experimental";
 const DEFAULT_CLI_VERSION: &str = "0.142.3";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 
-/// The ChatGPT/Codex wire configuration. Defaults to the verified recipe; the operator
-/// supplies their `account_id` (from `~/.codex/auth.json`) for the `chatgpt-account-id`
-/// header (without it the backend rejects the request).
+/// The ChatGPT/Codex wire configuration. Defaults to the verified recipe; the product
+/// credential path supplies `account_id` from the encrypted store. #627 experimental
+/// builds may derive the same value from local CLI state for drift/capture only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CodexConfig {

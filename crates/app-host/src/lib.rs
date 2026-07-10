@@ -8,7 +8,10 @@ use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
 use isyncyou_webui::{OfflineModeRisk, OneDriveMoveRisk};
 use std::collections::{BTreeSet, HashMap};
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,25 +86,34 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
     }
 }
 
-/// Fallback read executor for builds without the experimental agent (no store/SQLCipher
+/// Fallback read executor for builds without live agent providers (no store/SQLCipher
 /// pull): returns a placeholder so the turn loop still runs in CI/release shapes.
-#[cfg(not(feature = "agent-subscription-experimental"))]
+#[cfg(not(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+)))]
 struct StubExecutor;
-#[cfg(not(feature = "agent-subscription-experimental"))]
+#[cfg(not(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+)))]
 impl isyncyou_agent::ToolExecutor for StubExecutor {
     fn execute_read(
         &self,
         _action: &isyncyou_agent::ToolAction,
     ) -> Result<String, isyncyou_agent::AgentError> {
-        Ok("{\"note\":\"retrieval needs the agent-subscription-experimental build\"}".to_string())
+        Ok("{\"note\":\"retrieval needs the agent OAuth provider build\"}".to_string())
     }
 }
 
-/// Build the read-class tool executor for a turn. The experimental agent build binds the
+/// Build the read-class tool executor for a turn. The live-provider agent build binds the
 /// real `StoreArchive` retrieval executor (S-AG.3/#618: search/read/list/export over the
 /// encrypted store + on-disk body files for `account` under `archive_root`); other builds
 /// get the stub. S-AG.18/#643 is the progressive/deep-search behavior layered on top.
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn make_executor(
     account: &str,
     archive_root: std::path::PathBuf,
@@ -110,7 +122,10 @@ fn make_executor(
         isyncyou_agent::archive::StoreArchive::new(account, archive_root),
     ))
 }
-#[cfg(not(feature = "agent-subscription-experimental"))]
+#[cfg(not(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+)))]
 fn make_executor(
     _account: &str,
     _archive_root: std::path::PathBuf,
@@ -125,24 +140,36 @@ fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
 
 /// Default model for the in-app agent (override with `ISYNCYOU_AGENT_MODEL`). The
 /// subscription serves Sonnet/Opus; Sonnet is the cheaper default for general use.
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
 /// The Claude subscription models the in-app switcher offers (id, human label). Each id is
 /// verified against the subscription messages API.
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const CLAUDE_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-8", "Opus 4.8"),
     ("claude-sonnet-5", "Sonnet 5"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5"),
 ];
 /// The ChatGPT/Codex models the in-app switcher offers (id, human label).
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const CODEX_MODELS: &[(&str, &str)] = &[("gpt-5.5", "GPT-5.5"), ("gpt-5.4", "GPT-5.4")];
 
 /// A turn-provider builder (a `DaemonAgent` method): given the system prompt, return a
 /// boxed provider if its credentials are present.
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 type ProviderBuilder =
     fn(&DaemonAgent, &str) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>>;
 #[cfg(test)]
@@ -289,8 +316,8 @@ struct AgentStreamSlot {
     created_at_ms: u64,
 }
 
-/// The in-app agent handler (S-AG.6/#621). Drives a real turn: the experimental
-/// subscription provider when the user has connected an account, otherwise a deterministic
+/// The in-app agent handler (S-AG.6/#621). Drives a real turn: the product Claude/Codex
+/// OAuth provider path when the user has connected an account, otherwise a deterministic
 /// "not connected" message. Owns the stream hub + pending-action registry, so the model
 /// never holds a capability token.
 pub struct DaemonAgent {
@@ -303,13 +330,21 @@ pub struct DaemonAgent {
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
     seq: AtomicU64,
-    /// Directory holding the operator's local, uncommitted OAuth recipe
-    /// (`agent-oauth.json`) and the credential store — the parent of the config file.
-    /// Only read by the experimental subscription login (S-AG.12).
-    #[cfg_attr(not(feature = "agent-subscription-experimental"), allow(dead_code))]
+    /// Directory holding the app OAuth credential store and optional local OAuth recipe
+    /// override (`agent-oauth.json`) for development/operator builds.
+    #[cfg_attr(
+        not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )),
+        allow(dead_code)
+    )]
     oauth_dir: PathBuf,
     /// Tracks in-flight device OAuth logins between start and the browser callback.
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     oauth: isyncyou_agent::AgentOAuth,
     #[cfg(test)]
     test_provider_script: Option<TestProviderScript>,
@@ -327,7 +362,10 @@ impl DaemonAgent {
             streams: Mutex::new(std::collections::HashMap::new()),
             seq: AtomicU64::new(0),
             oauth_dir,
-            #[cfg(feature = "agent-subscription-experimental")]
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
             oauth: isyncyou_agent::AgentOAuth::new(),
             #[cfg(test)]
             test_provider_script: None,
@@ -398,9 +436,9 @@ impl DaemonAgent {
         self.streams.lock().unwrap().len()
     }
 
-    /// Pick the turn provider: the connected subscription (experimental feature) when a
-    /// token is present, otherwise a deterministic "not connected" message so the UI still
-    /// streams a clear instruction instead of erroring.
+    /// Pick the turn provider: a connected product OAuth provider when a token is present,
+    /// otherwise a deterministic "not connected" message so the UI still streams a clear
+    /// instruction instead of erroring.
     fn build_turn_provider(&self, system: &str) -> Box<dyn isyncyou_agent::LlmProvider + Send> {
         #[cfg(test)]
         if let Some(script) = &self.test_provider_script {
@@ -408,7 +446,10 @@ impl DaemonAgent {
                 return Box::new(isyncyou_agent::FakeProvider::new(script));
             }
         }
-        #[cfg(feature = "agent-subscription-experimental")]
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         {
             // Provider preference comes from the in-app switcher (persisted), falling back
             // to the env override; either falls back to the other if only one is connected.
@@ -422,7 +463,10 @@ impl DaemonAgent {
                 return p;
             }
         }
-        #[cfg(not(feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         let _ = system;
         Box::new(isyncyou_agent::FakeProvider::new(vec![vec![
             isyncyou_agent::AssistantBlock::Text(
@@ -434,11 +478,13 @@ impl DaemonAgent {
     }
 }
 
-/// The subscription credential we persist on mobile: the access token plus the refresh
-/// token and the access token's absolute expiry (ms since the Unix epoch), so the daemon
-/// can refresh the access token itself — the desktop `claude` CLI does this for its own
-/// `~/.claude/.credentials.json`, but on mobile we own the credential.
-#[cfg(feature = "agent-subscription-experimental")]
+/// The app OAuth credential we persist: access token, refresh token, and the access
+/// token's absolute expiry (ms since the Unix epoch), so the daemon can refresh without
+/// reading local provider CLI files.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 struct StoredCredential {
     access_token: String,
     refresh_token: String,
@@ -446,7 +492,10 @@ struct StoredCredential {
     expires_at_ms: u64,
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 impl StoredCredential {
     /// Serialize to the JSON blob persisted in the credential store.
     fn to_json(&self) -> Vec<u8> {
@@ -475,7 +524,10 @@ impl StoredCredential {
 }
 
 /// Ms since the Unix epoch (0 on a clock error).
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -484,7 +536,10 @@ fn now_ms() -> u64 {
 }
 
 /// The Codex/ChatGPT credential we persist (access + refresh + ChatGPT account id + expiry).
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 struct CodexStoredCredential {
     access_token: String,
     refresh_token: String,
@@ -492,7 +547,10 @@ struct CodexStoredCredential {
     expires_at_ms: u64,
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 impl CodexStoredCredential {
     fn to_json(&self) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -522,13 +580,22 @@ impl CodexStoredCredential {
     }
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const SUBSCRIPTION_CREDENTIAL_ID: &str = "subscription";
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const CODEX_CREDENTIAL_ID: &str = "codex";
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn credential_store_error(e: impl std::fmt::Display) -> String {
     let raw = e.to_string();
     let redacted = isyncyou_core::obs::redact(&raw);
@@ -539,12 +606,18 @@ fn credential_store_error(e: impl std::fmt::Display) -> String {
     }
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn agent_credential_config(oauth_dir: &Path) -> isyncyou_agent::CredentialStoreConfig {
     isyncyou_agent::CredentialStoreConfig::new(oauth_dir)
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn agent_credential_store(
     oauth_dir: &Path,
 ) -> Result<isyncyou_agent::AgentCredentialStore, String> {
@@ -553,12 +626,18 @@ fn agent_credential_store(
         .map_err(credential_store_error)
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn agent_credential_store_exists(oauth_dir: &Path) -> bool {
     agent_credential_config(oauth_dir).store_dir().exists()
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn store_agent_credential_blob(oauth_dir: &Path, id: &str, bytes: Vec<u8>) -> Result<(), String> {
     let store = agent_credential_store(oauth_dir)?;
     store
@@ -570,7 +649,10 @@ fn store_agent_credential_blob(oauth_dir: &Path, id: &str, bytes: Vec<u8>) -> Re
         .map_err(credential_store_error)
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn load_agent_credential_blob(
     oauth_dir: &Path,
     id: &str,
@@ -584,13 +666,19 @@ fn load_agent_credential_blob(
 }
 
 /// Persist a Codex credential to the encrypted store under `oauth_dir` (id `codex`).
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn store_codex_blob(oauth_dir: &Path, cred: &CodexStoredCredential) -> Result<(), String> {
     store_agent_credential_blob(oauth_dir, CODEX_CREDENTIAL_ID, cred.to_json())
 }
 
 /// Minimal percent-decode for the loopback callback query (`+`→space, `%XX`→byte).
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -621,13 +709,19 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const CODEX_OK_HTML: &str = "<!doctype html><meta charset=utf-8><title>ChatGPT connected</title>\
 <body style=\"font-family:system-ui;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;\
 align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Connected</h1>\
 <p style=color:#9aa3b2>ChatGPT is now linked. Close this tab and return to iSyncYou.</p></div>";
 
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const CODEX_ERR_HTML: &str = "<!doctype html><meta charset=utf-8><title>Sign-in failed</title>\
 <body style=\"font-family:system-ui;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;\
 align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Sign-in failed</h1>\
@@ -637,7 +731,10 @@ align-items:center;justify-content:center;margin:0\"><div style=text-align:cente
 /// `:1455` redirect). Waits for the browser to hit `/auth/callback?code=&state=`, verifies
 /// the CSRF `state`, exchanges the code, and persists the credential. Background thread;
 /// gives up after 5 minutes.
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn codex_callback_serve(
     listener: std::net::TcpListener,
     oauth_dir: std::path::PathBuf,
@@ -771,10 +868,13 @@ fn codex_callback_serve(
     }
 }
 
-/// EXPERIMENTAL subscription device-OAuth (S-AG.12) — only compiled with
-/// `agent-subscription-experimental`. The operator's recipe (endpoints/client_id) and
-/// the obtained token both live locally; nothing provider-specific is hardcoded.
-#[cfg(feature = "agent-subscription-experimental")]
+/// Product Claude/Codex OAuth runtime (#623). `agent-oauth-providers` owns the app OAuth
+/// credential path; `agent-subscription-experimental` layers the local CLI fallback/capture
+/// surface tracked by #627.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 impl DaemonAgent {
     /// A human-facing success page shown in the **system browser** after the callback.
     const OAUTH_SUCCESS_HTML: &'static str = "<!doctype html><html><head><meta charset=utf-8>\
@@ -809,7 +909,10 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// `fresh_access_token` can self-refresh before the ~8h subscription token expires
     /// (LIVE-verified 2026-07-01 — without the refresh token the client "connection-lost"s
     /// every ~8h with no way to renew).
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn store_token(&self, token: &isyncyou_agent::oauth::RefreshedToken) -> Result<(), String> {
         let expires_at_ms = if token.expires_in > 0 {
             now_ms() + token.expires_in * 1000
@@ -884,9 +987,8 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         std::fs::write(self.oauth_dir.join("agent-settings.json"), blob).map_err(|e| e.to_string())
     }
 
-    /// The subscription access token: our stored token (mobile, from the device OAuth
-    /// callback) first, else the existing `claude` CLI login on desktop
-    /// (`~/.claude/.credentials.json` → `claudeAiOauth.accessToken`). Never logged.
+    /// The Claude access token: first the product app OAuth credential store; the local
+    /// `claude` CLI credential fallback is compiled only for #627 experimental builds.
     fn subscription_token(&self) -> Option<String> {
         if agent_credential_store_exists(&self.oauth_dir) {
             if let Ok(Some(secret)) =
@@ -903,15 +1005,24 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 return self.fresh_access_token(cred);
             }
         }
-        // Desktop: the existing `claude` CLI login, which the CLI keeps refreshed.
-        let home = std::env::var_os("HOME")?;
-        let data =
-            std::fs::read_to_string(PathBuf::from(home).join(".claude/.credentials.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-        v.get("claudeAiOauth")?
-            .get("accessToken")?
-            .as_str()
-            .map(|s| s.to_string())
+        #[cfg(feature = "agent-subscription-experimental")]
+        {
+            // #627-only desktop fallback: the existing `claude` CLI login, which the CLI
+            // keeps refreshed. Never compiled into the product OAuth provider boundary.
+            let home = std::env::var_os("HOME")?;
+            let data =
+                std::fs::read_to_string(PathBuf::from(home).join(".claude/.credentials.json"))
+                    .ok()?;
+            let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+            v.get("claudeAiOauth")?
+                .get("accessToken")?
+                .as_str()
+                .map(|s| s.to_string())
+        }
+        #[cfg(not(feature = "agent-subscription-experimental"))]
+        {
+            None
+        }
     }
 
     /// Return a usable access token from a stored credential, refreshing it first if it is
@@ -951,27 +1062,35 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
-    /// The subscription config: the in-repo recipe + (on desktop) the account identity from
-    /// `~/.claude.json` for `metadata.user_id`.
+    /// The subscription config: the in-repo recipe plus, in #627 experimental builds only,
+    /// the local CLI account identity from `~/.claude.json` for `metadata.user_id`.
     fn subscription_config(&self) -> isyncyou_agent::SubscriptionConfig {
-        let mut cfg = isyncyou_agent::SubscriptionConfig::default();
-        if let Some(home) = std::env::var_os("HOME") {
-            if let Ok(data) = std::fs::read_to_string(PathBuf::from(home).join(".claude.json")) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                    if let Some(a) = v
-                        .get("oauthAccount")
-                        .and_then(|o| o.get("accountUuid"))
-                        .and_then(|x| x.as_str())
-                    {
-                        cfg.account_uuid = a.to_string();
-                    }
-                    if let Some(d) = v.get("userID").and_then(|x| x.as_str()) {
-                        cfg.device_id = d.to_string();
+        #[cfg(feature = "agent-subscription-experimental")]
+        {
+            let mut cfg = isyncyou_agent::SubscriptionConfig::default();
+            if let Some(home) = std::env::var_os("HOME") {
+                if let Ok(data) = std::fs::read_to_string(PathBuf::from(home).join(".claude.json"))
+                {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(a) = v
+                            .get("oauthAccount")
+                            .and_then(|o| o.get("accountUuid"))
+                            .and_then(|x| x.as_str())
+                        {
+                            cfg.account_uuid = a.to_string();
+                        }
+                        if let Some(d) = v.get("userID").and_then(|x| x.as_str()) {
+                            cfg.device_id = d.to_string();
+                        }
                     }
                 }
             }
+            cfg
         }
-        cfg
+        #[cfg(not(feature = "agent-subscription-experimental"))]
+        {
+            isyncyou_agent::SubscriptionConfig::default()
+        }
     }
 
     /// Build the subscription provider if a token is available (else None → fallback).
@@ -990,10 +1109,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         Some(Box::new(p))
     }
 
-    /// ChatGPT/Codex credentials: the existing `codex` CLI login on desktop
-    /// (`~/.codex/auth.json` → tokens.access_token + account_id). Never logged.
+    /// ChatGPT/Codex credentials: first the product app OAuth credential store; the local
+    /// `codex` CLI credential fallback is compiled only for #627 experimental builds.
     fn codex_credentials(&self) -> Option<(String, String)> {
-        // Mobile: a device-logged-in Codex credential in the store, refreshed if expired.
         if agent_credential_store_exists(&self.oauth_dir) {
             if let Ok(Some(secret)) =
                 load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID)
@@ -1003,21 +1121,29 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 }
             }
         }
-        // Desktop: the existing `codex` CLI login (`~/.codex/auth.json`).
-        let home = std::env::var_os("HOME")?;
-        let data = std::fs::read_to_string(PathBuf::from(home).join(".codex/auth.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-        let t = v.get("tokens")?;
-        let token = t.get("access_token")?.as_str()?.to_string();
-        let account = t
-            .get("account_id")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if token.is_empty() {
-            return None;
+        #[cfg(feature = "agent-subscription-experimental")]
+        {
+            // #627-only desktop fallback: the existing `codex` CLI login.
+            let home = std::env::var_os("HOME")?;
+            let data =
+                std::fs::read_to_string(PathBuf::from(home).join(".codex/auth.json")).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+            let t = v.get("tokens")?;
+            let token = t.get("access_token")?.as_str()?.to_string();
+            let account = t
+                .get("account_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if token.is_empty() {
+                return None;
+            }
+            Some((token, account))
         }
-        Some((token, account))
+        #[cfg(not(feature = "agent-subscription-experimental"))]
+        {
+            None
+        }
     }
 
     /// Usable Codex creds from a stored credential, refreshing first if expired (5-min
@@ -1070,7 +1196,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
-    /// EXPERIMENTAL (S-AG.12). Start the Codex/ChatGPT device OAuth: bind OpenAI's fixed
+    /// Start the Codex/ChatGPT OAuth flow: bind OpenAI's fixed
     /// loopback port, spawn a one-shot callback server (exchanges + stores on success),
     /// and return the authorize URL for the system browser. The app polls
     /// `/api/v1/agent/status` for `codex:true`.
@@ -1243,11 +1369,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         self.streams.lock().unwrap().remove(turn_id).map(|s| s.rx)
     }
 
-    /// EXPERIMENTAL (S-AG.12). Begin the MANUAL device OAuth login: PKCE + state, with the
+    /// Begin the Claude device OAuth login: PKCE + state, with the
     /// manual (copy-paste) redirect — claude.ai shows a code instead of redirecting to a
     /// loopback server. The app opens the returned URL in the system browser. Robust on
     /// mobile (no loopback host/port/IPv6 fragility).
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn oauth_start(&self, provider: &str, redirect_uri: &str) -> Result<String, String> {
         if provider == "codex" {
             return self.codex_oauth_start();
@@ -1267,10 +1396,13 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         Ok(started.authorize_url)
     }
 
-    /// EXPERIMENTAL (S-AG.12). Complete the MANUAL login: the operator pastes the
+    /// Complete the Claude manual login: the operator pastes the
     /// `code#state` shown by claude.ai. Look up the PKCE verifier by state, exchange, and
     /// persist the token.
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn oauth_complete(&self, pasted: &str) -> Result<String, String> {
         let (code, state_opt) = isyncyou_agent::oauth::parse_pasted_code(pasted);
         let state = state_opt.ok_or("the pasted code is missing its #state part")?;
@@ -1287,10 +1419,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         Ok("connected".to_string())
     }
 
-    /// EXPERIMENTAL (S-AG.12). Import a subscription credential obtained on another device
-    /// (e.g. the desktop `claude` login, where the OAuth consent works) so this device can
-    /// run + self-refresh it. Session/cap gated at the router; the credential is stored
-    /// encrypted at rest exactly like a device-OAuth result.
+    /// #627-only import of a subscription credential obtained outside the app OAuth flow.
+    /// Product setup must use OAuth start/complete/callback, not token import.
     #[cfg(feature = "agent-subscription-experimental")]
     fn subscription_import(
         &self,
@@ -1308,9 +1438,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         })
     }
 
-    /// EXPERIMENTAL (S-AG.12). The loopback callback path (kept for the auto flow); exchange
+    /// The loopback callback path (kept for the auto flow); exchange
     /// the code with the stored verifier + state and persist the token, then show a page.
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
         let (verifier, redirect_uri) = self
             .oauth
@@ -1325,7 +1458,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn status_json(&self) -> String {
         let claude = self.subscription_token().is_some();
         let codex = self.codex_credentials().is_some();
@@ -1366,7 +1502,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     }
 
     /// Persist the switcher's provider+model selection (validated against the offered lists).
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn set_model(&self, provider: &str, model: &str) -> Result<(), String> {
         self.set_agent_settings(provider, model)
     }
@@ -2616,8 +2755,8 @@ pub fn build_live_router(
     live_interval: Arc<AtomicU64>,
     progress: isyncyou_connectors::SharedProgress,
 ) -> isyncyou_webui::Router {
-    // The experimental subscription login reads its local recipe + stores its token
-    // next to the config file (on mobile that is the app-private filesDir).
+    // Agent OAuth credentials live next to the config file (on mobile, app-private
+    // filesDir). #627-only local fallback/capture uses the same directory for overrides.
     let oauth_dir = config_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -2729,7 +2868,10 @@ mod tests {
     use std::sync::{Mutex as StdMutex, OnceLock as StdOnceLock};
 
     static ENVELOPE_REQUIREMENT_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     static APP_HOST_CREDENTIAL_ENV_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
 
     struct EnvelopeRequirementGuard {
@@ -2865,14 +3007,20 @@ mod tests {
         ))
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     struct AppHostCredentialEnvGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
         home: Option<std::ffi::OsString>,
         cred_key: Option<std::ffi::OsString>,
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     impl AppHostCredentialEnvGuard {
         fn new() -> Self {
             let guard = APP_HOST_CREDENTIAL_ENV_TEST_LOCK
@@ -2894,7 +3042,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     impl Drop for AppHostCredentialEnvGuard {
         fn drop(&mut self) {
             match &self.home {
@@ -2908,7 +3059,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn apphost_credential_test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "isy-apphost-{name}-{}-{}",
@@ -3534,9 +3688,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
-    fn experimental_agent_executor_reads_store_archive_fixture() {
+    fn live_provider_agent_executor_reads_store_archive_fixture() {
         let _guard = EnvelopeRequirementGuard::new();
         isyncyou_core::envelope::set_body_key(618_070, [70u8; 32]);
 
@@ -3623,7 +3780,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn subscription_credential_round_trips_through_agent_credential_store() {
         let _env = AppHostCredentialEnvGuard::new();
@@ -3658,7 +3818,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn codex_credential_round_trips_through_agent_credential_store() {
         let _env = AppHostCredentialEnvGuard::new();
@@ -3684,7 +3847,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn credential_store_preferred_over_desktop_cli_fallback() {
         let env = AppHostCredentialEnvGuard::new();
@@ -3736,7 +3902,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(feature = "agent-subscription-experimental")]
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn product_oauth_provider_does_not_read_desktop_cli_fallbacks() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("product-no-cli-fallback");
+        let _ = std::fs::remove_dir_all(&root);
+        let oauth_dir = root.join("oauth");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"desktop-claude-token"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"desktop-account"},"userID":"desktop-device"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".codex/auth.json"),
+            r#"{"tokens":{"access_token":"desktop-codex-token","account_id":"desktop-account"}}"#,
+        )
+        .unwrap();
+        env.set_home(&home);
+
+        let agent = DaemonAgent::new(Config::default(), oauth_dir);
+
+        assert_eq!(agent.subscription_token(), None);
+        assert_eq!(agent.codex_credentials(), None);
+        let cfg = agent.subscription_config();
+        assert!(cfg.account_uuid.is_empty());
+        assert!(cfg.device_id.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn stored_credential_error_redaction_does_not_leak_tokens() {
         let _env = AppHostCredentialEnvGuard::new();
