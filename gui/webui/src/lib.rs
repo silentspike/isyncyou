@@ -270,11 +270,47 @@ fn redact_share_error_for_public_surface(error: &str) -> PublicShareError {
     PublicShareError { status, message }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicRestoreError {
+    status: u16,
+    message: String,
+}
+
+fn redact_restore_error_for_public_surface(error: &str) -> PublicRestoreError {
+    let lower = error.trim().to_ascii_lowercase();
+    let (status, message) = if lower.contains("restore is not enabled")
+        || lower.contains("cloud restore is disabled")
+        || lower.contains("disabled")
+    {
+        (400, "restore_disabled")
+    } else if lower.contains("not crash-safe")
+        || lower.contains("unsupported")
+        || lower.contains("not supported")
+    {
+        (400, "restore_unsupported_service")
+    } else if lower.contains("unknown account") {
+        (400, "restore_unknown_account")
+    } else {
+        (500, "restore_failed")
+    };
+    PublicRestoreError {
+        status,
+        message: message.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreResponse {
+    Completed { new_id: String },
+    Queued { job_id: String, state: String },
+}
+
 /// Performs a destructive cloud action on behalf of a POST request. Injected by
 /// the daemon (which owns the Graph/engine stack) so the router itself stays a
-/// pure read surface. Returns the new cloud id on success.
+/// pure read surface. Desktop handlers may complete immediately; mobile handlers
+/// enqueue a durable job and return its id/state without mutating in the request.
 pub trait RestoreHandler: Send + Sync {
-    fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String>;
+    fn restore(&self, account: &str, service: &str, id: &str) -> Result<RestoreResponse, String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3314,6 +3350,12 @@ impl Router {
             }
             _ => return ApiResponse::error(400, "account, service and id are required"),
         };
+        let pending_item = restore_cloud_pending_item(service, id);
+        if let Some(r) =
+            self.biometric_challenge("restore-cloud", account, service, &pending_item, req)
+        {
+            return r;
+        }
         if let Err(e) = self.audit_account(
             account,
             "audit:restore",
@@ -3323,7 +3365,7 @@ impl Router {
             return ApiResponse::error(500, &format!("audit: {e}"));
         }
         match handler.restore(account, service, id) {
-            Ok(new_id) => {
+            Ok(RestoreResponse::Completed { new_id }) => {
                 let _ = self.audit_account(
                     account,
                     "audit:restore",
@@ -3334,14 +3376,33 @@ impl Router {
                     &json!({ "restored": id, "service": service, "new_id": new_id }),
                 )
             }
+            Ok(RestoreResponse::Queued { job_id, state }) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:restore",
+                    "ok",
+                    &format!("restore queued service={service} id={id} job_id={job_id}"),
+                );
+                ApiResponse::ok_json(&json!({
+                    "queued": true,
+                    "restored": id,
+                    "service": service,
+                    "job_id": job_id,
+                    "state": state,
+                }))
+            }
             Err(e) => {
+                let public = redact_restore_error_for_public_surface(&e);
                 let _ = self.audit_account(
                     account,
                     "audit:restore",
                     "error",
-                    &format!("restore error service={service} id={id}: {e}"),
+                    &format!(
+                        "restore error service={service} id={id}: {}",
+                        public.message
+                    ),
                 );
-                ApiResponse::error(500, &e)
+                ApiResponse::error(public.status, &public.message)
             }
         }
     }
@@ -5191,6 +5252,16 @@ fn parse_services_param(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+fn restore_cloud_pending_item(service: &str, id: &str) -> String {
+    format!(
+        "service:{}:{}:id:{}:{}",
+        service.len(),
+        service,
+        id.len(),
+        id
+    )
+}
+
 fn mobile_job_summary_json(job: MobileJobSummary) -> Value {
     json!({
         "job_id": job.job_id,
@@ -6145,15 +6216,34 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     struct OkRestore;
     impl RestoreHandler for OkRestore {
-        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
-            Ok("new-cloud-id".into())
+        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<RestoreResponse, String> {
+            Ok(RestoreResponse::Completed {
+                new_id: "new-cloud-id".into(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct QueuedRestore {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+    impl RestoreHandler for QueuedRestore {
+        fn restore(&self, a: &str, s: &str, i: &str) -> Result<RestoreResponse, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((a.to_string(), s.to_string(), i.to_string()));
+            Ok(RestoreResponse::Queued {
+                job_id: "job-restore-1".into(),
+                state: "queued".into(),
+            })
         }
     }
 
     struct ErrRestore;
     impl RestoreHandler for ErrRestore {
-        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
-            Err("graph refused restore".into())
+        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<RestoreResponse, String> {
+            Err("graph refused restore for pat@example.com https://secret.example/item".into())
         }
     }
 
@@ -6213,7 +6303,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn restore_post_requires_a_valid_capability_token() {
+    fn restore_post_completed_shape_is_backward_compatible() {
         let (_d, router) = setup();
         let router = router.with_restore(std::sync::Arc::new(OkRestore), "secret".into());
         let q = "/api/v1/restore?account=a&service=mail&id=x";
@@ -6228,11 +6318,133 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // correct token -> 200 + the new cloud id
         let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
         assert_eq!(ok.status, 200);
-        assert!(String::from_utf8_lossy(&ok.body).contains("new-cloud-id"));
+        let body = body_json(&ok);
+        assert_eq!(body["restored"], "x");
+        assert_eq!(body["service"], "mail");
+        assert_eq!(body["new_id"], "new-cloud-id");
+        assert!(body.get("queued").is_none());
         // valid token but missing params -> 400
         let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
             .with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&bad).status, 400);
+    }
+
+    #[test]
+    fn restore_post_queued_shape_for_mobile_jobs() {
+        let (_d, router) = setup();
+        let restore = std::sync::Arc::new(QueuedRestore::default());
+        let router = router.with_restore(restore.clone(), "secret".into());
+        let q = "/api/v1/restore?account=a&service=mail&id=x";
+
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+
+        assert_eq!(ok.status, 200);
+        let body = body_json(&ok);
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["restored"], "x");
+        assert_eq!(body["service"], "mail");
+        assert_eq!(body["job_id"], "job-restore-1");
+        assert_eq!(body["state"], "queued");
+        assert_eq!(
+            restore.calls.lock().unwrap().as_slice(),
+            &[("a".to_string(), "mail".to_string(), "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn mobile_restore_route_is_401_without_session() {
+        let (_d, router) = setup();
+        let router = router
+            .with_restore(std::sync::Arc::new(QueuedRestore::default()), "cap".into())
+            .with_session_token("sess".into());
+        let req = ApiRequest::new("POST", "/api/v1/restore?account=a&service=mail&id=x")
+            .with_cap_token(Some("cap".into()));
+
+        assert_eq!(router.route(&req).status, 401);
+    }
+
+    #[test]
+    fn mobile_restore_route_is_401_without_cap_after_session() {
+        let (_d, router) = setup();
+        let router = router
+            .with_restore(std::sync::Arc::new(QueuedRestore::default()), "cap".into())
+            .with_session_token("sess".into());
+        let req = ApiRequest::new("POST", "/api/v1/restore?account=a&service=mail&id=x")
+            .with_session_token(Some("sess".into()));
+
+        assert_eq!(router.route(&req).status, 401);
+    }
+
+    #[test]
+    fn mobile_restore_route_is_biometric_token_gated_before_enqueue() {
+        let (_d, router) = setup();
+        let restore = std::sync::Arc::new(QueuedRestore::default());
+        let mobile = router
+            .with_restore(restore.clone(), "cap".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let post = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_cap_token(Some("cap".into()))
+                .with_session_token(Some("sess".into()))
+        };
+
+        let ch = mobile.route(&post("/api/v1/restore?account=a&service=mail&id=x"));
+
+        assert_eq!(ch.status, 200);
+        let body = body_json(&ch);
+        assert_eq!(body["status"], "confirmation_required");
+        assert_eq!(body["op"], "restore-cloud");
+        assert_eq!(body["account"], "a");
+        assert_eq!(body["service"], "mail");
+        assert_eq!(body["item"], restore_cloud_pending_item("mail", "x"));
+        assert!(restore.calls.lock().unwrap().is_empty());
+
+        let pat = body["pending_action_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/restore?account=a&service=mail&id=x&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert!(restore.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mobile_restore_route_enqueues_job_after_biometric_token() {
+        let (_d, router) = setup();
+        let restore = std::sync::Arc::new(QueuedRestore::default());
+        let mobile = router
+            .with_restore(restore.clone(), "cap".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let post = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_cap_token(Some("cap".into()))
+                .with_session_token(Some("sess".into()))
+        };
+
+        let ch = mobile.route(&post("/api/v1/restore?account=a&service=mail&id=x"));
+        let pat = body_json(&ch)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(mobile.confirm_biometric(&pat));
+
+        let ok = mobile.route(&post(&format!(
+            "/api/v1/restore?account=a&service=mail&id=x&_pat={pat}"
+        )));
+
+        assert_eq!(ok.status, 200);
+        let body = body_json(&ok);
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["job_id"], "job-restore-1");
+        assert_eq!(
+            restore.calls.lock().unwrap().as_slice(),
+            &[("a".to_string(), "mail".to_string(), "x".to_string())]
+        );
     }
 
     #[test]
@@ -9821,6 +10033,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         let err = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
         assert_eq!(err.status, 500);
+        let body = String::from_utf8_lossy(&err.body);
+        assert!(body.contains("restore_failed"));
+        assert!(!body.contains("pat@example.com"));
+        assert!(!body.contains("secret.example"));
 
         let audit =
             body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=5")));
@@ -9829,7 +10045,15 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(audit["runs"][0]["summary"]
             .as_str()
             .unwrap()
-            .contains("graph refused restore"));
+            .contains("restore_failed"));
+        assert!(!audit["runs"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("pat@example.com"));
+        assert!(!audit["runs"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("secret.example"));
         assert_eq!(audit["runs"][1]["status"], "started");
     }
 

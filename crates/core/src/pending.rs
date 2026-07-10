@@ -41,13 +41,12 @@ pub fn now_ms() -> u64 {
 /// The destructive / external op classes that require a biometric per-action
 /// confirmation on mobile (risk-based gate catalogue, #onedrive-mobile 0.6):
 /// delete, external share, upload/replace, backup, move OUT of a protected scope,
-/// a mode-switch that would pull a large folder offline, a conflict resolve that
-/// deletes the cloud copy (keep-mine), and bulk operations.
+/// queued cloud restore, a mode-switch that would pull a large folder offline, a
+/// conflict resolve that deletes the cloud copy (keep-mine), and bulk operations.
 ///
-/// `restore-cloud` is added with the queued restore route (#625 Task 4/6); read-only
-/// ops (search/read/list/export) are never gated. Free-up / download-now are NOT gated
-/// (local-only, reversible: free-up just drops a re-downloadable copy) — only the
-/// cloud-deleting keep-mine resolve is (#659).
+/// Read-only ops (search/read/list/export) are never gated. Free-up / download-now
+/// are NOT gated (local-only, reversible: free-up just drops a re-downloadable copy)
+/// — only the cloud-deleting keep-mine resolve is (#659).
 pub fn requires_confirmation(op: &str) -> bool {
     matches!(
         op,
@@ -55,6 +54,7 @@ pub fn requires_confirmation(op: &str) -> bool {
             | "share"
             | "external-share"
             | "backup"
+            | "restore-cloud"
             | "upload"
             | "replace"
             | "move-out-of-protected"
@@ -227,12 +227,13 @@ mod tests {
 
     // --- Gate catalogue (AC4) --------------------------------------------------
     #[test]
-    fn gate_catalogue_covers_destructive_ops_and_excludes_restore_cloud() {
+    fn gate_catalogue_covers_destructive_ops() {
         for op in [
             "delete",
             "share",
             "external-share",
             "backup",
+            "restore-cloud",
             "upload",
             "replace",
             "move-out-of-protected",
@@ -242,10 +243,9 @@ mod tests {
         ] {
             assert!(requires_confirmation(op), "{op} must be gated");
         }
-        // restore-cloud lands with the queued restore route; read-only ops are never gated.
-        // free-up / download-now are local-only, reversible → never gated (#659).
+        // Read-only ops are never gated. free-up / download-now are local-only,
+        // reversible -> never gated (#659).
         for op in [
-            "restore-cloud",
             "read",
             "list",
             "search",

@@ -412,6 +412,21 @@ impl isyncyou_webui::BackupHandler for MobileJobRuntime {
     }
 }
 
+impl isyncyou_webui::RestoreHandler for MobileJobRuntime {
+    fn restore(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+    ) -> Result<isyncyou_webui::RestoreResponse, String> {
+        let job = MobileJobRuntime::enqueue_restore_cloud(self, account, service, id)?;
+        Ok(isyncyou_webui::RestoreResponse::Queued {
+            job_id: job.job_id,
+            state: job.state.as_str().to_string(),
+        })
+    }
+}
+
 impl isyncyou_webui::MobileJobHandler for MobileJobRuntime {
     fn list_jobs(
         &self,

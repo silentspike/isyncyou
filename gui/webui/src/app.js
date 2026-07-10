@@ -4439,7 +4439,14 @@ async function renderSettingsView(view) {
 async function doRestore(it, btn) {
   if (!confirm(`Restore this ${it.service} item to the cloud as a new copy?`)) return;
   btn.disabled = true;
-  try { const d = await post("/api/v1/restore?" + qs({ account: App.account, service: it.service, id: it.remote_id }), CAP.restore); toast(`Restored (new id ${String(d.new_id).slice(0, 8)}…)`); }
+  try {
+    const d = await post("/api/v1/restore?" + qs({ account: App.account, service: it.service, id: it.remote_id }), CAP.restore);
+    if (d.queued) {
+      toast(`Restore queued (${String(d.job_id || "job").slice(0, 12)}…)`);
+    } else {
+      toast(`Restored (new id ${String(d.new_id || "").slice(0, 8)}…)`);
+    }
+  }
   catch (e) { toast("Restore failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 async function doShare(it, btn) {

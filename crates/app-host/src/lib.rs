@@ -79,7 +79,12 @@ pub struct DaemonRestore {
     cfg: Config,
 }
 impl isyncyou_webui::RestoreHandler for DaemonRestore {
-    fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String> {
+    fn restore(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+    ) -> Result<isyncyou_webui::RestoreResponse, String> {
         // Refuse a not-yet-ledger-migrated service before resolving a token, so the
         // web UI gets the clear "not crash-safe yet" message. (Engine re-checks.)
         if !isyncyou_engine::cloud_restore_service_supported(service) {
@@ -88,7 +93,8 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
             ));
         }
         let token = isyncyou_engine::auth::resolve_cached_restore_token(&self.cfg, account)?;
-        isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)
+        let new_id = isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)?;
+        Ok(isyncyou_webui::RestoreResponse::Completed { new_id })
     }
 }
 
