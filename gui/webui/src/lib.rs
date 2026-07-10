@@ -81,6 +81,8 @@ const STATUS_SERVICES: &[&str] = &[
     "onedrive", "mail", "calendar", "contacts", "todo", "onenote", "shared",
 ];
 
+const BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
+
 /// A parsed inbound request (method + path + decoded query pairs + an optional
 /// capability token captured from the `X-Capability-Token` header).
 #[derive(Debug, Clone)]
@@ -270,11 +272,91 @@ fn redact_share_error_for_public_surface(error: &str) -> PublicShareError {
     PublicShareError { status, message }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicRestoreError {
+    status: u16,
+    message: String,
+}
+
+fn redact_restore_error_for_public_surface(error: &str) -> PublicRestoreError {
+    let lower = error.trim().to_ascii_lowercase();
+    let (status, message) = if lower.contains("restore is not enabled")
+        || lower.contains("cloud restore is disabled")
+        || lower.contains("disabled")
+    {
+        (400, "restore_disabled")
+    } else if lower.contains("not crash-safe")
+        || lower.contains("unsupported")
+        || lower.contains("not supported")
+    {
+        (400, "restore_unsupported_service")
+    } else if lower.contains("unknown account") {
+        (400, "restore_unknown_account")
+    } else {
+        (500, "restore_failed")
+    };
+    PublicRestoreError {
+        status,
+        message: message.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreResponse {
+    Completed { new_id: String },
+    Queued { job_id: String, state: String },
+}
+
 /// Performs a destructive cloud action on behalf of a POST request. Injected by
 /// the daemon (which owns the Graph/engine stack) so the router itself stays a
-/// pure read surface. Returns the new cloud id on success.
+/// pure read surface. Desktop handlers may complete immediately; mobile handlers
+/// enqueue a durable job and return its id/state without mutating in the request.
 pub trait RestoreHandler: Send + Sync {
-    fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String>;
+    fn restore(&self, account: &str, service: &str, id: &str) -> Result<RestoreResponse, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupJobQueued {
+    pub job_id: String,
+    pub state: String,
+}
+
+/// Enqueues a durable mobile backup job. The handler must not perform the backup
+/// inline; execution belongs to the mobile job worker.
+pub trait BackupHandler: Send + Sync {
+    fn enqueue_backup(&self, account: &str, services: &[String])
+        -> Result<BackupJobQueued, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileJobSummary {
+    pub job_id: String,
+    pub kind: String,
+    pub state: String,
+    pub service: Option<String>,
+    pub target_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+/// Mobile durable job status/cancel surface. Summaries deliberately exclude
+/// intent/result payloads because those may contain operation-specific metadata.
+pub trait MobileJobHandler: Send + Sync {
+    fn list_jobs(&self, account: &str, limit: u32) -> Result<Vec<MobileJobSummary>, String>;
+    fn cancel_job(&self, account: &str, job_id: &str) -> Result<bool, String>;
+}
+
+/// Non-secret binding fields for a pending Agent destructive action. Mobile uses
+/// these to mint a native biometric-token challenge before the Agent's one-time
+/// confirmation token is consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPendingBinding {
+    pub op: String,
+    pub account: String,
+    pub service: String,
+    pub item: String,
 }
 
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
@@ -286,6 +368,15 @@ pub trait RestoreHandler: Send + Sync {
 pub trait AgentHandler: Send + Sync {
     /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
+    /// Peek the non-secret binding for a pending destructive action without checking
+    /// or consuming its one-time Agent confirmation token.
+    fn pending_binding(
+        &self,
+        _pending_id: &str,
+        _action_hash: &str,
+    ) -> Result<AgentPendingBinding, String> {
+        Err("pending binding is not enabled on this server".into())
+    }
     /// Confirm a pending destructive action with its one-time token; returns a summary.
     fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String>;
     /// Cancel an in-flight turn.
@@ -854,6 +945,15 @@ pub struct Router {
     /// can't read it (CSRF defense); paired with POST-only + an owner-only socket
     /// it gates cloud mutations (plan §11).
     restore_cap_token: Option<String>,
+    /// Optional mobile backup enqueue handler (#625). `None` => backup POSTs are
+    /// refused; when present the route queues a mobile job only.
+    backup: Option<std::sync::Arc<dyn BackupHandler>>,
+    /// Separate capability token for backup POSTs.
+    backup_cap_token: Option<String>,
+    /// Optional mobile job status/cancel handler (#625).
+    mobile_jobs: Option<std::sync::Arc<dyn MobileJobHandler>>,
+    /// Separate capability token for mobile job status/cancel.
+    mobile_job_cap_token: Option<String>,
     /// Separate capability token for scheduled-sync control POSTs. Keeping this
     /// distinct from the restore token limits the blast radius of a leaked token.
     sync_cap_token: Option<String>,
@@ -991,6 +1091,10 @@ impl Router {
             gate: None,
             restore: None,
             restore_cap_token: None,
+            backup: None,
+            backup_cap_token: None,
+            mobile_jobs: None,
+            mobile_job_cap_token: None,
             sync_cap_token: None,
             share: None,
             share_cap_token: None,
@@ -1043,6 +1147,10 @@ impl Router {
             gate: Some(gate),
             restore: None,
             restore_cap_token: None,
+            backup: None,
+            backup_cap_token: None,
+            mobile_jobs: None,
+            mobile_job_cap_token: None,
             sync_cap_token: None,
             share: None,
             share_cap_token: None,
@@ -1094,6 +1202,28 @@ impl Router {
     ) -> Self {
         self.restore = Some(handler);
         self.restore_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable mobile backup enqueue POSTs, guarded by `cap_token`.
+    pub fn with_backup(
+        mut self,
+        handler: std::sync::Arc<dyn BackupHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.backup = Some(handler);
+        self.backup_cap_token = Some(cap_token);
+        self
+    }
+
+    /// Enable mobile durable job list/cancel, guarded by `cap_token`.
+    pub fn with_mobile_jobs(
+        mut self,
+        handler: std::sync::Arc<dyn MobileJobHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.mobile_jobs = Some(handler);
+        self.mobile_job_cap_token = Some(cap_token);
         self
     }
 
@@ -1584,6 +1714,8 @@ impl Router {
         if req.method == "POST" {
             return match req.path.as_str() {
                 "/api/v1/restore" => self.restore(req),
+                "/api/v1/backup" => self.backup(req),
+                "/api/v1/jobs/cancel" => self.mobile_job_cancel(req),
                 "/api/v1/share" => self.share_link(req),
                 "/api/v1/sync/pause" => self.sync_command(req, |c| c.pause()),
                 "/api/v1/sync/resume" => self.sync_command(req, |c| c.resume()),
@@ -1671,6 +1803,14 @@ impl Router {
                     .replace(
                         "__RESTORE_CAP_TOKEN__",
                         self.restore_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__BACKUP_CAP_TOKEN__",
+                        self.backup_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
+                        "__MOBILE_JOB_CAP_TOKEN__",
+                        self.mobile_job_cap_token.as_deref().unwrap_or(""),
                     )
                     .replace(
                         "__SYNC_CAP_TOKEN__",
@@ -1771,6 +1911,7 @@ impl Router {
             "/sfx/pickup.mp3" => audio_response(SFX_PICKUP),
             "/sfx/hit.mp3" => audio_response(SFX_HIT),
             "/api/v1/accounts" => self.accounts(),
+            "/api/v1/jobs" => self.mobile_jobs(req),
             "/api/v1/settings" => self.settings(),
             "/api/v1/activity" => self.activity(req),
             "/api/v1/status" => self.status(req),
@@ -3231,6 +3372,12 @@ impl Router {
             }
             _ => return ApiResponse::error(400, "account, service and id are required"),
         };
+        let pending_item = restore_cloud_pending_item(service, id);
+        if let Some(r) =
+            self.biometric_challenge("restore-cloud", account, service, &pending_item, req)
+        {
+            return r;
+        }
         if let Err(e) = self.audit_account(
             account,
             "audit:restore",
@@ -3240,7 +3387,7 @@ impl Router {
             return ApiResponse::error(500, &format!("audit: {e}"));
         }
         match handler.restore(account, service, id) {
-            Ok(new_id) => {
+            Ok(RestoreResponse::Completed { new_id }) => {
                 let _ = self.audit_account(
                     account,
                     "audit:restore",
@@ -3251,15 +3398,115 @@ impl Router {
                     &json!({ "restored": id, "service": service, "new_id": new_id }),
                 )
             }
+            Ok(RestoreResponse::Queued { job_id, state }) => {
+                let _ = self.audit_account(
+                    account,
+                    "audit:restore",
+                    "ok",
+                    &format!("restore queued service={service} id={id} job_id={job_id}"),
+                );
+                ApiResponse::ok_json(&json!({
+                    "queued": true,
+                    "restored": id,
+                    "service": service,
+                    "job_id": job_id,
+                    "kind": "restore-cloud",
+                    "state": state,
+                }))
+            }
             Err(e) => {
+                let public = redact_restore_error_for_public_surface(&e);
                 let _ = self.audit_account(
                     account,
                     "audit:restore",
                     "error",
-                    &format!("restore error service={service} id={id}: {e}"),
+                    &format!(
+                        "restore error service={service} id={id}: {}",
+                        public.message
+                    ),
                 );
-                ApiResponse::error(500, &e)
+                ApiResponse::error(public.status, &public.message)
             }
+        }
+    }
+
+    /// `POST /api/v1/backup?account[&services=mail,calendar]` — enqueue a durable
+    /// mobile backup job. Requires its own capability token and, on mobile, a
+    /// per-action biometric token. The handler must not run the backup inline.
+    fn backup(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.backup {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "backup is not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.backup_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let services = match parse_backup_services_param(req.q("services")) {
+            Ok(services) => services,
+            Err(e) => return ApiResponse::error(400, &e),
+        };
+        if let Some(r) = self.biometric_challenge("backup", account, "backup", account, req) {
+            return r;
+        }
+        match handler.enqueue_backup(account, &services) {
+            Ok(job) => ApiResponse::ok_json(&json!({
+                "queued": true,
+                "job_id": job.job_id,
+                "kind": "backup",
+                "state": job.state,
+            })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// `GET /api/v1/jobs?account` — secret-free mobile job summaries.
+    fn mobile_jobs(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.mobile_jobs {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "mobile jobs are not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.mobile_job_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let account = match req.q("account").filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => return ApiResponse::error(400, "account is required"),
+        };
+        let limit = clamp_limit(req.q("limit"));
+        match handler.list_jobs(account, limit) {
+            Ok(jobs) => ApiResponse::ok_json(&json!({
+                "account": account,
+                "jobs": jobs.into_iter().map(mobile_job_summary_json).collect::<Vec<_>>(),
+            })),
+            Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// `POST /api/v1/jobs/cancel?account&job_id` — mark a queued/running mobile
+    /// job cancelled. This is queue-state cancellation; it does not claim to abort
+    /// an already in-flight Graph request.
+    fn mobile_job_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match &self.mobile_jobs {
+            Some(h) => h,
+            None => return ApiResponse::error(404, "mobile jobs are not enabled on this server"),
+        };
+        if !Self::cap_ok(&self.mobile_job_cap_token, req) {
+            return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        let (account, job_id) = match (req.q("account"), req.q("job_id")) {
+            (Some(a), Some(j)) if !a.is_empty() && !j.is_empty() => (a, j),
+            _ => return ApiResponse::error(400, "account and job_id are required"),
+        };
+        match handler.cancel_job(account, job_id) {
+            Ok(cancelled) => ApiResponse::ok_json(&json!({
+                "cancelled": cancelled,
+                "job_id": job_id,
+            })),
+            Err(e) => ApiResponse::error(500, &e),
         }
     }
 
@@ -4051,6 +4298,21 @@ impl Router {
                     return ApiResponse::error(400, "pending, token, and action_hash are required")
                 }
             };
+        if self.biometric_gate {
+            let binding = match handler.pending_binding(pending, action_hash) {
+                Ok(binding) => binding,
+                Err(e) => return ApiResponse::error(agent_confirm_error_status(&e), &e),
+            };
+            if let Some(r) = self.biometric_challenge(
+                &binding.op,
+                &binding.account,
+                &binding.service,
+                &binding.item,
+                req,
+            ) {
+                return r;
+            }
+        }
         match handler.confirm(pending, token, action_hash) {
             Ok(summary) => {
                 ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary }))
@@ -5022,6 +5284,51 @@ fn clamp_limit(raw: Option<&str>) -> u32 {
     }
 }
 
+fn parse_services_param(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_backup_services_param(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let mut services = parse_services_param(raw);
+    services.sort();
+    services.dedup();
+    for service in &services {
+        if !BACKUP_SERVICES.contains(&service.as_str()) {
+            return Err(format!("unsupported backup service: {service}"));
+        }
+    }
+    Ok(services)
+}
+
+fn restore_cloud_pending_item(service: &str, id: &str) -> String {
+    format!(
+        "service:{}:{}:id:{}:{}",
+        service.len(),
+        service,
+        id.len(),
+        id
+    )
+}
+
+fn mobile_job_summary_json(job: MobileJobSummary) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "kind": job.kind,
+        "state": job.state,
+        "service": job.service,
+        "target_id": job.target_id,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "finished_at": job.finished_at,
+        "last_error": job.last_error,
+    })
+}
+
 /// A deliberately non-executable content-type for archived bodies: `.json` is
 /// served as JSON; everything else (incl. `.eml` and `.html`) as plain text so a
 /// browser renders it inertly without running scripts, loading trackers, or
@@ -5962,20 +6269,94 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     struct OkRestore;
     impl RestoreHandler for OkRestore {
-        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
-            Ok("new-cloud-id".into())
+        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<RestoreResponse, String> {
+            Ok(RestoreResponse::Completed {
+                new_id: "new-cloud-id".into(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct QueuedRestore {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+    impl RestoreHandler for QueuedRestore {
+        fn restore(&self, a: &str, s: &str, i: &str) -> Result<RestoreResponse, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((a.to_string(), s.to_string(), i.to_string()));
+            Ok(RestoreResponse::Queued {
+                job_id: "job-restore-1".into(),
+                state: "queued".into(),
+            })
         }
     }
 
     struct ErrRestore;
     impl RestoreHandler for ErrRestore {
-        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<String, String> {
-            Err("graph refused restore".into())
+        fn restore(&self, _a: &str, _s: &str, _i: &str) -> Result<RestoreResponse, String> {
+            Err("graph refused restore for pat@example.com https://secret.example/item".into())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingBackup {
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl BackupHandler for RecordingBackup {
+        fn enqueue_backup(
+            &self,
+            account: &str,
+            services: &[String],
+        ) -> Result<BackupJobQueued, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((account.to_string(), services.to_vec()));
+            Ok(BackupJobQueued {
+                job_id: "job-backup-1".to_string(),
+                state: "queued".to_string(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingJobs {
+        cancelled: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl MobileJobHandler for RecordingJobs {
+        fn list_jobs(&self, account: &str, _limit: u32) -> Result<Vec<MobileJobSummary>, String> {
+            Ok(vec![MobileJobSummary {
+                job_id: "job-1".to_string(),
+                kind: "backup".to_string(),
+                state: "queued".to_string(),
+                service: None,
+                target_id: None,
+                created_at: 10,
+                updated_at: 11,
+                finished_at: None,
+                last_error: if account == "with-error" {
+                    Some("[redacted]".to_string())
+                } else {
+                    None
+                },
+            }])
+        }
+
+        fn cancel_job(&self, account: &str, job_id: &str) -> Result<bool, String> {
+            self.cancelled
+                .lock()
+                .unwrap()
+                .push((account.to_string(), job_id.to_string()));
+            Ok(true)
         }
     }
 
     #[test]
-    fn restore_post_requires_a_valid_capability_token() {
+    fn restore_post_completed_shape_is_backward_compatible() {
         let (_d, router) = setup();
         let router = router.with_restore(std::sync::Arc::new(OkRestore), "secret".into());
         let q = "/api/v1/restore?account=a&service=mail&id=x";
@@ -5990,11 +6371,271 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // correct token -> 200 + the new cloud id
         let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
         assert_eq!(ok.status, 200);
-        assert!(String::from_utf8_lossy(&ok.body).contains("new-cloud-id"));
+        let body = body_json(&ok);
+        assert_eq!(body["restored"], "x");
+        assert_eq!(body["service"], "mail");
+        assert_eq!(body["new_id"], "new-cloud-id");
+        assert!(body.get("queued").is_none());
         // valid token but missing params -> 400
         let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
             .with_cap_token(Some("secret".into()));
         assert_eq!(router.route(&bad).status, 400);
+    }
+
+    #[test]
+    fn restore_post_queued_shape_for_mobile_jobs() {
+        let (_d, router) = setup();
+        let restore = std::sync::Arc::new(QueuedRestore::default());
+        let router = router.with_restore(restore.clone(), "secret".into());
+        let q = "/api/v1/restore?account=a&service=mail&id=x";
+
+        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+
+        assert_eq!(ok.status, 200);
+        let body = body_json(&ok);
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["restored"], "x");
+        assert_eq!(body["service"], "mail");
+        assert_eq!(body["job_id"], "job-restore-1");
+        assert_eq!(body["state"], "queued");
+        assert_eq!(
+            restore.calls.lock().unwrap().as_slice(),
+            &[("a".to_string(), "mail".to_string(), "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn mobile_restore_route_is_401_without_session() {
+        let (_d, router) = setup();
+        let router = router
+            .with_restore(std::sync::Arc::new(QueuedRestore::default()), "cap".into())
+            .with_session_token("sess".into());
+        let req = ApiRequest::new("POST", "/api/v1/restore?account=a&service=mail&id=x")
+            .with_cap_token(Some("cap".into()));
+
+        assert_eq!(router.route(&req).status, 401);
+    }
+
+    #[test]
+    fn mobile_restore_route_is_401_without_cap_after_session() {
+        let (_d, router) = setup();
+        let router = router
+            .with_restore(std::sync::Arc::new(QueuedRestore::default()), "cap".into())
+            .with_session_token("sess".into());
+        let req = ApiRequest::new("POST", "/api/v1/restore?account=a&service=mail&id=x")
+            .with_session_token(Some("sess".into()));
+
+        assert_eq!(router.route(&req).status, 401);
+    }
+
+    #[test]
+    fn mobile_restore_route_is_biometric_token_gated_before_enqueue() {
+        let (_d, router) = setup();
+        let restore = std::sync::Arc::new(QueuedRestore::default());
+        let mobile = router
+            .with_restore(restore.clone(), "cap".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let post = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_cap_token(Some("cap".into()))
+                .with_session_token(Some("sess".into()))
+        };
+
+        let ch = mobile.route(&post("/api/v1/restore?account=a&service=mail&id=x"));
+
+        assert_eq!(ch.status, 200);
+        let body = body_json(&ch);
+        assert_eq!(body["status"], "confirmation_required");
+        assert_eq!(body["op"], "restore-cloud");
+        assert_eq!(body["account"], "a");
+        assert_eq!(body["service"], "mail");
+        assert_eq!(body["item"], restore_cloud_pending_item("mail", "x"));
+        assert!(restore.calls.lock().unwrap().is_empty());
+
+        let pat = body["pending_action_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/restore?account=a&service=mail&id=x&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert!(restore.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mobile_restore_route_enqueues_job_after_biometric_token() {
+        let (_d, router) = setup();
+        let restore = std::sync::Arc::new(QueuedRestore::default());
+        let mobile = router
+            .with_restore(restore.clone(), "cap".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let post = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_cap_token(Some("cap".into()))
+                .with_session_token(Some("sess".into()))
+        };
+
+        let ch = mobile.route(&post("/api/v1/restore?account=a&service=mail&id=x"));
+        let pat = body_json(&ch)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(mobile.confirm_biometric(&pat));
+
+        let ok = mobile.route(&post(&format!(
+            "/api/v1/restore?account=a&service=mail&id=x&_pat={pat}"
+        )));
+
+        assert_eq!(ok.status, 200);
+        let body = body_json(&ok);
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["job_id"], "job-restore-1");
+        assert_eq!(
+            restore.calls.lock().unwrap().as_slice(),
+            &[("a".to_string(), "mail".to_string(), "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn backup_route_is_absent_without_handler() {
+        let (_d, router) = setup();
+        let req = ApiRequest::new("POST", "/api/v1/backup?account=a")
+            .with_cap_token(Some("backup-secret".into()));
+        assert_eq!(router.route(&req).status, 404);
+    }
+
+    #[test]
+    fn backup_route_requires_backup_cap_token() {
+        let (_d, router) = setup();
+        let backup = std::sync::Arc::new(RecordingBackup::default());
+        let router = router.with_backup(backup.clone(), "backup-secret".into());
+        let q = "/api/v1/backup?account=a&services=calendar,mail";
+        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", q).with_cap_token(Some("wrong".into())))
+                .status,
+            401
+        );
+        let ok =
+            router.route(&ApiRequest::new("POST", q).with_cap_token(Some("backup-secret".into())));
+        assert_eq!(ok.status, 200);
+        let body = body_json(&ok);
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["job_id"], "job-backup-1");
+        assert_eq!(
+            backup.calls.lock().unwrap().as_slice(),
+            &[(
+                "a".to_string(),
+                vec!["calendar".to_string(), "mail".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn backup_route_is_session_gated_on_mobile() {
+        let (_d, router) = setup();
+        let router = router
+            .with_backup(
+                std::sync::Arc::new(RecordingBackup::default()),
+                "cap".into(),
+            )
+            .with_session_token("sess".into());
+        let req =
+            ApiRequest::new("POST", "/api/v1/backup?account=a").with_cap_token(Some("cap".into()));
+        assert_eq!(router.route(&req).status, 401);
+        let ok = router.route(&req.with_session_token(Some("sess".into())));
+        assert_eq!(ok.status, 200);
+    }
+
+    #[test]
+    fn backup_route_is_biometric_token_gated_on_mobile_before_handler_call() {
+        let (_d, router) = setup();
+        let backup = std::sync::Arc::new(RecordingBackup::default());
+        let mobile = router
+            .with_backup(backup.clone(), "cap".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let post = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_cap_token(Some("cap".into()))
+                .with_session_token(Some("sess".into()))
+        };
+        let ch = mobile.route(&post("/api/v1/backup?account=a&services=mail"));
+        assert_eq!(ch.status, 200);
+        let body = body_json(&ch);
+        assert_eq!(body["status"], "confirmation_required");
+        assert_eq!(body["op"], "backup");
+        assert!(backup.calls.lock().unwrap().is_empty());
+        let pat = body["pending_action_id"].as_str().unwrap().to_string();
+
+        assert_eq!(
+            mobile
+                .route(&post(&format!(
+                    "/api/v1/backup?account=a&services=mail&_pat={pat}"
+                )))
+                .status,
+            403
+        );
+        assert!(backup.calls.lock().unwrap().is_empty());
+
+        assert!(mobile.confirm_biometric(&pat));
+        let ok = mobile.route(&post(&format!(
+            "/api/v1/backup?account=a&services=mail&_pat={pat}"
+        )));
+        assert_eq!(ok.status, 200);
+        assert_eq!(backup.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backup_route_rejects_unknown_service_before_biometric_token() {
+        let (_d, router) = setup();
+        let backup = std::sync::Arc::new(RecordingBackup::default());
+        let mobile = router
+            .with_backup(backup.clone(), "cap".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let req = ApiRequest::new("POST", "/api/v1/backup?account=a&services=mail,shell")
+            .with_cap_token(Some("cap".into()))
+            .with_session_token(Some("sess".into()));
+
+        let resp = mobile.route(&req);
+
+        assert_eq!(resp.status, 400);
+        let body = body_json(&resp);
+        assert_eq!(body["error"], "unsupported backup service: shell");
+        assert!(backup.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mobile_job_routes_require_cap_and_return_secret_free_summaries() {
+        let (_d, router) = setup();
+        let jobs = std::sync::Arc::new(RecordingJobs::default());
+        let router = router.with_mobile_jobs(jobs.clone(), "jobs-secret".into());
+        let q = "/api/v1/jobs?account=with-error";
+        assert_eq!(router.route(&ApiRequest::get(q)).status, 401);
+        let ok = router.route(&ApiRequest::get(q).with_cap_token(Some("jobs-secret".into())));
+        assert_eq!(ok.status, 200);
+        let body = body_json(&ok);
+        assert_eq!(body["jobs"][0]["job_id"], "job-1");
+        assert_eq!(body["jobs"][0]["kind"], "backup");
+        assert_eq!(body["jobs"][0]["last_error"], "[redacted]");
+        assert!(body["jobs"][0].get("intent_json").is_none());
+        assert!(body["jobs"][0].get("result_json").is_none());
+
+        let cancel = router.route(
+            &ApiRequest::new("POST", "/api/v1/jobs/cancel?account=a&job_id=job-1")
+                .with_cap_token(Some("jobs-secret".into())),
+        );
+        assert_eq!(cancel.status, 200);
+        assert_eq!(
+            jobs.cancelled.lock().unwrap().as_slice(),
+            &[("a".to_string(), "job-1".to_string())]
+        );
     }
 
     struct FakeAgent;
@@ -6028,6 +6669,72 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
         fn status_json(&self) -> String {
             "{\"connected\":true,\"enabled\":true,\"model\":\"fake-1\"}".to_string()
+        }
+    }
+
+    struct RecordingAgent {
+        binding: AgentPendingBinding,
+        binding_calls: std::sync::Mutex<Vec<(String, String)>>,
+        confirm_calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl RecordingAgent {
+        fn backup() -> Self {
+            Self {
+                binding: AgentPendingBinding {
+                    op: "backup".into(),
+                    account: "a".into(),
+                    service: "agent".into(),
+                    item: "pending:2:p1:action_hash:4:hash".into(),
+                },
+                binding_calls: std::sync::Mutex::new(Vec::new()),
+                confirm_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn confirm_call_count(&self) -> usize {
+            self.confirm_calls.lock().unwrap().len()
+        }
+    }
+
+    impl AgentHandler for RecordingAgent {
+        fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+            Ok("turn-recording".into())
+        }
+
+        fn pending_binding(
+            &self,
+            pending_id: &str,
+            action_hash: &str,
+        ) -> Result<AgentPendingBinding, String> {
+            self.binding_calls
+                .lock()
+                .unwrap()
+                .push((pending_id.to_string(), action_hash.to_string()));
+            if pending_id == "p1" && action_hash == "hash" {
+                Ok(self.binding.clone())
+            } else {
+                Err("ActionMismatch".into())
+            }
+        }
+
+        fn confirm(&self, pending: &str, token: &str, action_hash: &str) -> Result<String, String> {
+            self.confirm_calls.lock().unwrap().push((
+                pending.to_string(),
+                token.to_string(),
+                action_hash.to_string(),
+            ));
+            if pending == "p1" && token == "right" && action_hash == "hash" {
+                Ok(format!("ran {pending}"))
+            } else {
+                Err("bad token".into())
+            }
+        }
+
+        fn cancel(&self, _turn_id: &str) {}
+
+        fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
         }
     }
 
@@ -6220,6 +6927,115 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let on = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
         assert_eq!(on.status, 200);
         assert!(String::from_utf8_lossy(&on.body).contains("\"connected\":true"));
+    }
+
+    #[test]
+    fn mobile_agent_confirm_requires_biometric_before_agent_token_consumption() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let req = ApiRequest::new(
+            "POST",
+            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
+        )
+        .with_session_token(Some("sess".into()))
+        .with_cap_token(Some("agentsecret".into()));
+
+        let resp = router.route(&req);
+
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(body["status"], "confirmation_required");
+        assert_eq!(body["op"], "backup");
+        assert_eq!(body["account"], "a");
+        assert_eq!(body["service"], "agent");
+        assert_eq!(body["item"], "pending:2:p1:action_hash:4:hash");
+        assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_wrong_biometric_token_does_not_consume_agent_pending() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let base = "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash";
+        let auth = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_session_token(Some("sess".into()))
+                .with_cap_token(Some("agentsecret".into()))
+        };
+
+        let first = router.route(&auth(base));
+        let pat = body_json(&first)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bad = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(bad.status, 403);
+        assert_eq!(agent.confirm_call_count(), 0);
+
+        assert!(router.confirm_biometric(&pat));
+        let ok = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(ok.status, 200);
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_after_biometric_consumes_agent_token_once() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let base = "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash";
+        let auth = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_session_token(Some("sess".into()))
+                .with_cap_token(Some("agentsecret".into()))
+        };
+        let challenge = router.route(&auth(base));
+        let pat = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(router.confirm_biometric(&pat));
+        let ok = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(ok.status, 200);
+        let replay = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(replay.status, 403);
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_wrong_action_hash_does_not_mint_biometric_pending() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let req = ApiRequest::new(
+            "POST",
+            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=wrong",
+        )
+        .with_session_token(Some("sess".into()))
+        .with_cap_token(Some("agentsecret".into()));
+
+        let resp = router.route(&req);
+
+        assert_eq!(resp.status, 409);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(body.contains("ActionMismatch"));
+        assert!(!body.contains("confirmation_required"));
+        assert_eq!(agent.confirm_call_count(), 0);
     }
 
     #[test]
@@ -8784,11 +9600,35 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "Make folder offline",
             "\"bulk\"",
             "Bulk OneDrive change",
-            "d.service === \"onedrive\" ? \"OneDrive\"",
+            "service === \"onedrive\" ? \"OneDrive\"",
+            "biometricServiceLabel(d.service)",
         ] {
             assert!(
                 APP_JS.contains(needle),
                 "app.js missing #723 biometric label invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_js_biometric_labels_cover_mobile_full_node_ops() {
+        for needle in [
+            "function biometricServiceLabel(service)",
+            "service === \"backup\" || service === \"agent\" ? \"iSyncYou\"",
+            "\"backup\" ? \"Start backup\"",
+            "\"restore-cloud\" ? \"Restore to cloud\"",
+            "\"live-write\" ? \"Run Agent write\"",
+            "biometricServiceLabel(d.service)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #625 biometric label invariant: {needle}"
+            );
+        }
+        for forbidden in ["body_html", "body_text", "recipient", "change"] {
+            assert!(
+                !APP_JS.contains(&format!("{forbidden} ?")),
+                "app.js biometric label must not branch on raw destructive payload field: {forbidden}"
             );
         }
     }
@@ -9465,6 +10305,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         let err = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
         assert_eq!(err.status, 500);
+        let body = String::from_utf8_lossy(&err.body);
+        assert!(body.contains("restore_failed"));
+        assert!(!body.contains("pat@example.com"));
+        assert!(!body.contains("secret.example"));
 
         let audit =
             body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=5")));
@@ -9473,7 +10317,15 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(audit["runs"][0]["summary"]
             .as_str()
             .unwrap()
-            .contains("graph refused restore"));
+            .contains("restore_failed"));
+        assert!(!audit["runs"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("pat@example.com"));
+        assert!(!audit["runs"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("secret.example"));
         assert_eq!(audit["runs"][1]["status"], "started");
     }
 

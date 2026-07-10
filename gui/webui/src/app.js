@@ -302,6 +302,8 @@ function activityChart(runs, days = 14) {
 /* ---------------------------------------------------------------- api + util */
 const CAP = {
   restore: "__RESTORE_CAP_TOKEN__",
+  backup: "__BACKUP_CAP_TOKEN__",
+  mobileJobs: "__MOBILE_JOB_CAP_TOKEN__",
   sync: "__SYNC_CAP_TOKEN__",
   share: "__SHARE_CAP_TOKEN__",
   verify: "__VERIFY_CAP_TOKEN__",
@@ -439,13 +441,26 @@ function runBiometricConfirm(pat, label) {
   });
 }
 /* A short human label for the biometric sheet from the challenge payload (#0.6). */
+function biometricServiceLabel(service) {
+  return service === "onedrive" ? "OneDrive"
+    : service === "backup" || service === "agent" ? "iSyncYou"
+    : service === "mail" ? "Mail"
+    : service === "calendar" ? "Calendar"
+    : service === "contacts" ? "Contacts"
+    : service === "todo" ? "To Do"
+    : service === "onenote" ? "OneNote"
+    : service || "Microsoft 365";
+}
 function biometricLabel(d) {
   const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
+    : d.op === "backup" ? "Start backup"
+    : d.op === "restore-cloud" ? "Restore to cloud"
+    : d.op === "live-write" ? "Run Agent write"
     : d.op === "move-out-of-protected" ? "Move out of offline folder"
     : d.op === "mode-switch-offline-large" ? "Make folder offline"
     : d.op === "bulk" ? "Bulk OneDrive change"
     : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
-  const service = d.service === "onedrive" ? "OneDrive" : d.service || "Microsoft 365";
+  const service = biometricServiceLabel(d.service);
   return `${verb} in ${service}`;
 }
 /* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses
@@ -4437,7 +4452,14 @@ async function renderSettingsView(view) {
 async function doRestore(it, btn) {
   if (!confirm(`Restore this ${it.service} item to the cloud as a new copy?`)) return;
   btn.disabled = true;
-  try { const d = await post("/api/v1/restore?" + qs({ account: App.account, service: it.service, id: it.remote_id }), CAP.restore); toast(`Restored (new id ${String(d.new_id).slice(0, 8)}…)`); }
+  try {
+    const d = await post("/api/v1/restore?" + qs({ account: App.account, service: it.service, id: it.remote_id }), CAP.restore);
+    if (d.queued) {
+      toast(`Restore queued (${String(d.job_id || "job").slice(0, 12)}…)`);
+    } else {
+      toast(`Restored (new id ${String(d.new_id || "").slice(0, 8)}…)`);
+    }
+  }
   catch (e) { toast("Restore failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 async function doShare(it, btn) {

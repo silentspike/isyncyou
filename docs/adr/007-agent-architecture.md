@@ -63,8 +63,10 @@ The constraints that force the shape of this decision:
    existing daemon/app-host/engine runtime paths: backup uses the shared refresh runner,
    restore-cloud uses the ledger restore path, live-write uses the service writer traits,
    share uses the ledger-backed share handler, and restore-local writes only to a controlled
-   local restore root. Mobile destructive Agent execution remains fail-closed until the
-   Android security/job stories land (REQ-AGENT-012).
+   local restore root. Mobile uses the same confirmed-action model but routes backup and
+   restore-cloud through durable mobile jobs, gates Agent confirmation with the per-action
+   biometric-token layer before consuming the Agent token, and limits mobile live-write to
+   the explicit metadata allowlist until the native Android proof lands (REQ-AND-016).
 
 7. **Encrypted, conflict-safe cross-device session.** Per-turn ULID files under
    `/Apps/iSyncYou/agent/<session>/<ulid>.json`, AES-256-GCM with a key derived
@@ -81,9 +83,11 @@ The constraints that force the shape of this decision:
 - **Cost:** a new crate, a second HTTP client (small, blocking, rustls), and a genuinely
   new streaming hub. The blocking-loop-on-a-thread choice trades a little plumbing for not
   rewriting `graph` as async.
-- **Mobile becomes a full cloud-write node** (superseding REQ-AND-013), but only together
-  with a full Android security model (Keystore, biometric-gated destructive confirmations,
-  foreground-service/WorkManager backup, resumable ledger jobs). Tracked in
+- **Mobile becomes a full cloud-write node** (superseding REQ-AND-013) in two layers:
+  #625 implements the Rust/server contract (session/cap/per-action-token gates, durable
+  backup/restore jobs, restart recovery, and mobile live-write allowlist), while #626 owns
+  the native Android proof (Keystore, physical BiometricPrompt, foreground-service/
+  WorkManager presentation, and device evidence). Tracked in
   `docs/requirements/android.yml` (REQ-AND-016) and the agent threat model.
 - **Governance:** the invariants above are tracked as `REQ-AGENT-*` in
   `docs/requirements/agent.yml`, the mobile-write surface in
