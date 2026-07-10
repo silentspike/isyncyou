@@ -329,8 +329,13 @@ mod live {
                 return Err(e);
             }
             let (blocks, usage) = finish_sse_blocks(text, tools, usage, failure)?;
+            let usage = usage.with_provider_response("codex", &self.cfg.model, &response.headers);
             self.last_usage = usage;
             Ok(blocks)
+        }
+
+        fn last_usage(&self) -> Option<Usage> {
+            (!self.last_usage.is_empty()).then(|| self.last_usage.clone())
         }
     }
 }

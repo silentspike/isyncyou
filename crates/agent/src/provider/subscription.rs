@@ -334,8 +334,13 @@ impl LlmProvider for SubscriptionProvider {
             return Err(e);
         }
         let (blocks, usage) = finish_claude_stream(state)?;
+        let usage = usage.with_provider_response("claude", &self.model, &response.headers);
         self.last_usage = usage;
         Ok(blocks)
+    }
+
+    fn last_usage(&self) -> Option<Usage> {
+        (!self.last_usage.is_empty()).then(|| self.last_usage.clone())
     }
 }
 

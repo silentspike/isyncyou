@@ -127,6 +127,7 @@ pub(crate) fn parse_response(v: &Value) -> Result<(Vec<AssistantBlock>, Usage), 
         Usage {
             input_tokens: g("input_tokens"),
             output_tokens: g("output_tokens"),
+            ..Default::default()
         },
     ))
 }
@@ -261,7 +262,8 @@ mod tests {
             usage,
             Usage {
                 input_tokens: 12,
-                output_tokens: 34
+                output_tokens: 34,
+                ..Default::default()
             }
         );
     }

@@ -329,6 +329,7 @@ pub struct DaemonAgent {
     confirmed_executor: Arc<dyn AgentConfirmedActionExecutor>,
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
+    last_usage: Arc<Mutex<Option<isyncyou_agent::Usage>>>,
     seq: AtomicU64,
     /// Directory holding the app OAuth credential store and optional local OAuth recipe
     /// override (`agent-oauth.json`) for development/operator builds.
@@ -360,6 +361,7 @@ impl DaemonAgent {
             confirmed_executor: Arc::new(NotImplementedConfirmedActionExecutor),
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
+            last_usage: Arc::new(Mutex::new(None)),
             seq: AtomicU64::new(0),
             oauth_dir,
             #[cfg(any(
@@ -1268,6 +1270,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let archive_root = self.archive_root_for(&account_id);
         let mut provider = self.build_turn_provider(&system);
         let pending = self.pending.clone();
+        let last_usage = Arc::clone(&self.last_usage);
         std::thread::spawn(move || {
             let exec = make_executor(&account_id, archive_root);
             let mut history = vec![isyncyou_agent::Message::user(prompt)];
@@ -1279,6 +1282,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     hub.emit(&tid, ev);
                 },
             );
+            if let Some(usage) = provider.last_usage() {
+                *last_usage.lock().unwrap() = Some(usage);
+            }
             match outcome {
                 Ok(isyncyou_agent::TurnOutcome::Final { .. }) => {}
                 Ok(isyncyou_agent::TurnOutcome::PendingConfirmation {
@@ -1489,7 +1495,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .map(|(id, label)| serde_json::json!({ "id": id, "label": label }))
                 .collect()
         };
-        serde_json::json!({
+        let mut status = serde_json::json!({
             "connected": claude || codex,
             "enabled": true,
             "provider": provider,
@@ -1497,8 +1503,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "claude": claude,
             "codex": codex,
             "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
-        })
-        .to_string()
+        });
+        if let Some(usage) = self.last_usage.lock().unwrap().as_ref() {
+            status["usage"] = usage.to_public_json();
+        }
+        status.to_string()
     }
 
     /// Persist the switcher's provider+model selection (validated against the offered lists).
@@ -3961,6 +3970,46 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("subscription import is not enabled"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn daemon_agent_status_reports_sanitized_last_provider_usage() {
+        let root = apphost_credential_test_root("usage-status");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        *agent.last_usage.lock().unwrap() = Some(isyncyou_agent::Usage {
+            input_tokens: 42,
+            output_tokens: 9,
+            provider: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            request_id: Some("req-123".into()),
+            rate_limit: std::collections::BTreeMap::from([(
+                "anthropic-ratelimit-tokens-remaining".into(),
+                "99".into(),
+            )]),
+        });
+
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+
+        assert_eq!(status["usage"]["provider"], "claude");
+        assert_eq!(status["usage"]["model"], "claude-sonnet-5");
+        assert_eq!(status["usage"]["input_tokens"], 42);
+        assert_eq!(status["usage"]["output_tokens"], 9);
+        assert_eq!(status["usage"]["request_id"], "req-123");
+        assert_eq!(
+            status["usage"]["rate_limit"]["anthropic-ratelimit-tokens-remaining"],
+            "99"
+        );
+        let rendered = status.to_string();
+        assert!(!rendered.contains("Bearer"));
+        assert!(!rendered.contains("refresh"));
+        assert!(!rendered.contains("acct_"));
         let _ = std::fs::remove_dir_all(root);
     }
 
