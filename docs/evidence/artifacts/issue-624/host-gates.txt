@@ -42,15 +42,29 @@ Final Task-10 static scans:
   - Result: no production app-host match.
 - PASS: git grep -n 'S-AG.9/#624' -- crates/agent/src crates/app-host/src gui/webui/src
   - Result: no stale implementation comment or error-string match.
-- PASS: git grep -n -E 'Bearer |access_token|refresh_token|cap-token|capability token|confirmation token|action_hash=' -- docs/evidence/artifacts/issue-624 docs/evidence/issue-624-manifest.json
+- PASS: git grep -n -E 'Bearer[ ]|access[_]token|refresh[_]token|cap[-]token|capability[ ]token|confirmation[ ]token|action_hash[=]' -- docs/evidence/artifacts/issue-624 docs/evidence/issue-624-manifest.json
   - Result: no secret-shaped evidence match.
 - REVIEWED: git grep -n -E 'shell|Command::new|std::process|free-form HTTP|arbitrary HTTP' -- crates/agent crates/app-host
   - Allowed matches are app-scope invariant comments, explicit denial/help text, test data asserting shell is rejected, and std::process::id() use for temp file names or process-scoped identifiers. No shell executor, Command::new, or free-form HTTP action was added.
 - REVIEWED: git grep -n -E 'create_link\(|invite\(' -- crates/app-host/src
   - Allowed matches are the ShareHandler/trait adapter path, existing DaemonShare ownership, and static tests. The confirmed desktop operation path is covered by desktop_agent_operations_impl_does_not_call_graphclient_mutations_directly and does not call raw GraphClient share mutations directly.
 
+Task-11 live Agent confirmation probes:
+
+- Code anchor: 407095875b821282988ee21485c77dfe08756429
+- PASS: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers live_issue_624_agent_confirm_
+  - Purpose: compile-check the ignored live #624 probes without running them.
+- PASS: cargo remote -b ISY624_M365_WRITE_TOKEN=<redacted> -c -- test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_
+  - Result: 2 passed; 0 failed; 0 ignored; 89 filtered out; finished in 6.66s.
+  - Covered: live_issue_624_agent_confirm_create_draft_and_cleanup.
+  - Covered: live_issue_624_agent_confirm_share_link_and_cleanup.
+  - Token handling: temporary 0600 token file was removed after the run.
+- PASS: cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings
+- PASS: cargo-remote-fmt --check
+
 Notes:
 
-- This artifact records host/unit evidence only. Live Microsoft 365 confirmations are not claimed here.
+- This artifact now records host/unit evidence plus Task-11 live Microsoft 365 Agent confirmation probes for Mail create_draft and OneDrive share-link.
+- Backup and RestoreCloud live confirmations are not claimed here; they remain covered by host/unit evidence unless separately executed.
 - Rust commands were executed via cargo remote; formatting was verified through cargo-remote-fmt.
 - Evidence contains no provider secret, OAuth query string, confirm secret, cap secret, share URL, or raw body sentinel.
