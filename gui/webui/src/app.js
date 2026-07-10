@@ -441,13 +441,26 @@ function runBiometricConfirm(pat, label) {
   });
 }
 /* A short human label for the biometric sheet from the challenge payload (#0.6). */
+function biometricServiceLabel(service) {
+  return service === "onedrive" ? "OneDrive"
+    : service === "backup" || service === "agent" ? "iSyncYou"
+    : service === "mail" ? "Mail"
+    : service === "calendar" ? "Calendar"
+    : service === "contacts" ? "Contacts"
+    : service === "todo" ? "To Do"
+    : service === "onenote" ? "OneNote"
+    : service || "Microsoft 365";
+}
 function biometricLabel(d) {
   const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
+    : d.op === "backup" ? "Start backup"
+    : d.op === "restore-cloud" ? "Restore to cloud"
+    : d.op === "live-write" ? "Run Agent write"
     : d.op === "move-out-of-protected" ? "Move out of offline folder"
     : d.op === "mode-switch-offline-large" ? "Make folder offline"
     : d.op === "bulk" ? "Bulk OneDrive change"
     : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
-  const service = d.service === "onedrive" ? "OneDrive" : d.service || "Microsoft 365";
+  const service = biometricServiceLabel(d.service);
   return `${verb} in ${service}`;
 }
 /* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses

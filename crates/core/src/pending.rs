@@ -40,9 +40,10 @@ pub fn now_ms() -> u64 {
 
 /// The destructive / external op classes that require a biometric per-action
 /// confirmation on mobile (risk-based gate catalogue, #onedrive-mobile 0.6):
-/// delete, external share, upload/replace, backup, move OUT of a protected scope,
-/// queued cloud restore, a mode-switch that would pull a large folder offline, a
-/// conflict resolve that deletes the cloud copy (keep-mine), and bulk operations.
+/// delete, external share, upload/replace, backup, queued cloud restore, Agent
+/// live-write, move OUT of a protected scope, a mode-switch that would pull a
+/// large folder offline, a conflict resolve that deletes the cloud copy
+/// (keep-mine), and bulk operations.
 ///
 /// Read-only ops (search/read/list/export) are never gated. Free-up / download-now
 /// are NOT gated (local-only, reversible: free-up just drops a re-downloadable copy)
@@ -55,6 +56,7 @@ pub fn requires_confirmation(op: &str) -> bool {
             | "external-share"
             | "backup"
             | "restore-cloud"
+            | "live-write"
             | "upload"
             | "replace"
             | "move-out-of-protected"
@@ -227,13 +229,14 @@ mod tests {
 
     // --- Gate catalogue (AC4) --------------------------------------------------
     #[test]
-    fn gate_catalogue_covers_destructive_ops() {
+    fn gate_catalogue_covers_full_node_mobile_agent_ops() {
         for op in [
             "delete",
             "share",
             "external-share",
             "backup",
             "restore-cloud",
+            "live-write",
             "upload",
             "replace",
             "move-out-of-protected",

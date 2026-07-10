@@ -9562,11 +9562,35 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "Make folder offline",
             "\"bulk\"",
             "Bulk OneDrive change",
-            "d.service === \"onedrive\" ? \"OneDrive\"",
+            "service === \"onedrive\" ? \"OneDrive\"",
+            "biometricServiceLabel(d.service)",
         ] {
             assert!(
                 APP_JS.contains(needle),
                 "app.js missing #723 biometric label invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_js_biometric_labels_cover_mobile_full_node_ops() {
+        for needle in [
+            "function biometricServiceLabel(service)",
+            "service === \"backup\" || service === \"agent\" ? \"iSyncYou\"",
+            "\"backup\" ? \"Start backup\"",
+            "\"restore-cloud\" ? \"Restore to cloud\"",
+            "\"live-write\" ? \"Run Agent write\"",
+            "biometricServiceLabel(d.service)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #625 biometric label invariant: {needle}"
+            );
+        }
+        for forbidden in ["body_html", "body_text", "recipient", "change"] {
+            assert!(
+                !APP_JS.contains(&format!("{forbidden} ?")),
+                "app.js biometric label must not branch on raw destructive payload field: {forbidden}"
             );
         }
     }
