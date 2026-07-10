@@ -12,6 +12,7 @@
 
 use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 // PathBuf is only used by the encrypted-store migrate/credential paths.
@@ -34,12 +35,16 @@ pub enum StoreError {
     AlreadyEncrypted(String),
     #[error("illegal restore-operation transition: {0}")]
     IllegalTransition(String),
+    #[error("illegal mobile-job transition: {0}")]
+    IllegalMobileJobTransition(String),
+    #[error("invalid mobile job: {0}")]
+    InvalidMobileJob(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -341,6 +346,36 @@ CREATE TABLE cloud_write_operations (
 CREATE INDEX idx_cloud_write_ops_open ON cloud_write_operations(account_id, state);
 "#;
 
+/// v16: durable mobile job queue (#625). Backup and restore-cloud are enqueued
+/// before any cloud mutation and are later driven by a leased mobile worker.
+/// `runs` remains activity history only; this table is the resumable queue.
+const MIGRATION_V16: &str = r#"
+CREATE TABLE mobile_jobs (
+    job_id           TEXT PRIMARY KEY,
+    account_id       TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    service          TEXT,
+    target_id        TEXT,
+    idempotency_key  TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    intent_json      TEXT NOT NULL,
+    progress_json    TEXT,
+    result_json      TEXT,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    lease_owner      TEXT,
+    lease_expires_at INTEGER,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    finished_at      INTEGER,
+    last_error       TEXT
+);
+CREATE INDEX idx_mobile_jobs_account ON mobile_jobs(account_id, created_at DESC);
+CREATE INDEX idx_mobile_jobs_open ON mobile_jobs(account_id, state, created_at);
+CREATE UNIQUE INDEX idx_mobile_jobs_open_idempotency
+  ON mobile_jobs(account_id, idempotency_key)
+  WHERE state IN ('queued','running');
+"#;
+
 /// A recorded engine run (one sync/backup/… pass) — the activity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -546,6 +581,104 @@ pub struct CloudWriteOp {
     /// The op payload (path/name/new-parent/recipient/…) as JSON.
     pub intent_json: Option<String>,
     pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+/// Durable mobile job kind (#625).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobKind {
+    Backup,
+    RestoreCloud,
+}
+
+impl MobileJobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MobileJobKind::Backup => "backup",
+            MobileJobKind::RestoreCloud => "restore-cloud",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "backup" => MobileJobKind::Backup,
+            "restore-cloud" => MobileJobKind::RestoreCloud,
+            _ => return None,
+        })
+    }
+}
+
+/// Durable mobile job state (#625).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobState {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl MobileJobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MobileJobState::Queued => "queued",
+            MobileJobState::Running => "running",
+            MobileJobState::Succeeded => "succeeded",
+            MobileJobState::Failed => "failed",
+            MobileJobState::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "queued" => MobileJobState::Queued,
+            "running" => MobileJobState::Running,
+            "succeeded" => MobileJobState::Succeeded,
+            "failed" => MobileJobState::Failed,
+            "cancelled" => MobileJobState::Cancelled,
+            _ => return None,
+        })
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            MobileJobState::Succeeded | MobileJobState::Failed | MobileJobState::Cancelled
+        )
+    }
+
+    pub fn can_transition_to(self, to: Self) -> bool {
+        use MobileJobState::*;
+        matches!(
+            (self, to),
+            (Queued, Running)
+                | (Queued, Cancelled)
+                | (Running, Succeeded)
+                | (Running, Failed)
+                | (Running, Cancelled)
+        )
+    }
+}
+
+/// One durable mobile job row (#625).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileJob {
+    pub job_id: String,
+    pub account_id: String,
+    pub kind: MobileJobKind,
+    pub service: Option<String>,
+    pub target_id: Option<String>,
+    pub idempotency_key: String,
+    pub state: MobileJobState,
+    pub intent_json: String,
+    pub progress_json: Option<String>,
+    pub result_json: Option<String>,
+    pub attempts: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
     pub last_error: Option<String>,
 }
 
@@ -1066,6 +1199,263 @@ impl Store {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- Mobile durable job queue (#625) -------------------------------
+
+    /// Enqueue a mobile job before any cloud mutation. Open jobs dedupe by
+    /// `(account_id, idempotency_key)`; terminal jobs intentionally do not block a
+    /// later user-confirmed retry with the same logical key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_mobile_job(
+        &self,
+        job_id: &str,
+        account: &str,
+        kind: MobileJobKind,
+        service: Option<&str>,
+        target_id: Option<&str>,
+        idempotency_key: &str,
+        intent_json: &str,
+        now: i64,
+    ) -> Result<MobileJob> {
+        validate_mobile_job_part("job_id", job_id)?;
+        validate_mobile_job_part("account", account)?;
+        validate_mobile_job_part("idempotency_key", idempotency_key)?;
+        if let Some(service) = service {
+            validate_mobile_job_part("service", service)?;
+        }
+        if let Some(target_id) = target_id {
+            validate_mobile_job_part("target_id", target_id)?;
+        }
+        validate_mobile_job_intent(intent_json)?;
+
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO mobile_jobs
+                 (job_id, account_id, kind, service, target_id, idempotency_key,
+                  state, intent_json, attempts, created_at, updated_at)
+               VALUES (?1,?2,?3,?4,?5,?6,'queued',?7,0,?8,?8)",
+            params![
+                job_id,
+                account,
+                kind.as_str(),
+                service,
+                target_id,
+                idempotency_key,
+                intent_json,
+                now
+            ],
+        )?;
+        if n == 1 {
+            return self.get_mobile_job(job_id)?.ok_or_else(|| {
+                StoreError::InvalidMobileJob(format!("inserted job {job_id} disappeared"))
+            });
+        }
+        self.find_open_mobile_job(account, idempotency_key)?
+            .ok_or_else(|| {
+                StoreError::InvalidMobileJob(format!(
+                    "job id {job_id} or idempotency key {idempotency_key} already exists"
+                ))
+            })
+    }
+
+    /// Fetch one mobile job by id.
+    pub fn get_mobile_job(&self, job_id: &str) -> Result<Option<MobileJob>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {MOBILE_JOB_COLS} FROM mobile_jobs WHERE job_id=?1"),
+                params![job_id],
+                map_mobile_job,
+            )
+            .optional()?)
+    }
+
+    /// Fetch the currently open job for a dedupe key, if one exists.
+    pub fn find_open_mobile_job(
+        &self,
+        account: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<MobileJob>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {MOBILE_JOB_COLS} FROM mobile_jobs
+                      WHERE account_id=?1 AND idempotency_key=?2
+                        AND state IN ('queued','running')
+                      ORDER BY created_at LIMIT 1"
+                ),
+                params![account, idempotency_key],
+                map_mobile_job,
+            )
+            .optional()?)
+    }
+
+    /// Recent mobile jobs for an account, newest first.
+    pub fn list_mobile_jobs(&self, account: &str, limit: u32) -> Result<Vec<MobileJob>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MOBILE_JOB_COLS} FROM mobile_jobs
+              WHERE account_id=?1
+              ORDER BY created_at DESC, job_id DESC
+              LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![account, limit], map_mobile_job)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Startup recovery work-list: queued jobs plus running jobs whose lease has
+    /// expired. Non-expired running jobs are owned by another worker and terminal
+    /// jobs are history only.
+    pub fn recoverable_mobile_jobs(&self, account: &str, now: i64) -> Result<Vec<MobileJob>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MOBILE_JOB_COLS} FROM mobile_jobs
+              WHERE account_id=?1
+                AND (
+                  state='queued'
+                  OR (
+                    state='running'
+                    AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?2)
+                  )
+                )
+              ORDER BY created_at, job_id"
+        ))?;
+        let rows = stmt.query_map(params![account, now], map_mobile_job)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Apply a mobile-job transition, preserving state if the transition is not in
+    /// the queue state machine. Entering `running` bumps attempts and terminal
+    /// states set `finished_at`.
+    pub fn transition_mobile_job(
+        &self,
+        job_id: &str,
+        to: MobileJobState,
+        now: i64,
+        progress_json: Option<&str>,
+        result_json: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        validate_mobile_job_json("progress_json", progress_json)?;
+        validate_mobile_job_json("result_json", result_json)?;
+        let last_error = redact_mobile_job_error(last_error);
+        let tx = self.conn.unchecked_transaction()?;
+        let cur: String = tx.query_row(
+            "SELECT state FROM mobile_jobs WHERE job_id=?1",
+            params![job_id],
+            |r| r.get(0),
+        )?;
+        let from = MobileJobState::parse(&cur).ok_or_else(|| {
+            StoreError::IllegalMobileJobTransition(format!(
+                "unknown stored state '{cur}' for {job_id}"
+            ))
+        })?;
+        if !from.can_transition_to(to) {
+            return Err(StoreError::IllegalMobileJobTransition(format!(
+                "{} -> {} ({job_id})",
+                from.as_str(),
+                to.as_str()
+            )));
+        }
+        let bump: i64 = if to == MobileJobState::Running { 1 } else { 0 };
+        let finished_at = if to.is_terminal() { Some(now) } else { None };
+        tx.execute(
+            "UPDATE mobile_jobs
+                SET state=?2,
+                    updated_at=?3,
+                    attempts=attempts+?4,
+                    progress_json=COALESCE(?5, progress_json),
+                    result_json=COALESCE(?6, result_json),
+                    last_error=?7,
+                    finished_at=COALESCE(?8, finished_at),
+                    lease_owner=CASE WHEN ?9 THEN NULL ELSE lease_owner END,
+                    lease_expires_at=CASE WHEN ?9 THEN NULL ELSE lease_expires_at END
+              WHERE job_id=?1",
+            params![
+                job_id,
+                to.as_str(),
+                now,
+                bump,
+                progress_json,
+                result_json,
+                last_error.as_deref(),
+                finished_at,
+                to.is_terminal()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Try to lease a queued job or reclaim an expired running job for `owner`.
+    /// Returns `false` if another worker still owns the job.
+    pub fn acquire_mobile_job_lease(
+        &self,
+        job_id: &str,
+        owner: &str,
+        now: i64,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        validate_mobile_job_part("owner", owner)?;
+        if ttl_secs <= 0 {
+            return Err(StoreError::InvalidMobileJob(
+                "lease ttl must be positive".into(),
+            ));
+        }
+        let n = self.conn.execute(
+            "UPDATE mobile_jobs
+                SET state='running',
+                    lease_owner=?2,
+                    lease_expires_at=?3,
+                    updated_at=?4,
+                    attempts=attempts+1
+              WHERE job_id=?1
+                AND (
+                  state='queued'
+                  OR (
+                    state='running'
+                    AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?4)
+                  )
+                )",
+            params![job_id, owner, now + ttl_secs, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Release a mobile-job lease without changing the job state. Used when a
+    /// worker parks the job for later reconciliation.
+    pub fn release_mobile_job_lease(&self, job_id: &str, owner: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE mobile_jobs
+                SET lease_owner=NULL, lease_expires_at=NULL
+              WHERE job_id=?1 AND lease_owner=?2 AND state='running'",
+            params![job_id, owner],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Complete a running job only if the same worker still owns it. This is the
+    /// guard for cancel races: a late cloud result after `cancelled` must not flip
+    /// the job to `succeeded`.
+    pub fn finish_mobile_job_if_running(
+        &self,
+        job_id: &str,
+        owner: &str,
+        now: i64,
+        result_json: Option<&str>,
+    ) -> Result<bool> {
+        validate_mobile_job_json("result_json", result_json)?;
+        let n = self.conn.execute(
+            "UPDATE mobile_jobs
+                SET state='succeeded',
+                    result_json=COALESCE(?3, result_json),
+                    updated_at=?4,
+                    finished_at=?4,
+                    lease_owner=NULL,
+                    lease_expires_at=NULL
+              WHERE job_id=?1 AND lease_owner=?2 AND state='running'",
+            params![job_id, owner, result_json, now],
+        )?;
+        Ok(n == 1)
     }
 
     pub fn get_item(&self, account: &str, service: &str, remote_id: &str) -> Result<Option<Item>> {
@@ -1994,6 +2384,158 @@ fn row_to_cloud_write(r: &rusqlite::Row) -> rusqlite::Result<CloudWriteOp> {
     })
 }
 
+const MOBILE_JOB_COLS: &str = "job_id, account_id, kind, service, target_id, \
+     idempotency_key, state, intent_json, progress_json, result_json, attempts, \
+     lease_owner, lease_expires_at, created_at, updated_at, finished_at, last_error";
+
+fn map_mobile_job(r: &rusqlite::Row) -> rusqlite::Result<MobileJob> {
+    let kind_s: String = r.get(2)?;
+    let kind = MobileJobKind::parse(&kind_s).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(2, "kind".into(), rusqlite::types::Type::Text)
+    })?;
+    let state_s: String = r.get(6)?;
+    let state = MobileJobState::parse(&state_s).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(6, "state".into(), rusqlite::types::Type::Text)
+    })?;
+    Ok(MobileJob {
+        job_id: r.get(0)?,
+        account_id: r.get(1)?,
+        kind,
+        service: r.get(3)?,
+        target_id: r.get(4)?,
+        idempotency_key: r.get(5)?,
+        state,
+        intent_json: r.get(7)?,
+        progress_json: r.get(8)?,
+        result_json: r.get(9)?,
+        attempts: r.get(10)?,
+        lease_owner: r.get(11)?,
+        lease_expires_at: r.get(12)?,
+        created_at: r.get(13)?,
+        updated_at: r.get(14)?,
+        finished_at: r.get(15)?,
+        last_error: r.get(16)?,
+    })
+}
+
+/// Build the dedupe key for a mobile backup job. Empty `services` means "all
+/// services"; otherwise the service list is sorted and de-duplicated before
+/// hashing so UI order cannot create duplicate jobs.
+pub fn mobile_backup_idempotency_key(account: &str, services: &[String]) -> Result<String> {
+    validate_mobile_job_part("account", account)?;
+    let mut services = services.to_vec();
+    services.sort();
+    services.dedup();
+    for service in &services {
+        validate_mobile_job_part("service", service)?;
+    }
+    let service_scope = if services.is_empty() {
+        "all".to_string()
+    } else {
+        canonical_len_fields(services.iter().map(String::as_str))
+    };
+    Ok(format!(
+        "backup:{account}:{}",
+        sha256_hex(service_scope.as_bytes())
+    ))
+}
+
+/// Build the dedupe key for a mobile restore-cloud job. The account, service and
+/// source id are hashed as length-prefixed fields to avoid delimiter ambiguity.
+pub fn mobile_restore_cloud_idempotency_key(
+    account: &str,
+    service: &str,
+    source_id: &str,
+) -> Result<String> {
+    validate_mobile_job_part("account", account)?;
+    validate_mobile_job_part("service", service)?;
+    validate_mobile_job_part("source_id", source_id)?;
+    let canonical = canonical_len_fields([account, service, source_id]);
+    Ok(format!(
+        "restore-cloud:{}",
+        sha256_hex(canonical.as_bytes())
+    ))
+}
+
+fn validate_mobile_job_part(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(StoreError::InvalidMobileJob(format!(
+            "{label} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_mobile_job_intent(intent_json: &str) -> Result<()> {
+    validate_mobile_job_part("intent_json", intent_json)?;
+    if mobile_job_contains_secret_shape(intent_json) {
+        return Err(StoreError::InvalidMobileJob(
+            "intent contains secret-shaped material".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mobile_job_json(label: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        if mobile_job_contains_secret_shape(value) {
+            return Err(StoreError::InvalidMobileJob(format!(
+                "{label} contains secret-shaped material"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn redact_mobile_job_error(error: Option<&str>) -> Option<String> {
+    error.map(|error| {
+        if mobile_job_contains_secret_shape(error) {
+            "[redacted]".to_string()
+        } else {
+            const MAX_ERROR_CHARS: usize = 512;
+            error.chars().take(MAX_ERROR_CHARS).collect()
+        }
+    })
+}
+
+fn mobile_job_contains_secret_shape(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    [
+        "authorization:",
+        "bearer ",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "x-session-token",
+        "cap-token",
+        "cap_token",
+        "code=",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn canonical_len_fields<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for field in fields {
+        out.push_str(&field.len().to_string());
+        out.push(':');
+        out.push_str(field);
+        out.push(';');
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
 /// The state of one cloud-restore operation in the ledger (ADR-001).
 ///
 /// Legal transitions form the recovery-safe machine:
@@ -2155,6 +2697,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 15 {
         conn.execute_batch(MIGRATION_V15)?;
+    }
+    if v < 16 {
+        conn.execute_batch(MIGRATION_V16)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -3269,6 +3814,324 @@ mod tests {
             .get_upload_session("a", "onedrive", "/Big.bin")
             .unwrap()
             .is_none());
+    }
+
+    // --- mobile durable job queue (#625) ---
+
+    #[test]
+    fn mobile_job_schema_migrates_to_v16() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='mobile_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mobile_job_create_get_and_list_roundtrip() {
+        let s = Store::open_in_memory().unwrap();
+        let job = s
+            .create_mobile_job(
+                "job-1",
+                "me",
+                MobileJobKind::Backup,
+                None,
+                None,
+                "backup-key",
+                r#"{"op":"backup","services":["onedrive"]}"#,
+                100,
+            )
+            .unwrap();
+        assert_eq!(job.job_id, "job-1");
+        assert_eq!(job.kind, MobileJobKind::Backup);
+        assert_eq!(job.state, MobileJobState::Queued);
+        assert_eq!(job.attempts, 0);
+        assert_eq!(job.created_at, 100);
+        assert!(s.get_mobile_job("missing").unwrap().is_none());
+        let fetched = s.get_mobile_job("job-1").unwrap().unwrap();
+        assert_eq!(fetched, job);
+        assert_eq!(s.list_mobile_jobs("me", 10).unwrap(), vec![job]);
+    }
+
+    #[test]
+    fn mobile_job_open_idempotency_dedupes_only_nonterminal_jobs() {
+        let s = Store::open_in_memory().unwrap();
+        let first = s
+            .create_mobile_job(
+                "job-1",
+                "me",
+                MobileJobKind::Backup,
+                None,
+                None,
+                "same-key",
+                r#"{"op":"backup"}"#,
+                100,
+            )
+            .unwrap();
+        let deduped = s
+            .create_mobile_job(
+                "job-2",
+                "me",
+                MobileJobKind::Backup,
+                None,
+                None,
+                "same-key",
+                r#"{"op":"backup"}"#,
+                101,
+            )
+            .unwrap();
+        assert_eq!(deduped.job_id, first.job_id);
+        assert_eq!(s.list_mobile_jobs("me", 10).unwrap().len(), 1);
+
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-a", 110, 30)
+            .unwrap());
+        assert!(s
+            .finish_mobile_job_if_running("job-1", "worker-a", 120, Some(r#"{"ok":true}"#))
+            .unwrap());
+        let retry = s
+            .create_mobile_job(
+                "job-3",
+                "me",
+                MobileJobKind::Backup,
+                None,
+                None,
+                "same-key",
+                r#"{"op":"backup"}"#,
+                130,
+            )
+            .unwrap();
+        assert_eq!(retry.job_id, "job-3");
+        assert_eq!(s.list_mobile_jobs("me", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mobile_job_idempotency_keys_are_canonical_and_bound() {
+        let a = mobile_backup_idempotency_key(
+            "me",
+            &[
+                "onedrive".to_string(),
+                "mail".to_string(),
+                "mail".to_string(),
+            ],
+        )
+        .unwrap();
+        let b = mobile_backup_idempotency_key("me", &["mail".to_string(), "onedrive".to_string()])
+            .unwrap();
+        let c =
+            mobile_backup_idempotency_key("other", &["mail".to_string(), "onedrive".to_string()])
+                .unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("backup:me:"));
+
+        let r1 = mobile_restore_cloud_idempotency_key("me", "mail", "source:1").unwrap();
+        let r2 = mobile_restore_cloud_idempotency_key("me", "mail", "source:2").unwrap();
+        let r3 = mobile_restore_cloud_idempotency_key("me", "onedrive", "source:1").unwrap();
+        assert_ne!(r1, r2);
+        assert_ne!(r1, r3);
+        assert!(r1.starts_with("restore-cloud:"));
+    }
+
+    #[test]
+    fn mobile_job_state_machine_rejects_illegal_transitions() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_mobile_job(
+            "job-1",
+            "me",
+            MobileJobKind::RestoreCloud,
+            Some("mail"),
+            Some("src"),
+            "restore-key",
+            r#"{"op":"restore-cloud"}"#,
+            100,
+        )
+        .unwrap();
+        let err = s
+            .transition_mobile_job("job-1", MobileJobState::Succeeded, 101, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::IllegalMobileJobTransition(_)));
+        assert_eq!(
+            s.get_mobile_job("job-1").unwrap().unwrap().state,
+            MobileJobState::Queued
+        );
+
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-a", 102, 30)
+            .unwrap());
+        let err = s
+            .transition_mobile_job("job-1", MobileJobState::Queued, 103, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::IllegalMobileJobTransition(_)));
+        assert_eq!(
+            s.get_mobile_job("job-1").unwrap().unwrap().state,
+            MobileJobState::Running
+        );
+    }
+
+    #[test]
+    fn mobile_job_lease_is_single_owner_until_expiry() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_mobile_job(
+            "job-1",
+            "me",
+            MobileJobKind::Backup,
+            None,
+            None,
+            "backup-key",
+            r#"{"op":"backup"}"#,
+            100,
+        )
+        .unwrap();
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-a", 110, 30)
+            .unwrap());
+        assert!(!s
+            .acquire_mobile_job_lease("job-1", "worker-b", 120, 30)
+            .unwrap());
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-b", 141, 30)
+            .unwrap());
+        let job = s.get_mobile_job("job-1").unwrap().unwrap();
+        assert_eq!(job.lease_owner.as_deref(), Some("worker-b"));
+        assert_eq!(job.attempts, 2);
+        assert!(!s.release_mobile_job_lease("job-1", "worker-a").unwrap());
+        assert!(s.release_mobile_job_lease("job-1", "worker-b").unwrap());
+        assert!(s
+            .get_mobile_job("job-1")
+            .unwrap()
+            .unwrap()
+            .lease_owner
+            .is_none());
+    }
+
+    #[test]
+    fn mobile_job_recoverable_lists_queued_and_expired_running_only() {
+        let s = Store::open_in_memory().unwrap();
+        for (idx, id) in ["queued", "active", "expired", "done", "other"]
+            .into_iter()
+            .enumerate()
+        {
+            s.create_mobile_job(
+                id,
+                if id == "other" { "other" } else { "me" },
+                MobileJobKind::Backup,
+                None,
+                None,
+                &format!("{id}-key"),
+                r#"{"op":"backup"}"#,
+                100 + idx as i64,
+            )
+            .unwrap();
+        }
+        assert!(s
+            .acquire_mobile_job_lease("active", "worker-a", 110, 50)
+            .unwrap());
+        assert!(s
+            .acquire_mobile_job_lease("expired", "worker-a", 110, 10)
+            .unwrap());
+        assert!(s
+            .acquire_mobile_job_lease("done", "worker-a", 110, 10)
+            .unwrap());
+        assert!(s
+            .finish_mobile_job_if_running("done", "worker-a", 111, None)
+            .unwrap());
+
+        let rec = s.recoverable_mobile_jobs("me", 121).unwrap();
+        let ids: Vec<_> = rec.iter().map(|j| j.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["queued", "expired"]);
+    }
+
+    #[test]
+    fn mobile_job_rejects_secret_shaped_intent_and_redacts_errors() {
+        let s = Store::open_in_memory().unwrap();
+        let err = s
+            .create_mobile_job(
+                "bad",
+                "me",
+                MobileJobKind::Backup,
+                None,
+                None,
+                "bad-key",
+                r#"{"authorization":"Bearer secret"}"#,
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidMobileJob(_)));
+        assert!(s.get_mobile_job("bad").unwrap().is_none());
+
+        s.create_mobile_job(
+            "job-1",
+            "me",
+            MobileJobKind::Backup,
+            None,
+            None,
+            "backup-key",
+            r#"{"op":"backup"}"#,
+            100,
+        )
+        .unwrap();
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-a", 110, 30)
+            .unwrap());
+        s.transition_mobile_job(
+            "job-1",
+            MobileJobState::Failed,
+            111,
+            None,
+            None,
+            Some("provider returned refresh_token=abc123"),
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_mobile_job("job-1")
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
+    fn mobile_job_cancelled_running_does_not_accept_late_success_without_reconcile() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_mobile_job(
+            "job-1",
+            "me",
+            MobileJobKind::RestoreCloud,
+            Some("mail"),
+            Some("src"),
+            "restore-key",
+            r#"{"op":"restore-cloud"}"#,
+            100,
+        )
+        .unwrap();
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-a", 110, 30)
+            .unwrap());
+        s.transition_mobile_job(
+            "job-1",
+            MobileJobState::Cancelled,
+            111,
+            Some(r#"{"cancelled":true}"#),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!s
+            .finish_mobile_job_if_running("job-1", "worker-a", 112, Some(r#"{"id":"new"}"#))
+            .unwrap());
+        let job = s.get_mobile_job("job-1").unwrap().unwrap();
+        assert_eq!(job.state, MobileJobState::Cancelled);
+        assert_eq!(job.result_json, None);
+        assert_eq!(job.progress_json.as_deref(), Some(r#"{"cancelled":true}"#));
     }
 
     // --- restore operation ledger (ADR-001) ---
