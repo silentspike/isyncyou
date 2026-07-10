@@ -13,12 +13,13 @@ use crate::AgentError;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 /// Default Claude-Code mimicry recipe (verified from the real client, 2026-06-27).
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
-const DEFAULT_CLI_VERSION: &str = "2.1.195";
+const DEFAULT_CLI_VERSION: &str = "2.1.206";
 
 /// The subscription wire configuration. Defaults to the verified Claude-Code recipe; the
 /// operator may override the CLI version or supply account identity for `metadata.user_id`.
@@ -129,7 +130,7 @@ impl SubscriptionProvider {
                 self.session_id.clone(),
             ),
             ("content-type".to_string(), "application/json".to_string()),
-            ("accept".to_string(), "application/json".to_string()),
+            ("accept".to_string(), "text/event-stream".to_string()),
         ]
     }
 
@@ -154,6 +155,133 @@ impl SubscriptionProvider {
             }).to_string()
         })
     }
+
+    fn request_body(&self, history: &[Message]) -> Value {
+        let mut body = anthropic::build_request_blocks(&self.model, self.system_blocks(), history);
+        body["metadata"] = self.metadata();
+        body["stream"] = json!(true);
+        body
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeStreamState {
+    text: String,
+    active_tools: BTreeMap<u64, (String, String)>,
+    tools: Vec<(String, Value)>,
+    usage: Usage,
+    failure: Option<String>,
+}
+
+fn apply_claude_sse_event(
+    data: &str,
+    state: &mut ClaudeStreamState,
+) -> Result<Option<String>, AgentError> {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+    let v: Value = serde_json::from_str(data)
+        .map_err(|e| AgentError::Provider(format!("subscription: invalid SSE JSON: {e}")))?;
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("message_start") => {
+            if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
+                let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                state.usage.input_tokens = g("input_tokens");
+                state.usage.output_tokens = g("output_tokens");
+            }
+        }
+        Some("content_block_start") => {
+            if v.get("content_block")
+                .and_then(|b| b.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("tool_use")
+            {
+                let index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+                let block = &v["content_block"];
+                let id = block
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let args = block
+                    .get("input")
+                    .filter(|input| input.as_object().map(|o| !o.is_empty()).unwrap_or(true))
+                    .map(Value::to_string)
+                    .unwrap_or_default();
+                state.active_tools.insert(index, (id, args));
+            }
+        }
+        Some("content_block_delta") => {
+            let delta = &v["delta"];
+            match delta.get("type").and_then(|t| t.as_str()) {
+                Some("text_delta") => {
+                    if let Some(text) = delta.get("text").and_then(|x| x.as_str()) {
+                        state.text.push_str(text);
+                        return Ok(Some(text.to_string()));
+                    }
+                }
+                Some("input_json_delta") => {
+                    let index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let partial = delta
+                        .get("partial_json")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let entry = state
+                        .active_tools
+                        .entry(index)
+                        .or_insert_with(|| (String::new(), String::new()));
+                    entry.1.push_str(partial);
+                }
+                _ => {}
+            }
+        }
+        Some("content_block_stop") => {
+            let index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+            if let Some((id, args)) = state.active_tools.remove(&index) {
+                let input = if args.is_empty() {
+                    Value::Object(Default::default())
+                } else {
+                    serde_json::from_str(&args).unwrap_or(Value::Null)
+                };
+                state.tools.push((id, input));
+            }
+        }
+        Some("message_delta") => {
+            if let Some(u) = v.get("usage") {
+                if let Some(output) = u.get("output_tokens").and_then(|x| x.as_u64()) {
+                    state.usage.output_tokens = output;
+                }
+            }
+        }
+        Some("error") => {
+            state.failure = Some(
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("stream error")
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn finish_claude_stream(
+    state: ClaudeStreamState,
+) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
+    if let Some(e) = state.failure {
+        return Err(AgentError::Provider(format!("subscription: {e}")));
+    }
+    let mut blocks = Vec::new();
+    if !state.text.is_empty() {
+        blocks.push(AssistantBlock::Text(state.text));
+    }
+    for (id, input) in state.tools {
+        blocks.push(AssistantBlock::ToolUse { id, input });
+    }
+    Ok((blocks, state.usage))
 }
 
 impl LlmProvider for SubscriptionProvider {
@@ -167,25 +295,46 @@ impl LlmProvider for SubscriptionProvider {
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<Vec<AssistantBlock>, AgentError> {
         // Reuse the official Messages shaping; only system blocks + headers + metadata differ.
-        let mut body = anthropic::build_request_blocks(&self.model, self.system_blocks(), history);
-        body["metadata"] = self.metadata();
-        let (status, text) =
-            self.http
-                .post_json(&self.cfg.messages_url, &self.request_headers(), &body)?;
-        if status == 401 || status == 403 {
+        let body = self.request_body(history);
+        let mut state = ClaudeStreamState::default();
+        let mut parse_error: Option<AgentError> = None;
+        let response = self.http.post_json_sse(
+            &self.cfg.messages_url,
+            &self.request_headers(),
+            &body,
+            &mut |event| {
+                if parse_error.is_some() {
+                    return;
+                }
+                match apply_claude_sse_event(&event.data, &mut state) {
+                    Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                    Ok(None) => {}
+                    Err(e) => parse_error = Some(e),
+                }
+            },
+        )?;
+        if response.status == 401 || response.status == 403 {
             return Err(AgentError::Provider(
-                "subscription: unauthorized — run the official login first".into(),
+                "subscription: unauthorized — connect Claude again".into(),
             ));
         }
-        let v: Value = serde_json::from_str(&text)
-            .map_err(|e| AgentError::Provider(format!("subscription: invalid JSON: {e}")))?;
-        let (blocks, usage) = anthropic::parse_response(&v)?;
-        self.last_usage = usage;
-        for b in &blocks {
-            if let AssistantBlock::Text(t) = b {
-                emit(StreamEvent::Token(t.clone()));
-            }
+        if response.status >= 400 {
+            let detail = response.body_preview.unwrap_or_default();
+            return Err(AgentError::Provider(format!(
+                "subscription: backend status {}{}",
+                response.status,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )));
         }
+        if let Some(e) = parse_error {
+            return Err(e);
+        }
+        let (blocks, usage) = finish_claude_stream(state)?;
+        self.last_usage = usage;
         Ok(blocks)
     }
 }
@@ -201,7 +350,7 @@ mod tests {
             c.messages_url,
             "https://api.anthropic.com/v1/messages?beta=true"
         );
-        assert_eq!(c.cli_version, "2.1.195");
+        assert_eq!(c.cli_version, "2.1.206");
     }
 
     #[test]
@@ -224,8 +373,9 @@ mod tests {
         assert_eq!(get("x-app").unwrap(), "cli");
         assert_eq!(
             get("user-agent").unwrap(),
-            "claude-cli/2.1.195 (external, sdk-cli)"
+            "claude-cli/2.1.206 (external, sdk-cli)"
         );
+        assert_eq!(get("accept").unwrap(), "text/event-stream");
         assert!(get("x-claude-code-session-id").is_some());
     }
 
@@ -240,12 +390,85 @@ mod tests {
         .unwrap();
         let s = p.system_blocks();
         let first = s[0]["text"].as_str().unwrap();
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.195.cab;"));
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.206.cab;"));
         assert!(first.contains("cc_entrypoint=sdk-cli"));
         assert!(first.contains("cch=00000"));
         // second block is the real prompt, cached
         assert_eq!(s[1]["text"], "the real system prompt");
         assert_eq!(s[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn request_body_enables_streaming_and_metadata() {
+        let cfg = SubscriptionConfig {
+            account_uuid: "acc-1".into(),
+            device_id: "dev-1".into(),
+            ..Default::default()
+        };
+        let p = SubscriptionProvider::new("t", "m", "system", cfg).unwrap();
+        let body = p.request_body(&[Message::user("hello")]);
+
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(body["metadata"]["user_id"]
+            .as_str()
+            .unwrap()
+            .contains("acc-1"));
+    }
+
+    #[test]
+    fn claude_sse_event_returns_text_delta_immediately() {
+        let mut state = ClaudeStreamState::default();
+        let delta = apply_claude_sse_event(
+            "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}",
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(delta.as_deref(), Some("hello"));
+        assert_eq!(state.text, "hello");
+    }
+
+    #[test]
+    fn claude_sse_extracts_tool_use_and_usage() {
+        let mut state = ClaudeStreamState::default();
+        for data in [
+            "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}",
+            "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"isyncyou\",\"input\":{}}}",
+            "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"op\\\":\"}}",
+            "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"search\\\"}\"}}",
+            "{\"type\":\"content_block_stop\",\"index\":1}",
+            "{\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}",
+        ] {
+            apply_claude_sse_event(data, &mut state).unwrap();
+        }
+
+        let (blocks, usage) = finish_claude_stream(state).unwrap();
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 7);
+        match &blocks[0] {
+            AssistantBlock::ToolUse { id, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(input["op"], "search");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_sse_surfaces_error() {
+        let mut state = ClaudeStreamState::default();
+        apply_claude_sse_event(
+            "{\"type\":\"error\",\"error\":{\"message\":\"subscription rejected\"}}",
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(finish_claude_stream(state)
+            .unwrap_err()
+            .to_string()
+            .contains("subscription rejected"));
     }
 
     #[test]

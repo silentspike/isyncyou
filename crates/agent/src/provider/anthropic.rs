@@ -3,9 +3,11 @@
 //! runtime; the `AnthropicProvider` API-key live type is quarantined behind
 //! `byo-api-providers`.
 
+#[cfg(any(feature = "byo-api-providers", test))]
 use super::{AssistantBlock, Usage};
 use crate::tool::{tool_schema, TOOL_NAME};
 use crate::turn::{Message, Role};
+#[cfg(any(feature = "byo-api-providers", test))]
 use crate::AgentError;
 use serde_json::{json, Value};
 
@@ -81,6 +83,7 @@ fn headers(api_key: &str) -> Vec<(String, String)> {
 
 /// Parse a Messages response into assistant blocks + usage. Surfaces API errors clearly
 /// without leaking the key.
+#[cfg(any(feature = "byo-api-providers", test))]
 pub(crate) fn parse_response(v: &Value) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
     if let Some(err) = v.get("error") {
         let msg = err
