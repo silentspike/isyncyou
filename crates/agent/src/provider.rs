@@ -62,7 +62,7 @@ pub enum StreamEvent {
     /// stops here; the model never receives a capability token (REQ-AGENT-004).
     ConfirmationRequired {
         id: String,
-        action: ToolAction,
+        action: Box<ToolAction>,
         preview: String,
         action_hash: String,
         risk: String,
@@ -274,10 +274,10 @@ mod tests {
             },
             StreamEvent::ConfirmationRequired {
                 id: "pending-1".into(),
-                action: ToolAction::Backup {
+                action: Box::new(ToolAction::Backup {
                     account: "me".into(),
                     services: vec!["mail".into()],
-                },
+                }),
                 preview: "Requires confirmation".into(),
                 action_hash: "a".repeat(64),
                 risk: "destructive".into(),

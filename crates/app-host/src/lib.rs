@@ -3,6 +3,10 @@
 //! calls [`build_live_router`] for the shared base and adds its daemon-only
 //! restore/share/push on top; the mobile client uses the base as-is.
 
+mod agent_ops;
+
+pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
+
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
@@ -118,8 +122,13 @@ fn make_executor(
     account: &str,
     archive_root: std::path::PathBuf,
 ) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
-    Box::new(isyncyou_agent::retrieval::RetrievalExecutor::new(
-        isyncyou_agent::archive::StoreArchive::new(account, archive_root),
+    let restore_root = archive_root.join(".isyncyou-agent").join("restore-local");
+    Box::new(agent_ops::RestoreLocalReadExecutor::new(
+        isyncyou_agent::archive::StoreArchive::new(account, archive_root.clone()),
+        isyncyou_agent::retrieval::RetrievalExecutor::new(
+            isyncyou_agent::archive::StoreArchive::new(account, archive_root),
+        ),
+        restore_root,
     ))
 }
 #[cfg(not(any(
@@ -209,20 +218,6 @@ pub trait AgentAuditSink: Send + Sync {
     ) -> Result<(), String>;
 }
 
-struct NotImplementedConfirmedActionExecutor;
-
-impl AgentConfirmedActionExecutor for NotImplementedConfirmedActionExecutor {
-    fn execute_confirmed(
-        &self,
-        action: &isyncyou_agent::ToolAction,
-    ) -> Result<ConfirmedActionResult, String> {
-        Err(format!(
-            "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
-            action.op()
-        ))
-    }
-}
-
 struct StoreAgentAuditSink {
     cfg: Config,
 }
@@ -268,13 +263,22 @@ impl AgentAuditSink for StoreAgentAuditSink {
 fn agent_action_summary(action: &isyncyou_agent::ToolAction) -> String {
     let mut parts = vec![
         format!("op={}", action.op()),
-        format!("account={}", action.account()),
+        format!(
+            "account={}",
+            agent_ops::redact_agent_operation_text(action.account())
+        ),
     ];
     if let Some(service) = action.service() {
-        parts.push(format!("service={service}"));
+        parts.push(format!(
+            "service={}",
+            agent_ops::redact_agent_operation_text(service)
+        ));
     }
     if let Some(item) = action.item_or_target() {
-        parts.push(format!("item={item}"));
+        parts.push(format!(
+            "item={}",
+            agent_ops::redact_agent_operation_text(item)
+        ));
     }
     parts.join(" ")
 }
@@ -291,6 +295,10 @@ fn agent_audit_summary(summary: &str) -> String {
 fn agent_safe_executor_error(error: &str) -> &'static str {
     if error.contains("not_implemented") {
         "not_implemented"
+    } else if error.contains("not_available_on_mobile")
+        || error.contains("mobile_agent_operations_land_in_625_626")
+    {
+        "not_available_on_mobile"
     } else {
         "execution_failed"
     }
@@ -353,12 +361,28 @@ pub struct DaemonAgent {
 
 impl DaemonAgent {
     pub fn new(cfg: Config, oauth_dir: PathBuf) -> Self {
+        Self::new_with_policy(
+            cfg,
+            oauth_dir,
+            AgentOperationPolicy::DesktopEnabled,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    pub fn new_with_policy(
+        cfg: Config,
+        oauth_dir: PathBuf,
+        operation_policy: AgentOperationPolicy,
+        gate: Arc<Mutex<()>>,
+    ) -> Self {
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let confirmed_executor =
+            agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
         Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
             pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
-            confirmed_executor: Arc::new(NotImplementedConfirmedActionExecutor),
+            confirmed_executor,
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
             last_usage: Arc::new(Mutex::new(None)),
@@ -1287,16 +1311,40 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             }
             match outcome {
                 Ok(isyncyou_agent::TurnOutcome::Final { .. }) => {}
-                Ok(isyncyou_agent::TurnOutcome::PendingConfirmation {
-                    action, preview, ..
-                }) => {
-                    match pending.register(action, preview, unix_now_ms(), AGENT_CONFIRM_TTL_MS) {
+                Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
+                    let action = *action;
+                    let preview = match agent_ops::preview_for_pending_action(&action) {
+                        Ok(preview) => preview,
+                        Err(e) => {
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::Error(
+                                    agent_ops::redact_agent_operation_text(&e),
+                                ),
+                            );
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::done(
+                                    isyncyou_agent::DoneReason::Error,
+                                ),
+                            );
+                            hub.close(&tid);
+                            return;
+                        }
+                    };
+                    let _risk = preview.risk.as_str();
+                    match pending.register(
+                        action,
+                        preview.text,
+                        unix_now_ms(),
+                        AGENT_CONFIRM_TTL_MS,
+                    ) {
                         Ok((pending_action, token)) => {
                             let _ = hub.emit(
                                 &tid,
                                 isyncyou_agent::StreamEvent::ConfirmationRequired {
                                     id: pending_action.id,
-                                    action: pending_action.action,
+                                    action: Box::new(pending_action.action),
                                     preview: pending_action.preview,
                                     action_hash: pending_action.action_hash,
                                     risk: pending_action.risk,
@@ -1341,17 +1389,24 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .pending
             .confirm(pending_id, token, action_hash, unix_now_ms())
             .map_err(|e| format!("{e:?}"))?;
+        agent_ops::preview_for_pending_action(&action).map_err(|e| {
+            format!(
+                "invalid_confirmed_action: {}",
+                agent_ops::redact_agent_operation_text(&e)
+            )
+        })?;
         let action_summary = agent_action_summary(&action);
         self.audit_sink
             .record_confirm(&action, "started", &action_summary)?;
         match self.confirmed_executor.execute_confirmed(&action) {
             Ok(result) => {
+                let safe_summary = agent_ops::redact_agent_operation_text(&result.summary);
                 self.audit_sink
                     .record_confirm(&action, "ok", &format!("{action_summary} ok"))?;
                 serde_json::to_string(&serde_json::json!({
                     "status": "ok",
                     "op": action.op(),
-                    "summary": result.summary,
+                    "summary": safe_summary,
                 }))
                 .map_err(|e| e.to_string())
             }
@@ -2766,6 +2821,7 @@ pub fn build_live_router(
     config_path: PathBuf,
     live_interval: Arc<AtomicU64>,
     progress: isyncyou_connectors::SharedProgress,
+    agent_policy: AgentOperationPolicy,
 ) -> isyncyou_webui::Router {
     // Agent OAuth credentials live next to the config file (on mobile, app-private
     // filesDir). #627-only local fallback/capture uses the same directory for overrides.
@@ -2773,6 +2829,7 @@ pub fn build_live_router(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    let agent_gate = gate.clone().unwrap_or_else(|| Arc::new(Mutex::new(())));
     let base = match gate {
         Some(g) => isyncyou_webui::Router::with_gate(cfg.clone(), g),
         None => isyncyou_webui::Router::new(cfg.clone()),
@@ -2835,8 +2892,12 @@ pub fn build_live_router(
             mint_cap_token(),
         )
         .with_agent(
-            Arc::new(DaemonAgent::new(cfg.clone(), oauth_dir))
-                as Arc<dyn isyncyou_webui::AgentHandler>,
+            Arc::new(DaemonAgent::new_with_policy(
+                cfg.clone(),
+                oauth_dir,
+                agent_policy,
+                agent_gate,
+            )) as Arc<dyn isyncyou_webui::AgentHandler>,
             mint_cap_token(),
         )
         // #onedrive-mobile 0.9: outbound sharing is wired here (was daemon-only) so the
@@ -3174,6 +3235,184 @@ mod tests {
     }
 
     #[test]
+    fn agent_confirm_with_desktop_policy_uses_real_operation_executor() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-desktop-policy");
+        let mut agent = DaemonAgent::new_with_policy(
+            Config::default(),
+            root.clone(),
+            AgentOperationPolicy::DesktopEnabled,
+            Arc::new(Mutex::new(())),
+        );
+        agent.audit_sink = Arc::new(audit.clone());
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "backup failed: execution_failed");
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, "started");
+        assert_eq!(events[1].1, "error");
+        assert!(!events[1].2.contains("not_available_on_mobile"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_revalidates_action_before_execution() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-revalidate");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "mail",
+            "target": "drafts",
+            "change": {
+                "body_html": "<html>raw-body-sentinel recipient@example.com</html>",
+                "to": ["recipient@example.com"]
+            }
+        }))
+        .unwrap();
+        let (pending, token) = agent
+            .pending
+            .register(
+                action,
+                "invalid live write",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("invalid_confirmed_action"));
+        assert!(err.contains("missing verb"));
+        assert!(!err.contains("raw-body-sentinel"));
+        assert!(!err.contains("recipient@example.com"));
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_read_class_action_cannot_execute_in_confirm_path() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-read-class");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "search",
+            "account": "me",
+            "services": ["mail"],
+            "query": "status"
+        }))
+        .unwrap();
+        let (pending, token) = agent
+            .pending
+            .register(
+                action,
+                "search should not confirm",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("invalid_confirmed_action"));
+        assert!(err.contains("not_confirmable: search"));
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_result_summary_is_json_and_redacted() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok(
+            "backup wrote https://tenant.example/item?code=secret for owner@example.com",
+            order.clone(),
+        );
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-json-redacted");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let result = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let summary = result["summary"].as_str().unwrap();
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["op"], "backup");
+        assert!(summary.contains("<redacted-url>"));
+        assert!(summary.contains("<redacted-email>"));
+        assert!(!summary.contains("tenant.example"));
+        assert!(!summary.contains("owner@example.com"));
+        assert_eq!(executor.call_count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn agent_confirm_replay_rejected_and_executor_not_called_twice() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
@@ -3257,6 +3496,105 @@ mod tests {
     }
 
     #[test]
+    fn agent_restore_cloud_error_is_redacted_in_api_and_audit() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::err(
+            "restore failed for https://tenant.example/path?code=oauth-code and user@example.com",
+            order.clone(),
+        );
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-restore-redaction");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor),
+            Arc::new(audit.clone()),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "restore-cloud",
+            "account": "owner@example.com",
+            "service": "mail",
+            "id": "https://tenant.example/item?code=secret user@example.com"
+        }))
+        .unwrap();
+        let (pending, token) = agent
+            .pending
+            .register(action, "restore cloud", unix_now_ms(), AGENT_CONFIRM_TTL_MS)
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "restore-cloud failed: execution_failed");
+        assert!(!err.contains("tenant.example"));
+        assert!(!err.contains("user@example.com"));
+        let audit_text = serde_json::to_string(&audit.events()).unwrap();
+        assert!(!audit_text.contains("tenant.example"));
+        assert!(!audit_text.contains("owner@example.com"));
+        assert!(!audit_text.contains("user@example.com"));
+        assert!(!audit_text.contains("oauth-code"));
+        assert!(!audit_text.contains("restore failed for"));
+        assert!(audit_text.contains("<redacted-url>"));
+        assert!(audit_text.contains("<redacted-email>"));
+        assert!(audit_text.contains("execution_failed"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_share_invite_audit_summary_redacts_recipient_emails() {
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "share",
+            "account": "owner@example.com",
+            "service": "onedrive",
+            "id": "item-1",
+            "mode": "invite",
+            "recipients": ["recipient@example.com"],
+            "role": "read"
+        }))
+        .unwrap();
+
+        let summary = agent_action_summary(&action);
+
+        assert!(summary.contains("op=share"));
+        assert!(summary.contains("service=onedrive"));
+        assert!(summary.contains("item=item-1"));
+        assert!(!summary.contains("owner@example.com"));
+        assert!(!summary.contains("recipient@example.com"));
+        assert!(summary.contains("<redacted-email>"));
+    }
+
+    #[test]
+    fn agent_live_write_body_html_is_not_audited() {
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "live-write",
+            "account": "owner@example.com",
+            "service": "mail",
+            "change": {
+                "verb": "create_draft",
+                "subject": "private subject",
+                "body_html": "<html>raw-body-sentinel recipient@example.com</html>",
+                "to": ["recipient@example.com"]
+            }
+        }))
+        .unwrap();
+
+        let summary = agent_action_summary(&action);
+
+        assert!(summary.contains("op=live-write"));
+        assert!(summary.contains("service=mail"));
+        assert!(!summary.contains("owner@example.com"));
+        assert!(!summary.contains("recipient@example.com"));
+        assert!(!summary.contains("raw-body-sentinel"));
+        assert!(!summary.contains("private subject"));
+        assert!(summary.contains("<redacted-email>"));
+    }
+
+    #[test]
     fn agent_confirm_unknown_or_expired_pending_does_not_audit_execution() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
@@ -3321,6 +3659,49 @@ mod tests {
         assert_eq!(err, "audit_start_failed");
         assert_eq!(executor.call_count(), 0);
         assert_eq!(order.lock().unwrap().as_slice(), ["audit:started"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_mobile_policy_refuses_before_mutation() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let audit = RecordingAuditSink::new(order.clone());
+        let root = temp_agent_root("confirm-mobile-disabled");
+        let mut agent = DaemonAgent::new_with_policy(
+            Config::default(),
+            root.clone(),
+            AgentOperationPolicy::MobileDisabled,
+            Arc::new(Mutex::new(())),
+        );
+        agent.audit_sink = Arc::new(audit.clone());
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "backup failed: not_available_on_mobile");
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["audit:started", "audit:error"]
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, "started");
+        assert_eq!(events[1].1, "error");
+        assert!(events[1].2.contains("not_available_on_mobile"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3399,6 +3780,662 @@ mod tests {
         assert!(!pending_id.is_empty());
         assert_eq!(executor.call_count(), 0);
         assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_destructive_preview_is_redacted_before_pending_registration() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"share",
+                "account":"me",
+                "service":"onedrive",
+                "id":"file-1",
+                "recipient":"recipient@example.com"
+            }),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("share accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("pending-preview-redacted");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "share file").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut preview = String::new();
+        let mut tool_call_input = serde_json::Value::Null;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => tool_call_input = event["input"].clone(),
+                Some("confirmation_required") => {
+                    preview = event["preview"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+
+        assert_eq!(agent.pending.len(), 1);
+        assert!(preview.contains("Invite 1 recipient"));
+        assert!(!preview.contains("recipient@example.com"));
+        assert_eq!(tool_call_input["redacted"], true);
+        assert_eq!(tool_call_input["recipient_count"], 1);
+        assert!(!tool_call_input
+            .to_string()
+            .contains("recipient@example.com"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_live_write_does_not_register_pending() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"live-write",
+                "account":"me",
+                "service":"mail",
+                "target":"drafts",
+                "change":{
+                    "body":"<html>raw-body-sentinel</html>",
+                    "to":["recipient@example.com"]
+                }
+            }),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("invalid-live-write-no-pending");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "draft mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut saw_error = String::new();
+        let mut done_reason = String::new();
+        let mut saw_confirmation = false;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("error") => saw_error = event["message"].as_str().unwrap().to_string(),
+                Some("confirmation_required") => saw_confirmation = true,
+                Some("done") => {
+                    done_reason = event["reason"].as_str().unwrap().to_string();
+                    break;
+                }
+                Some("tool_call") => {
+                    let text = event["input"].to_string();
+                    assert!(!text.contains("recipient@example.com"));
+                    assert!(!text.contains("raw-body-sentinel"));
+                }
+                _ => {}
+            }
+        }
+
+        assert!(!saw_confirmation);
+        assert!(saw_error.contains("invalid_live_write"));
+        assert!(!saw_error.contains("recipient@example.com"));
+        assert!(!saw_error.contains("raw-body-sentinel"));
+        assert_eq!(done_reason, "error");
+        assert_eq!(agent.pending.len(), 0);
+        assert_eq!(executor.call_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn issue_624_live_write_token() -> Option<String> {
+        if let Ok(path) = std::env::var("ISY624_M365_WRITE_TOKEN_FILE") {
+            let token = std::fs::read_to_string(path).ok()?;
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+        std::env::var("ISY624_M365_WRITE_TOKEN")
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    fn issue_624_live_config(root: &std::path::Path, access_token: &str) -> Config {
+        let archive = root.join("archive");
+        let sync = root.join("sync");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let token_cache = serde_json::json!({
+            "access_token": access_token,
+            "refresh_token": null,
+            "expires_at": unix_now().parse::<u64>().unwrap_or(0).saturating_add(1800),
+        });
+        let token_cache_bytes = serde_json::to_vec_pretty(&token_cache).unwrap();
+        std::fs::write(
+            archive.join(isyncyou_engine::auth::WRITE_CACHE_FILE),
+            &token_cache_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            archive.join(isyncyou_engine::auth::READ_CACHE_FILE),
+            &token_cache_bytes,
+        )
+        .unwrap();
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "me".to_string(),
+                username: "redacted-live-account".to_string(),
+                sync_root: sync,
+                archive_root: archive,
+                cache_root: cache,
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    fn issue_624_collect_pending(
+        agent: &DaemonAgent,
+        prompt: &str,
+        expected_op: &str,
+    ) -> (String, String, String) {
+        let turn = isyncyou_webui::AgentHandler::start_turn(agent, "me", prompt).unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        let mut confirm_token = String::new();
+        let mut action_hash = String::new();
+        let mut saw_redacted_tool_call = false;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => {
+                    saw_redacted_tool_call = true;
+                    assert_eq!(event["input"]["op"].as_str(), Some(expected_op));
+                    assert!(event["input"]["redacted"].as_bool().unwrap_or(false));
+                }
+                Some("confirmation_required") => {
+                    pending_id = event["pending_id"].as_str().unwrap().to_string();
+                    confirm_token = event["token"].as_str().unwrap().to_string();
+                    action_hash = event["action_hash"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+        assert!(saw_redacted_tool_call);
+        assert!(!pending_id.is_empty());
+        assert!(!confirm_token.is_empty());
+        assert!(!action_hash.is_empty());
+        (pending_id, confirm_token, action_hash)
+    }
+
+    fn issue_624_url_segment(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
+    }
+
+    struct Issue624DraftCleanup {
+        token: String,
+        draft_id: Option<String>,
+    }
+
+    impl Issue624DraftCleanup {
+        fn set(&mut self, draft_id: String) {
+            self.draft_id = Some(draft_id);
+        }
+    }
+
+    impl Drop for Issue624DraftCleanup {
+        fn drop(&mut self) {
+            if let Some(id) = self.draft_id.take() {
+                let graph = isyncyou_graph::GraphClient::new(self.token.clone());
+                let _ = graph.delete_message(&id);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 write token via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_create_draft_and_cleanup() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-draft");
+        let cfg = issue_624_live_config(&root, &access_token);
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let subject = format!("isyncyou issue 624 live confirm {}", unix_now());
+        let recipient = std::env::var("ISY624_M365_DRAFT_TO")
+            .unwrap_or_else(|_| "recipient@example.invalid".to_string());
+        let recipient_for_assert = recipient.clone();
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"live-write",
+                "account":"me",
+                "service":"mail",
+                "change":{
+                    "verb":"create_draft",
+                    "subject": subject,
+                    "body_html": "<p>isyncyou issue 624 live confirmation probe</p>",
+                    "to": [recipient]
+                }
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg,
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let turn =
+            isyncyou_webui::AgentHandler::start_turn(&agent, "me", "create a controlled draft")
+                .unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        let mut confirm_token = String::new();
+        let mut action_hash = String::new();
+        let mut saw_redacted_tool_call = false;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => {
+                    saw_redacted_tool_call = true;
+                    let text = event["input"].to_string();
+                    assert!(event["input"]["redacted"].as_bool().unwrap_or(false));
+                    assert!(!text.contains(&recipient_for_assert));
+                    assert!(!text.contains("live confirmation probe"));
+                }
+                Some("confirmation_required") => {
+                    pending_id = event["pending_id"].as_str().unwrap().to_string();
+                    confirm_token = event["token"].as_str().unwrap().to_string();
+                    action_hash = event["action_hash"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+        assert!(saw_redacted_tool_call);
+        assert!(!pending_id.is_empty());
+        assert!(!confirm_token.is_empty());
+        assert!(!action_hash.is_empty());
+
+        let mut cleanup = Issue624DraftCleanup {
+            token: access_token,
+            draft_id: None,
+        };
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "live-write");
+        let summary: serde_json::Value =
+            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["op"], "live-write");
+        assert_eq!(summary["service"], "mail");
+        assert_eq!(summary["verb"], "create_draft");
+        let draft_id = summary["result_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(String::from)
+            .expect("confirmed create_draft returns a draft id");
+        cleanup.set(draft_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct Issue624DriveCleanup {
+        token: String,
+        item_id: Option<String>,
+        permission_ids: Vec<String>,
+    }
+
+    impl Issue624DriveCleanup {
+        fn set_item(&mut self, item_id: String) {
+            self.item_id = Some(item_id);
+        }
+
+        fn add_permission(&mut self, permission_id: String) {
+            self.permission_ids.push(permission_id);
+        }
+    }
+
+    impl Drop for Issue624DriveCleanup {
+        fn drop(&mut self) {
+            let graph = isyncyou_graph::GraphClient::new(self.token.clone());
+            if let Some(item_id) = self.item_id.as_deref() {
+                for permission_id in self.permission_ids.drain(..) {
+                    let _ = graph.delete_permission(item_id, &permission_id);
+                }
+                let _ = graph.delete_item(item_id);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 write token with Files.ReadWrite via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_share_link_and_cleanup() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-share");
+        let cfg = issue_624_live_config(&root, &access_token);
+        let graph = isyncyou_graph::GraphClient::new(access_token.clone());
+        let name = format!("isyncyou-issue-624-live-{}.txt", unix_now());
+        let uploaded = graph
+            .upload_content_with_conflict_behavior(
+                &name,
+                b"isyncyou issue 624 controlled share probe",
+                isyncyou_graph::http::ConflictBehavior::Fail,
+            )
+            .unwrap()
+            .expect("temporary OneDrive fixture must not already exist");
+        let item_id = uploaded["id"].as_str().unwrap().to_string();
+        let mut cleanup = Issue624DriveCleanup {
+            token: access_token,
+            item_id: None,
+            permission_ids: Vec::new(),
+        };
+        cleanup.set_item(item_id.clone());
+
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"share",
+                "account":"me",
+                "service":"onedrive",
+                "id": item_id,
+                "mode":"link",
+                "link_type":"view",
+                "scope":"anonymous"
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg,
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let turn =
+            isyncyou_webui::AgentHandler::start_turn(&agent, "me", "share temporary file").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut pending_id = String::new();
+        let mut confirm_token = String::new();
+        let mut action_hash = String::new();
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => {
+                    assert!(event["input"]["redacted"].as_bool().unwrap_or(false));
+                    assert_eq!(event["input"]["mode"], "link");
+                    assert_eq!(event["input"]["link_type"], "view");
+                    assert_eq!(event["input"]["scope"], "anonymous");
+                }
+                Some("confirmation_required") => {
+                    pending_id = event["pending_id"].as_str().unwrap().to_string();
+                    confirm_token = event["token"].as_str().unwrap().to_string();
+                    action_hash = event["action_hash"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+        assert!(!pending_id.is_empty());
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "share");
+        let summary: serde_json::Value =
+            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["op"], "share");
+        assert_eq!(summary["mode"], "link");
+        assert_eq!(summary["link_type"], "view");
+        assert_eq!(summary["scope"], "anonymous");
+
+        let permissions = graph
+            .list_permissions_detailed(cleanup.item_id.as_ref().unwrap())
+            .unwrap();
+        let created = permissions
+            .iter()
+            .find(|permission| {
+                permission.link_type.as_deref() == Some("view")
+                    && permission.link_scope.as_deref() == Some("anonymous")
+                    && !permission.inherited
+            })
+            .expect("confirmed share creates a direct anonymous view link");
+        cleanup.add_permission(created.id.clone());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 token with Mail.Read via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_backup_mail_records_run() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-backup");
+        let cfg = issue_624_live_config(&root, &access_token);
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"backup",
+                "account":"me",
+                "services":["mail"]
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg.clone(),
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let (pending_id, confirm_token, action_hash) =
+            issue_624_collect_pending(&agent, "run a controlled mail backup", "backup");
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "backup");
+        let summary = body["summary"].as_str().unwrap();
+        assert!(summary.contains("mail:"));
+        assert!(!summary.contains("Bearer "));
+        assert!(!summary.contains("access_token"));
+
+        let store =
+            isyncyou_store::Store::open(cfg.accounts[0].archive_root.join(".isyncyou-store.db"))
+                .unwrap();
+        let runs = store.recent_runs("me", 3).unwrap();
+        let latest = runs
+            .iter()
+            .find(|run| run.kind == "backup")
+            .expect("confirmed backup records a backup run");
+        assert_eq!(latest.status, "ok");
+        assert!(latest.summary.contains("mail:"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires a live Microsoft 365 token with Mail.ReadWrite via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    fn live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup() {
+        let access_token = issue_624_live_write_token()
+            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+        let root = temp_agent_root("live-issue-624-confirm-restore-cloud");
+        let mut cfg = issue_624_live_config(&root, &access_token);
+        cfg.restore.cloud_restore_enabled = true;
+        let archive = cfg.accounts[0].archive_root.clone();
+        std::fs::create_dir_all(archive.join("mail/live-restore")).unwrap();
+        let source_id = format!("issue-624-restore-{}", unix_now());
+        let rel = format!("mail/live-restore/{source_id}.eml");
+        let subject = format!("isyncyou issue 624 restore cloud {}", unix_now());
+        let mime = format!(
+            "From: iSyncYou Probe <isyncyou-probe@example.invalid>\r\n\
+             To: iSyncYou Probe <isyncyou-probe@example.invalid>\r\n\
+             Subject: {subject}\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             isyncyou issue 624 restore-cloud controlled probe\r\n"
+        );
+        {
+            let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+            let mut item = isyncyou_store::Item::new(
+                "me",
+                "mail",
+                &source_id,
+                "Issue 624 restore-cloud probe.eml",
+                "message",
+            );
+            item.local_path = Some(rel.clone());
+            store.upsert_item(&item).unwrap();
+        }
+        isyncyou_core::envelope::write_body_atomic(&archive.join(&rel), mime.as_bytes()).unwrap();
+
+        let gate = Arc::new(Mutex::new(()));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::DesktopEnabled,
+            cfg.clone(),
+            gate,
+        );
+        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"restore-cloud",
+                "account":"me",
+                "service":"mail",
+                "id": source_id
+            }),
+        }]];
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            cfg.clone(),
+            root.clone(),
+            script,
+            executor,
+            audit,
+        );
+
+        let (pending_id, confirm_token, action_hash) =
+            issue_624_collect_pending(&agent, "restore controlled archived mail", "restore-cloud");
+        let confirm = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending_id,
+            &confirm_token,
+            &action_hash,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["op"], "restore-cloud");
+        let summary: serde_json::Value =
+            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["op"], "restore-cloud");
+        assert_eq!(summary["service"], "mail");
+        assert_eq!(summary["source_id"], source_id);
+        let new_id = summary["new_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .expect("restore-cloud returns new message id")
+            .to_string();
+        let mut cleanup = Issue624DraftCleanup {
+            token: access_token,
+            draft_id: None,
+        };
+        cleanup.set(new_id.clone());
+
+        let graph = isyncyou_graph::GraphClient::new(cleanup.token.clone());
+        let restored = graph
+            .get_json(&format!(
+                "/me/messages/{}?$select=id,subject",
+                issue_624_url_segment(&new_id)
+            ))
+            .unwrap();
+        assert_eq!(restored["id"].as_str(), Some(new_id.as_str()));
+        assert_eq!(restored["subject"].as_str(), Some(subject.as_str()));
+
+        let bytes = isyncyou_core::envelope::read_body(&archive.join(&rel)).unwrap();
+        let secret =
+            isyncyou_engine::load_or_create_secret(&archive.join(".isyncyou-restore-secret"))
+                .unwrap();
+        let key = isyncyou_engine::idempotency_key(&secret, "me", "mail", &source_id, &bytes);
+        let op_id = format!("me:{key}");
+        let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+        let op = store
+            .get_restore_operation(&op_id)
+            .unwrap()
+            .expect("restore-cloud records a ledger operation");
+        assert_eq!(op.state, isyncyou_store::RestoreState::Committed);
+        assert_eq!(op.new_cloud_id.as_deref(), Some(new_id.as_str()));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3831,6 +4868,250 @@ mod tests {
             .unwrap()
             .contains("Runtime body archived text"));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn seed_restore_local_fixture(
+        name: &str,
+        service: &str,
+        id: &str,
+        item_name: &str,
+        rel: Option<&str>,
+        body: &[u8],
+    ) -> PathBuf {
+        let root = temp_agent_root(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = isyncyou_store::Store::open(root.join(".isyncyou-store.db")).unwrap();
+        let mut item = isyncyou_store::Item::new("me", service, id, item_name, "message");
+        if let Some(rel) = rel {
+            item.local_path = Some(rel.into());
+        }
+        store.upsert_item(&item).unwrap();
+        drop(store);
+
+        if let Some(rel) = rel {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            isyncyou_core::envelope::write_body_atomic(&path, body).unwrap();
+        }
+        root
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn restore_local_action(service: &str, id: &str) -> isyncyou_agent::ToolAction {
+        isyncyou_agent::ToolAction::RestoreLocal {
+            account: "me".into(),
+            service: service.into(),
+            id: id.into(),
+        }
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn restored_path(out: &serde_json::Value) -> PathBuf {
+        PathBuf::from(out["path"].as_str().unwrap())
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_writes_archived_body_to_controlled_restore_root() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_301, [31u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-write",
+            "mail",
+            "m1",
+            "Archived message.eml",
+            Some("mail/aa/m1.eml"),
+            b"restore-local plaintext",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m1"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+
+        assert!(path.starts_with(root.join(".isyncyou-agent/restore-local/mail")));
+        assert_eq!(std::fs::read(&path).unwrap(), b"restore-local plaintext");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_output_path_is_not_model_controlled() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_302, [32u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-path",
+            "mail",
+            "m-escape",
+            "../../escape.txt",
+            Some("mail/aa/m-escape.eml"),
+            b"safe output",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-escape"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+
+        assert!(path.starts_with(root.join(".isyncyou-agent/restore-local/mail")));
+        assert!(!path.to_string_lossy().contains("../"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"safe output");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_rejects_missing_archived_body() {
+        let _guard = EnvelopeRequirementGuard::new();
+        let root = seed_restore_local_fixture(
+            "restore-local-missing-body",
+            "mail",
+            "m-missing",
+            "Missing body",
+            None,
+            b"",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let err = exec
+            .execute_read(&restore_local_action("mail", "m-missing"))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("has no archived body"));
+        assert!(!root.join(".isyncyou-agent/restore-local").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_uses_envelope_reader_for_sealed_body() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_303, [33u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-sealed",
+            "mail",
+            "m-sealed",
+            "Sealed message.eml",
+            Some("mail/aa/m-sealed.eml"),
+            b"sealed restore bytes",
+        );
+        let raw_archive = std::fs::read(root.join("mail/aa/m-sealed.eml")).unwrap();
+        assert_ne!(raw_archive, b"sealed restore bytes");
+        assert!(raw_archive.starts_with(b"ISYE"));
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-sealed"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"sealed restore bytes");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )
+    ))]
+    #[test]
+    fn restore_local_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_304, [34u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-perms",
+            "mail",
+            "m-perms",
+            "Perms.eml",
+            Some("mail/aa/m-perms.eml"),
+            b"permission bytes",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-perms"))
+                .unwrap(),
+        )
+        .unwrap();
+        let path = restored_path(&out);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn restore_local_response_carries_source_id_and_byte_count() {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(624_305, [35u8; 32]);
+        let root = seed_restore_local_fixture(
+            "restore-local-response",
+            "mail",
+            "m-response",
+            "Response.eml",
+            Some("mail/aa/m-response.eml"),
+            b"response bytes",
+        );
+        let exec = make_executor("me", root.clone());
+
+        let out: serde_json::Value = serde_json::from_str(
+            &exec
+                .execute_read(&restore_local_action("mail", "m-response"))
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["service"], "mail");
+        assert_eq!(out["id"], "m-response");
+        assert_eq!(out["bytes"], b"response bytes".len());
+        assert_eq!(out["source"]["service"], "mail");
+        assert_eq!(out["source"]["id"], "m-response");
+        assert_eq!(out["source"]["path"], "mail/aa/m-response.eml");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4823,6 +6104,7 @@ mod tests {
             PathBuf::from("/x/isyncyou.toml"),
             Arc::new(AtomicU64::new(5)),
             progress.clone(),
+            AgentOperationPolicy::DesktopEnabled,
         );
         let resp = router.route(&ApiRequest::get("/api/v1/onedrive/transfers"));
         assert_eq!(resp.status, 200);
@@ -5144,6 +6426,7 @@ mod tests {
             PathBuf::from("/x/isyncyou.toml"),
             Arc::new(AtomicU64::new(5)),
             SharedProgress::new(),
+            AgentOperationPolicy::DesktopEnabled,
         );
         for path in [
             "/api/v1/onedrive/free-up?account=a&id=i1",
@@ -5176,6 +6459,7 @@ mod tests {
             PathBuf::from("/x/isyncyou.toml"),
             Arc::new(AtomicU64::new(5)),
             SharedProgress::new(),
+            AgentOperationPolicy::MobileDisabled,
         );
         assert_eq!(
             router

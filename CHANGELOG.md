@@ -8,6 +8,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent confirmed desktop operations**
+- `agent`+`app-host`: completed #624's desktop confirmed-operation path for
+  `restore-local`, `backup`, `restore-cloud`, `live-write`, and `share`.
+  Destructive operations now revalidate the stored PendingAction before
+  execution, reuse the existing daemon/engine/writer/ledger runtime paths, keep
+  mobile destructive Agent execution fail-closed, and redact API/audit summaries
+  for body HTML/text, share URLs, OAuth material, provider tokens, and emails.
+
 **Agent Claude/Codex OAuth providers**
 - `agent`+`app-host`+`webui`+`mobile`: advanced #623's Claude/Codex
   app-OAuth provider path with product feature wiring, encrypted CredentialStore

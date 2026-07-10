@@ -512,9 +512,10 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
                 ..
             } => self.list(service, parent.as_deref(), *limit, *offset),
             ToolAction::Export { service, id, .. } => self.export(service, id),
-            // restore-local is read-class but writes a local file — it lands in S-AG.9/#624.
+            // restore-local is read-class but writes a local file; app-host owns the
+            // controlled restore root and wraps this executor when that operation is enabled.
             ToolAction::RestoreLocal { .. } => Err(AgentError::ToolArgs(
-                "restore-local is implemented in the operations layer (S-AG.9/#624)".into(),
+                "restore-local is implemented in the app-host operations layer".into(),
             )),
             other => Err(AgentError::ToolArgs(format!(
                 "unsupported read op: {}",

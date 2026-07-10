@@ -490,11 +490,13 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    #[cfg(feature = "http")]
     struct EnvRestore {
         key: &'static str,
         value: Option<std::ffi::OsString>,
     }
 
+    #[cfg(feature = "http")]
     impl EnvRestore {
         fn set(key: &'static str, value: &str) -> Self {
             let old = std::env::var_os(key);
@@ -503,6 +505,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             match &self.value {
