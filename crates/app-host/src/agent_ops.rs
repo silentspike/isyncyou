@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use isyncyou_core::Config;
+use isyncyou_store::MobileJob;
 use isyncyou_store::Store;
 
+use crate::mobile_jobs::MobileJobRuntime;
 use crate::{AgentConfirmedActionExecutor, ConfirmedActionResult};
 
 #[cfg(any(
@@ -22,10 +24,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Explicitly separates desktop Agent operation execution from the shared mobile router.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum AgentOperationPolicy {
     DesktopEnabled,
     MobileDisabled,
+    MobileFullNode { mobile_jobs: Arc<MobileJobRuntime> },
+}
+
+impl std::fmt::Debug for AgentOperationPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DesktopEnabled => f.write_str("DesktopEnabled"),
+            Self::MobileDisabled => f.write_str("MobileDisabled"),
+            Self::MobileFullNode { .. } => f.write_str("MobileFullNode"),
+        }
+    }
 }
 
 pub(crate) fn confirmed_executor_for_policy(
@@ -36,6 +49,9 @@ pub(crate) fn confirmed_executor_for_policy(
     match policy {
         AgentOperationPolicy::DesktopEnabled => Arc::new(DesktopAgentOperations::new(cfg, gate)),
         AgentOperationPolicy::MobileDisabled => Arc::new(MobileDisabledAgentOperations),
+        AgentOperationPolicy::MobileFullNode { mobile_jobs } => {
+            Arc::new(MobileFullNodeAgentOperations::new(cfg, gate, mobile_jobs))
+        }
     }
 }
 
@@ -975,6 +991,26 @@ fn validate_live_write_action(
     }
 }
 
+fn ensure_mobile_live_write_allowlisted(action: &isyncyou_agent::ToolAction) -> Result<(), String> {
+    let intent = validate_live_write_action(action)?;
+    let allowed = matches!(
+        intent,
+        AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { .. })
+            | AgentLiveWriteIntent::Mail(MailLiveWrite::SetFlag { .. })
+            | AgentLiveWriteIntent::Mail(MailLiveWrite::SetCategories { .. })
+            | AgentLiveWriteIntent::Todo(TodoLiveWrite::Complete { .. })
+            | AgentLiveWriteIntent::Todo(TodoLiveWrite::ChecklistToggle { .. })
+    );
+    if allowed {
+        return Ok(());
+    }
+    Err(format!(
+        "not_available_on_mobile: live-write {}:{} is outside the mobile allowlist",
+        intent.service(),
+        intent.verb()
+    ))
+}
+
 fn required_target(
     top_target: &Option<String>,
     change: &serde_json::Value,
@@ -1841,7 +1877,127 @@ impl AgentConfirmedActionExecutor for MobileDisabledAgentOperations {
         &self,
         _action: &isyncyou_agent::ToolAction,
     ) -> Result<ConfirmedActionResult, String> {
-        Err("not_available_on_mobile: mobile_agent_operations_land_in_625_626".to_string())
+        Err(
+            "not_available_on_mobile: mobile disabled policy refused this confirmed operation"
+                .to_string(),
+        )
+    }
+}
+
+pub(crate) struct MobileFullNodeAgentOperations {
+    cfg: Config,
+    gate: Arc<Mutex<()>>,
+    mobile_jobs: Arc<MobileJobRuntime>,
+}
+
+impl MobileFullNodeAgentOperations {
+    pub(crate) fn new(
+        cfg: Config,
+        gate: Arc<Mutex<()>>,
+        mobile_jobs: Arc<MobileJobRuntime>,
+    ) -> Self {
+        Self {
+            cfg,
+            gate,
+            mobile_jobs,
+        }
+    }
+
+    fn queued_job_result(
+        op: &str,
+        account: &str,
+        job: &MobileJob,
+        extra: serde_json::Value,
+    ) -> ConfirmedActionResult {
+        let mut body = serde_json::json!({
+            "op": op,
+            "account": redact_agent_operation_text(account),
+            "queued": true,
+            "job_id": job.job_id,
+            "kind": job.kind.as_str(),
+            "state": job.state.as_str(),
+        });
+        if let (Some(dst), Some(src)) = (body.as_object_mut(), extra.as_object()) {
+            for (key, value) in src {
+                dst.insert(key.clone(), value.clone());
+            }
+        }
+        ConfirmedActionResult::new(body.to_string())
+    }
+}
+
+impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
+    fn execute_confirmed(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+    ) -> Result<ConfirmedActionResult, String> {
+        match action {
+            isyncyou_agent::ToolAction::Backup { account, services } => {
+                let job = self.mobile_jobs.enqueue_backup(account, services)?;
+                Ok(Self::queued_job_result(
+                    "backup",
+                    account,
+                    &job,
+                    serde_json::json!({ "services": services }),
+                ))
+            }
+            isyncyou_agent::ToolAction::RestoreCloud {
+                account,
+                service,
+                id,
+            } => {
+                let job = self
+                    .mobile_jobs
+                    .enqueue_restore_cloud(account, service, id)?;
+                Ok(Self::queued_job_result(
+                    "restore-cloud",
+                    account,
+                    &job,
+                    serde_json::json!({
+                        "service": service,
+                        "source_id": redact_agent_operation_text(id),
+                    }),
+                ))
+            }
+            isyncyou_agent::ToolAction::LiveWrite { account, .. } => {
+                ensure_mobile_live_write_allowlisted(action)?;
+                let run = run_live_write(&self.cfg, action, &self.gate)?;
+                Ok(ConfirmedActionResult::new(
+                    serde_json::json!({
+                        "op": "live-write",
+                        "account": redact_agent_operation_text(account),
+                        "service": run.service,
+                        "verb": run.verb,
+                        "target": run.target,
+                        "result_id": run.result_id,
+                        "summary": run.summary,
+                    })
+                    .to_string(),
+                ))
+            }
+            isyncyou_agent::ToolAction::Share { account, .. } => {
+                let run = run_share(&self.cfg, action, &self.gate)?;
+                Ok(ConfirmedActionResult::new(
+                    serde_json::json!({
+                        "op": "share",
+                        "account": redact_agent_operation_text(account),
+                        "service": run.service,
+                        "item_id": redact_agent_operation_text(&run.item_id),
+                        "mode": run.mode,
+                        "link_type": run.link_type,
+                        "scope": run.scope,
+                        "role": run.role,
+                        "recipient_count": run.recipient_count,
+                        "summary": run.summary,
+                    })
+                    .to_string(),
+                ))
+            }
+            _ => Err(format!(
+                "not_confirmable: confirmed agent action '{}' is not a supported mobile full-node operation",
+                action.op()
+            )),
+        }
     }
 }
 
@@ -2321,6 +2477,112 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("unsupported_live_write_verb"));
         assert!(runtime.state().calls.is_empty());
+    }
+
+    #[test]
+    fn mobile_live_write_allowlist_accepts_only_metadata_verbs() {
+        for action in [
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "msg-1",
+                "change": { "verb": "set_read", "is_read": true }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "msg-1",
+                "change": { "verb": "set_flag", "flag_status": "flagged" }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "msg-1",
+                "change": { "verb": "set_categories", "categories": ["Follow-up"] }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "todo",
+                "target": "task-1",
+                "change": { "verb": "complete", "list_id": "list-1" }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "todo",
+                "target": "task-1",
+                "change": {
+                    "verb": "checklist_toggle",
+                    "list_id": "list-1",
+                    "item_id": "check-1",
+                    "checked": true
+                }
+            }),
+        ] {
+            let action = isyncyou_agent::parse_action(&action).unwrap();
+            ensure_mobile_live_write_allowlisted(&action).unwrap();
+        }
+    }
+
+    #[test]
+    fn mobile_live_write_disallowed_create_send_delete_append_verbs_fail_closed() {
+        for action in [
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "msg-1",
+                "change": { "verb": "move", "destination_id": "archive-folder" }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "change": {
+                    "verb": "create_draft",
+                    "body_html": "<p>private</p>",
+                    "to": ["recipient@example.com"]
+                }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "calendar",
+                "target": "event-1",
+                "change": { "verb": "delete" }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "todo",
+                "target": "task-1",
+                "change": { "verb": "delete", "list_id": "list-1" }
+            }),
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "onenote",
+                "target": "page-1",
+                "change": { "verb": "append", "text": "private note body" }
+            }),
+        ] {
+            let action = isyncyou_agent::parse_action(&action).unwrap();
+            let err = ensure_mobile_live_write_allowlisted(&action).unwrap_err();
+            assert!(
+                err.contains("not_available_on_mobile"),
+                "disallowed mobile live-write must fail closed: {err}"
+            );
+            assert!(
+                !err.contains("private")
+                    && !err.contains("recipient@example.com")
+                    && !err.contains("private note body"),
+                "policy error must be redacted: {err}"
+            );
+        }
     }
 
     #[test]

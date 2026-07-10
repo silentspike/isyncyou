@@ -30,6 +30,20 @@ pub struct PendingAction {
     pub expires_at_ms: u64,
 }
 
+/// Non-secret binding fields for a pending destructive action. Mobile uses this
+/// to mint a native biometric-token challenge before the Agent confirmation token
+/// is consumed. `item` is intentionally bound to the pending id + action hash,
+/// not raw payload fields, so the biometric token cannot be reused across two
+/// pending actions with the same cloud item but different mutation payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingActionBinding {
+    pub op: String,
+    pub account: String,
+    pub service: String,
+    pub item: String,
+    pub expires_at_ms: u64,
+}
+
 struct Pending {
     action: ToolAction,
     token: String,
@@ -101,6 +115,16 @@ pub fn action_hash(action: &ToolAction, expires_at_ms: u64) -> Result<String, Ag
     Ok(hex(digest::digest(&digest::SHA256, &bytes).as_ref()))
 }
 
+fn biometric_binding_item(pending_id: &str, action_hash: &str) -> String {
+    format!(
+        "pending:{}:{}:action_hash:{}:{}",
+        pending_id.len(),
+        pending_id,
+        action_hash.len(),
+        action_hash
+    )
+}
+
 impl PendingRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -165,6 +189,33 @@ impl PendingRegistry {
         }
         // Single-use: consume on success.
         Ok(map.remove(pending_id).expect("present").action)
+    }
+
+    /// Return a non-secret action binding without checking or consuming the
+    /// one-time Agent confirmation token. This is for mobile's native biometric
+    /// gate, which must run before [`Self::confirm`] can safely consume the token.
+    pub fn binding(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+        now_ms: u64,
+    ) -> Result<PendingActionBinding, ConfirmError> {
+        let mut map = self.inner.lock().unwrap();
+        let pending = map.get(pending_id).ok_or(ConfirmError::NotFound)?;
+        if now_ms > pending.expires_at_ms {
+            map.remove(pending_id);
+            return Err(ConfirmError::Expired);
+        }
+        if !ct_eq(action_hash.as_bytes(), pending.action_hash.as_bytes()) {
+            return Err(ConfirmError::ActionMismatch);
+        }
+        Ok(PendingActionBinding {
+            op: pending.action.op().to_string(),
+            account: pending.action.account().to_string(),
+            service: pending.action.service().unwrap_or("agent").to_string(),
+            item: biometric_binding_item(pending_id, action_hash),
+            expires_at_ms: pending.expires_at_ms,
+        })
     }
 
     /// Number of outstanding pending actions (for tests/metrics).
@@ -232,6 +283,43 @@ mod tests {
             reg.confirm(&pending.id, &token, &bad_hash, 1),
             Err(ConfirmError::ActionMismatch)
         );
+        assert!(reg
+            .confirm(&pending.id, &token, &pending.action_hash, 2)
+            .is_ok());
+    }
+
+    #[test]
+    fn agent_pending_binding_peek_does_not_consume_confirmation() {
+        let reg = PendingRegistry::new();
+        let (pending, token) = reg.register(backup(), "p", 0, 60_000).unwrap();
+
+        let binding = reg
+            .binding(&pending.id, &pending.action_hash, 1)
+            .expect("binding peek");
+
+        assert_eq!(binding.op, "backup");
+        assert_eq!(binding.account, "me");
+        assert_eq!(binding.service, "agent");
+        assert!(binding.item.contains(&pending.id));
+        assert!(binding.item.contains(&pending.action_hash));
+        assert_eq!(binding.expires_at_ms, pending.expires_at_ms);
+        assert_eq!(reg.len(), 1, "peek must not consume the pending action");
+        assert!(reg
+            .confirm(&pending.id, &token, &pending.action_hash, 2)
+            .is_ok());
+    }
+
+    #[test]
+    fn agent_pending_binding_rejects_action_hash_mismatch() {
+        let reg = PendingRegistry::new();
+        let (pending, token) = reg.register(backup(), "p", 0, 60_000).unwrap();
+        let bad_hash = action_hash(&backup(), pending.expires_at_ms + 1).unwrap();
+
+        assert_eq!(
+            reg.binding(&pending.id, &bad_hash, 1),
+            Err(ConfirmError::ActionMismatch)
+        );
+        assert_eq!(reg.len(), 1, "bad binding peek must not consume");
         assert!(reg
             .confirm(&pending.id, &token, &pending.action_hash, 2)
             .is_ok());

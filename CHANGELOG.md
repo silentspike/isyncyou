@@ -8,6 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent mobile full-node server contract**
+- `mobile`+`app-host`+`webui`+`store`: added #625's server-side mobile
+  full-node contract. Mobile now wires restore-cloud, backup, share, and the
+  allowed live-write subset through the shared router, queues restore-cloud and
+  backup as durable `mobile_jobs`, recovers queued/expired-lease jobs on app
+  start, binds Agent confirm to the per-action biometric-token gate before
+  consuming the Agent one-time token, and keeps unsupported mobile live-write
+  verbs fail-closed. Physical Android BiometricPrompt, Keystore, foreground job
+  presentation, and device closeout remain #626.
+
 **Agent confirmed desktop operations**
 - `agent`+`app-host`: completed #624's desktop confirmed-operation path for
   `restore-local`, `backup`, `restore-cloud`, `live-write`, and `share`.

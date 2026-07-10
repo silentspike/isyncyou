@@ -204,26 +204,23 @@ requirements:
       - test: session_token_gates_data_routes_over_http
       - test: session_gate_requires_token_on_data_routes
   - id: REQ-AND-013
-    title: The mobile profile omits crash-unsafe restore-cloud; share is gated, not absent
+    title: The legacy mobile companion profile omitted crash-unsafe restore-cloud
     statement: >
-      The phone is a live companion; the laptop holds the backup. build_live_router omits
-      the restore-cloud handler, so /api/v1/restore 404s on mobile and the UI hides every
-      restore action (no restore capability token is injected); the UI wording reads
-      "cached on this device", not "backup". Since #onedrive-mobile 0.9 outbound SHARE is
-      wired into the shared router (so it is reachable, cap-gated) and, on mobile, is
-      additionally guarded by the biometric per-action token (0.6) — it is gated, not absent.
-      NOTE: planned supersession — the in-app agent (Epic #614) makes the phone a full
-      cloud-write node (REQ-AND-016, story S-AG.10/#625). This requirement holds and is
-      enforced until that ships with its full Android security model; it is not dropped,
-      it is replaced by a stronger, gated requirement.
+      The pre-agent phone profile was a live companion while the laptop held the backup:
+      the shared base router omitted restore-cloud, so the route was absent unless a
+      full-node mobile wrapper was explicitly attached. #625 supersedes that companion
+      contract by wiring restore-cloud and backup through session/cap/per-action gates
+      and durable mobile jobs. The old safety property still matters as a regression
+      invariant for the shared base router: restore-cloud is not accidentally exposed by
+      the base router; only the full-node mobile job wrapper may add it.
     status: implemented
     superseded_by: REQ-AND-016
     acceptance:
-      - A POST to /api/v1/restore is 404 in the mobile router (restore-cloud omitted).
-      - Share is wired (cap-gated 401 without a token, not 404), proving omission is selective.
+      - The shared base live router still omits restore-cloud until the mobile job wrapper attaches it.
+      - Share is wired in the base router (cap-gated 401 without a token, not 404), proving omission is selective.
       - On mobile, a gated destructive op requires the biometric per-action token (0.6).
     verified_by:
-      - test: mobile_live_router_wires_share_but_omits_restore
+      - test: base_live_router_wires_share_but_omits_restore_until_mobile_job_wrapper
       - test: share_is_biometric_gated_on_mobile
   - id: REQ-AND-014
     title: A single device-code login fills the on-device cache
@@ -255,19 +252,38 @@ requirements:
     title: Mobile is a full cloud-write node, gated by the agent security model (supersedes REQ-AND-013)
     statement: >
       With the in-app agent (Epic #614), the mobile profile becomes a full cloud-write
-      node: build_live_router on mobile gains the restore/backup/share surface. This
-      deliberately supersedes REQ-AND-013 and is a release blocker only together with the
-      full Android security model — session-token gate (REQ-AND-012), a one-time
-      PendingAction confirmation token (the model never holds a cap token), Android
-      Keystore for credentials, a mandatory BiometricPrompt for restore-cloud/share/backup/
-      live-write, a foreground-service backup with visible status, and destructive actions
-      as resumable crash-safe ledger jobs. (Stories S-AG.10/#625 + S-AG.11/#626.)
+      node. #625 implements the Rust/server contract: mobile wires restore-cloud,
+      backup, share, and the allowed live-write subset; restore-cloud and backup are
+      queued as resumable durable jobs; Agent confirmations bind a PendingAction before
+      consuming the one-time confirmation token; route execution remains session/cap
+      gated and then per-action biometric-token gated. This deliberately supersedes
+      REQ-AND-013, but the complete requirement remains planned until #626 proves the
+      native Android layer: physical BiometricPrompt, Android Keystore-backed mobile
+      credentials, foreground-service/WorkManager job presentation, and device recovery
+      evidence. (Stories S-AG.10/#625 + S-AG.11/#626.)
     status: planned
+    note: >
+      server_contract: implemented_by #625; native_foreground_biometric_keystore_proof:
+      pending #626. Do not mark this requirement fully implemented until #626 closes.
     design: docs/adr/007-agent-architecture.md
     supersedes: REQ-AND-013
     acceptance:
       - A POST to /api/v1/restore|share|backup is reachable on mobile (not 404) but session-token gated.
-      - Every destructive mobile action requires a passed BiometricPrompt before the one-time token is minted.
-      - A backup/restore-cloud runs as a foreground-service job and recovers (no dup/loss) after app restart.
+      - Backup and restore-cloud enqueue durable mobile jobs; the HTTP request thread does not execute the Graph mutation.
+      - Mobile Agent confirm checks the PendingAction binding, then the per-action biometric token, before consuming the Agent one-time token.
+      - Mobile Agent live-write is limited to the explicit D4 metadata allowlist; all other verbs fail closed.
+      - A backup/restore-cloud job recovers after app restart or expired lease without duplicate cloud mutation.
+      - Physical BiometricPrompt, foreground-service status, and Android Keystore proof remain pending #626.
     verified_by:
       - test: mobile_full_node_router_exposes_gated_restore_and_backup
+      - test: standalone_full_node_serves_ui_and_gates_restore_backup
+      - test: mobile_full_node_restore_backup_do_not_run_without_biometric_token
+      - test: mobile_agent_confirm_requires_biometric_before_agent_token_consumption
+      - test: mobile_agent_confirm_wrong_biometric_token_does_not_consume_agent_pending
+      - test: mobile_agent_confirm_after_biometric_consumes_agent_token_once
+      - test: mobile_agent_confirm_wrong_action_hash_does_not_mint_biometric_pending
+      - test: mobile_backup_job_enqueue_only_worker_executes_later
+      - test: mobile_restore_cloud_job_recovery_after_running_lease_expiry_reconciles
+      - test: mobile_job_worker_does_not_duplicate_restore_after_restart
+      - test: mobile_live_write_allowlist_accepts_only_metadata_verbs
+      - test: mobile_live_write_disallowed_create_send_delete_append_verbs_fail_closed

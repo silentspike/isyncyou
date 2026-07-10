@@ -1,11 +1,13 @@
 //! Shared web-UI router assembly + the live request handlers, reused by the
 //! desktop daemon (`isyncyoud`) and the standalone mobile client (#89). The daemon
-//! calls [`build_live_router`] for the shared base and adds its daemon-only
-//! restore/share/push on top; the mobile client uses the base as-is.
+//! calls [`build_live_router`] for the shared base; the mobile client adds its
+//! full-node job handlers with [`with_mobile_full_node_jobs`].
 
 mod agent_ops;
+mod mobile_jobs;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
+pub use mobile_jobs::{MobileJobRunOutcome, MobileJobRuntime};
 
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
@@ -71,13 +73,19 @@ pub fn mint_cap_token() -> String {
     }
 }
 
-/// The daemon's destructive-action handler: re-create an archived item in the
-/// cloud using the cached `login --write` (restore-scoped) token.
+/// The desktop daemon's destructive-action handler: re-create an archived item
+/// in the cloud using the cached `login --write` (restore-scoped) token. Mobile
+/// wires `MobileJobRuntime` instead, so the route enqueues a durable job.
 pub struct DaemonRestore {
     cfg: Config,
 }
 impl isyncyou_webui::RestoreHandler for DaemonRestore {
-    fn restore(&self, account: &str, service: &str, id: &str) -> Result<String, String> {
+    fn restore(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+    ) -> Result<isyncyou_webui::RestoreResponse, String> {
         // Refuse a not-yet-ledger-migrated service before resolving a token, so the
         // web UI gets the clear "not crash-safe yet" message. (Engine re-checks.)
         if !isyncyou_engine::cloud_restore_service_supported(service) {
@@ -86,7 +94,8 @@ impl isyncyou_webui::RestoreHandler for DaemonRestore {
             ));
         }
         let token = isyncyou_engine::auth::resolve_cached_restore_token(&self.cfg, account)?;
-        isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)
+        let new_id = isyncyou_engine::restore_cloud(&self.cfg, account, service, id, token)?;
+        Ok(isyncyou_webui::RestoreResponse::Completed { new_id })
     }
 }
 
@@ -295,9 +304,7 @@ fn agent_audit_summary(summary: &str) -> String {
 fn agent_safe_executor_error(error: &str) -> &'static str {
     if error.contains("not_implemented") {
         "not_implemented"
-    } else if error.contains("not_available_on_mobile")
-        || error.contains("mobile_agent_operations_land_in_625_626")
-    {
+    } else if error.contains("not_available_on_mobile") {
         "not_available_on_mobile"
     } else {
         "execution_failed"
@@ -1382,6 +1389,23 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             hub.close(&tid);
         });
         Ok(turn_id)
+    }
+
+    fn pending_binding(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+    ) -> Result<isyncyou_webui::AgentPendingBinding, String> {
+        let binding = self
+            .pending
+            .binding(pending_id, action_hash, unix_now_ms())
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(isyncyou_webui::AgentPendingBinding {
+            op: binding.op,
+            account: binding.account,
+            service: binding.service,
+            item: binding.item,
+        })
     }
 
     fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String> {
@@ -2601,7 +2625,7 @@ impl isyncyou_webui::OneDriveOpenHandler for DaemonOneDriveOpen {
 }
 
 impl DaemonRestore {
-    /// Construct the restore handler (daemon-only; the mobile profile never wires it).
+    /// Construct the desktop restore handler. Mobile uses a queued job handler.
     pub fn new(cfg: Config) -> Self {
         Self { cfg }
     }
@@ -2903,7 +2927,7 @@ pub fn build_live_router(
         // #onedrive-mobile 0.9: outbound sharing is wired here (was daemon-only) so the
         // mobile profile gets it too. On mobile it is additionally biometric-gated (op
         // "share" is in the per-action-token catalogue); the cap token is the CSRF gate.
-        // restore-cloud stays daemon-only (excluded on mobile).
+        // restore-cloud is added by the mobile full-node job wrapper (#625), not here.
         .with_share(
             Arc::new(DaemonShare::new(cfg.clone())) as Arc<dyn isyncyou_webui::ShareHandler>,
             mint_cap_token(),
@@ -2932,6 +2956,26 @@ pub fn build_live_router(
             mint_cap_token(),
         )
         .with_events(events)
+}
+
+/// Attach the #625 mobile full-node job surface to a shared live router.
+///
+/// Backup and restore-cloud are queue-only on mobile: the HTTP request thread
+/// only creates durable `mobile_jobs`; the worker/recovery path performs the
+/// cloud mutation under a job lease. Each route still receives its own cap token
+/// and is additionally per-action biometric-token gated by `with_biometric_gate`
+/// in `crates/mobile`.
+pub fn with_mobile_full_node_jobs(
+    router: isyncyou_webui::Router,
+    mobile_jobs: Arc<MobileJobRuntime>,
+) -> isyncyou_webui::Router {
+    let restore: Arc<dyn isyncyou_webui::RestoreHandler> = mobile_jobs.clone();
+    let backup: Arc<dyn isyncyou_webui::BackupHandler> = mobile_jobs.clone();
+    let jobs: Arc<dyn isyncyou_webui::MobileJobHandler> = mobile_jobs;
+    router
+        .with_restore(restore, mint_cap_token())
+        .with_backup(backup, mint_cap_token())
+        .with_mobile_jobs(jobs, mint_cap_token())
 }
 
 #[cfg(test)]
@@ -3592,6 +3636,61 @@ mod tests {
         assert!(!summary.contains("raw-body-sentinel"));
         assert!(!summary.contains("private subject"));
         assert!(summary.contains("<redacted-email>"));
+    }
+
+    #[test]
+    fn agent_confirm_destructive_binding_redacts_live_write_change() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-binding-redacts-live-write");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "live-write",
+            "account": "owner@example.com",
+            "service": "mail",
+            "target": "msg-1",
+            "change": {
+                "verb": "create_draft",
+                "subject": "private subject",
+                "body_html": "<html>raw-body-sentinel recipient@example.com</html>",
+                "to": ["recipient@example.com"]
+            }
+        }))
+        .unwrap();
+        let (pending, _token) = agent
+            .pending
+            .register(action, "live write", unix_now_ms(), AGENT_CONFIRM_TTL_MS)
+            .unwrap();
+
+        let binding = isyncyou_webui::AgentHandler::pending_binding(
+            &agent,
+            &pending.id,
+            &pending.action_hash,
+        )
+        .unwrap();
+        let text = serde_json::to_string(&serde_json::json!({
+            "op": binding.op,
+            "account": binding.account,
+            "service": binding.service,
+            "item": binding.item,
+        }))
+        .unwrap();
+
+        assert!(text.contains("live-write"));
+        assert!(text.contains("mail"));
+        assert!(text.contains(&pending.id));
+        assert!(text.contains(&pending.action_hash));
+        assert!(!text.contains("raw-body-sentinel"));
+        assert!(!text.contains("recipient@example.com"));
+        assert!(!text.contains("private subject"));
+        assert!(!text.contains("create_draft"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6445,12 +6544,12 @@ mod tests {
     }
 
     #[test]
-    fn mobile_live_router_wires_share_but_omits_restore() {
+    fn base_live_router_wires_share_but_omits_restore_until_mobile_job_wrapper() {
         // #89 + #onedrive-mobile 0.9 profile contract: build_live_router wires the live
-        // handlers AND (now) share, but NOT the daemon-only restore-cloud. restore POSTs
-        // are refused 404 (absent); share + a live-write route are reached and cap-gated
-        // (401, not 404). On mobile share is additionally biometric-gated by the app's
-        // with_biometric_gate (not exercised here — this builds the base router only).
+        // handlers AND share. restore-cloud is attached by the #625 mobile job wrapper,
+        // not by the shared base router. share + a live-write route are reached and
+        // cap-gated (401, not 404). On mobile share is additionally biometric-gated by
+        // the app's with_biometric_gate (not exercised here — this builds the base router only).
         let events = Arc::new(isyncyou_webui::EventBus::new());
         let router = build_live_router(
             Config::default(),
@@ -6485,5 +6584,57 @@ mod tests {
             401,
             "mail write must be wired (cap-gated, not absent)"
         );
+    }
+
+    #[test]
+    fn mobile_full_node_router_exposes_gated_restore_and_backup() {
+        let root = temp_agent_root("mobile-full-node-router");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "me".into(),
+                username: "me@example.invalid".into(),
+                sync_root: root.join("sync"),
+                archive_root: root.join("archive"),
+                cache_root: root.join("cache"),
+                mount_point: None,
+            }],
+            ..Config::default()
+        };
+        let events = Arc::new(isyncyou_webui::EventBus::new());
+        let gate = Arc::new(Mutex::new(()));
+        let jobs = Arc::new(MobileJobRuntime::new(
+            cfg.clone(),
+            gate.clone(),
+            events.clone(),
+        ));
+        let router = with_mobile_full_node_jobs(
+            build_live_router(
+                cfg,
+                Some(gate),
+                events,
+                root.join("isyncyou.toml"),
+                Arc::new(AtomicU64::new(5)),
+                SharedProgress::new(),
+                AgentOperationPolicy::MobileFullNode {
+                    mobile_jobs: jobs.clone(),
+                },
+            ),
+            jobs,
+        );
+
+        for path in [
+            "/api/v1/restore?account=me&service=mail&id=m1",
+            "/api/v1/backup?account=me&services=mail",
+            "/api/v1/jobs?account=me",
+            "/api/v1/jobs/cancel?account=me&job_id=job-1",
+        ] {
+            let method = if path == "/api/v1/jobs?account=me" {
+                "GET"
+            } else {
+                "POST"
+            };
+            let resp = router.route(&ApiRequest::new(method, path));
+            assert_eq!(resp.status, 401, "wired + cap-gated (not 404): {path}");
+        }
     }
 }
