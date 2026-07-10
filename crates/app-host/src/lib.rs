@@ -1291,10 +1291,33 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             }
             match outcome {
                 Ok(isyncyou_agent::TurnOutcome::Final { .. }) => {}
-                Ok(isyncyou_agent::TurnOutcome::PendingConfirmation {
-                    action, preview, ..
-                }) => {
-                    match pending.register(action, preview, unix_now_ms(), AGENT_CONFIRM_TTL_MS) {
+                Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
+                    let preview = match agent_ops::preview_for_pending_action(&action) {
+                        Ok(preview) => preview,
+                        Err(e) => {
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::Error(
+                                    agent_ops::redact_agent_operation_text(&e),
+                                ),
+                            );
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::done(
+                                    isyncyou_agent::DoneReason::Error,
+                                ),
+                            );
+                            hub.close(&tid);
+                            return;
+                        }
+                    };
+                    let _risk = preview.risk.as_str();
+                    match pending.register(
+                        action,
+                        preview.text,
+                        unix_now_ms(),
+                        AGENT_CONFIRM_TTL_MS,
+                    ) {
                         Ok((pending_action, token)) => {
                             let _ = hub.emit(
                                 &tid,
@@ -3449,6 +3472,123 @@ mod tests {
         assert!(!pending_id.is_empty());
         assert_eq!(executor.call_count(), 0);
         assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_destructive_preview_is_redacted_before_pending_registration() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"share",
+                "account":"me",
+                "service":"onedrive",
+                "id":"file-1",
+                "recipient":"recipient@example.com"
+            }),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("share accepted", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("pending-preview-redacted");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "share file").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut preview = String::new();
+        let mut tool_call_input = serde_json::Value::Null;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("tool_call") => tool_call_input = event["input"].clone(),
+                Some("confirmation_required") => {
+                    preview = event["preview"].as_str().unwrap().to_string();
+                    break;
+                }
+                other => panic!("unexpected event before confirmation: {other:?} {line}"),
+            }
+        }
+
+        assert_eq!(agent.pending.len(), 1);
+        assert!(preview.contains("Invite 1 recipient"));
+        assert!(!preview.contains("recipient@example.com"));
+        assert_eq!(tool_call_input["redacted"], true);
+        assert_eq!(tool_call_input["recipient_count"], 1);
+        assert!(!tool_call_input
+            .to_string()
+            .contains("recipient@example.com"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_live_write_does_not_register_pending() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"live-write",
+                "account":"me",
+                "service":"mail",
+                "target":"drafts",
+                "change":{
+                    "body":"<html>raw-body-sentinel</html>",
+                    "to":["recipient@example.com"]
+                }
+            }),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("invalid-live-write-no-pending");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "draft mail").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut saw_error = String::new();
+        let mut done_reason = String::new();
+        let mut saw_confirmation = false;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match event["event"].as_str() {
+                Some("error") => saw_error = event["message"].as_str().unwrap().to_string(),
+                Some("confirmation_required") => saw_confirmation = true,
+                Some("done") => {
+                    done_reason = event["reason"].as_str().unwrap().to_string();
+                    break;
+                }
+                Some("tool_call") => {
+                    let text = event["input"].to_string();
+                    assert!(!text.contains("recipient@example.com"));
+                    assert!(!text.contains("raw-body-sentinel"));
+                }
+                _ => {}
+            }
+        }
+
+        assert!(!saw_confirmation);
+        assert!(saw_error.contains("invalid_live_write"));
+        assert!(!saw_error.contains("recipient@example.com"));
+        assert!(!saw_error.contains("raw-body-sentinel"));
+        assert_eq!(done_reason, "error");
+        assert_eq!(agent.pending.len(), 0);
+        assert_eq!(executor.call_count(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 

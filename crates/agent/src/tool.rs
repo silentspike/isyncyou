@@ -209,6 +209,54 @@ pub fn parse_action(input: &serde_json::Value) -> Result<ToolAction, String> {
         .map_err(|e| format!("invalid isyncyou tool call: {e}\n\n{}", help_text()))
 }
 
+/// Public stream representation for a parsed tool call. Read-class inputs are safe to
+/// show as-is; destructive inputs are reduced before the first public `tool_call` event.
+pub fn public_tool_call_input(
+    action: &ToolAction,
+    raw_input: &serde_json::Value,
+) -> serde_json::Value {
+    if action.class() == ToolClass::Read {
+        return raw_input.clone();
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("op".to_string(), serde_json::json!(action.op()));
+    out.insert("account".to_string(), serde_json::json!(action.account()));
+    out.insert("redacted".to_string(), serde_json::json!(true));
+    if let Some(service) = action.service() {
+        out.insert("service".to_string(), serde_json::json!(service));
+    }
+    if let Some(item) = action.item_or_target() {
+        out.insert("item".to_string(), serde_json::json!(item));
+    }
+    match action {
+        ToolAction::Backup { services, .. } => {
+            out.insert(
+                "service_count".to_string(),
+                serde_json::json!(services.len()),
+            );
+        }
+        ToolAction::LiveWrite { change, .. } => {
+            if let Some(verb) = change.get("verb").and_then(serde_json::Value::as_str) {
+                out.insert("verb".to_string(), serde_json::json!(verb));
+            }
+        }
+        ToolAction::Share { recipient, .. } => {
+            out.insert(
+                "recipient_count".to_string(),
+                serde_json::json!(usize::from(recipient.is_some())),
+            );
+        }
+        ToolAction::RestoreCloud { .. } => {}
+        ToolAction::Search { .. }
+        | ToolAction::DeepSearch { .. }
+        | ToolAction::Read { .. }
+        | ToolAction::List { .. }
+        | ToolAction::Export { .. }
+        | ToolAction::RestoreLocal { .. } => {}
+    }
+    serde_json::Value::Object(out)
+}
+
 /// The complete tool registry advertised to any provider. **Exactly one** tool — the
 /// app-scope invariant (REQ-AGENT-001), asserted by a snapshot test.
 pub fn registry_tool_names() -> Vec<&'static str> {

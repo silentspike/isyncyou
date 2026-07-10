@@ -4,7 +4,7 @@
 //! (The module is named `turn`, not `loop`, because `loop` is a Rust keyword.)
 
 use crate::provider::{AssistantBlock, DoneReason, LlmProvider, StreamEvent};
-use crate::tool::{parse_action, ToolAction, ToolClass, TOOL_NAME};
+use crate::tool::{parse_action, public_tool_call_input, ToolAction, ToolClass, TOOL_NAME};
 
 /// Who authored a message in the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +158,7 @@ pub fn run_turn(
             emit(StreamEvent::ToolCall {
                 id: tu.id.clone(),
                 name: TOOL_NAME.to_string(),
-                input: tu.input.clone(),
+                input: public_tool_call_input(&action, &tu.input),
             });
 
             match action.class() {
@@ -353,6 +353,66 @@ mod tests {
             !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
             "a pending turn is not Done"
         );
+    }
+
+    #[test]
+    fn destructive_tool_call_event_redacts_input_before_pending() {
+        let raw_change = json!({
+            "verb": "create_draft",
+            "to": ["recipient@example.com"],
+            "subject": "Secret subject",
+            "body": "<html>raw-body-sentinel</html>"
+        });
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "drafts",
+                "change": raw_change
+            }),
+        )]]);
+        let exec = CountingExecutor::new("should never run");
+        let mut history = vec![Message::user("draft an email")];
+        let mut events = Vec::new();
+
+        let outcome =
+            run_turn(&mut provider, &exec, &mut history, &mut |e| events.push(e)).unwrap();
+
+        match outcome {
+            TurnOutcome::PendingConfirmation { action, .. } => {
+                assert_eq!(action.op(), "live-write");
+                if let ToolAction::LiveWrite { change, .. } = action {
+                    assert!(change.to_string().contains("recipient@example.com"));
+                    assert!(change.to_string().contains("raw-body-sentinel"));
+                } else {
+                    panic!("expected live-write action");
+                }
+            }
+            other => panic!("expected PendingConfirmation, got {other:?}"),
+        }
+        let public_tool_call = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCall { input, .. } => Some(input.clone()),
+                _ => None,
+            })
+            .expect("public tool_call event");
+        let public_text = public_tool_call.to_string();
+        assert_eq!(public_tool_call["op"], "live-write");
+        assert_eq!(public_tool_call["account"], "me");
+        assert_eq!(public_tool_call["service"], "mail");
+        assert_eq!(public_tool_call["verb"], "create_draft");
+        assert_eq!(public_tool_call["redacted"], true);
+        assert!(
+            public_tool_call.get("change").is_none(),
+            "public tool_call must omit raw destructive change"
+        );
+        assert!(!public_text.contains("recipient@example.com"));
+        assert!(!public_text.contains("raw-body-sentinel"));
+        assert!(!public_text.contains("Secret subject"));
+        assert_eq!(exec.reads.get(), 0);
     }
 
     #[test]
