@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use isyncyou_core::Config;
+use isyncyou_store::Store;
 
 use crate::{AgentConfirmedActionExecutor, ConfirmedActionResult};
 
@@ -30,9 +31,10 @@ pub enum AgentOperationPolicy {
 pub(crate) fn confirmed_executor_for_policy(
     policy: AgentOperationPolicy,
     cfg: Config,
+    gate: Arc<Mutex<()>>,
 ) -> Arc<dyn AgentConfirmedActionExecutor> {
     match policy {
-        AgentOperationPolicy::DesktopEnabled => Arc::new(DesktopAgentOperations::new(cfg)),
+        AgentOperationPolicy::DesktopEnabled => Arc::new(DesktopAgentOperations::new(cfg, gate)),
         AgentOperationPolicy::MobileDisabled => Arc::new(MobileDisabledAgentOperations),
     }
 }
@@ -54,6 +56,260 @@ impl PendingOperationPreview {
 
 const BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 const RESTORE_CLOUD_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackupDelta {
+    pub mail: u64,
+    pub calendar: u64,
+    pub contacts: u64,
+    pub todo: u64,
+    pub onenote: u64,
+}
+
+impl BackupDelta {
+    pub fn total(&self) -> u64 {
+        self.mail + self.calendar + self.contacts + self.todo + self.onenote
+    }
+
+    /// A short human notification body, or `None` when nothing new was archived.
+    pub fn notification(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        let one_or_many =
+            |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut parts = Vec::new();
+        if self.mail > 0 {
+            parts.push(one_or_many(self.mail, "email", "emails"));
+        }
+        if self.calendar > 0 {
+            parts.push(one_or_many(self.calendar, "event", "events"));
+        }
+        if self.contacts > 0 {
+            parts.push(one_or_many(self.contacts, "contact", "contacts"));
+        }
+        if self.todo > 0 {
+            parts.push(one_or_many(self.todo, "task", "tasks"));
+        }
+        if self.onenote > 0 {
+            parts.push(one_or_many(self.onenote, "note", "notes"));
+        }
+        Some(format!("{} backed up", parts.join(", ")))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupRun {
+    pub summary: String,
+    pub delta: BackupDelta,
+}
+
+pub fn run_backup_account(
+    cfg: &Config,
+    account: &str,
+    gate: &Arc<Mutex<()>>,
+    services: &[String],
+) -> Result<BackupRun, String> {
+    run_backup_account_with_runtime(cfg, account, gate, services, &LiveBackupRuntime)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackupServiceSet {
+    mail: bool,
+    calendar: bool,
+    contacts: bool,
+    todo: bool,
+    onenote: bool,
+}
+
+impl BackupServiceSet {
+    fn from_requested(services: &[String]) -> Result<Self, String> {
+        if services.is_empty() {
+            return Ok(Self::all());
+        }
+        let mut set = Self::none();
+        for service in services {
+            validate_service("backup", service, BACKUP_SERVICES)?;
+            match service.as_str() {
+                "mail" => set.mail = true,
+                "calendar" => set.calendar = true,
+                "contacts" => set.contacts = true,
+                "todo" => set.todo = true,
+                "onenote" => set.onenote = true,
+                _ => unreachable!("validated backup service"),
+            }
+        }
+        Ok(set)
+    }
+
+    fn all() -> Self {
+        Self {
+            mail: true,
+            calendar: true,
+            contacts: true,
+            todo: true,
+            onenote: true,
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            mail: false,
+            calendar: false,
+            contacts: false,
+            todo: false,
+            onenote: false,
+        }
+    }
+
+    fn refresh_services(self) -> isyncyou_engine::RefreshServices {
+        isyncyou_engine::RefreshServices {
+            mail: self.mail,
+            calendar: self.calendar,
+            contacts: self.contacts,
+            todo: self.todo,
+            onenote: self.onenote,
+        }
+    }
+}
+
+trait BackupRuntime {
+    fn resolve_read_token(&self, cfg: &Config, account: &str) -> Result<String, String>;
+    fn resolve_restore_token(&self, cfg: &Config, account: &str) -> Result<String, String>;
+    fn refresh(
+        &self,
+        cfg: &Config,
+        account: &str,
+        read_token: String,
+        restore_token: Option<String>,
+        services: isyncyou_engine::RefreshServices,
+    ) -> Result<isyncyou_engine::RefreshCounts, String>;
+    fn record_run(
+        &self,
+        cfg: &Config,
+        account: &str,
+        started: &str,
+        finished: &str,
+        status: &str,
+        summary: &str,
+    ) -> Result<(), String>;
+}
+
+struct LiveBackupRuntime;
+
+impl BackupRuntime for LiveBackupRuntime {
+    fn resolve_read_token(&self, cfg: &Config, account: &str) -> Result<String, String> {
+        isyncyou_engine::auth::resolve_cached_read_token(cfg, account)
+    }
+
+    fn resolve_restore_token(&self, cfg: &Config, account: &str) -> Result<String, String> {
+        isyncyou_engine::auth::resolve_cached_restore_token(cfg, account)
+    }
+
+    fn refresh(
+        &self,
+        cfg: &Config,
+        account: &str,
+        read_token: String,
+        restore_token: Option<String>,
+        services: isyncyou_engine::RefreshServices,
+    ) -> Result<isyncyou_engine::RefreshCounts, String> {
+        isyncyou_engine::refresh_cache_account_filtered(
+            cfg,
+            account,
+            read_token,
+            restore_token,
+            services,
+        )
+    }
+
+    fn record_run(
+        &self,
+        cfg: &Config,
+        account: &str,
+        started: &str,
+        finished: &str,
+        status: &str,
+        summary: &str,
+    ) -> Result<(), String> {
+        let path = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .map(|a| a.archive_root.join(".isyncyou-store.db"))
+            .ok_or_else(|| format!("no account '{account}'"))?;
+        let store = Store::open(path).map_err(|e| e.to_string())?;
+        store
+            .add_run(account, "backup", started, finished, status, summary)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn run_backup_account_with_runtime<R: BackupRuntime>(
+    cfg: &Config,
+    account: &str,
+    gate: &Arc<Mutex<()>>,
+    services: &[String],
+    runtime: &R,
+) -> Result<BackupRun, String> {
+    let service_set = BackupServiceSet::from_requested(services)?;
+    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let started = crate::unix_now();
+    let result: Result<BackupRun, String> = (|| {
+        let read = runtime.resolve_read_token(cfg, account)?;
+        let restore = runtime.resolve_restore_token(cfg, account).ok();
+        let counts =
+            runtime.refresh(cfg, account, read, restore, service_set.refresh_services())?;
+        Ok(backup_run_from_counts(counts))
+    })();
+    let finished = crate::unix_now();
+    let (status, summary) = match &result {
+        Ok(run) => ("ok", run.summary.as_str()),
+        Err(error) => ("error", error.as_str()),
+    };
+    if let Err(e) = runtime.record_run(cfg, account, &started, &finished, status, summary) {
+        eprintln!("isyncyou: could not record backup run for {account}: {e}");
+    }
+    result
+}
+
+fn backup_run_from_counts(c: isyncyou_engine::RefreshCounts) -> BackupRun {
+    let delta = BackupDelta {
+        mail: c.mail_bodies as u64,
+        calendar: c.calendar_bodies as u64,
+        contacts: c.contacts_bodies as u64,
+        todo: c.todo_bodies as u64,
+        onenote: c.onenote_bodies as u64,
+    };
+    let summary = format!(
+        "mail: {} folders, {} upserted, {} deleted; {} new bodies; {} flanks | \
+         calendar: {} events, {} bodies, {} flanks | \
+         contacts: {} upserted, {} bodies, {} photos | \
+         todo: {} indexed, {} bodies, {} flanks, {} sub | \
+         onenote: {} pages, {} bodies, {} resources, {} containers",
+        c.mail_folders,
+        c.mail_upserted,
+        c.mail_deleted,
+        c.mail_bodies,
+        c.mail_flanks,
+        c.calendar_events,
+        c.calendar_bodies,
+        c.calendar_flanks,
+        c.contacts_upserted,
+        c.contacts_bodies,
+        c.contacts_photos,
+        c.todo_indexed,
+        c.todo_bodies,
+        c.todo_flanks,
+        c.todo_sub,
+        c.onenote_pages,
+        c.onenote_bodies,
+        c.onenote_resources,
+        c.onenote_containers,
+    );
+    BackupRun { summary, delta }
+}
 
 pub(crate) fn preview_for_pending_action(
     action: &isyncyou_agent::ToolAction,
@@ -525,12 +781,13 @@ fn write_owner_only_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// Desktop operation executor. Later #624 tasks fill in the individual operation
 /// dispatches; Task 1 only makes the desktop/mobile policy explicit.
 pub(crate) struct DesktopAgentOperations {
-    _cfg: Config,
+    cfg: Config,
+    gate: Arc<Mutex<()>>,
 }
 
 impl DesktopAgentOperations {
-    pub(crate) fn new(cfg: Config) -> Self {
-        Self { _cfg: cfg }
+    pub(crate) fn new(cfg: Config, gate: Arc<Mutex<()>>) -> Self {
+        Self { cfg, gate }
     }
 }
 
@@ -539,10 +796,30 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
         &self,
         action: &isyncyou_agent::ToolAction,
     ) -> Result<ConfirmedActionResult, String> {
-        Err(format!(
-            "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
-            action.op()
-        ))
+        match action {
+            isyncyou_agent::ToolAction::Backup { account, services } => {
+                let run = run_backup_account(&self.cfg, account, &self.gate, services)?;
+                Ok(ConfirmedActionResult::new(
+                    serde_json::json!({
+                        "op": "backup",
+                        "account": account,
+                        "summary": run.summary,
+                        "delta": {
+                            "mail": run.delta.mail,
+                            "calendar": run.delta.calendar,
+                            "contacts": run.delta.contacts,
+                            "todo": run.delta.todo,
+                            "onenote": run.delta.onenote,
+                        }
+                    })
+                    .to_string(),
+                ))
+            }
+            _ => Err(format!(
+                "not_implemented: confirmed agent action '{}' lands in S-AG.9/#624",
+                action.op()
+            )),
+        }
     }
 }
 
@@ -561,6 +838,100 @@ impl AgentConfirmedActionExecutor for MobileDisabledAgentOperations {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{mpsc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct BackupRuntimeState {
+        read_calls: usize,
+        restore_calls: usize,
+        refresh_services: Vec<isyncyou_engine::RefreshServices>,
+        recorded: Vec<(String, String)>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingBackupRuntime {
+        state: Arc<StdMutex<BackupRuntimeState>>,
+        counts: isyncyou_engine::RefreshCounts,
+        read_result: Result<String, String>,
+        restore_result: Result<String, String>,
+        read_signal: Arc<StdMutex<Option<mpsc::Sender<()>>>>,
+    }
+
+    impl RecordingBackupRuntime {
+        fn new(counts: isyncyou_engine::RefreshCounts) -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(BackupRuntimeState::default())),
+                counts,
+                read_result: Ok("read-token".to_string()),
+                restore_result: Ok("restore-token".to_string()),
+                read_signal: Arc::new(StdMutex::new(None)),
+            }
+        }
+
+        fn failing_read(error: &str) -> Self {
+            Self {
+                read_result: Err(error.to_string()),
+                ..Self::new(Default::default())
+            }
+        }
+
+        fn with_read_signal(self, sender: mpsc::Sender<()>) -> Self {
+            {
+                let mut signal = self.read_signal.lock().unwrap();
+                *signal = Some(sender);
+            }
+            self
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, BackupRuntimeState> {
+            self.state.lock().unwrap()
+        }
+    }
+
+    impl BackupRuntime for RecordingBackupRuntime {
+        fn resolve_read_token(&self, _cfg: &Config, _account: &str) -> Result<String, String> {
+            self.state.lock().unwrap().read_calls += 1;
+            if let Some(sender) = self.read_signal.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            self.read_result.clone()
+        }
+
+        fn resolve_restore_token(&self, _cfg: &Config, _account: &str) -> Result<String, String> {
+            self.state.lock().unwrap().restore_calls += 1;
+            self.restore_result.clone()
+        }
+
+        fn refresh(
+            &self,
+            _cfg: &Config,
+            _account: &str,
+            _read_token: String,
+            _restore_token: Option<String>,
+            services: isyncyou_engine::RefreshServices,
+        ) -> Result<isyncyou_engine::RefreshCounts, String> {
+            self.state.lock().unwrap().refresh_services.push(services);
+            Ok(self.counts.clone())
+        }
+
+        fn record_run(
+            &self,
+            _cfg: &Config,
+            _account: &str,
+            _started: &str,
+            _finished: &str,
+            status: &str,
+            summary: &str,
+        ) -> Result<(), String> {
+            self.state
+                .lock()
+                .unwrap()
+                .recorded
+                .push((status.to_string(), summary.to_string()));
+            Ok(())
+        }
+    }
 
     #[test]
     fn share_invite_preview_redacts_recipient_emails() {
@@ -605,5 +976,107 @@ mod tests {
 
         assert!(err.contains("unsupported_backup_service"));
         assert!(err.contains("shell"));
+    }
+
+    #[test]
+    fn agent_backup_confirm_runs_refresh_cache_and_records_backup_run() {
+        let runtime = RecordingBackupRuntime::new(isyncyou_engine::RefreshCounts {
+            mail_bodies: 2,
+            calendar_bodies: 1,
+            ..Default::default()
+        });
+        let gate = Arc::new(Mutex::new(()));
+
+        let run = run_backup_account_with_runtime(&Config::default(), "me", &gate, &[], &runtime)
+            .unwrap();
+
+        assert!(run.summary.contains("2 new bodies"));
+        assert_eq!(run.delta.mail, 2);
+        assert_eq!(run.delta.calendar, 1);
+        let state = runtime.state();
+        assert_eq!(state.read_calls, 1);
+        assert_eq!(state.restore_calls, 1);
+        assert_eq!(
+            state.refresh_services,
+            vec![isyncyou_engine::RefreshServices::all()]
+        );
+        assert_eq!(state.recorded.len(), 1);
+        assert_eq!(state.recorded[0].0, "ok");
+        assert!(state.recorded[0].1.contains("mail:"));
+    }
+
+    #[test]
+    fn agent_backup_confirm_holds_store_gate() {
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let runtime =
+            RecordingBackupRuntime::failing_read("no cached read token").with_read_signal(tx);
+        let runtime_for_thread = runtime.clone();
+        let gate_for_thread = gate.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_backup_account_with_runtime(
+                &Config::default(),
+                "me",
+                &gate_for_thread,
+                &[],
+                &runtime_for_thread,
+            )
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let err = handle.join().unwrap().unwrap_err();
+        assert!(err.contains("no cached read token"));
+        assert_eq!(runtime.state().read_calls, 1);
+    }
+
+    #[test]
+    fn agent_backup_unknown_service_rejected_before_token_lookup() {
+        let runtime = RecordingBackupRuntime::new(Default::default());
+        let gate = Arc::new(Mutex::new(()));
+
+        let err = run_backup_account_with_runtime(
+            &Config::default(),
+            "me",
+            &gate,
+            &["shell".to_string()],
+            &runtime,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("unsupported_backup_service"));
+        let state = runtime.state();
+        assert_eq!(state.read_calls, 0);
+        assert!(state.refresh_services.is_empty());
+        assert!(state.recorded.is_empty());
+    }
+
+    #[test]
+    fn agent_backup_service_filter_does_not_run_unselected_connectors() {
+        let runtime = RecordingBackupRuntime::new(Default::default());
+        let gate = Arc::new(Mutex::new(()));
+
+        run_backup_account_with_runtime(
+            &Config::default(),
+            "me",
+            &gate,
+            &["mail".to_string(), "todo".to_string()],
+            &runtime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime.state().refresh_services,
+            vec![isyncyou_engine::RefreshServices {
+                mail: true,
+                calendar: false,
+                contacts: false,
+                todo: true,
+                onenote: false,
+            }]
+        );
     }
 }

@@ -5,7 +5,7 @@
 
 mod agent_ops;
 
-pub use agent_ops::AgentOperationPolicy;
+pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
 
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
@@ -352,17 +352,23 @@ pub struct DaemonAgent {
 
 impl DaemonAgent {
     pub fn new(cfg: Config, oauth_dir: PathBuf) -> Self {
-        Self::new_with_policy(cfg, oauth_dir, AgentOperationPolicy::DesktopEnabled)
+        Self::new_with_policy(
+            cfg,
+            oauth_dir,
+            AgentOperationPolicy::DesktopEnabled,
+            Arc::new(Mutex::new(())),
+        )
     }
 
     pub fn new_with_policy(
         cfg: Config,
         oauth_dir: PathBuf,
         operation_policy: AgentOperationPolicy,
+        gate: Arc<Mutex<()>>,
     ) -> Self {
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
         let confirmed_executor =
-            agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone());
+            agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
         Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
@@ -2806,6 +2812,7 @@ pub fn build_live_router(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    let agent_gate = gate.clone().unwrap_or_else(|| Arc::new(Mutex::new(())));
     let base = match gate {
         Some(g) => isyncyou_webui::Router::with_gate(cfg.clone(), g),
         None => isyncyou_webui::Router::new(cfg.clone()),
@@ -2872,6 +2879,7 @@ pub fn build_live_router(
                 cfg.clone(),
                 oauth_dir,
                 agent_policy,
+                agent_gate,
             )) as Arc<dyn isyncyou_webui::AgentHandler>,
             mint_cap_token(),
         )
@@ -3369,6 +3377,7 @@ mod tests {
             Config::default(),
             root.clone(),
             AgentOperationPolicy::MobileDisabled,
+            Arc::new(Mutex::new(())),
         );
         agent.audit_sink = Arc::new(audit.clone());
         let (pending, token) = agent

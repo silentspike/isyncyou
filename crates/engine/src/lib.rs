@@ -349,6 +349,30 @@ impl RefreshCounts {
     }
 }
 
+/// Service filter for the read-only cache refresh/backup pass. The default
+/// scheduled backup uses [`RefreshServices::all`]; Agent-confirmed backup uses
+/// the same runner with an explicit subset when the model requested one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshServices {
+    pub mail: bool,
+    pub calendar: bool,
+    pub contacts: bool,
+    pub todo: bool,
+    pub onenote: bool,
+}
+
+impl RefreshServices {
+    pub fn all() -> Self {
+        Self {
+            mail: true,
+            calendar: true,
+            contacts: true,
+            todo: true,
+            onenote: true,
+        }
+    }
+}
+
 /// Refresh the local store for `account` from Microsoft Graph across mail, calendar,
 /// contacts, ToDo and OneNote — the read-only pass that both the daemon's scheduled
 /// backup and the standalone mobile client use. `read_access` is the primary token
@@ -363,6 +387,22 @@ pub fn refresh_cache_account(
     read_access: String,
     write_access: Option<String>,
 ) -> Result<RefreshCounts, String> {
+    refresh_cache_account_filtered(
+        cfg,
+        account,
+        read_access,
+        write_access,
+        RefreshServices::all(),
+    )
+}
+
+pub fn refresh_cache_account_filtered(
+    cfg: &Config,
+    account: &str,
+    read_access: String,
+    write_access: Option<String>,
+    services: RefreshServices,
+) -> Result<RefreshCounts, String> {
     let acc = cfg
         .accounts
         .iter()
@@ -373,116 +413,171 @@ pub fn refresh_cache_account(
     let mut client = GraphClient::new(read_access);
     let now = unix_now();
     // `&mut client` (Transport delta) must finish before the by-ref archive passes.
-    let r = isyncyou_connectors::incremental_sync_mail(
-        &mut client,
-        &store,
-        account,
-        &now,
-        &archive_root,
-    )
-    .map_err(|e| e.to_string())?;
-    let b = isyncyou_connectors::backup_message_bodies(&client, &store, account, &archive_root, 25)
+    let (r, b_downloaded, flanks) = if services.mail {
+        let r = isyncyou_connectors::incremental_sync_mail(
+            &mut client,
+            &store,
+            account,
+            &now,
+            &archive_root,
+        )
         .map_err(|e| e.to_string())?;
-    let flanks =
-        match isyncyou_connectors::backup_mailbox_flanks(&client, &store, account, &archive_root) {
+        let b =
+            isyncyou_connectors::backup_message_bodies(&client, &store, account, &archive_root, 25)
+                .map_err(|e| e.to_string())?;
+        let flanks = match isyncyou_connectors::backup_mailbox_flanks(
+            &client,
+            &store,
+            account,
+            &archive_root,
+        ) {
             Ok(f) => f.archived,
             Err(e) => {
                 eprintln!("isyncyou: mail flanks for {account} skipped: {e}");
                 0
             }
         };
-    let cal = match isyncyou_connectors::events_sync_calendar(&mut client, &store, account, &now) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("isyncyou: calendar sync for {account} skipped: {e}");
-            Default::default()
-        }
+        (r, b.downloaded, flanks)
+    } else {
+        (Default::default(), 0, 0)
     };
-    let cbodies =
-        isyncyou_connectors::backup_calendar_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let cflanks =
-        isyncyou_connectors::backup_calendar_flanks(&client, &store, account, &archive_root)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let _ =
-        isyncyou_connectors::backup_event_attachments(&client, &store, account, &archive_root, 25);
-    let con =
-        match isyncyou_connectors::incremental_sync_contacts(&mut client, &store, account, &now) {
+    let (cal, cbodies, cflanks) = if services.calendar {
+        let cal =
+            match isyncyou_connectors::events_sync_calendar(&mut client, &store, account, &now) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("isyncyou: calendar sync for {account} skipped: {e}");
+                    Default::default()
+                }
+            };
+        let cbodies = isyncyou_connectors::backup_calendar_bodies(
+            &client,
+            &store,
+            account,
+            &archive_root,
+            50,
+        )
+        .map(|r| r.archived)
+        .unwrap_or(0);
+        let cflanks =
+            isyncyou_connectors::backup_calendar_flanks(&client, &store, account, &archive_root)
+                .map(|r| r.archived)
+                .unwrap_or(0);
+        let _ = isyncyou_connectors::backup_event_attachments(
+            &client,
+            &store,
+            account,
+            &archive_root,
+            25,
+        );
+        (cal, cbodies, cflanks)
+    } else {
+        (Default::default(), 0, 0)
+    };
+    let (con, conbodies, conphotos) = if services.contacts {
+        let con = match isyncyou_connectors::incremental_sync_contacts(
+            &mut client,
+            &store,
+            account,
+            &now,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("isyncyou: contacts sync for {account} skipped: {e}");
                 Default::default()
             }
         };
-    let conbodies =
-        isyncyou_connectors::backup_contacts_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let conphotos =
-        isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50)
-            .map(|r| r.downloaded)
-            .unwrap_or(0);
-    let todo = match isyncyou_connectors::incremental_sync_todo(&mut client, &store, account, &now)
-    {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("isyncyou: todo sync for {account} skipped: {e}");
-            Default::default()
-        }
+        let conbodies = isyncyou_connectors::backup_contacts_bodies(
+            &client,
+            &store,
+            account,
+            &archive_root,
+            50,
+        )
+        .map(|r| r.archived)
+        .unwrap_or(0);
+        let conphotos =
+            isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50)
+                .map(|r| r.downloaded)
+                .unwrap_or(0);
+        (con, conbodies, conphotos)
+    } else {
+        (Default::default(), 0, 0)
     };
-    let tbodies =
-        isyncyou_connectors::backup_todo_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let tflanks =
-        isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    // To Do attachments need Tasks.ReadWrite (the read scope is denied), so use the
-    // write/restore client when available; best-effort, skipped without it.
-    let att_client = write_access.map(GraphClient::new);
-    let tsub = isyncyou_connectors::backup_task_subresources(
-        &client,
-        att_client.as_ref(),
-        &store,
-        account,
-        &archive_root,
-        25,
-    )
-    .map(|r| r.archived)
-    .unwrap_or(0);
-    let note = match isyncyou_connectors::incremental_sync_onenote(
-        &mut client,
-        &store,
-        account,
-        &now,
-        Some(&archive_root),
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("isyncyou: onenote sync for {account} skipped: {e}");
-            Default::default()
-        }
+    let (todo, tbodies, tflanks, tsub) = if services.todo {
+        let todo =
+            match isyncyou_connectors::incremental_sync_todo(&mut client, &store, account, &now) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("isyncyou: todo sync for {account} skipped: {e}");
+                    Default::default()
+                }
+            };
+        let tbodies =
+            isyncyou_connectors::backup_todo_bodies(&client, &store, account, &archive_root, 50)
+                .map(|r| r.archived)
+                .unwrap_or(0);
+        let tflanks =
+            isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root)
+                .map(|r| r.archived)
+                .unwrap_or(0);
+        // To Do attachments need Tasks.ReadWrite (the read scope is denied), so use the
+        // write/restore client when available; best-effort, skipped without it.
+        let att_client = write_access.map(GraphClient::new);
+        let tsub = isyncyou_connectors::backup_task_subresources(
+            &client,
+            att_client.as_ref(),
+            &store,
+            account,
+            &archive_root,
+            25,
+        )
+        .map(|r| r.archived)
+        .unwrap_or(0);
+        (todo, tbodies, tflanks, tsub)
+    } else {
+        (Default::default(), 0, 0, 0)
     };
-    let nbodies =
-        isyncyou_connectors::backup_onenote_bodies(&client, &store, account, &archive_root, 50)
-            .map(|r| r.archived)
-            .unwrap_or(0);
-    let nres =
-        isyncyou_connectors::backup_onenote_resources(&client, &store, account, &archive_root, 50)
-            .map(|r| r.resources)
-            .unwrap_or(0);
-    let nhier =
-        isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root)
-            .map(|r| r.notebooks + r.section_groups + r.sections)
-            .unwrap_or(0);
+    let (note, nbodies, nres, nhier) = if services.onenote {
+        let note = match isyncyou_connectors::incremental_sync_onenote(
+            &mut client,
+            &store,
+            account,
+            &now,
+            Some(&archive_root),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("isyncyou: onenote sync for {account} skipped: {e}");
+                Default::default()
+            }
+        };
+        let nbodies =
+            isyncyou_connectors::backup_onenote_bodies(&client, &store, account, &archive_root, 50)
+                .map(|r| r.archived)
+                .unwrap_or(0);
+        let nres = isyncyou_connectors::backup_onenote_resources(
+            &client,
+            &store,
+            account,
+            &archive_root,
+            50,
+        )
+        .map(|r| r.resources)
+        .unwrap_or(0);
+        let nhier =
+            isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root)
+                .map(|r| r.notebooks + r.section_groups + r.sections)
+                .unwrap_or(0);
+        (note, nbodies, nres, nhier)
+    } else {
+        (Default::default(), 0, 0, 0)
+    };
     Ok(RefreshCounts {
         mail_folders: r.folders,
         mail_upserted: r.upserted,
         mail_deleted: r.deleted,
-        mail_bodies: b.downloaded,
+        mail_bodies: b_downloaded,
         mail_flanks: flanks,
         calendar_events: cal.upserted,
         calendar_bodies: cbodies,
