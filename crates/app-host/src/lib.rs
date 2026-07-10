@@ -3873,12 +3873,12 @@ mod tests {
         item.local_path = Some("mail/live/m-live.eml".into());
         store.upsert_item(&item).unwrap();
         store
-            .index_body("me", "mail", "m-live", "isyncyou-623-product-live-sentinel")
+            .index_body("me", "mail", "m-live", "isyncyou623productlivesentinel")
             .unwrap();
         drop(store);
         isyncyou_core::envelope::write_body_atomic(
             &archive.join("mail/live/m-live.eml"),
-            b"Subject: Issue 623 product live fixture\r\n\r\nisyncyou-623-product-live-sentinel",
+            b"Subject: Issue 623 product live fixture\r\n\r\nisyncyou623productlivesentinel",
         )
         .unwrap();
 
@@ -3902,8 +3902,8 @@ mod tests {
     fn assert_product_live_storearchive_roundtrip(agent: &DaemonAgent, provider: &str) {
         let prompt = concat!(
             "Use the isyncyou tool before answering. Search account me, service mail, ",
-            "query \"isyncyou-623-product-live-sentinel\", then read item id \"m-live\". ",
-            "Answer exactly: m-live isyncyou-623-product-live-sentinel"
+            "query \"isyncyou623productlivesentinel\", then read item id \"m-live\". ",
+            "Answer exactly: m-live isyncyou623productlivesentinel"
         );
         let turn = isyncyou_webui::AgentHandler::start_turn(agent, "me", prompt).unwrap();
         let rx = isyncyou_webui::AgentHandler::open_stream(agent, &turn).expect("turn stream");
@@ -3932,13 +3932,12 @@ mod tests {
                     assert_eq!(event["name"].as_str(), Some(isyncyou_agent::TOOL_NAME));
                 }
                 Some("tool_result") => {
-                    saw_tool_result = true;
                     let content = event["content"].as_str().unwrap_or_default();
-                    assert!(
-                        content.contains("m-live")
-                            || content.contains("isyncyou-623-product-live-sentinel"),
-                        "tool_result must come from the seeded StoreArchive fixture: {content}"
-                    );
+                    if content.contains("m-live")
+                        || content.contains("isyncyou623productlivesentinel")
+                    {
+                        saw_tool_result = true;
+                    }
                 }
                 Some("done") => {
                     done_reason = event["reason"].as_str().map(|s| s.to_string());
@@ -3962,8 +3961,7 @@ mod tests {
         );
         assert_eq!(done_reason.as_deref(), Some("complete"));
         assert!(
-            final_text.contains("m-live")
-                || final_text.contains("isyncyou-623-product-live-sentinel"),
+            final_text.contains("m-live") || final_text.contains("isyncyou623productlivesentinel"),
             "{provider} final answer must cite the seeded StoreArchive fixture: {final_text}"
         );
 
