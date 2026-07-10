@@ -346,6 +346,17 @@ pub trait MobileJobHandler: Send + Sync {
     fn cancel_job(&self, account: &str, job_id: &str) -> Result<bool, String>;
 }
 
+/// Non-secret binding fields for a pending Agent destructive action. Mobile uses
+/// these to mint a native biometric-token challenge before the Agent's one-time
+/// confirmation token is consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPendingBinding {
+    pub op: String,
+    pub account: String,
+    pub service: String,
+    pub item: String,
+}
+
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
 /// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
 /// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
@@ -355,6 +366,15 @@ pub trait MobileJobHandler: Send + Sync {
 pub trait AgentHandler: Send + Sync {
     /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
+    /// Peek the non-secret binding for a pending destructive action without checking
+    /// or consuming its one-time Agent confirmation token.
+    fn pending_binding(
+        &self,
+        _pending_id: &str,
+        _action_hash: &str,
+    ) -> Result<AgentPendingBinding, String> {
+        Err("pending binding is not enabled on this server".into())
+    }
     /// Confirm a pending destructive action with its one-time token; returns a summary.
     fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String>;
     /// Cancel an in-flight turn.
@@ -4272,6 +4292,21 @@ impl Router {
                     return ApiResponse::error(400, "pending, token, and action_hash are required")
                 }
             };
+        if self.biometric_gate {
+            let binding = match handler.pending_binding(pending, action_hash) {
+                Ok(binding) => binding,
+                Err(e) => return ApiResponse::error(agent_confirm_error_status(&e), &e),
+            };
+            if let Some(r) = self.biometric_challenge(
+                &binding.op,
+                &binding.account,
+                &binding.service,
+                &binding.item,
+                req,
+            ) {
+                return r;
+            }
+        }
         match handler.confirm(pending, token, action_hash) {
             Ok(summary) => {
                 ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary }))
@@ -6599,6 +6634,72 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
 
+    struct RecordingAgent {
+        binding: AgentPendingBinding,
+        binding_calls: std::sync::Mutex<Vec<(String, String)>>,
+        confirm_calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl RecordingAgent {
+        fn backup() -> Self {
+            Self {
+                binding: AgentPendingBinding {
+                    op: "backup".into(),
+                    account: "a".into(),
+                    service: "agent".into(),
+                    item: "pending:2:p1:action_hash:4:hash".into(),
+                },
+                binding_calls: std::sync::Mutex::new(Vec::new()),
+                confirm_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn confirm_call_count(&self) -> usize {
+            self.confirm_calls.lock().unwrap().len()
+        }
+    }
+
+    impl AgentHandler for RecordingAgent {
+        fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+            Ok("turn-recording".into())
+        }
+
+        fn pending_binding(
+            &self,
+            pending_id: &str,
+            action_hash: &str,
+        ) -> Result<AgentPendingBinding, String> {
+            self.binding_calls
+                .lock()
+                .unwrap()
+                .push((pending_id.to_string(), action_hash.to_string()));
+            if pending_id == "p1" && action_hash == "hash" {
+                Ok(self.binding.clone())
+            } else {
+                Err("ActionMismatch".into())
+            }
+        }
+
+        fn confirm(&self, pending: &str, token: &str, action_hash: &str) -> Result<String, String> {
+            self.confirm_calls.lock().unwrap().push((
+                pending.to_string(),
+                token.to_string(),
+                action_hash.to_string(),
+            ));
+            if pending == "p1" && token == "right" && action_hash == "hash" {
+                Ok(format!("ran {pending}"))
+            } else {
+                Err("bad token".into())
+            }
+        }
+
+        fn cancel(&self, _turn_id: &str) {}
+
+        fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+    }
+
     #[test]
     fn agent_routes_require_cap_token_and_validate_params() {
         let (_d, router) = setup();
@@ -6788,6 +6889,115 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let on = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
         assert_eq!(on.status, 200);
         assert!(String::from_utf8_lossy(&on.body).contains("\"connected\":true"));
+    }
+
+    #[test]
+    fn mobile_agent_confirm_requires_biometric_before_agent_token_consumption() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let req = ApiRequest::new(
+            "POST",
+            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
+        )
+        .with_session_token(Some("sess".into()))
+        .with_cap_token(Some("agentsecret".into()));
+
+        let resp = router.route(&req);
+
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(body["status"], "confirmation_required");
+        assert_eq!(body["op"], "backup");
+        assert_eq!(body["account"], "a");
+        assert_eq!(body["service"], "agent");
+        assert_eq!(body["item"], "pending:2:p1:action_hash:4:hash");
+        assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_wrong_biometric_token_does_not_consume_agent_pending() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let base = "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash";
+        let auth = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_session_token(Some("sess".into()))
+                .with_cap_token(Some("agentsecret".into()))
+        };
+
+        let first = router.route(&auth(base));
+        let pat = body_json(&first)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bad = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(bad.status, 403);
+        assert_eq!(agent.confirm_call_count(), 0);
+
+        assert!(router.confirm_biometric(&pat));
+        let ok = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(ok.status, 200);
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_after_biometric_consumes_agent_token_once() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let base = "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash";
+        let auth = |path: &str| {
+            ApiRequest::new("POST", path)
+                .with_session_token(Some("sess".into()))
+                .with_cap_token(Some("agentsecret".into()))
+        };
+        let challenge = router.route(&auth(base));
+        let pat = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(router.confirm_biometric(&pat));
+        let ok = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(ok.status, 200);
+        let replay = router.route(&auth(&format!("{base}&_pat={pat}")));
+        assert_eq!(replay.status, 403);
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_wrong_action_hash_does_not_mint_biometric_pending() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let req = ApiRequest::new(
+            "POST",
+            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=wrong",
+        )
+        .with_session_token(Some("sess".into()))
+        .with_cap_token(Some("agentsecret".into()));
+
+        let resp = router.route(&req);
+
+        assert_eq!(resp.status, 409);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(body.contains("ActionMismatch"));
+        assert!(!body.contains("confirmation_required"));
+        assert_eq!(agent.confirm_call_count(), 0);
     }
 
     #[test]

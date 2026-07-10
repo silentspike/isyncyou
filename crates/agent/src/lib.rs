@@ -43,7 +43,9 @@ pub mod tool;
 pub mod turn;
 
 pub use archive::{ArchiveSource, ItemRef};
-pub use confirm::{action_hash, ConfirmError, PendingAction, PendingRegistry};
+pub use confirm::{
+    action_hash, ConfirmError, PendingAction, PendingActionBinding, PendingRegistry,
+};
 pub use error::AgentError;
 pub use provider::{AssistantBlock, DoneReason, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;

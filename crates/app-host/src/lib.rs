@@ -1392,6 +1392,23 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         Ok(turn_id)
     }
 
+    fn pending_binding(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+    ) -> Result<isyncyou_webui::AgentPendingBinding, String> {
+        let binding = self
+            .pending
+            .binding(pending_id, action_hash, unix_now_ms())
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(isyncyou_webui::AgentPendingBinding {
+            op: binding.op,
+            account: binding.account,
+            service: binding.service,
+            item: binding.item,
+        })
+    }
+
     fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String> {
         let action = self
             .pending
@@ -3600,6 +3617,61 @@ mod tests {
         assert!(!summary.contains("raw-body-sentinel"));
         assert!(!summary.contains("private subject"));
         assert!(summary.contains("<redacted-email>"));
+    }
+
+    #[test]
+    fn agent_confirm_destructive_binding_redacts_live_write_change() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-binding-redacts-live-write");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor),
+            Arc::new(audit),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "live-write",
+            "account": "owner@example.com",
+            "service": "mail",
+            "target": "msg-1",
+            "change": {
+                "verb": "create_draft",
+                "subject": "private subject",
+                "body_html": "<html>raw-body-sentinel recipient@example.com</html>",
+                "to": ["recipient@example.com"]
+            }
+        }))
+        .unwrap();
+        let (pending, _token) = agent
+            .pending
+            .register(action, "live write", unix_now_ms(), AGENT_CONFIRM_TTL_MS)
+            .unwrap();
+
+        let binding = isyncyou_webui::AgentHandler::pending_binding(
+            &agent,
+            &pending.id,
+            &pending.action_hash,
+        )
+        .unwrap();
+        let text = serde_json::to_string(&serde_json::json!({
+            "op": binding.op,
+            "account": binding.account,
+            "service": binding.service,
+            "item": binding.item,
+        }))
+        .unwrap();
+
+        assert!(text.contains("live-write"));
+        assert!(text.contains("mail"));
+        assert!(text.contains(&pending.id));
+        assert!(text.contains(&pending.action_hash));
+        assert!(!text.contains("raw-body-sentinel"));
+        assert!(!text.contains("recipient@example.com"));
+        assert!(!text.contains("private subject"));
+        assert!(!text.contains("create_draft"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
