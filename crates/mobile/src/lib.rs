@@ -1380,6 +1380,7 @@ mod tests {
         // Host test of the non-JNI core (#89 P4 / #0A): start succeeds, mints a session
         // token, and a second call reuses the SAME running engine (Activity recreation must
         // not start a second one). No loopback port is bound in the default build.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
@@ -1646,6 +1647,7 @@ mod tests {
 
     #[test]
     fn mobile_config_start_inner_forces_poll_interval_and_persists_once() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("isyncyou.toml");
@@ -1666,6 +1668,7 @@ mod tests {
 
     #[test]
     fn mobile_start_inner_clears_legacy_plaintext_cache_but_keeps_tokens() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("archive");
@@ -1858,6 +1861,7 @@ mod tests {
         // phone — serves the UI shell and fully session-token gates the data API **entirely
         // in-process**, with NO loopback TCP port. `asset_request` serves the shell (as the
         // WebView's shouldInterceptRequest does); `bridge_request` carries the data API.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         restore_enabled_mobile_config(dir.path());
@@ -1909,6 +1913,7 @@ mod tests {
 
     #[test]
     fn mobile_full_node_router_exposes_gated_restore_and_backup() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         restore_enabled_mobile_config(dir.path());
@@ -1941,6 +1946,7 @@ mod tests {
 
     #[test]
     fn mobile_full_node_restore_backup_do_not_run_without_biometric_token() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         restore_enabled_mobile_config(dir.path());
@@ -2036,6 +2042,7 @@ mod tests {
 
     #[test]
     fn mobile_full_node_job_recovery_runs_on_start() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         restore_enabled_mobile_config(dir.path());
@@ -2090,6 +2097,7 @@ mod tests {
         // #0A: the in-process bridge answers against the same router as loopback and
         // enforces the same session gate — proving the phone needs no TCP port to serve
         // its own UI's data calls.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
@@ -2116,6 +2124,7 @@ mod tests {
     fn asset_request_serves_the_shell_framed_binary_safe() {
         // #0A: browser-initiated GETs (shell + subresources) are served binary-safe with
         // an explicit content-type, so images/viewers survive intact (no lossy UTF-8).
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
@@ -2137,6 +2146,7 @@ mod tests {
 
     #[test]
     fn asset_request_with_session_uses_trusted_session_not_cookie_or_query() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
@@ -2198,6 +2208,7 @@ mod tests {
         // #0A: the push-stream FFI plumbing — gating + open/close registry. Event delivery
         // semantics are proven in webui's open_bridge_stream test; the full push round-trip
         // is device-verified.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
