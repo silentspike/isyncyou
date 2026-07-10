@@ -1389,17 +1389,24 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .pending
             .confirm(pending_id, token, action_hash, unix_now_ms())
             .map_err(|e| format!("{e:?}"))?;
+        agent_ops::preview_for_pending_action(&action).map_err(|e| {
+            format!(
+                "invalid_confirmed_action: {}",
+                agent_ops::redact_agent_operation_text(&e)
+            )
+        })?;
         let action_summary = agent_action_summary(&action);
         self.audit_sink
             .record_confirm(&action, "started", &action_summary)?;
         match self.confirmed_executor.execute_confirmed(&action) {
             Ok(result) => {
+                let safe_summary = agent_ops::redact_agent_operation_text(&result.summary);
                 self.audit_sink
                     .record_confirm(&action, "ok", &format!("{action_summary} ok"))?;
                 serde_json::to_string(&serde_json::json!({
                     "status": "ok",
                     "op": action.op(),
-                    "summary": result.summary,
+                    "summary": safe_summary,
                 }))
                 .map_err(|e| e.to_string())
             }
@@ -3224,6 +3231,184 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].1, "started");
         assert_eq!(events[1].1, "ok");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_with_desktop_policy_uses_real_operation_executor() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-desktop-policy");
+        let mut agent = DaemonAgent::new_with_policy(
+            Config::default(),
+            root.clone(),
+            AgentOperationPolicy::DesktopEnabled,
+            Arc::new(Mutex::new(())),
+        );
+        agent.audit_sink = Arc::new(audit.clone());
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "backup failed: execution_failed");
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, "started");
+        assert_eq!(events[1].1, "error");
+        assert!(!events[1].2.contains("not_available_on_mobile"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_revalidates_action_before_execution() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-revalidate");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "mail",
+            "target": "drafts",
+            "change": {
+                "body_html": "<html>raw-body-sentinel recipient@example.com</html>",
+                "to": ["recipient@example.com"]
+            }
+        }))
+        .unwrap();
+        let (pending, token) = agent
+            .pending
+            .register(
+                action,
+                "invalid live write",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("invalid_confirmed_action"));
+        assert!(err.contains("missing verb"));
+        assert!(!err.contains("raw-body-sentinel"));
+        assert!(!err.contains("recipient@example.com"));
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_read_class_action_cannot_execute_in_confirm_path() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-read-class");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "search",
+            "account": "me",
+            "services": ["mail"],
+            "query": "status"
+        }))
+        .unwrap();
+        let (pending, token) = agent
+            .pending
+            .register(
+                action,
+                "search should not confirm",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let err = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("invalid_confirmed_action"));
+        assert!(err.contains("not_confirmable: search"));
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_result_summary_is_json_and_redacted() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok(
+            "backup wrote https://tenant.example/item?code=secret for owner@example.com",
+            order.clone(),
+        );
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-json-redacted");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = agent
+            .pending
+            .register(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+            )
+            .unwrap();
+
+        let result = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let summary = result["summary"].as_str().unwrap();
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["op"], "backup");
+        assert!(summary.contains("<redacted-url>"));
+        assert!(summary.contains("<redacted-email>"));
+        assert!(!summary.contains("tenant.example"));
+        assert!(!summary.contains("owner@example.com"));
+        assert_eq!(executor.call_count(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
