@@ -44,7 +44,8 @@
       "docs/evidence/artifacts/issue-623/device-codex-browser-attempt.png",
       "docs/evidence/artifacts/issue-623/device-codex-turn.png"
     ],
-    "screenshots_redacted": true
+    "screenshots_redacted": true,
+    "notes": "device-codex-turn.png has the Usage chip area redacted because the committed screenshot is turn evidence; rate-limit formatting is proven by current_apk_usage_chip_check."
   },
   "webview_status_after_oauth": {
     "document_cookie": "",
@@ -66,7 +67,8 @@
     },
     "rendered_after_reinstall": "Usage unavailable",
     "synthetic_rate_limit_render": "Request req_1234567890abcdef · 12 in · 3 out · limit allowed · 23%",
-    "contains_object_object": false
+    "contains_object_object": false,
+    "screenshot_usage_area_redacted": true
   },
   "credential_store_observation": {
     "path_root": "/data/user/0/com.silentspike.isyncyou.debug/files",
