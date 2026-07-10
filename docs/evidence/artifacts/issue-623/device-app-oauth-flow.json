@@ -1,8 +1,8 @@
 {
   "artifact": "issue-623-device-app-oauth-flow",
   "captured_at": "2026-07-10T08:39:00Z",
-  "oauth_flow_code_commit": "b2be12adb83d34e5afa624d30aec3be1e936b2cf",
-  "current_apk_code_commit": "cfcc7143968171c376eddaec787ff7aea95f376f",
+  "oauth_flow_commit": "b2be12a",
+  "current_apk_commit": "cfcc714",
   "device": {
     "model": "Pixel 8 Pro",
     "transport": "usb-adb",
