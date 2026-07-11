@@ -1,0 +1,22 @@
+Issue #627 public-surface scan
+Generated: 2026-07-11T19:21:35Z
+Tested code commit: affcd88dbf82ad02299753b1ced2ad24d4aa1c1b
+
+Scopes checked:
+- README, packaging, Android distribution, Android README, product WebUI,
+  mobile Rust, and daemon Rust for local credential/import markers
+- release, staging, and main workflows for the experimental feature or
+  --all-features
+- every scalar in both reduced drift summaries for credential, OAuth-code,
+  account/email, local-path, and raw-capture value shapes
+- issue-627 artifact filenames for raw/debug/event/model/auth capture files
+
+Results:
+product_surface_forbidden_matches=0
+product_workflow_experimental_matches=0
+drift_summary_forbidden_scalar_matches=0
+raw_capture_artifacts=0
+
+The experimental documentation is intentionally excluded from the product-copy
+scan. It describes only the unsupported build boundary and privacy policy; it
+contains no credential material or standalone provider request recipe.

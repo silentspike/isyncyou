@@ -1,0 +1,209 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-11T19:21:35Z",
+  "commit": "affcd88dbf82ad02299753b1ced2ad24d4aa1c1b",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Default product builds ignore a synthetic local Claude credential file.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers product_build_does_not_read_dot_claude -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::product_build_does_not_read_dot_claude ... ok",
+      "test": "product_build_does_not_read_dot_claude"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Default product builds ignore a synthetic local Codex credential file.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers product_build_does_not_read_dot_codex -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::product_build_does_not_read_dot_codex ... ok",
+      "test": "product_build_does_not_read_dot_codex"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-008",
+      "claim": "An encrypted product credential takes precedence over the experimental desktop fallback.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental credential_store_preferred_over_desktop_cli_fallback -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::credential_store_preferred_over_desktop_cli_fallback ... ok",
+      "test": "credential_store_preferred_over_desktop_cli_fallback"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-008",
+      "claim": "A corrupt present product credential fails closed instead of falling through to local CLI auth.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental corrupt_product_credential_does_not_fall_through_to_local_cli -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::corrupt_product_credential_does_not_fall_through_to_local_cli ... ok",
+      "test": "corrupt_product_credential_does_not_fall_through_to_local_cli"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Experimental local CLI credentials cannot satisfy product harness readiness.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental experimental_local_cli_does_not_satisfy_product_harness_readiness -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::experimental_local_cli_does_not_satisfy_product_harness_readiness ... ok",
+      "test": "experimental_local_cli_does_not_satisfy_product_harness_readiness"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The app-host production source has no subscription credential ingest method or route.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers app_host_product_source_has_no_credential_ingest_surface -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::app_host_product_source_has_no_credential_ingest_surface ... ok",
+      "test": "app_host_product_source_has_no_credential_ingest_surface"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The mobile crate exposes no local-client experimental feature or generic fallback listener.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-mobile mobile_product_has_no_local_cli_experimental_feature -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::mobile_product_has_no_local_cli_experimental_feature ... ok",
+      "test": "mobile_product_has_no_local_cli_experimental_feature"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Android's bounded Cargo feature allowlist rejects the desktop experimental feature.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-mobile android_rejects_agent_subscription_experimental_feature -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::android_rejects_agent_subscription_experimental_feature ... ok",
+      "test": "android_rejects_agent_subscription_experimental_feature"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The drift reducer does not copy authorization material or account identifiers.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_redacts_authorization_and_account_ids -- --nocapture",
+      "result": "pass",
+      "evidence": "test drift_capture::tests::experimental_capture_redacts_authorization_and_account_ids ... ok",
+      "test": "experimental_capture_redacts_authorization_and_account_ids"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Unknown future usage fields force manual drift review without copying their names or values.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_new_usage_field_requires_manual_review -- --nocapture",
+      "result": "pass",
+      "evidence": "test drift_capture::tests::experimental_capture_new_usage_field_requires_manual_review ... ok",
+      "test": "experimental_capture_new_usage_field_requires_manual_review"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Claude's provider-required billing block remains first and exact.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers claude_billing_block_remains_first_and_unchanged -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::subscription::tests::claude_billing_block_remains_first_and_unchanged ... ok",
+      "test": "claude_billing_block_remains_first_and_unchanged"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Codex subscription/account identity headers remain in the expected provider envelope.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers codex_subscription_identity_envelope_remains_unchanged -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::codex::tests::codex_subscription_identity_envelope_remains_unchanged ... ok",
+      "test": "codex_subscription_identity_envelope_remains_unchanged"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Provider requests contain no default-client prompt, tool, skill, MCP, rule, or history component.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers custom_harness_removes_default_prompt_tools_skills_mcp_rules_and_history -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::tests::custom_harness_removes_default_prompt_tools_skills_mcp_rules_and_history ... ok",
+      "test": "custom_harness_removes_default_prompt_tools_skills_mcp_rules_and_history"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Claude and Codex custom requests install only the controlled iSyncYou prompt and one isyncyou tool.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers custom_harness_installs_only_isyncyou_prompt_and_tool -- --nocapture",
+      "result": "pass",
+      "evidence": "test provider::tests::custom_harness_installs_only_isyncyou_prompt_and_tool ... ok",
+      "test": "custom_harness_installs_only_isyncyou_prompt_and_tool"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The product host rejects OAuth endpoint, client, scope, and redirect overrides.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers product_oauth_config_rejects_endpoint_client_scope_override -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::product_oauth_config_rejects_endpoint_client_scope_override ... ok",
+      "test": "product_oauth_config_rejects_endpoint_client_scope_override"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Claude Code 2.1.207 produced a controlled, allowlist-reduced local drift summary with no retained raw capture.",
+      "method": "probe",
+      "command": "tools/capture-agent-local-drift.sh capture; manual scalar review; tools/capture-agent-local-drift.sh publish <review-dir> docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES",
+      "result": "pass",
+      "evidence": "controlled_sentinel_observed=true; raw_retained=false; drift_decision=not_safely_observable",
+      "artifact": "docs/evidence/artifacts/issue-627/claude-code-2.1.207-drift-summary.json",
+      "notes": "This is local-client drift evidence only, not product authentication evidence. Headers and endpoint were not safely visible."
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Codex CLI 0.144.1 produced a controlled, allowlist-reduced local drift summary with no retained raw capture.",
+      "method": "probe",
+      "command": "tools/capture-agent-local-drift.sh capture; manual scalar review; tools/capture-agent-local-drift.sh publish <review-dir> docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES",
+      "result": "pass",
+      "evidence": "controlled_sentinel_observed=true; raw_retained=false; drift_decision=not_safely_observable; model catalog reduced to counts/presence",
+      "artifact": "docs/evidence/artifacts/issue-627/codex-cli-0.144.1-drift-summary.json",
+      "notes": "This is local-client drift evidence only, not product authentication evidence. Headers and endpoint were not safely visible."
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Cargo feature resolution excludes the fallback by default, enables it through one explicit daemon chain, and rejects it on mobile.",
+      "method": "command",
+      "command": "cargo metadata --no-deps --format-version 1; cargo tree -p isyncyou-daemon -e normal -f '{p} features={f}'; cargo tree -p isyncyou-daemon --features agent-subscription-experimental -e normal -f '{p} features={f}'; cargo remote -c -- check -p isyncyou-mobile --features agent-subscription-experimental",
+      "result": "pass",
+      "evidence": "Default graph has no experimental feature; explicit graph resolves daemon to app-host to Agent; mobile rejects the absent feature with exit 101 before artifact creation.",
+      "artifact": "docs/evidence/artifacts/issue-627/feature-matrix.json"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Default desktop and Android product artifacts exclude local fallback and import markers.",
+      "method": "command",
+      "command": "cargo remote -c -- build --release -p isyncyou-daemon; strings target/release/isyncyoud <forbidden-marker-scan>; (cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug); unzip packaged libisyncyou_mobile.so; strings <forbidden-marker-scan>",
+      "result": "pass",
+      "evidence": "Default daemon and clean default APK built successfully; both native scans returned zero forbidden markers; hashes are recorded in the artifact.",
+      "artifact": "docs/evidence/artifacts/issue-627/release-exclusion.json"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Product copy/workflows and reduced public evidence expose neither the experimental setup nor credential/account/raw-capture values.",
+      "method": "command",
+      "command": "python3 -m unittest tools.test_agent_experimental_boundary -v; scoped product-source/workflow/summarized-scalar scans",
+      "result": "pass",
+      "evidence": "Product source matches=0; product workflow matches=0; forbidden reduced-summary scalar matches=0; raw capture artifacts=0.",
+      "artifact": "docs/evidence/artifacts/issue-627/public-surface-scan.txt"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "scope": "issue_627_default_product_artifact_exclusion",
+  "tested_commit": "affcd88dbf82ad02299753b1ced2ad24d4aa1c1b",
+  "release_workflow": {
+    "experimental_feature_requested": false,
+    "all_features_requested": false,
+    "default_release_build_command_present": true,
+    "default_android_release_build_command_present": true
+  },
+  "desktop_release_daemon": {
+    "build_status": "pass",
+    "sha256": "70e243230ed10b9feadffa78089475ddfb0ea389e76c9e1707034f4a69044569",
+    "forbidden_marker_matches": 0
+  },
+  "android_default_debug_apk": {
+    "build_status": "pass",
+    "cargo_test_features_unset": true,
+    "sha256": "a05a02f26972b4e87199a79b830cf2eced95334bfe039fb13ca9a8b8035167c5",
+    "packaged_arm64_library_sha256": "64a62efd0a83502c50e76fca694d52ee02e6dfb1df5c92b1a55be07b10807716",
+    "forbidden_marker_matches": 0
+  },
+  "forbidden_marker_categories": [
+    "local_claude_credential_path",
+    "local_codex_credential_path",
+    "local_client_config_override",
+    "credential_import_route"
+  ],
+  "device_installation_required": false
+}

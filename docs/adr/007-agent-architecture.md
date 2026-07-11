@@ -53,6 +53,27 @@ The constraints that force the shape of this decision:
    wire-drift capture remain a separate, default-off #627 surface
    (`agent-subscription-experimental`) and are not product-auth evidence.
 
+   The product harness sequence is fixed: complete official provider OAuth, store
+   the resulting credential in the encrypted iSyncYou CredentialStore, preserve
+   the provider-required auth/billing/subscription identity envelope unchanged and
+   in place, remove all other default-client harness behavior, then install the
+   iSyncYou harness. For Claude, the original billing block remains the first
+   system block. For Codex, required subscription/account identity headers remain
+   unchanged and requests retain `store:false`. Required protocol fields such as
+   content/stream types and provider version fields remain where the protocol
+   requires them.
+
+   The replacement harness contains the iSyncYou M365 system prompt, exactly one
+   `isyncyou` tool, StoreArchive retrieval/citations, confirmation policy, and
+   streaming/usage handling. It does not import the default client's system
+   prompt, tools, skills, plugins, MCP configuration, rules, memories, history,
+   client context, shell/filesystem capabilities, or other default agent behavior.
+   #627's optional local resolver supplies credential material only and cannot
+   advance product OAuth, encrypted-credential, subscription-identity, onboarding,
+   handoff, or ready state. #639 owns the visible first-run ordering/state machine;
+   the provider builders and #627 evidence enforce the retained-versus-removed
+   request boundary.
+
 6. **Confirmation without model authority.** Read/search/list/export/restore-local run
    immediately; `backup`/`restore-cloud`/`live-write`/`share` emit a **PendingAction**.
    The human confirms via a normal session-authenticated request, and the server then
