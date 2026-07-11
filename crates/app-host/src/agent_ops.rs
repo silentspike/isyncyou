@@ -155,7 +155,7 @@ pub(crate) fn run_mobile_backup_account(
     let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
     let started = crate::unix_now();
     let result = (|| {
-        let read = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)
+        let read = isyncyou_engine::auth::resolve_cache_refresh_token(cfg, account)
             .map_err(|_| MobileBackupError::Authentication)?;
         let restore = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account).ok();
         let counts = isyncyou_engine::refresh_cache_account_filtered_strict(
