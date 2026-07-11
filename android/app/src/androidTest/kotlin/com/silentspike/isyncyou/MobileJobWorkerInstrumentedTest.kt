@@ -1,6 +1,5 @@
 package com.silentspike.isyncyou
 
-import android.app.Application
 import android.os.Process
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.work.OneTimeWorkRequestBuilder
@@ -30,6 +29,6 @@ class MobileJobWorkerInstrumentedTest {
         assertTrue("process probe worker did not finish", info.state.isFinished)
         assertEquals(WorkInfo.State.SUCCEEDED, info.state)
         assertEquals(Process.myPid(), info.outputData.getInt("pid", -1))
-        assertEquals(Application.getProcessName(), info.outputData.getString("process_name"))
+        assertEquals(currentProcessName(context), info.outputData.getString("process_name"))
     }
 }
