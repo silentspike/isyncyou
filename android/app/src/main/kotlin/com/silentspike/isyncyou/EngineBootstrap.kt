@@ -20,6 +20,14 @@ object EngineBootstrap {
     @Volatile
     private var sessionToken: String? = null
 
+    internal data class BodyKeyMaterial(
+        val keyId: Int,
+        val key: ByteArray,
+        val justCreated: Boolean,
+    )
+
+    internal data class AgentCredentialKeyMaterial(val key: ByteArray)
+
     /**
      * Start-or-reuse the engine and return the session token (`""` if the engine failed to start).
      * Idempotent: the first successful call caches the token; later calls return it without re-running
@@ -30,22 +38,21 @@ object EngineBootstrap {
     fun ensureStarted(filesDir: File): String {
         sessionToken?.let { return it }
 
-        // Install the at-rest body key from the Keystore BEFORE the engine touches disk (#0B), so
-        // the first body write/read is already sealed.
-        val r = BodyKeyStore.getOrCreate(filesDir)
-        if (r.justCreated) {
-            discardReproducibleLocalCache(filesDir)
-            Log.i(TAG, "body encryption on: discarded plaintext cache (kept auth)")
-        }
-
-        // Install the separate provider-credential key before nativeStart (#620). App-host
-        // credential consumers in Rust resolve through this process-installed key on Android,
-        // never through a WebView/API path or accidental local fallback.
-        val agentCredential = AgentCredentialKeyStore.getOrCreate(filesDir)
-        val port = runNativeStartupSequence(
-            bodyKeyId = r.keyId,
-            bodyKey = r.key,
-            agentCredentialKey = agentCredential.key,
+        val port = loadAndRunStartupSequence(
+            loadBodyKey = {
+                BodyKeyStore.getOrCreate(filesDir).let {
+                    BodyKeyMaterial(it.keyId, it.key, it.justCreated)
+                }
+            },
+            discardCache = {
+                discardReproducibleLocalCache(filesDir)
+                Log.i(TAG, "body encryption on: discarded plaintext cache (kept auth)")
+            },
+            loadAgentCredentialKey = {
+                AgentCredentialKeyStore.getOrCreate(filesDir).let {
+                    AgentCredentialKeyMaterial(it.key)
+                }
+            },
             installBodyKey = { keyId, key -> NativeEngine.nativeSetBodyKey(keyId, key) == 1 },
             installAgentCredentialKey = { key -> NativeEngine.nativeSetAgentCredentialKey(key) == 1 },
             startEngine = {
@@ -60,6 +67,39 @@ object EngineBootstrap {
             return t
         }
         return "" // don't cache failure; a later caller may retry
+    }
+
+    /**
+     * Load both unwrapped keys and keep their complete lifetime under one outer wipe.
+     * This covers failures before [runNativeStartupSequence], including cache cleanup
+     * and loading the second key.
+     */
+    internal fun loadAndRunStartupSequence(
+        loadBodyKey: () -> BodyKeyMaterial,
+        discardCache: () -> Unit,
+        loadAgentCredentialKey: () -> AgentCredentialKeyMaterial,
+        installBodyKey: (Int, ByteArray) -> Boolean,
+        installAgentCredentialKey: (ByteArray) -> Boolean,
+        startEngine: () -> Int,
+    ): Int {
+        var body: BodyKeyMaterial? = null
+        var agent: AgentCredentialKeyMaterial? = null
+        try {
+            body = loadBodyKey()
+            if (body.justCreated) discardCache()
+            agent = loadAgentCredentialKey()
+            return runNativeStartupSequence(
+                body.keyId,
+                body.key,
+                agent.key,
+                installBodyKey,
+                installAgentCredentialKey,
+                startEngine,
+            )
+        } finally {
+            body?.key?.fill(0)
+            agent?.key?.fill(0)
+        }
     }
 
     /** The only allowed native startup order, with an injectable seam for JVM tests. */
@@ -86,10 +126,21 @@ object EngineBootstrap {
     }
 
     private fun discardReproducibleLocalCache(filesDir: File) {
-        File(filesDir, "archive").listFiles()?.forEach { f ->
-            if (!f.name.startsWith(".isyncyou-token")) f.deleteRecursively()
+        val archive = File(filesDir, "archive")
+        if (archive.exists()) {
+            val entries = archive.listFiles()
+                ?: throw EncryptedStorageSetupException("Could not inspect reproducible cache")
+            entries.forEach { file ->
+                if (!file.name.startsWith(".isyncyou-token") && !file.deleteRecursively()) {
+                    throw EncryptedStorageSetupException("Could not discard reproducible cache")
+                }
+            }
         }
-        File(filesDir, "sync").deleteRecursively()
-        File(filesDir, "cache").deleteRecursively()
+        for (name in listOf("sync", "cache")) {
+            val path = File(filesDir, name)
+            if (path.exists() && !path.deleteRecursively()) {
+                throw EncryptedStorageSetupException("Could not discard reproducible cache")
+            }
+        }
     }
 }
