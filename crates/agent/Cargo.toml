@@ -35,6 +35,11 @@ isyncyou-graph = { path = "../graph", default-features = false, optional = true 
 [dev-dependencies]
 tempfile = "3"
 
+[[example]]
+name = "reduce_local_drift"
+path = "examples/reduce_local_drift.rs"
+required-features = ["agent-subscription-experimental"]
+
 [features]
 http = ["dep:reqwest"]
 onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http"]

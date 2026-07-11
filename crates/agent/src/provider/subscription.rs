@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
-const DEFAULT_CLI_VERSION: &str = "2.1.206";
+pub(crate) const DEFAULT_CLI_VERSION: &str = "2.1.206";
 
 /// The subscription wire configuration. Defaults to the verified Claude-Code recipe; the
 /// operator may override the CLI version or supply account identity for `metadata.user_id`.
