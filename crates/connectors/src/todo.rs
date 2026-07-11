@@ -137,9 +137,7 @@ pub fn backup_todo_list_flanks<F: JsonFetcher>(
     archive_root: &Path,
 ) -> Result<ArchiveReport, SyncError> {
     let mut report = ArchiveReport::default();
-    let lists = fetcher
-        .fetch_json("/me/todo/lists?$top=100")
-        .map_err(SyncError::Remote)?;
+    let lists = fetcher.fetch_json_for_sync("/me/todo/lists?$top=100")?;
     let raw: Vec<Value> = lists
         .get("value")
         .and_then(Value::as_array)

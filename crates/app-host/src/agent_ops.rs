@@ -137,6 +137,50 @@ pub fn run_backup_account(
     run_backup_account_with_runtime(cfg, account, gate, services, &LiveBackupRuntime)
 }
 
+#[derive(Debug)]
+pub(crate) enum MobileBackupError {
+    InvalidRequest,
+    Authentication,
+    Refresh(isyncyou_engine::RefreshFailure),
+}
+
+pub(crate) fn run_mobile_backup_account(
+    cfg: &Config,
+    account: &str,
+    gate: &Arc<Mutex<()>>,
+    services: &[String],
+) -> Result<BackupRun, MobileBackupError> {
+    let service_set = BackupServiceSet::from_requested(services)
+        .map_err(|_| MobileBackupError::InvalidRequest)?;
+    let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let started = crate::unix_now();
+    let result = (|| {
+        let read = isyncyou_engine::auth::resolve_cached_read_token(cfg, account)
+            .map_err(|_| MobileBackupError::Authentication)?;
+        let restore = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account).ok();
+        let counts = isyncyou_engine::refresh_cache_account_filtered_strict(
+            cfg,
+            account,
+            read,
+            restore,
+            service_set.refresh_services(),
+        )
+        .map_err(MobileBackupError::Refresh)?;
+        Ok(backup_run_from_counts(counts))
+    })();
+    let finished = crate::unix_now();
+    let (status, summary) = match &result {
+        Ok(run) => ("ok", run.summary.as_str()),
+        Err(_) => ("error", "mobile backup failed"),
+    };
+    if let Err(error) =
+        LiveBackupRuntime.record_run(cfg, account, &started, &finished, status, summary)
+    {
+        eprintln!("isyncyou: could not record mobile backup run for {account}: {error}");
+    }
+    result
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackupServiceSet {
     mail: bool,

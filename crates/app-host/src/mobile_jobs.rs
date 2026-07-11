@@ -113,6 +113,97 @@ impl MobileJobExecutionError {
         }
     }
 
+    fn from_refresh(error: isyncyou_engine::RefreshFailure) -> Self {
+        use isyncyou_engine::RefreshFailureKind;
+        match error.kind {
+            RefreshFailureKind::Network => Self::Retryable {
+                code: MobileJobRetryCode::Network,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Timeout => Self::Retryable {
+                code: MobileJobRetryCode::Timeout,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(408) => Self::Retryable {
+                code: MobileJobRetryCode::Http408,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(425) => Self::Retryable {
+                code: MobileJobRetryCode::Http425,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(429) => Self::Retryable {
+                code: MobileJobRetryCode::RateLimited,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(500..=599) => Self::Retryable {
+                code: MobileJobRetryCode::Server,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Authentication => Self::terminal(
+                MobileJobFailureCode::Authentication,
+                "authentication required",
+            ),
+            RefreshFailureKind::Http(_) | RefreshFailureKind::Internal => {
+                Self::terminal(MobileJobFailureCode::Internal, error.redacted)
+            }
+        }
+    }
+
+    fn from_restore(error: isyncyou_engine::RestoreError) -> Self {
+        use isyncyou_engine::RestoreFailureKind;
+        let redacted = "cloud restore failed".to_string();
+        match error.kind {
+            RestoreFailureKind::Network => Self::Retryable {
+                code: MobileJobRetryCode::Network,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Timeout => Self::Retryable {
+                code: MobileJobRetryCode::Timeout,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(408) => Self::Retryable {
+                code: MobileJobRetryCode::Http408,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(425) => Self::Retryable {
+                code: MobileJobRetryCode::Http425,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(429) => Self::Retryable {
+                code: MobileJobRetryCode::RateLimited,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(500..=599) => Self::Retryable {
+                code: MobileJobRetryCode::Server,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Authentication => Self::terminal(
+                MobileJobFailureCode::Authentication,
+                "authentication required",
+            ),
+            RestoreFailureKind::Invalid => Self::terminal(
+                MobileJobFailureCode::InvalidIntent,
+                "invalid restore request",
+            ),
+            RestoreFailureKind::Http(_) | RestoreFailureKind::Internal => {
+                Self::terminal(MobileJobFailureCode::Internal, redacted)
+            }
+        }
+    }
+
     #[cfg(test)]
     fn retryable(code: MobileJobRetryCode, retry_after: Option<Duration>) -> Self {
         Self::Retryable {
@@ -133,8 +224,25 @@ impl MobileJobExecutor for LiveMobileJobExecutor {
         gate: &Arc<Mutex<()>>,
         services: &[String],
     ) -> Result<BackupRun, MobileJobExecutionError> {
-        crate::run_backup_account(cfg, account, gate, services)
-            .map_err(|e| MobileJobExecutionError::terminal(MobileJobFailureCode::Internal, e))
+        crate::agent_ops::run_mobile_backup_account(cfg, account, gate, services).map_err(|error| {
+            match error {
+                crate::agent_ops::MobileBackupError::InvalidRequest => {
+                    MobileJobExecutionError::terminal(
+                        MobileJobFailureCode::InvalidIntent,
+                        "invalid backup request",
+                    )
+                }
+                crate::agent_ops::MobileBackupError::Authentication => {
+                    MobileJobExecutionError::terminal(
+                        MobileJobFailureCode::Authentication,
+                        "authentication required",
+                    )
+                }
+                crate::agent_ops::MobileBackupError::Refresh(error) => {
+                    MobileJobExecutionError::from_refresh(error)
+                }
+            }
+        })
     }
 
     fn run_restore_cloud(
@@ -165,8 +273,8 @@ impl MobileJobExecutor for LiveMobileJobExecutor {
                     "authentication required",
                 )
             })?;
-        isyncyou_engine::restore_cloud(cfg, account, service, id, token)
-            .map_err(|e| MobileJobExecutionError::terminal(MobileJobFailureCode::Internal, e))
+        isyncyou_engine::restore_cloud_classified(cfg, account, service, id, token)
+            .map_err(MobileJobExecutionError::from_restore)
     }
 }
 
@@ -1307,6 +1415,140 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, MobileJobState::Failed);
+    }
+
+    #[test]
+    fn live_backup_refresh_errors_map_structurally_without_text_matching() {
+        let cases = [
+            (
+                isyncyou_engine::RefreshFailureKind::Network,
+                MobileJobRetryCode::Network,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Timeout,
+                MobileJobRetryCode::Timeout,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(408),
+                MobileJobRetryCode::Http408,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(425),
+                MobileJobRetryCode::Http425,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(429),
+                MobileJobRetryCode::RateLimited,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(503),
+                MobileJobRetryCode::Server,
+            ),
+        ];
+        for (kind, expected) in cases {
+            let mapped = MobileJobExecutionError::from_refresh(isyncyou_engine::RefreshFailure {
+                kind,
+                redacted: "unrelated text",
+            });
+            assert!(matches!(
+                mapped,
+                MobileJobExecutionError::Retryable { code, .. } if code == expected
+            ));
+        }
+        assert!(matches!(
+            MobileJobExecutionError::from_refresh(isyncyou_engine::RefreshFailure {
+                kind: isyncyou_engine::RefreshFailureKind::Internal,
+                redacted: "network timeout HTTP 503",
+            }),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::Internal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_restore_errors_map_structurally_without_text_matching() {
+        use isyncyou_graph::http::UploadError;
+
+        let graph_cases = [
+            (
+                UploadError::Transport("unrelated text".into()),
+                MobileJobRetryCode::Network,
+            ),
+            (
+                UploadError::Timeout("unrelated text".into()),
+                MobileJobRetryCode::Timeout,
+            ),
+            (
+                UploadError::Http {
+                    status: 408,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::Http408,
+            ),
+            (
+                UploadError::Http {
+                    status: 425,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::Http425,
+            ),
+            (
+                UploadError::Http {
+                    status: 429,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::RateLimited,
+            ),
+            (
+                UploadError::Http {
+                    status: 503,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::Server,
+            ),
+        ];
+        for (graph_error, expected) in graph_cases {
+            let mapped = MobileJobExecutionError::from_restore(
+                isyncyou_engine::RestoreError::from_graph(graph_error),
+            );
+            assert!(matches!(
+                mapped,
+                MobileJobExecutionError::Retryable { code, .. } if code == expected
+            ));
+        }
+
+        assert!(matches!(
+            MobileJobExecutionError::from_restore(isyncyou_engine::RestoreError::from_graph(
+                UploadError::Http {
+                    status: 401,
+                    body: "network timeout HTTP 503".into(),
+                },
+            )),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::Authentication,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MobileJobExecutionError::from_restore(isyncyou_engine::RestoreError::internal(
+                "network timeout HTTP 503",
+            )),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::Internal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MobileJobExecutionError::from_restore(isyncyou_engine::RestoreError::invalid(
+                "invalid request",
+            )),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::InvalidIntent,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -18,6 +18,10 @@ use std::path::Path;
 /// driver is unit-testable with a mock and live-tested with the real client.
 pub trait JsonFetcher {
     fn fetch_json(&self, url: &str) -> Result<Value, String>;
+
+    fn fetch_json_for_sync(&self, url: &str) -> Result<Value, SyncError> {
+        self.fetch_json(url).map_err(SyncError::Remote)
+    }
 }
 
 #[cfg(feature = "http")]
@@ -25,18 +29,30 @@ impl JsonFetcher for isyncyou_graph::GraphClient {
     fn fetch_json(&self, url: &str) -> Result<Value, String> {
         self.get_json(url).map_err(|e| e.to_string())
     }
+
+    fn fetch_json_for_sync(&self, url: &str) -> Result<Value, SyncError> {
+        self.get_json(url).map_err(SyncError::Graph)
+    }
 }
 
 /// Fetches a Graph resource's raw bytes by URL (for non-JSON bodies such as
 /// OneNote page HTML). Abstracted so the archive driver is mockable.
 pub trait BytesFetcher {
     fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String>;
+
+    fn fetch_bytes_for_sync(&self, url: &str) -> Result<Vec<u8>, SyncError> {
+        self.fetch_bytes(url).map_err(SyncError::Remote)
+    }
 }
 
 #[cfg(feature = "http")]
 impl BytesFetcher for isyncyou_graph::GraphClient {
     fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
         self.get_bytes(url).map_err(|e| e.to_string())
+    }
+
+    fn fetch_bytes_for_sync(&self, url: &str) -> Result<Vec<u8>, SyncError> {
+        self.get_bytes(url).map_err(SyncError::Graph)
     }
 }
 
@@ -88,7 +104,7 @@ fn archive_bodies<G>(
     fetch: G,
 ) -> Result<ArchiveReport, SyncError>
 where
-    G: Fn(&Item) -> Result<Vec<u8>, String>,
+    G: Fn(&Item) -> Result<Vec<u8>, SyncError>,
 {
     let mut report = ArchiveReport::default();
     for item in store.items_by_type(account, service, item_type)? {
@@ -99,7 +115,7 @@ where
         if limit != 0 && report.archived >= limit {
             break;
         }
-        let bytes = fetch(&item).map_err(SyncError::Remote)?;
+        let bytes = fetch(&item)?;
         let abs = shard_path(archive_root, service, &item.remote_id, ext);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
@@ -147,8 +163,8 @@ where
         "json",
         limit,
         |item| {
-            let json = fetcher.fetch_json(&url_for(item))?;
-            serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())
+            let json = fetcher.fetch_json_for_sync(&url_for(item))?;
+            serde_json::to_vec_pretty(&json).map_err(|e| SyncError::Remote(e.to_string()))
         },
     )
 }
@@ -179,7 +195,7 @@ where
         archive_root,
         ext,
         limit,
-        |item| fetcher.fetch_bytes(&url_for(item)),
+        |item| fetcher.fetch_bytes_for_sync(&url_for(item)),
     )
 }
 
@@ -322,9 +338,7 @@ pub fn backup_onenote_resources<F: BytesFetcher>(
             if abs.exists() {
                 report.skipped += 1;
             } else {
-                let bytes = fetcher
-                    .fetch_bytes(&resource.url)
-                    .map_err(SyncError::Remote)?;
+                let bytes = fetcher.fetch_bytes_for_sync(&resource.url)?;
                 let tmp = abs.with_extension(format!("{ext}.part"));
                 std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(&bytes))?;
                 std::fs::rename(&tmp, &abs)?;
