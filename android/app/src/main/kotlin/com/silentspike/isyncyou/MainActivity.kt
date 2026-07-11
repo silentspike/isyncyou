@@ -247,6 +247,9 @@ class MainActivity : FragmentActivity() {
         // traffic rides the preflighted origin-bound WebMessage bridge.
         android.util.Log.i(TAG, "engine ready (in-process), loading $APP_ORIGIN")
         pushDeviceState()
+        if (MobileJobWakeupPolicy.shouldReconcileAfterEngineReady(sessionToken)) {
+            bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+        }
         web.loadUrl("$APP_ORIGIN/")
     }
 

@@ -13,6 +13,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.StatFs
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
@@ -40,6 +41,17 @@ internal enum class MobileJobKindWire(val wire: String) {
 }
 
 internal data class MobileJobInput(val jobId: String, val kind: MobileJobKindWire)
+
+internal data class MobileJobConstraintsWire(
+    val wifiOnly: Boolean,
+    val chargingOnly: Boolean,
+    val minFreeBytes: Long,
+)
+
+internal data class MobileJobPlan(
+    val jobs: List<MobileJobInput>,
+    val constraints: MobileJobConstraintsWire,
+)
 
 internal data class MobileDeviceSnapshot(
     val networkValidated: Boolean,
@@ -96,6 +108,53 @@ internal object MobileJobWorkerPolicy {
     enum class WorkerResult { Success, Retry, Failure }
 }
 
+internal object MobileJobSchedulerPolicy {
+    const val MAX_JOBS = 64
+
+    fun parsePlan(raw: String): MobileJobPlan? = runCatching {
+        val plan = JSONObject(raw)
+        if (plan.optInt("v", -1) != 1 || plan.optString("status") != "ok") return null
+        val constraintsJson = plan.optJSONObject("constraints") ?: return null
+        val wifiOnly = constraintsJson.opt("wifi_only") as? Boolean ?: return null
+        val chargingOnly = constraintsJson.opt("charging_only") as? Boolean ?: return null
+        val minFree = (constraintsJson.opt("min_free_bytes") as? Number)?.toLong() ?: return null
+        if (minFree < 0) return null
+        val jobsJson = plan.optJSONArray("jobs") ?: return null
+        if (jobsJson.length() > MAX_JOBS) return null
+        val jobs = ArrayList<MobileJobInput>(jobsJson.length())
+        for (index in 0 until jobsJson.length()) {
+            val job = jobsJson.optJSONObject(index) ?: return null
+            val input = Data.Builder()
+                .putString(MobileJobWorkerPolicy.JOB_ID, job.optString("job_id", ""))
+                .putString(MobileJobWorkerPolicy.KIND, job.optString("kind", ""))
+                .build()
+            jobs += MobileJobWorkerPolicy.parseInput(input) ?: return null
+        }
+        MobileJobPlan(jobs, MobileJobConstraintsWire(wifiOnly, chargingOnly, minFree))
+    }.getOrNull()
+
+    fun workConstraints(policy: MobileJobConstraintsWire): Constraints = Constraints.Builder()
+        .setRequiredNetworkType(if (policy.wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED)
+        .setRequiresCharging(policy.chargingOnly)
+        .setRequiresBatteryNotLow(true)
+        .setRequiresStorageNotLow(true)
+        .build()
+}
+
+internal object MobileJobNotificationPolicy {
+    fun canPublish(
+        apiLevel: Int,
+        notificationsEnabled: Boolean,
+        runtimePermissionGranted: Boolean,
+        channelImportance: Int?,
+    ): Boolean {
+        if (!notificationsEnabled) return false
+        if (apiLevel >= 33 && !runtimePermissionGranted) return false
+        return apiLevel < 26 || channelImportance != null &&
+            channelImportance != NotificationManager.IMPORTANCE_NONE
+    }
+}
+
 internal interface MobileJobForegroundController {
     suspend fun publish(job: MobileJobInput): Boolean
 }
@@ -134,15 +193,22 @@ internal class AndroidMobileJobForegroundController(
     override suspend fun publish(job: MobileJobInput): Boolean {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return false
         ensureChannel(manager)
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) return false
-        if (Build.VERSION.SDK_INT >= 26) {
-            val channel = manager.getNotificationChannel(MobileJobWorkerPolicy.CHANNEL_ID)
-                ?: return false
-            if (channel.importance == NotificationManager.IMPORTANCE_NONE) return false
+        val permissionGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        val channelImportance = if (Build.VERSION.SDK_INT >= 26) {
+            manager.getNotificationChannel(MobileJobWorkerPolicy.CHANNEL_ID)?.importance
+        } else {
+            null
         }
+        if (!MobileJobNotificationPolicy.canPublish(
+                Build.VERSION.SDK_INT,
+                NotificationManagerCompat.from(context).areNotificationsEnabled(),
+                permissionGranted,
+                channelImportance,
+            )
+        ) return false
         val notification: Notification = NotificationCompat.Builder(
             context,
             MobileJobWorkerPolicy.CHANNEL_ID,
@@ -246,24 +312,23 @@ class MobileJobWorker(appContext: Context, params: WorkerParameters) : Coroutine
 }
 
 object MobileJobScheduler {
-    fun enqueue(context: Context, jobId: String, kind: String): Boolean {
+    private fun enqueue(
+        context: Context,
+        job: MobileJobInput,
+        policy: MobileJobConstraintsWire,
+    ): Boolean {
         val input = Data.Builder()
-            .putString(MobileJobWorkerPolicy.JOB_ID, jobId)
-            .putString(MobileJobWorkerPolicy.KIND, kind)
+            .putString(MobileJobWorkerPolicy.JOB_ID, job.jobId)
+            .putString(MobileJobWorkerPolicy.KIND, job.kind.wire)
             .build()
         if (MobileJobWorkerPolicy.parseInput(input) == null) return false
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .setRequiresBatteryNotLow(true)
-            .setRequiresStorageNotLow(true)
-            .build()
         val request = OneTimeWorkRequestBuilder<MobileJobWorker>()
             .setInputData(input)
-            .setConstraints(constraints)
+            .setConstraints(MobileJobSchedulerPolicy.workConstraints(policy))
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
         WorkManager.getInstance(context).enqueueUniqueWork(
-            "mobile-job:$jobId",
+            "mobile-job:${job.jobId}",
             ExistingWorkPolicy.KEEP,
             request,
         )
@@ -272,12 +337,9 @@ object MobileJobScheduler {
 
     /** Reconcile Rust's durable plan after an exact successful queue-producing POST. */
     fun reconcile(context: Context) {
-        val plan = runCatching { JSONObject(NativeEngine.nativeMobileJobPlan()) }.getOrNull() ?: return
-        if (plan.optInt("v", -1) != 1 || plan.optString("status") != "ok") return
-        val jobs = plan.optJSONArray("jobs") ?: return
-        for (index in 0 until jobs.length()) {
-            val job = jobs.optJSONObject(index) ?: continue
-            enqueue(context, job.optString("job_id", ""), job.optString("kind", ""))
+        val plan = MobileJobSchedulerPolicy.parsePlan(NativeEngine.nativeMobileJobPlan()) ?: return
+        for (job in plan.jobs) {
+            enqueue(context, job, plan.constraints)
         }
     }
 }

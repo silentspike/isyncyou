@@ -1,6 +1,7 @@
 package com.silentspike.isyncyou
 
 import androidx.work.Data
+import androidx.work.NetworkType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -107,5 +108,36 @@ class MobileJobWorkerPolicyTest {
         assertEquals(MobileJobWorkerPolicy.WorkerResult.Failure, outcome.result)
         assertEquals("notifications_required", outcome.code)
         assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun schedulerUsesRustPlanWifiAndChargingConstraints() {
+        val plan = MobileJobSchedulerPolicy.parsePlan(
+            """{"v":1,"status":"ok","jobs":[{"job_id":"job-1","kind":"backup"}],"constraints":{"wifi_only":true,"charging_only":true,"min_free_bytes":4096}}""",
+        )!!
+        assertEquals(4096L, plan.constraints.minFreeBytes)
+        val constraints = MobileJobSchedulerPolicy.workConstraints(plan.constraints)
+        assertEquals(NetworkType.UNMETERED, constraints.requiredNetworkType)
+        assertTrue(constraints.requiresCharging())
+        assertTrue(constraints.requiresBatteryNotLow())
+        assertTrue(constraints.requiresStorageNotLow())
+    }
+
+    @Test
+    fun schedulerRejectsMissingOrMalformedRustConstraints() {
+        assertNull(MobileJobSchedulerPolicy.parsePlan(
+            """{"v":1,"status":"ok","jobs":[],"constraints":{"wifi_only":"true","charging_only":false,"min_free_bytes":1}}""",
+        ))
+        assertNull(MobileJobSchedulerPolicy.parsePlan(
+            """{"v":1,"status":"ok","jobs":[]}""",
+        ))
+    }
+
+    @Test
+    fun pre33GlobalNotificationDisableFailsClosed() {
+        assertTrue(!MobileJobNotificationPolicy.canPublish(28, false, true, 2))
+        assertTrue(MobileJobNotificationPolicy.canPublish(28, true, true, 2))
+        assertTrue(!MobileJobNotificationPolicy.canPublish(33, true, false, 2))
+        assertTrue(!MobileJobNotificationPolicy.canPublish(33, true, true, 0))
     }
 }

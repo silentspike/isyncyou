@@ -15,4 +15,6 @@ internal object MobileJobWakeupPolicy {
         val path = value.substringBefore('?')
         return path in paths
     }
+
+    fun shouldReconcileAfterEngineReady(sessionToken: String): Boolean = sessionToken.isNotBlank()
 }

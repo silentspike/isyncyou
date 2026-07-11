@@ -20,4 +20,10 @@ class MobileJobWakeupPolicyTest {
         assertFalse(MobileJobWakeupPolicy.shouldReconcile("POST", null, 200))
         assertFalse(MobileJobWakeupPolicy.shouldReconcile("POST", "https://evil.example/api/v1/backup", 200))
     }
+
+    @Test
+    fun coldStartReconcilesImmediatelyAfterEngineTokenArrives() {
+        assertFalse(MobileJobWakeupPolicy.shouldReconcileAfterEngineReady(""))
+        assertTrue(MobileJobWakeupPolicy.shouldReconcileAfterEngineReady("native-session"))
+    }
 }
