@@ -1,6 +1,6 @@
 Issue #626 host and Android gate summary
-Implementation commit: 09a2d954e082afe7d6bc038d225e0a8969ee4d66
-Rust source tested through: fd1d2e8e3649a66b547ecbe42990d6954a8c95fd
+Implementation commit: 10a6fe79df12100743a09f9f37f65147b24870aa
+Rust source tested through: 10a6fe79df12100743a09f9f37f65147b24870aa
 
 PASS cargo remote -c -- test --workspace --no-fail-fast
 PASS cargo remote -c -- clippy --workspace --all-targets -- -D warnings
@@ -12,9 +12,17 @@ PASS python3 tools/check_traceability.py
 PASS (cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --console=plain --no-daemon)
 PASS MobileJobWorkerInstrumentedTest on physical Pixel 8 Pro (1 test)
 PASS AgentCredentialKeyStoreInstrumentedTest on physical Pixel 8 Pro (2 tests)
+PASS BiometricPromptInstrumentedTest API-30+ StrongCrypto PromptInfo builder (1 test)
+NOT EXECUTED physical StrongCrypto prompt: no Strong Biometric is enrolled; PIN/device
+credential is the owner-selected and physically verified product user-presence path.
 PASS debugRuntimeClasspath contains no work-multiprocess dependency
 PASS merged debug manifest contains no android:process and declares dataSync for SystemForegroundService
 PASS independently clean-built default APK contains no mobile-job device-test hook strings
 
 The first clean Android lint run found two minSdk-24 compatibility errors. Commit
 09a2d954 fixed both; the complete Android unit/lint/assemble gate then passed.
+
+The post-implementation audit fixes through 10a6fe7 were followed by another clean
+Android unit/lint/assemble build, final APK negative hook scan, full workspace test,
+full workspace clippy, remote fmt check, and an exact-APK real mail backup on the
+Pixel 8 Pro. The product backup reached terminal state succeeded.

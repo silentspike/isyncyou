@@ -1,8 +1,8 @@
 {
   "issue": 626,
-  "implementation_commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
-  "rust_source_commit": "fd1d2e8e3649a66b547ecbe42990d6954a8c95fd",
-  "captured_at": "2026-07-11T12:45:00+02:00",
+  "implementation_commit": "10a6fe79df12100743a09f9f37f65147b24870aa",
+  "rust_source_commit": "10a6fe79df12100743a09f9f37f65147b24870aa",
+  "captured_at": "2026-07-11T15:20:00+02:00",
   "tests": {
     "workspace_tests": "pass",
     "workspace_clippy_deny_warnings": "pass",
@@ -12,6 +12,8 @@
     "android_default_assemble": "pass",
     "android_same_process_instrumentation": "pass_1_of_1",
     "android_keystore_instrumentation": "pass_2_of_2",
+    "android_strong_prompt_builder_instrumentation": "pass_1_of_1",
+    "android_strong_prompt_physical": "not_executed_no_strong_biometric_enrolled",
     "node_syntax": "pass",
     "python_probe_tests": "pass_2_of_2",
     "python_test_discovery_tests": "pass_2_of_2",
@@ -20,11 +22,33 @@
     "merged_manifest_single_process": true,
     "default_apk_hook_scan": "pass_no_matches"
   },
-  "finding_fixed": {
-    "gate": "android_lint",
-    "initial_result": "fail",
-    "reason": "two API calls exceeded minSdk 24",
-    "fix_commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
-    "final_result": "pass"
-  }
+  "findings_fixed": [
+    {
+      "gate": "android_lint",
+      "initial_result": "fail",
+      "reason": "two API calls exceeded minSdk 24",
+      "fix_commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
+      "final_result": "pass"
+    },
+    {
+      "gate": "post_implementation_audit",
+      "reason": "strong prompt compatibility, early key wiping, typed retry classification, worker-busy deferral, scheduler constraints, notification/cold-start recovery, and pending-handle prompt dedupe required hardening",
+      "fix_commits": [
+        "2450e36",
+        "30d0589",
+        "69f8916",
+        "658cea0",
+        "8a7e5b4",
+        "6346503"
+      ],
+      "final_result": "pass_host_and_available_device_paths"
+    },
+    {
+      "gate": "real_product_backup",
+      "initial_result": "fail_authentication_required",
+      "reason": "standalone mobile backup resolved only a read token although mobile had a valid write token",
+      "fix_commit": "10a6fe7",
+      "final_result": "pass_succeeded_on_pixel_8_pro"
+    }
+  ]
 }

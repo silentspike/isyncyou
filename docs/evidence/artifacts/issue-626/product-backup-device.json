@@ -1,0 +1,28 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "apk_sha256": "ccde83caa20c8f780ff0da18c136bf2ac37d87cb1822918e3e045502d1210125",
+  "source_commit": "10a6fe79df12100743a09f9f37f65147b24870aa",
+  "transport": "USB ADB plus production WebView bridge",
+  "account": "me",
+  "service": "mail",
+  "credential_evidence": {
+    "fresh_real_m365_token_installed": true,
+    "token_value_captured": false,
+    "token_file_mode": "0600"
+  },
+  "finding": {
+    "before_fix_job_state": "failed",
+    "before_fix_error_class": "authentication",
+    "cause": "standalone backup worker did not fall back from a missing read token to the installed mobile write token"
+  },
+  "after_fix": {
+    "job_id": "mobile-backup-1783775710498-0",
+    "initial_state": "queued",
+    "terminal_state": "succeeded",
+    "last_error": null,
+    "store_database_updated": true,
+    "cloud_mutation": false
+  },
+  "secret_scan": "no token, refresh token, account email, or OAuth query material recorded"
+}

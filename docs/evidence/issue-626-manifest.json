@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-11T12:45:00+02:00",
-  "commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
+  "generated_at": "2026-07-11T15:20:00+02:00",
+  "commit": "10a6fe79df12100743a09f9f37f65147b24870aa",
   "entries": [
     {
       "id": "EV-001",
@@ -145,6 +145,56 @@
       "command": "Physical Pixel 8 Pro post-test state readback and cleanup",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-626/device-state-restoration.json"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AND-016",
+      "claim": "The API-30+ StrongCrypto PromptInfo/CryptoObject path builds with the required negative action and cannot downgrade to device credential.",
+      "method": "test",
+      "command": "(cd android && ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.BiometricPromptInstrumentedTest)",
+      "test": "api30PlusStrongCryptoPromptBuildsWithCancelButton",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/biometric-device.json",
+      "notes": "The Pixel has no Strong Biometric enrolled. Physical StrongCrypto prompt execution is explicitly not claimed; the owner-selected PIN/device-credential path remains the physical user-presence proof."
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AND-016",
+      "claim": "The exact final default APK runs a real mail backup through the production WorkManager path using the installed mobile credential and reaches succeeded.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro production WebView bridge enqueue followed by mobile-job status polling and store readback",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/product-backup-device.json"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AND-016",
+      "claim": "Product backup errors are mapped structurally to terminal or retry outcomes without parsing error strings.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "live_backup_refresh_errors_map_structurally_without_text_matching",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/post-audit-fixes.json"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AND-016",
+      "claim": "Product restore errors are mapped structurally to terminal or retry outcomes without parsing error strings.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "live_restore_errors_map_structurally_without_text_matching",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/post-audit-fixes.json"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AND-016",
+      "claim": "A second concurrent mobile worker receives a typed retry outcome instead of terminally abandoning a queued job.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "concurrent_mobile_workers_defer_second_as_worker_busy",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/post-audit-fixes.json"
     }
   ]
 }

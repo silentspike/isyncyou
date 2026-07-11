@@ -18,7 +18,10 @@
     "validated_network": true
   },
   "state_restored": true,
+  "final_readback_at": "2026-07-11T15:22:00+02:00",
+  "final_source_commit": "10a6fe79df12100743a09f9f37f65147b24870aa",
   "adb_forward_removed": true,
+  "instrumentation_test_package_removed": true,
   "test_markers_removed": true,
   "temporary_m365_token_files_removed": true,
   "cloud_restore_policy_restored_to_false": true
