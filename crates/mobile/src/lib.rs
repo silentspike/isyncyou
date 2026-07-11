@@ -1081,18 +1081,14 @@ fn native_mobile_job_run_json(request_json: &str) -> String {
         Ok(isyncyou_app_host::MobileJobRunOutcome::Failed { code, .. }) => {
             serde_json::json!({"v": 1, "status": "failed", "code": code.as_str()}).to_string()
         }
-        Ok(isyncyou_app_host::MobileJobRunOutcome::Skipped { reason, .. }) => {
-            let status = if reason == "worker_busy" {
-                "retry"
-            } else {
-                "skipped"
-            };
-            serde_json::json!({"v": 1, "status": status, "code": reason}).to_string()
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Deferred { code, .. }) => {
+            serde_json::json!({"v": 1, "status": "retry", "code": code.as_str()}).to_string()
+        }
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Noop { code, .. }) => {
+            serde_json::json!({"v": 1, "status": "succeeded", "code": code.as_str()}).to_string()
         }
         Err(error) => {
-            let code = if error == "worker_busy" {
-                "worker_busy"
-            } else if error == "job_kind_mismatch" {
+            let code = if error == "job_kind_mismatch" {
                 "kind_mismatch"
             } else {
                 "internal"

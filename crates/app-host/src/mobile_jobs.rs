@@ -189,10 +189,52 @@ pub enum MobileJobRunOutcome {
         code: MobileJobRetryCode,
         retry_after_secs: Option<u64>,
     },
-    Skipped {
+    Deferred {
         job_id: String,
-        reason: String,
+        code: MobileJobDeferredCode,
     },
+    Noop {
+        job_id: String,
+        code: MobileJobNoopCode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobDeferredCode {
+    DeviceStateUnavailable,
+    WifiOnly,
+    ChargingOnly,
+    InsufficientStorage,
+    WorkerBusy,
+    LeaseNotAcquired,
+}
+
+impl MobileJobDeferredCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceStateUnavailable => "device_state_unavailable",
+            Self::WifiOnly => "wifi_only",
+            Self::ChargingOnly => "charging_only",
+            Self::InsufficientStorage => "insufficient_storage",
+            Self::WorkerBusy => "worker_busy",
+            Self::LeaseNotAcquired => "lease_not_acquired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobNoopCode {
+    JobNoLongerRunning,
+    JobStateChanged,
+}
+
+impl MobileJobNoopCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::JobNoLongerRunning => "job_no_longer_running",
+            Self::JobStateChanged => "job_state_changed",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -406,33 +448,35 @@ impl MobileJobRuntime {
         device: MobileWorkerDeviceSnapshot,
     ) -> Result<MobileJobRunOutcome, String> {
         if !device.network_validated {
-            return Ok(MobileJobRunOutcome::Skipped {
+            return Ok(MobileJobRunOutcome::Deferred {
                 job_id: job_id.to_string(),
-                reason: "device_state_unavailable".to_string(),
+                code: MobileJobDeferredCode::DeviceStateUnavailable,
             });
         }
         if device.metered && self.cfg.sync.wifi_only {
-            return Ok(MobileJobRunOutcome::Skipped {
+            return Ok(MobileJobRunOutcome::Deferred {
                 job_id: job_id.to_string(),
-                reason: "wifi_only".to_string(),
+                code: MobileJobDeferredCode::WifiOnly,
             });
         }
         if !device.charging && self.cfg.sync.charging_only {
-            return Ok(MobileJobRunOutcome::Skipped {
+            return Ok(MobileJobRunOutcome::Deferred {
                 job_id: job_id.to_string(),
-                reason: "charging_only".to_string(),
+                code: MobileJobDeferredCode::ChargingOnly,
             });
         }
         if device.free_bytes < self.cfg.sync.min_free_bytes {
-            return Ok(MobileJobRunOutcome::Skipped {
+            return Ok(MobileJobRunOutcome::Deferred {
                 job_id: job_id.to_string(),
-                reason: "insufficient_storage".to_string(),
+                code: MobileJobDeferredCode::InsufficientStorage,
             });
         }
-        let _guard = self
-            .execution_guard
-            .try_lock()
-            .map_err(|_| "worker_busy".to_string())?;
+        let Ok(_guard) = self.execution_guard.try_lock() else {
+            return Ok(MobileJobRunOutcome::Deferred {
+                job_id: job_id.to_string(),
+                code: MobileJobDeferredCode::WorkerBusy,
+            });
+        };
         let (_, job) = self.find_job(job_id)?;
         if job.kind != expected_kind {
             return Err("job_kind_mismatch".to_string());
@@ -452,9 +496,9 @@ impl MobileJobRuntime {
                 )
                 .map_err(|e| format!("lease mobile job {job_id}: {e}"))?;
             if !acquired {
-                return Ok(MobileJobRunOutcome::Skipped {
+                return Ok(MobileJobRunOutcome::Deferred {
                     job_id: job_id.to_string(),
-                    reason: "lease_not_acquired".to_string(),
+                    code: MobileJobDeferredCode::LeaseNotAcquired,
                 });
             }
             self.events.notify();
@@ -493,9 +537,9 @@ impl MobileJobRuntime {
                     .map_err(|e| format!("finish mobile job {}: {e}", job.job_id))?;
                 if !finished {
                     self.events.notify();
-                    return Ok(MobileJobRunOutcome::Skipped {
+                    return Ok(MobileJobRunOutcome::Noop {
                         job_id: job.job_id,
-                        reason: "job_no_longer_running".to_string(),
+                        code: MobileJobNoopCode::JobNoLongerRunning,
                     });
                 }
                 self.record_job_activity(&store, &job, "succeeded", &summary)?;
@@ -529,9 +573,9 @@ impl MobileJobRuntime {
                         )
                         .map_err(|e| format!("requeue mobile job {}: {e}", job.job_id))?;
                     if !requeued {
-                        return Ok(MobileJobRunOutcome::Skipped {
+                        return Ok(MobileJobRunOutcome::Noop {
                             job_id: job.job_id,
-                            reason: "job_state_changed".into(),
+                            code: MobileJobNoopCode::JobStateChanged,
                         });
                     }
                     self.events.notify();
@@ -572,9 +616,9 @@ impl MobileJobRuntime {
                         }
                         Ok(false) => {
                             self.events.notify();
-                            Ok(MobileJobRunOutcome::Skipped {
+                            Ok(MobileJobRunOutcome::Noop {
                                 job_id: job.job_id,
-                                reason: "job_state_changed".to_string(),
+                                code: MobileJobNoopCode::JobStateChanged,
                             })
                         }
                         Err(e) => Err(format!("fail mobile job {}: {e}", job.job_id)),
@@ -844,6 +888,7 @@ mod tests {
     use crate::{BackupDelta, BackupRun};
     use isyncyou_core::AccountConfig;
     use std::path::PathBuf;
+    use std::sync::Condvar;
 
     #[derive(Default)]
     struct RecordingExecutor {
@@ -941,6 +986,65 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BlockingExecutor {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl BlockingExecutor {
+        fn wait_until_entered(&self) {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |(entered, _)| !*entered)
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(!timeout.timed_out(), "first worker did not enter executor");
+            assert!(state.0);
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl MobileJobExecutor for BlockingExecutor {
+        fn run_backup(
+            &self,
+            _cfg: &Config,
+            _account: &str,
+            _gate: &Arc<Mutex<()>>,
+            _services: &[String],
+        ) -> Result<BackupRun, MobileJobExecutionError> {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            Ok(BackupRun {
+                summary: "backup ok".to_string(),
+                delta: BackupDelta::default(),
+            })
+        }
+
+        fn run_restore_cloud(
+            &self,
+            _cfg: &Config,
+            _account: &str,
+            _service: &str,
+            _id: &str,
+            _gate: &Arc<Mutex<()>>,
+        ) -> Result<String, MobileJobExecutionError> {
+            Err(MobileJobExecutionError::terminal(
+                MobileJobFailureCode::Unsupported,
+                "restore not used by concurrency test",
+            ))
+        }
+    }
+
     fn temp_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "isyncyou-mobile-jobs-{name}-{}-{}",
@@ -1022,6 +1126,59 @@ mod tests {
         assert!(runs
             .iter()
             .any(|run| run.kind == "mobile-job:backup" && run.status == "succeeded"));
+    }
+
+    #[test]
+    fn concurrent_mobile_workers_defer_second_as_worker_busy() {
+        let executor = Arc::new(BlockingExecutor::default());
+        let runtime = Arc::new(MobileJobRuntime::with_executor(
+            test_cfg("worker-busy"),
+            Arc::new(Mutex::new(())),
+            Arc::new(isyncyou_webui::EventBus::new()),
+            executor.clone(),
+        ));
+        let job = runtime.enqueue_backup("me", &["mail".to_string()]).unwrap();
+        let first_runtime = runtime.clone();
+        let first_job_id = job.job_id.clone();
+        let first = std::thread::spawn(move || {
+            first_runtime.run_mobile_job_for_worker(
+                &first_job_id,
+                MobileJobKind::Backup,
+                MobileWorkerDeviceSnapshot {
+                    network_validated: true,
+                    metered: false,
+                    charging: true,
+                    free_bytes: u64::MAX,
+                },
+            )
+        });
+        executor.wait_until_entered();
+
+        let second = runtime
+            .run_mobile_job_for_worker(
+                &job.job_id,
+                MobileJobKind::Backup,
+                MobileWorkerDeviceSnapshot {
+                    network_validated: true,
+                    metered: false,
+                    charging: true,
+                    free_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            second,
+            MobileJobRunOutcome::Deferred {
+                code: MobileJobDeferredCode::WorkerBusy,
+                ..
+            }
+        ));
+
+        executor.release();
+        assert!(matches!(
+            first.join().unwrap().unwrap(),
+            MobileJobRunOutcome::Succeeded { .. }
+        ));
     }
 
     #[test]
