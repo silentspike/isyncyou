@@ -7,7 +7,10 @@ mod agent_ops;
 mod mobile_jobs;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
-pub use mobile_jobs::{MobileJobRunOutcome, MobileJobRuntime};
+pub use mobile_jobs::{
+    MobileJobExecutionError, MobileJobFailureCode, MobileJobKind, MobileJobRetryCode,
+    MobileJobRunOutcome, MobileJobRuntime, MobileWorkerDeviceSnapshot,
+};
 
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
@@ -281,12 +284,6 @@ fn agent_action_summary(action: &isyncyou_agent::ToolAction) -> String {
         parts.push(format!(
             "service={}",
             agent_ops::redact_agent_operation_text(service)
-        ));
-    }
-    if let Some(item) = action.item_or_target() {
-        parts.push(format!(
-            "item={}",
-            agent_ops::redact_agent_operation_text(item)
         ));
     }
     parts.join(" ")
@@ -3583,7 +3580,7 @@ mod tests {
         assert!(!audit_text.contains("user@example.com"));
         assert!(!audit_text.contains("oauth-code"));
         assert!(!audit_text.contains("restore failed for"));
-        assert!(audit_text.contains("<redacted-url>"));
+        assert!(!audit_text.contains("<redacted-url>"));
         assert!(audit_text.contains("<redacted-email>"));
         assert!(audit_text.contains("execution_failed"));
         let _ = std::fs::remove_dir_all(root);
@@ -3606,10 +3603,29 @@ mod tests {
 
         assert!(summary.contains("op=share"));
         assert!(summary.contains("service=onedrive"));
-        assert!(summary.contains("item=item-1"));
+        assert!(!summary.contains("item-1"));
         assert!(!summary.contains("owner@example.com"));
         assert!(!summary.contains("recipient@example.com"));
         assert!(summary.contains("<redacted-email>"));
+    }
+
+    #[test]
+    fn agent_live_write_audit_summary_omits_target_identifiers() {
+        let action = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "todo",
+            "target": "private-task-id",
+            "change": { "verb": "complete", "list_id": "private-list-id" }
+        }))
+        .unwrap();
+
+        let summary = agent_action_summary(&action);
+
+        assert!(summary.contains("op=live-write"));
+        assert!(summary.contains("service=todo"));
+        assert!(!summary.contains("private-task-id"));
+        assert!(!summary.contains("private-list-id"));
     }
 
     #[test]

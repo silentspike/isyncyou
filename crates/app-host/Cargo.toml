@@ -18,6 +18,7 @@ isyncyou-webui = { path = "../../gui/webui", default-features = false }
 # compile the product OAuth provider/retrieval path or the #627 local fallback surface.
 isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
+ring = "0.17"
 
 [dev-dependencies]
 filetime = "0.2"
@@ -55,3 +56,6 @@ agent-subscription-experimental = [
     "agent-oauth-providers",
     "isyncyou-agent/agent-subscription-experimental",
 ]
+# TEST/EVIDENCE ONLY, default-OFF: bounded app-private hold points for mobile
+# process-death recovery evidence. Never reachable from the product router.
+mobile-job-device-test-hooks = []

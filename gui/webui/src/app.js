@@ -421,7 +421,7 @@ async function registerPushToken() {
 /* Ask the native side (#0.6) to run a BiometricPrompt and, on success, arm the server's
    per-action token for `pat`. Resolves true only if the human authenticated. Without the
    native bridge there is no biometric path, so a destructive op cannot be confirmed. */
-function runBiometricConfirm(pat, label) {
+function runBiometricConfirm(pat) {
   if (!BRIDGE) return Promise.resolve(false);
   return new Promise((resolve) => {
     const id = "b" + (++_bridgeSeq);
@@ -432,7 +432,7 @@ function runBiometricConfirm(pat, label) {
     _bioPending.set(id, { resolve, timer });
     _bridgeStats.bio++;
     try {
-      BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat, label }));
+      BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat }));
     } catch (_) {
       clearTimeout(timer);
       _bioPending.delete(id);
@@ -528,7 +528,7 @@ async function request(method, path, opts) {
   // a request that already carries `_pat` is never re-challenged into another biometric.
   if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
       && d.pending_action_id && !/[?&]_pat=/.test(path)) {
-    const ok = await runBiometricConfirm(d.pending_action_id, biometricLabel(d));
+    const ok = await runBiometricConfirm(d.pending_action_id);
     if (!ok) throw new Error("Confirmation cancelled");
     const sep = path.includes("?") ? "&" : "?";
     return request(method, `${path}${sep}_pat=${encodeURIComponent(d.pending_action_id)}`, opts);

@@ -1,6 +1,7 @@
 package com.silentspike.isyncyou
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
@@ -82,11 +83,13 @@ class MainActivity : FragmentActivity() {
     )
 
     private data class PendingBio(
+        val requestId: String,
         val prompt: BiometricPrompt,
         val timeout: Runnable,
     )
 
-    private val bioPending = ConcurrentHashMap<String, PendingBio>()
+    /** One active native prompt per opaque PendingAction handle. */
+    private val bioPending = BiometricPendingRegistry<PendingBio>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -244,6 +247,9 @@ class MainActivity : FragmentActivity() {
         // traffic rides the preflighted origin-bound WebMessage bridge.
         android.util.Log.i(TAG, "engine ready (in-process), loading $APP_ORIGIN")
         pushDeviceState()
+        if (MobileJobWakeupPolicy.shouldReconcileAfterEngineReady(sessionToken)) {
+            bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+        }
         web.loadUrl("$APP_ORIGIN/")
     }
 
@@ -271,6 +277,20 @@ class MainActivity : FragmentActivity() {
         // Refresh the device conditions on return to the foreground (cheap; the engine's offline
         // pass reads the latest each cycle). Safe before the engine is up — it only sets a global.
         pushDeviceState()
+        if (sessionToken.isNotEmpty()) bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1 && sessionToken.isNotEmpty()) {
+            // Notification denial leaves jobs queued; a later permission callback is
+            // an explicit reconciliation point, not an automatic retry loop.
+            bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+        }
     }
 
     private fun currentPushToken(): String {
@@ -401,6 +421,7 @@ class MainActivity : FragmentActivity() {
                         JSONObject().put("error", "internal_error"),
                     )
                 }
+                reconcileMobileJobsAfterSuccess(obj, resp)
                 reply.postMessage(resp)
             }
             "sub" -> {
@@ -418,12 +439,20 @@ class MainActivity : FragmentActivity() {
             "bio" -> {
                 val reqId = validation.id
                 val pat = obj.optString("pat")
-                val label = obj.optString("label").ifEmpty { "Confirm this action" }
-                runOnUiThread { runBiometric(reqId, pat, label, reply) }
+                runOnUiThread { runBiometric(reqId, pat, reply) }
             }
             "native" -> {
                 handleNativeMessage(obj, validation.id, reply)
             }
+        }
+    }
+
+    private fun reconcileMobileJobsAfterSuccess(request: JSONObject, response: String) {
+        val method = request.optString("method", "")
+        val path = request.optString("path", "")
+        val status = runCatching { JSONObject(response).optInt("status", -1) }.getOrDefault(-1)
+        if (MobileJobWakeupPolicy.shouldReconcile(method, path, status)) {
+            MobileJobScheduler.reconcile(this)
         }
     }
 
@@ -577,35 +606,42 @@ class MainActivity : FragmentActivity() {
         null
     }
 
-    /**
-     * Show a `BiometricPrompt` (#onedrive-mobile 0.6, #WP-8). Prefer a **crypto-bound
-     * strong-biometric** confirmation: on success, run a crypto op with the biometric-unlocked
-     * Keystore key ([bioConfirmCipher]) — proof of a real strong-biometric auth. When **no strong
-     * biometric is enrolled**, fall back to a **device-credential (PIN/pattern)** confirmation:
-     * a CryptoObject cannot ride a device credential (Android restriction on all API levels), so
-     * the fallback is a plain user-presence gate — far better than denying a legitimate destructive
-     * op (requiring STRONG only regressed PIN-only devices). Either way, arm the server-side
-     * per-action token over the JNI-only [NativeEngine.nativeConfirmAction] path (the WebView
-     * cannot reach it) and reply `{t:"bio",id,ok}`. Must be called on the UI thread.
-     */
-    private fun runBiometric(reqId: String, pat: String, label: String, reply: JavaScriptReplyProxy) {
-        fun done(ok: Boolean) = completeBiometric(reqId, reply, ok)
+    /** Show a native prompt using only the Rust-owned pending descriptor. */
+    private fun runBiometric(reqId: String, pat: String, reply: JavaScriptReplyProxy) {
+        val descriptor = try {
+            JSONObject(NativeEngine.nativeDescribePendingAction(pat)).let { result ->
+                if (result.optString("status") != "ok") return reply.postMessage(bioReplyJson(reqId, false))
+                val op = result.optString("op")
+                val service = result.optString("service")
+                if (op.isBlank() || service.isBlank()) return reply.postMessage(bioReplyJson(reqId, false))
+                BiometricLabelPolicy.label(op, service)
+                    ?: return reply.postMessage(bioReplyJson(reqId, false))
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "pending action descriptor unavailable", e)
+            reply.postMessage(bioReplyJson(reqId, false))
+            return
+        }
         val mgr = BiometricManager.from(this)
         val strong = BiometricManager.Authenticators.BIOMETRIC_STRONG
-        // Crypto-bound path only when a strong biometric is actually enrolled; otherwise fall back
-        // to a device-credential confirmation (no CryptoObject — the successful auth is the proof).
-        val cipher =
-            if (mgr.canAuthenticate(strong) == BiometricManager.BIOMETRIC_SUCCESS) bioConfirmCipher() else null
-        val authenticators =
-            if (cipher != null) strong else strong or BiometricManager.Authenticators.DEVICE_CREDENTIAL
-        if (mgr.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
-            android.util.Log.w(TAG, "no biometric or device credential available; destructive op denied")
+        val strongAvailable = mgr.canAuthenticate(strong) == BiometricManager.BIOMETRIC_SUCCESS
+        val cipher = if (strongAvailable) bioConfirmCipher() else null
+        val credential = BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        val credentialAvailable = BiometricPolicy.credentialAvailable(
+            apiLevel = Build.VERSION.SDK_INT,
+            biometricManagerAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                mgr.canAuthenticate(credential) == BiometricManager.BIOMETRIC_SUCCESS,
+            keyguardDeviceSecure = getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true,
+        )
+        val decision = BiometricPolicy.choose(strongAvailable, cipher != null, credentialAvailable)
+        if (decision == null) {
+            android.util.Log.w(TAG, "biometric confirmation unavailable or strong cipher failed")
             reply.postMessage(bioReplyJson(reqId, false))
             return
         }
         lateinit var prompt: BiometricPrompt
         val timeout = Runnable {
-            bioPending.remove(reqId)?.let { pending ->
+            takePendingBiometric(pat, reqId)?.let { pending ->
                 pending.prompt.cancelAuthentication()
                 reply.postMessage(bioReplyJson(reqId, false))
             }
@@ -615,59 +651,74 @@ class MainActivity : FragmentActivity() {
             ContextCompat.getMainExecutor(this),
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    val pending = takePendingBiometric(pat, reqId) ?: return
+                    mainHandler.removeCallbacks(pending.timeout)
                     val armed = try {
-                        if (cipher != null) {
+                        if (decision.mode == BiometricMode.StrongCrypto) {
                             // Crypto path: the op must succeed under the biometric-unlocked key —
                             // fail-closed if the result carries no crypto object.
                             result.cryptoObject?.cipher?.doFinal(pat.toByteArray(Charsets.UTF_8))
                                 ?: throw IllegalStateException("no crypto object in auth result")
                         }
-                        // Device-credential fallback has no crypto object; the successful auth is
-                        // itself the user-presence proof.
                         NativeEngine.nativeConfirmAction(pat)
                     } catch (e: Exception) {
                         android.util.Log.w(TAG, "confirm crypto/arming failed", e)
                         false
                     }
-                    done(armed)
+                    reply.postMessage(bioReplyJson(reqId, armed))
                 }
 
-                override fun onAuthenticationError(code: Int, msg: CharSequence) = done(false)
+                override fun onAuthenticationError(code: Int, msg: CharSequence) =
+                    completeBiometric(pat, reqId, reply, false)
 
                 // A single non-match keeps the prompt up; no reply until success/error/cancel.
                 override fun onAuthenticationFailed() {}
             },
         )
-        bioPending.put(reqId, PendingBio(prompt, timeout))?.let { old ->
-            mainHandler.removeCallbacks(old.timeout)
-            old.prompt.cancelAuthentication()
+        val pending = PendingBio(reqId, prompt, timeout)
+        if (!bioPending.register(pat, pending)) {
+            reply.postMessage(bioReplyJson(reqId, false))
+            return
         }
         mainHandler.postDelayed(timeout, BIO_TIMEOUT_MS)
-        val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Confirm action")
-            .setSubtitle(label)
-            .setAllowedAuthenticators(authenticators)
-            .build()
-        if (cipher != null) {
-            prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
-        } else {
-            prompt.authenticate(info)
+        try {
+            val info = BiometricPolicy.buildPromptInfo(
+                Build.VERSION.SDK_INT,
+                decision,
+                "Confirm action",
+                descriptor,
+            )
+            if (decision.mode == BiometricMode.StrongCrypto) {
+                prompt.authenticate(info, BiometricPrompt.CryptoObject(checkNotNull(cipher)))
+            } else {
+                prompt.authenticate(info)
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "biometric prompt failed to start", e)
+            completeBiometric(pat, reqId, reply, false)
         }
     }
 
-    private fun completeBiometric(reqId: String, reply: JavaScriptReplyProxy, ok: Boolean) {
-        val pending = bioPending.remove(reqId) ?: return
+    private fun completeBiometric(
+        pat: String,
+        reqId: String,
+        reply: JavaScriptReplyProxy,
+        ok: Boolean,
+    ) {
+        val pending = takePendingBiometric(pat, reqId) ?: return
         mainHandler.removeCallbacks(pending.timeout)
         reply.postMessage(bioReplyJson(reqId, ok))
+    }
+
+    private fun takePendingBiometric(pat: String, reqId: String): PendingBio? {
+        return bioPending.take(pat) { it.requestId == reqId }
     }
 
     private fun bioReplyJson(reqId: String, ok: Boolean): String =
         JSONObject().put("t", "bio").put("id", reqId).put("ok", ok).toString()
 
     private fun cancelPendingBiometrics() {
-        val pending = bioPending.values.toList()
-        bioPending.clear()
-        pending.forEach {
+        bioPending.drain().forEach {
             mainHandler.removeCallbacks(it.timeout)
             it.prompt.cancelAuthentication()
         }

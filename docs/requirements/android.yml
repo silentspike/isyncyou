@@ -257,14 +257,16 @@ requirements:
       queued as resumable durable jobs; Agent confirmations bind a PendingAction before
       consuming the one-time confirmation token; route execution remains session/cap
       gated and then per-action biometric-token gated. This deliberately supersedes
-      REQ-AND-013, but the complete requirement remains planned until #626 proves the
-      native Android layer: physical BiometricPrompt, Android Keystore-backed mobile
+      REQ-AND-013. #626 completes the native Android layer with physical
+      BiometricPrompt/device-credential user presence, Android Keystore-backed mobile
       credentials, foreground-service/WorkManager job presentation, and device recovery
       evidence. (Stories S-AG.10/#625 + S-AG.11/#626.)
-    status: planned
+    status: implemented
     note: >
       server_contract: implemented_by #625; native_foreground_biometric_keystore_proof:
-      pending #626. Do not mark this requirement fully implemented until #626 closes.
+      implemented_by #626. The physical recovery matrix uses a deterministic debug-only
+      application network failure while retaining USB ADB, as explicitly selected for
+      the device run; it does not claim Android lost its validated network.
     design: docs/adr/007-agent-architecture.md
     supersedes: REQ-AND-013
     acceptance:
@@ -273,7 +275,9 @@ requirements:
       - Mobile Agent confirm checks the PendingAction binding, then the per-action biometric token, before consuming the Agent one-time token.
       - Mobile Agent live-write is limited to the explicit D4 metadata allowlist; all other verbs fail closed.
       - A backup/restore-cloud job recovers after app restart or expired lease without duplicate cloud mutation.
-      - Physical BiometricPrompt, foreground-service status, and Android Keystore proof remain pending #626.
+      - WorkManager is the only production mobile-job executor; it receives only bounded job_id/kind input and publishes a visible foreground notification before engine/JNI work.
+      - Missing notification permission/channel, invalid device state, or encrypted bootstrap failure prevents engine start and Graph work; the valid Rust job remains queued for reconciliation.
+      - Physical native-prompt interaction, Android Keystore hardware evidence, notification denial, process death, and deterministic network-failure recovery are verified on the Pixel 8 Pro with Graph/store cross-checks and cleanup.
     verified_by:
       - test: mobile_full_node_router_exposes_gated_restore_and_backup
       - test: standalone_full_node_serves_ui_and_gates_restore_backup
@@ -287,3 +291,20 @@ requirements:
       - test: mobile_job_worker_does_not_duplicate_restore_after_restart
       - test: mobile_live_write_allowlist_accepts_only_metadata_verbs
       - test: mobile_live_write_disallowed_create_send_delete_append_verbs_fail_closed
+      - test: accepts_only_bounded_job_id_and_known_kind
+      - test: worker_policy_never_starts_native_before_foreground_and_snapshot
+      - test: notification_failure_never_reaches_device_or_native
+      - test: accepts_only_exact_post_paths_and_success_status
+      - test: mobile_job_test_hook_is_bounded
+      - test: mobile_job_retryable_error_requeues_and_clears_owner_lease
+      - test: mobile_job_network_test_hook_requeues_without_calling_executor
+      - test: mobile_job_foreign_process_reclaim_is_owner_scoped
+      - test: mobile_job_cancelled_running_does_not_accept_late_success_without_reconcile
+      - test: agent_live_write_does_not_wait_for_mobile_store_gate
+      - test: agent_live_write_audit_summary_omits_target_identifiers
+      - test: startupInstallsBodyThenAgentKeyBeforeNativeStartAndWipesBoth
+      - test: strongEnrollmentWithCipherFailureFailsClosed
+      - test: agentCredentialKeyStoreInstallsAndSealsProviderCredentialStore
+      - test: corruptWrappedAgentCredentialKeyFailsClosedWithoutReplacement
+      - test: activityAndWorkManagerUseSameProcess
+      - file: docs/evidence/issue-626-manifest.json
