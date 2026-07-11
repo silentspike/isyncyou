@@ -472,6 +472,11 @@ mod tests {
     }
 
     #[test]
+    fn local_cli_fallback_imports_credentials_not_client_harness_state() {
+        experimental_local_cli_fallback_imports_credentials_not_client_harness_state();
+    }
+
+    #[test]
     fn experimental_local_cli_errors_are_value_and_path_free() {
         let root = TestRoot::new("redacted-error");
         let claude_root = root.path().join("private-user-path-sentinel");
