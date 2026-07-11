@@ -68,7 +68,10 @@ pub use restore_onenote::{
     pending_onenote_restore_count, recover_pending_onenote_restores,
     recover_pending_onenote_restores_with, restore_onenote_via_ledger, OneNoteApi, OneNoteSink,
 };
-pub use restore_recovery::{recover_restore_op, run_restore_op, RestoreOutcome, RestoreSink};
+pub use restore_recovery::{
+    recover_restore_op, run_restore_op, RestoreError, RestoreFailureKind, RestoreOutcome,
+    RestoreResult, RestoreSink,
+};
 pub use restore_todo::{
     pending_todo_restore_count, recover_pending_todo_restores, recover_pending_todo_restores_with,
     restore_todo_via_ledger, ToDoApi, ToDoSink,
@@ -361,6 +364,88 @@ pub struct RefreshServices {
     pub onenote: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFailureKind {
+    Network,
+    Timeout,
+    Http(u16),
+    Authentication,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshFailure {
+    pub kind: RefreshFailureKind,
+    pub redacted: &'static str,
+}
+
+impl std::fmt::Display for RefreshFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.redacted)
+    }
+}
+
+impl std::error::Error for RefreshFailure {}
+
+impl RefreshFailure {
+    fn internal() -> Self {
+        Self {
+            kind: RefreshFailureKind::Internal,
+            redacted: "cache refresh failed",
+        }
+    }
+
+    fn from_upload(error: isyncyou_graph::http::UploadError) -> Self {
+        use isyncyou_graph::http::GraphTransientFailure;
+        let kind = match error.transient_failure() {
+            Some(GraphTransientFailure::Network) => RefreshFailureKind::Network,
+            Some(GraphTransientFailure::Timeout) => RefreshFailureKind::Timeout,
+            Some(GraphTransientFailure::Http(status)) => RefreshFailureKind::Http(status),
+            None => match error {
+                isyncyou_graph::http::UploadError::Http { status: 401, .. } => {
+                    RefreshFailureKind::Authentication
+                }
+                _ => RefreshFailureKind::Internal,
+            },
+        };
+        Self {
+            kind,
+            redacted: "Graph cache refresh failed",
+        }
+    }
+
+    fn from_sync(error: isyncyou_connectors::SyncError) -> Self {
+        use isyncyou_graph::DeltaError;
+        match error {
+            isyncyou_connectors::SyncError::Graph(error) => Self::from_upload(error),
+            isyncyou_connectors::SyncError::HttpStatus(status) => Self {
+                kind: match status {
+                    401 => RefreshFailureKind::Authentication,
+                    other => RefreshFailureKind::Http(other),
+                },
+                redacted: "Graph cache refresh failed",
+            },
+            isyncyou_connectors::SyncError::Delta(DeltaError::TooManyRetries) => Self {
+                kind: RefreshFailureKind::Http(503),
+                redacted: "Graph cache refresh retry budget exhausted",
+            },
+            isyncyou_connectors::SyncError::Delta(DeltaError::AuthExpired) => Self {
+                kind: RefreshFailureKind::Authentication,
+                redacted: "Graph authentication required",
+            },
+            isyncyou_connectors::SyncError::Delta(DeltaError::Fatal(status)) => Self {
+                kind: if status == 401 {
+                    RefreshFailureKind::Authentication
+                } else {
+                    RefreshFailureKind::Http(status)
+                },
+                redacted: "Graph cache refresh failed",
+            },
+            _ => Self::internal(),
+        }
+    }
+}
+
 impl RefreshServices {
     pub fn all() -> Self {
         Self {
@@ -403,13 +488,66 @@ pub fn refresh_cache_account_filtered(
     write_access: Option<String>,
     services: RefreshServices,
 ) -> Result<RefreshCounts, String> {
+    refresh_cache_account_filtered_with_policy(
+        cfg,
+        account,
+        read_access,
+        write_access,
+        services,
+        false,
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn refresh_cache_account_filtered_strict(
+    cfg: &Config,
+    account: &str,
+    read_access: String,
+    write_access: Option<String>,
+    services: RefreshServices,
+) -> Result<RefreshCounts, RefreshFailure> {
+    refresh_cache_account_filtered_with_policy(
+        cfg,
+        account,
+        read_access,
+        write_access,
+        services,
+        true,
+    )
+}
+
+fn service_refresh<T: Default>(
+    result: Result<T, isyncyou_connectors::SyncError>,
+    strict: bool,
+    account: &str,
+    service: &str,
+) -> Result<T, RefreshFailure> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if strict => Err(RefreshFailure::from_sync(error)),
+        Err(error) => {
+            eprintln!("isyncyou: {service} refresh for {account} skipped: {error}");
+            Ok(T::default())
+        }
+    }
+}
+
+fn refresh_cache_account_filtered_with_policy(
+    cfg: &Config,
+    account: &str,
+    read_access: String,
+    write_access: Option<String>,
+    services: RefreshServices,
+    strict: bool,
+) -> Result<RefreshCounts, RefreshFailure> {
     let acc = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}'"))?;
+        .ok_or_else(RefreshFailure::internal)?;
     let archive_root = acc.archive_root.clone();
-    let store = Store::open(archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let store = Store::open(archive_root.join(".isyncyou-store.db"))
+        .map_err(|_| RefreshFailure::internal())?;
     let mut client = GraphClient::new(read_access);
     let now = unix_now();
     // `&mut client` (Transport delta) must finish before the by-ref archive passes.
@@ -421,154 +559,177 @@ pub fn refresh_cache_account_filtered(
             &now,
             &archive_root,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(RefreshFailure::from_sync)?;
         let b =
             isyncyou_connectors::backup_message_bodies(&client, &store, account, &archive_root, 25)
-                .map_err(|e| e.to_string())?;
-        let flanks = match isyncyou_connectors::backup_mailbox_flanks(
-            &client,
-            &store,
+                .map_err(RefreshFailure::from_sync)?;
+        let flanks = service_refresh(
+            isyncyou_connectors::backup_mailbox_flanks(&client, &store, account, &archive_root),
+            strict,
             account,
-            &archive_root,
-        ) {
-            Ok(f) => f.archived,
-            Err(e) => {
-                eprintln!("isyncyou: mail flanks for {account} skipped: {e}");
-                0
-            }
-        };
+            "mail flanks",
+        )?
+        .archived;
         (r, b.downloaded, flanks)
     } else {
         (Default::default(), 0, 0)
     };
     let (cal, cbodies, cflanks) = if services.calendar {
-        let cal =
-            match isyncyou_connectors::events_sync_calendar(&mut client, &store, account, &now) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("isyncyou: calendar sync for {account} skipped: {e}");
-                    Default::default()
-                }
-            };
-        let cbodies = isyncyou_connectors::backup_calendar_bodies(
-            &client,
-            &store,
+        let cal = service_refresh(
+            isyncyou_connectors::events_sync_calendar(&mut client, &store, account, &now),
+            strict,
             account,
-            &archive_root,
-            50,
-        )
-        .map(|r| r.archived)
-        .unwrap_or(0);
-        let cflanks =
-            isyncyou_connectors::backup_calendar_flanks(&client, &store, account, &archive_root)
-                .map(|r| r.archived)
-                .unwrap_or(0);
-        let _ = isyncyou_connectors::backup_event_attachments(
-            &client,
-            &store,
+            "calendar",
+        )?;
+        let cbodies = service_refresh(
+            isyncyou_connectors::backup_calendar_bodies(
+                &client,
+                &store,
+                account,
+                &archive_root,
+                50,
+            ),
+            strict,
             account,
-            &archive_root,
-            25,
-        );
+            "calendar bodies",
+        )?
+        .archived;
+        let cflanks = service_refresh(
+            isyncyou_connectors::backup_calendar_flanks(&client, &store, account, &archive_root),
+            strict,
+            account,
+            "calendar flanks",
+        )?
+        .archived;
+        let _attachments = service_refresh(
+            isyncyou_connectors::backup_event_attachments(
+                &client,
+                &store,
+                account,
+                &archive_root,
+                25,
+            ),
+            strict,
+            account,
+            "calendar attachments",
+        )?;
         (cal, cbodies, cflanks)
     } else {
         (Default::default(), 0, 0)
     };
     let (con, conbodies, conphotos) = if services.contacts {
-        let con = match isyncyou_connectors::incremental_sync_contacts(
-            &mut client,
-            &store,
+        let con = service_refresh(
+            isyncyou_connectors::incremental_sync_contacts(&mut client, &store, account, &now),
+            strict,
             account,
-            &now,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("isyncyou: contacts sync for {account} skipped: {e}");
-                Default::default()
-            }
-        };
-        let conbodies = isyncyou_connectors::backup_contacts_bodies(
-            &client,
-            &store,
+            "contacts",
+        )?;
+        let conbodies = service_refresh(
+            isyncyou_connectors::backup_contacts_bodies(
+                &client,
+                &store,
+                account,
+                &archive_root,
+                50,
+            ),
+            strict,
             account,
-            &archive_root,
-            50,
-        )
-        .map(|r| r.archived)
-        .unwrap_or(0);
-        let conphotos =
-            isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50)
-                .map(|r| r.downloaded)
-                .unwrap_or(0);
+            "contact bodies",
+        )?
+        .archived;
+        let conphotos = service_refresh(
+            isyncyou_connectors::backup_contact_photos(&client, &store, account, &archive_root, 50),
+            strict,
+            account,
+            "contact photos",
+        )?
+        .downloaded;
         (con, conbodies, conphotos)
     } else {
         (Default::default(), 0, 0)
     };
     let (todo, tbodies, tflanks, tsub) = if services.todo {
-        let todo =
-            match isyncyou_connectors::incremental_sync_todo(&mut client, &store, account, &now) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("isyncyou: todo sync for {account} skipped: {e}");
-                    Default::default()
-                }
-            };
-        let tbodies =
-            isyncyou_connectors::backup_todo_bodies(&client, &store, account, &archive_root, 50)
-                .map(|r| r.archived)
-                .unwrap_or(0);
-        let tflanks =
-            isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root)
-                .map(|r| r.archived)
-                .unwrap_or(0);
+        let todo = service_refresh(
+            isyncyou_connectors::incremental_sync_todo(&mut client, &store, account, &now),
+            strict,
+            account,
+            "todo",
+        )?;
+        let tbodies = service_refresh(
+            isyncyou_connectors::backup_todo_bodies(&client, &store, account, &archive_root, 50),
+            strict,
+            account,
+            "todo bodies",
+        )?
+        .archived;
+        let tflanks = service_refresh(
+            isyncyou_connectors::backup_todo_list_flanks(&client, &store, account, &archive_root),
+            strict,
+            account,
+            "todo flanks",
+        )?
+        .archived;
         // To Do attachments need Tasks.ReadWrite (the read scope is denied), so use the
         // write/restore client when available; best-effort, skipped without it.
         let att_client = write_access.map(GraphClient::new);
-        let tsub = isyncyou_connectors::backup_task_subresources(
-            &client,
-            att_client.as_ref(),
-            &store,
+        let tsub = service_refresh(
+            isyncyou_connectors::backup_task_subresources(
+                &client,
+                att_client.as_ref(),
+                &store,
+                account,
+                &archive_root,
+                25,
+            ),
+            strict,
             account,
-            &archive_root,
-            25,
-        )
-        .map(|r| r.archived)
-        .unwrap_or(0);
+            "todo subresources",
+        )?
+        .archived;
         (todo, tbodies, tflanks, tsub)
     } else {
         (Default::default(), 0, 0, 0)
     };
     let (note, nbodies, nres, nhier) = if services.onenote {
-        let note = match isyncyou_connectors::incremental_sync_onenote(
-            &mut client,
-            &store,
+        let note = service_refresh(
+            isyncyou_connectors::incremental_sync_onenote(
+                &mut client,
+                &store,
+                account,
+                &now,
+                Some(&archive_root),
+            ),
+            strict,
             account,
-            &now,
-            Some(&archive_root),
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("isyncyou: onenote sync for {account} skipped: {e}");
-                Default::default()
-            }
-        };
-        let nbodies =
-            isyncyou_connectors::backup_onenote_bodies(&client, &store, account, &archive_root, 50)
-                .map(|r| r.archived)
-                .unwrap_or(0);
-        let nres = isyncyou_connectors::backup_onenote_resources(
-            &client,
-            &store,
+            "onenote",
+        )?;
+        let nbodies = service_refresh(
+            isyncyou_connectors::backup_onenote_bodies(&client, &store, account, &archive_root, 50),
+            strict,
             account,
-            &archive_root,
-            50,
-        )
-        .map(|r| r.resources)
-        .unwrap_or(0);
-        let nhier =
-            isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root)
-                .map(|r| r.notebooks + r.section_groups + r.sections)
-                .unwrap_or(0);
+            "onenote bodies",
+        )?
+        .archived;
+        let nres = service_refresh(
+            isyncyou_connectors::backup_onenote_resources(
+                &client,
+                &store,
+                account,
+                &archive_root,
+                50,
+            ),
+            strict,
+            account,
+            "onenote resources",
+        )?
+        .resources;
+        let hierarchy = service_refresh(
+            isyncyou_connectors::backup_onenote_hierarchy(&client, &store, account, &archive_root),
+            strict,
+            account,
+            "onenote hierarchy",
+        )?;
+        let nhier = hierarchy.notebooks + hierarchy.section_groups + hierarchy.sections;
         (note, nbodies, nres, nhier)
     } else {
         (Default::default(), 0, 0, 0)
@@ -670,23 +831,38 @@ pub fn restore_cloud(
     id: &str,
     token: String,
 ) -> Result<String, String> {
+    restore_cloud_classified(cfg, account, service, id, token).map_err(|error| error.to_string())
+}
+
+/// Structured mobile-worker variant of [`restore_cloud`]. It preserves Graph
+/// transport and HTTP failure classes so WorkManager can retry only transient
+/// failures without parsing redacted error text.
+pub fn restore_cloud_classified(
+    cfg: &Config,
+    account: &str,
+    service: &str,
+    id: &str,
+    token: String,
+) -> RestoreResult<String> {
     // Safety gate: cloud-mutating restore is off by default — it re-creates items in
     // a real mailbox. Recovering an archived body to a local file goes through a
     // different path and is never gated here.
     if !cfg.restore.cloud_restore_enabled {
-        return Err(cloud_restore_disabled_error());
+        return Err(RestoreError::invalid(cloud_restore_disabled_error()));
     }
     if !RESTORE_SERVICES.contains(&service) {
-        return Err(format!(
+        return Err(RestoreError::invalid(format!(
             "service '{service}' has no restore path (expected one of {}); \
              use restore --to-local to recover its archived body to a file",
             RESTORE_SERVICES.join("|")
-        ));
+        )));
     }
     // Only crash-safe (ledger-backed) services may mutate the cloud; the rest are
     // refused until migrated. A direct connector POST is not crash-safe (ADR-001).
     if !cloud_restore_service_supported(service) {
-        return Err(unsupported_cloud_restore_service_error(service));
+        return Err(RestoreError::invalid(
+            unsupported_cloud_restore_service_error(service),
+        ));
     }
     // Each ledger-backed service goes through the crash-safe operation ledger
     // (ADR-001): record intent, stamp a findable marker, post, and
@@ -695,13 +871,21 @@ pub fn restore_cloud(
     // contacts: single-value extended property; todo: body marker + LIST scan;
     // onenote: invisible HTML-comment marker + page-content scan).
     match service {
-        "mail" => mail_restore::restore_mail_via_ledger(cfg, account, id, token),
-        "calendar" => restore_calendar::restore_calendar_via_ledger(cfg, account, id, token),
-        "contacts" => restore_contacts::restore_contacts_via_ledger(cfg, account, id, token),
-        "todo" => restore_todo::restore_todo_via_ledger(cfg, account, id, token),
-        "onenote" => restore_onenote::restore_onenote_via_ledger(cfg, account, id, token),
+        "mail" => mail_restore::restore_mail_via_ledger_classified(cfg, account, id, token),
+        "calendar" => {
+            restore_calendar::restore_calendar_via_ledger_classified(cfg, account, id, token)
+        }
+        "contacts" => {
+            restore_contacts::restore_contacts_via_ledger_classified(cfg, account, id, token)
+        }
+        "todo" => restore_todo::restore_todo_via_ledger_classified(cfg, account, id, token),
+        "onenote" => {
+            restore_onenote::restore_onenote_via_ledger_classified(cfg, account, id, token)
+        }
         // unreachable: cloud_restore_service_supported() gated everything else above.
-        other => Err(unsupported_cloud_restore_service_error(other)),
+        other => Err(RestoreError::invalid(
+            unsupported_cloud_restore_service_error(other),
+        )),
     }
 }
 

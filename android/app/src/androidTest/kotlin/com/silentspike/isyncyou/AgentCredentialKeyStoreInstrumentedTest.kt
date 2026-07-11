@@ -7,11 +7,38 @@ import java.util.Arrays
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.fail
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeNoException
 import org.junit.Test
 
 class AgentCredentialKeyStoreInstrumentedTest {
+    @Test
+    fun corruptWrappedAgentCredentialKeyFailsClosedWithoutReplacement() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val root = File(context.cacheDir, "agent-credential-corruption-${System.nanoTime()}")
+        assertTrue(root.mkdirs())
+        try {
+            val created = AgentCredentialKeyStore.getOrCreate(root)
+            Arrays.fill(created.key, 0)
+            val wrapped = File(root, AgentCredentialKeyStore.KEY_FILE)
+            assertTrue(wrapped.isFile)
+            val corrupt = "corrupt-wrapped-key".toByteArray()
+            wrapped.writeBytes(corrupt)
+
+            try {
+                val unexpected = AgentCredentialKeyStore.getOrCreate(root)
+                Arrays.fill(unexpected.key, 0)
+                fail("corrupt wrapped key was silently accepted or replaced")
+            } catch (_: Exception) {
+                // Expected: corruption is terminal for this startup attempt.
+            }
+            assertTrue(wrapped.readBytes().contentEquals(corrupt))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test
     fun agentCredentialKeyStoreInstallsAndSealsProviderCredentialStore() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext

@@ -18,6 +18,12 @@ object NativeEngine {
      */
     external fun nativeStart(filesDir: String): Int
 
+    /** Return the bounded recoverable mobile-job plan for WorkManager. */
+    external fun nativeMobileJobPlan(): String
+
+    /** Validate and execute one versioned WorkManager mobile-job request. */
+    external fun nativeRunMobileJob(requestJson: String): String
+
     /** The per-process session token held by trusted native callers, never by WebView JS. */
     external fun nativeSessionToken(): String
 
@@ -84,6 +90,13 @@ object NativeEngine {
      * native instrumentation path, not a WebView, bridge, HTTP, or production UI capability.
      */
     external fun nativeAgentCredentialStoreSelfTest(filesDir: String, sentinel: String): String
+
+    /**
+     * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
+     * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,
+     * or `not_found`.
+     */
+    external fun nativeDescribePendingAction(pendingId: String): String
 
     /**
      * Record a successful native `BiometricPrompt` for a pending destructive action

@@ -1,0 +1,27 @@
+{
+  "issue": 626,
+  "source_commit": "10a6fe79df12100743a09f9f37f65147b24870aa",
+  "audit_findings": {
+    "strong_prompt_api_30_plus": "fixed_and_builder_instrumentation_passed",
+    "structured_product_retry_classification": "fixed_and_host_tests_passed",
+    "concurrent_worker_busy": "fixed_as_retry_and_concurrency_test_passed",
+    "policy_deferrals_and_scheduler_constraints": "fixed_and_android_unit_tests_passed",
+    "legacy_device_credential_api_24_29": "fixed_and_android_unit_tests_passed",
+    "early_key_zeroization": "fixed_and_android_unit_tests_passed",
+    "notification_and_cold_start_reconcile": "fixed_and_android_unit_tests_passed",
+    "unknown_descriptor_and_duplicate_pending_prompt": "fixed_fail_closed_and_unit_tests_passed"
+  },
+  "final_gates": {
+    "cargo_remote_fmt_check": "pass",
+    "cargo_remote_workspace_tests": "pass",
+    "cargo_remote_workspace_clippy_deny_warnings": "pass",
+    "android_clean_unit_lint_assemble": "pass",
+    "default_apk_hook_scan": "pass_no_matches",
+    "real_product_backup": "pass"
+  },
+  "physical_scope": {
+    "device_credential_pin": "pass",
+    "strong_biometric_crypto": "not_executed_no_strong_biometric_enrolled",
+    "no_false_pass_claim": true
+  }
+}

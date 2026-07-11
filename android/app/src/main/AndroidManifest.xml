@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
@@ -52,6 +53,14 @@
             android:name=".OAuthGuardService"
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
+
+        <!-- WorkManager's long-running Worker delegates to this service. Android 14+
+             rejects the foreground transition unless both the manifest and the
+             ForegroundInfo runtime value declare the dataSync type. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge"/>
 
         <!-- Storage Access Framework: expose OneDrive in the system Documents UI (S-OM.12, #658).
              android:permission="MANAGE_DOCUMENTS" is required OF the caller — a signature|privileged

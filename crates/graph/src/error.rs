@@ -42,8 +42,8 @@ pub fn classify(status: u16, retry_after: Option<Duration>) -> GraphAction {
         410 => GraphAction::Resync,
         412 => GraphAction::PreconditionFailed,
         416 => GraphAction::RangeNotSatisfiable,
-        // 429 and the retryable server errors honor Retry-After when present.
-        429 | 500 | 502 | 503 | 504 | 509 => GraphAction::Retry { after: retry_after },
+        // 425, 429, and all 5xx responses honor Retry-After when present.
+        425 | 429 | 500..=506 | 508..=599 => GraphAction::Retry { after: retry_after },
         507 => GraphAction::InsufficientStorage,
         _ => GraphAction::Fatal,
     }
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn server_errors_are_retryable() {
-        for s in [500, 502, 503, 504, 509, 408] {
+        for s in [408, 425, 429, 500, 502, 503, 504, 506, 508, 599] {
             assert!(classify(s, None).is_retryable(), "status {s} should retry");
         }
     }

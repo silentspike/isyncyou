@@ -32,7 +32,9 @@ object BridgeMessagePolicy {
             "req" -> requireFields(obj, t, id, "method", "path")
             "sub" -> requireFields(obj, t, id, "path")
             "unsub" -> BridgeValidation(true, t, id)
-            "bio" -> requireFields(obj, t, id, "pat", "label")
+            // The label is deliberately not accepted from WebView JS. Rust owns the
+            // operation/service descriptor and Android maps those enums to fixed text.
+            "bio" -> requireFields(obj, t, id, "pat")
             "native" -> validateNative(obj, t, id)
             else -> BridgeValidation(false, id = id, error = "unknown_type")
         }

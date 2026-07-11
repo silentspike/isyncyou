@@ -39,7 +39,7 @@ class OAuthGuardService : Service() {
         val token = intent?.getStringExtra(EXTRA_START_TOKEN)
         try {
             ensureChannel(this)
-            val notif: Notification = Notification.Builder(this, CHANNEL_ID)
+            val notif: Notification = notificationBuilder(this)
                 .setContentTitle("Signing in…")
                 .setContentText("Keeping the connection open to finish sign-in.")
                 .setSmallIcon(R.drawable.ic_stat_isyncyou)
@@ -117,6 +117,14 @@ class OAuthGuardService : Service() {
                 }
             }
         }
+
+        @Suppress("DEPRECATION")
+        private fun notificationBuilder(ctx: Context): Notification.Builder =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Notification.Builder(ctx, CHANNEL_ID)
+            } else {
+                Notification.Builder(ctx)
+            }
 
         private fun ackStart(token: String?, ack: StartAck) {
             if (token.isNullOrBlank()) return

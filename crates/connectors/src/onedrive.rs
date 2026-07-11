@@ -31,6 +31,10 @@ pub enum SyncError {
     Malformed(String),
     #[error("remote: {0}")]
     Remote(String),
+    #[error("graph: {0}")]
+    Graph(#[source] isyncyou_graph::http::UploadError),
+    #[error("HTTP {0}")]
+    HttpStatus(u16),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -162,6 +162,7 @@ pub enum UploadError {
         body: String,
     },
     Transport(String),
+    Timeout(String),
     Parse(String),
     /// The session ended without a completion response.
     Incomplete,
@@ -172,12 +173,41 @@ impl std::fmt::Display for UploadError {
         match self {
             UploadError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
             UploadError::Transport(e) => write!(f, "transport error: {e}"),
+            UploadError::Timeout(e) => write!(f, "timeout: {e}"),
             UploadError::Parse(e) => write!(f, "parse error: {e}"),
             UploadError::Incomplete => write!(f, "upload ended without completion"),
         }
     }
 }
 impl std::error::Error for UploadError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphTransientFailure {
+    Network,
+    Timeout,
+    Http(u16),
+}
+
+impl UploadError {
+    fn from_reqwest(error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout(error.to_string())
+        } else {
+            Self::Transport(error.to_string())
+        }
+    }
+
+    pub fn transient_failure(&self) -> Option<GraphTransientFailure> {
+        match self {
+            Self::Timeout(_) => Some(GraphTransientFailure::Timeout),
+            Self::Transport(_) => Some(GraphTransientFailure::Network),
+            Self::Http { status, .. } if matches!(*status, 408 | 425 | 429 | 500..=599) => {
+                Some(GraphTransientFailure::Http(*status))
+            }
+            Self::Http { .. } | Self::Parse(_) | Self::Incomplete => None,
+        }
+    }
+}
 
 /// A Microsoft Graph HTTP client carrying a bearer access token.
 pub struct GraphClient {
@@ -328,7 +358,7 @@ impl GraphClient {
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         json_or_err(resp)
     }
 
@@ -351,7 +381,7 @@ impl GraphClient {
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 201 => Ok(Some(
                 resp.json::<serde_json::Value>()
@@ -380,7 +410,7 @@ impl GraphClient {
             .get(&url)
             .bearer_auth(&self.token)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 => Ok(Some(
                 resp.json::<serde_json::Value>()
@@ -412,7 +442,7 @@ impl GraphClient {
             .bearer_auth(&self.token)
             .json(&body)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         let v = json_or_err(resp)?;
         let upload_url = v.get("uploadUrl").and_then(|u| u.as_str()).ok_or_else(|| {
             UploadError::Parse("createUploadSession response had no uploadUrl".into())
@@ -475,7 +505,7 @@ impl GraphClient {
                 .header(reqwest::header::CONTENT_RANGE, &plan.content_range)
                 .body(slice.to_vec())
                 .send()
-                .map_err(|e| UploadError::Transport(e.to_string()))?;
+                .map_err(UploadError::from_reqwest)?;
             match resp.status().as_u16() {
                 202 => {
                     let v = resp.json::<serde_json::Value>().ok();
@@ -534,7 +564,7 @@ impl GraphClient {
             .client
             .get(upload_url) // pre-authorized URL: no bearer header
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 => {
                 let v = resp.json::<serde_json::Value>().ok();
@@ -575,7 +605,7 @@ impl GraphClient {
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 201 => Ok(Some(
                 resp.json::<serde_json::Value>()
@@ -631,7 +661,7 @@ impl GraphClient {
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 201 => Ok(Some(
                 resp.json::<serde_json::Value>()
@@ -660,7 +690,7 @@ impl GraphClient {
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 201 => resp
                 .json::<serde_json::Value>()
@@ -686,7 +716,7 @@ impl GraphClient {
             .delete(&url)
             .bearer_auth(&self.token)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 204 => Ok(()),
             s => Err(UploadError::Http {
@@ -704,7 +734,7 @@ impl GraphClient {
             .bearer_auth(&self.token)
             .header(reqwest::header::IF_MATCH, etag)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 204 => Ok(true),
             412 => Ok(false),
@@ -1015,9 +1045,7 @@ impl GraphClient {
             if self.prefer_immutable_id {
                 req = req.header("Prefer", PREFER_IMMUTABLE_ID);
             }
-            let resp = req
-                .send()
-                .map_err(|e| UploadError::Transport(e.to_string()))?;
+            let resp = req.send().map_err(UploadError::from_reqwest)?;
             let status = resp.status().as_u16();
             if let Some(rid) = resp
                 .headers()
@@ -1183,7 +1211,7 @@ impl GraphClient {
             .bearer_auth(&self.token)
             .json(body)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         json_with_status_or_err(resp)
     }
 
@@ -1202,7 +1230,7 @@ impl GraphClient {
             .bearer_auth(&self.token)
             .json(body)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         json_or_err(resp)
     }
 
@@ -1223,7 +1251,7 @@ impl GraphClient {
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(body)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         json_or_err(resp)
     }
 
@@ -1268,7 +1296,7 @@ impl GraphClient {
             .delete(&url)
             .bearer_auth(&self.token)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 202 | 204 => Ok(()),
             s => Err(UploadError::Http {
@@ -1329,7 +1357,7 @@ impl GraphClient {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 202 | 204 => Ok(()),
             s => Err(UploadError::Http {
@@ -1348,7 +1376,7 @@ impl GraphClient {
             .delete(&url)
             .bearer_auth(&self.token)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 202 | 204 => Ok(()),
             s => Err(UploadError::Http {
@@ -1376,7 +1404,7 @@ impl GraphClient {
             .bearer_auth(&self.token)
             .json(body)
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 201 | 202 | 204 => Ok(()),
             s => Err(UploadError::Http {
@@ -1398,7 +1426,7 @@ impl GraphClient {
             // HTTP 411 Length Required.
             .body(Vec::<u8>::new())
             .send()
-            .map_err(|e| UploadError::Transport(e.to_string()))?;
+            .map_err(UploadError::from_reqwest)?;
         match resp.status().as_u16() {
             200 | 201 | 202 | 204 => Ok(()),
             s => Err(UploadError::Http {
@@ -1981,6 +2009,34 @@ fn enc_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_transient_failure_is_structured_without_message_matching() {
+        assert_eq!(
+            UploadError::Transport("arbitrary".into()).transient_failure(),
+            Some(GraphTransientFailure::Network)
+        );
+        assert_eq!(
+            UploadError::Timeout("arbitrary".into()).transient_failure(),
+            Some(GraphTransientFailure::Timeout)
+        );
+        assert_eq!(
+            UploadError::Http {
+                status: 425,
+                body: "arbitrary".into()
+            }
+            .transient_failure(),
+            Some(GraphTransientFailure::Http(425))
+        );
+        assert_eq!(
+            UploadError::Http {
+                status: 403,
+                body: "timeout network 503".into()
+            }
+            .transient_failure(),
+            None
+        );
+    }
     use crate::run_delta;
 
     #[test]

@@ -1483,6 +1483,63 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Update safe progress only while this process still owns the running row.
+    pub fn update_mobile_job_progress_if_running(
+        &self,
+        job_id: &str,
+        owner: &str,
+        progress_json: &str,
+        now: i64,
+    ) -> Result<bool> {
+        validate_mobile_job_json("progress_json", Some(progress_json))?;
+        let n = self.conn.execute(
+            "UPDATE mobile_jobs SET progress_json=?3, updated_at=?4
+             WHERE job_id=?1 AND lease_owner=?2 AND state='running'",
+            params![job_id, owner, progress_json, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Requeue a retryable running job only for its current owner.
+    pub fn requeue_mobile_job_if_running(
+        &self,
+        job_id: &str,
+        owner: &str,
+        safe_error: &str,
+        progress_json: &str,
+        now: i64,
+    ) -> Result<bool> {
+        validate_mobile_job_json("progress_json", Some(progress_json))?;
+        let last_error = redact_mobile_job_error(Some(safe_error));
+        let n = self.conn.execute(
+            "UPDATE mobile_jobs
+                SET state='queued', progress_json=?4, last_error=?3,
+                    updated_at=?5, finished_at=NULL,
+                    lease_owner=NULL, lease_expires_at=NULL
+              WHERE job_id=?1 AND lease_owner=?2 AND state='running'",
+            params![job_id, owner, last_error.as_deref(), progress_json, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Make nonterminal leases from a previous single-process owner recoverable.
+    /// The Android manifest must remain single-process for this operation to be safe.
+    pub fn reclaim_mobile_jobs_from_foreign_process(
+        &self,
+        current_owner: &str,
+        now: i64,
+    ) -> Result<u64> {
+        validate_mobile_job_part("owner", current_owner)?;
+        let n = self.conn.execute(
+            "UPDATE mobile_jobs
+                SET state='queued', lease_owner=NULL, lease_expires_at=NULL,
+                    updated_at=?, last_error='process_handoff'
+              WHERE state='running' AND lease_owner IS NOT NULL AND lease_owner != ?",
+            params![now, current_owner],
+        )?;
+        Ok(n as u64)
+    }
+
     pub fn get_item(&self, account: &str, service: &str, remote_id: &str) -> Result<Option<Item>> {
         let it = self
             .conn
@@ -4195,6 +4252,100 @@ mod tests {
         assert_eq!(failed.state, MobileJobState::Failed);
         assert_eq!(failed.lease_owner, None);
         assert_eq!(failed.last_error.as_deref(), Some("[redacted]"));
+    }
+
+    #[test]
+    fn mobile_job_progress_and_requeue_are_owner_guarded() {
+        let s = Store::open_in_memory().unwrap();
+        s.create_mobile_job(
+            "job-1",
+            "me",
+            MobileJobKind::Backup,
+            None,
+            None,
+            "backup-key",
+            r#"{"op":"backup"}"#,
+            100,
+        )
+        .unwrap();
+        assert!(s
+            .acquire_mobile_job_lease("job-1", "worker-a", 110, 30)
+            .unwrap());
+        assert!(!s
+            .update_mobile_job_progress_if_running(
+                "job-1",
+                "worker-b",
+                r#"{"v":1,"status":"progress"}"#,
+                111,
+            )
+            .unwrap());
+        assert!(s
+            .update_mobile_job_progress_if_running(
+                "job-1",
+                "worker-a",
+                r#"{"v":1,"status":"progress"}"#,
+                112,
+            )
+            .unwrap());
+        assert!(!s
+            .requeue_mobile_job_if_running(
+                "job-1",
+                "worker-b",
+                "late error",
+                r#"{"v":1,"status":"retry"}"#,
+                113,
+            )
+            .unwrap());
+        assert!(s
+            .requeue_mobile_job_if_running(
+                "job-1",
+                "worker-a",
+                "provider returned refresh_token=secret",
+                r#"{"v":1,"status":"retry"}"#,
+                114,
+            )
+            .unwrap());
+        let job = s.get_mobile_job("job-1").unwrap().unwrap();
+        assert_eq!(job.state, MobileJobState::Queued);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.lease_expires_at, None);
+        assert_eq!(
+            job.progress_json.as_deref(),
+            Some(r#"{"v":1,"status":"retry"}"#)
+        );
+        assert_eq!(job.last_error.as_deref(), Some("[redacted]"));
+    }
+
+    #[test]
+    fn mobile_job_foreign_process_reclaim_is_owner_scoped() {
+        let s = Store::open_in_memory().unwrap();
+        for (id, owner) in [("foreign", "old-process"), ("current", "current-process")] {
+            s.create_mobile_job(
+                id,
+                "me",
+                MobileJobKind::Backup,
+                None,
+                None,
+                &format!("{id}-key"),
+                r#"{"op":"backup"}"#,
+                100,
+            )
+            .unwrap();
+            assert!(s.acquire_mobile_job_lease(id, owner, 110, 300).unwrap());
+        }
+
+        assert_eq!(
+            s.reclaim_mobile_jobs_from_foreign_process("current-process", 120)
+                .unwrap(),
+            1
+        );
+        let foreign = s.get_mobile_job("foreign").unwrap().unwrap();
+        assert_eq!(foreign.state, MobileJobState::Queued);
+        assert_eq!(foreign.lease_owner, None);
+        assert_eq!(foreign.last_error.as_deref(), Some("process_handoff"));
+        let current = s.get_mobile_job("current").unwrap().unwrap();
+        assert_eq!(current.state, MobileJobState::Running);
+        assert_eq!(current.lease_owner.as_deref(), Some("current-process"));
     }
 
     // --- restore operation ledger (ADR-001) ---

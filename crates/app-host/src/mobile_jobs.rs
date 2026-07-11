@@ -1,16 +1,31 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use ring::rand::SecureRandom;
 
 use isyncyou_core::{AccountConfig, Config};
+pub use isyncyou_store::MobileJobKind;
 use isyncyou_store::{
-    mobile_backup_idempotency_key, mobile_restore_cloud_idempotency_key, MobileJob, MobileJobKind,
-    MobileJobState, Store,
+    mobile_backup_idempotency_key, mobile_restore_cloud_idempotency_key, MobileJob, MobileJobState,
+    Store,
 };
 
 use crate::{agent_ops, BackupRun};
 
 const MOBILE_BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onenote"];
 const MOBILE_JOB_LEASE_TTL_SECS: i64 = 300;
+const MOBILE_JOB_PLAN_LIMIT: usize = 64;
+#[cfg(feature = "mobile-job-device-test-hooks")]
+const MOBILE_JOB_DEVICE_TEST_HOOK_MAX_SECS: u64 = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MobileWorkerDeviceSnapshot {
+    pub network_validated: bool,
+    pub metered: bool,
+    pub charging: bool,
+    pub free_bytes: u64,
+}
 
 pub trait MobileJobExecutor: Send + Sync {
     fn run_backup(
@@ -19,7 +34,7 @@ pub trait MobileJobExecutor: Send + Sync {
         account: &str,
         gate: &Arc<Mutex<()>>,
         services: &[String],
-    ) -> Result<BackupRun, String>;
+    ) -> Result<BackupRun, MobileJobExecutionError>;
 
     fn run_restore_cloud(
         &self,
@@ -28,7 +43,175 @@ pub trait MobileJobExecutor: Send + Sync {
         service: &str,
         id: &str,
         gate: &Arc<Mutex<()>>,
-    ) -> Result<String, String>;
+    ) -> Result<String, MobileJobExecutionError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobRetryCode {
+    Network,
+    Timeout,
+    Http408,
+    Http425,
+    RateLimited,
+    Server,
+}
+
+impl MobileJobRetryCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Http408 => "http_408",
+            Self::Http425 => "http_425",
+            Self::RateLimited => "rate_limited",
+            Self::Server => "server",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobFailureCode {
+    InvalidIntent,
+    Unsupported,
+    Policy,
+    Authentication,
+    Internal,
+    RetryBudgetExhausted,
+}
+
+impl MobileJobFailureCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidIntent => "invalid_intent",
+            Self::Unsupported => "unsupported",
+            Self::Policy => "policy",
+            Self::Authentication => "authentication",
+            Self::Internal => "internal",
+            Self::RetryBudgetExhausted => "retry_budget_exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MobileJobExecutionError {
+    Retryable {
+        code: MobileJobRetryCode,
+        retry_after: Option<Duration>,
+        redacted: String,
+    },
+    Terminal {
+        code: MobileJobFailureCode,
+        redacted: String,
+    },
+}
+
+impl MobileJobExecutionError {
+    fn terminal(code: MobileJobFailureCode, message: impl Into<String>) -> Self {
+        Self::Terminal {
+            code,
+            redacted: crate::agent_ops::redact_agent_operation_text(&message.into()),
+        }
+    }
+
+    fn from_refresh(error: isyncyou_engine::RefreshFailure) -> Self {
+        use isyncyou_engine::RefreshFailureKind;
+        match error.kind {
+            RefreshFailureKind::Network => Self::Retryable {
+                code: MobileJobRetryCode::Network,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Timeout => Self::Retryable {
+                code: MobileJobRetryCode::Timeout,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(408) => Self::Retryable {
+                code: MobileJobRetryCode::Http408,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(425) => Self::Retryable {
+                code: MobileJobRetryCode::Http425,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(429) => Self::Retryable {
+                code: MobileJobRetryCode::RateLimited,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Http(500..=599) => Self::Retryable {
+                code: MobileJobRetryCode::Server,
+                retry_after: None,
+                redacted: error.redacted.to_string(),
+            },
+            RefreshFailureKind::Authentication => Self::terminal(
+                MobileJobFailureCode::Authentication,
+                "authentication required",
+            ),
+            RefreshFailureKind::Http(_) | RefreshFailureKind::Internal => {
+                Self::terminal(MobileJobFailureCode::Internal, error.redacted)
+            }
+        }
+    }
+
+    fn from_restore(error: isyncyou_engine::RestoreError) -> Self {
+        use isyncyou_engine::RestoreFailureKind;
+        let redacted = "cloud restore failed".to_string();
+        match error.kind {
+            RestoreFailureKind::Network => Self::Retryable {
+                code: MobileJobRetryCode::Network,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Timeout => Self::Retryable {
+                code: MobileJobRetryCode::Timeout,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(408) => Self::Retryable {
+                code: MobileJobRetryCode::Http408,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(425) => Self::Retryable {
+                code: MobileJobRetryCode::Http425,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(429) => Self::Retryable {
+                code: MobileJobRetryCode::RateLimited,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Http(500..=599) => Self::Retryable {
+                code: MobileJobRetryCode::Server,
+                retry_after: None,
+                redacted,
+            },
+            RestoreFailureKind::Authentication => Self::terminal(
+                MobileJobFailureCode::Authentication,
+                "authentication required",
+            ),
+            RestoreFailureKind::Invalid => Self::terminal(
+                MobileJobFailureCode::InvalidIntent,
+                "invalid restore request",
+            ),
+            RestoreFailureKind::Http(_) | RestoreFailureKind::Internal => {
+                Self::terminal(MobileJobFailureCode::Internal, redacted)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn retryable(code: MobileJobRetryCode, retry_after: Option<Duration>) -> Self {
+        Self::Retryable {
+            redacted: format!("mobile job retry: {}", code.as_str()),
+            code,
+            retry_after,
+        }
+    }
 }
 
 struct LiveMobileJobExecutor;
@@ -40,8 +223,26 @@ impl MobileJobExecutor for LiveMobileJobExecutor {
         account: &str,
         gate: &Arc<Mutex<()>>,
         services: &[String],
-    ) -> Result<BackupRun, String> {
-        crate::run_backup_account(cfg, account, gate, services)
+    ) -> Result<BackupRun, MobileJobExecutionError> {
+        crate::agent_ops::run_mobile_backup_account(cfg, account, gate, services).map_err(|error| {
+            match error {
+                crate::agent_ops::MobileBackupError::InvalidRequest => {
+                    MobileJobExecutionError::terminal(
+                        MobileJobFailureCode::InvalidIntent,
+                        "invalid backup request",
+                    )
+                }
+                crate::agent_ops::MobileBackupError::Authentication => {
+                    MobileJobExecutionError::terminal(
+                        MobileJobFailureCode::Authentication,
+                        "authentication required",
+                    )
+                }
+                crate::agent_ops::MobileBackupError::Refresh(error) => {
+                    MobileJobExecutionError::from_refresh(error)
+                }
+            }
+        })
     }
 
     fn run_restore_cloud(
@@ -51,18 +252,29 @@ impl MobileJobExecutor for LiveMobileJobExecutor {
         service: &str,
         id: &str,
         gate: &Arc<Mutex<()>>,
-    ) -> Result<String, String> {
+    ) -> Result<String, MobileJobExecutionError> {
         if !isyncyou_engine::cloud_restore_service_supported(service) {
-            return Err(isyncyou_engine::unsupported_cloud_restore_service_error(
-                service,
+            return Err(MobileJobExecutionError::terminal(
+                MobileJobFailureCode::Unsupported,
+                isyncyou_engine::unsupported_cloud_restore_service_error(service),
             ));
         }
         if !cfg.restore.cloud_restore_enabled {
-            return Err(isyncyou_engine::cloud_restore_disabled_error());
+            return Err(MobileJobExecutionError::terminal(
+                MobileJobFailureCode::Policy,
+                isyncyou_engine::cloud_restore_disabled_error(),
+            ));
         }
         let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-        let token = isyncyou_engine::auth::resolve_cached_restore_token(cfg, account)?;
-        isyncyou_engine::restore_cloud(cfg, account, service, id, token)
+        let token =
+            isyncyou_engine::auth::resolve_cached_restore_token(cfg, account).map_err(|_| {
+                MobileJobExecutionError::terminal(
+                    MobileJobFailureCode::Authentication,
+                    "authentication required",
+                )
+            })?;
+        isyncyou_engine::restore_cloud_classified(cfg, account, service, id, token)
+            .map_err(MobileJobExecutionError::from_restore)
     }
 }
 
@@ -76,12 +288,61 @@ pub enum MobileJobRunOutcome {
     Failed {
         job_id: String,
         kind: MobileJobKind,
+        code: MobileJobFailureCode,
         error: String,
     },
-    Skipped {
+    Retrying {
         job_id: String,
-        reason: String,
+        kind: MobileJobKind,
+        code: MobileJobRetryCode,
+        retry_after_secs: Option<u64>,
     },
+    Deferred {
+        job_id: String,
+        code: MobileJobDeferredCode,
+    },
+    Noop {
+        job_id: String,
+        code: MobileJobNoopCode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobDeferredCode {
+    DeviceStateUnavailable,
+    WifiOnly,
+    ChargingOnly,
+    InsufficientStorage,
+    WorkerBusy,
+    LeaseNotAcquired,
+}
+
+impl MobileJobDeferredCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceStateUnavailable => "device_state_unavailable",
+            Self::WifiOnly => "wifi_only",
+            Self::ChargingOnly => "charging_only",
+            Self::InsufficientStorage => "insufficient_storage",
+            Self::WorkerBusy => "worker_busy",
+            Self::LeaseNotAcquired => "lease_not_acquired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileJobNoopCode {
+    JobNoLongerRunning,
+    JobStateChanged,
+}
+
+impl MobileJobNoopCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::JobNoLongerRunning => "job_no_longer_running",
+            Self::JobStateChanged => "job_state_changed",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -92,11 +353,14 @@ pub struct MobileJobRuntime {
     owner: String,
     seq: Arc<AtomicU64>,
     executor: Arc<dyn MobileJobExecutor>,
+    execution_guard: Arc<Mutex<()>>,
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    device_test_hook_root: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl MobileJobRuntime {
     pub fn new(cfg: Config, gate: Arc<Mutex<()>>, events: Arc<isyncyou_webui::EventBus>) -> Self {
-        let owner = format!("mobile-job-{}-{}", std::process::id(), crate::unix_now_ms());
+        let owner = process_owner_id();
         Self {
             cfg,
             gate,
@@ -104,7 +368,45 @@ impl MobileJobRuntime {
             owner,
             seq: Arc::new(AtomicU64::new(0)),
             executor: Arc::new(LiveMobileJobExecutor),
+            execution_guard: Arc::new(Mutex::new(())),
+            #[cfg(feature = "mobile-job-device-test-hooks")]
+            device_test_hook_root: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    pub fn set_device_test_hook_root(&self, root: impl Into<std::path::PathBuf>) {
+        *self
+            .device_test_hook_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(root.into());
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    fn device_test_hook(&self, phase: &str) {
+        let root = self
+            .device_test_hook_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(root) = root else { return };
+        let marker = root.join(format!("mobile-job-hook-{phase}"));
+        if !marker.is_file() {
+            return;
+        }
+        eprintln!("mobile job device-test hold: {phase}");
+        std::thread::sleep(std::time::Duration::from_secs(
+            MOBILE_JOB_DEVICE_TEST_HOOK_MAX_SECS,
+        ));
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    fn device_test_network_offline(&self) -> bool {
+        self.device_test_hook_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|root| root.join("mobile-job-network-offline").is_file())
     }
 
     #[cfg(test)]
@@ -199,6 +501,9 @@ impl MobileJobRuntime {
         let now = now_secs();
         for account in accounts {
             let store = self.open_store(&account)?;
+            store
+                .reclaim_mobile_jobs_from_foreign_process(&self.owner, now)
+                .map_err(|e| format!("reclaim mobile jobs for {account}: {e}"))?;
             job_ids.extend(
                 store
                     .recoverable_mobile_jobs(&account, now)
@@ -214,6 +519,79 @@ impl MobileJobRuntime {
         Ok(outcomes)
     }
 
+    pub fn mobile_worker_plan(
+        &self,
+        account: &str,
+    ) -> Result<(Vec<(String, MobileJobKind)>, bool), String> {
+        let store = self.open_store(account)?;
+        let now = now_secs();
+        store
+            .reclaim_mobile_jobs_from_foreign_process(&self.owner, now)
+            .map_err(|e| format!("reclaim mobile jobs for {account}: {e}"))?;
+        let jobs = store
+            .recoverable_mobile_jobs(account, now)
+            .map_err(|e| format!("list mobile jobs for {account}: {e}"))?;
+        let truncated = jobs.len() > MOBILE_JOB_PLAN_LIMIT;
+        Ok((
+            jobs.into_iter()
+                .take(MOBILE_JOB_PLAN_LIMIT)
+                .map(|job| (job.job_id, job.kind))
+                .collect(),
+            truncated,
+        ))
+    }
+
+    pub fn mobile_worker_constraints(&self) -> (bool, bool, u64) {
+        (
+            self.cfg.sync.wifi_only,
+            self.cfg.sync.charging_only,
+            self.cfg.sync.min_free_bytes,
+        )
+    }
+
+    pub fn run_mobile_job_for_worker(
+        &self,
+        job_id: &str,
+        expected_kind: MobileJobKind,
+        device: MobileWorkerDeviceSnapshot,
+    ) -> Result<MobileJobRunOutcome, String> {
+        if !device.network_validated {
+            return Ok(MobileJobRunOutcome::Deferred {
+                job_id: job_id.to_string(),
+                code: MobileJobDeferredCode::DeviceStateUnavailable,
+            });
+        }
+        if device.metered && self.cfg.sync.wifi_only {
+            return Ok(MobileJobRunOutcome::Deferred {
+                job_id: job_id.to_string(),
+                code: MobileJobDeferredCode::WifiOnly,
+            });
+        }
+        if !device.charging && self.cfg.sync.charging_only {
+            return Ok(MobileJobRunOutcome::Deferred {
+                job_id: job_id.to_string(),
+                code: MobileJobDeferredCode::ChargingOnly,
+            });
+        }
+        if device.free_bytes < self.cfg.sync.min_free_bytes {
+            return Ok(MobileJobRunOutcome::Deferred {
+                job_id: job_id.to_string(),
+                code: MobileJobDeferredCode::InsufficientStorage,
+            });
+        }
+        let Ok(_guard) = self.execution_guard.try_lock() else {
+            return Ok(MobileJobRunOutcome::Deferred {
+                job_id: job_id.to_string(),
+                code: MobileJobDeferredCode::WorkerBusy,
+            });
+        };
+        let (_, job) = self.find_job(job_id)?;
+        if job.kind != expected_kind {
+            return Err("job_kind_mismatch".to_string());
+        }
+        self.run_one_job(job_id)
+    }
+
     pub fn run_one_job(&self, job_id: &str) -> Result<MobileJobRunOutcome, String> {
         let job = {
             let (store, job) = self.find_job(job_id)?;
@@ -226,9 +604,9 @@ impl MobileJobRuntime {
                 )
                 .map_err(|e| format!("lease mobile job {job_id}: {e}"))?;
             if !acquired {
-                return Ok(MobileJobRunOutcome::Skipped {
+                return Ok(MobileJobRunOutcome::Deferred {
                     job_id: job_id.to_string(),
-                    reason: "lease_not_acquired".to_string(),
+                    code: MobileJobDeferredCode::LeaseNotAcquired,
                 });
             }
             self.events.notify();
@@ -238,7 +616,22 @@ impl MobileJobRuntime {
                 .unwrap_or(job)
         };
 
+        #[cfg(feature = "mobile-job-device-test-hooks")]
+        self.device_test_hook("after_lease");
+        #[cfg(feature = "mobile-job-device-test-hooks")]
+        let execution = if self.device_test_network_offline() {
+            Err(MobileJobExecutionError::Retryable {
+                code: MobileJobRetryCode::Network,
+                retry_after: None,
+                redacted: "mobile job network unavailable (device test hook)".to_string(),
+            })
+        } else {
+            self.execute_job(&job)
+        };
+        #[cfg(not(feature = "mobile-job-device-test-hooks"))]
         let execution = self.execute_job(&job);
+        #[cfg(feature = "mobile-job-device-test-hooks")]
+        self.device_test_hook("after_execute_before_finish");
         let store = self.open_store(&job.account_id)?;
         match execution {
             Ok((result_json, summary)) => {
@@ -252,9 +645,9 @@ impl MobileJobRuntime {
                     .map_err(|e| format!("finish mobile job {}: {e}", job.job_id))?;
                 if !finished {
                     self.events.notify();
-                    return Ok(MobileJobRunOutcome::Skipped {
+                    return Ok(MobileJobRunOutcome::Noop {
                         job_id: job.job_id,
-                        reason: "job_no_longer_running".to_string(),
+                        code: MobileJobNoopCode::JobNoLongerRunning,
                     });
                 }
                 self.record_job_activity(&store, &job, "succeeded", &summary)?;
@@ -265,36 +658,90 @@ impl MobileJobRuntime {
                     summary,
                 })
             }
-            Err(raw_error) => {
-                let error = agent_ops::redact_agent_operation_text(&raw_error);
-                match store.fail_mobile_job_if_running(&job.job_id, &self.owner, now_secs(), &error)
-                {
-                    Ok(true) => {
-                        self.record_job_activity(&store, &job, "failed", &error)?;
-                        self.events.notify();
-                        Ok(MobileJobRunOutcome::Failed {
+            Err(error) => match error {
+                MobileJobExecutionError::Retryable {
+                    code,
+                    retry_after,
+                    redacted,
+                } if job.attempts < 5 => {
+                    let progress = serde_json::json!({
+                        "v": 1,
+                        "status": "retry",
+                        "code": code.as_str(),
+                        "retry_after_secs": retry_after.map(|d| d.as_secs()),
+                    })
+                    .to_string();
+                    let requeued = store
+                        .requeue_mobile_job_if_running(
+                            &job.job_id,
+                            &self.owner,
+                            &redacted,
+                            &progress,
+                            now_secs(),
+                        )
+                        .map_err(|e| format!("requeue mobile job {}: {e}", job.job_id))?;
+                    if !requeued {
+                        return Ok(MobileJobRunOutcome::Noop {
                             job_id: job.job_id,
-                            kind: job.kind,
-                            error,
-                        })
+                            code: MobileJobNoopCode::JobStateChanged,
+                        });
                     }
-                    Ok(false) => {
-                        self.events.notify();
-                        Ok(MobileJobRunOutcome::Skipped {
-                            job_id: job.job_id,
-                            reason: "job_state_changed".to_string(),
-                        })
-                    }
-                    Err(e) => Err(format!("fail mobile job {}: {e}", job.job_id)),
+                    self.events.notify();
+                    Ok(MobileJobRunOutcome::Retrying {
+                        job_id: job.job_id,
+                        kind: job.kind,
+                        code,
+                        retry_after_secs: retry_after.map(|d| d.as_secs()),
+                    })
                 }
-            }
+                MobileJobExecutionError::Retryable { .. }
+                | MobileJobExecutionError::Terminal {
+                    code: _,
+                    redacted: _,
+                } => {
+                    let (code, error) = match error {
+                        MobileJobExecutionError::Retryable { redacted, .. } => {
+                            (MobileJobFailureCode::RetryBudgetExhausted, redacted)
+                        }
+                        MobileJobExecutionError::Terminal { code, redacted } => (code, redacted),
+                    };
+                    let error = format!("{}: {}", code.as_str(), error);
+                    match store.fail_mobile_job_if_running(
+                        &job.job_id,
+                        &self.owner,
+                        now_secs(),
+                        &error,
+                    ) {
+                        Ok(true) => {
+                            self.record_job_activity(&store, &job, "failed", &error)?;
+                            self.events.notify();
+                            Ok(MobileJobRunOutcome::Failed {
+                                job_id: job.job_id,
+                                kind: job.kind,
+                                code,
+                                error,
+                            })
+                        }
+                        Ok(false) => {
+                            self.events.notify();
+                            Ok(MobileJobRunOutcome::Noop {
+                                job_id: job.job_id,
+                                code: MobileJobNoopCode::JobStateChanged,
+                            })
+                        }
+                        Err(e) => Err(format!("fail mobile job {}: {e}", job.job_id)),
+                    }
+                }
+            },
         }
     }
 
-    fn execute_job(&self, job: &MobileJob) -> Result<(String, String), String> {
+    fn execute_job(&self, job: &MobileJob) -> Result<(String, String), MobileJobExecutionError> {
         match job.kind {
             MobileJobKind::Backup => {
-                let services = backup_services_from_intent(&job.intent_json)?;
+                let services = backup_services_from_intent(&job.intent_json).map_err(|e| {
+                    MobileJobExecutionError::terminal(MobileJobFailureCode::InvalidIntent, e)
+                })?;
                 let run =
                     self.executor
                         .run_backup(&self.cfg, &job.account_id, &self.gate, &services)?;
@@ -312,14 +759,18 @@ impl MobileJobRuntime {
                 Ok((result_json, run.summary))
             }
             MobileJobKind::RestoreCloud => {
-                let service = job
-                    .service
-                    .as_deref()
-                    .ok_or_else(|| "restore-cloud job missing service".to_string())?;
-                let id = job
-                    .target_id
-                    .as_deref()
-                    .ok_or_else(|| "restore-cloud job missing target_id".to_string())?;
+                let service = job.service.as_deref().ok_or_else(|| {
+                    MobileJobExecutionError::terminal(
+                        MobileJobFailureCode::InvalidIntent,
+                        "restore-cloud job missing service",
+                    )
+                })?;
+                let id = job.target_id.as_deref().ok_or_else(|| {
+                    MobileJobExecutionError::terminal(
+                        MobileJobFailureCode::InvalidIntent,
+                        "restore-cloud job missing target_id",
+                    )
+                })?;
                 let new_id = self.executor.run_restore_cloud(
                     &self.cfg,
                     &job.account_id,
@@ -390,6 +841,20 @@ impl MobileJobRuntime {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         format!("mobile-{}-{}-{seq}", kind.as_str(), crate::unix_now_ms())
     }
+}
+
+fn process_owner_id() -> String {
+    static OWNER: OnceLock<String> = OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            let mut nonce = [0u8; 16];
+            ring::rand::SystemRandom::new()
+                .fill(&mut nonce)
+                .expect("system randomness required for mobile job owner");
+            let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            format!("mobile-process-{}-{nonce}", std::process::id())
+        })
+        .clone()
 }
 
 impl isyncyou_webui::BackupHandler for MobileJobRuntime {
@@ -531,18 +996,32 @@ mod tests {
     use crate::{BackupDelta, BackupRun};
     use isyncyou_core::AccountConfig;
     use std::path::PathBuf;
+    use std::sync::Condvar;
 
     #[derive(Default)]
     struct RecordingExecutor {
         backup_calls: Mutex<Vec<Vec<String>>>,
         restore_calls: Mutex<Vec<(String, String)>>,
-        fail_with: Mutex<Option<String>>,
+        fail_with: Mutex<Option<MobileJobExecutionError>>,
     }
 
     impl RecordingExecutor {
         fn fail(error: &str) -> Self {
             Self {
-                fail_with: Mutex::new(Some(error.to_string())),
+                fail_with: Mutex::new(Some(MobileJobExecutionError::terminal(
+                    MobileJobFailureCode::Internal,
+                    error,
+                ))),
+                ..Self::default()
+            }
+        }
+
+        fn retry(code: MobileJobRetryCode) -> Self {
+            Self {
+                fail_with: Mutex::new(Some(MobileJobExecutionError::retryable(
+                    code,
+                    Some(Duration::from_secs(7)),
+                ))),
                 ..Self::default()
             }
         }
@@ -569,7 +1048,7 @@ mod tests {
             _account: &str,
             _gate: &Arc<Mutex<()>>,
             services: &[String],
-        ) -> Result<BackupRun, String> {
+        ) -> Result<BackupRun, MobileJobExecutionError> {
             if let Some(error) = self
                 .fail_with
                 .lock()
@@ -598,7 +1077,7 @@ mod tests {
             service: &str,
             id: &str,
             _gate: &Arc<Mutex<()>>,
-        ) -> Result<String, String> {
+        ) -> Result<String, MobileJobExecutionError> {
             if let Some(error) = self
                 .fail_with
                 .lock()
@@ -612,6 +1091,65 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .push((service.to_string(), id.to_string()));
             Ok(format!("new-{id}"))
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingExecutor {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl BlockingExecutor {
+        fn wait_until_entered(&self) {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |(entered, _)| !*entered)
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(!timeout.timed_out(), "first worker did not enter executor");
+            assert!(state.0);
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl MobileJobExecutor for BlockingExecutor {
+        fn run_backup(
+            &self,
+            _cfg: &Config,
+            _account: &str,
+            _gate: &Arc<Mutex<()>>,
+            _services: &[String],
+        ) -> Result<BackupRun, MobileJobExecutionError> {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            Ok(BackupRun {
+                summary: "backup ok".to_string(),
+                delta: BackupDelta::default(),
+            })
+        }
+
+        fn run_restore_cloud(
+            &self,
+            _cfg: &Config,
+            _account: &str,
+            _service: &str,
+            _id: &str,
+            _gate: &Arc<Mutex<()>>,
+        ) -> Result<String, MobileJobExecutionError> {
+            Err(MobileJobExecutionError::terminal(
+                MobileJobFailureCode::Unsupported,
+                "restore not used by concurrency test",
+            ))
         }
     }
 
@@ -699,6 +1237,59 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_mobile_workers_defer_second_as_worker_busy() {
+        let executor = Arc::new(BlockingExecutor::default());
+        let runtime = Arc::new(MobileJobRuntime::with_executor(
+            test_cfg("worker-busy"),
+            Arc::new(Mutex::new(())),
+            Arc::new(isyncyou_webui::EventBus::new()),
+            executor.clone(),
+        ));
+        let job = runtime.enqueue_backup("me", &["mail".to_string()]).unwrap();
+        let first_runtime = runtime.clone();
+        let first_job_id = job.job_id.clone();
+        let first = std::thread::spawn(move || {
+            first_runtime.run_mobile_job_for_worker(
+                &first_job_id,
+                MobileJobKind::Backup,
+                MobileWorkerDeviceSnapshot {
+                    network_validated: true,
+                    metered: false,
+                    charging: true,
+                    free_bytes: u64::MAX,
+                },
+            )
+        });
+        executor.wait_until_entered();
+
+        let second = runtime
+            .run_mobile_job_for_worker(
+                &job.job_id,
+                MobileJobKind::Backup,
+                MobileWorkerDeviceSnapshot {
+                    network_validated: true,
+                    metered: false,
+                    charging: true,
+                    free_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            second,
+            MobileJobRunOutcome::Deferred {
+                code: MobileJobDeferredCode::WorkerBusy,
+                ..
+            }
+        ));
+
+        executor.release();
+        assert!(matches!(
+            first.join().unwrap().unwrap(),
+            MobileJobRunOutcome::Succeeded { .. }
+        ));
+    }
+
+    #[test]
     fn mobile_restore_cloud_job_worker_calls_existing_restore_path() {
         let executor = Arc::new(RecordingExecutor::default());
         let rt = runtime_with_executor(test_cfg("restore-worker"), executor.clone());
@@ -778,6 +1369,189 @@ mod tests {
     }
 
     #[test]
+    fn mobile_job_retryable_error_requeues_and_clears_owner_lease() {
+        let executor = Arc::new(RecordingExecutor::retry(MobileJobRetryCode::RateLimited));
+        let rt = runtime_with_executor(test_cfg("retry-requeue"), executor);
+        let job = rt.enqueue_backup("me", &["mail".to_string()]).unwrap();
+
+        let out = rt.run_one_job(&job.job_id).unwrap();
+        assert!(matches!(
+            out,
+            MobileJobRunOutcome::Retrying {
+                code: MobileJobRetryCode::RateLimited,
+                retry_after_secs: Some(7),
+                ..
+            }
+        ));
+        let stored = rt
+            .open_store("me")
+            .unwrap()
+            .get_mobile_job(&job.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, MobileJobState::Queued);
+        assert_eq!(stored.lease_owner, None);
+        assert!(stored.progress_json.unwrap().contains("rate_limited"));
+    }
+
+    #[test]
+    fn mobile_job_terminal_error_is_failed_without_text_classification() {
+        let executor = Arc::new(RecordingExecutor::fail("temporarily unavailable 503"));
+        let rt = runtime_with_executor(test_cfg("terminal-no-text-classification"), executor);
+        let job = rt.enqueue_backup("me", &["mail".to_string()]).unwrap();
+
+        let out = rt.run_one_job(&job.job_id).unwrap();
+        assert!(matches!(
+            out,
+            MobileJobRunOutcome::Failed {
+                error,
+                ..
+            } if error.starts_with("internal:")
+        ));
+        let stored = rt
+            .open_store("me")
+            .unwrap()
+            .get_mobile_job(&job.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, MobileJobState::Failed);
+    }
+
+    #[test]
+    fn live_backup_refresh_errors_map_structurally_without_text_matching() {
+        let cases = [
+            (
+                isyncyou_engine::RefreshFailureKind::Network,
+                MobileJobRetryCode::Network,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Timeout,
+                MobileJobRetryCode::Timeout,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(408),
+                MobileJobRetryCode::Http408,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(425),
+                MobileJobRetryCode::Http425,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(429),
+                MobileJobRetryCode::RateLimited,
+            ),
+            (
+                isyncyou_engine::RefreshFailureKind::Http(503),
+                MobileJobRetryCode::Server,
+            ),
+        ];
+        for (kind, expected) in cases {
+            let mapped = MobileJobExecutionError::from_refresh(isyncyou_engine::RefreshFailure {
+                kind,
+                redacted: "unrelated text",
+            });
+            assert!(matches!(
+                mapped,
+                MobileJobExecutionError::Retryable { code, .. } if code == expected
+            ));
+        }
+        assert!(matches!(
+            MobileJobExecutionError::from_refresh(isyncyou_engine::RefreshFailure {
+                kind: isyncyou_engine::RefreshFailureKind::Internal,
+                redacted: "network timeout HTTP 503",
+            }),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::Internal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_restore_errors_map_structurally_without_text_matching() {
+        use isyncyou_graph::http::UploadError;
+
+        let graph_cases = [
+            (
+                UploadError::Transport("unrelated text".into()),
+                MobileJobRetryCode::Network,
+            ),
+            (
+                UploadError::Timeout("unrelated text".into()),
+                MobileJobRetryCode::Timeout,
+            ),
+            (
+                UploadError::Http {
+                    status: 408,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::Http408,
+            ),
+            (
+                UploadError::Http {
+                    status: 425,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::Http425,
+            ),
+            (
+                UploadError::Http {
+                    status: 429,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::RateLimited,
+            ),
+            (
+                UploadError::Http {
+                    status: 503,
+                    body: "unrelated text".into(),
+                },
+                MobileJobRetryCode::Server,
+            ),
+        ];
+        for (graph_error, expected) in graph_cases {
+            let mapped = MobileJobExecutionError::from_restore(
+                isyncyou_engine::RestoreError::from_graph(graph_error),
+            );
+            assert!(matches!(
+                mapped,
+                MobileJobExecutionError::Retryable { code, .. } if code == expected
+            ));
+        }
+
+        assert!(matches!(
+            MobileJobExecutionError::from_restore(isyncyou_engine::RestoreError::from_graph(
+                UploadError::Http {
+                    status: 401,
+                    body: "network timeout HTTP 503".into(),
+                },
+            )),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::Authentication,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MobileJobExecutionError::from_restore(isyncyou_engine::RestoreError::internal(
+                "network timeout HTTP 503",
+            )),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::Internal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MobileJobExecutionError::from_restore(isyncyou_engine::RestoreError::invalid(
+                "invalid request",
+            )),
+            MobileJobExecutionError::Terminal {
+                code: MobileJobFailureCode::InvalidIntent,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn mobile_backup_completed_job_does_not_block_future_backup_job() {
         let executor = Arc::new(RecordingExecutor::default());
         let rt = runtime_with_executor(test_cfg("backup-terminal-retry"), executor);
@@ -786,5 +1560,50 @@ mod tests {
         rt.run_one_job(&first.job_id).unwrap();
         let second = rt.enqueue_backup("me", &services).unwrap();
         assert_ne!(first.job_id, second.job_id);
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    #[test]
+    fn mobile_job_test_hook_is_bounded() {
+        assert_eq!(MOBILE_JOB_DEVICE_TEST_HOOK_MAX_SECS, 120);
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    #[test]
+    fn mobile_job_network_test_hook_requeues_without_calling_executor() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let rt = runtime_with_executor(test_cfg("network-hook"), executor.clone());
+        let hook_root = temp_root("network-hook-marker");
+        rt.set_device_test_hook_root(&hook_root);
+        std::fs::write(hook_root.join("mobile-job-network-offline"), b"test").unwrap();
+
+        let job = rt.enqueue_backup("me", &["mail".to_string()]).unwrap();
+        let outcome = rt.run_one_job(&job.job_id).unwrap();
+        assert!(matches!(
+            outcome,
+            MobileJobRunOutcome::Retrying {
+                code: MobileJobRetryCode::Network,
+                ..
+            }
+        ));
+        assert_eq!(executor.backup_calls(), 0);
+
+        std::fs::remove_file(hook_root.join("mobile-job-network-offline")).unwrap();
+        let outcome = rt.run_one_job(&job.job_id).unwrap();
+        assert!(matches!(
+            outcome,
+            MobileJobRunOutcome::Succeeded {
+                kind: MobileJobKind::Backup,
+                ..
+            }
+        ));
+        assert_eq!(executor.backup_calls(), 1);
+    }
+
+    #[cfg(not(feature = "mobile-job-device-test-hooks"))]
+    #[test]
+    fn mobile_job_test_hook_does_not_change_default_build() {
+        // The test itself is compiled only in the product's default feature set;
+        // the hook code is absent from that build by construction.
     }
 }

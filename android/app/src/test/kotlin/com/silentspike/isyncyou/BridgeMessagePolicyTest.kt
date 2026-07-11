@@ -47,14 +47,14 @@ class BridgeMessagePolicyTest {
         )
         assertValid(
             BridgeMessagePolicy.validateEnvelope(
-                JSONObject().put("t", "bio").put("id", "b1").put("pat", "delete").put("label", "Delete").toString(),
+                JSONObject().put("t", "bio").put("id", "b1").put("pat", "pending-1").toString(),
             ),
             "bio",
             "b1",
         )
         assertInvalid(
-            BridgeMessagePolicy.validateEnvelope(JSONObject().put("t", "bio").put("id", "b2").put("pat", "delete").toString()),
-            "missing_label",
+            BridgeMessagePolicy.validateEnvelope(JSONObject().put("t", "bio").put("id", "b2").toString()),
+            "missing_pat",
         )
     }
 

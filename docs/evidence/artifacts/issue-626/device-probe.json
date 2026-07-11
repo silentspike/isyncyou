@@ -1,0 +1,23 @@
+{
+  "issue": 626,
+  "device": {
+    "model": "Pixel 8 Pro",
+    "transport": "USB ADB",
+    "android_api": 36,
+    "package": "com.silentspike.isyncyou.debug"
+  },
+  "physical_matrix": {
+    "biometric_cancel": "pass",
+    "device_credential_approve": "pass",
+    "agent_live_write_cancel_and_approve": "pass",
+    "keystore_round_trip": "pass",
+    "corrupt_wrapped_key_fail_closed": "pass",
+    "foreground_notification_visible": "pass",
+    "notification_denial_fail_closed": "pass",
+    "same_process_worker": "pass",
+    "process_death_recovery": "pass",
+    "deterministic_network_retry": "pass",
+    "graph_verify_and_revert": "pass"
+  },
+  "secrets": "No account identifier, token, OAuth URL, item identifier, notification dump, or content title is retained."
+}

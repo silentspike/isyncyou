@@ -223,7 +223,7 @@ pub fn backup_contact_photos<F: BytesFetcher>(
             "https://graph.microsoft.com/v1.0/me/contacts/{}/photo/$value",
             c.remote_id
         );
-        match fetcher.fetch_bytes(&url) {
+        match fetcher.fetch_bytes_for_sync(&url) {
             Ok(bytes) => {
                 let abs = shard_path(archive_root, SERVICE, &c.remote_id, "jpg");
                 if let Some(parent) = abs.parent() {
@@ -236,8 +236,11 @@ pub fn backup_contact_photos<F: BytesFetcher>(
                 report.bytes += bytes.len() as u64;
             }
             // No photo set on this contact (or no body) -> skip, don't fail.
-            Err(e) if e.contains("404") => report.skipped += 1,
-            Err(e) => return Err(SyncError::Remote(e)),
+            Err(SyncError::Graph(isyncyou_graph::http::UploadError::Http {
+                status: 404, ..
+            }))
+            | Err(SyncError::HttpStatus(404)) => report.skipped += 1,
+            Err(e) => return Err(e),
         }
     }
     Ok(report)
@@ -376,6 +379,14 @@ mod tests {
                 Ok(vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]) // jpeg-ish bytes
             } else {
                 Err("HTTP 404: ItemNotFound".into()) // no photo set
+            }
+        }
+
+        fn fetch_bytes_for_sync(&self, url: &str) -> Result<Vec<u8>, SyncError> {
+            if url.contains("/c1/") {
+                Ok(vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3])
+            } else {
+                Err(SyncError::HttpStatus(404))
             }
         }
     }
