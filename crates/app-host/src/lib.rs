@@ -4,6 +4,8 @@
 //! full-node job handlers with [`with_mobile_full_node_jobs`].
 
 mod agent_ops;
+#[cfg(feature = "agent-subscription-experimental")]
+mod local_cli_fallback;
 mod mobile_jobs;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
@@ -1037,17 +1039,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
         #[cfg(feature = "agent-subscription-experimental")]
         {
-            // #627-only desktop fallback: the existing `claude` CLI login, which the CLI
-            // keeps refreshed. Never compiled into the product OAuth provider boundary.
-            let home = std::env::var_os("HOME")?;
-            let data =
-                std::fs::read_to_string(PathBuf::from(home).join(".claude/.credentials.json"))
-                    .ok()?;
-            let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-            v.get("claudeAiOauth")?
-                .get("accessToken")?
-                .as_str()
-                .map(|s| s.to_string())
+            local_cli_fallback::load_claude_from_process()
+                .ok()
+                .map(|credential| credential.access_token)
         }
         #[cfg(not(feature = "agent-subscription-experimental"))]
         {
@@ -1092,35 +1086,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
-    /// The subscription config: the in-repo recipe plus, in #627 experimental builds only,
-    /// the local CLI account identity from `~/.claude.json` for `metadata.user_id`.
+    /// The minimized Claude request config. Local client account/device metadata is not
+    /// imported: #627 supplies credentials only and leaves all default-client harness
+    /// state outside iSyncYou.
     fn subscription_config(&self) -> isyncyou_agent::SubscriptionConfig {
-        #[cfg(feature = "agent-subscription-experimental")]
-        {
-            let mut cfg = isyncyou_agent::SubscriptionConfig::default();
-            if let Some(home) = std::env::var_os("HOME") {
-                if let Ok(data) = std::fs::read_to_string(PathBuf::from(home).join(".claude.json"))
-                {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                        if let Some(a) = v
-                            .get("oauthAccount")
-                            .and_then(|o| o.get("accountUuid"))
-                            .and_then(|x| x.as_str())
-                        {
-                            cfg.account_uuid = a.to_string();
-                        }
-                        if let Some(d) = v.get("userID").and_then(|x| x.as_str()) {
-                            cfg.device_id = d.to_string();
-                        }
-                    }
-                }
-            }
-            cfg
-        }
-        #[cfg(not(feature = "agent-subscription-experimental"))]
-        {
-            isyncyou_agent::SubscriptionConfig::default()
-        }
+        isyncyou_agent::SubscriptionConfig::default()
     }
 
     /// Build the subscription provider if a token is available (else None → fallback).
@@ -1153,22 +1123,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
         #[cfg(feature = "agent-subscription-experimental")]
         {
-            // #627-only desktop fallback: the existing `codex` CLI login.
-            let home = std::env::var_os("HOME")?;
-            let data =
-                std::fs::read_to_string(PathBuf::from(home).join(".codex/auth.json")).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-            let t = v.get("tokens")?;
-            let token = t.get("access_token")?.as_str()?.to_string();
-            let account = t
-                .get("account_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string();
-            if token.is_empty() {
-                return None;
-            }
-            Some((token, account))
+            local_cli_fallback::load_codex_from_process()
+                .ok()
+                .map(|credential| (credential.access_token, credential.account_id))
         }
         #[cfg(not(feature = "agent-subscription-experimental"))]
         {
