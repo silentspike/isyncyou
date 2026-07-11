@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
@@ -158,6 +159,7 @@ internal class AndroidMobileJobForegroundController(
                 ForegroundInfo(
                     MobileJobWorkerPolicy.NOTIFICATION_ID,
                     notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
                 ),
             )
             true
