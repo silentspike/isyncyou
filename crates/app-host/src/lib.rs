@@ -1713,25 +1713,6 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         Ok("connected".to_string())
     }
 
-    /// #627-only import of a subscription credential obtained outside the app OAuth flow.
-    /// Product setup must use OAuth start/complete/callback, not token import.
-    #[cfg(feature = "agent-subscription-experimental")]
-    fn subscription_import(
-        &self,
-        access: &str,
-        refresh: &str,
-        expires_at_ms: u64,
-    ) -> Result<(), String> {
-        if access.is_empty() {
-            return Err("access token is required".into());
-        }
-        self.store_credential(&StoredCredential {
-            access_token: access.to_string(),
-            refresh_token: refresh.to_string(),
-            expires_at_ms,
-        })
-    }
-
     /// The loopback callback path (kept for the auto flow); exchange
     /// the code with the stored verifier + state and persist the token, then show a page.
     #[cfg(any(
@@ -6296,26 +6277,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(all(
-        feature = "agent-oauth-providers",
-        not(feature = "agent-subscription-experimental")
-    ))]
     #[test]
-    fn product_oauth_provider_does_not_enable_subscription_import() {
-        let root = apphost_credential_test_root("product-no-import");
-        let _ = std::fs::remove_dir_all(&root);
-        let agent = DaemonAgent::new(Config::default(), root.clone());
+    fn app_host_product_source_has_no_credential_ingest_surface() {
+        let source = include_str!("lib.rs");
+        let method = ["subscription", "_import"].concat();
+        let route = ["subscription", "/import"].concat();
 
-        let err = isyncyou_webui::AgentHandler::subscription_import(
-            &agent,
-            "access-token",
-            "refresh-token",
-            123,
-        )
-        .unwrap_err();
-
-        assert!(err.contains("subscription import is not enabled"));
-        let _ = std::fs::remove_dir_all(root);
+        assert!(!source.contains(&method));
+        assert!(!source.contains(&route));
     }
 
     #[cfg(any(
