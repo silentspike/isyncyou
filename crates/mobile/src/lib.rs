@@ -1,14 +1,12 @@
 //! Standalone Android client (#89): runs the real iSyncYou engine **in the app
-//! process**. A tiny JNI surface lets Kotlin start the embedded loopback server
-//! (the same `build_live_router` the desktop daemon uses, in the live-companion
-//! profile) and read the per-process session token; the app's WebView then loads
-//! `http://127.0.0.1:<port>/`. No desktop daemon, no `adb reverse` — the phone is a
-//! self-contained iSyncYou node over mobile data.
+//! process**. A small JNI surface starts the same `build_live_router` used by the
+//! desktop daemon. The app's WebView reaches that router only through the native
+//! message/asset bridge at the appassets origin. No desktop daemon, loopback TCP
+//! server, or `adb reverse` is involved.
 //!
-//! SECURITY: the loopback API is fully session-token gated (#89 P1) because any app
-//! on the device can reach `127.0.0.1`. The token is minted here, handed to Kotlin
-//! over JNI (never served in a static asset), and required on every `/api/v1/*`
-//! route. Tokens are NEVER logged.
+//! SECURITY: the data API remains session-token gated (#89 P1/#721). The token is
+//! minted here, used only by trusted native request paths, and required on every
+//! `/api/v1/*` route. Tokens are NEVER logged or exposed to WebView JavaScript.
 
 use isyncyou_core::{AccountConfig, Config, OneDriveMode};
 #[cfg(test)]
@@ -53,11 +51,8 @@ const ACCOUNT: &str = "me";
 
 struct EngineState {
     session_token: String,
-    /// The live router. In the default build it is reached **only** in-process (the
-    /// message bridge + `shouldInterceptRequest` asset path) — no TCP port is bound, so no
-    /// other app on the device can reach it (#0A netstat AC). A loopback server is bound
-    /// **only** under the experimental agent-subscription feature (whose OAuth flow needs a
-    /// `http://127.0.0.1/callback` redirect target); its port is not retained here.
+    /// The live router is reached only in-process through the message bridge and
+    /// `shouldInterceptRequest` asset path. No TCP port is bound (#0A/#721).
     router: Arc<isyncyou_webui::Router>,
     mobile_jobs: Arc<isyncyou_app_host::MobileJobRuntime>,
 }
@@ -524,7 +519,7 @@ fn current_router() -> Option<Arc<isyncyou_webui::Router>> {
 /// **Binary-safe** (unlike the JSON bridge envelope, which is text-only) and header-faithful
 /// so a viewer's per-response `Content-Security-Policy` survives. Frame:
 /// `[status:u16 BE][ct_len:u16 BE][content_type][hdr_len:u16 BE][headers "K: V\r\n"…][body]`.
-/// Cookie-gated exactly like the loopback path. Empty vec when the engine hasn't started.
+/// Session-gated like every native data path. Empty vec when the engine has not started.
 pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     let router = current_router();
     let Some(router) = router else {
@@ -672,8 +667,8 @@ pub fn stream_close(id: i64) {
     }
 }
 
-/// The per-process session token Kotlin must hand to the WebView (header + cookie)
-/// so the WebUI can reach the gated loopback API. `None` until the engine started.
+/// The per-process session token used by trusted Kotlin/native request paths. It is
+/// never exposed to WebView JavaScript. `None` until the engine starts.
 pub fn session_token() -> Option<String> {
     cell()
         .lock()
@@ -814,24 +809,6 @@ fn start_inner(
         // native BiometricPrompt (confirmed over `nativeConfirmAction`, below).
         .with_biometric_gate(),
     );
-
-    // #0A: NO loopback TCP port in the default build — the WebView reaches the engine only
-    // in-process (the message bridge for data, `shouldInterceptRequest`→`asset_request` for
-    // GET assets), so nothing is reachable by another app on the device. A loopback server
-    // is bound ONLY under the experimental agent-subscription feature, whose device-code
-    // OAuth flow returns to a `http://127.0.0.1:<port>/callback` redirect the browser hits.
-    #[cfg(feature = "agent-subscription-experimental")]
-    {
-        let listener = isyncyou_webui::bind_loopback("127.0.0.1:0").map_err(|e| e.to_string())?;
-        // Serve on a background thread, panic-isolated: a request-handling panic must never
-        // take down the host app process. Shares the same router as the in-process bridge.
-        let serve_router = Arc::clone(&router);
-        std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let _ = isyncyou_webui::serve_listener_shared(listener, serve_router);
-            }));
-        });
-    }
 
     // Cache-refresh thread (#89 P2): once the account is signed in, periodically pull
     // mail/calendar/contacts/todo/onenote from Graph into the local cache store
@@ -1152,7 +1129,7 @@ fn jni_convert_byte_array<'local>(
     }
 }
 
-/// JNI: start the engine, returning the bound loopback port (or -1 on error).
+/// JNI: start the in-process engine, returning a positive readiness value or -1.
 /// SECURITY: never logs the session token or any secret.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart<'local>(
@@ -1495,6 +1472,48 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_product_has_no_local_cli_experimental_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let source = include_str!("lib.rs");
+        let forbidden_feature = ["agent-subscription", "-experimental"].concat();
+        let loopback_symbol = ["bind_", "loopback("].concat();
+
+        assert!(!manifest.contains(&forbidden_feature));
+        assert!(!source.contains(&forbidden_feature));
+        assert!(!source.contains(&loopback_symbol));
+    }
+
+    #[test]
+    fn android_rejects_agent_subscription_experimental_feature() {
+        let gradle = include_str!("../../../android/app/build.gradle.kts");
+        let forbidden_feature = ["agent-subscription", "-experimental"].concat();
+        let expected = [
+            "agent-session-kdf-bench",
+            "agent-credential-store-self-test",
+            "mobile-job-device-test-hooks",
+        ];
+        let allowlist = gradle
+            .split_once("val allowedCargoTestFeatures = setOf(")
+            .unwrap()
+            .1
+            .split_once(")\nval requestedCargoTestFeatures")
+            .unwrap()
+            .0;
+        let declared = allowlist
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|line| line.strip_suffix("\","))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(declared, expected);
+        assert!(gradle.contains("Unsupported ISY_CARGO_FEATURES value"));
+        assert!(!gradle.contains(&forbidden_feature));
+    }
 
     #[test]
     fn native_mobile_job_run_rejects_malformed_and_unbounded_requests() {
