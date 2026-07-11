@@ -1,6 +1,7 @@
 package com.silentspike.isyncyou
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
@@ -82,11 +83,13 @@ class MainActivity : FragmentActivity() {
     )
 
     private data class PendingBio(
+        val requestId: String,
         val prompt: BiometricPrompt,
         val timeout: Runnable,
     )
 
-    private val bioPending = ConcurrentHashMap<String, PendingBio>()
+    /** One active native prompt per opaque PendingAction handle. */
+    private val bioPending = BiometricPendingRegistry<PendingBio>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -609,6 +612,7 @@ class MainActivity : FragmentActivity() {
                 val service = result.optString("service")
                 if (op.isBlank() || service.isBlank()) return reply.postMessage(bioReplyJson(reqId, false))
                 BiometricLabelPolicy.label(op, service)
+                    ?: return reply.postMessage(bioReplyJson(reqId, false))
             }
         } catch (e: Exception) {
             android.util.Log.w(TAG, "pending action descriptor unavailable", e)
@@ -620,7 +624,12 @@ class MainActivity : FragmentActivity() {
         val strongAvailable = mgr.canAuthenticate(strong) == BiometricManager.BIOMETRIC_SUCCESS
         val cipher = if (strongAvailable) bioConfirmCipher() else null
         val credential = BiometricManager.Authenticators.DEVICE_CREDENTIAL
-        val credentialAvailable = mgr.canAuthenticate(credential) == BiometricManager.BIOMETRIC_SUCCESS
+        val credentialAvailable = BiometricPolicy.credentialAvailable(
+            apiLevel = Build.VERSION.SDK_INT,
+            biometricManagerAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                mgr.canAuthenticate(credential) == BiometricManager.BIOMETRIC_SUCCESS,
+            keyguardDeviceSecure = getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true,
+        )
         val decision = BiometricPolicy.choose(strongAvailable, cipher != null, credentialAvailable)
         if (decision == null) {
             android.util.Log.w(TAG, "biometric confirmation unavailable or strong cipher failed")
@@ -629,7 +638,7 @@ class MainActivity : FragmentActivity() {
         }
         lateinit var prompt: BiometricPrompt
         val timeout = Runnable {
-            bioPending.remove(reqId)?.let { pending ->
+            takePendingBiometric(pat, reqId)?.let { pending ->
                 pending.prompt.cancelAuthentication()
                 reply.postMessage(bioReplyJson(reqId, false))
             }
@@ -639,7 +648,7 @@ class MainActivity : FragmentActivity() {
             ContextCompat.getMainExecutor(this),
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    val pending = bioPending.remove(reqId) ?: return
+                    val pending = takePendingBiometric(pat, reqId) ?: return
                     mainHandler.removeCallbacks(pending.timeout)
                     val armed = try {
                         if (decision.mode == BiometricMode.StrongCrypto) {
@@ -656,31 +665,26 @@ class MainActivity : FragmentActivity() {
                     reply.postMessage(bioReplyJson(reqId, armed))
                 }
 
-                override fun onAuthenticationError(code: Int, msg: CharSequence) = completeBiometric(reqId, reply, false)
+                override fun onAuthenticationError(code: Int, msg: CharSequence) =
+                    completeBiometric(pat, reqId, reply, false)
 
                 // A single non-match keeps the prompt up; no reply until success/error/cancel.
                 override fun onAuthenticationFailed() {}
             },
         )
-        bioPending.put(reqId, PendingBio(prompt, timeout))?.let { old ->
-            mainHandler.removeCallbacks(old.timeout)
-            old.prompt.cancelAuthentication()
+        val pending = PendingBio(reqId, prompt, timeout)
+        if (!bioPending.register(pat, pending)) {
+            reply.postMessage(bioReplyJson(reqId, false))
+            return
         }
         mainHandler.postDelayed(timeout, BIO_TIMEOUT_MS)
-        val infoBuilder = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Confirm action")
-            .setSubtitle(descriptor)
-        if (decision.mode == BiometricMode.DeviceCredential && Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            @Suppress("DEPRECATION")
-            infoBuilder.setDeviceCredentialAllowed(true)
-        } else {
-            infoBuilder.setAllowedAuthenticators(decision.authenticators)
-        }
-        if (BiometricPolicy.requiresNegativeButton(Build.VERSION.SDK_INT, decision.mode)) {
-            infoBuilder.setNegativeButtonText("Cancel")
-        }
-        val info = infoBuilder.build()
         try {
+            val info = BiometricPolicy.buildPromptInfo(
+                Build.VERSION.SDK_INT,
+                decision,
+                "Confirm action",
+                descriptor,
+            )
             if (decision.mode == BiometricMode.StrongCrypto) {
                 prompt.authenticate(info, BiometricPrompt.CryptoObject(checkNotNull(cipher)))
             } else {
@@ -688,23 +692,30 @@ class MainActivity : FragmentActivity() {
             }
         } catch (e: Exception) {
             android.util.Log.w(TAG, "biometric prompt failed to start", e)
-            completeBiometric(reqId, reply, false)
+            completeBiometric(pat, reqId, reply, false)
         }
     }
 
-    private fun completeBiometric(reqId: String, reply: JavaScriptReplyProxy, ok: Boolean) {
-        val pending = bioPending.remove(reqId) ?: return
+    private fun completeBiometric(
+        pat: String,
+        reqId: String,
+        reply: JavaScriptReplyProxy,
+        ok: Boolean,
+    ) {
+        val pending = takePendingBiometric(pat, reqId) ?: return
         mainHandler.removeCallbacks(pending.timeout)
         reply.postMessage(bioReplyJson(reqId, ok))
+    }
+
+    private fun takePendingBiometric(pat: String, reqId: String): PendingBio? {
+        return bioPending.take(pat) { it.requestId == reqId }
     }
 
     private fun bioReplyJson(reqId: String, ok: Boolean): String =
         JSONObject().put("t", "bio").put("id", reqId).put("ok", ok).toString()
 
     private fun cancelPendingBiometrics() {
-        val pending = bioPending.values.toList()
-        bioPending.clear()
-        pending.forEach {
+        bioPending.drain().forEach {
             mainHandler.removeCallbacks(it.timeout)
             it.prompt.cancelAuthentication()
         }

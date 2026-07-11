@@ -26,15 +26,32 @@ class BiometricPolicyTest {
     }
 
     @Test
-    fun strongModeRequiresLegacyNegativeButton() {
-        assertTrue(BiometricPolicy.requiresNegativeButton(Build.VERSION_CODES.Q, BiometricMode.StrongCrypto))
-        assertTrue(!BiometricPolicy.requiresNegativeButton(Build.VERSION_CODES.R, BiometricMode.StrongCrypto))
+    fun strongModeAlwaysRequiresNegativeButton() {
+        assertTrue(BiometricPolicy.requiresNegativeButton(BiometricMode.StrongCrypto))
+        assertTrue(!BiometricPolicy.requiresNegativeButton(BiometricMode.DeviceCredential))
+    }
+
+    @Test
+    fun legacyDeviceCredentialUsesKeyguardSecurityState() {
+        assertTrue(BiometricPolicy.credentialAvailable(Build.VERSION_CODES.Q, false, true))
+        assertTrue(!BiometricPolicy.credentialAvailable(Build.VERSION_CODES.Q, true, false))
+        assertTrue(BiometricPolicy.credentialAvailable(Build.VERSION_CODES.R, true, false))
     }
 
     @Test
     fun labelsComeOnlyFromKnownRustEnums() {
         assertEquals("Delete in OneDrive", BiometricLabelPolicy.label("delete", "onedrive"))
         assertEquals("Make folder offline in OneDrive", BiometricLabelPolicy.label("mode-switch-offline-large", "onedrive"))
-        assertEquals("Confirm action in Microsoft 365", BiometricLabelPolicy.label("unknown", "unknown"))
+        assertNull(BiometricLabelPolicy.label("unknown", "unknown"))
+        assertNull(BiometricLabelPolicy.label("delete", "unknown"))
+    }
+
+    @Test
+    fun duplicatePendingHandleCannotOpenTwoPrompts() {
+        val registry = BiometricPendingRegistry<String>()
+        assertTrue(registry.register("pending-1", "request-1"))
+        assertTrue(!registry.register("pending-1", "request-2"))
+        assertNull(registry.take("pending-1") { it == "request-2" })
+        assertEquals("request-1", registry.take("pending-1") { it == "request-1" })
     }
 }
