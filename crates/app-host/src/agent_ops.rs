@@ -2444,7 +2444,7 @@ mod tests {
             tx.send(result.is_ok()).unwrap();
         });
 
-        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), true);
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
         drop(held);
         worker.join().unwrap();
     }
