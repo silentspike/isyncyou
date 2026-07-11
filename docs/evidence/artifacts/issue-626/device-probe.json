@@ -1,19 +1,23 @@
 {
   "issue": 626,
-  "device": "Pixel 8 Pro via USB",
-  "probe": "tools/android-mobile-job-probe.py",
-  "snapshot": {
-    "airplane_mode": false,
-    "wifi_enabled": false,
-    "mobile_data_enabled": true,
-    "stay_awake": "15",
-    "notifications_allowed": true,
-    "validated_network": true
+  "device": {
+    "model": "Pixel 8 Pro",
+    "transport": "USB ADB",
+    "android_api": 36,
+    "package": "com.silentspike.isyncyou.debug"
   },
-  "state_restore": "pass",
-  "network_loss": {
-    "result": "skip",
-    "reason": "device still reported a validated network after airplane, Wi-Fi, and mobile-data commands; no offline PASS claimed"
+  "physical_matrix": {
+    "biometric_cancel": "pass",
+    "device_credential_approve": "pass",
+    "agent_live_write_cancel_and_approve": "pass",
+    "keystore_round_trip": "pass",
+    "corrupt_wrapped_key_fail_closed": "pass",
+    "foreground_notification_visible": "pass",
+    "notification_denial_fail_closed": "pass",
+    "same_process_worker": "pass",
+    "process_death_recovery": "pass",
+    "deterministic_network_retry": "pass",
+    "graph_verify_and_revert": "pass"
   },
-  "secrets": "No account, token, URL, notification dump, or native response was recorded."
+  "secrets": "No account identifier, token, OAuth URL, item identifier, notification dump, or content title is retained."
 }

@@ -1,15 +1,23 @@
 {
   "issue": 626,
   "hook_apk": {
-    "path": "/tmp/isyncyou-626-apks/isyncyou-626-hook.apk",
+    "path": "/tmp/isyncyou-issue-626-apks/isyncyou-626-hook-final-head.apk",
     "features": "mobile-job-device-test-hooks",
-    "sha256": "1c4240eae7ea19067c7f162d2b53a27be66c28fd201056e7a289b62944abaab3"
+    "sha256": "bc29e992a8d4a3f8f78655a7311599de9b72508d19baa85979ded58e536d1be9",
+    "physically_tested_source_through": "8fbf916872d88eeed0cb4d570d24ab400719e1e7"
   },
   "default_apk": {
-    "path": "/tmp/isyncyou-626-apks/isyncyou-626-default.apk",
+    "path": "/tmp/isyncyou-issue-626-apks/isyncyou-626-default-final.apk",
     "features": "",
-    "sha256": "aebc00fca9a620b8d21120916fdcf95982ca318ef46c1c9ad90b40b50fa6696e",
-    "hook_string_scan": "pass"
+    "sha256": "988107dec9390e60e4be93336d7e2cbd823808843e2f20477ec0a4f10252a3ea",
+    "source_commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
+    "hook_string_scan": "pass_no_matches",
+    "installed_after_feature_instrumentation": true
   },
-  "build_rule": "Each APK was built after clean in a separate no-daemon Gradle invocation; no previous app-debug.apk was reused."
+  "build_rule": "Hook and default APKs were built in separate clean no-daemon Gradle invocations. The default build used an unset ISY_CARGO_FEATURES environment.",
+  "post_device_host_only_changes": [
+    "5225aed9d8192ff500e627e46c86add2dfb32eb5 removes target identifiers from Agent confirm audit",
+    "fd1d2e8e3649a66b547ecbe42990d6954a8c95fd simplifies a clippy-only assertion",
+    "09a2d954e082afe7d6bc038d225e0a8969ee4d66 fixes minSdk compatibility and was rechecked on device with the default APK"
+  ]
 }

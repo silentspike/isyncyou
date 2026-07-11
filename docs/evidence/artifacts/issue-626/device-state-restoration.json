@@ -1,0 +1,25 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "before": {
+    "airplane_mode": false,
+    "wifi_enabled": false,
+    "mobile_data_enabled": true,
+    "stay_awake": "15",
+    "notifications_allowed": true,
+    "validated_network": true
+  },
+  "after": {
+    "airplane_mode": false,
+    "wifi_enabled": false,
+    "mobile_data_enabled": true,
+    "stay_awake": "15",
+    "notifications_allowed": true,
+    "validated_network": true
+  },
+  "state_restored": true,
+  "adb_forward_removed": true,
+  "test_markers_removed": true,
+  "temporary_m365_token_files_removed": true,
+  "cloud_restore_policy_restored_to_false": true
+}

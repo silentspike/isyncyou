@@ -27,7 +27,7 @@ implementing stories. Design: [ADR-007](../adr/007-agent-architecture.md). Requi
 | T1 | **Prompt injection** — retrieved mail/document content instructs the model to take a destructive action ("delete my inbox"). | Tool calls are taken only from the model's `tool_use` structure, never parsed from content; tool results are tagged `untrusted_content`; the system prompt forbids content from overriding policy; destructive actions require a human-confirmed one-time token (REQ-AGENT-005, REQ-AGENT-002/003). |
 | T2 | **Model self-authorization** — the model obtains a capability token and authorizes its own destructive action. | The model never receives a capability/confirmation token; the server mints a one-time, action-bound, single-use token only after a human confirms via a session-authenticated request (REQ-AGENT-003/004). |
 | T3 | **Scope escape** — the agent reaches the device/OS/filesystem beyond M365. | App-scope invariant: a single `isyncyou` tool, enforced by a tool-registry snapshot test; no other tool exists (REQ-AGENT-001). |
-| T4 | **Loopback abuse on mobile** — a malicious local app calls the agent API. | Session-token gate on every `/api/v1/agent/*` route (REQ-AND-012); destructive mobile actions additionally require the per-action biometric-token gate before the Agent one-time token is consumed (#625), and the physical native BiometricPrompt proof lands in #626 (REQ-AND-016, S-AG.11). |
+| T4 | **Loopback abuse on mobile** — a malicious local app calls the agent API. | Session-token gate on every `/api/v1/agent/*` route (REQ-AND-012); destructive mobile actions additionally require the per-action biometric-token gate before the Agent one-time token is consumed (#625), with physical native-prompt cancel/approval evidence from #626 (REQ-AND-016, S-AG.11). |
 | T5 | **Session history disclosure** — plaintext M365 excerpts in OneDrive. | Per-turn files are AES-256-GCM encrypted with a pairing-derived key (Argon2id/HKDF), not the device-local key; only ciphertext is uploaded (REQ-AGENT-006). |
 | T6 | **Credential theft** - provider API keys/tokens leak. | Credentials are stored through the typed encrypted CredentialStore, with owner-only Unix files and a separate Android Keystore-wrapped agent credential key installed before `nativeStart`; raw credentials and raw credential keys are never sent to the WebView, bridge, or API logs. The LLM call is server-side (S-AG.5, REQ-AGENT-010). |
 | T7 | **Interrupted destructive job on mobile** — a backup/restore-cloud job is killed mid-flight and re-runs, duplicating cloud items. | Mobile backup/restore-cloud run as durable `mobile_jobs` with owner leases, WorkManager-only execution, restart recovery, dedupe keys, and late-cancel reconciliation. Restore-cloud also reuses the crash-safe restore ledger (`run_restore_op` / `recover_pending_restores`) so retries do not duplicate cloud items (REQ-AND-016, R1). |
@@ -41,7 +41,7 @@ biometric-token confirmation before Agent-token consumption, Android Keystore fo
 credentials (T6), native BiometricPrompt for every destructive confirmation, foreground
 job presentation, strict device-state gates, and resumable jobs (T7). #625 implements the
 server/router/job contract; #626 implements the WorkManager/notification/native ordering
-and evidence tooling, while physical BiometricPrompt, Keystore evidence, and validated
-network-loss proof remain native closeout gates. The complete package is a **release blocker**
+and closes the physical native-prompt, Keystore, foreground-notification, process-death,
+and deterministic application-network recovery gates. The complete package is a **release blocker**
 for the mobile full node
 (REQ-AND-016, stories S-AG.10/#625 + S-AG.11/#626) — not optional hardening.

@@ -1,61 +1,150 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-10T23:38:00+02:00",
-  "commit": "271779f79486c09eb5bc3c52f2bcb3dc25430ebf",
+  "generated_at": "2026-07-11T12:45:00+02:00",
+  "commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
   "entries": [
     {
       "id": "EV-001",
       "requirement": "REQ-AND-016",
-      "claim": "The Android worker accepts only bounded job_id/kind input and executes notification, device snapshot, encrypted bootstrap, and native run in that order.",
+      "claim": "WorkManager publishes foreground state before device snapshot, encrypted bootstrap, or native job execution.",
       "method": "test",
-      "command": "(cd android && ./gradlew :app:testDebugUnitTest --console=plain --no-daemon)",
-      "result": "pass",
+      "command": "(cd android && ./gradlew :app:testDebugUnitTest)",
       "test": "worker_policy_never_starts_native_before_foreground_and_snapshot",
-      "evidence": "Android unit suite passed; injected controller recorded foreground, snapshot, start, run order.",
+      "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-626/host-gates.json"
     },
     {
       "id": "EV-002",
       "requirement": "REQ-AND-016",
-      "claim": "Notification denial stops before device snapshot and native startup and does not create an automatic retry loop.",
+      "claim": "A Strong-Biometric cipher failure fails closed instead of downgrading to device credential.",
       "method": "test",
-      "command": "(cd android && ./gradlew :app:testDebugUnitTest --tests com.silentspike.isyncyou.MobileJobWorkerPolicyTest --console=plain --no-daemon)",
+      "command": "(cd android && ./gradlew :app:testDebugUnitTest)",
+      "test": "strongEnrollmentWithCipherFailureFailsClosed",
       "result": "pass",
-      "test": "notification_failure_never_reaches_device_or_native",
-      "evidence": "The injected foreground controller returns false; snapshot and native event lists remain empty and the result code is notifications_required.",
       "artifact": "docs/evidence/artifacts/issue-626/host-gates.json"
     },
     {
       "id": "EV-003",
       "requirement": "REQ-AND-016",
-      "claim": "Only exact successful queue-producing POST routes reconcile the Rust mobile-job plan.",
+      "claim": "Mobile Agent confirmation checks the pending binding and biometric token before consuming the Agent one-time token.",
       "method": "test",
-      "command": "(cd android && ./gradlew :app:testDebugUnitTest --tests com.silentspike.isyncyou.MobileJobWakeupPolicyTest --console=plain --no-daemon)",
+      "command": "cargo remote -c -- test -p isyncyou-mobile mobile_agent_confirm_requires_biometric_before_agent_token_consumption -- --nocapture",
+      "test": "mobile_agent_confirm_requires_biometric_before_agent_token_consumption",
       "result": "pass",
-      "test": "accepts_only_exact_post_paths_and_success_status",
-      "evidence": "The policy accepts backup, restore, and agent confirm with 2xx only; near-match, GET, external, and error paths are rejected.",
-      "artifact": "docs/evidence/artifacts/issue-626/host-gates.json"
+      "artifact": "docs/evidence/artifacts/issue-626/host-gates.txt"
     },
     {
       "id": "EV-004",
       "requirement": "REQ-AND-016",
-      "claim": "Default-off recovery hooks are bounded and absent from the separately rebuilt default APK.",
+      "claim": "Android Keystore installs a hardware-backed wrapping key, seals the provider credential store, and rejects a corrupt wrapped key without replacement.",
       "method": "test",
-      "command": "cargo remote -c -- test -p isyncyou-app-host --features mobile-job-device-test-hooks mobile_job_test_hook_is_bounded -- --nocapture",
+      "command": "(cd android && ISY_CARGO_FEATURES=agent-credential-store-self-test ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentCredentialKeyStoreInstrumentedTest)",
+      "test": "agentCredentialKeyStoreInstallsAndSealsProviderCredentialStore",
       "result": "pass",
-      "test": "mobile_job_test_hook_is_bounded",
-      "evidence": "Hook and default APKs were clean-built separately; default strings scan is clean and hashes are recorded.",
-      "artifact": "docs/evidence/artifacts/issue-626/apk-builds.json"
+      "artifact": "docs/evidence/artifacts/issue-626/keystore-device.json"
     },
     {
       "id": "EV-005",
       "requirement": "REQ-AND-016",
-      "claim": "The device-state probe writes a bounded snapshot and restores state through an outer cleanup path.",
-      "method": "command",
-      "command": "python3 -m unittest tools/test_android_mobile_job_probe.py",
+      "claim": "The Activity and WorkManager Worker run in the same Android process.",
+      "method": "test",
+      "command": "(cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.MobileJobWorkerInstrumentedTest)",
+      "test": "activityAndWorkManagerUseSameProcess",
       "result": "pass",
-      "evidence": "Probe unit tests passed; Pixel snapshot and restore passed. Validated network-loss was conservatively skipped because the device retained VALIDATED.",
-      "artifact": "docs/evidence/artifacts/issue-626/device-probe.json"
+      "artifact": "docs/evidence/artifacts/issue-626/android-unit-instrumentation.txt"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AND-016",
+      "claim": "Retryable mobile-job errors requeue through typed state without retaining the lease owner.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host mobile_job_retryable_error_requeues_and_clears_owner_lease -- --nocapture",
+      "test": "mobile_job_retryable_error_requeues_and_clears_owner_lease",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/host-gates.txt"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AND-016",
+      "claim": "A real native prompt cancel causes no mutation; physical device-credential approval arms only the matching action and the effect is reverted.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro app flow with native prompt, CDP observation, and Graph/store verification",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/biometric-device.json"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AND-016",
+      "claim": "A real app-OAuth Codex tool call composes Agent PendingAction confirmation with native user presence; cancel is inert and approval changes exactly the intended Graph object.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro Agent live-write flow with app OAuth, CDP stream, Graph verification, and revert",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/graph-verify-revert.json"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AND-016",
+      "claim": "A real backup runs under a visible dataSync foreground notification with safe generic text.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro backup with bounded foreground hold and filtered dumpsys/UI capture",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/workmanager-device.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AND-016",
+      "claim": "Notification denial leaves the valid job queued without engine start, lease, or Graph effect; restoring permission reconciles the same job.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro notification-permission denial and restore flow",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/notification-denial-device.json"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AND-016",
+      "claim": "Killing the app after the cloud effect but before local completion recovers to one result without duplication.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro bounded after-execute process-death hook, relaunch, Graph count, and revert",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/process-recovery-device.json"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AND-016",
+      "claim": "A deterministic in-app network failure requeues a real-token job and succeeds after restoration without losing USB ADB or duplicating the effect.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro debug-only network-failure marker, real job retry, marker removal, and reconciliation",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/network-retry-device.json",
+      "notes": "This is the user-directed app-level recovery proof; Android retained a validated network throughout."
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AND-016",
+      "claim": "Restore-cloud creates exactly one Graph object and all device-created fixtures are reverted or deleted.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro restore-cloud and Agent live-write Graph verify/revert sequence",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/graph-verify-revert.json"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AND-016",
+      "claim": "The independently clean-built default APK contains no recovery test-hook strings and is the final APK installed on the device.",
+      "method": "command",
+      "command": "unzip -p /tmp/isyncyou-issue-626-apks/isyncyou-626-default-final.apk lib/arm64-v8a/libisyncyou_mobile.so | strings | rg 'mobile-job-hook|mobile job device-test hold|mobile-job-network-offline'",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/apk-builds.json",
+      "notes": "Pass means the negative scan produced no matches."
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AND-016",
+      "claim": "All deliberately changed device settings were restored and all temporary token, marker, forward, and fixture state was removed.",
+      "method": "probe",
+      "command": "Physical Pixel 8 Pro post-test state readback and cleanup",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-626/device-state-restoration.json"
     }
   ]
 }

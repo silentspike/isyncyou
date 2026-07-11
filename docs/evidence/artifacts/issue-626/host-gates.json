@@ -1,19 +1,30 @@
 {
   "issue": 626,
-  "source_head_at_capture": "271779f79486c09eb5bc3c52f2bcb3dc25430ebf",
+  "implementation_commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
+  "rust_source_commit": "fd1d2e8e3649a66b547ecbe42990d6954a8c95fd",
+  "captured_at": "2026-07-11T12:45:00+02:00",
   "tests": {
+    "workspace_tests": "pass",
+    "workspace_clippy_deny_warnings": "pass",
+    "cargo_remote_fmt_check": "pass",
     "android_unit": "pass",
-    "python_probe_tests": "pass",
+    "android_lint": "pass",
+    "android_default_assemble": "pass",
+    "android_same_process_instrumentation": "pass_1_of_1",
+    "android_keystore_instrumentation": "pass_2_of_2",
+    "node_syntax": "pass",
+    "python_probe_tests": "pass_2_of_2",
+    "python_test_discovery_tests": "pass_2_of_2",
     "traceability": "pass",
-    "evidence_validator": "pass",
-    "cargo_remote_fmt": "pass",
-    "app_host_mobile_clippy": "pass"
+    "workmanager_multiprocess_dependency_absent": true,
+    "merged_manifest_single_process": true,
+    "default_apk_hook_scan": "pass_no_matches"
   },
-  "claims": [
-    "WorkManager input is bounded to job_id and kind",
-    "foreground notification precedes device snapshot and native startup",
-    "notification failure does not reach native or Graph work",
-    "wake-up policy accepts only exact successful queue routes",
-    "default-off recovery hooks are isolated from the product build"
-  ]
+  "finding_fixed": {
+    "gate": "android_lint",
+    "initial_result": "fail",
+    "reason": "two API calls exceeded minSdk 24",
+    "fix_commit": "09a2d954e082afe7d6bc038d225e0a8969ee4d66",
+    "final_result": "pass"
+  }
 }

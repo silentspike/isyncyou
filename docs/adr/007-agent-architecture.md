@@ -66,7 +66,7 @@ The constraints that force the shape of this decision:
    local restore root. Mobile uses the same confirmed-action model but routes backup and
    restore-cloud through durable mobile jobs, gates Agent confirmation with the per-action
    biometric-token layer before consuming the Agent token, and limits mobile live-write to
-   the explicit metadata allowlist until the native Android proof lands (REQ-AND-016).
+   the explicit metadata allowlist proven by the native Android closeout (REQ-AND-016).
 
 7. **Encrypted, conflict-safe cross-device session.** Per-turn ULID files under
    `/Apps/iSyncYou/agent/<session>/<ulid>.json`, AES-256-GCM with a key derived
@@ -88,8 +88,10 @@ The constraints that force the shape of this decision:
   backup/restore jobs, restart recovery, and mobile live-write allowlist), while #626 owns
   the native Android proof (Keystore, physical BiometricPrompt, foreground-service/
   WorkManager presentation, and device evidence). #626 now supplies the WorkManager
-  contract, strict notification/device gates, bounded native hooks, and probe tooling;
-  physical biometric/Keystore and validated network-loss proof remain closeout gates.
+  contract, strict notification/device gates, bounded native hooks, and probe tooling.
+  Its Pixel 8 Pro closeout proves physical native user presence, hardware-backed
+  Keystore sealing, visible foreground execution, notification denial, process-death
+  adoption, and deterministic application-network retry while USB ADB remains intact.
   Tracked in
   `docs/requirements/android.yml` (REQ-AND-016) and the agent threat model.
 - **Governance:** the invariants above are tracked as `REQ-AGENT-*` in

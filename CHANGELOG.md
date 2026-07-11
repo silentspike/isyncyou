@@ -14,8 +14,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   snapshot, encrypted engine bootstrap, and native execution happen in that order.
   Notification denial fails closed without a retry loop, and exact successful queue
   routes reconcile the durable Rust plan. Default-off recovery hooks and a state-safe
-  ADB probe support process-death evidence. Physical BiometricPrompt and complete
-  device network-loss proof remain explicitly pending until on-device closeout.
+  ADB probe support process-death evidence. Pixel 8 Pro closeout verified physical
+  native-prompt cancel/approval, hardware-backed Keystore credential sealing,
+  notification-denied fail-closed behavior, visible `dataSync` foreground work,
+  process-death adoption, and deterministic network-error recovery with Graph/store
+  cross-checks and reverts. The device run also found and fixed Android 14 foreground
+  service typing, live-write store-gate starvation, audit target leakage, and min-SDK
+  compatibility defects.
 
 **Agent mobile full-node server contract**
 - `mobile`+`app-host`+`webui`+`store`: added #625's server-side mobile
@@ -24,8 +29,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   backup as durable `mobile_jobs`, recovers queued/expired-lease jobs on app
   start, binds Agent confirm to the per-action biometric-token gate before
   consuming the Agent one-time token, and keeps unsupported mobile live-write
-  verbs fail-closed. Physical Android BiometricPrompt, Keystore, foreground job
-  presentation, and device closeout remain #626.
+  verbs fail-closed. #626 completes the native Android BiometricPrompt/Keystore,
+  foreground-job presentation, and physical-device closeout.
 
 **Agent confirmed desktop operations**
 - `agent`+`app-host`: completed #624's desktop confirmed-operation path for
