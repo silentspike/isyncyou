@@ -821,14 +821,16 @@ impl LiveWriteRuntime for LiveLiveWriteRuntime {
 fn run_live_write_with_runtime<R: LiveWriteRuntime>(
     cfg: &Config,
     action: &isyncyou_agent::ToolAction,
-    gate: &Arc<Mutex<()>>,
+    _gate: &Arc<Mutex<()>>,
     runtime: &R,
 ) -> Result<LiveWriteRun, String> {
     let isyncyou_agent::ToolAction::LiveWrite { account, .. } = action else {
         return Err(format!("not_live_write_action: {}", action.op()));
     };
     let intent = validate_live_write_action(action)?;
-    let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+    // These adapters call the same direct Graph writers as the WebUI and do not
+    // open the local Store. Waiting on the mobile Store gate here can starve a
+    // confirmed action behind a long cache refresh until the bridge times out.
     let result_id = runtime.execute_live_write(cfg, account, &intent)?;
     let service = intent.service().to_string();
     let verb = intent.verb().to_string();
@@ -2418,6 +2420,33 @@ mod tests {
                 })
             )]
         );
+    }
+
+    #[test]
+    fn agent_live_write_does_not_wait_for_mobile_store_gate() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "todo",
+            "target": "task-1",
+            "change": { "verb": "complete", "list_id": "list-1" }
+        }))
+        .unwrap();
+        let runtime = RecordingLiveWriteRuntime::new();
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker_gate = Arc::clone(&gate);
+
+        let worker = std::thread::spawn(move || {
+            let result =
+                run_live_write_with_runtime(&Config::default(), &action, &worker_gate, &runtime);
+            tx.send(result.is_ok()).unwrap();
+        });
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), true);
+        drop(held);
+        worker.join().unwrap();
     }
 
     #[test]
