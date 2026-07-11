@@ -257,6 +257,253 @@ pub use fake::FakeProvider;
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn assert_no_default_client_components(value: &serde_json::Value) {
+        const FORBIDDEN_KEYS: &[&str] = &[
+            "client_context",
+            "commands",
+            "cwd",
+            "default_system_prompt",
+            "filesystem",
+            "history",
+            "mcp",
+            "mcp_servers",
+            "memories",
+            "plugins",
+            "rules",
+            "shell",
+            "skills",
+            "system_prompt",
+            "workspace",
+        ];
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, nested) in object {
+                    assert!(
+                        !FORBIDDEN_KEYS.contains(&key.as_str()),
+                        "custom harness retained forbidden default-client key: {key}"
+                    );
+                    assert_no_default_client_components(nested);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_no_default_client_components(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn harness_requests() -> (serde_json::Value, serde_json::Value) {
+        let history = [crate::turn::Message::user("controlled user request")];
+        let claude = subscription::SubscriptionProvider::new(
+            "claude-oauth-token",
+            "claude-test",
+            "iSyncYou controlled system prompt",
+            subscription::SubscriptionConfig {
+                account_uuid: "account-identity".into(),
+                device_id: "device-identity".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .request_body(&history);
+        let codex =
+            codex::build_request("codex-test", "iSyncYou controlled system prompt", &history);
+        (claude, codex)
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn custom_harness_replaces_only_non_auth_non_billing_sections() {
+        let claude_provider = subscription::SubscriptionProvider::new(
+            "claude-oauth-token",
+            "claude-test",
+            "iSyncYou controlled system prompt",
+            subscription::SubscriptionConfig::default(),
+        )
+        .unwrap();
+        let claude_headers = claude_provider.request_headers();
+        let claude_system = claude_provider.system_blocks();
+        let codex_provider = codex::CodexProvider::new(
+            "codex-oauth-token",
+            "iSyncYou controlled system prompt",
+            codex::CodexConfig {
+                account_id: "codex-account-identity".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let codex_headers = codex_provider.request_headers();
+
+        assert_eq!(claude_headers[0].0, "authorization");
+        assert_eq!(claude_headers[0].1, "Bearer claude-oauth-token");
+        assert_eq!(
+            claude_system[0]["text"],
+            "x-anthropic-billing-header: cc_version=2.1.207.cab; cc_entrypoint=sdk-cli; cch=00000;"
+        );
+        assert_eq!(
+            claude_system[1]["text"],
+            "iSyncYou controlled system prompt"
+        );
+        assert_eq!(codex_headers[0].0, "authorization");
+        assert_eq!(codex_headers[0].1, "Bearer codex-oauth-token");
+        assert_eq!(codex_headers[1].0, "chatgpt-account-id");
+        assert_eq!(codex_headers[1].1, "codex-account-identity");
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn custom_harness_removes_default_prompt_tools_skills_mcp_rules_and_history() {
+        let (claude, codex) = harness_requests();
+        assert_no_default_client_components(&claude);
+        assert_no_default_client_components(&codex);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn custom_harness_installs_only_isyncyou_prompt_and_tool() {
+        let (claude, codex) = harness_requests();
+
+        assert_eq!(claude["system"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            claude["system"][1]["text"],
+            "iSyncYou controlled system prompt"
+        );
+        assert_eq!(claude["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(claude["tools"][0]["name"], crate::tool::TOOL_NAME);
+        assert_eq!(codex["instructions"], "iSyncYou controlled system prompt");
+        assert_eq!(codex["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(codex["tools"][0]["name"], crate::tool::TOOL_NAME);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_harness_retains_only_required_provider_identity_fields() {
+        let claude = subscription::SubscriptionProvider::new(
+            "claude-oauth-token",
+            "claude-test",
+            "iSyncYou controlled system prompt",
+            subscription::SubscriptionConfig::default(),
+        )
+        .unwrap();
+        let claude_names = claude
+            .request_headers()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        let codex = codex::CodexProvider::new(
+            "codex-oauth-token",
+            "iSyncYou controlled system prompt",
+            codex::CodexConfig {
+                account_id: "codex-account-identity".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let codex_names = codex
+            .request_headers()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            claude_names,
+            [
+                "authorization",
+                "anthropic-version",
+                "anthropic-beta",
+                "anthropic-dangerous-direct-browser-access",
+                "user-agent",
+                "x-app",
+                "x-claude-code-session-id",
+                "content-type",
+                "accept",
+            ]
+        );
+        assert_eq!(
+            codex_names,
+            [
+                "authorization",
+                "chatgpt-account-id",
+                "originator",
+                "openai-beta",
+                "user-agent",
+                "accept",
+            ]
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_harness_contains_no_default_client_agent_components() {
+        let (claude, codex) = harness_requests();
+        assert_no_default_client_components(&claude);
+        assert_no_default_client_components(&codex);
+
+        let claude_keys = claude
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let codex_keys = codex
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            claude_keys,
+            BTreeSet::from([
+                "max_tokens".into(),
+                "messages".into(),
+                "metadata".into(),
+                "model".into(),
+                "stream".into(),
+                "system".into(),
+                "tools".into(),
+            ])
+        );
+        assert_eq!(
+            codex_keys,
+            BTreeSet::from([
+                "input".into(),
+                "instructions".into(),
+                "model".into(),
+                "parallel_tool_calls".into(),
+                "store".into(),
+                "stream".into(),
+                "tool_choice".into(),
+                "tools".into(),
+            ])
+        );
+    }
 
     #[test]
     fn agent_stream_event_json_is_single_line_and_stable() {

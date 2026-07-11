@@ -6041,6 +6041,34 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
+    fn oauth_completes_before_custom_harness_transformation() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("oauth-before-custom-harness");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        assert_eq!(agent.build_turn_provider("custom harness").name(), "fake");
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "completed-product-oauth-token".into(),
+                refresh_token: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+            })
+            .unwrap();
+        let resolved = agent.resolve_claude_credential().unwrap();
+
+        assert!(resolved.satisfies_product_harness_readiness());
+        assert_eq!(
+            agent.build_turn_provider("custom harness").name(),
+            "subscription"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
     fn agent_provider_selection_uses_stored_claude_oauth_credential() {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("agent-provider-claude");

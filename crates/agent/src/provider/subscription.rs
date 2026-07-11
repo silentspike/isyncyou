@@ -105,7 +105,7 @@ impl SubscriptionProvider {
     }
 
     /// The Claude-Code identity headers + Bearer (the legitimately-obtained OAuth token).
-    fn request_headers(&self) -> Vec<(String, String)> {
+    pub(crate) fn request_headers(&self) -> Vec<(String, String)> {
         vec![
             (
                 "authorization".to_string(),
@@ -136,7 +136,7 @@ impl SubscriptionProvider {
 
     /// `system` as the two-block array: the billing header block (which identifies the
     /// request as Claude Code so the subscription serves Opus/Sonnet) then the real prompt.
-    fn system_blocks(&self) -> Value {
+    pub(crate) fn system_blocks(&self) -> Value {
         json!([
             {"type": "text", "text": format!(
                 "x-anthropic-billing-header: cc_version={}.cab; cc_entrypoint=sdk-cli; cch=00000;",
@@ -156,7 +156,7 @@ impl SubscriptionProvider {
         })
     }
 
-    fn request_body(&self, history: &[Message]) -> Value {
+    pub(crate) fn request_body(&self, history: &[Message]) -> Value {
         let mut body = anthropic::build_request_blocks(&self.model, self.system_blocks(), history);
         body["metadata"] = self.metadata();
         body["stream"] = json!(true);
@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn first_system_block_is_the_billing_header() {
+    fn claude_billing_block_remains_first_and_unchanged() {
         let p = SubscriptionProvider::new(
             "t",
             "m",
@@ -395,9 +395,11 @@ mod tests {
         .unwrap();
         let s = p.system_blocks();
         let first = s[0]["text"].as_str().unwrap();
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.207.cab;"));
-        assert!(first.contains("cc_entrypoint=sdk-cli"));
-        assert!(first.contains("cch=00000"));
+        assert_eq!(
+            first,
+            "x-anthropic-billing-header: cc_version=2.1.207.cab; cc_entrypoint=sdk-cli; cch=00000;"
+        );
+        assert_eq!(s.as_array().unwrap().len(), 2);
         // second block is the real prompt, cached
         assert_eq!(s[1]["text"], "the real system prompt");
         assert_eq!(s[1]["cache_control"]["type"], "ephemeral");

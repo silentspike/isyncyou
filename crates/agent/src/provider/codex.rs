@@ -377,7 +377,7 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[test]
-    fn headers_mimic_codex_cli() {
+    fn codex_subscription_identity_envelope_remains_unchanged() {
         let p = CodexProvider::new(
             "tok123",
             "instructions",
@@ -389,6 +389,18 @@ mod tests {
         .unwrap();
         let h = p.request_headers();
         let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+
+        assert_eq!(
+            h.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "authorization",
+                "chatgpt-account-id",
+                "originator",
+                "openai-beta",
+                "user-agent",
+                "accept",
+            ]
+        );
 
         assert_eq!(get("authorization").unwrap(), "Bearer tok123");
         assert_eq!(get("chatgpt-account-id").unwrap(), "acct_123");
