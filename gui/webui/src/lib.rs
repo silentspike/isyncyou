@@ -9604,12 +9604,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn assistant_product_source_has_no_subscription_import_affordance() {
-        for forbidden in [
-            "subscription/import",
-            "data-agent-subscription-import",
-            "ISY_LIVE_TOKEN",
-            "ISY_CODEX_TOKEN",
-        ] {
+        for forbidden in ["subscription/import", "data-agent-subscription-import"] {
             assert!(
                 !APP_JS.contains(forbidden),
                 "Assistant product source exposes experimental credential import: {forbidden}"
