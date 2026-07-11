@@ -50,6 +50,10 @@ fn main() {
         .map_err(str::to_string)
         .and_then(|(options, output)| {
             let summary = reduce_capture(&options).map_err(|error| error.to_string())?;
+            let review = summary.manual_review_categories();
+            if !review.is_empty() {
+                eprintln!("local drift manual review categories: {}", review.join(","));
+            }
             write_summary_atomic(
                 options.provider,
                 &summary,

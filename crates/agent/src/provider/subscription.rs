@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
-pub(crate) const DEFAULT_CLI_VERSION: &str = "2.1.206";
+pub(crate) const DEFAULT_CLI_VERSION: &str = "2.1.207";
 
 /// The subscription wire configuration. Defaults to the verified Claude-Code recipe; the
 /// operator may override the CLI version or supply account identity for `metadata.user_id`.
@@ -355,7 +355,7 @@ mod tests {
             c.messages_url,
             "https://api.anthropic.com/v1/messages?beta=true"
         );
-        assert_eq!(c.cli_version, "2.1.206");
+        assert_eq!(c.cli_version, "2.1.207");
     }
 
     #[test]
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(get("x-app").unwrap(), "cli");
         assert_eq!(
             get("user-agent").unwrap(),
-            "claude-cli/2.1.206 (external, sdk-cli)"
+            "claude-cli/2.1.207 (external, sdk-cli)"
         );
         assert_eq!(get("accept").unwrap(), "text/event-stream");
         assert!(get("x-claude-code-session-id").is_some());
@@ -395,7 +395,7 @@ mod tests {
         .unwrap();
         let s = p.system_blocks();
         let first = s[0]["text"].as_str().unwrap();
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.206.cab;"));
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.207.cab;"));
         assert!(first.contains("cc_entrypoint=sdk-cli"));
         assert!(first.contains("cch=00000"));
         // second block is the real prompt, cached

@@ -26,6 +26,20 @@ const CLAUDE_USAGE_FIELDS: &[&str] = &[
     "cache_read_input_tokens",
     "service_tier",
 ];
+// Safely observed in the earlier reduced #623 CLI capture. These are client
+// diagnostics, not fields consumed by the iSyncYou streaming/usage contract. Keep
+// discarding the entire value; any other usage key still forces manual review.
+const CLAUDE_IGNORED_USAGE_FIELDS: &[&str] = &[
+    "cache_creation",
+    "ephemeral_1h_input_tokens",
+    "fast",
+    "inference_geo",
+    "iterations",
+    "output_tokens_details",
+    "server_tool_use",
+    "speed",
+    "web_search_requests",
+];
 const CLAUDE_RATE_LIMIT_FIELDS: &[&str] = &[
     "rateLimitType",
     "status",
@@ -180,6 +194,10 @@ impl CaptureProvider {
             .find(|allowed| *allowed == value)
     }
 
+    fn ignored_usage_field(self, value: &str) -> bool {
+        self == Self::Claude && CLAUDE_IGNORED_USAGE_FIELDS.contains(&value)
+    }
+
     fn event_fields(self, event_type: &str) -> &'static [&'static str] {
         match (self, event_type) {
             (Self::Claude, "assistant") => CLAUDE_ASSISTANT_FIELDS,
@@ -270,6 +288,14 @@ pub struct DriftSummary {
     pub model_catalog: Option<ModelCatalogSummary>,
     pub drift_decision: DriftDecision,
     pub raw_retained: bool,
+    #[serde(skip)]
+    review: ReviewMarkers,
+}
+
+impl DriftSummary {
+    pub fn manual_review_categories(&self) -> Vec<&'static str> {
+        self.review.categories()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -334,8 +360,42 @@ struct ReductionState {
     paths: BTreeSet<&'static str>,
     headers: HeaderVisibility,
     sentinel_observed: bool,
-    unknown_event_or_field: bool,
     structured_debug_observed: bool,
+    review: ReviewMarkers,
+}
+
+#[derive(Debug, Default)]
+struct ReviewMarkers {
+    version: bool,
+    event_type: bool,
+    event_field: bool,
+    usage_field: bool,
+    rate_limit_field: bool,
+    debug_shape: bool,
+    endpoint: bool,
+    header: bool,
+}
+
+impl ReviewMarkers {
+    fn requires_update(&self) -> bool {
+        !self.categories().is_empty()
+    }
+
+    fn categories(&self) -> Vec<&'static str> {
+        [
+            (self.version, "version"),
+            (self.event_type, "event_type"),
+            (self.event_field, "event_field"),
+            (self.usage_field, "usage_field"),
+            (self.rate_limit_field, "rate_limit_field"),
+            (self.debug_shape, "debug_shape"),
+            (self.endpoint, "endpoint"),
+            (self.header, "header"),
+        ]
+        .into_iter()
+        .filter_map(|(present, category)| present.then_some(category))
+        .collect()
+    }
 }
 
 pub fn reduce_capture(options: &DriftCaptureOptions) -> Result<DriftSummary, DriftCaptureError> {
@@ -371,14 +431,14 @@ pub fn reduce_capture(options: &DriftCaptureOptions) -> Result<DriftSummary, Dri
     let model_catalog = inspect_model_catalogs(options)?;
     let headers_observed = state.headers.any();
     let endpoint_observed = !state.hosts.is_empty() && !state.paths.is_empty();
-    let drift_decision =
-        if version != options.provider.compatibility_version() || state.unknown_event_or_field {
-            DriftDecision::ImplementationUpdateRequired
-        } else if !state.structured_debug_observed || !headers_observed || !endpoint_observed {
-            DriftDecision::NotSafelyObservable
-        } else {
-            DriftDecision::NoDrift
-        };
+    state.review.version = version != options.provider.compatibility_version();
+    let drift_decision = if state.review.requires_update() {
+        DriftDecision::ImplementationUpdateRequired
+    } else if !state.structured_debug_observed || !headers_observed || !endpoint_observed {
+        DriftDecision::NotSafelyObservable
+    } else {
+        DriftDecision::NoDrift
+    };
 
     Ok(DriftSummary {
         schema_version: 1,
@@ -403,6 +463,7 @@ pub fn reduce_capture(options: &DriftCaptureOptions) -> Result<DriftSummary, Dri
         model_catalog,
         drift_decision,
         raw_retained: false,
+        review: state.review,
     })
 }
 
@@ -566,7 +627,7 @@ fn inspect_events(
             .and_then(|value| options.provider.event_type(value))
             .unwrap_or("unknown");
         if event_type == "unknown" {
-            state.unknown_event_or_field = true;
+            state.review.event_type = true;
         }
         if let Some(object) = value.as_object() {
             let allowed = options.provider.event_fields(event_type);
@@ -574,10 +635,10 @@ fn inspect_events(
                 .keys()
                 .any(|field| !allowed.contains(&field.as_str()))
             {
-                state.unknown_event_or_field = true;
+                state.review.event_field = true;
             }
         } else {
-            state.unknown_event_or_field = true;
+            state.review.event_field = true;
         }
         *state.counts.entry(event_type).or_default() += 1;
         inspect_event_value(options.provider, &value, &options.expected_sentinel, state);
@@ -598,7 +659,11 @@ fn inspect_event_value(
                     "request_id" => state.identifiers.request_id_present |= !value.is_null(),
                     "session_id" => state.identifiers.session_id_present |= !value.is_null(),
                     "thread_id" => state.identifiers.thread_id_present |= !value.is_null(),
-                    "usage" | "modelUsage" => inspect_usage(provider, value, state),
+                    "usage" => inspect_usage(provider, value, state),
+                    // Claude's aggregate per-model billing object contains model names
+                    // and cost diagnostics. It is known from the reduced #623 capture,
+                    // is not part of iSyncYou Usage, and is discarded as one unit.
+                    "modelUsage" => {}
                     "rate_limit_info" => inspect_rate_limit(value, state),
                     _ => {}
                 }
@@ -617,23 +682,26 @@ fn inspect_event_value(
 
 fn inspect_usage(provider: CaptureProvider, value: &Value, state: &mut ReductionState) {
     let Some(object) = value.as_object() else {
-        state.unknown_event_or_field = true;
+        state.review.usage_field = true;
         return;
     };
     for (key, value) in object {
         if let Some(field) = provider.usage_field(key) {
             state.usage_fields.insert(field);
+        } else if provider.ignored_usage_field(key) {
+            // Intentionally ignored as a whole; nested diagnostic values must not be
+            // inspected or copied into the public summary.
         } else if value.is_object() {
             inspect_usage(provider, value, state);
         } else {
-            state.unknown_event_or_field = true;
+            state.review.usage_field = true;
         }
     }
 }
 
 fn inspect_rate_limit(value: &Value, state: &mut ReductionState) {
     let Some(object) = value.as_object() else {
-        state.unknown_event_or_field = true;
+        state.review.rate_limit_field = true;
         return;
     };
     for key in object.keys() {
@@ -644,7 +712,7 @@ fn inspect_rate_limit(value: &Value, state: &mut ReductionState) {
         {
             state.rate_limit_fields.insert(field);
         } else {
-            state.unknown_event_or_field = true;
+            state.review.rate_limit_field = true;
         }
     }
 }
@@ -658,7 +726,7 @@ fn inspect_debug(provider: CaptureProvider, raw: &str, state: &mut ReductionStat
     let mut parsed_any = false;
     for line in raw.lines() {
         if line.len() > MAX_LINE_BYTES {
-            state.unknown_event_or_field = true;
+            state.review.debug_shape = true;
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(line) {
@@ -705,22 +773,22 @@ fn inspect_request_object(
 
 fn inspect_url(provider: CaptureProvider, raw: &str, state: &mut ReductionState) {
     let Ok(url) = Url::parse(raw) else {
-        state.unknown_event_or_field = true;
+        state.review.endpoint = true;
         return;
     };
     if url.scheme() != "https" {
-        state.unknown_event_or_field = true;
+        state.review.endpoint = true;
         return;
     }
     let Some(host) = url.host_str() else {
-        state.unknown_event_or_field = true;
+        state.review.endpoint = true;
         return;
     };
     let host = match host {
         "api.anthropic.com" => "api.anthropic.com",
         "chatgpt.com" => "chatgpt.com",
         _ => {
-            state.unknown_event_or_field = true;
+            state.review.endpoint = true;
             return;
         }
     };
@@ -730,7 +798,7 @@ fn inspect_url(provider: CaptureProvider, raw: &str, state: &mut ReductionState)
         (CaptureProvider::Codex, "/backend-api/codex/responses") => "codex_responses",
         (CaptureProvider::Codex, path) if path.contains("models") => "model_catalog",
         _ => {
-            state.unknown_event_or_field = true;
+            state.review.endpoint = true;
             return;
         }
     };
@@ -750,7 +818,7 @@ fn inspect_header(header: &str, state: &mut ReductionState) {
         }
         "accept" => state.headers.stream_accept_present = true,
         "host" | "content-length" | "accept-encoding" | "connection" => {}
-        _ => state.unknown_event_or_field = true,
+        _ => state.review.header = true,
     }
 }
 
@@ -877,7 +945,7 @@ mod tests {
     fn claude_options(dir: &Path, events: &str) -> DriftCaptureOptions {
         let version = dir.join("version.txt");
         let event_file = dir.join("events.jsonl");
-        write_private(&version, "2.1.206 (Claude Code)\n");
+        write_private(&version, "2.1.207 (Claude Code)\n");
         write_private(&event_file, events);
         DriftCaptureOptions {
             provider: CaptureProvider::Claude,
@@ -993,6 +1061,41 @@ mod tests {
         assert!(!text.contains("person@example.test"));
         assert!(!text.contains("unknown-secret"));
         assert!(!text.contains("unknown\""));
+    }
+
+    #[test]
+    fn experimental_capture_known_cli_usage_diagnostics_are_discarded() {
+        let dir = fixture_dir();
+        let events = r#"{"type":"result","result":"issue-627-controlled-sentinel","usage":{"input_tokens":1,"cache_creation":{"private":"diagnostic-secret"},"ephemeral_1h_input_tokens":1,"fast":true,"inference_geo":"private","iterations":1,"output_tokens_details":{"private":"detail-secret"},"server_tool_use":{"private":true},"speed":"private","web_search_requests":0},"modelUsage":{"private-model":{"costUSD":"billing-secret"}}}"#;
+
+        let summary = reduce_capture(&claude_options(dir.path(), events)).unwrap();
+        let text = serialized(&summary);
+
+        assert_eq!(summary.usage_fields, vec!["input_tokens"]);
+        assert!(summary.manual_review_categories().is_empty());
+        assert!(!text.contains("diagnostic-secret"));
+        assert!(!text.contains("billing-secret"));
+        assert!(!text.contains("detail-secret"));
+        assert!(!text.contains("cache_creation\""));
+        assert!(!text.contains("server_tool_use"));
+        assert!(!text.contains("modelUsage"));
+    }
+
+    #[test]
+    fn experimental_capture_new_usage_field_requires_manual_review() {
+        let dir = fixture_dir();
+        let events = r#"{"type":"result","result":"issue-627-controlled-sentinel","usage":{"new_metric":"metric-secret"}}"#;
+
+        let summary = reduce_capture(&claude_options(dir.path(), events)).unwrap();
+        let text = serialized(&summary);
+
+        assert_eq!(summary.manual_review_categories(), vec!["usage_field"]);
+        assert_eq!(
+            summary.drift_decision,
+            DriftDecision::ImplementationUpdateRequired
+        );
+        assert!(!text.contains("new_metric"));
+        assert!(!text.contains("metric-secret"));
     }
 
     #[test]
@@ -1134,13 +1237,13 @@ mod tests {
         let options = claude_options(dir.path(), "{\"type\":\"assistant\"}");
         write_private(
             &options.version_file,
-            "2.1.206 (Claude Code) local=/home/private-user\n",
+            "2.1.207 (Claude Code) local=/home/private-user\n",
         );
 
         let summary = reduce_capture(&options).unwrap();
         let text = serialized(&summary);
 
-        assert_eq!(summary.client.version, "2.1.206");
+        assert_eq!(summary.client.version, "2.1.207");
         assert!(!text.contains("Claude Code"));
         assert!(!text.contains("private-user"));
         assert!(!text.contains("/home/"));
