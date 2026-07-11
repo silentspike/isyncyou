@@ -350,8 +350,9 @@ pub struct DaemonAgent {
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
     last_usage: Arc<Mutex<Option<isyncyou_agent::Usage>>>,
     seq: AtomicU64,
-    /// Directory holding the app OAuth credential store and optional local OAuth recipe
-    /// override (`agent-oauth.json`) for development/operator builds.
+    /// Directory holding the app OAuth credential store and an optional local
+    /// `agent-oauth.json` policy assertion. Product builds reject any tuple that differs
+    /// from the compiled official provider configuration.
     #[cfg_attr(
         not(any(
             feature = "agent-oauth-providers",
@@ -1109,14 +1110,26 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
 <h1>Connected</h1><p>This device is now authorized. You can close this tab and return to iSyncYou.</p>\
 </div></body></html>";
 
-    /// The OAuth recipe: the in-repo Claude default, with optional local overrides from
-    /// `agent-oauth.json` next to the config (the recipe may now live in-repo, so no file
-    /// is required for the default Claude flow to work).
+    /// Load the compiled official Claude OAuth recipe. A local `agent-oauth.json` may
+    /// assert the same tuple for development diagnostics, but it cannot override any
+    /// endpoint, client, scope, or redirect used by the product flow.
     fn load_oauth_config(&self) -> Result<isyncyou_agent::OAuthConfig, String> {
         let path = self.oauth_dir.join("agent-oauth.json");
         if path.exists() {
-            let s = std::fs::read_to_string(&path).map_err(|e| format!("OAuth recipe: {e}"))?;
-            serde_json::from_str(&s).map_err(|e| format!("OAuth recipe is invalid JSON: {e}"))
+            let source = std::fs::read_to_string(&path)
+                .map_err(|_| "OAuth recipe is unavailable".to_string())?;
+            let candidate: isyncyou_agent::OAuthConfig =
+                serde_json::from_str(&source).map_err(|_| "OAuth recipe is invalid".to_string())?;
+            let official = isyncyou_agent::OAuthConfig::default();
+            if candidate.authorize_url != official.authorize_url
+                || candidate.token_url != official.token_url
+                || candidate.client_id != official.client_id
+                || candidate.scopes != official.scopes
+                || candidate.manual_redirect_url != official.manual_redirect_url
+            {
+                return Err("OAuth recipe does not match the official product policy".to_string());
+            }
+            Ok(official)
         } else {
             Ok(isyncyou_agent::OAuthConfig::default())
         }
@@ -6061,6 +6074,65 @@ mod tests {
             agent.build_turn_provider("custom harness").name(),
             "subscription"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_oauth_config_rejects_endpoint_client_scope_override() {
+        let root = apphost_credential_test_root("official-oauth-config-rejects-override");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("agent-oauth.json"),
+            r#"{
+                "authorize_url":"https://provider.invalid/oauth/authorize",
+                "token_url":"https://provider.invalid/oauth/token",
+                "client_id":"replacement-client",
+                "scopes":["unexpected:scope"],
+                "manual_redirect_url":"https://provider.invalid/oauth/callback"
+            }"#,
+        )
+        .unwrap();
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        assert_eq!(
+            agent.load_oauth_config().unwrap_err(),
+            "OAuth recipe does not match the official product policy"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_oauth_config_accepts_only_compiled_official_recipe() {
+        let root = apphost_credential_test_root("official-oauth-config-accepts-exact");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("agent-oauth.json"),
+            r#"{
+                "authorize_url":"https://claude.com/cai/oauth/authorize",
+                "token_url":"https://platform.claude.com/v1/oauth/token",
+                "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "scopes":["user:inference"],
+                "manual_redirect_url":"https://platform.claude.com/oauth/code/callback"
+            }"#,
+        )
+        .unwrap();
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        let loaded = agent.load_oauth_config().unwrap();
+        let official = isyncyou_agent::OAuthConfig::default();
+        assert_eq!(loaded.authorize_url, official.authorize_url);
+        assert_eq!(loaded.token_url, official.token_url);
+        assert_eq!(loaded.client_id, official.client_id);
+        assert_eq!(loaded.scopes, official.scopes);
+        assert_eq!(loaded.manual_redirect_url, official.manual_redirect_url);
         let _ = std::fs::remove_dir_all(root);
     }
 
