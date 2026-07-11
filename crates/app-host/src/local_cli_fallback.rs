@@ -49,6 +49,24 @@ impl fmt::Display for LocalCliFallbackError {
 
 impl std::error::Error for LocalCliFallbackError {}
 
+impl LocalCliFallbackError {
+    pub(crate) fn is_absent(self) -> bool {
+        matches!(self, Self::MissingEnvironment | Self::MissingFile)
+    }
+
+    pub(crate) fn is_unsupported_platform(self) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        {
+            self == Self::UnsupportedPlatform
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self;
+            false
+        }
+    }
+}
+
 pub(crate) struct LocalClaudeCredential {
     pub(crate) access_token: String,
 }
@@ -422,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn local_cli_fallback_imports_credentials_not_client_harness_state() {
+    fn experimental_local_cli_fallback_imports_credentials_not_client_harness_state() {
         let root = TestRoot::new("minimal-bundle");
         let claude_root = root.path().join("claude");
         secure_write(

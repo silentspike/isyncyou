@@ -193,8 +193,13 @@ const CODEX_MODELS: &[(&str, &str)] = &[("gpt-5.5", "GPT-5.5"), ("gpt-5.4", "GPT
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-type ProviderBuilder =
-    fn(&DaemonAgent, &str) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>>;
+type ProviderBuilder = fn(
+    &DaemonAgent,
+    &str,
+) -> Result<
+    Option<Box<dyn isyncyou_agent::LlmProvider + Send>>,
+    ProviderCredentialResolutionError,
+>;
 #[cfg(test)]
 type TestProviderScript = Arc<Mutex<Option<Vec<Vec<isyncyou_agent::AssistantBlock>>>>>;
 
@@ -491,8 +496,15 @@ impl DaemonAgent {
             } else {
                 (Self::try_subscription_provider, Self::try_codex_provider)
             };
-            if let Some(p) = first(self, system).or_else(|| second(self, system)) {
-                return p;
+            match first(self, system) {
+                Ok(Some(provider)) => return provider,
+                Err(_) => return credential_resolution_error_provider(),
+                Ok(None) => {}
+            }
+            match second(self, system) {
+                Ok(Some(provider)) => return provider,
+                Err(_) => return credential_resolution_error_provider(),
+                Ok(None) => {}
             }
         }
         #[cfg(not(any(
@@ -577,6 +589,185 @@ struct CodexStoredCredential {
     refresh_token: String,
     account_id: String,
     expires_at_ms: u64,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderCredentialOrigin {
+    ProductCredentialStore,
+    ExperimentalLocalCli,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+enum ProductCredentialState<T> {
+    Absent,
+    PresentValid(T),
+    PresentNeedsRefresh(T),
+    PresentInvalid,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    Claude,
+    Codex,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+enum ResolvedProviderCredential {
+    Claude {
+        origin: ProviderCredentialOrigin,
+        credential: StoredCredential,
+    },
+    Codex {
+        origin: ProviderCredentialOrigin,
+        credential: CodexStoredCredential,
+    },
+    Unconfigured(ProviderKind),
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl ResolvedProviderCredential {
+    fn satisfies_product_harness_readiness(&self) -> bool {
+        matches!(
+            self,
+            Self::Claude {
+                origin: ProviderCredentialOrigin::ProductCredentialStore,
+                ..
+            } | Self::Codex {
+                origin: ProviderCredentialOrigin::ProductCredentialStore,
+                ..
+            }
+        )
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderCredentialResolutionError {
+    ProductReconnectRequired,
+    #[cfg(feature = "agent-subscription-experimental")]
+    ExperimentalUnsupportedPlatform,
+    #[cfg(feature = "agent-subscription-experimental")]
+    ExperimentalCredentialRejected,
+    ProviderUnavailable,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl std::fmt::Display for ProviderCredentialResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::ProductReconnectRequired => "product_reconnect_required",
+            #[cfg(feature = "agent-subscription-experimental")]
+            Self::ExperimentalUnsupportedPlatform => "experimental_platform_unsupported",
+            #[cfg(feature = "agent-subscription-experimental")]
+            Self::ExperimentalCredentialRejected => "experimental_credential_rejected",
+            Self::ProviderUnavailable => "provider_unavailable",
+        };
+        write!(f, "agent provider unavailable: {reason}")
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn credential_resolution_error_provider() -> Box<dyn isyncyou_agent::LlmProvider + Send> {
+    Box::new(isyncyou_agent::FakeProvider::new(vec![vec![
+        isyncyou_agent::AssistantBlock::Text(
+            "The connected AI provider needs to be reconnected before it can be used.".to_string(),
+        ),
+    ]]))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn resolve_product_or_local<T>(
+    state: ProductCredentialState<T>,
+    refresh: impl FnOnce(T) -> Result<T, ProviderCredentialResolutionError>,
+    local: impl FnOnce() -> Result<Option<T>, ProviderCredentialResolutionError>,
+) -> Result<Option<(ProviderCredentialOrigin, T)>, ProviderCredentialResolutionError> {
+    match state {
+        ProductCredentialState::Absent => local().map(|credential| {
+            credential
+                .map(|credential| (ProviderCredentialOrigin::ExperimentalLocalCli, credential))
+        }),
+        ProductCredentialState::PresentValid(credential) => Ok(Some((
+            ProviderCredentialOrigin::ProductCredentialStore,
+            credential,
+        ))),
+        ProductCredentialState::PresentNeedsRefresh(credential) => refresh(credential)
+            .map(|credential| Some((ProviderCredentialOrigin::ProductCredentialStore, credential))),
+        ProductCredentialState::PresentInvalid => {
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn credential_needs_refresh(access_token: &str, expires_at_ms: u64) -> bool {
+    access_token.is_empty()
+        || (expires_at_ms != 0 && expires_at_ms <= now_ms().saturating_add(5 * 60 * 1000))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn classify_claude_product_credential(
+    credential: StoredCredential,
+) -> ProductCredentialState<StoredCredential> {
+    if credential.access_token.is_empty() && credential.refresh_token.is_empty() {
+        ProductCredentialState::PresentInvalid
+    } else if credential_needs_refresh(&credential.access_token, credential.expires_at_ms) {
+        ProductCredentialState::PresentNeedsRefresh(credential)
+    } else {
+        ProductCredentialState::PresentValid(credential)
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn classify_codex_product_credential(
+    credential: CodexStoredCredential,
+) -> ProductCredentialState<CodexStoredCredential> {
+    if credential.account_id.trim().is_empty()
+        || (credential.access_token.is_empty() && credential.refresh_token.is_empty())
+    {
+        ProductCredentialState::PresentInvalid
+    } else if credential_needs_refresh(&credential.access_token, credential.expires_at_ms) {
+        ProductCredentialState::PresentNeedsRefresh(credential)
+    } else {
+        ProductCredentialState::PresentValid(credential)
+    }
 }
 
 #[cfg(any(
@@ -1019,71 +1210,87 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         std::fs::write(self.oauth_dir.join("agent-settings.json"), blob).map_err(|e| e.to_string())
     }
 
-    /// The Claude access token: first the product app OAuth credential store; the local
-    /// `claude` CLI credential fallback is compiled only for #627 experimental builds.
-    fn subscription_token(&self) -> Option<String> {
-        if agent_credential_store_exists(&self.oauth_dir) {
-            if let Ok(Some(secret)) =
-                load_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
-            {
-                let raw = secret.expose();
-                // Newer format: a JSON credential blob (access + refresh + expiry). Older
-                // format (pre-refresh): the bare access token as UTF-8.
-                let cred = StoredCredential::from_json(raw).unwrap_or_else(|| StoredCredential {
-                    access_token: std::str::from_utf8(raw).unwrap_or("").to_string(),
-                    refresh_token: String::new(),
-                    expires_at_ms: 0,
-                });
-                return self.fresh_access_token(cred);
-            }
-        }
-        #[cfg(feature = "agent-subscription-experimental")]
-        {
-            local_cli_fallback::load_claude_from_process()
-                .ok()
-                .map(|credential| credential.access_token)
-        }
-        #[cfg(not(feature = "agent-subscription-experimental"))]
-        {
-            None
+    fn claude_product_credential_state(&self) -> ProductCredentialState<StoredCredential> {
+        match load_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID) {
+            Ok(None) => ProductCredentialState::Absent,
+            Ok(Some(secret)) => StoredCredential::from_json(secret.expose())
+                .map(classify_claude_product_credential)
+                .unwrap_or(ProductCredentialState::PresentInvalid),
+            Err(_) => ProductCredentialState::PresentInvalid,
         }
     }
 
-    /// Return a usable access token from a stored credential, refreshing it first if it is
-    /// expired (or within a small margin) and we hold a refresh token. On a successful
-    /// refresh the rotated credential is persisted so the next call is cheap.
-    fn fresh_access_token(&self, cred: StoredCredential) -> Option<String> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        // 5-minute margin so a turn never starts on a token about to expire mid-flight.
-        let near_expiry = cred.expires_at_ms != 0 && cred.expires_at_ms <= now_ms + 5 * 60 * 1000;
-        if !cred.refresh_token.is_empty() && (near_expiry || cred.access_token.is_empty()) {
-            if let Ok(cfg) = self.load_oauth_config() {
-                if let Ok(http) = isyncyou_agent::http::HttpTransport::new() {
-                    if let Ok(t) = isyncyou_agent::oauth::refresh(&http, &cfg, &cred.refresh_token)
-                    {
-                        let expires_at_ms = if t.expires_in > 0 {
-                            now_ms + t.expires_in * 1000
-                        } else {
-                            0
-                        };
-                        let _ = self.store_credential(&StoredCredential {
-                            access_token: t.access_token.clone(),
-                            refresh_token: t.refresh_token,
-                            expires_at_ms,
-                        });
-                        return Some(t.access_token);
-                    }
+    fn refresh_claude_product_credential(
+        &self,
+        credential: StoredCredential,
+    ) -> Result<StoredCredential, ProviderCredentialResolutionError> {
+        if credential.refresh_token.is_empty() {
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
+        let config = self
+            .load_oauth_config()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let http = isyncyou_agent::http::HttpTransport::new()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let refreshed = isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        if refreshed.access_token.is_empty() {
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
+        let refreshed_credential = StoredCredential {
+            access_token: refreshed.access_token,
+            refresh_token: if refreshed.refresh_token.is_empty() {
+                credential.refresh_token
+            } else {
+                refreshed.refresh_token
+            },
+            expires_at_ms: if refreshed.expires_in > 0 {
+                now_ms().saturating_add(refreshed.expires_in.saturating_mul(1000))
+            } else {
+                0
+            },
+        };
+        self.store_credential(&refreshed_credential)
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        Ok(refreshed_credential)
+    }
+
+    fn experimental_claude_credential(
+        &self,
+    ) -> Result<Option<StoredCredential>, ProviderCredentialResolutionError> {
+        #[cfg(feature = "agent-subscription-experimental")]
+        {
+            match local_cli_fallback::load_claude_from_process() {
+                Ok(credential) => Ok(Some(StoredCredential {
+                    access_token: credential.access_token,
+                    refresh_token: String::new(),
+                    expires_at_ms: 0,
+                })),
+                Err(error) if error.is_absent() => Ok(None),
+                Err(error) if error.is_unsupported_platform() => {
+                    Err(ProviderCredentialResolutionError::ExperimentalUnsupportedPlatform)
                 }
+                Err(_) => Err(ProviderCredentialResolutionError::ExperimentalCredentialRejected),
             }
         }
-        if cred.access_token.is_empty() {
-            None
-        } else {
-            Some(cred.access_token)
+        #[cfg(not(feature = "agent-subscription-experimental"))]
+        {
+            Ok(None)
         }
+    }
+
+    fn resolve_claude_credential(
+        &self,
+    ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
+        let resolved = resolve_product_or_local(
+            self.claude_product_credential_state(),
+            |credential| self.refresh_claude_product_credential(credential),
+            || self.experimental_claude_credential(),
+        )?;
+        Ok(match resolved {
+            Some((origin, credential)) => ResolvedProviderCredential::Claude { origin, credential },
+            None => ResolvedProviderCredential::Unconfigured(ProviderKind::Claude),
+        })
     }
 
     /// The minimized Claude request config. Local client account/device metadata is not
@@ -1093,94 +1300,127 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         isyncyou_agent::SubscriptionConfig::default()
     }
 
-    /// Build the subscription provider if a token is available (else None → fallback).
+    /// Build the Claude provider from one origin-bound credential bundle.
     fn try_subscription_provider(
         &self,
         system: &str,
-    ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
-        let token = self.subscription_token()?;
+    ) -> Result<
+        Option<Box<dyn isyncyou_agent::LlmProvider + Send>>,
+        ProviderCredentialResolutionError,
+    > {
+        let credential = match self.resolve_claude_credential()? {
+            ResolvedProviderCredential::Claude { origin, credential } => {
+                let _credential_origin = origin;
+                credential
+            }
+            ResolvedProviderCredential::Unconfigured(ProviderKind::Claude) => return Ok(None),
+            _ => return Err(ProviderCredentialResolutionError::ProviderUnavailable),
+        };
         let p = isyncyou_agent::SubscriptionProvider::new(
-            token,
+            credential.access_token,
             self.model_for("claude"),
             system,
             self.subscription_config(),
         )
-        .ok()?;
-        Some(Box::new(p))
+        .map_err(|_| ProviderCredentialResolutionError::ProviderUnavailable)?;
+        Ok(Some(Box::new(p)))
     }
 
-    /// ChatGPT/Codex credentials: first the product app OAuth credential store; the local
-    /// `codex` CLI credential fallback is compiled only for #627 experimental builds.
-    fn codex_credentials(&self) -> Option<(String, String)> {
-        if agent_credential_store_exists(&self.oauth_dir) {
-            if let Ok(Some(secret)) =
-                load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID)
-            {
-                if let Some(cred) = CodexStoredCredential::from_json(secret.expose()) {
-                    return self.fresh_codex_credential(cred);
-                }
-            }
+    fn codex_product_credential_state(&self) -> ProductCredentialState<CodexStoredCredential> {
+        match load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID) {
+            Ok(None) => ProductCredentialState::Absent,
+            Ok(Some(secret)) => CodexStoredCredential::from_json(secret.expose())
+                .map(classify_codex_product_credential)
+                .unwrap_or(ProductCredentialState::PresentInvalid),
+            Err(_) => ProductCredentialState::PresentInvalid,
         }
+    }
+
+    fn refresh_codex_product_credential(
+        &self,
+        credential: CodexStoredCredential,
+    ) -> Result<CodexStoredCredential, ProviderCredentialResolutionError> {
+        if credential.refresh_token.is_empty() {
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
+        let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
+        let mut addresses =
+            isyncyou_agent::http::doh_resolve("auth.openai.com").unwrap_or_default();
+        if addresses.is_empty() {
+            addresses = vec![
+                std::net::IpAddr::from([104, 18, 41, 241]),
+                std::net::IpAddr::from([172, 64, 146, 15]),
+            ];
+        }
+        let http =
+            isyncyou_agent::http::HttpTransport::new_resolving("auth.openai.com", &addresses)
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let refreshed =
+            isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        if refreshed.access_token.is_empty() {
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
+        let refreshed_credential = CodexStoredCredential {
+            access_token: refreshed.access_token,
+            refresh_token: if refreshed.refresh_token.is_empty() {
+                credential.refresh_token
+            } else {
+                refreshed.refresh_token
+            },
+            account_id: if refreshed.account_id.is_empty() {
+                credential.account_id
+            } else {
+                refreshed.account_id
+            },
+            expires_at_ms: if refreshed.expires_in > 0 {
+                now_ms().saturating_add(refreshed.expires_in.saturating_mul(1000))
+            } else {
+                0
+            },
+        };
+        store_codex_blob(&self.oauth_dir, &refreshed_credential)
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        Ok(refreshed_credential)
+    }
+
+    fn experimental_codex_credential(
+        &self,
+    ) -> Result<Option<CodexStoredCredential>, ProviderCredentialResolutionError> {
         #[cfg(feature = "agent-subscription-experimental")]
         {
-            local_cli_fallback::load_codex_from_process()
-                .ok()
-                .map(|credential| (credential.access_token, credential.account_id))
+            match local_cli_fallback::load_codex_from_process() {
+                Ok(credential) => Ok(Some(CodexStoredCredential {
+                    access_token: credential.access_token,
+                    refresh_token: String::new(),
+                    account_id: credential.account_id,
+                    expires_at_ms: 0,
+                })),
+                Err(error) if error.is_absent() => Ok(None),
+                Err(error) if error.is_unsupported_platform() => {
+                    Err(ProviderCredentialResolutionError::ExperimentalUnsupportedPlatform)
+                }
+                Err(_) => Err(ProviderCredentialResolutionError::ExperimentalCredentialRejected),
+            }
         }
         #[cfg(not(feature = "agent-subscription-experimental"))]
         {
-            None
+            Ok(None)
         }
     }
 
-    /// Usable Codex creds from a stored credential, refreshing first if expired (5-min
-    /// margin). The refresh response may omit the id_token → keep the stored account id.
-    fn fresh_codex_credential(&self, cred: CodexStoredCredential) -> Option<(String, String)> {
-        let now = now_ms();
-        let near_expiry = cred.expires_at_ms != 0 && cred.expires_at_ms <= now + 5 * 60 * 1000;
-        if !cred.refresh_token.is_empty() && (near_expiry || cred.access_token.is_empty()) {
-            let cfg = isyncyou_agent::oauth::CodexOAuthConfig::default();
-            let mut ips = isyncyou_agent::http::doh_resolve("auth.openai.com").unwrap_or_default();
-            if ips.is_empty() {
-                ips = vec![
-                    std::net::IpAddr::from([104, 18, 41, 241]),
-                    std::net::IpAddr::from([172, 64, 146, 15]),
-                ];
-            }
-            if let Ok(http) =
-                isyncyou_agent::http::HttpTransport::new_resolving("auth.openai.com", &ips)
-            {
-                if let Ok(tok) =
-                    isyncyou_agent::oauth::codex_refresh(&http, &cfg, &cred.refresh_token)
-                {
-                    let account_id = if tok.account_id.is_empty() {
-                        cred.account_id.clone()
-                    } else {
-                        tok.account_id.clone()
-                    };
-                    let expires_at_ms = if tok.expires_in > 0 {
-                        now + tok.expires_in * 1000
-                    } else {
-                        0
-                    };
-                    let _ = store_codex_blob(
-                        &self.oauth_dir,
-                        &CodexStoredCredential {
-                            access_token: tok.access_token.clone(),
-                            refresh_token: tok.refresh_token,
-                            account_id: account_id.clone(),
-                            expires_at_ms,
-                        },
-                    );
-                    return Some((tok.access_token, account_id));
-                }
-            }
-        }
-        if cred.access_token.is_empty() {
-            None
-        } else {
-            Some((cred.access_token, cred.account_id))
-        }
+    fn resolve_codex_credential(
+        &self,
+    ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
+        let resolved = resolve_product_or_local(
+            self.codex_product_credential_state(),
+            |credential| self.refresh_codex_product_credential(credential),
+            || self.experimental_codex_credential(),
+        )?;
+        Ok(match resolved {
+            Some((origin, credential)) => ResolvedProviderCredential::Codex { origin, credential },
+            None => ResolvedProviderCredential::Unconfigured(ProviderKind::Codex),
+        })
     }
 
     /// Start the Codex/ChatGPT OAuth flow: bind OpenAI's fixed
@@ -1205,15 +1445,27 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn try_codex_provider(
         &self,
         instructions: &str,
-    ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
-        let (token, account) = self.codex_credentials()?;
+    ) -> Result<
+        Option<Box<dyn isyncyou_agent::LlmProvider + Send>>,
+        ProviderCredentialResolutionError,
+    > {
+        let credential = match self.resolve_codex_credential()? {
+            ResolvedProviderCredential::Codex { origin, credential } => {
+                let _credential_origin = origin;
+                credential
+            }
+            ResolvedProviderCredential::Unconfigured(ProviderKind::Codex) => return Ok(None),
+            _ => return Err(ProviderCredentialResolutionError::ProviderUnavailable),
+        };
         let cfg = isyncyou_agent::CodexConfig {
-            account_id: account,
+            account_id: credential.account_id,
             model: self.model_for("codex"),
             ..Default::default()
         };
-        let p = isyncyou_agent::CodexProvider::new(token, instructions, cfg).ok()?;
-        Some(Box::new(p))
+        let provider =
+            isyncyou_agent::CodexProvider::new(credential.access_token, instructions, cfg)
+                .map_err(|_| ProviderCredentialResolutionError::ProviderUnavailable)?;
+        Ok(Some(Box::new(provider)))
     }
 }
 
@@ -1505,8 +1757,31 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn status_json(&self) -> String {
-        let claude = self.subscription_token().is_some();
-        let codex = self.codex_credentials().is_some();
+        let claude_resolution = self.resolve_claude_credential();
+        let codex_resolution = self.resolve_codex_credential();
+        let claude = matches!(
+            &claude_resolution,
+            Ok(ResolvedProviderCredential::Claude { .. })
+        );
+        let codex = matches!(
+            &codex_resolution,
+            Ok(ResolvedProviderCredential::Codex { .. })
+        );
+        let reconnect_required = matches!(
+            &claude_resolution,
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        ) || matches!(
+            &codex_resolution,
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        );
+        // #639 owns the visible onboarding state machine. Keep its readiness input
+        // origin-aware here so an experimental local credential can never qualify.
+        let _product_harness_readiness = claude_resolution
+            .as_ref()
+            .is_ok_and(|credential| credential.satisfies_product_harness_readiness())
+            || codex_resolution
+                .as_ref()
+                .is_ok_and(|credential| credential.satisfies_product_harness_readiness());
         let (sel_provider, _) = self.agent_settings();
         // Effective provider: the selection if it is connected, else whichever is
         // (Claude preferred). A selected+connected Claude is already covered by the
@@ -1538,6 +1813,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "model": model,
             "claude": claude,
             "codex": codex,
+            "reconnect_required": reconnect_required,
             "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
         });
         if let Some(usage) = self.last_usage.lock().unwrap().as_ref() {
@@ -3154,6 +3430,21 @@ mod tests {
         fn set_home(&self, home: &Path) {
             std::env::set_var("HOME", home);
         }
+
+        fn use_home_fallbacks(&self, home: &Path) {
+            self.set_home(home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        fn set_claude_config_dir(&self, root: &Path) {
+            std::env::set_var("CLAUDE_CONFIG_DIR", root);
+        }
+
+        #[cfg(feature = "agent-subscription-experimental")]
+        fn set_codex_home(&self, root: &Path) {
+            std::env::set_var("CODEX_HOME", root);
+        }
     }
 
     #[cfg(any(
@@ -3185,6 +3476,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn write_local_cli_fixture(path: &Path, value: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, value).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]
@@ -5497,19 +5800,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let oauth_dir = root.join("oauth");
         let home = root.join("home");
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::write(
-            home.join(".claude/.credentials.json"),
+        write_local_cli_fixture(
+            &home.join(".claude/.credentials.json"),
             r#"{"claudeAiOauth":{"accessToken":"desktop-claude-token"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            home.join(".codex/auth.json"),
+        );
+        write_local_cli_fixture(
+            &home.join(".codex/auth.json"),
             r#"{"tokens":{"access_token":"desktop-codex-token","account_id":"desktop-account"}}"#,
-        )
-        .unwrap();
-        env.set_home(&home);
+        );
+        env.use_home_fallbacks(&home);
 
         let agent = DaemonAgent::new(Config::default(), oauth_dir.clone());
         agent
@@ -5530,14 +5829,229 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            agent.subscription_token().as_deref(),
-            Some("stored-claude-token")
+        let claude = agent.resolve_claude_credential().unwrap();
+        let codex = agent.resolve_codex_credential().unwrap();
+        assert!(matches!(
+            claude,
+            ResolvedProviderCredential::Claude {
+                origin: ProviderCredentialOrigin::ProductCredentialStore,
+                credential: StoredCredential { ref access_token, .. },
+            } if access_token == "stored-claude-token"
+        ));
+        assert!(matches!(
+            codex,
+            ResolvedProviderCredential::Codex {
+                origin: ProviderCredentialOrigin::ProductCredentialStore,
+                credential: CodexStoredCredential {
+                    ref access_token,
+                    ref account_id,
+                    ..
+                },
+            } if access_token == "stored-codex-token" && account_id == "stored-account"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn experimental_local_cli_fallback_is_not_persisted_to_product_store() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("local-fallback-not-persisted");
+        let oauth_dir = root.join("oauth");
+        let home = root.join("home");
+        write_local_cli_fixture(
+            &home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"local-only-claude"}}"#,
         );
-        assert_eq!(
-            agent.codex_credentials(),
-            Some(("stored-codex-token".into(), "stored-account".into()))
+        env.use_home_fallbacks(&home);
+        let agent = DaemonAgent::new(Config::default(), oauth_dir.clone());
+
+        let resolved = agent.resolve_claude_credential().unwrap();
+
+        assert!(matches!(
+            &resolved,
+            ResolvedProviderCredential::Claude {
+                origin: ProviderCredentialOrigin::ExperimentalLocalCli,
+                ..
+            }
+        ));
+        assert!(
+            load_agent_credential_blob(&oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none(),
+            "experimental fallback must remain in memory"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn product_credential_never_combines_with_local_cli_metadata() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("credential-origin-is-atomic");
+        let oauth_dir = root.join("oauth");
+        let local_codex = root.join("local-codex");
+        write_local_cli_fixture(
+            &local_codex.join("auth.json"),
+            r#"{"tokens":{"access_token":"local-token","account_id":"local-account"}}"#,
+        );
+        env.set_codex_home(&local_codex);
+        let agent = DaemonAgent::new(Config::default(), oauth_dir.clone());
+        store_codex_blob(
+            &oauth_dir,
+            &CodexStoredCredential {
+                access_token: "product-token".into(),
+                refresh_token: String::new(),
+                account_id: "product-account".into(),
+                expires_at_ms: now_ms() + 3_600_000,
+            },
+        )
+        .unwrap();
+
+        let resolved = agent.resolve_codex_credential().unwrap();
+
+        assert!(matches!(
+            resolved,
+            ResolvedProviderCredential::Codex {
+                origin: ProviderCredentialOrigin::ProductCredentialStore,
+                credential: CodexStoredCredential {
+                    ref access_token,
+                    ref account_id,
+                    ..
+                },
+            } if access_token == "product-token" && account_id == "product-account"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn corrupt_product_credential_does_not_fall_through_to_local_cli() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("corrupt-product-no-fallback");
+        let oauth_dir = root.join("oauth");
+        let local_claude = root.join("local-claude");
+        write_local_cli_fixture(
+            &local_claude.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"local-token"}}"#,
+        );
+        env.set_claude_config_dir(&local_claude);
+        store_agent_credential_blob(
+            &oauth_dir,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            b"not-the-product-credential-schema".to_vec(),
+        )
+        .unwrap();
+        let agent = DaemonAgent::new(Config::default(), oauth_dir);
+
+        let error = agent.resolve_claude_credential().err();
+
+        assert_eq!(
+            error,
+            Some(ProviderCredentialResolutionError::ProductReconnectRequired)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn expired_product_credential_does_not_silently_switch_origin() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("expired-product-no-fallback");
+        let oauth_dir = root.join("oauth");
+        let local_claude = root.join("local-claude");
+        write_local_cli_fixture(
+            &local_claude.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"local-token"}}"#,
+        );
+        env.set_claude_config_dir(&local_claude);
+        let agent = DaemonAgent::new(Config::default(), oauth_dir);
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "expired-product-token".into(),
+                refresh_token: String::new(),
+                expires_at_ms: 1,
+            })
+            .unwrap();
+
+        let error = agent.resolve_claude_credential().err();
+
+        assert_eq!(
+            error,
+            Some(ProviderCredentialResolutionError::ProductReconnectRequired)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn expired_product_credential_refresh_preserves_product_origin() {
+        let local_called = std::cell::Cell::new(false);
+        let resolved = resolve_product_or_local(
+            ProductCredentialState::PresentNeedsRefresh("expired"),
+            |_| Ok("refreshed"),
+            || {
+                local_called.set(true);
+                Ok(Some("local"))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(resolved.0, ProviderCredentialOrigin::ProductCredentialStore);
+        assert_eq!(resolved.1, "refreshed");
+        assert!(
+            !local_called.get(),
+            "refresh must not consult local CLI state"
+        );
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn experimental_local_cli_does_not_satisfy_product_harness_readiness() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("local-not-product-ready");
+        let local_claude = root.join("local-claude");
+        write_local_cli_fixture(
+            &local_claude.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"local-token"}}"#,
+        );
+        env.set_claude_config_dir(&local_claude);
+        let agent = DaemonAgent::new(Config::default(), root.join("oauth"));
+
+        let resolved = agent.resolve_claude_credential().unwrap();
+
+        assert!(matches!(
+            &resolved,
+            ResolvedProviderCredential::Claude {
+                origin: ProviderCredentialOrigin::ExperimentalLocalCli,
+                ..
+            }
+        ));
+        assert!(!resolved.satisfies_product_harness_readiness());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_harness_requires_encrypted_app_oauth_credential() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("product-harness-readiness");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "product-token".into(),
+                refresh_token: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+            })
+            .unwrap();
+
+        let resolved = agent.resolve_claude_credential().unwrap();
+
+        assert!(resolved.satisfies_product_harness_readiness());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5638,21 +6152,22 @@ mod tests {
         not(feature = "agent-subscription-experimental")
     ))]
     #[test]
-    fn non_live_provider_tests_ignore_real_claude_home() {
+    fn product_build_does_not_read_dot_claude() {
         let env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("non-live-ignores-claude-home");
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::write(
-            home.join(".claude/.credentials.json"),
+        write_local_cli_fixture(
+            &home.join(".claude/.credentials.json"),
             r#"{"claudeAiOauth":{"accessToken":"must-not-be-read"}}"#,
-        )
-        .unwrap();
-        env.set_home(&home);
+        );
+        env.use_home_fallbacks(&home);
         let agent = DaemonAgent::new(Config::default(), root.join("oauth"));
 
-        assert_eq!(agent.subscription_token(), None);
+        assert!(matches!(
+            agent.resolve_claude_credential().unwrap(),
+            ResolvedProviderCredential::Unconfigured(ProviderKind::Claude)
+        ));
         assert_eq!(agent.build_turn_provider("system").name(), "fake");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5662,21 +6177,22 @@ mod tests {
         not(feature = "agent-subscription-experimental")
     ))]
     #[test]
-    fn non_live_provider_tests_ignore_real_codex_home() {
+    fn product_build_does_not_read_dot_codex() {
         let env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("non-live-ignores-codex-home");
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::write(
-            home.join(".codex/auth.json"),
+        write_local_cli_fixture(
+            &home.join(".codex/auth.json"),
             r#"{"tokens":{"access_token":"must-not-be-read","account_id":"acct-real"}}"#,
-        )
-        .unwrap();
-        env.set_home(&home);
+        );
+        env.use_home_fallbacks(&home);
         let agent = DaemonAgent::new(Config::default(), root.join("oauth"));
 
-        assert_eq!(agent.codex_credentials(), None);
+        assert!(matches!(
+            agent.resolve_codex_credential().unwrap(),
+            ResolvedProviderCredential::Unconfigured(ProviderKind::Codex)
+        ));
         assert_eq!(agent.build_turn_provider("system").name(), "fake");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5727,32 +6243,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let oauth_dir = root.join("oauth");
         let home = root.join("home");
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::write(
-            home.join(".claude/.credentials.json"),
+        write_local_cli_fixture(
+            &home.join(".claude/.credentials.json"),
             r#"{"claudeAiOauth":{"accessToken":"desktop-claude-token"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            home.join(".claude.json"),
+        );
+        write_local_cli_fixture(
+            &home.join(".claude.json"),
             r#"{"oauthAccount":{"accountUuid":"desktop-account"},"userID":"desktop-device"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            home.join(".codex/auth.json"),
+        );
+        write_local_cli_fixture(
+            &home.join(".codex/auth.json"),
             r#"{"tokens":{"access_token":"desktop-codex-token","account_id":"desktop-account"}}"#,
-        )
-        .unwrap();
-        env.set_home(&home);
+        );
+        env.use_home_fallbacks(&home);
 
         let agent = DaemonAgent::new(Config::default(), oauth_dir);
 
-        assert_eq!(agent.subscription_token(), None);
-        assert_eq!(agent.codex_credentials(), None);
+        assert!(matches!(
+            agent.resolve_claude_credential().unwrap(),
+            ResolvedProviderCredential::Unconfigured(ProviderKind::Claude)
+        ));
+        assert!(matches!(
+            agent.resolve_codex_credential().unwrap(),
+            ResolvedProviderCredential::Unconfigured(ProviderKind::Codex)
+        ));
         let cfg = agent.subscription_config();
         assert!(cfg.account_uuid.is_empty());
         assert!(cfg.device_id.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn agent_subscription_experimental_required_for_local_cli_fallback() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("experimental-feature-required");
+        let local_claude = root.join("local-claude");
+        write_local_cli_fixture(
+            &local_claude.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"must-not-be-read"}}"#,
+        );
+        env.set_claude_config_dir(&local_claude);
+        let agent = DaemonAgent::new(Config::default(), root.join("oauth"));
+
+        assert!(matches!(
+            agent.resolve_claude_credential().unwrap(),
+            ResolvedProviderCredential::Unconfigured(ProviderKind::Claude)
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
