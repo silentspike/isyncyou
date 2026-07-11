@@ -152,6 +152,7 @@ internal class AndroidMobileJobForegroundController(
             .setContentText("${job.kind.wire} in progress")
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setProgress(0, 0, true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
         return runCatching {
