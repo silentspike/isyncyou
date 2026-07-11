@@ -250,6 +250,15 @@ impl MobileJobRuntime {
         ));
     }
 
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    fn device_test_network_offline(&self) -> bool {
+        self.device_test_hook_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|root| root.join("mobile-job-network-offline").is_file())
+    }
+
     #[cfg(test)]
     fn with_executor(
         cfg: Config,
@@ -457,6 +466,17 @@ impl MobileJobRuntime {
 
         #[cfg(feature = "mobile-job-device-test-hooks")]
         self.device_test_hook("after_lease");
+        #[cfg(feature = "mobile-job-device-test-hooks")]
+        let execution = if self.device_test_network_offline() {
+            Err(MobileJobExecutionError::Retryable {
+                code: MobileJobRetryCode::Network,
+                retry_after: None,
+                redacted: "mobile job network unavailable (device test hook)".to_string(),
+            })
+        } else {
+            self.execute_job(&job)
+        };
+        #[cfg(not(feature = "mobile-job-device-test-hooks"))]
         let execution = self.execute_job(&job);
         #[cfg(feature = "mobile-job-device-test-hooks")]
         self.device_test_hook("after_execute_before_finish");
@@ -1147,6 +1167,38 @@ mod tests {
     #[test]
     fn mobile_job_test_hook_is_bounded() {
         assert_eq!(MOBILE_JOB_DEVICE_TEST_HOOK_MAX_SECS, 120);
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    #[test]
+    fn mobile_job_network_test_hook_requeues_without_calling_executor() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let rt = runtime_with_executor(test_cfg("network-hook"), executor.clone());
+        let hook_root = temp_root("network-hook-marker");
+        rt.set_device_test_hook_root(&hook_root);
+        std::fs::write(hook_root.join("mobile-job-network-offline"), b"test").unwrap();
+
+        let job = rt.enqueue_backup("me", &["mail".to_string()]).unwrap();
+        let outcome = rt.run_one_job(&job.job_id).unwrap();
+        assert!(matches!(
+            outcome,
+            MobileJobRunOutcome::Retrying {
+                code: MobileJobRetryCode::Network,
+                ..
+            }
+        ));
+        assert_eq!(executor.backup_calls(), 0);
+
+        std::fs::remove_file(hook_root.join("mobile-job-network-offline")).unwrap();
+        let outcome = rt.run_one_job(&job.job_id).unwrap();
+        assert!(matches!(
+            outcome,
+            MobileJobRunOutcome::Succeeded {
+                kind: MobileJobKind::Backup,
+                ..
+            }
+        ));
+        assert_eq!(executor.backup_calls(), 1);
     }
 
     #[cfg(not(feature = "mobile-job-device-test-hooks"))]

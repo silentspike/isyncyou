@@ -100,6 +100,14 @@ def restore_state(adb_path: str, state: dict[str, object]) -> None:
         shell(adb_path, f"settings put global stay_on_while_plugged_in {stay}", check=False)
 
 
+def set_app_network_hook(adb_path: str, package: str, offline: bool) -> None:
+    marker = "files/mobile-job-network-offline"
+    if offline:
+        shell(adb_path, f"run-as {package} touch {marker}")
+    else:
+        shell(adb_path, f"run-as {package} rm -f {marker}")
+
+
 def enter_network_loss(adb_path: str, state_path: Path, package: str) -> None:
     state = read_state(state_path)
     shell(adb_path, "cmd connectivity airplane-mode enable")
@@ -119,19 +127,33 @@ def lock(args: argparse.Namespace) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("snapshot-state", "enter-network-loss", "restore-network", "restore-state"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "snapshot-state",
+            "enter-network-loss",
+            "restore-network",
+            "restore-state",
+            "set-app-network",
+        ),
+    )
     parser.add_argument("--adb", default="adb")
     parser.add_argument("--package", default="com.silentspike.isyncyou.debug")
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--lock", default="ag-626")
     parser.add_argument("--skip-lock", action="store_true")
+    parser.add_argument("--app-network", choices=("offline", "online"))
     args = parser.parse_args()
     owns_lock = False
     try:
         owns_lock = lock(args)
         if args.command == "snapshot-state":
             write_state(args.output or args.state, snapshot(args.adb, args.package))
+        elif args.command == "set-app-network":
+            if args.app_network is None:
+                raise ProbeError("--app-network is required")
+            set_app_network_hook(args.adb, args.package, args.app_network == "offline")
         elif args.command == "enter-network-loss":
             enter_network_loss(args.adb, args.state, args.package)
         else:
