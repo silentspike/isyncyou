@@ -144,4 +144,20 @@ class NetworkCriticalGuardRegistryTest {
         assertEquals(1, starts)
         now += 1
     }
+
+    @Test
+    fun activeLeaseRejectsMissingExpiredAndUnknownGuards() {
+        var now = 1L
+        val registry = NetworkCriticalGuardRegistry(
+            onStart = {},
+            onStop = {},
+            nowElapsedMs = { now },
+            newId = { "oauth" },
+        )
+        assertNull(registry.activeLease("oauth"))
+        assertTrue(registry.begin(NetworkGuardReason.OAUTH).ok)
+        assertEquals(NetworkGuardReason.OAUTH, registry.activeLease("oauth")?.reason)
+        now += NetworkGuardReason.OAUTH.startingLeaseMs
+        assertNull(registry.activeLease("oauth"))
+    }
 }

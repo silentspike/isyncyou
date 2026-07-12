@@ -113,4 +113,19 @@ object NativeEngine {
      * charging-only). May be called any time; the latest value wins.
      */
     external fun nativeDeviceState(metered: Boolean, charging: Boolean, freeBytes: Long)
+
+    /**
+     * Register a one-shot Rust-owned handle for a connectivity snapshot captured only after
+     * Kotlin has validated the active foreground guard. The returned value is opaque to JS.
+     */
+    external fun nativeRegisterNetworkSnapshot(
+        guardId: String,
+        reason: String,
+        activeNetwork: Boolean,
+        internetCapability: Boolean,
+        validatedCapability: Boolean,
+        metered: Boolean,
+        restrictBackground: String,
+        notificationsVisible: Boolean,
+    ): String
 }

@@ -685,6 +685,41 @@ pub fn session_token() -> Option<String> {
         .map(|s| s.session_token.clone())
 }
 
+/// Register a Kotlin-captured connectivity snapshot for one mobile preflight. Kotlin validates
+/// the foreground guard before this JNI-owned call; JavaScript receives only the opaque result.
+pub fn register_network_snapshot(
+    guard_id: &str,
+    reason: &str,
+    active_network: bool,
+    internet_capability: bool,
+    validated_capability: bool,
+    metered: bool,
+    restrict_background: &str,
+    notifications_visible: bool,
+) -> Result<String, String> {
+    let restrict_background = match restrict_background {
+        "disabled" => isyncyou_agent::RestrictBackgroundStatus::Disabled,
+        "whitelisted" => isyncyou_agent::RestrictBackgroundStatus::Whitelisted,
+        "enabled" => isyncyou_agent::RestrictBackgroundStatus::Enabled,
+        _ => isyncyou_agent::RestrictBackgroundStatus::Unknown,
+    };
+    let session_token = session_token().ok_or_else(|| "engine not started".to_string())?;
+    isyncyou_app_host::register_mobile_connectivity_snapshot(
+        &session_token,
+        guard_id,
+        reason,
+        isyncyou_agent::AndroidNetworkSnapshot {
+            active_network,
+            internet_capability,
+            validated_capability,
+            metered,
+            restrict_background,
+            notifications_visible,
+            guard_ready: true,
+        },
+    )
+}
+
 /// Record a successful native `BiometricPrompt` for a pending destructive action
 /// (#onedrive-mobile 0.6). Kotlin calls this ONLY after the biometric succeeds; the
 /// WebView has no route to it, which is what makes the per-action token a real second
@@ -1213,6 +1248,43 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDeviceSt
     free_bytes: jni::sys::jlong,
 ) {
     set_device_state(metered, charging, free_bytes.max(0) as u64);
+}
+
+/// JNI: register a one-shot, session-bound Android connectivity snapshot. No raw snapshot
+/// fields are returned to WebView JavaScript; callers receive only an opaque handle.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeRegisterNetworkSnapshot<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    guard_id: jni::objects::JString<'local>,
+    reason: jni::objects::JString<'local>,
+    active_network: jni::sys::jboolean,
+    internet_capability: jni::sys::jboolean,
+    validated_capability: jni::sys::jboolean,
+    metered: jni::sys::jboolean,
+    restrict_background: jni::objects::JString<'local>,
+    notifications_visible: jni::sys::jboolean,
+) -> jni::sys::jstring {
+    let result = (|| {
+        let guard_id = jni_get_string(&mut env, &guard_id)?;
+        let reason = jni_get_string(&mut env, &reason)?;
+        let restrict_background = jni_get_string(&mut env, &restrict_background)?;
+        register_network_snapshot(
+            &guard_id,
+            &reason,
+            active_network != 0,
+            internet_capability != 0,
+            validated_capability != 0,
+            metered != 0,
+            &restrict_background,
+            notifications_visible != 0,
+        )
+        .ok()
+    })()
+    .unwrap_or_default();
+    jni_new_string(&mut env, result)
 }
 
 /// JNI: answer one in-process bridge request (#0A). Kotlin passes the JSON request

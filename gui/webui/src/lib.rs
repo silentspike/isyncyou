@@ -455,6 +455,17 @@ pub trait AgentHandler: Send + Sync {
         Err("connectivity preflight is not enabled on this server".into())
     }
 
+    /// Same preflight with the Router-authenticated session token. Desktop handlers can use
+    /// the default implementation; mobile handlers consume a one-shot native snapshot that is
+    /// bound to this token before doing any network I/O.
+    fn connectivity_preflight_with_session(
+        &self,
+        request: AgentConnectivityPreflightRequest,
+        _session_token: Option<&str>,
+    ) -> Result<AgentConnectivityPreflightResponse, String> {
+        self.connectivity_preflight(request)
+    }
+
     /// Agent provider OAuth login. Begin a device OAuth login for
     /// `provider`; `redirect_uri` is the loopback callback the browser returns to
     /// (the client supplies its own origin). Returns the authorize URL the UI opens
@@ -4447,7 +4458,9 @@ impl Router {
             Ok(request) => request,
             Err(_) => return no_store_json_error(400, "invalid connectivity preflight request"),
         };
-        let response = match handler.connectivity_preflight(request) {
+        let response = match handler
+            .connectivity_preflight_with_session(request, req.session_token.as_deref())
+        {
             Ok(response) => response,
             Err(_) => return no_store_json_error(503, "connectivity preflight unavailable"),
         };

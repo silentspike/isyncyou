@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Seconds since the Unix epoch as a string (handlers stamp "now" with it).
@@ -330,6 +330,109 @@ the user out of band — propose them, never assume they ran.";
 const AGENT_CONFIRM_TTL_MS: u64 = 120_000;
 const AGENT_STREAM_UNOPENED_TTL_MS: u64 = 120_000;
 static CONNECTIVITY_PROBES: isyncyou_agent::ProbeLimiter = isyncyou_agent::ProbeLimiter::new();
+
+const MOBILE_CONNECTIVITY_SNAPSHOT_TTL_MS: u64 = 15_000;
+const MOBILE_CONNECTIVITY_SNAPSHOT_LIMIT: usize = 8;
+
+#[derive(Clone)]
+struct MobileConnectivitySnapshot {
+    snapshot: isyncyou_agent::AndroidNetworkSnapshot,
+    purpose: isyncyou_agent::ConnectivityPurpose,
+    _guard_id: String,
+    expires_at_ms: u64,
+}
+
+struct MobileConnectivitySnapshotEntry {
+    session_token: String,
+    snapshot: MobileConnectivitySnapshot,
+}
+
+static MOBILE_CONNECTIVITY_SNAPSHOTS: OnceLock<
+    Mutex<HashMap<String, MobileConnectivitySnapshotEntry>>,
+> = OnceLock::new();
+
+fn mobile_connectivity_snapshots(
+) -> &'static Mutex<HashMap<String, MobileConnectivitySnapshotEntry>> {
+    MOBILE_CONNECTIVITY_SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn snapshot_purpose_for_guard(reason: &str) -> Option<isyncyou_agent::ConnectivityPurpose> {
+    match reason {
+        "oauth" => Some(isyncyou_agent::ConnectivityPurpose::OAuthStart),
+        "credential_refresh" => Some(isyncyou_agent::ConnectivityPurpose::Refresh),
+        "agent_turn" => Some(isyncyou_agent::ConnectivityPurpose::TurnStart),
+        _ => None,
+    }
+}
+
+fn reap_mobile_connectivity_snapshots(
+    entries: &mut HashMap<String, MobileConnectivitySnapshotEntry>,
+    now_ms: u64,
+) {
+    entries.retain(|_, entry| entry.snapshot.expires_at_ms > now_ms);
+}
+
+/// Register a native-captured Android connectivity snapshot for exactly one subsequent
+/// preflight in this app process. The caller is Kotlin/JNI, after it has already validated the
+/// opaque foreground-guard id. WebView JavaScript sees only the returned random handle.
+pub fn register_mobile_connectivity_snapshot(
+    session_token: &str,
+    guard_id: &str,
+    guard_reason: &str,
+    snapshot: isyncyou_agent::AndroidNetworkSnapshot,
+) -> Result<String, String> {
+    if session_token.is_empty() || guard_id.is_empty() || !snapshot.guard_ready {
+        return Err("mobile connectivity snapshot is unavailable".into());
+    }
+    let Some(purpose) = snapshot_purpose_for_guard(guard_reason) else {
+        return Err("mobile connectivity snapshot is unavailable".into());
+    };
+    let now_ms = unix_now_ms();
+    let expires_at_ms = now_ms.saturating_add(MOBILE_CONNECTIVITY_SNAPSHOT_TTL_MS);
+    let mut entries = mobile_connectivity_snapshots()
+        .lock()
+        .map_err(|_| "mobile connectivity snapshot is unavailable".to_string())?;
+    reap_mobile_connectivity_snapshots(&mut entries, now_ms);
+    if entries.len() >= MOBILE_CONNECTIVITY_SNAPSHOT_LIMIT {
+        return Err("mobile connectivity snapshot is unavailable".into());
+    }
+    let id = mint_cap_token();
+    entries.insert(
+        id.clone(),
+        MobileConnectivitySnapshotEntry {
+            session_token: session_token.to_string(),
+            snapshot: MobileConnectivitySnapshot {
+                snapshot,
+                purpose,
+                _guard_id: guard_id.to_string(),
+                expires_at_ms,
+            },
+        },
+    );
+    Ok(id)
+}
+
+fn consume_mobile_connectivity_snapshot(
+    snapshot_id: &str,
+    session_token: Option<&str>,
+    purpose: isyncyou_agent::ConnectivityPurpose,
+) -> Result<isyncyou_agent::AndroidNetworkSnapshot, String> {
+    let Some(session_token) = session_token.filter(|value| !value.is_empty()) else {
+        return Err("mobile connectivity snapshot is unavailable".into());
+    };
+    let now_ms = unix_now_ms();
+    let mut entries = mobile_connectivity_snapshots()
+        .lock()
+        .map_err(|_| "mobile connectivity snapshot is unavailable".to_string())?;
+    reap_mobile_connectivity_snapshots(&mut entries, now_ms);
+    let Some(entry) = entries.remove(snapshot_id) else {
+        return Err("mobile connectivity snapshot is unavailable".into());
+    };
+    if entry.session_token != session_token || entry.snapshot.purpose != purpose {
+        return Err("mobile connectivity snapshot is unavailable".into());
+    }
+    Ok(entry.snapshot.snapshot)
+}
 
 struct AgentStreamSlot {
     rx: std::sync::mpsc::Receiver<String>,
@@ -1531,10 +1634,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         &self,
         request: isyncyou_webui::AgentConnectivityPreflightRequest,
     ) -> Result<isyncyou_webui::AgentConnectivityPreflightResponse, String> {
-        if request.snapshot_id.is_some() {
-            // Only the Task 3 native bridge can mint a session/guard-bound snapshot.
-            return Err("mobile connectivity snapshot is not registered".into());
-        }
+        self.connectivity_preflight_with_session(request, None)
+    }
+
+    fn connectivity_preflight_with_session(
+        &self,
+        request: isyncyou_webui::AgentConnectivityPreflightRequest,
+        session_token: Option<&str>,
+    ) -> Result<isyncyou_webui::AgentConnectivityPreflightResponse, String> {
         let provider = isyncyou_agent::ConnectivityProvider::parse(&request.provider)
             .ok_or_else(|| "unknown provider".to_string())?;
         let purpose = isyncyou_agent::ConnectivityPurpose::parse(&request.purpose)
@@ -1542,6 +1649,16 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let preflight = match CONNECTIVITY_PROBES.try_acquire() {
             None => isyncyou_agent::classify(None, None),
             Some(_permit) => {
+                // Do not consume the single-use mobile handle until the request has passed
+                // every local admission check and will actually run a probe.
+                let snapshot = match request.snapshot_id.as_deref() {
+                    Some(snapshot_id) => Some(consume_mobile_connectivity_snapshot(
+                        snapshot_id,
+                        session_token,
+                        purpose,
+                    )?),
+                    None => None,
+                };
                 #[cfg(any(
                     feature = "agent-oauth-providers",
                     feature = "agent-subscription-experimental"
@@ -1554,7 +1671,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                                 .ok()
                         })
                         .unwrap_or(isyncyou_agent::ProbeObservation::ConnectFailed);
-                    isyncyou_agent::classify(None, Some(observation))
+                    isyncyou_agent::classify(snapshot, Some(observation))
                 }
                 #[cfg(not(any(
                     feature = "agent-oauth-providers",
@@ -1563,7 +1680,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 {
                     let _ = (provider, purpose);
                     isyncyou_agent::classify(
-                        None,
+                        snapshot,
                         Some(isyncyou_agent::ProbeObservation::ConnectFailed),
                     )
                 }
@@ -7492,5 +7609,53 @@ mod tests {
             let resp = router.route(&ApiRequest::new(method, path));
             assert_eq!(resp.status, 401, "wired + cap-gated (not 404): {path}");
         }
+    }
+
+    #[test]
+    fn mobile_connectivity_snapshot_is_one_time_session_and_purpose_bound() {
+        let snapshot = isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: isyncyou_agent::RestrictBackgroundStatus::Disabled,
+            notifications_visible: true,
+            guard_ready: true,
+        };
+        let id = register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot)
+            .expect("snapshot is registered");
+        assert!(consume_mobile_connectivity_snapshot(
+            &id,
+            Some("session-b"),
+            isyncyou_agent::ConnectivityPurpose::OAuthStart,
+        )
+        .is_err());
+
+        let id = register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot)
+            .expect("snapshot is registered");
+        assert!(consume_mobile_connectivity_snapshot(
+            &id,
+            Some("session-a"),
+            isyncyou_agent::ConnectivityPurpose::TurnStart,
+        )
+        .is_err());
+
+        let id = register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot)
+            .expect("snapshot is registered");
+        assert_eq!(
+            consume_mobile_connectivity_snapshot(
+                &id,
+                Some("session-a"),
+                isyncyou_agent::ConnectivityPurpose::OAuthStart,
+            )
+            .expect("correct session and purpose consume the snapshot"),
+            snapshot
+        );
+        assert!(consume_mobile_connectivity_snapshot(
+            &id,
+            Some("session-a"),
+            isyncyou_agent::ConnectivityPurpose::OAuthStart,
+        )
+        .is_err());
     }
 }

@@ -514,6 +514,32 @@ class MainActivity : FragmentActivity() {
                 )
                 postBridgeResponse(reply, id, if (bound) 200 else 409, JSONObject().put("ok", bound))
             }
+            "captureNetworkSnapshot" -> {
+                bridgeExecutor.execute {
+                    val guardId = payload.optString("guard_id", "")
+                    val lease = NetworkCriticalGuardRuntime.activeLease(guardId)
+                    if (lease == null) {
+                        postBridgeError(reply, id, 409, "unavailable", "network_guard_unavailable")
+                        return@execute
+                    }
+                    val snapshot = NetworkSnapshotProvider.capture(applicationContext)
+                    val handle = NativeEngine.nativeRegisterNetworkSnapshot(
+                        guardId,
+                        lease.reason.wire,
+                        snapshot.activeNetwork,
+                        snapshot.internetCapability,
+                        snapshot.validatedCapability,
+                        snapshot.metered,
+                        snapshot.restrictBackground,
+                        snapshot.notificationsVisible,
+                    )
+                    if (handle.isBlank()) {
+                        postBridgeError(reply, id, 503, "unavailable", "network_snapshot_unavailable")
+                    } else {
+                        postBridgeResponse(reply, id, 200, JSONObject().put("snapshot_id", handle))
+                    }
+                }
+            }
             "openNetworkSettings" -> {
                 val hint = NetworkSettingsHint.fromWire(payload.optString("hint", ""))
                 if (hint == null) {

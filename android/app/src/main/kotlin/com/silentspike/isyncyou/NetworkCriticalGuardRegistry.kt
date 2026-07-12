@@ -98,6 +98,14 @@ class NetworkCriticalGuardRegistry(
         NetworkGuardLeaseSnapshot(id, lease.reason, lease.deadlineElapsedMs, lease.turnId)
     }
 
+    @Synchronized
+    fun activeLease(id: String?): NetworkGuardLeaseSnapshot? {
+        if (id.isNullOrBlank()) return null
+        reapExpiredLocked(nowElapsedMs())
+        val lease = active[id] ?: return null
+        return NetworkGuardLeaseSnapshot(id, lease.reason, lease.deadlineElapsedMs, lease.turnId)
+    }
+
     private fun reapExpiredLocked(now: Long): Int {
         val expired = active.filterValues { it.deadlineElapsedMs <= now }.keys.toList()
         expired.forEach(active::remove)

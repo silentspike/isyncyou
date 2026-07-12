@@ -42,6 +42,12 @@ object NetworkCriticalGuardRuntime {
         ended
     }
 
+    fun activeLease(guardId: String?): NetworkGuardLeaseSnapshot? = synchronized(lock) {
+        val lease = requireRegistry().activeLease(guardId)
+        scheduleExpiryLocked()
+        lease
+    }
+
     fun onServiceDestroyed() {
         synchronized(lock) {
             requireRegistry().invalidateAll()

@@ -108,11 +108,18 @@ object BridgeMessagePolicy {
                     return BridgeValidation(false, type, id, "invalid_turn")
                 }
             }
+            "captureNetworkSnapshot" -> {
+                if (payload.optString("guard_id", "").isBlank()) {
+                    return BridgeValidation(false, type, id, "missing_guard_id")
+                }
+            }
             "openNetworkSettings" -> {
                 if (NetworkSettingsHint.fromWire(payload.optString("hint", "")) == null) {
                     return BridgeValidation(false, type, id, "missing_or_unknown_settings_hint")
                 }
             }
+            "openExternal", "pushToken" -> Unit
+            else -> return BridgeValidation(false, type, id, "unknown_native_op")
         }
         return BridgeValidation(true, type, id)
     }

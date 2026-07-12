@@ -538,6 +538,13 @@ async function request(method, path, opts) {
 }
 async function api(path) { return request("GET", path); }
 async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
+async function postJson(path, capToken, value) {
+  return request("POST", path, {
+    capToken,
+    body: JSON.stringify(value),
+    headers: { "Content-Type": "application/json" },
+  });
+}
 /* Base64-encode raw bytes (Uint8Array) in fromCharCode-safe chunks (#657). The mobile bridge
    body is text-only, so a binary upload rides base64; serve.rs decodes on X-Body-Encoding. */
 function bytesToBase64(bytes) {
@@ -4511,6 +4518,26 @@ async function beginNetworkGuard(reason) {
   const d = await nativeCall("beginNetworkGuard", { reason }, NATIVE_TIMEOUT_MS);
   return d && d.guard_id ? d.guard_id : null;
 }
+async function captureNetworkSnapshot(guardId) {
+  if (!BRIDGE || !guardId) return null;
+  const d = await nativeCall("captureNetworkSnapshot", { guard_id: guardId }, NATIVE_TIMEOUT_MS);
+  return d && d.snapshot_id ? d.snapshot_id : null;
+}
+async function runConnectivityPreflight(provider, purpose, guardId) {
+  const body = { provider, purpose };
+  if (BRIDGE) {
+    const snapshotId = await captureNetworkSnapshot(guardId);
+    if (!snapshotId) throw new Error("network_guard_unavailable");
+    body.snapshot_id = snapshotId;
+  }
+  const result = await postJson("/api/v1/agent/connectivity/preflight", CAP.agent, body);
+  if (!result || result.status !== "ready") {
+    const error = new Error((result && result.code) || "connectivity_unavailable");
+    error.connectivity = result || null;
+    throw error;
+  }
+  return result;
+}
 async function endNetworkGuard(guardId) {
   if (!BRIDGE || !guardId) return;
   try { await nativeCall("endNetworkGuard", { guard_id: guardId }, NATIVE_TIMEOUT_MS); } catch (_) {}
@@ -4518,6 +4545,7 @@ async function endNetworkGuard(guardId) {
 
 let AGENT_GUARD_ID = null;
 let CODEX_GUARD_ID = null;
+const TURN_GUARDS = new Map();
 async function finishAgentGuard() {
   const id = AGENT_GUARD_ID;
   AGENT_GUARD_ID = null;
@@ -4527,6 +4555,15 @@ async function finishCodexGuard() {
   const id = CODEX_GUARD_ID;
   CODEX_GUARD_ID = null;
   await endNetworkGuard(id);
+}
+async function finishOAuthGuard(provider) {
+  if (provider === "codex") await finishCodexGuard();
+  else await finishAgentGuard();
+}
+async function finishTurnGuard(turnId) {
+  const guardId = TURN_GUARDS.get(turnId);
+  TURN_GUARDS.delete(turnId);
+  await endNetworkGuard(guardId);
 }
 function localCallbackRedirect(host) {
   return location.port ? `http://${host}:${location.port}/callback` : "";
@@ -4541,6 +4578,11 @@ async function startAiLogin(provider) {
   }
   let guardId = null;
   try {
+    guardId = await beginNetworkGuard("oauth");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    if (provider === "codex") CODEX_GUARD_ID = guardId;
+    else AGENT_GUARD_ID = guardId;
+    await runConnectivityPreflight(provider, "oauth_start", guardId);
     const params = { provider };
     const redirect = localCallbackRedirect("localhost");
     if (redirect) params.redirect = redirect;
@@ -4548,14 +4590,13 @@ async function startAiLogin(provider) {
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
     if (manualCodeFlow) showCodeStep();
-    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
+    else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    guardId = await beginNetworkGuard("oauth");
-    AGENT_GUARD_ID = guardId;
     await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
     if (guardId) await endNetworkGuard(guardId);
     if (AGENT_GUARD_ID === guardId) AGENT_GUARD_ID = null;
+    if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
     toast("Sign-in unavailable: " + (e.message || e));
   }
 }
@@ -4563,7 +4604,7 @@ async function startAiLogin(provider) {
 // After the browser login the engine's /callback stores the token; poll status until
 // connected, then switch to the chat.
 let AGENT_POLL_ON = false;
-function showWaitingStep() {
+function showWaitingStep(provider) {
   const card = document.getElementById("asst-connect-card");
   if (card) {
     clear(card).append(
@@ -4573,16 +4614,17 @@ function showWaitingStep() {
       el("div", { class: "skel", style: "height:8px;width:60%;margin:0 auto;border-radius:4px" }),
     );
   }
-  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0); }
+  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0, provider); }
 }
-async function pollAgentStatus(n) {
-  if (App.route !== "assistant") { AGENT_POLL_ON = false; await finishAgentGuard(); return; }
+async function pollAgentStatus(n, provider) {
+  if (App.route !== "assistant") { AGENT_POLL_ON = false; await finishOAuthGuard(provider); return; }
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.connected) { AGENT_POLL_ON = false; await finishAgentGuard(); toast("Connected!"); renderAssistantView($("#view")); return; }
+    const connected = provider === "codex" ? !!(s && s.codex) : !!(s && s.claude);
+    if (connected) { AGENT_POLL_ON = false; await finishOAuthGuard(provider); toast("Connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
-  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1), 2000); }
-  else { AGENT_POLL_ON = false; await finishAgentGuard(); }
+  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1, provider), 2000); }
+  else { AGENT_POLL_ON = false; await finishOAuthGuard(provider); }
 }
 
 // Swap the connect card to the "paste your code" step.
@@ -4920,28 +4962,7 @@ async function pickModel(provider, model) {
   }
 }
 async function connectCodex() {
-  if (!agentPrivacyConsentAccepted("codex")) {
-    toast("Review privacy consent for ChatGPT", "err");
-    renderAssistantView($("#view"));
-    return;
-  }
-  let guardId = null;
-  try {
-    const params = { provider: "codex" };
-    const redirect = localCallbackRedirect("127.0.0.1");
-    if (redirect) params.redirect = redirect;
-    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
-    toast("Opening ChatGPT sign-in…");
-    guardId = await beginNetworkGuard("oauth");
-    CODEX_GUARD_ID = guardId;
-    await openExternalAuth(d.authorize_url, "agent_authorize");
-    pollCodexStatus(0);
-  } catch (e) {
-    if (guardId) await endNetworkGuard(guardId);
-    if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
-    toast("ChatGPT sign-in unavailable: " + (e.message || e));
-  }
+  await startAiLogin("codex");
 }
 async function pollCodexStatus(n) {
   try {
@@ -5418,32 +5439,47 @@ async function agentSend(text) {
   };
 
   let turn;
+  let startingGuardId = null;
   try {
+    startingGuardId = await beginNetworkGuard("agent_turn");
+    if (BRIDGE && !startingGuardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "turn_start", startingGuardId);
     const r = await post("/api/v1/agent/turn?" + qs({ account: App.account, prompt: text }), CAP.agent);
     turn = r && r.turn;
   } catch (e) {
+    await endNetworkGuard(startingGuardId);
     AssistantState.busy = false;
     AssistantState.activeMessage = null;
     setText("Error: " + (e.message || e));
     return;
   }
   if (!turn) {
+    await endNetworkGuard(startingGuardId);
     AssistantState.busy = false;
     AssistantState.activeMessage = null;
     setText("Error: could not start the turn");
     return;
   }
   AssistantState.activeTurnId = turn;
+  if (BRIDGE && startingGuardId) {
+    try {
+      const bound = await nativeCall("bindNetworkGuard", { guard_id: startingGuardId, turn }, NATIVE_TIMEOUT_MS);
+      if (bound && bound.ok) TURN_GUARDS.set(turn, startingGuardId);
+    } catch (_) {
+      // A lost bind response is ambiguous. Keep the short starting lease for native expiry.
+    }
+  }
 
   const url = "/api/v1/agent/stream?" + qs({ turn });
   // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
   // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
   // event or a stream drop ends the turn.
   let stream;
-  const finish = (msg) => {
+  const finish = (msg, terminalReason) => {
     clearThinking();
     if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
     else { try { stream.close(); } catch (_) {} }
+    if (terminalReason) void finishTurnGuard(turn);
     if (!asst.text && msg) setText(msg);
   };
   const turnState = {
