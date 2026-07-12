@@ -13,6 +13,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
 
+    <!-- The network diagnostic opens only these trusted system Settings actions. -->
+    <queries>
+        <intent><action android:name="android.settings.APPLICATION_DETAILS_SETTINGS"/></intent>
+        <intent><action android:name="android.settings.panel.action.INTERNET_CONNECTIVITY"/></intent>
+        <intent><action android:name="android.settings.IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS"/></intent>
+        <intent><action android:name="android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS"/></intent>
+    </queries>
+
     <application
         android:label="@string/app_name"
         android:networkSecurityConfig="@xml/network_security_config"
@@ -47,10 +55,10 @@
             </intent-filter>
         </service>
 
-        <!-- OAuth network guard (#640): holds the process foreground during the sign-in
-             browser round-trip so the loopback token exchange isn't blocked in the background. -->
+        <!-- #640: bounded interactive OAuth/refresh/turn guard. It is not the #626
+             WorkManager foreground service and does not imply universal network reachability. -->
         <service
-            android:name=".OAuthGuardService"
+            android:name=".NetworkCriticalGuardService"
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
 

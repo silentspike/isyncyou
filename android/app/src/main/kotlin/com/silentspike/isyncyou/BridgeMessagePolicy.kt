@@ -89,8 +89,30 @@ object BridgeMessagePolicy {
                 return BridgeValidation(false, type, id, "missing_or_unknown_kind")
             }
         }
-        if (op == "endNetworkGuard" && payload.optString("guard_id", "").isBlank()) {
-            return BridgeValidation(false, type, id, "missing_guard_id")
+        when (op) {
+            "beginNetworkGuard" -> {
+                if (NetworkGuardReason.fromWire(payload.optString("reason", "")) == null) {
+                    return BridgeValidation(false, type, id, "missing_or_unknown_guard_reason")
+                }
+            }
+            "endNetworkGuard" -> {
+                if (payload.optString("guard_id", "").isBlank()) {
+                    return BridgeValidation(false, type, id, "missing_guard_id")
+                }
+            }
+            "bindNetworkGuard" -> {
+                if (payload.optString("guard_id", "").isBlank()) {
+                    return BridgeValidation(false, type, id, "missing_guard_id")
+                }
+                if (!NetworkGuardPolicy.validTurnId(payload.optString("turn", ""))) {
+                    return BridgeValidation(false, type, id, "invalid_turn")
+                }
+            }
+            "openNetworkSettings" -> {
+                if (NetworkSettingsHint.fromWire(payload.optString("hint", "")) == null) {
+                    return BridgeValidation(false, type, id, "missing_or_unknown_settings_hint")
+                }
+            }
         }
         return BridgeValidation(true, type, id)
     }

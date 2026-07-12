@@ -77,11 +77,6 @@ class MainActivity : FragmentActivity() {
     /** Latches true on the first bridge message so we log the live data path once (#0A). */
     private val bridgeSeen = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    private val oauthGuards = OAuthGuardRegistry(
-        onStart = { OAuthGuardService.start(this@MainActivity) },
-        onStop = { OAuthGuardService.stop(this@MainActivity) },
-    )
-
     private data class PendingBio(
         val requestId: String,
         val prompt: BiometricPrompt,
@@ -93,6 +88,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        NetworkCriticalGuardRuntime.initialize(applicationContext)
 
         // Debuggable builds only: expose the WebView to chrome://inspect / CDP for
         // on-device debugging and verification. The FLAG_DEBUGGABLE bit is unset in release
@@ -483,7 +479,12 @@ class MainActivity : FragmentActivity() {
             )
             "beginNetworkGuard" -> {
                 bridgeExecutor.execute {
-                    val result = oauthGuards.begin()
+                    val reason = NetworkGuardReason.fromWire(payload.optString("reason", ""))
+                    val result = if (reason == null) {
+                        NetworkGuardBeginResult(null, "invalid_reason")
+                    } else {
+                        NetworkCriticalGuardRuntime.begin(reason)
+                    }
                     if (result.ok) {
                         postBridgeResponse(
                             reply,
@@ -498,13 +499,35 @@ class MainActivity : FragmentActivity() {
                 }
             }
             "endNetworkGuard" -> {
-                val ended = oauthGuards.end(payload.optString("guard_id", ""))
+                val ended = NetworkCriticalGuardRuntime.end(payload.optString("guard_id", ""))
                 postBridgeResponse(
                     reply,
                     id,
                     200,
                     JSONObject().put("ok", true).put("ended", ended),
                 )
+            }
+            "bindNetworkGuard" -> {
+                val bound = NetworkCriticalGuardRuntime.bindTurn(
+                    payload.optString("guard_id", ""),
+                    payload.optString("turn", ""),
+                )
+                postBridgeResponse(reply, id, if (bound) 200 else 409, JSONObject().put("ok", bound))
+            }
+            "openNetworkSettings" -> {
+                val hint = NetworkSettingsHint.fromWire(payload.optString("hint", ""))
+                if (hint == null) {
+                    postBridgeError(reply, id, 400, "bad_request", "missing_or_unknown_settings_hint")
+                    return
+                }
+                runOnUiThread {
+                    val opened = NetworkSettingsPolicy.open(this, hint)
+                    if (opened) {
+                        postBridgeResponse(reply, id, 200, JSONObject().put("ok", true))
+                    } else {
+                        postBridgeError(reply, id, 503, "unavailable", "settings_unavailable")
+                    }
+                }
             }
             "openExternal" -> openExternalFromBridge(payload, id, reply)
             else -> postBridgeError(reply, id, 400, "bad_request", "unknown_op")
@@ -807,13 +830,11 @@ class MainActivity : FragmentActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
-    /** Safety net: never leak the sign-in network guard past the Activity's life. */
+    /** Activity recreation must not clear application-owned network guard leases. */
     override fun onDestroy() {
         cancelPendingBiometrics()
         bridgeStreams.values.forEach { NativeEngine.nativeStreamClose(it) }
         bridgeStreams.clear()
-        oauthGuards.clear()
-        OAuthGuardService.stop(this)
         bridgeExecutor.shutdownNow()
         super.onDestroy()
     }

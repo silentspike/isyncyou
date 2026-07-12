@@ -4506,9 +4506,9 @@ async function openExternalAuth(url, kind, opts) {
   }
   openDesktopExternal(url, !!(opts && opts.newTab));
 }
-async function beginNetworkGuard() {
+async function beginNetworkGuard(reason) {
   if (!BRIDGE) return null;
-  const d = await nativeCall("beginNetworkGuard", {}, NATIVE_TIMEOUT_MS);
+  const d = await nativeCall("beginNetworkGuard", { reason }, NATIVE_TIMEOUT_MS);
   return d && d.guard_id ? d.guard_id : null;
 }
 async function endNetworkGuard(guardId) {
@@ -4550,7 +4550,7 @@ async function startAiLogin(provider) {
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep();          // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    guardId = await beginNetworkGuard();
+    guardId = await beginNetworkGuard("oauth");
     AGENT_GUARD_ID = guardId;
     await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
@@ -4933,7 +4933,7 @@ async function connectCodex() {
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
     if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
     toast("Opening ChatGPT sign-in…");
-    guardId = await beginNetworkGuard();
+    guardId = await beginNetworkGuard("oauth");
     CODEX_GUARD_ID = guardId;
     await openExternalAuth(d.authorize_url, "agent_authorize");
     pollCodexStatus(0);
