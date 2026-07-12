@@ -1549,6 +1549,25 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
     jni_new_string(&mut env, out)
 }
 
+/// #640 evidence marker. It is intentionally JNI-only and has no WebView, bridge, HTTP,
+/// or router caller. The fixed marker lets the device harness distinguish a hook APK from a
+/// rebuilt default APK without relying on Cargo feature names surviving link-time stripping.
+#[cfg(feature = "agent-network-device-test-hooks")]
+const NETWORK_DEVICE_HOOK_MARKER: &str = "ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkDeviceHooksEnabled<
+    'local,
+>(
+    _env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+) -> jni::sys::jboolean {
+    // Keep the marker referenced in the executable path so binary scans can prove the
+    // hook/default split. Returning a boolean avoids exposing any diagnostic control.
+    !NETWORK_DEVICE_HOOK_MARKER.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1573,6 +1592,7 @@ mod tests {
             "agent-session-kdf-bench",
             "agent-credential-store-self-test",
             "mobile-job-device-test-hooks",
+            "agent-network-device-test-hooks",
         ];
         let allowlist = gradle
             .split_once("val allowedCargoTestFeatures = setOf(")

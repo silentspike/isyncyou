@@ -92,6 +92,12 @@ object NativeEngine {
     external fun nativeAgentCredentialStoreSelfTest(filesDir: String, sentinel: String): String
 
     /**
+     * #640 test/evidence hook marker. This method is present only in a deliberately
+     * feature-enabled test APK and is not callable from WebView, HTTP, or the bridge.
+     */
+    external fun nativeNetworkDeviceHooksEnabled(): Boolean
+
+    /**
      * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
      * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,
      * or `not_found`.
