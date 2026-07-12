@@ -1752,6 +1752,7 @@ dependencies = [
  "isyncyou-store",
  "isyncyou-webui",
  "jni",
+ "libc",
  "serde_json",
  "tempfile",
 ]

@@ -696,6 +696,7 @@ pub fn register_network_snapshot(
     metered: bool,
     restrict_background: &str,
     notifications_visible: bool,
+    test_hook: Option<&str>,
 ) -> Result<String, String> {
     let restrict_background = match restrict_background {
         "disabled" => isyncyou_agent::RestrictBackgroundStatus::Disabled,
@@ -717,6 +718,7 @@ pub fn register_network_snapshot(
             notifications_visible,
             guard_ready: true,
         },
+        test_hook,
     )
 }
 
@@ -1266,20 +1268,23 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeRegister
     metered: jni::sys::jboolean,
     restrict_background: jni::objects::JString<'local>,
     notifications_visible: jni::sys::jboolean,
+    test_hook: jni::objects::JString<'local>,
 ) -> jni::sys::jstring {
     let result = (|| {
         let guard_id = jni_get_string(&mut env, &guard_id)?;
         let reason = jni_get_string(&mut env, &reason)?;
         let restrict_background = jni_get_string(&mut env, &restrict_background)?;
+        let test_hook = jni_get_string(&mut env, &test_hook)?;
         register_network_snapshot(
             &guard_id,
             &reason,
-            active_network != 0,
-            internet_capability != 0,
-            validated_capability != 0,
-            metered != 0,
+            active_network,
+            internet_capability,
+            validated_capability,
+            metered,
             &restrict_background,
-            notifications_visible != 0,
+            notifications_visible,
+            (!test_hook.is_empty()).then_some(test_hook.as_str()),
         )
         .ok()
     })()
@@ -1553,7 +1558,86 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
 /// or router caller. The fixed marker lets the device harness distinguish a hook APK from a
 /// rebuilt default APK without relying on Cargo feature names surviving link-time stripping.
 #[cfg(feature = "agent-network-device-test-hooks")]
-const NETWORK_DEVICE_HOOK_MARKER: &str = "ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER: &[u8] = b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
+
+/// Consume one app-private #640 diagnostic hook. This is deliberately JNI-only: WebView,
+/// HTTP, bridge payloads, and capability tokens cannot select a diagnostic branch.
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn take_network_device_test_hook(files_dir: &str) -> String {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Path;
+
+    const MAX_HOOK_BYTES: u64 = 128;
+    const HOOK_FILE: &str = "network-diagnostic-test-hook";
+
+    let root = Path::new(files_dir);
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return String::new();
+    }
+    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
+        return String::new();
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return String::new();
+    }
+    let path = root.join(HOOK_FILE);
+    let Ok(pre_open_meta) = std::fs::symlink_metadata(&path) else {
+        return String::new();
+    };
+    if pre_open_meta.file_type().is_symlink()
+        || !pre_open_meta.is_file()
+        || pre_open_meta.len() > MAX_HOOK_BYTES
+        || pre_open_meta.mode() & 0o077 != 0
+        || pre_open_meta.uid() != unsafe { libc::geteuid() }
+    {
+        let _ = std::fs::remove_file(&path);
+        return String::new();
+    }
+
+    let mut bytes = Vec::with_capacity(pre_open_meta.len() as usize);
+    let read_result = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .and_then(|mut file| {
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || meta.len() > MAX_HOOK_BYTES
+                || meta.mode() & 0o077 != 0
+                || meta.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(std::io::Error::other("invalid hook file"));
+            }
+            file.read_to_end(&mut bytes)
+        });
+    // The hook is always one-shot, including malformed or failed reads.
+    let _ = std::fs::remove_file(&path);
+    if read_result.is_err() || bytes.len() > MAX_HOOK_BYTES as usize {
+        return String::new();
+    }
+    let Ok(value) = std::str::from_utf8(&bytes) else {
+        return String::new();
+    };
+    match value.trim() {
+        "no_validated_network"
+        | "connect_timeout"
+        | "tls_failed"
+        | "http_failed"
+        | "foreground_guard_unavailable" => value.trim().to_string(),
+        _ => String::new(),
+    }
+}
 
 #[cfg(feature = "agent-network-device-test-hooks")]
 #[no_mangle]
@@ -1565,12 +1649,65 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkD
 ) -> jni::sys::jboolean {
     // Keep the marker referenced in the executable path so binary scans can prove the
     // hook/default split. Returning a boolean avoids exposing any diagnostic control.
-    !NETWORK_DEVICE_HOOK_MARKER.is_empty()
+    !ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER.is_empty()
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeTakeNetworkDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let value = jni_get_string(&mut env, &files_dir)
+        .map(|path| take_network_device_test_hook(&path))
+        .unwrap_or_default();
+    jni_new_string(&mut env, value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn network_device_hook_is_one_shot_and_rejects_unsafe_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("network-diagnostic-test-hook");
+        std::fs::write(&hook, "connect_timeout\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_network_device_test_hook(dir.path().to_str().unwrap()),
+            "connect_timeout"
+        );
+        assert!(!hook.exists(), "a valid hook must be consumed exactly once");
+        assert!(
+            take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty(),
+            "a consumed hook cannot be replayed"
+        );
+
+        let target = dir.path().join("outside");
+        std::fs::write(&target, "tls_failed").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &hook).unwrap();
+        assert!(take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty());
+        assert!(
+            !hook.exists(),
+            "a rejected symlink is removed without following it"
+        );
+
+        std::fs::write(&hook, "http_failed").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty());
+        assert!(
+            !hook.exists(),
+            "a non-owner-only hook is consumed and rejected"
+        );
+    }
 
     #[test]
     fn mobile_product_has_no_local_cli_experimental_feature() {

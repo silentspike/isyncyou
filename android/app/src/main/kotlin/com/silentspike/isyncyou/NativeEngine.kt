@@ -98,6 +98,13 @@ object NativeEngine {
     external fun nativeNetworkDeviceHooksEnabled(): Boolean
 
     /**
+     * #640 test/evidence hook input. Available only in the explicitly feature-enabled
+     * native library and never reachable from WebView, HTTP, or the bridge. Native code
+     * consumes the fixed app-private file before returning one closed diagnostic category.
+     */
+    external fun nativeTakeNetworkDeviceTestHook(filesDir: String): String
+
+    /**
      * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
      * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,
      * or `not_found`.
@@ -133,5 +140,6 @@ object NativeEngine {
         metered: Boolean,
         restrictBackground: String,
         notificationsVisible: Boolean,
+        testHook: String,
     ): String
 }

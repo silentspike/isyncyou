@@ -344,6 +344,7 @@ struct MobileConnectivitySnapshot {
     snapshot: isyncyou_agent::AndroidNetworkSnapshot,
     purpose: isyncyou_agent::ConnectivityPurpose,
     _guard_id: String,
+    forced_observation: Option<isyncyou_agent::ProbeObservation>,
     expires_at_ms: u64,
 }
 
@@ -385,12 +386,28 @@ pub fn register_mobile_connectivity_snapshot(
     guard_id: &str,
     guard_reason: &str,
     snapshot: isyncyou_agent::AndroidNetworkSnapshot,
+    test_hook: Option<&str>,
 ) -> Result<String, String> {
     if session_token.is_empty() || guard_id.is_empty() || !snapshot.guard_ready {
         return Err("mobile connectivity snapshot is unavailable".into());
     }
     let Some(purpose) = snapshot_purpose_for_guard(guard_reason) else {
         return Err("mobile connectivity snapshot is unavailable".into());
+    };
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    let forced_observation = match test_hook {
+        None | Some("") => None,
+        Some("connect_timeout") => Some(isyncyou_agent::ProbeObservation::ConnectTimedOut),
+        Some("tls_failed") => Some(isyncyou_agent::ProbeObservation::TlsFailed),
+        Some("http_failed") => Some(isyncyou_agent::ProbeObservation::HttpStatus(500)),
+        Some(_) => return Err("mobile connectivity snapshot is unavailable".into()),
+    };
+    #[cfg(not(feature = "agent-network-device-test-hooks"))]
+    let forced_observation = {
+        if test_hook.is_some_and(|value| !value.is_empty()) {
+            return Err("mobile connectivity snapshot is unavailable".into());
+        }
+        None
     };
     let now_ms = unix_now_ms();
     let expires_at_ms = now_ms.saturating_add(MOBILE_CONNECTIVITY_SNAPSHOT_TTL_MS);
@@ -410,6 +427,7 @@ pub fn register_mobile_connectivity_snapshot(
                 snapshot,
                 purpose,
                 _guard_id: guard_id.to_string(),
+                forced_observation,
                 expires_at_ms,
             },
         },
@@ -417,11 +435,16 @@ pub fn register_mobile_connectivity_snapshot(
     Ok(id)
 }
 
+struct ConsumedMobileConnectivitySnapshot {
+    snapshot: isyncyou_agent::AndroidNetworkSnapshot,
+    forced_observation: Option<isyncyou_agent::ProbeObservation>,
+}
+
 fn consume_mobile_connectivity_snapshot(
     snapshot_id: &str,
     session_token: Option<&str>,
     purpose: isyncyou_agent::ConnectivityPurpose,
-) -> Result<isyncyou_agent::AndroidNetworkSnapshot, String> {
+) -> Result<ConsumedMobileConnectivitySnapshot, String> {
     let Some(session_token) = session_token.filter(|value| !value.is_empty()) else {
         return Err("mobile connectivity snapshot is unavailable".into());
     };
@@ -436,7 +459,10 @@ fn consume_mobile_connectivity_snapshot(
     if entry.session_token != session_token || entry.snapshot.purpose != purpose {
         return Err("mobile connectivity snapshot is unavailable".into());
     }
-    Ok(entry.snapshot.snapshot)
+    Ok(ConsumedMobileConnectivitySnapshot {
+        snapshot: entry.snapshot.snapshot,
+        forced_observation: entry.snapshot.forced_observation,
+    })
 }
 
 struct AgentStreamSlot {
@@ -1712,7 +1738,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             Some(_permit) => {
                 // Do not consume the single-use mobile handle until the request has passed
                 // every local admission check and will actually run a probe.
-                let snapshot = match request.snapshot_id.as_deref() {
+                let consumed_snapshot = match request.snapshot_id.as_deref() {
                     Some(snapshot_id) => Some(consume_mobile_connectivity_snapshot(
                         snapshot_id,
                         session_token,
@@ -1720,18 +1746,24 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     )?),
                     None => None,
                 };
+                let snapshot = consumed_snapshot.as_ref().map(|value| value.snapshot);
+                let forced_observation = consumed_snapshot
+                    .as_ref()
+                    .and_then(|value| value.forced_observation);
                 #[cfg(any(
                     feature = "agent-oauth-providers",
                     feature = "agent-subscription-experimental"
                 ))]
                 {
-                    let observation = isyncyou_agent::http::HttpTransport::new()
-                        .ok()
-                        .and_then(|http| {
-                            http.probe(isyncyou_agent::target_for(provider, purpose))
-                                .ok()
-                        })
-                        .unwrap_or(isyncyou_agent::ProbeObservation::ConnectFailed);
+                    let observation = forced_observation.unwrap_or_else(|| {
+                        isyncyou_agent::http::HttpTransport::new()
+                            .ok()
+                            .and_then(|http| {
+                                http.probe(isyncyou_agent::target_for(provider, purpose))
+                                    .ok()
+                            })
+                            .unwrap_or(isyncyou_agent::ProbeObservation::ConnectFailed)
+                    });
                     isyncyou_agent::classify(snapshot, Some(observation))
                 }
                 #[cfg(not(any(
@@ -1739,7 +1771,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     feature = "agent-subscription-experimental"
                 )))]
                 {
-                    let _ = (provider, purpose);
+                    let _ = (provider, purpose, forced_observation);
                     isyncyou_agent::classify(
                         snapshot,
                         Some(isyncyou_agent::ProbeObservation::ConnectFailed),
@@ -7702,8 +7734,9 @@ mod tests {
             notifications_visible: true,
             guard_ready: true,
         };
-        let id = register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot)
-            .expect("snapshot is registered");
+        let id =
+            register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot, None)
+                .expect("snapshot is registered");
         assert!(consume_mobile_connectivity_snapshot(
             &id,
             Some("session-b"),
@@ -7711,8 +7744,9 @@ mod tests {
         )
         .is_err());
 
-        let id = register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot)
-            .expect("snapshot is registered");
+        let id =
+            register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot, None)
+                .expect("snapshot is registered");
         assert!(consume_mobile_connectivity_snapshot(
             &id,
             Some("session-a"),
@@ -7720,21 +7754,67 @@ mod tests {
         )
         .is_err());
 
-        let id = register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot)
-            .expect("snapshot is registered");
-        assert_eq!(
-            consume_mobile_connectivity_snapshot(
-                &id,
-                Some("session-a"),
-                isyncyou_agent::ConnectivityPurpose::OAuthStart,
-            )
-            .expect("correct session and purpose consume the snapshot"),
-            snapshot
-        );
+        let id =
+            register_mobile_connectivity_snapshot("session-a", "guard-a", "oauth", snapshot, None)
+                .expect("snapshot is registered");
+        let consumed = consume_mobile_connectivity_snapshot(
+            &id,
+            Some("session-a"),
+            isyncyou_agent::ConnectivityPurpose::OAuthStart,
+        )
+        .expect("correct session and purpose consumes the snapshot");
+        assert_eq!(consumed.snapshot, snapshot);
+        assert_eq!(consumed.forced_observation, None);
         assert!(consume_mobile_connectivity_snapshot(
             &id,
             Some("session-a"),
             isyncyou_agent::ConnectivityPurpose::OAuthStart,
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn network_snapshot_hook_is_closed_and_one_shot() {
+        let snapshot = isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: isyncyou_agent::RestrictBackgroundStatus::Disabled,
+            notifications_visible: true,
+            guard_ready: true,
+        };
+        let id = register_mobile_connectivity_snapshot(
+            "hook-session",
+            "hook-guard",
+            "oauth",
+            snapshot,
+            Some("tls_failed"),
+        )
+        .expect("closed hook is accepted only in the test build");
+        let consumed = consume_mobile_connectivity_snapshot(
+            &id,
+            Some("hook-session"),
+            isyncyou_agent::ConnectivityPurpose::OAuthStart,
+        )
+        .expect("hook snapshot can be consumed once");
+        assert_eq!(
+            consumed.forced_observation,
+            Some(isyncyou_agent::ProbeObservation::TlsFailed)
+        );
+        assert!(consume_mobile_connectivity_snapshot(
+            &id,
+            Some("hook-session"),
+            isyncyou_agent::ConnectivityPurpose::OAuthStart,
+        )
+        .is_err());
+        assert!(register_mobile_connectivity_snapshot(
+            "hook-session",
+            "hook-guard",
+            "oauth",
+            snapshot,
+            Some("arbitrary_endpoint"),
         )
         .is_err());
     }

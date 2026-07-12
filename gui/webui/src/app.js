@@ -4577,6 +4577,37 @@ async function finishTurnGuard(turnId) {
   TURN_GUARDS.delete(turnId);
   await endNetworkGuard(guardId);
 }
+
+function agentCredentialState(st, provider) {
+  const states = st && st.credential_state;
+  return states && typeof states === "object" ? states[provider] : "";
+}
+
+async function refreshAssistantCredentialIfRequired(st) {
+  const provider = agentActiveProvider(st);
+  if (agentCredentialState(st, provider) !== "refresh_required") return st;
+  let guardId = null;
+  try {
+    guardId = await beginNetworkGuard("credential_refresh");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "refresh", guardId);
+    await postJson("/api/v1/agent/credential/refresh", CAP.agent, { provider });
+    return await api("/api/v1/agent/status");
+  } catch (_) {
+    // The server exposes reconnect_required as a closed state; never surface a transport
+    // chain or provider response in the Assistant UI.
+    return Object.assign({}, st || {}, {
+      connected: false,
+      credential_state: Object.assign({}, (st && st.credential_state) || {}, {
+        [provider]: "reconnect_required",
+      }),
+      reconnect_required: true,
+    });
+  } finally {
+    await endNetworkGuard(guardId);
+  }
+}
+
 function localCallbackRedirect(host) {
   return location.port ? `http://${host}:${location.port}/callback` : "";
 }
@@ -4786,7 +4817,10 @@ async function renderAssistantView(view) {
   body.append(el("div", { class: "assistant-loading" },
     el("div", { class: "skel", style: "height:20px;width:50%" })));
   let st = {};
-  try { st = await api("/api/v1/agent/status"); } catch (_) { st = {}; }
+  try {
+    st = await api("/api/v1/agent/status");
+    st = await refreshAssistantCredentialIfRequired(st);
+  } catch (_) { st = {}; }
   rememberAssistantStatus(st);
   clear(body);
   if (st && st.connected) renderAssistantChat(body, st);

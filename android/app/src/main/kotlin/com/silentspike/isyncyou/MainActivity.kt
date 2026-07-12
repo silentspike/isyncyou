@@ -522,7 +522,24 @@ class MainActivity : FragmentActivity() {
                         postBridgeError(reply, id, 409, "unavailable", "network_guard_unavailable")
                         return@execute
                     }
-                    val snapshot = NetworkSnapshotProvider.capture(applicationContext)
+                    val hook = NetworkDeviceTestHook.take(applicationContext)
+                    if (hook == NetworkDeviceTestHook.ForegroundGuardUnavailable) {
+                        postBridgeError(reply, id, 503, "unavailable", "network_guard_unavailable")
+                        return@execute
+                    }
+                    val captured = NetworkSnapshotProvider.capture(applicationContext)
+                    val snapshot = if (hook == NetworkDeviceTestHook.NoValidatedNetwork) {
+                        captured.copy(validatedCapability = false)
+                    } else {
+                        captured
+                    }
+                    val transportHook = when (hook) {
+                        NetworkDeviceTestHook.ConnectTimeout,
+                        NetworkDeviceTestHook.TlsFailed,
+                        NetworkDeviceTestHook.HttpFailed,
+                        -> hook.wire
+                        else -> ""
+                    }
                     val handle = NativeEngine.nativeRegisterNetworkSnapshot(
                         guardId,
                         lease.reason.wire,
@@ -532,6 +549,7 @@ class MainActivity : FragmentActivity() {
                         snapshot.metered,
                         snapshot.restrictBackground,
                         snapshot.notificationsVisible,
+                        transportHook,
                     )
                     if (handle.isBlank()) {
                         postBridgeError(reply, id, 503, "unavailable", "network_snapshot_unavailable")
