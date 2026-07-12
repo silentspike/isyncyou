@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-11T19:21:35Z",
-  "commit": "affcd88dbf82ad02299753b1ced2ad24d4aa1c1b",
+  "generated_at": "2026-07-12T06:49:55Z",
+  "commit": "fdf9411eacd016df691748c9c2bf1f3a843ab399",
   "entries": [
     {
       "id": "EV-001",
@@ -158,7 +158,7 @@
       "requirement": "REQ-AGENT-008",
       "claim": "Claude Code 2.1.207 produced a controlled, allowlist-reduced local drift summary with no retained raw capture.",
       "method": "probe",
-      "command": "tools/capture-agent-local-drift.sh capture; manual scalar review; tools/capture-agent-local-drift.sh publish <review-dir> docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES",
+      "command": "cargo remote -c -- build -p isyncyou-agent --example reduce_local_drift --features agent-subscription-experimental && rm -rf /tmp/isyncyou-627-evidence-review && tools/capture-agent-local-drift.sh capture /tmp/isyncyou-627-evidence-review && jq -S . /tmp/isyncyou-627-evidence-review/*.json && tools/capture-agent-local-drift.sh publish /tmp/isyncyou-627-evidence-review docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES && rm -rf /tmp/isyncyou-627-evidence-review",
       "result": "pass",
       "evidence": "controlled_sentinel_observed=true; raw_retained=false; drift_decision=not_safely_observable",
       "artifact": "docs/evidence/artifacts/issue-627/claude-code-2.1.207-drift-summary.json",
@@ -169,7 +169,7 @@
       "requirement": "REQ-AGENT-008",
       "claim": "Codex CLI 0.144.1 produced a controlled, allowlist-reduced local drift summary with no retained raw capture.",
       "method": "probe",
-      "command": "tools/capture-agent-local-drift.sh capture; manual scalar review; tools/capture-agent-local-drift.sh publish <review-dir> docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES",
+      "command": "cargo remote -c -- build -p isyncyou-agent --example reduce_local_drift --features agent-subscription-experimental && rm -rf /tmp/isyncyou-627-evidence-review && tools/capture-agent-local-drift.sh capture /tmp/isyncyou-627-evidence-review && jq -S . /tmp/isyncyou-627-evidence-review/*.json && tools/capture-agent-local-drift.sh publish /tmp/isyncyou-627-evidence-review docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES && rm -rf /tmp/isyncyou-627-evidence-review",
       "result": "pass",
       "evidence": "controlled_sentinel_observed=true; raw_retained=false; drift_decision=not_safely_observable; model catalog reduced to counts/presence",
       "artifact": "docs/evidence/artifacts/issue-627/codex-cli-0.144.1-drift-summary.json",
@@ -204,6 +204,106 @@
       "result": "pass",
       "evidence": "Product source matches=0; product workflow matches=0; forbidden reduced-summary scalar matches=0; raw capture artifacts=0.",
       "artifact": "docs/evidence/artifacts/issue-627/public-surface-scan.txt"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-AGENT-008",
+      "claim": "A partial Claude capture containing only authorization cannot be classified as no drift.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_authorization_only_is_not_safely_observable -- --nocapture",
+      "result": "pass",
+      "evidence": "test drift_capture::tests::experimental_capture_authorization_only_is_not_safely_observable ... ok",
+      "test": "experimental_capture_authorization_only_is_not_safely_observable"
+    },
+    {
+      "id": "EV-022",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Removing any one required Claude wire header leaves the capture not safely observable.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_each_missing_claude_header_is_not_safely_observable -- --nocapture",
+      "result": "pass",
+      "evidence": "test drift_capture::tests::experimental_capture_each_missing_claude_header_is_not_safely_observable ... ok",
+      "test": "experimental_capture_each_missing_claude_header_is_not_safely_observable"
+    },
+    {
+      "id": "EV-023",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Removing any one required Codex wire header leaves the capture not safely observable.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_each_missing_codex_header_is_not_safely_observable -- --nocapture",
+      "result": "pass",
+      "evidence": "test drift_capture::tests::experimental_capture_each_missing_codex_header_is_not_safely_observable ... ok",
+      "test": "experimental_capture_each_missing_codex_header_is_not_safely_observable"
+    },
+    {
+      "id": "EV-024",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The drift reducer rejects a direct input symlink even when both link and target are below /tmp.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_rejects_symlink_within_tmp -- --nocapture",
+      "result": "pass",
+      "evidence": "test drift_capture::tests::experimental_capture_rejects_symlink_within_tmp ... ok",
+      "test": "experimental_capture_rejects_symlink_within_tmp"
+    },
+    {
+      "id": "EV-025",
+      "requirement": "REQ-AGENT-008",
+      "claim": "A corrupt product credential emits error followed by done(error), never a successful FakeProvider turn.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers corrupt_product_credential_streams_error_and_done_error -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::corrupt_product_credential_streams_error_and_done_error ... ok",
+      "test": "corrupt_product_credential_streams_error_and_done_error"
+    },
+    {
+      "id": "EV-026",
+      "requirement": "REQ-AGENT-008",
+      "claim": "An expired non-refreshable product credential emits error followed by done(error), never a successful FakeProvider turn.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers expired_product_credential_streams_error_and_done_error -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::expired_product_credential_streams_error_and_done_error ... ok",
+      "test": "expired_product_credential_streams_error_and_done_error"
+    },
+    {
+      "id": "EV-027",
+      "requirement": "REQ-AGENT-008",
+      "claim": "Persisted Codex callback diagnostics contain only a fixed safe-boolean schema, with no callback URL, code, state, or error text.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_callback_diagnostics_persist_only_safe_booleans -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::codex_callback_diagnostics_persist_only_safe_booleans ... ok",
+      "test": "codex_callback_diagnostics_persist_only_safe_booleans"
+    },
+    {
+      "id": "EV-028",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The product-source scanner retains production code after early cfg(test) items and excludes only the final test module.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers product_source_scan_keeps_production_after_early_cfg_test_items -- --nocapture",
+      "result": "pass",
+      "evidence": "test product_source_scan_keeps_production_after_early_cfg_test_items ... ok",
+      "test": "product_source_scan_keeps_production_after_early_cfg_test_items"
+    },
+    {
+      "id": "EV-029",
+      "requirement": "REQ-AGENT-008",
+      "claim": "The drift reducer's exact required header sets remain synchronized with the Claude and Codex runtime builders.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_required_headers_match_runtime_builders -- --nocapture",
+      "result": "pass",
+      "evidence": "test drift_capture::tests::experimental_capture_required_headers_match_runtime_builders ... ok",
+      "test": "experimental_capture_required_headers_match_runtime_builders"
+    },
+    {
+      "id": "EV-030",
+      "requirement": "REQ-AGENT-008",
+      "claim": "App-host startup removes any legacy Codex callback diagnostics file that may contain an old callback target.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers daemon_agent_startup_removes_legacy_codex_callback_diagnostics -- --nocapture",
+      "result": "pass",
+      "evidence": "test tests::daemon_agent_startup_removes_legacy_codex_callback_diagnostics ... ok",
+      "test": "daemon_agent_startup_removes_legacy_codex_callback_diagnostics"
     }
   ]
 }

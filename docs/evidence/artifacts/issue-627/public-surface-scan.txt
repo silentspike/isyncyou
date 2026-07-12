@@ -1,6 +1,6 @@
 Issue #627 public-surface scan
-Generated: 2026-07-11T19:21:35Z
-Tested code commit: affcd88dbf82ad02299753b1ced2ad24d4aa1c1b
+Generated: 2026-07-12T06:49:55Z
+Tested code commit: fdf9411eacd016df691748c9c2bf1f3a843ab399
 
 Scopes checked:
 - README, packaging, Android distribution, Android README, product WebUI,

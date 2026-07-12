@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "scope": "issue_627_default_product_artifact_exclusion",
-  "tested_commit": "affcd88dbf82ad02299753b1ced2ad24d4aa1c1b",
+  "tested_commit": "fdf9411eacd016df691748c9c2bf1f3a843ab399",
   "release_workflow": {
     "experimental_feature_requested": false,
     "all_features_requested": false,
@@ -10,14 +10,14 @@
   },
   "desktop_release_daemon": {
     "build_status": "pass",
-    "sha256": "70e243230ed10b9feadffa78089475ddfb0ea389e76c9e1707034f4a69044569",
+    "sha256": "f19bf41e36b4cac725467ec1c008bab7657f1a720e3d898fc91d895f22f7f710",
     "forbidden_marker_matches": 0
   },
   "android_default_debug_apk": {
     "build_status": "pass",
     "cargo_test_features_unset": true,
-    "sha256": "a05a02f26972b4e87199a79b830cf2eced95334bfe039fb13ca9a8b8035167c5",
-    "packaged_arm64_library_sha256": "64a62efd0a83502c50e76fca694d52ee02e6dfb1df5c92b1a55be07b10807716",
+    "sha256": "d617857b94dc481536b7c156a9aa5255bd2ffc7fbb7cbc3d3fb3f0a53aaf26f8",
+    "packaged_arm64_library_sha256": "ff42007ca95e39ff1fde219ff00240cdae9454e7582a8deed985695ef097c10e",
     "forbidden_marker_matches": 0
   },
   "forbidden_marker_categories": [
