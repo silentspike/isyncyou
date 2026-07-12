@@ -49,6 +49,10 @@ pub use archive::{ArchiveSource, ItemRef};
 pub use confirm::{
     action_hash, ConfirmError, PendingAction, PendingActionBinding, PendingRegistry,
 };
+pub use connectivity::{
+    classify, target_for, AndroidNetworkSnapshot, ConnectivityPreflightCode, ConnectivityProvider,
+    ConnectivityPurpose, ProbeLimiter, ProbeObservation, RestrictBackgroundStatus,
+};
 pub use error::AgentError;
 pub use provider::{AssistantBlock, DoneReason, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
