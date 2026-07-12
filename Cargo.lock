@@ -1573,6 +1573,7 @@ dependencies = [
  "isyncyou-core",
  "isyncyou-graph",
  "isyncyou-store",
+ "libc",
  "reqwest",
  "ring",
  "serde",

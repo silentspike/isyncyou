@@ -592,7 +592,18 @@ fn read_bounded(
             "input outside temporary root",
         ));
     }
-    let metadata = fs::metadata(&canonical)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| DriftCaptureError::new(provider, role, None, "input unavailable"))?;
+    let metadata = file
+        .metadata()
         .map_err(|_| DriftCaptureError::new(provider, role, None, "input unavailable"))?;
     if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(DriftCaptureError::new(
@@ -605,6 +616,14 @@ fn read_bounded(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != link_metadata.dev() || metadata.ino() != link_metadata.ino() {
+            return Err(DriftCaptureError::new(
+                provider,
+                role,
+                None,
+                "input identity changed",
+            ));
+        }
         if metadata.mode() & 0o077 != 0 {
             return Err(DriftCaptureError::new(
                 provider,
@@ -615,11 +634,8 @@ fn read_bounded(
         }
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(&canonical)
-        .and_then(|file| {
-            file.take(max_bytes.saturating_add(1))
-                .read_to_end(&mut bytes)
-        })
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|_| DriftCaptureError::new(provider, role, None, "input read failed"))?;
     if bytes.len() as u64 > max_bytes {
         return Err(DriftCaptureError::new(
@@ -740,14 +756,12 @@ fn inspect_usage(provider: CaptureProvider, value: &Value, state: &mut Reduction
         state.review.usage_field = true;
         return;
     };
-    for (key, value) in object {
+    for key in object.keys() {
         if let Some(field) = provider.usage_field(key) {
             state.usage_fields.insert(field);
         } else if provider.ignored_usage_field(key) {
             // Intentionally ignored as a whole; nested diagnostic values must not be
             // inspected or copied into the public summary.
-        } else if value.is_object() {
-            inspect_usage(provider, value, state);
         } else {
             state.review.usage_field = true;
         }
@@ -1272,19 +1286,27 @@ mod tests {
 
     #[test]
     fn experimental_capture_new_usage_field_requires_manual_review() {
-        let dir = fixture_dir();
-        let events = r#"{"type":"result","result":"issue-627-controlled-sentinel","usage":{"new_metric":"metric-secret"}}"#;
+        for events in [
+            r#"{"type":"result","result":"issue-627-controlled-sentinel","usage":{"new_metric":"metric-secret"}}"#,
+            r#"{"type":"result","result":"issue-627-controlled-sentinel","usage":{"new_metric":{"input_tokens":1,"private":"metric-secret"}}}"#,
+        ] {
+            let dir = fixture_dir();
+            let mut options = claude_options(dir.path(), events);
+            let debug = dir.path().join("debug.json");
+            write_private(&debug, &complete_claude_debug().to_string());
+            options.debug_file = Some(debug);
 
-        let summary = reduce_capture(&claude_options(dir.path(), events)).unwrap();
-        let text = serialized(&summary);
+            let summary = reduce_capture(&options).unwrap();
+            let text = serialized(&summary);
 
-        assert_eq!(summary.manual_review_categories(), vec!["usage_field"]);
-        assert_eq!(
-            summary.drift_decision,
-            DriftDecision::ImplementationUpdateRequired
-        );
-        assert!(!text.contains("new_metric"));
-        assert!(!text.contains("metric-secret"));
+            assert_eq!(summary.manual_review_categories(), vec!["usage_field"]);
+            assert_eq!(
+                summary.drift_decision,
+                DriftDecision::ImplementationUpdateRequired
+            );
+            assert!(!text.contains("new_metric"));
+            assert!(!text.contains("metric-secret"));
+        }
     }
 
     #[test]
