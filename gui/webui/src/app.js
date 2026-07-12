@@ -4745,8 +4745,17 @@ async function pollAgentStatus(n, provider) {
 
 // Swap the connect card to the "paste your code" step.
 function showCodeStep() {
-  const card = document.getElementById("asst-connect-card");
-  if (!card) return;
+  let card = document.getElementById("asst-connect-card");
+  if (!card) {
+    const body = document.getElementById("asst-body");
+    if (!body) return;
+    card = el("div", {
+      id: "asst-connect-card",
+      class: "assistant-setup",
+      "data-agent-oauth-code-step": "claude",
+    });
+    body.prepend(card);
+  }
   clear(card).append(
     el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
     el("h2", { style: "margin:.3rem 0 .5rem", text: "Paste your code" }),
@@ -4770,7 +4779,7 @@ async function completeAiLogin() {
     toast("Connected!");
     renderAssistantView($("#view"));   // re-fetch status -> switches to chat
   } catch (e) {
-    OAUTH_ATTEMPTS.delete("claude");
+    await cancelOAuthAttempt("claude");
     await finishAgentGuard();
     toast("Couldn't connect. Start sign-in again.", "err");
   }
@@ -4788,6 +4797,7 @@ const AssistantState = {
   busy: false,
   activeMessage: null,
   connectivityIssue: null,
+  pendingConnectProvider: null,
 };
 
 function closeAssistantStream(_reason) {
@@ -4837,17 +4847,22 @@ function agentPrivacyConsentAccepted(provider) {
     && c.accepted === true
     && c.provider === agentProviderConsentId(provider);
 }
-function acceptAgentPrivacyConsent(provider) {
+async function acceptAgentPrivacyConsent(provider) {
+  const consentProvider = agentProviderConsentId(provider);
   const record = {
     version: AGENT_PRIVACY_CONSENT_VERSION,
     accepted: true,
-    provider: agentProviderConsentId(provider),
+    provider: consentProvider,
     timestamp: new Date().toISOString(),
   };
   try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
-  renderAssistantView($("#view"));
+  const resumeConnect = AssistantState.pendingConnectProvider === consentProvider;
+  AssistantState.pendingConnectProvider = null;
+  await renderAssistantView($("#view"));
+  if (resumeConnect) await startAiLogin(consentProvider);
 }
 function resetAgentPrivacyConsent() {
+  AssistantState.pendingConnectProvider = null;
   try { localStorage.removeItem(AGENT_PRIVACY_CONSENT_KEY); } catch (_) {}
   renderAssistantView($("#view"));
 }
@@ -4884,6 +4899,7 @@ async function renderAssistantView(view) {
   clear(body);
   if (st && st.connected) renderAssistantChat(body, st);
   else renderAssistantSetup(body, st);
+  if (OAUTH_ATTEMPTS.has("claude") && !(st && st.claude)) showCodeStep();
 }
 
 // The connect card (shown until an AI account is connected).
@@ -4937,6 +4953,10 @@ function renderAssistantChat(body, st) {
     renderAssistantComposer(st),
   ];
   if (!hasConsent) chatNodes.splice(1, 0, renderAssistantConsentPanel([provider]));
+  const pendingConnect = AssistantState.pendingConnectProvider;
+  if (pendingConnect && !agentPrivacyConsentAccepted(pendingConnect)) {
+    chatNodes.splice(1, 0, renderAssistantConsentPanel([pendingConnect]));
+  }
   const diagnostic = renderConnectivityDiagnostic();
   if (diagnostic) body.append(diagnostic);
   body.append(...chatNodes);
@@ -5043,8 +5063,13 @@ function agentModelSwitcher(st) {
   };
   addGroup("claude", st.claude);
   addGroup("codex", st.codex);
+  if (!st.claude) {
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "claude", onclick: () => connectAgentProvider("claude") },
+      el("span", { class: "mdl-plus" }, "＋"),
+      el("span", { class: "mdl-lbl", text: "Connect Claude…" })));
+  }
   if (!st.codex) {
-    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectCodex() },
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectAgentProvider("codex") },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
   }
@@ -5072,6 +5097,14 @@ function agentModelSwitcher(st) {
   wrap.append(trigger, el("div", { class: "mdl-panel", role: "listbox" }, ...rows));
   return wrap;
 }
+async function connectAgentProvider(provider) {
+  if (!agentPrivacyConsentAccepted(provider)) {
+    AssistantState.pendingConnectProvider = agentProviderConsentId(provider);
+    await renderAssistantView($("#view"));
+    return;
+  }
+  await startAiLogin(provider);
+}
 async function pickModel(provider, model) {
   if (!agentPrivacyConsentAccepted(provider)) {
     toast("Review privacy consent for " + agentProviderLabel(provider), "err");
@@ -5089,7 +5122,7 @@ async function pickModel(provider, model) {
   }
 }
 async function connectCodex() {
-  await startAiLogin("codex");
+  await connectAgentProvider("codex");
 }
 async function pollCodexStatus(n) {
   try {

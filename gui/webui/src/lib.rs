@@ -9877,7 +9877,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "const list = models[prov] || [];",
             "if (!connected || !list.length) return;",
             "\"data-agent-model-option\": val",
+            "\"data-agent-model-connect\": \"claude\"",
             "\"data-agent-model-connect\": \"codex\"",
+            "async function connectAgentProvider(provider)",
+            "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
             "await post(\"/api/v1/agent/model?\" + qs({ provider, model }), CAP.agent);",
             "const st = await api(\"/api/v1/agent/status\");",
             "rememberAssistantStatus(st);",
@@ -9899,15 +9903,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_claude_manual_code_step_survives_connected_rerender() {
+        for needle in [
+            "data-agent-oauth-code-step\": \"claude\"",
+            "body.prepend(card);",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
+            "await cancelOAuthAttempt(\"claude\");",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing persistent Claude manual-code invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn assistant_setup_consent_is_required_and_non_secret() {
         for needle in [
             "const AGENT_PRIVACY_CONSENT_KEY = \"isy_agent_privacy_consent_v1\";",
             "const AGENT_PRIVACY_CONSENT_VERSION = 1;",
             "function agentPrivacyConsentAccepted(provider)",
-            "function acceptAgentPrivacyConsent(provider)",
+            "async function acceptAgentPrivacyConsent(provider)",
             "version: AGENT_PRIVACY_CONSENT_VERSION",
             "accepted: true",
-            "provider: agentProviderConsentId(provider)",
+            "provider: consentProvider",
             "timestamp: new Date().toISOString()",
             "localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record))",
             "function renderAssistantConsentPanel(providers)",
