@@ -84,6 +84,26 @@ struct RequestHeaders {
     host: Option<String>,
     origin: Option<String>,
     body_encoding: Option<String>,
+    content_type: Option<String>,
+}
+
+const AGENT_STRICT_JSON_MAX_BYTES: usize = 8 * 1024;
+
+fn strict_json_body_limit(method: &str, target: &str) -> Option<usize> {
+    if method != "POST" {
+        return None;
+    }
+    let path = target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target);
+    matches!(
+        path,
+        "/api/v1/agent/connectivity/preflight"
+            | "/api/v1/agent/credential/refresh"
+            | "/api/v1/agent/oauth/cancel"
+    )
+    .then_some(AGENT_STRICT_JSON_MAX_BYTES)
 }
 
 /// Decode a request body per the `X-Body-Encoding` header (#657 in-app upload/replace):
@@ -136,6 +156,7 @@ fn build_request(
     cap_token: Option<String>,
     session_token: Option<String>,
     cookie: Option<String>,
+    content_type: Option<String>,
     body: Vec<u8>,
 ) -> ApiRequest {
     let session_token = session_token.or_else(|| {
@@ -146,6 +167,7 @@ fn build_request(
     ApiRequest::new(method, target)
         .with_cap_token(cap_token)
         .with_session_token(session_token)
+        .with_content_type(content_type)
         .with_body(body)
 }
 
@@ -163,6 +185,7 @@ pub fn dispatch_message(
     cap_token: Option<String>,
     session_token: Option<String>,
     cookie: Option<String>,
+    content_type: Option<String>,
     body: Vec<u8>,
 ) -> ApiResponse {
     router.route(&build_request(
@@ -171,6 +194,7 @@ pub fn dispatch_message(
         cap_token,
         session_token,
         cookie,
+        content_type,
         body,
     ))
 }
@@ -221,6 +245,7 @@ pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
         header("X-Capability-Token"),
         header("X-Session-Token"),
         header("Cookie"),
+        header("Content-Type"),
         body,
     );
     serde_json::json!({
@@ -389,10 +414,26 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             }
             Err(e) => return Err(e),
         }
+        let (method, target) = match parse_request_line(request_line.trim_end()) {
+            Some(mt) => mt,
+            None => {
+                let resp = ApiResponse {
+                    status: 400,
+                    content_type: "text/plain".into(),
+                    body: b"bad request line".to_vec(),
+                    headers: Vec::new(),
+                };
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(());
+            }
+        };
+        let strict_json_limit = strict_json_body_limit(&method, &target);
         // Read headers up to the blank line; capture the small set the local security
         // policy needs plus the body length. Unknown headers are ignored.
         let mut headers = RequestHeaders::default();
-        let mut content_length = 0usize;
+        let mut content_length = None;
+        let mut malformed_framing = false;
         loop {
             let mut h = String::new();
             let n = reader.read_line(&mut h)?;
@@ -413,26 +454,36 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
                 } else if k.eq_ignore_ascii_case("origin") {
                     headers.origin = Some(v);
                 } else if k.eq_ignore_ascii_case("content-length") {
-                    content_length = v.parse().unwrap_or(0);
+                    if strict_json_limit.is_some() {
+                        if content_length.is_some() {
+                            malformed_framing = true;
+                        } else {
+                            content_length = v.parse::<usize>().ok();
+                            if content_length.is_none() {
+                                malformed_framing = true;
+                            }
+                        }
+                    } else {
+                        // Preserve legacy framing behavior outside the three strict JSON
+                        // endpoints. Their later hardening belongs to #628.
+                        content_length = Some(v.parse::<usize>().unwrap_or(0));
+                    }
                 } else if k.eq_ignore_ascii_case("x-body-encoding") {
                     headers.body_encoding = Some(v);
+                } else if k.eq_ignore_ascii_case("content-type") {
+                    headers.content_type = Some(v);
+                } else if k.eq_ignore_ascii_case("transfer-encoding") && strict_json_limit.is_some()
+                {
+                    malformed_framing = true;
                 }
             }
         }
-        let (method, target) = match parse_request_line(request_line.trim_end()) {
-            Some(mt) => mt,
-            None => {
-                let resp = ApiResponse {
-                    status: 400,
-                    content_type: "text/plain".into(),
-                    body: b"bad request line".to_vec(),
-                    headers: Vec::new(),
-                };
-                stream.write_all(&format_http(&resp))?;
-                stream.flush()?;
-                return Ok(()); // malformed → close
-            }
-        };
+        if malformed_framing || (strict_json_limit.is_some() && headers.body_encoding.is_some()) {
+            let resp = ApiResponse::error(400, "invalid request framing");
+            stream.write_all(&format_http(&resp))?;
+            stream.flush()?;
+            return Ok(());
+        }
         // Local-access policy (loopback host / local origin) runs first, for every path.
         if let Some(resp) = validate_request_headers(policy, &method, &headers) {
             stream.write_all(&format_http(&resp))?;
@@ -443,7 +494,9 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
         // over HTTP too (#0A); the query-string GETs that dominate today carry none. An
         // oversized body is refused (413) rather than buffered — it can't be reframed
         // safely on a keep-alive connection, so that path also closes.
-        let body = if content_length > MAX_REQUEST_BODY {
+        let body_limit = strict_json_limit.unwrap_or(MAX_REQUEST_BODY);
+        let content_length = content_length.unwrap_or(0);
+        let body = if content_length > body_limit {
             let resp = ApiResponse::error(413, "request body too large");
             stream.write_all(&format_http(&resp))?;
             stream.flush()?;
@@ -459,7 +512,7 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             Vec::new()
         };
         // #657: an upload may ride base64 (uniform with the JSON bridge); decode it here.
-        let body = match decode_body(headers.body_encoding.as_deref(), body, MAX_REQUEST_BODY) {
+        let body = match decode_body(headers.body_encoding.as_deref(), body, body_limit) {
             Ok(b) => b,
             Err((status, message)) => {
                 let resp = ApiResponse::error(status, message);
@@ -477,6 +530,7 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             headers.cap_token.clone(),
             headers.session_token.clone(),
             headers.cookie.clone(),
+            headers.content_type.clone(),
             body,
         );
         // SSE change stream: a long-lived connection that bypasses the one-shot
@@ -713,6 +767,27 @@ mod tests {
         );
         assert_eq!(parse_request_line(""), None);
         assert_eq!(parse_request_line("GET"), None);
+    }
+
+    #[test]
+    fn strict_agent_json_routes_have_small_preallocation_limits() {
+        assert_eq!(
+            strict_json_body_limit("POST", "/api/v1/agent/connectivity/preflight"),
+            Some(AGENT_STRICT_JSON_MAX_BYTES)
+        );
+        assert_eq!(
+            strict_json_body_limit("POST", "/api/v1/agent/credential/refresh"),
+            Some(AGENT_STRICT_JSON_MAX_BYTES)
+        );
+        assert_eq!(
+            strict_json_body_limit("POST", "/api/v1/agent/oauth/cancel"),
+            Some(AGENT_STRICT_JSON_MAX_BYTES)
+        );
+        assert_eq!(strict_json_body_limit("POST", "/api/v1/agent/turn"), None);
+        assert_eq!(
+            strict_json_body_limit("GET", "/api/v1/agent/connectivity/preflight"),
+            None
+        );
     }
 
     #[test]
@@ -1218,12 +1293,14 @@ mod tests {
             Some("cap-1".into()),
             None,
             Some("other=z; isy_session=cook-tok".into()),
+            Some("application/json".into()),
             b"hello-body".to_vec(),
         );
         assert_eq!(r.method, "POST");
         assert_eq!(r.path, "/api/v1/x");
         assert_eq!(r.cap_token.as_deref(), Some("cap-1"));
         assert_eq!(r.session_token.as_deref(), Some("cook-tok"));
+        assert_eq!(r.content_type.as_deref(), Some("application/json"));
         assert_eq!(r.body, b"hello-body");
         // An explicit X-Session-Token header wins over the cookie.
         let r2 = build_request(
@@ -1232,6 +1309,7 @@ mod tests {
             None,
             Some("hdr-tok".into()),
             Some("isy_session=cook-tok".into()),
+            None,
             Vec::new(),
         );
         assert_eq!(r2.session_token.as_deref(), Some("hdr-tok"));
@@ -1247,6 +1325,7 @@ mod tests {
             &open,
             "GET",
             "/api/v1/accounts",
+            None,
             None,
             None,
             None,
@@ -1267,6 +1346,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
         );
         assert_eq!(denied.status, 401, "bridge without token must 401");
@@ -1276,6 +1356,7 @@ mod tests {
             "/api/v1/status",
             None,
             Some("sess-bridge".into()),
+            None,
             None,
             Vec::new(),
         );

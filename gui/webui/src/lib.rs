@@ -95,6 +95,9 @@ pub struct ApiRequest {
     /// The `X-Session-Token` header value (#89 mobile profile): required on every
     /// `/api/v1/*` route when the Router runs with a session token.
     pub session_token: Option<String>,
+    /// Normalized inbound `Content-Type`. Only newly introduced JSON routes depend on
+    /// this; legacy query/body routes intentionally retain their existing contract.
+    pub content_type: Option<String>,
     /// The request body bytes (#0A transport). Empty for the query-string GETs that
     /// make up today's API; carried so a body-bearing request survives **both**
     /// transports — HTTP (`serve.rs` reads it instead of draining) and the Android
@@ -123,6 +126,7 @@ impl ApiRequest {
             query,
             cap_token: None,
             session_token: None,
+            content_type: None,
             body: Vec::new(),
         }
     }
@@ -136,6 +140,13 @@ impl ApiRequest {
     /// Attach the captured `X-Session-Token` header (builder style, #89).
     pub fn with_session_token(mut self, token: Option<String>) -> Self {
         self.session_token = token;
+        self
+    }
+
+    /// Attach the normalized request content type (builder style, shared by HTTP and
+    /// the Android bridge).
+    pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
+        self.content_type = content_type;
         self
     }
 
@@ -196,6 +207,37 @@ fn agent_oauth_provider_param(provider: &str) -> Result<&'static str, &'static s
         "" => Err("provider is required"),
         _ => Err("unknown provider"),
     }
+}
+
+const AGENT_STRICT_JSON_MAX_BYTES: usize = 8 * 1024;
+
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    let mut parts = content_type.split(';');
+    if !parts
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return false;
+    }
+    parts.all(|parameter| {
+        let parameter = parameter.trim();
+        parameter.is_empty()
+            || parameter.split_once('=').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("charset")
+                    && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+            })
+    })
+}
+
+fn no_store_json_error(status: u16, message: &str) -> ApiResponse {
+    let mut response = ApiResponse::error(status, message);
+    response
+        .headers
+        .push(("Cache-Control".into(), "no-store".into()));
+    response
 }
 
 /// A response ready to be written by any server adapter.
@@ -359,6 +401,26 @@ pub struct AgentPendingBinding {
     pub item: String,
 }
 
+/// The only provider/purpose pairs accepted by the connectivity preflight route.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConnectivityPreflightRequest {
+    pub provider: String,
+    pub purpose: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+}
+
+/// Redacted connectivity result returned to the Assistant. Values are closed enums;
+/// transport errors, host names, URLs, and snapshot fields never cross this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgentConnectivityPreflightResponse {
+    pub status: String,
+    pub code: String,
+    pub retryable: bool,
+    pub settings_hint: String,
+}
+
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
 /// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
 /// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
@@ -383,6 +445,15 @@ pub trait AgentHandler: Send + Sync {
     fn cancel(&self, turn_id: &str);
     /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
+
+    /// Run a closed provider connectivity preflight. The router parses the strict JSON
+    /// request and the handler returns only the closed diagnostic response.
+    fn connectivity_preflight(
+        &self,
+        _request: AgentConnectivityPreflightRequest,
+    ) -> Result<AgentConnectivityPreflightResponse, String> {
+        Err("connectivity preflight is not enabled on this server".into())
+    }
 
     /// Agent provider OAuth login. Begin a device OAuth login for
     /// `provider`; `redirect_uri` is the loopback callback the browser returns to
@@ -1784,6 +1855,7 @@ impl Router {
                 "/api/v1/agent/turn" | "/api/v1/agent/chat" => self.agent_turn(req),
                 "/api/v1/agent/confirm" => self.agent_confirm(req),
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
+                "/api/v1/agent/connectivity/preflight" => self.agent_connectivity_preflight(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
                 "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
                 "/api/v1/agent/model" => self.agent_set_model(req),
@@ -4347,6 +4419,53 @@ impl Router {
         ApiResponse::ok_json(&json!({ "cancelled": turn }))
     }
 
+    /// Run a bounded, redacted connectivity preflight. This is deliberately the only
+    /// new #640 JSON route in this change; legacy agent routes remain query-based until
+    /// their separate hardening work lands.
+    fn agent_connectivity_preflight(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(mut e) => {
+                e.headers.push(("Cache-Control".into(), "no-store".into()));
+                return e;
+            }
+        };
+        if !req.query.is_empty() {
+            return no_store_json_error(400, "connectivity preflight accepts JSON only");
+        }
+        if !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "application/json content type is required");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid JSON request body"),
+        };
+        let request = match serde_json::from_str::<AgentConnectivityPreflightRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid connectivity preflight request"),
+        };
+        let response = match handler.connectivity_preflight(request) {
+            Ok(response) => response,
+            Err(_) => return no_store_json_error(503, "connectivity preflight unavailable"),
+        };
+        let mut response =
+            ApiResponse::ok_json(&serde_json::to_value(response).unwrap_or_else(|_| {
+                json!({
+                    "status": "unavailable",
+                    "code": "connectivity_unavailable",
+                    "retryable": true,
+                    "settings_hint": "none",
+                })
+            }));
+        response
+            .headers
+            .push(("Cache-Control".into(), "no-store".into()));
+        response
+    }
+
     /// Agent connection status as JSON (`{connected, model?}`). Read-only; returns
     /// `enabled:false` when no agent is wired so the UI can hide the assistant entirely.
     fn agent_status(&self, _req: &ApiRequest) -> ApiResponse {
@@ -6648,6 +6767,20 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             tx.send("{\"event\":\"token\",\"text\":\"hi\"}".into()).ok();
             Some(rx)
         }
+        fn connectivity_preflight(
+            &self,
+            request: AgentConnectivityPreflightRequest,
+        ) -> Result<AgentConnectivityPreflightResponse, String> {
+            if request.provider != "claude" || request.purpose != "turn_start" {
+                return Err("unsupported test request".into());
+            }
+            Ok(AgentConnectivityPreflightResponse {
+                status: "ready".into(),
+                code: "ready".into(),
+                retryable: false,
+                settings_hint: "none".into(),
+            })
+        }
         fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
             Ok(format!(
                 "https://auth.example/authorize?redirect_uri={redirect_uri}&state=st-1"
@@ -6725,6 +6858,71 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
             None
         }
+    }
+
+    #[test]
+    fn connectivity_preflight_route_requires_cap_strict_json_and_no_store() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let valid = || {
+            ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json; charset=utf-8".into()))
+                .with_body(b"{\"provider\":\"claude\",\"purpose\":\"turn_start\"}".to_vec())
+        };
+
+        let denied = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_content_type(Some("application/json".into()))
+                .with_body(b"{}".to_vec()),
+        );
+        assert_eq!(denied.status, 401);
+        assert!(denied
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+
+        let wrong_type = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("text/plain".into()))
+                .with_body(b"{}".to_vec()),
+        );
+        assert_eq!(wrong_type.status, 400);
+        assert!(wrong_type
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+
+        let extra_field = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    b"{\"provider\":\"claude\",\"purpose\":\"turn_start\",\"host\":\"example\"}"
+                        .to_vec(),
+                ),
+        );
+        assert_eq!(extra_field.status, 400);
+
+        let duplicate_field = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    b"{\"provider\":\"claude\",\"provider\":\"codex\",\"purpose\":\"turn_start\"}"
+                        .to_vec(),
+                ),
+        );
+        assert_eq!(duplicate_field.status, 400);
+
+        let ready = router.route(&valid());
+        assert_eq!(ready.status, 200);
+        assert_eq!(body_json(&ready)["code"], "ready");
+        assert!(ready
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
     }
 
     #[test]

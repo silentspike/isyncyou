@@ -525,8 +525,16 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     let Some(router) = router else {
         return Vec::new();
     };
-    let resp =
-        isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
+    let resp = isyncyou_webui::dispatch_message(
+        &router,
+        "GET",
+        path,
+        None,
+        None,
+        cookie,
+        None,
+        Vec::new(),
+    );
     frame_response(resp)
 }
 

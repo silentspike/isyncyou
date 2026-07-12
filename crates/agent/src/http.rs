@@ -6,7 +6,7 @@
 use crate::AgentError;
 #[cfg(any(feature = "http", test))]
 use std::collections::BTreeMap;
-#[cfg(any(feature = "http", test))]
+#[cfg(test)]
 use std::io::Read;
 
 #[cfg(any(feature = "http", test))]
@@ -181,7 +181,7 @@ impl SseDecoder {
     }
 }
 
-#[cfg(any(feature = "http", test))]
+#[cfg(test)]
 fn read_sse_stream(
     mut reader: impl Read,
     on_event: &mut dyn FnMut(SseEvent),
@@ -254,7 +254,7 @@ fn body_preview_from_bytes(bytes: &[u8], truncated: bool) -> Option<String> {
     Some(preview)
 }
 
-#[cfg(any(feature = "http", test))]
+#[cfg(test)]
 fn read_body_preview(mut reader: impl Read) -> Result<Option<String>, AgentError> {
     let mut buf = Vec::with_capacity(MAX_PROVIDER_BODY_PREVIEW_BYTES);
     let mut chunk = [0u8; 1024];
@@ -280,10 +280,20 @@ fn read_body_preview(mut reader: impl Read) -> Result<Option<String>, AgentError
 #[cfg(feature = "http")]
 mod live {
     use super::{
-        filter_provider_header_pairs, read_body_preview, read_sse_stream, ProviderHttpResponse,
-        SseEvent,
+        filter_provider_header_pairs, ProviderHttpResponse, SseDecoder, SseEvent,
+        MAX_PROVIDER_BODY_PREVIEW_BYTES,
     };
+    use crate::connectivity::{ProbeObservation, ProbeTarget};
     use crate::AgentError;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    /// Compiled policy for product provider traffic. Callers cannot override these values.
+    pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const PROVIDER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const PROVIDER_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    pub const PROVIDER_TURN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+    pub const PREFLIGHT_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 
     /// Resolve `host`'s A records via **DNS-over-HTTPS to `1.1.1.1`**. Android forbids apps
     /// from doing raw DNS (UDP → `EPERM`) and its platform resolver intermittently `EAI_NODATA`s
@@ -350,14 +360,37 @@ mod live {
     /// their own request bodies and headers; this just sends and returns status+body.
     pub struct HttpTransport {
         client: reqwest::blocking::Client,
+        probe_client: reqwest::blocking::Client,
+        sse_client: reqwest::Client,
+        sse_runtime: tokio::runtime::Runtime,
     }
 
     impl HttpTransport {
         pub fn new() -> Result<Self, AgentError> {
             let client = reqwest::blocking::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PROVIDER_TURN_TIMEOUT)
                 .build()
                 .map_err(|e| AgentError::Transport(e.to_string()))?;
-            Ok(Self { client })
+            let probe_client = reqwest::blocking::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PREFLIGHT_TOTAL_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            let sse_client = async_sse_client_builder()
+                .build()
+                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            let sse_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_time()
+                .build()
+                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            Ok(Self {
+                client,
+                probe_client,
+                sse_client,
+                sse_runtime,
+            })
         }
 
         fn ensure_test_network_allowed() -> Result<(), AgentError> {
@@ -390,7 +423,44 @@ mod live {
                 .resolve_to_addrs(host, &addrs)
                 .build()
                 .map_err(|e| AgentError::Transport(e.to_string()))?;
-            Ok(Self { client })
+            let probe_client = reqwest::blocking::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PREFLIGHT_TOTAL_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            let sse_client = async_sse_client_builder()
+                .no_proxy()
+                .resolve_to_addrs(host, &addrs)
+                .build()
+                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            let sse_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_time()
+                .build()
+                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            Ok(Self {
+                client,
+                probe_client,
+                sse_client,
+                sse_runtime,
+            })
+        }
+
+        /// Run one unauthenticated, no-redirect provider reachability probe. The target
+        /// table is closed and neither the URL nor raw reqwest error leaves this module.
+        pub fn probe(&self, target: ProbeTarget) -> Result<ProbeObservation, AgentError> {
+            Self::ensure_test_network_allowed()?;
+            let mut request = self.probe_client.get(probe_target_url(target));
+            for (name, value) in probe_request_headers() {
+                request = request.header(name, value);
+            }
+            let result = request.send();
+            match result {
+                Ok(response) => Ok(ProbeObservation::HttpStatus(response.status().as_u16())),
+                Err(error) if error.is_timeout() => Ok(ProbeObservation::ConnectTimedOut),
+                Err(error) if error.is_connect() => Ok(ProbeObservation::ConnectFailed),
+                Err(_) => Ok(ProbeObservation::ConnectFailed),
+            }
         }
 
         /// POST a JSON body with the given headers; returns `(status, body_text)`.
@@ -401,7 +471,11 @@ mod live {
             body: &serde_json::Value,
         ) -> Result<(u16, String), AgentError> {
             Self::ensure_test_network_allowed()?;
-            let mut req = self.client.post(url).json(body);
+            let mut req = self
+                .client
+                .post(url)
+                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
             }
@@ -425,32 +499,48 @@ mod live {
             on_event: &mut dyn FnMut(SseEvent),
         ) -> Result<ProviderHttpResponse, AgentError> {
             Self::ensure_test_network_allowed()?;
-            let mut req = self.client.post(url).json(body);
+            let mut req = self.sse_client.post(url).json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
             }
-            let mut resp = req
-                .send()
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
-            let status = resp.status().as_u16();
-            let headers = filter_provider_header_pairs(
-                resp.headers()
-                    .iter()
-                    .filter_map(|(k, v)| v.to_str().ok().map(|value| (k.as_str(), value))),
-            );
-            if !(200..=299).contains(&status) {
-                let body_preview = read_body_preview(&mut resp)?;
-                return Ok(ProviderHttpResponse {
+            self.sse_runtime.block_on(async {
+                let deadline = tokio::time::Instant::now() + PROVIDER_TURN_TIMEOUT;
+                let response = within_deadline(deadline, PROVIDER_RESPONSE_TIMEOUT, req.send())
+                    .await
+                    .map_err(async_transport_error)?;
+                let status = response.status().as_u16();
+                let headers = filter_provider_header_pairs(
+                    response
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|value| (k.as_str(), value))),
+                );
+                if !(200..=299).contains(&status) {
+                    let body_preview = read_body_preview_async(response, deadline).await?;
+                    return Ok(ProviderHttpResponse {
+                        status,
+                        headers,
+                        body_preview,
+                    });
+                }
+                let mut stream = response.bytes_stream();
+                let mut decoder = SseDecoder::new();
+                loop {
+                    let next = within_deadline(deadline, PROVIDER_SSE_IDLE_TIMEOUT, stream.next())
+                        .await
+                        .map_err(async_transport_error)?;
+                    let Some(chunk) = next else {
+                        break;
+                    };
+                    let chunk = chunk.map_err(|e| AgentError::Transport(e.to_string()))?;
+                    decoder.push_bytes(&chunk, on_event)?;
+                }
+                decoder.finish(on_event)?;
+                Ok(ProviderHttpResponse {
                     status,
                     headers,
-                    body_preview,
-                });
-            }
-            read_sse_stream(&mut resp, on_event)?;
-            Ok(ProviderHttpResponse {
-                status,
-                headers,
-                body_preview: None,
+                    body_preview: None,
+                })
             })
         }
 
@@ -462,22 +552,89 @@ mod live {
             form: &[(&str, &str)],
         ) -> Result<(u16, String), AgentError> {
             Self::ensure_test_network_allowed()?;
-            let resp = self.client.post(url).form(form).send().map_err(|e| {
-                use std::error::Error;
-                let mut msg = e.to_string();
-                let mut src = e.source();
-                while let Some(s) = src {
-                    msg.push_str(&format!(" | {s}"));
-                    src = s.source();
-                }
-                AgentError::Transport(msg)
-            })?;
+            let resp = self
+                .client
+                .post(url)
+                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .form(form)
+                .send()
+                .map_err(|e| {
+                    use std::error::Error;
+                    let mut msg = e.to_string();
+                    let mut src = e.source();
+                    while let Some(s) = src {
+                        msg.push_str(&format!(" | {s}"));
+                        src = s.source();
+                    }
+                    AgentError::Transport(msg)
+                })?;
             let status = resp.status().as_u16();
             let text = resp
                 .text()
                 .map_err(|e| AgentError::Transport(e.to_string()))?;
             Ok((status, text))
         }
+    }
+
+    fn probe_target_url(target: ProbeTarget) -> &'static str {
+        match target {
+            ProbeTarget::ClaudeOAuth => "https://claude.com/cai/oauth/authorize",
+            ProbeTarget::ClaudeInference => "https://api.anthropic.com/v1/messages",
+            ProbeTarget::CodexOAuth => "https://auth.openai.com/",
+            ProbeTarget::CodexInference => "https://chatgpt.com/backend-api/codex/responses",
+        }
+    }
+
+    fn probe_request_headers() -> [(&'static str, &'static str); 1] {
+        [("accept", "application/json")]
+    }
+
+    fn async_sse_client_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder().connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+    }
+
+    async fn within_deadline<T>(
+        deadline: tokio::time::Instant,
+        limit: Duration,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, ()> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let timeout = remaining.min(limit);
+        tokio::time::timeout(timeout, future).await.map_err(|_| ())
+    }
+
+    fn async_transport_error<T>(_: T) -> AgentError {
+        AgentError::Transport("provider transport timeout or failure".into())
+    }
+
+    async fn read_body_preview_async(
+        response: reqwest::Response,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<String>, AgentError> {
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::with_capacity(MAX_PROVIDER_BODY_PREVIEW_BYTES);
+        let mut truncated = false;
+        loop {
+            let next = within_deadline(deadline, PROVIDER_SSE_IDLE_TIMEOUT, stream.next())
+                .await
+                .map_err(async_transport_error)?;
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = chunk.map_err(|e| AgentError::Transport(e.to_string()))?;
+            let remaining = MAX_PROVIDER_BODY_PREVIEW_BYTES.saturating_sub(bytes.len());
+            if chunk.len() > remaining {
+                bytes.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() == MAX_PROVIDER_BODY_PREVIEW_BYTES {
+                truncated = true;
+                break;
+            }
+        }
+        Ok(super::body_preview_from_bytes(&bytes, truncated))
     }
 }
 
@@ -632,6 +789,27 @@ mod tests {
 
         assert!(preview.len() <= MAX_PROVIDER_BODY_PREVIEW_BYTES + "\n[truncated]".len());
         assert!(preview.ends_with("[truncated]"));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn provider_transport_timeout_policy_has_distinct_response_idle_and_turn_bounds() {
+        assert_eq!(live::PROVIDER_CONNECT_TIMEOUT.as_secs(), 10);
+        assert_eq!(live::PROVIDER_RESPONSE_TIMEOUT.as_secs(), 60);
+        assert_eq!(live::PROVIDER_SSE_IDLE_TIMEOUT.as_secs(), 120);
+        assert_eq!(live::PROVIDER_TURN_TIMEOUT.as_secs(), 20 * 60);
+        assert!(live::PROVIDER_RESPONSE_TIMEOUT < live::PROVIDER_SSE_IDLE_TIMEOUT);
+        assert!(live::PROVIDER_SSE_IDLE_TIMEOUT < live::PROVIDER_TURN_TIMEOUT);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn preflight_transport_never_sends_authorization_or_cookie() {
+        for (name, _) in live::probe_request_headers() {
+            let name = name.to_ascii_lowercase();
+            assert_ne!(name, "authorization");
+            assert_ne!(name, "cookie");
+        }
     }
 
     struct ChunkReader {

@@ -329,6 +329,7 @@ the user out of band — propose them, never assume they ran.";
 
 const AGENT_CONFIRM_TTL_MS: u64 = 120_000;
 const AGENT_STREAM_UNOPENED_TTL_MS: u64 = 120_000;
+static CONNECTIVITY_PROBES: isyncyou_agent::ProbeLimiter = isyncyou_agent::ProbeLimiter::new();
 
 struct AgentStreamSlot {
     rx: std::sync::mpsc::Receiver<String>,
@@ -1526,6 +1527,69 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
 }
 
 impl isyncyou_webui::AgentHandler for DaemonAgent {
+    fn connectivity_preflight(
+        &self,
+        request: isyncyou_webui::AgentConnectivityPreflightRequest,
+    ) -> Result<isyncyou_webui::AgentConnectivityPreflightResponse, String> {
+        if request.snapshot_id.is_some() {
+            // Only the Task 3 native bridge can mint a session/guard-bound snapshot.
+            return Err("mobile connectivity snapshot is not registered".into());
+        }
+        let provider = isyncyou_agent::ConnectivityProvider::parse(&request.provider)
+            .ok_or_else(|| "unknown provider".to_string())?;
+        let purpose = isyncyou_agent::ConnectivityPurpose::parse(&request.purpose)
+            .ok_or_else(|| "unknown connectivity purpose".to_string())?;
+        let preflight = match CONNECTIVITY_PROBES.try_acquire() {
+            None => isyncyou_agent::classify(None, None),
+            Some(_permit) => {
+                #[cfg(any(
+                    feature = "agent-oauth-providers",
+                    feature = "agent-subscription-experimental"
+                ))]
+                {
+                    let observation = isyncyou_agent::http::HttpTransport::new()
+                        .ok()
+                        .and_then(|http| {
+                            http.probe(isyncyou_agent::target_for(provider, purpose))
+                                .ok()
+                        })
+                        .unwrap_or(isyncyou_agent::ProbeObservation::ConnectFailed);
+                    isyncyou_agent::classify(None, Some(observation))
+                }
+                #[cfg(not(any(
+                    feature = "agent-oauth-providers",
+                    feature = "agent-subscription-experimental"
+                )))]
+                {
+                    let _ = (provider, purpose);
+                    isyncyou_agent::classify(
+                        None,
+                        Some(isyncyou_agent::ProbeObservation::ConnectFailed),
+                    )
+                }
+            }
+        };
+        let (status, settings_hint) = match preflight.code {
+            isyncyou_agent::ConnectivityPreflightCode::Ready => ("ready", "none"),
+            isyncyou_agent::ConnectivityPreflightCode::NoValidatedNetwork => {
+                ("action_required", "internet_panel")
+            }
+            isyncyou_agent::ConnectivityPreflightCode::RestrictedMeteredBackground => {
+                ("action_required", "background_data")
+            }
+            isyncyou_agent::ConnectivityPreflightCode::ForegroundGuardUnavailable => {
+                ("action_required", "app_details")
+            }
+            _ => ("unavailable", "none"),
+        };
+        Ok(isyncyou_webui::AgentConnectivityPreflightResponse {
+            status: status.into(),
+            code: preflight.code.wire().into(),
+            retryable: preflight.retryable,
+            settings_hint: settings_hint.into(),
+        })
+    }
+
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let turn_id = format!("turn-{n}-{}", unix_now());

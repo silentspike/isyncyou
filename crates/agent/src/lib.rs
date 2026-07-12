@@ -25,6 +25,7 @@
 
 pub mod archive;
 pub mod confirm;
+pub mod connectivity;
 #[cfg(feature = "agent-subscription-experimental")]
 pub mod drift_capture;
 mod error;
