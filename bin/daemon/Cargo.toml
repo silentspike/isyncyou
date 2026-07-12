@@ -34,3 +34,11 @@ isyncyou-change-source = { path = "../../crates/change-source" }
 isyncyou-fuse = { path = "../../crates/fuse" }
 # Live delta into the store for the mount's cloud refresh (#478 P4).
 isyncyou-connectors = { path = "../../crates/connectors", features = ["http"] }
+
+[features]
+default = []
+# Desktop Linux development/personal builds only. Product defaults continue to use
+# encrypted app OAuth credentials and do not read local client credential files.
+agent-subscription-experimental = [
+    "isyncyou-app-host/agent-subscription-experimental",
+]

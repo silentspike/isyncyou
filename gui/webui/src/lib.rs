@@ -410,17 +410,6 @@ pub trait AgentHandler: Send + Sync {
         "{\"connected\":false}".to_string()
     }
 
-    /// #627-only subscription credential import: store an access token + refresh token
-    /// obtained outside the product OAuth flow. Default: not available.
-    fn subscription_import(
-        &self,
-        _access: &str,
-        _refresh: &str,
-        _expires_at_ms: u64,
-    ) -> Result<(), String> {
-        Err("subscription import is not enabled on this server".into())
-    }
-
     /// Set the active provider + model (the in-app model switcher). The offered models are
     /// reported in `status_json`'s `models` field. Default: not available.
     fn set_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
@@ -1797,7 +1786,6 @@ impl Router {
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
                 "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
-                "/api/v1/agent/subscription/import" => self.agent_subscription_import(req),
                 "/api/v1/agent/model" => self.agent_set_model(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
@@ -4407,29 +4395,6 @@ impl Router {
             _ => return ApiResponse::error(400, "code is required"),
         };
         match handler.oauth_complete(code) {
-            Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
-            Err(e) => ApiResponse::error(400, &e),
-        }
-    }
-
-    /// Import a subscription credential obtained on another device (S-AG.12). Cap + session
-    /// gated (the app initiates it). `access_token`, `refresh_token` and `expires_at_ms`
-    /// come as query params (the router parses no body); the handler stores it encrypted.
-    fn agent_subscription_import(&self, req: &ApiRequest) -> ApiResponse {
-        let handler = match self.agent_gate(req) {
-            Ok(h) => h,
-            Err(e) => return e,
-        };
-        let access = req.q("access_token").unwrap_or("");
-        if access.is_empty() {
-            return ApiResponse::error(400, "access_token is required");
-        }
-        let refresh = req.q("refresh_token").unwrap_or("");
-        let expires_at_ms = req
-            .q("expires_at_ms")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        match handler.subscription_import(access, refresh, expires_at_ms) {
             Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
             Err(e) => ApiResponse::error(400, &e),
         }
@@ -7063,6 +7028,28 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn product_router_has_no_subscription_import_route() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let access = "issue627-access-query-sentinel";
+        let refresh = "issue627-refresh-query-sentinel";
+        let request = ApiRequest::new(
+            "POST",
+            &format!(
+                "/api/v1/agent/subscription/import?access_token={access}&refresh_token={refresh}&expires_at_ms=123"
+            ),
+        )
+        .with_cap_token(Some("agentsecret".into()));
+
+        let response = router.route(&request);
+        let body = String::from_utf8_lossy(&response.body);
+
+        assert_eq!(response.status, 405);
+        assert!(!body.contains(access));
+        assert!(!body.contains(refresh));
+    }
+
+    #[test]
     fn agent_oauth_start_is_cap_gated_and_returns_authorize_url() {
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
@@ -9611,6 +9598,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             assert!(
                 !APP_JS.contains(forbidden),
                 "Assistant product setup must not expose stale provider/BYO affordance: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_product_source_has_no_subscription_import_affordance() {
+        for forbidden in ["subscription/import", "data-agent-subscription-import"] {
+            assert!(
+                !APP_JS.contains(forbidden),
+                "Assistant product source exposes experimental credential import: {forbidden}"
             );
         }
     }

@@ -31,9 +31,15 @@ isyncyou-connectors = { path = "../connectors", default-features = false, option
 # model + crypto (tested over an in-memory transport) stay light. The caller passes a
 # pre-resolved Files.ReadWrite token, so no engine dependency is needed here.
 isyncyou-graph = { path = "../graph", default-features = false, optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "reduce_local_drift"
+path = "examples/reduce_local_drift.rs"
+required-features = ["agent-subscription-experimental"]
 
 [features]
 http = ["dep:reqwest"]
@@ -51,4 +57,4 @@ byo-api-providers = ["http"]
 # EXPERIMENTAL, UNSUPPORTED, personal-build only (#627). Off by default; not part of
 # #623 product acceptance. This keeps local CLI credential fallback/capture separated
 # from the product app-OAuth provider runtime above.
-agent-subscription-experimental = ["http"]
+agent-subscription-experimental = ["http", "dep:libc"]

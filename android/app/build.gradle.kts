@@ -59,6 +59,36 @@ if (System.getenv("ISY_REQUIRE_RELEASE_SIGNING") == "1") {
 val androidAbis = (System.getenv("ISY_ANDROID_ABIS") ?: "arm64-v8a")
     .split(",").map { it.trim() }.filter { it.isNotEmpty() }
 
+// Bounded native evidence hooks only. Product/runtime features are defined in the
+// mobile crate defaults and cannot be forwarded through the Android build environment.
+val allowedCargoTestFeatures = setOf(
+    "agent-session-kdf-bench",
+    "agent-credential-store-self-test",
+    "mobile-job-device-test-hooks",
+)
+val requestedCargoTestFeatures = System.getenv("ISY_CARGO_FEATURES")
+    ?.takeUnless { it.isBlank() }
+    ?.split(",")
+    ?.map { it.trim() }
+    ?.also { requested ->
+        if (requested.any { it.isEmpty() }) {
+            throw GradleException("ISY_CARGO_FEATURES contains an empty feature")
+        }
+        val duplicates = requested.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+        if (duplicates.isNotEmpty()) {
+            throw GradleException(
+                "ISY_CARGO_FEATURES contains duplicate features: ${duplicates.sorted().joinToString(",")}",
+            )
+        }
+        val unsupported = requested.filterNot { it in allowedCargoTestFeatures }
+        if (unsupported.isNotEmpty()) {
+            throw GradleException(
+                "Unsupported ISY_CARGO_FEATURES value: ${unsupported.sorted().joinToString(",")}",
+            )
+        }
+    }
+    .orEmpty()
+
 android {
     namespace = "com.silentspike.isyncyou"
     compileSdk = 34
@@ -150,12 +180,13 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     // One -t per ABI; cargo-ndk maps arm64-v8a -> aarch64-linux-android and
     // x86_64 -> x86_64-linux-android, building each requested target's .so.
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
-    // Extra cargo features are reserved for explicit local/test builds (for example the
-    // #627-only agent-subscription-experimental local CLI fallback/capture surface).
-    // The #623 product Claude/Codex app-OAuth provider path is part of the Rust mobile
-    // default feature set, so it must not depend on ISY_CARGO_FEATURES.
-    val extraFeatures = System.getenv("ISY_CARGO_FEATURES")
-    val featureFlags = if (!extraFeatures.isNullOrBlank()) listOf("--features", extraFeatures) else emptyList()
+    // Only the validated JNI/device evidence hooks above may be forwarded. The #623
+    // product app-OAuth runtime is in the mobile default feature set; #627 is desktop-only.
+    val featureFlags = if (requestedCargoTestFeatures.isNotEmpty()) {
+        listOf("--features", requestedCargoTestFeatures.joinToString(","))
+    } else {
+        emptyList()
+    }
     commandLine(
         listOf(cargo, "+$toolchain", "ndk") + targetFlags +
             listOf("-o", "android/app/src/main/jniLibs", "build", "-p", "isyncyou-mobile", "--release") + featureFlags,

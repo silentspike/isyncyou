@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-10T08:39:00Z",
+  "generated_at": "2026-07-12T07:44:45Z",
   "commit": "cfcc7143968171c376eddaec787ff7aea95f376f",
   "entries": [
     {
@@ -136,24 +136,24 @@
     {
       "id": "EV-014",
       "requirement": "REQ-AGENT-008",
-      "claim": "Local Claude Code 2.1.206 drift capture succeeded and the committed artifact is redacted and marked non-product-auth.",
+      "claim": "The superseding Claude Code 2.1.207 local-client drift summary is allowlist-reduced and explicitly not product-auth evidence.",
       "method": "probe",
-      "command": "claude -p --model sonnet --output-format stream-json --include-partial-messages --verbose --debug api --debug-file /tmp/isyncyou-623-captures/claude-debug.raw.log <controlled-smoke-prompt>",
+      "command": "cargo remote -c -- build -p isyncyou-agent --example reduce_local_drift --features agent-subscription-experimental && rm -rf /tmp/isyncyou-627-evidence-review && tools/capture-agent-local-drift.sh capture /tmp/isyncyou-627-evidence-review && jq -S . /tmp/isyncyou-627-evidence-review/*.json && tools/capture-agent-local-drift.sh publish /tmp/isyncyou-627-evidence-review docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES && rm -rf /tmp/isyncyou-627-evidence-review",
       "result": "pass",
-      "evidence": "controlled prompt returned isyncyou-623-claude-smoke; value-only secret scan passed; artifact scope=local_cli_drift_only_not_product_auth",
-      "artifact": "docs/evidence/artifacts/issue-623/claude-code-2.1.206-capture.json",
-      "notes": "Partial drift evidence only: the reduced artifact records visible_header_names=[], so installed-client request headers are not fully proven by this capture."
+      "evidence": "The controlled sentinel was observed; raw_retained=false; identifier values, raw hashes, broad key lists, prompts, responses, credentials, and local paths are absent; scope=local_cli_drift_only_not_product_auth.",
+      "artifact": "docs/evidence/artifacts/issue-627/claude-code-2.1.207-drift-summary.json",
+      "notes": "Header and endpoint visibility remain not_safely_observable. This hygiene replacement does not alter #623 product OAuth or StoreArchive proof."
     },
     {
       "id": "EV-015",
       "requirement": "REQ-AGENT-008",
-      "claim": "Local Codex CLI 0.144.1 drift capture succeeded and the committed artifact is redacted and marked non-product-auth.",
+      "claim": "The superseding Codex CLI 0.144.1 local-client drift summary is allowlist-reduced and explicitly not product-auth evidence.",
       "method": "probe",
-      "command": "codex exec --json --ephemeral --skip-git-repo-check -C /tmp <controlled-smoke-prompt>; codex debug models; codex debug models --bundled",
+      "command": "cargo remote -c -- build -p isyncyou-agent --example reduce_local_drift --features agent-subscription-experimental && rm -rf /tmp/isyncyou-627-evidence-review && tools/capture-agent-local-drift.sh capture /tmp/isyncyou-627-evidence-review && jq -S . /tmp/isyncyou-627-evidence-review/*.json && tools/capture-agent-local-drift.sh publish /tmp/isyncyou-627-evidence-review docs/evidence/artifacts/issue-627 APPROVE_REDUCED_SUMMARIES && rm -rf /tmp/isyncyou-627-evidence-review",
       "result": "pass",
-      "evidence": "controlled prompt returned isyncyou-623-codex-smoke; model catalog captured; value-only secret scan passed; artifact scope=local_cli_drift_only_not_product_auth",
-      "artifact": "docs/evidence/artifacts/issue-623/codex-cli-0.144.1-capture.json",
-      "notes": "Partial drift evidence only: codex exec --json did not expose raw request headers; request shape remains covered by in-repo tests, not installed-client header extraction."
+      "evidence": "The controlled sentinel was observed; model catalog output is reduced to counts and presence booleans; raw_retained=false; identifier values, raw hashes, broad key lists, prompts, responses, credentials, and local paths are absent.",
+      "artifact": "docs/evidence/artifacts/issue-627/codex-cli-0.144.1-drift-summary.json",
+      "notes": "Header and endpoint visibility remain not_safely_observable. This hygiene replacement does not alter #623 product OAuth or StoreArchive proof."
     },
     {
       "id": "EV-016",

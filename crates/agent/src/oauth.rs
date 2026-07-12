@@ -6,8 +6,9 @@
 //! engine's loopback `redirect_uri`; [`exchange`] swaps the code for a token (PKCE
 //! verifier), which is then stored in the [`crate::CredentialStore`].
 //!
-//! Product defaults are non-secret public OAuth client metadata. Operator overrides may
-//! still come from a local, uncommitted [`OAuthConfig`] in development builds.
+//! Product defaults are non-secret public OAuth client metadata. The app-host product
+//! path accepts only this compiled official endpoint/client/scope tuple; a local file
+//! cannot replace it.
 
 use crate::AgentError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
@@ -18,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// OAuth endpoints/client. Defaults to the public Claude OAuth client (PKCE public
-/// client — these are not secrets); an operator may override via a local config file.
+/// client — these are not secrets). Product callers must enforce this exact tuple.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct OAuthConfig {
