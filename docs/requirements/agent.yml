@@ -334,3 +334,22 @@ requirements:
       - test: agent_confirm_revalidates_action_before_execution
       - test: agent_confirm_result_summary_is_json_and_redacted
       - file: docs/evidence/issue-624-manifest.json
+  - id: REQ-AGENT-013
+    title: Network-critical product OAuth and streamed turns remain diagnosable on Android
+    statement: >
+      Android product OAuth, explicit credential refresh, and active streamed Agent turns
+      acquire an acknowledged, bounded dataSync foreground-service lease before their
+      network-critical work. A session- and capability-gated preflight returns only closed,
+      redacted diagnostic codes. Credential status is network-free; an explicit refresh
+      either atomically persists a complete encrypted product credential or returns a
+      reconnect-required error without local fallback or FakeProvider success. (S-AG.15, #640)
+    status: planned
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Foreground guards are service-owned, reason-bound, bounded, and survive Activity recreation.
+      - Preflight input is provider/purpose allowlisted, unauthenticated, bounded, and returns no host, URL, token, IP, or raw transport text.
+      - Mobile preflight consumes a one-shot native guard/session-bound snapshot; WebUI cannot supply raw device state.
+      - Status checks do not refresh credentials; explicit refresh persists only a complete encrypted product credential and fails closed on error.
+      - Codex callback attempts are loopback-only, cancellable, bounded, and never persist callback URLs or diagnostics.
+      - Default mobile artifacts exclude network diagnostic hooks; a separate hook artifact proves only diagnostic plumbing.
+    verified_by: []
