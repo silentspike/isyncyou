@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-12T06:49:55Z",
-  "commit": "fdf9411eacd016df691748c9c2bf1f3a843ab399",
+  "generated_at": "2026-07-12T07:44:45Z",
+  "commit": "6f06ea548926165e630475c18a927822402ae3f6",
   "entries": [
     {
       "id": "EV-001",
@@ -96,7 +96,7 @@
     {
       "id": "EV-010",
       "requirement": "REQ-AGENT-008",
-      "claim": "Unknown future usage fields force manual drift review without copying their names or values.",
+      "claim": "Unknown future scalar or object-valued usage fields force manual drift review without copying their names or values.",
       "method": "test",
       "command": "cargo remote -c -- test -p isyncyou-agent --features agent-subscription-experimental experimental_capture_new_usage_field_requires_manual_review -- --nocapture",
       "result": "pass",
@@ -180,7 +180,7 @@
       "requirement": "REQ-AGENT-008",
       "claim": "Cargo feature resolution excludes the fallback by default, enables it through one explicit daemon chain, and rejects it on mobile.",
       "method": "command",
-      "command": "cargo metadata --no-deps --format-version 1; cargo tree -p isyncyou-daemon -e normal -f '{p} features={f}'; cargo tree -p isyncyou-daemon --features agent-subscription-experimental -e normal -f '{p} features={f}'; cargo remote -c -- check -p isyncyou-mobile --features agent-subscription-experimental",
+      "command": "tools/verify-agent-experimental-boundary.sh feature-matrix",
       "result": "pass",
       "evidence": "Default graph has no experimental feature; explicit graph resolves daemon to app-host to Agent; mobile rejects the absent feature with exit 101 before artifact creation.",
       "artifact": "docs/evidence/artifacts/issue-627/feature-matrix.json"
@@ -190,7 +190,7 @@
       "requirement": "REQ-AGENT-008",
       "claim": "Default desktop and Android product artifacts exclude local fallback and import markers.",
       "method": "command",
-      "command": "cargo remote -c -- build --release -p isyncyou-daemon; strings target/release/isyncyoud <forbidden-marker-scan>; (cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug); unzip packaged libisyncyou_mobile.so; strings <forbidden-marker-scan>",
+      "command": "tools/verify-agent-experimental-boundary.sh release-exclusion",
       "result": "pass",
       "evidence": "Default daemon and clean default APK built successfully; both native scans returned zero forbidden markers; hashes are recorded in the artifact.",
       "artifact": "docs/evidence/artifacts/issue-627/release-exclusion.json"
@@ -200,7 +200,7 @@
       "requirement": "REQ-AGENT-008",
       "claim": "Product copy/workflows and reduced public evidence expose neither the experimental setup nor credential/account/raw-capture values.",
       "method": "command",
-      "command": "python3 -m unittest tools.test_agent_experimental_boundary -v; scoped product-source/workflow/summarized-scalar scans",
+      "command": "tools/verify-agent-experimental-boundary.sh public-surface",
       "result": "pass",
       "evidence": "Product source matches=0; product workflow matches=0; forbidden reduced-summary scalar matches=0; raw capture artifacts=0.",
       "artifact": "docs/evidence/artifacts/issue-627/public-surface-scan.txt"

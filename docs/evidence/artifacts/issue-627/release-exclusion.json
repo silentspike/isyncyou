@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "scope": "issue_627_default_product_artifact_exclusion",
-  "tested_commit": "fdf9411eacd016df691748c9c2bf1f3a843ab399",
+  "tested_commit": "6f06ea548926165e630475c18a927822402ae3f6",
   "release_workflow": {
     "experimental_feature_requested": false,
     "all_features_requested": false,
@@ -16,8 +16,8 @@
   "android_default_debug_apk": {
     "build_status": "pass",
     "cargo_test_features_unset": true,
-    "sha256": "d617857b94dc481536b7c156a9aa5255bd2ffc7fbb7cbc3d3fb3f0a53aaf26f8",
-    "packaged_arm64_library_sha256": "ff42007ca95e39ff1fde219ff00240cdae9454e7582a8deed985695ef097c10e",
+    "sha256": "1a95f3ff2cfc63861ea7fd269fa044bd8d0485cfd1100f3330029991f3818ce4",
+    "packaged_arm64_library_sha256": "94b34cf69b51d266016d83de9ba04d6f51032768df2b14f677a497fafba9d0c1",
     "forbidden_marker_matches": 0
   },
   "forbidden_marker_categories": [

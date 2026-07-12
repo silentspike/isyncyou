@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "scope": "issue_627_feature_reachability_only",
-  "tested_commit": "fdf9411eacd016df691748c9c2bf1f3a843ab399",
+  "tested_commit": "6f06ea548926165e630475c18a927822402ae3f6",
   "raw_cargo_metadata_committed": false,
   "builds": [
     {

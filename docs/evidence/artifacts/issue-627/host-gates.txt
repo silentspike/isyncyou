@@ -1,6 +1,6 @@
 Issue #627 host gates
-Generated: 2026-07-12T06:49:55Z
-Tested code commit: fdf9411eacd016df691748c9c2bf1f3a843ab399
+Generated: 2026-07-12T07:44:45Z
+Tested code commit: 6f06ea548926165e630475c18a927822402ae3f6
 
 Targeted implementation gates:
 - local_cli_fallback module tests: PASS
@@ -8,9 +8,9 @@ Targeted implementation gates:
 - product/import route negative tests: PASS
 - mobile feature and Android feature-allowlist tests: PASS
 - experimental raw-token documentation boundary test: PASS
-- experimental capture reducer tests: 23 passed
+- experimental capture reducer tests: PASS, including scalar and object-valued unknown usage drift
 - exact provider header-set and per-header negative tests: PASS
-- direct symlink rejection inside /tmp: PASS
+- direct symlink rejection inside /tmp plus no-follow file identity enforcement: PASS
 - Codex callback diagnostics safe-boolean schema and legacy cleanup: PASS
 - product source-scan post-cfg(test) mutation test: PASS
 - current Claude Code 2.1.207 compatibility tests: PASS
@@ -29,8 +29,11 @@ Artifact/feature gates:
 - default daemon feature graph excludes experimental fallback: PASS
 - explicit daemon graph reaches app-host and Agent fallback: PASS
 - mobile experimental feature request rejected before artifact: PASS (exit 101)
+- executable feature-matrix evidence probe: PASS
 - default release daemon build and forbidden-string scan: PASS (0 matches)
 - clean default Android APK build and packaged-native scan: PASS (0 matches)
+- executable release-exclusion evidence probe: PASS
+- executable public-surface evidence probe: PASS
 - reduced Claude/Codex capture scalar review: PASS
 - raw capture cleanup: PASS
 
@@ -40,8 +43,8 @@ Final regression gates:
 - cargo-remote-fmt --check: PASS
 - node --check gui/webui/src/app.js: PASS
 - Android :app:testDebugUnitTest: PASS
-- final default release daemon rebuild/scan on fdf9411: PASS
-- final clean default APK rebuild/scan on fdf9411: PASS
+- final default release daemon rebuild/scan on 6f06ea5: PASS
+- final clean default APK rebuild/scan on 6f06ea5: PASS
 - issue-627 and updated issue-623 evidence manifests: PASS
 - requirements traceability: 68 implemented, 0 planned, PASS
 - evidence JSON and git diff checks: PASS
