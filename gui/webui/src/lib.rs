@@ -429,6 +429,23 @@ pub struct AgentCredentialRefreshRequest {
     pub provider: String,
 }
 
+/// A provider OAuth start result. `attempt_id` is opaque and exists only so the
+/// initiating UI can cancel the exact server-side attempt without handling OAuth
+/// state, codes, or callback URLs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgentOAuthStartResponse {
+    pub authorize_url: String,
+    pub attempt_id: String,
+}
+
+/// Closed cancellation request for one provider OAuth attempt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOAuthCancelRequest {
+    pub provider: String,
+    pub attempt_id: String,
+}
+
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
 /// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
 /// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
@@ -485,6 +502,23 @@ pub trait AgentHandler: Send + Sync {
     /// (the client supplies its own origin). Returns the authorize URL the UI opens
     /// in the **system browser**. Default: not available (handler opted out).
     fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
+    /// Structured OAuth start used by current product clients. The compatibility default
+    /// keeps older handlers usable while still returning an opaque, non-secret attempt id.
+    fn oauth_start_with_attempt(
+        &self,
+        provider: &str,
+        redirect_uri: &str,
+    ) -> Result<AgentOAuthStartResponse, String> {
+        let authorize_url = self.oauth_start(provider, redirect_uri)?;
+        Ok(AgentOAuthStartResponse {
+            authorize_url,
+            attempt_id: String::new(),
+        })
+    }
+    /// Cancel an OAuth attempt. Implementations must only cancel the matching opaque id.
+    fn oauth_cancel(&self, _provider: &str, _attempt_id: &str) -> Result<(), String> {
         Err("subscription login is not enabled on this server".into())
     }
     /// Agent provider OAuth callback. The system browser returns here with
@@ -1883,6 +1917,7 @@ impl Router {
                 "/api/v1/agent/connectivity/preflight" => self.agent_connectivity_preflight(req),
                 "/api/v1/agent/credential/refresh" => self.agent_credential_refresh(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
+                "/api/v1/agent/oauth/cancel" => self.agent_oauth_cancel(req),
                 "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
                 "/api/v1/agent/model" => self.agent_set_model(req),
                 _ => ApiResponse::error(405, "method not allowed"),
@@ -4559,9 +4594,49 @@ impl Router {
             Ok(p) => p,
             Err(e) => return ApiResponse::error(400, e),
         };
-        match handler.oauth_start(provider, redirect) {
-            Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
+        match handler.oauth_start_with_attempt(provider, redirect) {
+            Ok(result) => ApiResponse::ok_json(&result),
             Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Cancel one active provider OAuth attempt. The body is deliberately strict so
+    /// callback state, verifier, and URLs never cross the WebView boundary.
+    fn agent_oauth_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "oauth cancel accepts JSON only");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid oauth cancel request"),
+        };
+        let request = match serde_json::from_str::<AgentOAuthCancelRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid oauth cancel request"),
+        };
+        let provider = match agent_oauth_provider_param(&request.provider) {
+            Ok(provider) => provider,
+            Err(e) => return no_store_json_error(400, e),
+        };
+        if request.attempt_id.is_empty() || request.attempt_id.len() > 128 {
+            return no_store_json_error(400, "invalid oauth cancel request");
+        }
+        match handler.oauth_cancel(provider, &request.attempt_id) {
+            Ok(()) => {
+                let mut response = ApiResponse::ok_json(&json!({ "cancelled": true }));
+                response
+                    .headers
+                    .push(("Cache-Control".into(), "no-store".into()));
+                response
+            }
+            Err(_) => no_store_json_error(409, "oauth attempt is not active"),
         }
     }
 

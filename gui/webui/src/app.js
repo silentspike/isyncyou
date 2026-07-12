@@ -4546,6 +4546,7 @@ async function endNetworkGuard(guardId) {
 let AGENT_GUARD_ID = null;
 let CODEX_GUARD_ID = null;
 const TURN_GUARDS = new Map();
+const OAUTH_ATTEMPTS = new Map();
 async function finishAgentGuard() {
   const id = AGENT_GUARD_ID;
   AGENT_GUARD_ID = null;
@@ -4559,6 +4560,17 @@ async function finishCodexGuard() {
 async function finishOAuthGuard(provider) {
   if (provider === "codex") await finishCodexGuard();
   else await finishAgentGuard();
+}
+async function cancelOAuthAttempt(provider) {
+  const attemptId = OAUTH_ATTEMPTS.get(provider);
+  OAUTH_ATTEMPTS.delete(provider);
+  if (!attemptId) return;
+  try {
+    await postJson("/api/v1/agent/oauth/cancel", CAP.agent, {
+      provider,
+      attempt_id: attemptId,
+    });
+  } catch (_) {}
 }
 async function finishTurnGuard(turnId) {
   const guardId = TURN_GUARDS.get(turnId);
@@ -4588,12 +4600,14 @@ async function startAiLogin(provider) {
     if (redirect) params.redirect = redirect;
     const manualCodeFlow = provider === "claude" && !redirect;
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
+    if (!d || !d.authorize_url || !d.attempt_id) { toast("Could not start sign-in"); return; }
+    OAUTH_ATTEMPTS.set(provider, d.attempt_id);
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
     await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
+    await cancelOAuthAttempt(provider);
     if (guardId) await endNetworkGuard(guardId);
     if (AGENT_GUARD_ID === guardId) AGENT_GUARD_ID = null;
     if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
@@ -4617,14 +4631,30 @@ function showWaitingStep(provider) {
   if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0, provider); }
 }
 async function pollAgentStatus(n, provider) {
-  if (App.route !== "assistant") { AGENT_POLL_ON = false; await finishOAuthGuard(provider); return; }
+  if (App.route !== "assistant") {
+    AGENT_POLL_ON = false;
+    await cancelOAuthAttempt(provider);
+    await finishOAuthGuard(provider);
+    return;
+  }
   try {
     const s = await api("/api/v1/agent/status");
     const connected = provider === "codex" ? !!(s && s.codex) : !!(s && s.claude);
-    if (connected) { AGENT_POLL_ON = false; await finishOAuthGuard(provider); toast("Connected!"); renderAssistantView($("#view")); return; }
+    if (connected) {
+      AGENT_POLL_ON = false;
+      OAUTH_ATTEMPTS.delete(provider);
+      await finishOAuthGuard(provider);
+      toast("Connected!");
+      renderAssistantView($("#view"));
+      return;
+    }
   } catch (_) {}
   if (n < 90) { setTimeout(() => pollAgentStatus(n + 1, provider), 2000); }
-  else { AGENT_POLL_ON = false; await finishOAuthGuard(provider); }
+  else {
+    AGENT_POLL_ON = false;
+    await cancelOAuthAttempt(provider);
+    await finishOAuthGuard(provider);
+  }
 }
 
 // Swap the connect card to the "paste your code" step.

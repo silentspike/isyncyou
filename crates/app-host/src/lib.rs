@@ -25,6 +25,11 @@ use std::collections::{BTreeSet, HashMap};
 ))]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -439,6 +444,15 @@ struct AgentStreamSlot {
     created_at_ms: u64,
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+enum OAuthAttempt {
+    Claude { state: String },
+    Codex { cancelled: Arc<AtomicBool> },
+}
+
 /// The in-app agent handler (S-AG.6/#621). Drives a real turn: the product Claude/Codex
 /// OAuth provider path when the user has connected an account, otherwise a deterministic
 /// "not connected" message. Owns the stream hub + pending-action registry, so the model
@@ -471,6 +485,13 @@ pub struct DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     oauth: isyncyou_agent::AgentOAuth,
+    /// Opaque UI attempt ids map to private OAuth state or cancellation flags. They are
+    /// process-local, short-lived, and never serialized into status/audit output.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    oauth_attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
     #[cfg(test)]
     test_provider_script: Option<TestProviderScript>,
 }
@@ -514,6 +535,11 @@ impl DaemonAgent {
                 feature = "agent-subscription-experimental"
             ))]
             oauth: isyncyou_agent::AgentOAuth::new(),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
+            oauth_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_provider_script: None,
         }
@@ -1120,20 +1146,23 @@ fn codex_callback_serve(
     cfg: isyncyou_agent::oauth::CodexOAuthConfig,
     verifier: String,
     want_state: String,
+    attempt_id: String,
+    cancelled: Arc<AtomicBool>,
+    attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
 ) {
     use std::io::{Read, Write};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     if listener.set_nonblocking(true).is_err() {
         return;
     }
-    while std::time::Instant::now() < deadline {
+    while std::time::Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-            Err(_) => return,
+            Err(_) => break,
         };
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
         let mut buf = [0u8; 4096];
@@ -1192,7 +1221,14 @@ fn codex_callback_serve(
             body
         );
         let _ = stream.write_all(resp.as_bytes());
-        return;
+        break;
+    }
+    // A stale callback thread may only clear the exact attempt it owns. A newer login
+    // therefore cannot be erased by a late timeout/cancellation path.
+    let mut attempts = attempts.lock().unwrap();
+    if matches!(attempts.get(&attempt_id), Some(OAuthAttempt::Codex { cancelled: current }) if Arc::ptr_eq(current, &cancelled))
+    {
+        attempts.remove(&attempt_id);
     }
 }
 
@@ -1578,18 +1614,52 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// loopback port, spawn a one-shot callback server (exchanges + stores on success),
     /// and return the authorize URL for the system browser. The app polls
     /// `/api/v1/agent/status` for `codex:true`.
-    fn codex_oauth_start(&self) -> Result<String, String> {
+    fn codex_oauth_start(&self) -> Result<isyncyou_webui::AgentOAuthStartResponse, String> {
         let cfg = isyncyou_agent::oauth::CodexOAuthConfig::default();
         let (verifier, challenge) = isyncyou_agent::oauth::pkce().map_err(|e| e.to_string())?;
         let state = isyncyou_agent::oauth::rand_state().map_err(|e| e.to_string())?;
         let url = isyncyou_agent::oauth::codex_build_authorize_url(&cfg, &challenge, &state);
-        // Bind OpenAI's registered redirect port up front (fail early if busy).
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 1455)).map_err(|e| {
-            format!("could not open the ChatGPT sign-in port :1455 ({e}) — is another login already running?")
-        })?;
+        let attempt_id = mint_cap_token();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // The registered callback port and active-attempt check are owned together so a
+        // second UI start cannot create a competing listener.
+        let listener = {
+            let mut attempts = self.oauth_attempts.lock().unwrap();
+            if attempts
+                .values()
+                .any(|attempt| matches!(attempt, OAuthAttempt::Codex { .. }))
+            {
+                return Err("ChatGPT sign-in is already in progress".into());
+            }
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 1455))
+                .map_err(|_| "could not open the ChatGPT sign-in port".to_string())?;
+            attempts.insert(
+                attempt_id.clone(),
+                OAuthAttempt::Codex {
+                    cancelled: Arc::clone(&cancelled),
+                },
+            );
+            listener
+        };
         let oauth_dir = self.oauth_dir.clone();
-        std::thread::spawn(move || codex_callback_serve(listener, oauth_dir, cfg, verifier, state));
-        Ok(url)
+        let attempts = Arc::clone(&self.oauth_attempts);
+        let callback_attempt_id = attempt_id.clone();
+        std::thread::spawn(move || {
+            codex_callback_serve(
+                listener,
+                oauth_dir,
+                cfg,
+                verifier,
+                state,
+                callback_attempt_id,
+                cancelled,
+                attempts,
+            )
+        });
+        Ok(isyncyou_webui::AgentOAuthStartResponse {
+            authorize_url: url,
+            attempt_id,
+        })
     }
 
     /// Build the Codex (ChatGPT) provider if credentials are available.
@@ -1916,7 +1986,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    fn oauth_start(&self, provider: &str, redirect_uri: &str) -> Result<String, String> {
+    fn oauth_start_with_attempt(
+        &self,
+        provider: &str,
+        redirect_uri: &str,
+    ) -> Result<isyncyou_webui::AgentOAuthStartResponse, String> {
         match provider {
             "codex" => self.codex_oauth_start(),
             "claude" => {
@@ -1932,9 +2006,46 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     .oauth
                     .start(&cfg, redirect)
                     .map_err(|e| e.to_string())?;
-                Ok(started.authorize_url)
+                let attempt_id = mint_cap_token();
+                self.oauth_attempts.lock().unwrap().insert(
+                    attempt_id.clone(),
+                    OAuthAttempt::Claude {
+                        state: started.state,
+                    },
+                );
+                Ok(isyncyou_webui::AgentOAuthStartResponse {
+                    authorize_url: started.authorize_url,
+                    attempt_id,
+                })
             }
             _ => Err("unknown provider".into()),
+        }
+    }
+
+    fn oauth_start(&self, provider: &str, redirect_uri: &str) -> Result<String, String> {
+        self.oauth_start_with_attempt(provider, redirect_uri)
+            .map(|result| result.authorize_url)
+    }
+
+    fn oauth_cancel(&self, provider: &str, attempt_id: &str) -> Result<(), String> {
+        let attempt = self.oauth_attempts.lock().unwrap().remove(attempt_id);
+        match (provider, attempt) {
+            ("claude", Some(OAuthAttempt::Claude { state })) => {
+                let _ = self.oauth.cancel(&state);
+                Ok(())
+            }
+            ("codex", Some(OAuthAttempt::Codex { cancelled })) => {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            }
+            (_, Some(attempt)) => {
+                self.oauth_attempts
+                    .lock()
+                    .unwrap()
+                    .insert(attempt_id.to_string(), attempt);
+                Err("oauth attempt does not match provider".into())
+            }
+            _ => Err("oauth attempt is not active".into()),
         }
     }
 
@@ -1958,6 +2069,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             isyncyou_agent::oauth::exchange(&http, &cfg, &code, &verifier, &redirect_uri, &state)
                 .map_err(|e| e.to_string())?;
         self.store_token(&token)?;
+        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
+            !matches!(attempt, OAuthAttempt::Claude { state: pending } if pending == &state)
+        });
         Ok("connected".to_string())
     }
 
@@ -1978,6 +2092,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri, state)
                 .map_err(|e| e.to_string())?;
         self.store_token(&token)?;
+        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
+            !matches!(attempt, OAuthAttempt::Claude { state: pending } if pending == state)
+        });
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
 

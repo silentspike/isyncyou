@@ -163,6 +163,12 @@ impl AgentOAuth {
             .remove(state)
             .map(|p| (p.verifier, p.redirect_uri))
     }
+
+    /// Forget one pending login without exchanging it. The opaque browser-facing state
+    /// never leaves the host; callers use this only after matching their own attempt id.
+    pub fn cancel(&self, state: &str) -> bool {
+        self.pending.lock().unwrap().remove(state).is_some()
+    }
 }
 
 // Tiny helper so `start` stays readable.
