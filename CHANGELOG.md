@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Experimental local Agent credential boundary**
+- `agent`+`app-host`: isolated #627's unsupported Linux desktop local-client
+  credential fallback behind an explicit default-off daemon feature, removed the
+  HTTP/WebView credential-import surface, excluded the fallback from mobile and
+  product artifacts, and added privacy-bounded Claude/Codex drift summaries plus
+  retained-versus-removed custom-harness regression evidence.
+
 **Android mobile-job execution boundary (#626)**
 - `android`: added a WorkManager-backed foreground worker for durable mobile jobs.
   Work requests carry only bounded `job_id` and `kind`; notification, strict device
@@ -46,8 +53,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   provider selection, incremental Claude/Codex streaming, sanitized usage status,
   StoreArchive executor binding, strict `claude`/`codex` WebUI provider IDs,
   BYO API-key quarantine, and non-live test isolation from local CLI auth,
-  provider env vars, and unexpected provider network POSTs. Live product OAuth
-  StoreArchive roundtrip evidence still gates final #623 closeout.
+  provider env vars, and unexpected provider network POSTs. #623's live app-OAuth
+  StoreArchive roundtrips are recorded in its committed evidence package.
 
 **Agent Assistant UI**
 - `webui`: added #622's capability-gated Assistant tab with streaming

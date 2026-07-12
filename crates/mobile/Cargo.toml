@@ -43,12 +43,6 @@ encrypted-store = [
 # Product Claude/Codex app-OAuth provider path (#623). Enabled in the default mobile
 # product feature set; credentials still load from the encrypted app/host store.
 agent-oauth-providers = ["isyncyou-app-host/agent-oauth-providers"]
-# EXPERIMENTAL, default-OFF, personal-build only (risk R8/#627): local CLI
-# fallback/capture surface. Not part of #623 product acceptance.
-agent-subscription-experimental = [
-    "agent-oauth-providers",
-    "isyncyou-app-host/agent-subscription-experimental",
-]
 # TEST/EVIDENCE ONLY, default-OFF: exposes a JNI-only Argon2id/HKDF session-key
 # benchmark for Pixel evidence in #619. It is not wired to WebView, HTTP, or the normal
 # bridge, and release/CI builds leave ISY_CARGO_FEATURES unset.

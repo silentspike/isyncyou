@@ -159,7 +159,7 @@ requirements:
       local CLI credential fallback and private wire-drift capture stay separated
       under #627/default-off `agent-subscription-experimental`. (S-AG.2/#617,
       S-AG.8/#623, S-AG.12/#627)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Desktop and mobile product feature wiring includes the app-OAuth provider runtime without requiring #627's local CLI fallback.
@@ -168,28 +168,50 @@ requirements:
       - Claude/Codex provider streams emit tokens before completion; Codex requests keep `store:false`.
       - The WebUI setup posts product provider IDs (`claude`, `codex`) and exposes no BYO API-key setup row.
       - #627 remains separate for local CLI fallback/capture and cannot be counted as #623 product-auth evidence.
-      - Closing #623 still requires live product OAuth StoreArchive roundtrip evidence or an honest blocked state; FakeProvider is not acceptable live evidence.
+      - Local CLI reads are Linux desktop-only, bounded, default-off, never persisted, and cannot satisfy product onboarding/readiness.
+      - Default daemon/mobile/release feature graphs and built artifacts exclude the experimental fallback.
+      - The provider-required auth/billing/subscription identity envelope remains unchanged and in place while all default-client harness components are absent and exactly one `isyncyou` tool is installed.
+      - Reduced client-drift summaries contain no credentials, account identifiers, user content, raw hashes, local paths, or standalone wire recipe; unavailable visibility is reported honestly.
     verified_by:
       - test: product_oauth_feature_does_not_export_byo_api_providers
       - test: app_host_product_code_does_not_reference_legacy_byo_provider_types
-      - test: product_oauth_provider_does_not_enable_subscription_import
+      - test: app_host_product_source_has_no_credential_ingest_surface
       - test: product_oauth_provider_does_not_read_desktop_cli_fallbacks
-      - test: non_live_provider_tests_ignore_real_claude_home
-      - test: non_live_provider_tests_ignore_real_codex_home
+      - test: product_build_does_not_read_dot_claude
+      - test: product_build_does_not_read_dot_codex
       - test: non_live_provider_tests_clear_public_api_key_env
       - test: non_live_provider_tests_fail_on_unexpected_network
       - test: agent_provider_selection_uses_stored_claude_oauth_credential
       - test: agent_provider_selection_uses_stored_codex_oauth_credential
-      - test: live_provider_agent_executor_reads_store_archive_fixture
+      - test: credential_store_preferred_over_desktop_cli_fallback
+      - test: corrupt_product_credential_does_not_fall_through_to_local_cli
+      - test: corrupt_product_credential_streams_error_and_done_error
+      - test: expired_product_credential_streams_error_and_done_error
+      - test: expired_product_credential_refresh_preserves_product_origin
+      - test: experimental_local_cli_does_not_satisfy_product_harness_readiness
+      - test: product_harness_requires_encrypted_app_oauth_credential
+      - test: product_oauth_config_rejects_endpoint_client_scope_override
       - test: claude_sse_event_returns_text_delta_immediately
       - test: apply_sse_event_returns_text_delta_immediately
       - test: build_request_uses_responses_shape_with_instructions_and_tool
-      - test: agent_oauth_start_is_cap_gated_and_returns_authorize_url
-      - test: assistant_setup_consent_is_required_and_non_secret
-      - test: agent_oauth_start_rejects_legacy_provider_ids
-      - test: daemon_agent_status_reports_sanitized_last_provider_usage
-      - test: live_claude_oauth_storearchive_tool_roundtrip
-      - test: live_codex_oauth_storearchive_tool_roundtrip
+      - test: claude_billing_block_remains_first_and_unchanged
+      - test: codex_subscription_identity_envelope_remains_unchanged
+      - test: custom_harness_replaces_only_non_auth_non_billing_sections
+      - test: custom_harness_removes_default_prompt_tools_skills_mcp_rules_and_history
+      - test: custom_harness_installs_only_isyncyou_prompt_and_tool
+      - test: product_harness_retains_only_required_provider_identity_fields
+      - test: product_harness_contains_no_default_client_agent_components
+      - test: experimental_capture_authorization_only_is_not_safely_observable
+      - test: experimental_capture_each_missing_claude_header_is_not_safely_observable
+      - test: experimental_capture_each_missing_codex_header_is_not_safely_observable
+      - test: experimental_capture_required_headers_match_runtime_builders
+      - test: experimental_capture_rejects_symlink_within_tmp
+      - test: codex_callback_diagnostics_persist_only_safe_booleans
+      - test: daemon_agent_startup_removes_legacy_codex_callback_diagnostics
+      - test: product_source_scan_keeps_production_after_early_cfg_test_items
+      - test: mobile_product_has_no_local_cli_experimental_feature
+      - test: assistant_product_source_has_no_subscription_import_affordance
+      - file: docs/evidence/issue-627-manifest.json
   - id: REQ-AGENT-009
     title: Answers carry source citations and respect byte budgets
     statement: >

@@ -61,8 +61,6 @@ skip = [
     { crate = "rustix@0.38.44", reason = "transitive split from winit platform stack versus async/zbus stack" },
     { crate = "thiserror@1.0.69", reason = "transitive split from calloop/smithay while app crates use thiserror 2" },
     { crate = "thiserror-impl@1.0.69", reason = "proc-macro pair for transitive thiserror 1" },
-    { crate = "ttf-parser@0.20.0", reason = "transitive split from fontdb/cosmic-text text stack" },
-    { crate = "ttf-parser@0.21.1", reason = "transitive split from cosmic-text/rustybuzz text stack" },
     { crate = "windows-sys@0.52.0", reason = "transitive Windows platform split from ring/rustls versus notify" },
     { crate = "windows-sys@0.60.2", reason = "transitive Windows platform split from notify versus newer Windows crates" },
     { crate = "windows-targets@0.52.6", reason = "transitive Windows platform split from ring/rustls versus notify" },
