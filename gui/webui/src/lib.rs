@@ -421,6 +421,14 @@ pub struct AgentConnectivityPreflightResponse {
     pub settings_hint: String,
 }
 
+/// Closed request for the explicitly user-triggered product credential refresh. It is separate
+/// from status polling so an ordinary Assistant render cannot create provider network traffic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCredentialRefreshRequest {
+    pub provider: String,
+}
+
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
 /// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
 /// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
@@ -464,6 +472,12 @@ pub trait AgentHandler: Send + Sync {
         _session_token: Option<&str>,
     ) -> Result<AgentConnectivityPreflightResponse, String> {
         self.connectivity_preflight(request)
+    }
+
+    /// Refresh a configured product OAuth credential. The handler returns only its closed
+    /// post-operation state; provider errors and token details never reach the router.
+    fn credential_refresh(&self, _provider: &str) -> Result<String, String> {
+        Err("credential refresh is not enabled on this server".into())
     }
 
     /// Agent provider OAuth login. Begin a device OAuth login for
@@ -1867,6 +1881,7 @@ impl Router {
                 "/api/v1/agent/confirm" => self.agent_confirm(req),
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
                 "/api/v1/agent/connectivity/preflight" => self.agent_connectivity_preflight(req),
+                "/api/v1/agent/credential/refresh" => self.agent_credential_refresh(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
                 "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
                 "/api/v1/agent/model" => self.agent_set_model(req),
@@ -4479,6 +4494,41 @@ impl Router {
         response
     }
 
+    /// Explicit product credential refresh. This uses the same strict, bounded JSON contract as
+    /// connectivity preflight but deliberately never accepts snapshot, URL, or token fields.
+    fn agent_credential_refresh(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(mut e) => {
+                e.headers.push(("Cache-Control".into(), "no-store".into()));
+                return e;
+            }
+        };
+        if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "credential refresh accepts JSON only");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid JSON request body"),
+        };
+        let request = match serde_json::from_str::<AgentCredentialRefreshRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid credential refresh request"),
+        };
+        let state = match handler.credential_refresh(&request.provider) {
+            Ok(state) => state,
+            Err(_) => return no_store_json_error(409, "reconnect_required"),
+        };
+        let mut response = ApiResponse::ok_json(&json!({ "credential_state": state }));
+        response
+            .headers
+            .push(("Cache-Control".into(), "no-store".into()));
+        response
+    }
+
     /// Agent connection status as JSON (`{connected, model?}`). Read-only; returns
     /// `enabled:false` when no agent is wired so the UI can hide the assistant entirely.
     fn agent_status(&self, _req: &ApiRequest) -> ApiResponse {
@@ -6794,6 +6844,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 settings_hint: "none".into(),
             })
         }
+        fn credential_refresh(&self, provider: &str) -> Result<String, String> {
+            if provider == "claude" {
+                Ok("connected".into())
+            } else {
+                Err("reconnect_required".into())
+            }
+        }
         fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
             Ok(format!(
                 "https://auth.example/authorize?redirect_uri={redirect_uri}&state=st-1"
@@ -6936,6 +6993,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .headers
             .iter()
             .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+    }
+
+    #[test]
+    fn credential_refresh_route_requires_cap_strict_json_and_no_store() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let valid = || {
+            ApiRequest::new("POST", "/api/v1/agent/credential/refresh")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(b"{\"provider\":\"claude\"}".to_vec())
+        };
+
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", "/api/v1/agent/credential/refresh"))
+                .status,
+            401
+        );
+        let response = router.route(&valid());
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["credential_state"], "connected");
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+
+        let malformed = ApiRequest::new("POST", "/api/v1/agent/credential/refresh")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(b"{\"provider\":\"claude\",\"extra\":true}".to_vec());
+        assert_eq!(router.route(&malformed).status, 400);
     }
 
     #[test]

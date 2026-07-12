@@ -865,7 +865,21 @@ fn resolve_product_or_local<T>(
 ))]
 fn credential_needs_refresh(access_token: &str, expires_at_ms: u64) -> bool {
     access_token.is_empty()
-        || (expires_at_ms != 0 && expires_at_ms <= now_ms().saturating_add(5 * 60 * 1000))
+        || expires_at_ms == 0
+        || expires_at_ms <= now_ms().saturating_add(5 * 60 * 1000)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn product_credential_state_wire<T>(state: &ProductCredentialState<T>) -> &'static str {
+    match state {
+        ProductCredentialState::Absent => "unconfigured",
+        ProductCredentialState::PresentValid(_) => "connected",
+        ProductCredentialState::PresentNeedsRefresh(_) => "refresh_required",
+        ProductCredentialState::PresentInvalid => "reconnect_required",
+    }
 }
 
 #[cfg(any(
@@ -1583,6 +1597,49 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         })
     }
 
+    /// Side-effect-free product status. Local CLI fallback is intentionally absent here: it is
+    /// not product readiness, and this method must never perform a network refresh.
+    fn product_credential_status(&self, provider: &str) -> Result<&'static str, String> {
+        match provider {
+            "claude" => Ok(product_credential_state_wire(
+                &self.claude_product_credential_state(),
+            )),
+            "codex" => Ok(product_credential_state_wire(
+                &self.codex_product_credential_state(),
+            )),
+            _ => Err("unknown provider".into()),
+        }
+    }
+
+    /// The only explicit product refresh entry point. A refresh never reads the experimental
+    /// local CLI source, and the encrypted store is updated only by the existing atomic writer
+    /// after a complete finite credential response has been validated.
+    fn refresh_product_credential(&self, provider: &str) -> Result<&'static str, String> {
+        match provider {
+            "claude" => match self.claude_product_credential_state() {
+                ProductCredentialState::PresentValid(_) => Ok("connected"),
+                ProductCredentialState::PresentNeedsRefresh(credential) => self
+                    .refresh_claude_product_credential(credential)
+                    .map(|_| "connected")
+                    .map_err(|_| "reconnect_required".into()),
+                ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
+                    Err("reconnect_required".into())
+                }
+            },
+            "codex" => match self.codex_product_credential_state() {
+                ProductCredentialState::PresentValid(_) => Ok("connected"),
+                ProductCredentialState::PresentNeedsRefresh(credential) => self
+                    .refresh_codex_product_credential(credential)
+                    .map(|_| "connected")
+                    .map_err(|_| "reconnect_required".into()),
+                ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
+                    Err("reconnect_required".into())
+                }
+            },
+            _ => Err("unknown provider".into()),
+        }
+    }
+
     /// Start the Codex/ChatGPT OAuth flow: bind OpenAI's fixed
     /// loopback port, spawn a one-shot callback server (exchanges + stores on success),
     /// and return the authorize URL for the system browser. The app polls
@@ -1705,6 +1762,26 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             retryable: preflight.retryable,
             settings_hint: settings_hint.into(),
         })
+    }
+
+    fn credential_refresh(&self, provider: &str) -> Result<String, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            return self
+                .refresh_product_credential(provider)
+                .map(str::to_string);
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = provider;
+            Err("reconnect_required".into())
+        }
     }
 
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String> {
@@ -1975,31 +2052,19 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn status_json(&self) -> String {
-        let claude_resolution = self.resolve_claude_credential();
-        let codex_resolution = self.resolve_codex_credential();
-        let claude = matches!(
-            &claude_resolution,
-            Ok(ResolvedProviderCredential::Claude { .. })
-        );
-        let codex = matches!(
-            &codex_resolution,
-            Ok(ResolvedProviderCredential::Codex { .. })
-        );
-        let reconnect_required = matches!(
-            &claude_resolution,
-            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
-        ) || matches!(
-            &codex_resolution,
-            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
-        );
+        let claude_state = self
+            .product_credential_status("claude")
+            .unwrap_or("reconnect_required");
+        let codex_state = self
+            .product_credential_status("codex")
+            .unwrap_or("reconnect_required");
+        let claude = claude_state == "connected";
+        let codex = codex_state == "connected";
+        let reconnect_required =
+            claude_state == "reconnect_required" || codex_state == "reconnect_required";
         // #639 owns the visible onboarding state machine. Keep its readiness input
         // origin-aware here so an experimental local credential can never qualify.
-        let _product_harness_readiness = claude_resolution
-            .as_ref()
-            .is_ok_and(|credential| credential.satisfies_product_harness_readiness())
-            || codex_resolution
-                .as_ref()
-                .is_ok_and(|credential| credential.satisfies_product_harness_readiness());
+        let _product_harness_readiness = claude || codex;
         let (sel_provider, _) = self.agent_settings();
         // Effective provider: the selection if it is connected, else whichever is
         // (Claude preferred). A selected+connected Claude is already covered by the
@@ -2031,6 +2096,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "model": model,
             "claude": claude,
             "codex": codex,
+            "credential_state": { "claude": claude_state, "codex": codex_state },
             "reconnect_required": reconnect_required,
             "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
         });
@@ -6313,6 +6379,24 @@ mod tests {
             !local_called.get(),
             "refresh must not consult local CLI state"
         );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn unknown_product_expiry_is_not_treated_as_indefinitely_valid() {
+        let credential = StoredCredential {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at_ms: 0,
+        };
+
+        assert!(matches!(
+            classify_claude_product_credential(credential),
+            ProductCredentialState::PresentNeedsRefresh(_)
+        ));
     }
 
     #[cfg(feature = "agent-subscription-experimental")]
