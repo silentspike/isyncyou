@@ -7,6 +7,8 @@ use crate::tool::{tool_schema, TOOL_NAME};
 use crate::turn::{Message, Role};
 use crate::AgentError;
 use serde_json::{json, Value};
+#[cfg(feature = "byo-api-providers")]
+use std::sync::Arc;
 
 #[cfg(feature = "byo-api-providers")]
 const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -149,7 +151,7 @@ mod live {
 
     /// Live OpenAI provider over the agent's own blocking HTTP transport.
     pub struct OpenAiProvider {
-        http: crate::http::HttpTransport,
+        http: Arc<crate::http::HttpTransport>,
         api_key: String,
         model: String,
         system: String,
@@ -165,7 +167,7 @@ mod live {
             system: impl Into<String>,
         ) -> Result<Self, AgentError> {
             Ok(Self {
-                http: crate::http::HttpTransport::new()?,
+                http: crate::http::HttpTransport::shared()?,
                 api_key: api_key.into(),
                 model: model.into(),
                 system: system.into(),

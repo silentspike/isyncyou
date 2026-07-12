@@ -527,13 +527,15 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     };
     let resp = isyncyou_webui::dispatch_message(
         &router,
-        "GET",
-        path,
-        None,
-        None,
-        cookie,
-        None,
-        Vec::new(),
+        isyncyou_webui::BridgeDispatchRequest {
+            method: "GET",
+            target: path,
+            cap_token: None,
+            session_token: None,
+            cookie,
+            content_type: None,
+            body: Vec::new(),
+        },
     );
     frame_response(resp)
 }
@@ -687,18 +689,20 @@ pub fn session_token() -> Option<String> {
 
 /// Register a Kotlin-captured connectivity snapshot for one mobile preflight. Kotlin validates
 /// the foreground guard before this JNI-owned call; JavaScript receives only the opaque result.
-pub fn register_network_snapshot(
-    guard_id: &str,
-    reason: &str,
+struct NetworkSnapshotRegistration<'a> {
+    guard_id: &'a str,
+    reason: &'a str,
     active_network: bool,
     internet_capability: bool,
     validated_capability: bool,
     metered: bool,
-    restrict_background: &str,
+    restrict_background: &'a str,
     notifications_visible: bool,
-    test_hook: Option<&str>,
-) -> Result<String, String> {
-    let restrict_background = match restrict_background {
+    test_hook: Option<&'a str>,
+}
+
+fn register_network_snapshot(input: NetworkSnapshotRegistration<'_>) -> Result<String, String> {
+    let restrict_background = match input.restrict_background {
         "disabled" => isyncyou_agent::RestrictBackgroundStatus::Disabled,
         "whitelisted" => isyncyou_agent::RestrictBackgroundStatus::Whitelisted,
         "enabled" => isyncyou_agent::RestrictBackgroundStatus::Enabled,
@@ -707,19 +711,23 @@ pub fn register_network_snapshot(
     let session_token = session_token().ok_or_else(|| "engine not started".to_string())?;
     isyncyou_app_host::register_mobile_connectivity_snapshot(
         &session_token,
-        guard_id,
-        reason,
+        input.guard_id,
+        input.reason,
         isyncyou_agent::AndroidNetworkSnapshot {
-            active_network,
-            internet_capability,
-            validated_capability,
-            metered,
+            active_network: input.active_network,
+            internet_capability: input.internet_capability,
+            validated_capability: input.validated_capability,
+            metered: input.metered,
             restrict_background,
-            notifications_visible,
+            notifications_visible: input.notifications_visible,
             guard_ready: true,
         },
-        test_hook,
+        input.test_hook,
     )
+}
+
+pub fn invalidate_network_guard(guard_id: &str) {
+    isyncyou_app_host::invalidate_mobile_connectivity_guard(guard_id);
 }
 
 /// Record a successful native `BiometricPrompt` for a pending destructive action
@@ -1275,21 +1283,34 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeRegister
         let reason = jni_get_string(&mut env, &reason)?;
         let restrict_background = jni_get_string(&mut env, &restrict_background)?;
         let test_hook = jni_get_string(&mut env, &test_hook)?;
-        register_network_snapshot(
-            &guard_id,
-            &reason,
+        register_network_snapshot(NetworkSnapshotRegistration {
+            guard_id: &guard_id,
+            reason: &reason,
             active_network,
             internet_capability,
             validated_capability,
             metered,
-            &restrict_background,
+            restrict_background: &restrict_background,
             notifications_visible,
-            (!test_hook.is_empty()).then_some(test_hook.as_str()),
-        )
+            test_hook: (!test_hook.is_empty()).then_some(test_hook.as_str()),
+        })
         .ok()
     })()
     .unwrap_or_default();
     jni_new_string(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeInvalidateNetworkGuard<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    guard_id: jni::objects::JString<'local>,
+) {
+    if let Some(guard_id) = jni_get_string(&mut env, &guard_id) {
+        invalidate_network_guard(&guard_id);
+    }
 }
 
 /// JNI: answer one in-process bridge request (#0A). Kotlin passes the JSON request
@@ -1639,7 +1660,6 @@ fn take_network_device_test_hook(files_dir: &str) -> String {
     }
 }
 
-#[cfg(feature = "agent-network-device-test-hooks")]
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkDeviceHooksEnabled<
     'local,
@@ -1647,9 +1667,16 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkD
     _env: jni::EnvUnowned<'local>,
     _class: jni::objects::JClass<'local>,
 ) -> jni::sys::jboolean {
-    // Keep the marker referenced in the executable path so binary scans can prove the
-    // hook/default split. Returning a boolean avoids exposing any diagnostic control.
-    !ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER.is_empty()
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    {
+        // Keep the marker referenced in the executable path so binary scans can prove the
+        // hook/default split. Returning a boolean avoids exposing any diagnostic control.
+        !ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER.is_empty()
+    }
+    #[cfg(not(feature = "agent-network-device-test-hooks"))]
+    {
+        false
+    }
 }
 
 #[cfg(feature = "agent-network-device-test-hooks")]

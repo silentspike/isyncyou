@@ -27,6 +27,7 @@ class NetworkCriticalGuardRegistry(
     private val nowElapsedMs: () -> Long,
     private val newId: () -> String = { UUID.randomUUID().toString() },
     private val maxLeases: Int = NetworkGuardPolicy.MAX_LEASES,
+    private val onInvalidate: (Collection<String>) -> Unit = {},
 ) {
     private data class Lease(
         val reason: NetworkGuardReason,
@@ -72,7 +73,8 @@ class NetworkCriticalGuardRegistry(
     fun end(id: String?): Boolean {
         if (id.isNullOrBlank()) return false
         reapExpiredLocked(nowElapsedMs())
-        val removed = active.remove(id) ?: return false
+        active.remove(id) ?: return false
+        onInvalidate(listOf(id))
         if (active.isEmpty()) onStop()
         return true
     }
@@ -83,7 +85,9 @@ class NetworkCriticalGuardRegistry(
     @Synchronized
     fun invalidateAll(): Int {
         val count = active.size
+        val ids = active.keys.toList()
         active.clear()
+        if (ids.isNotEmpty()) onInvalidate(ids)
         return count
     }
 
@@ -109,6 +113,7 @@ class NetworkCriticalGuardRegistry(
     private fun reapExpiredLocked(now: Long): Int {
         val expired = active.filterValues { it.deadlineElapsedMs <= now }.keys.toList()
         expired.forEach(active::remove)
+        if (expired.isNotEmpty()) onInvalidate(expired)
         if (expired.isNotEmpty() && active.isEmpty()) onStop()
         return expired.size
     }

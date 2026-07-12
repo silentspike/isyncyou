@@ -24,9 +24,8 @@ enum class NetworkDeviceTestHook(val wire: String) {
                 if (!context.filesDir.exists() && !context.filesDir.mkdirs()) {
                     null
                 } else {
-                    values().firstOrNull {
-                        it.wire == NativeEngine.nativeTakeNetworkDeviceTestHook(context.filesDir.absolutePath)
-                    }
+                    val wire = NativeEngine.nativeTakeNetworkDeviceTestHook(context.filesDir.absolutePath)
+                    values().firstOrNull { it.wire == wire }
                 }
             }
         } catch (_: UnsatisfiedLinkError) {

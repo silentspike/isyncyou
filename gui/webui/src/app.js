@@ -332,7 +332,10 @@ let _bridgeSeq = 0;
 const BRIDGE_TIMEOUT_MS = 15000;
 const NATIVE_TIMEOUT_MS = 5000;
 const BIO_TIMEOUT_MS = 120000;
-const BRIDGE_STREAM_TIMEOUT_MS = BRIDGE_TIMEOUT_MS;
+// Provider transport permits 60s to first response and 120s of SSE read idleness.
+// Keep the bridge watchdog just beyond that policy; the native stream also emits
+// 20-second pings, so a healthy long turn remains observable while backgrounded.
+const BRIDGE_STREAM_TIMEOUT_MS = 125000;
 const _bridgePending = new Map(); // request/native id -> { resolve, reject, timer }
 const _bridgeStreams = new Map(); // stream id -> onEvent handler
 const _bioPending = new Map();    // biometric request id -> { resolve, timer } (#0.6)
@@ -4536,7 +4539,58 @@ async function runConnectivityPreflight(provider, purpose, guardId) {
     error.connectivity = result || null;
     throw error;
   }
+  clearConnectivityIssue();
   return result;
+}
+const CONNECTIVITY_COPY = {
+  no_validated_network: "Connect to the internet, then try again.",
+  restricted_metered_background: "Allow background data for iSyncYou, then try again.",
+  foreground_guard_unavailable: "iSyncYou could not keep this network action active.",
+  connect_failed: "The provider could not be reached.",
+  connect_timed_out: "The provider took too long to respond.",
+  tls_failed: "A secure connection to the provider could not be established.",
+  http_failed: "The provider is temporarily unavailable.",
+  name_resolution_failed: "The provider address could not be resolved.",
+  connectivity_unavailable: "Connectivity could not be verified.",
+};
+function rememberConnectivityIssue(error, retry) {
+  const d = error && error.connectivity;
+  const code = d && CONNECTIVITY_COPY[d.code] ? d.code : "connectivity_unavailable";
+  AssistantState.connectivityIssue = {
+    code,
+    retryable: !!(d && d.retryable),
+    settings_hint: d && d.settings_hint ? d.settings_hint : "none",
+    retry: typeof retry === "function" ? retry : null,
+  };
+}
+function clearConnectivityIssue() {
+  AssistantState.connectivityIssue = null;
+}
+async function openConnectivitySettings(hint) {
+  const allowed = ["internet_panel", "background_data", "app_details", "battery_settings"];
+  if (!BRIDGE || !allowed.includes(hint)) return;
+  try { await nativeCall("openNetworkSettings", { hint }, NATIVE_TIMEOUT_MS); }
+  catch (_) { toast("Settings are unavailable", "err"); }
+}
+function renderConnectivityDiagnostic() {
+  const issue = AssistantState.connectivityIssue;
+  if (!issue) return null;
+  const actions = [];
+  if (issue.retryable && issue.retry) {
+    actions.push(el("button", { class: "btn sm", type: "button", onclick: async () => {
+      const retry = issue.retry;
+      clearConnectivityIssue();
+      await retry();
+    }, "data-agent-connectivity-retry": "1" }, icon("refresh-cw", "icon-sm"), "Retry"));
+  }
+  if (BRIDGE && issue.settings_hint !== "none") {
+    actions.push(el("button", { class: "btn ghost sm", type: "button", onclick: () => openConnectivitySettings(issue.settings_hint), "data-agent-connectivity-settings": issue.settings_hint }, icon("settings", "icon-sm"), "Settings"));
+  }
+  return el("div", { class: "assistant-consent", "data-agent-connectivity": issue.code },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Connection needs attention" }),
+      el("p", { class: "dim", text: CONNECTIVITY_COPY[issue.code] })),
+    actions.length ? el("div", { class: "assistant-consent-actions" }, actions) : null);
 }
 async function endNetworkGuard(guardId) {
   if (!BRIDGE || !guardId) return;
@@ -4593,16 +4647,12 @@ async function refreshAssistantCredentialIfRequired(st) {
     await runConnectivityPreflight(provider, "refresh", guardId);
     await postJson("/api/v1/agent/credential/refresh", CAP.agent, { provider });
     return await api("/api/v1/agent/status");
-  } catch (_) {
-    // The server exposes reconnect_required as a closed state; never surface a transport
-    // chain or provider response in the Assistant UI.
-    return Object.assign({}, st || {}, {
-      connected: false,
-      credential_state: Object.assign({}, (st && st.credential_state) || {}, {
-        [provider]: "reconnect_required",
-      }),
-      reconnect_required: true,
-    });
+  } catch (error) {
+    if (error && error.connectivity) {
+      rememberConnectivityIssue(error, () => renderAssistantView($("#view")));
+      return st;
+    }
+    return await api("/api/v1/agent/status").catch(() => st);
   } finally {
     await endNetworkGuard(guardId);
   }
@@ -4642,7 +4692,12 @@ async function startAiLogin(provider) {
     if (guardId) await endNetworkGuard(guardId);
     if (AGENT_GUARD_ID === guardId) AGENT_GUARD_ID = null;
     if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
-    toast("Sign-in unavailable: " + (e.message || e));
+    if (e && e.connectivity) {
+      rememberConnectivityIssue(e, () => startAiLogin(provider));
+      renderAssistantView($("#view"));
+    } else {
+      toast("Sign-in unavailable", "err");
+    }
   }
 }
 
@@ -4699,7 +4754,7 @@ function showCodeStep() {
     el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
     el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
       el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
-      el("button", { class: "btn", onclick: async () => { await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
+      el("button", { class: "btn", onclick: async () => { await cancelOAuthAttempt("claude"); await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
     ),
   );
 }
@@ -4710,12 +4765,14 @@ async function completeAiLogin() {
   if (!code) { toast("Paste the code first"); return; }
   try {
     await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
     toast("Connected!");
     renderAssistantView($("#view"));   // re-fetch status -> switches to chat
   } catch (e) {
+    OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
-    toast("Couldn't connect: " + (e.message || e));
+    toast("Couldn't connect. Start sign-in again.", "err");
   }
 }
 
@@ -4730,6 +4787,7 @@ const AssistantState = {
   draft: "",
   busy: false,
   activeMessage: null,
+  connectivityIssue: null,
 };
 
 function closeAssistantStream(_reason) {
@@ -4764,6 +4822,7 @@ function agentProviderConsentId(provider) {
 }
 function agentActiveProvider(st) {
   if (st && st.provider) return agentProviderConsentId(st.provider);
+  if (st && st.selected_provider) return agentProviderConsentId(st.selected_provider);
   if (st && st.claude) return "claude";
   if (st && st.codex) return "codex";
   return "claude";
@@ -4845,8 +4904,10 @@ function renderAssistantSetup(body, st) {
   if (unavailable || !codexAllowed) {
     codex.setAttribute("disabled", "disabled");
   }
+  body.append(el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }));
+  const diagnostic = renderConnectivityDiagnostic();
+  if (diagnostic) body.append(diagnostic);
   body.append(
-    el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
     el("div", { id: "asst-connect-card", class: "assistant-setup", "data-agent-setup": "1", "data-testid": "agent-setup" },
       el("div", { class: "assistant-setup-icon" }, icon("sparkles")),
       el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
@@ -4876,6 +4937,8 @@ function renderAssistantChat(body, st) {
     renderAssistantComposer(st),
   ];
   if (!hasConsent) chatNodes.splice(1, 0, renderAssistantConsentPanel([provider]));
+  const diagnostic = renderConnectivityDiagnostic();
+  if (diagnostic) body.append(diagnostic);
   body.append(...chatNodes);
   const log = $("#asst-log");
   if (!AssistantState.transcript.length) {
@@ -5324,6 +5387,25 @@ function renderAssistantMessage(m) {
   return el("div", { class: "assistant-message" + (isUser ? " user" : ""), "data-agent-message": m.role || "assistant" }, bubble);
 }
 
+function agentSafeErrorCopy(code) {
+  const known = {
+    assistant_tool_arguments_invalid: "The assistant requested an invalid operation.",
+    provider_request_failed: "The provider could not complete this request.",
+    provider_connect_timed_out: "The provider took too long to respond.",
+    provider_response_timed_out: "The provider did not begin responding in time.",
+    provider_stream_idle_timed_out: "The provider stopped responding.",
+    provider_tls_failed: "A secure provider connection could not be established.",
+    provider_name_resolution_failed: "The provider address could not be resolved.",
+    provider_connect_failed: "The provider could not be reached.",
+    provider_stream_read_failed: "The provider stream ended unexpectedly.",
+    provider_stream_ended_without_event: "The provider returned no usable response.",
+    provider_response_read_failed: "The provider response could not be read.",
+    provider_transport_failed: "The provider connection failed.",
+    confirmation_unavailable: "Confirmation is temporarily unavailable.",
+  };
+  return known[code] || "The assistant could not complete this request.";
+}
+
 function handleAgentEvent(message, turnState) {
   const d = message || {};
   switch (d.event) {
@@ -5373,7 +5455,7 @@ function handleAgentEvent(message, turnState) {
       break;
     }
     case "error":
-      turnState.addError(d.message || "Stream error");
+      turnState.addError(agentSafeErrorCopy(d.message));
       break;
     case "done": {
       const reason = d.reason || "complete";
@@ -5514,7 +5596,13 @@ async function agentSend(text) {
     await endNetworkGuard(startingGuardId);
     AssistantState.busy = false;
     AssistantState.activeMessage = null;
-    setText("Error: " + (e.message || e));
+    if (e && e.connectivity) {
+      rememberConnectivityIssue(e, () => agentSend(text));
+      setText(CONNECTIVITY_COPY[AssistantState.connectivityIssue.code]);
+      renderAssistantView($("#view"));
+    } else {
+      setText("The assistant could not start this turn.");
+    }
     return;
   }
   if (!turn) {

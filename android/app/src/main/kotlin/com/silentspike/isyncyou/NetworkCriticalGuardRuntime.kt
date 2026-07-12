@@ -20,6 +20,7 @@ object NetworkCriticalGuardRuntime {
                 onStart = { NetworkCriticalGuardService.start(requireContext()) },
                 onStop = { NetworkCriticalGuardService.stop(requireContext()) },
                 nowElapsedMs = { android.os.SystemClock.elapsedRealtime() },
+                onInvalidate = { ids -> ids.forEach(NativeEngine::nativeInvalidateNetworkGuard) },
             )
         }
     }

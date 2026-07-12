@@ -32,7 +32,7 @@ mod serve;
 mod view;
 pub use serve::{
     bind_loopback, dispatch_message, format_http, handle_bridge_request, parse_request_line, serve,
-    serve_listener, serve_listener_shared,
+    serve_listener, serve_listener_shared, BridgeDispatchRequest,
 };
 #[cfg(unix)]
 pub use serve::{default_unix_socket_path, serve_unix};
@@ -9916,7 +9916,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "\"data-agent-consent-reset\": \"1\"",
             "if (!agentPrivacyConsentAccepted(consentProvider))",
             "if (!agentPrivacyConsentAccepted(provider))",
-            "if (!agentPrivacyConsentAccepted(\"codex\"))",
+            "const consentProvider = agentProviderConsentId(provider);",
             "if (!agentPrivacyConsentAccepted(provider)) {",
             "Review privacy consent first",
             "renderAssistantConsentPanel([provider])",
@@ -9985,6 +9985,39 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "Assistant product source exposes experimental credential import: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn app_js_renders_closed_connectivity_retry_and_settings_actions() {
+        for needle in [
+            "function renderConnectivityDiagnostic()",
+            "data-agent-connectivity-retry",
+            "data-agent-connectivity-settings",
+            "nativeCall(\"openNetworkSettings\", { hint }",
+            "const BRIDGE_STREAM_TIMEOUT_MS = 125000",
+            "if (st && st.selected_provider)",
+            "if (error && error.connectivity)",
+            "await cancelOAuthAttempt(\"claude\"); await finishAgentGuard()",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #640 connectivity invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("[provider]: \"reconnect_required\""),
+            "a connectivity failure must not rewrite credential state"
+        );
+        let effective = APP_JS
+            .find("if (st && st.provider)")
+            .expect("effective provider branch");
+        let selected = APP_JS
+            .find("if (st && st.selected_provider)")
+            .expect("selected provider branch");
+        assert!(
+            effective < selected,
+            "the currently effective connected provider must win over a stale selection"
+        );
     }
 
     #[test]
@@ -10138,15 +10171,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "Claude on appassets must detect the manual code flow when no loopback redirect exists"
         );
         assert!(
-            APP_JS.contains("if (manualCodeFlow) showCodeStep();\n    else showWaitingStep();"),
+            APP_JS.contains(
+                "if (manualCodeFlow) showCodeStep();\n    else showWaitingStep(provider);"
+            ),
             "manual Claude OAuth must show the paste-code UI instead of a polling-only wait screen"
         );
         assert!(
-            APP_JS.contains("await finishAgentGuard();\n    toast(\"Connected!\");"),
+            APP_JS.contains(
+                "OAUTH_ATTEMPTS.delete(\"claude\");\n    await finishAgentGuard();\n    toast(\"Connected!\");"
+            ),
             "manual OAuth completion must clean up the network guard after a successful code exchange"
         );
         assert!(
-            APP_JS.contains("await finishAgentGuard(); renderAssistantView($(\"#view\"));"),
+            APP_JS.contains(
+                "await cancelOAuthAttempt(\"claude\"); await finishAgentGuard(); renderAssistantView($(\"#view\"));"
+            ),
             "manual OAuth cancellation must clean up the network guard"
         );
     }

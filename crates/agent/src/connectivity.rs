@@ -236,6 +236,12 @@ impl ProbeLimiter {
     }
 }
 
+impl Default for ProbeLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ProbePermit<'a> {
     limiter: &'a ProbeLimiter,
 }

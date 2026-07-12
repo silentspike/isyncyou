@@ -206,7 +206,6 @@ requirements:
       - test: experimental_capture_each_missing_codex_header_is_not_safely_observable
       - test: experimental_capture_required_headers_match_runtime_builders
       - test: experimental_capture_rejects_symlink_within_tmp
-      - test: codex_callback_diagnostics_persist_only_safe_booleans
       - test: daemon_agent_startup_removes_legacy_codex_callback_diagnostics
       - test: product_source_scan_keeps_production_after_early_cfg_test_items
       - test: mobile_product_has_no_local_cli_experimental_feature

@@ -320,6 +320,25 @@ fn agent_safe_executor_error(error: &str) -> &'static str {
     }
 }
 
+fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
+    match error {
+        isyncyou_agent::AgentError::ToolArgs(_) => "assistant_tool_arguments_invalid",
+        isyncyou_agent::AgentError::Provider(_) => "provider_request_failed",
+        isyncyou_agent::AgentError::Transport(code) => match code.as_str() {
+            "provider_connect_timed_out" => "provider_connect_timed_out",
+            "provider_response_timed_out" => "provider_response_timed_out",
+            "provider_stream_idle_timed_out" => "provider_stream_idle_timed_out",
+            "provider_tls_failed" => "provider_tls_failed",
+            "provider_name_resolution_failed" => "provider_name_resolution_failed",
+            "provider_connect_failed" => "provider_connect_failed",
+            "provider_stream_read_failed" => "provider_stream_read_failed",
+            "provider_stream_ended_without_event" => "provider_stream_ended_without_event",
+            "provider_response_read_failed" => "provider_response_read_failed",
+            _ => "provider_transport_failed",
+        },
+    }
+}
+
 /// The agent's system prompt — app-/M365-scoped (the only tool is `isyncyou`).
 const AGENT_SYSTEM_PROMPT: &str = "You are the iSyncYou in-app assistant. You help the user with \
 their own Microsoft 365 data that iSyncYou manages — mail, OneDrive files and photos, calendar, \
@@ -343,7 +362,7 @@ const MOBILE_CONNECTIVITY_SNAPSHOT_LIMIT: usize = 8;
 struct MobileConnectivitySnapshot {
     snapshot: isyncyou_agent::AndroidNetworkSnapshot,
     purpose: isyncyou_agent::ConnectivityPurpose,
-    _guard_id: String,
+    guard_id: String,
     forced_observation: Option<isyncyou_agent::ProbeObservation>,
     expires_at_ms: u64,
 }
@@ -356,6 +375,12 @@ struct MobileConnectivitySnapshotEntry {
 static MOBILE_CONNECTIVITY_SNAPSHOTS: OnceLock<
     Mutex<HashMap<String, MobileConnectivitySnapshotEntry>>,
 > = OnceLock::new();
+static ACTIVE_MOBILE_CONNECTIVITY_GUARDS: OnceLock<Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+fn active_mobile_connectivity_guards() -> &'static Mutex<std::collections::HashSet<String>> {
+    ACTIVE_MOBILE_CONNECTIVITY_GUARDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 
 fn mobile_connectivity_snapshots(
 ) -> &'static Mutex<HashMap<String, MobileConnectivitySnapshotEntry>> {
@@ -418,6 +443,10 @@ pub fn register_mobile_connectivity_snapshot(
     if entries.len() >= MOBILE_CONNECTIVITY_SNAPSHOT_LIMIT {
         return Err("mobile connectivity snapshot is unavailable".into());
     }
+    active_mobile_connectivity_guards()
+        .lock()
+        .map_err(|_| "mobile connectivity snapshot is unavailable".to_string())?
+        .insert(guard_id.to_string());
     let id = mint_cap_token();
     entries.insert(
         id.clone(),
@@ -426,13 +455,25 @@ pub fn register_mobile_connectivity_snapshot(
             snapshot: MobileConnectivitySnapshot {
                 snapshot,
                 purpose,
-                _guard_id: guard_id.to_string(),
+                guard_id: guard_id.to_string(),
                 forced_observation,
                 expires_at_ms,
             },
         },
     );
     Ok(id)
+}
+
+pub fn invalidate_mobile_connectivity_guard(guard_id: &str) {
+    if guard_id.is_empty() {
+        return;
+    }
+    if let Ok(mut entries) = mobile_connectivity_snapshots().lock() {
+        entries.retain(|_, entry| entry.snapshot.guard_id != guard_id);
+    }
+    if let Ok(mut guards) = active_mobile_connectivity_guards().lock() {
+        guards.remove(guard_id);
+    }
 }
 
 struct ConsumedMobileConnectivitySnapshot {
@@ -459,6 +500,13 @@ fn consume_mobile_connectivity_snapshot(
     if entry.session_token != session_token || entry.snapshot.purpose != purpose {
         return Err("mobile connectivity snapshot is unavailable".into());
     }
+    let guard_active = active_mobile_connectivity_guards()
+        .lock()
+        .map_err(|_| "mobile connectivity snapshot is unavailable".to_string())?
+        .contains(&entry.snapshot.guard_id);
+    if !guard_active {
+        return Err("mobile connectivity snapshot is unavailable".into());
+    }
     Ok(ConsumedMobileConnectivitySnapshot {
         snapshot: entry.snapshot.snapshot,
         forced_observation: entry.snapshot.forced_observation,
@@ -475,8 +523,33 @@ struct AgentStreamSlot {
     feature = "agent-subscription-experimental"
 ))]
 enum OAuthAttempt {
-    Claude { state: String },
-    Codex { cancelled: Arc<AtomicBool> },
+    Claude {
+        state: String,
+        expires_at: std::time::Instant,
+    },
+    Codex {
+        cancelled: Arc<AtomicBool>,
+        expires_at: std::time::Instant,
+    },
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const OAUTH_ATTEMPT_TTL: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn reap_oauth_attempts(attempts: &mut HashMap<String, OAuthAttempt>) {
+    let now = std::time::Instant::now();
+    attempts.retain(|_, attempt| match attempt {
+        OAuthAttempt::Claude { expires_at, .. } | OAuthAttempt::Codex { expires_at, .. } => {
+            *expires_at > now
+        }
+    });
 }
 
 /// The in-app agent handler (S-AG.6/#621). Drives a real turn: the product Claude/Codex
@@ -493,6 +566,8 @@ pub struct DaemonAgent {
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
     last_usage: Arc<Mutex<Option<isyncyou_agent::Usage>>>,
+    credential_now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    credential_refresh_gate: Mutex<()>,
     seq: AtomicU64,
     /// Directory holding the app OAuth credential store and an optional local
     /// `agent-oauth.json` policy assertion. Product builds reject any tuple that differs
@@ -554,6 +629,8 @@ impl DaemonAgent {
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
             last_usage: Arc::new(Mutex::new(None)),
+            credential_now_ms: Arc::new(now_ms),
+            credential_refresh_gate: Mutex::new(()),
             seq: AtomicU64::new(0),
             oauth_dir,
             #[cfg(any(
@@ -916,10 +993,10 @@ fn resolve_product_or_local<T>(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn credential_needs_refresh(access_token: &str, expires_at_ms: u64) -> bool {
+fn credential_needs_refresh_at(access_token: &str, expires_at_ms: u64, now_ms: u64) -> bool {
     access_token.is_empty()
         || expires_at_ms == 0
-        || expires_at_ms <= now_ms().saturating_add(5 * 60 * 1000)
+        || expires_at_ms <= now_ms.saturating_add(5 * 60 * 1000)
 }
 
 #[cfg(any(
@@ -939,12 +1016,17 @@ fn product_credential_state_wire<T>(state: &ProductCredentialState<T>) -> &'stat
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn classify_claude_product_credential(
+fn classify_claude_product_credential_at(
     credential: StoredCredential,
+    now_ms: u64,
 ) -> ProductCredentialState<StoredCredential> {
     if credential.access_token.is_empty() && credential.refresh_token.is_empty() {
         ProductCredentialState::PresentInvalid
-    } else if credential_needs_refresh(&credential.access_token, credential.expires_at_ms) {
+    } else if credential_needs_refresh_at(
+        &credential.access_token,
+        credential.expires_at_ms,
+        now_ms,
+    ) {
         ProductCredentialState::PresentNeedsRefresh(credential)
     } else {
         ProductCredentialState::PresentValid(credential)
@@ -955,14 +1037,19 @@ fn classify_claude_product_credential(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn classify_codex_product_credential(
+fn classify_codex_product_credential_at(
     credential: CodexStoredCredential,
+    now_ms: u64,
 ) -> ProductCredentialState<CodexStoredCredential> {
     if credential.account_id.trim().is_empty()
         || (credential.access_token.is_empty() && credential.refresh_token.is_empty())
     {
         ProductCredentialState::PresentInvalid
-    } else if credential_needs_refresh(&credential.access_token, credential.expires_at_ms) {
+    } else if credential_needs_refresh_at(
+        &credential.access_token,
+        credential.expires_at_ms,
+        now_ms,
+    ) {
         ProductCredentialState::PresentNeedsRefresh(credential)
     } else {
         ProductCredentialState::PresentValid(credential)
@@ -1096,6 +1183,32 @@ fn store_codex_blob(oauth_dir: &Path, cred: &CodexStoredCredential) -> Result<()
     store_agent_credential_blob(oauth_dir, CODEX_CREDENTIAL_ID, cred.to_json())
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn store_agent_provider_selection(
+    oauth_dir: &Path,
+    provider: &str,
+    model: &str,
+) -> Result<(), String> {
+    let known = match provider {
+        "claude" => CLAUDE_MODELS,
+        "codex" => CODEX_MODELS,
+        _ => return Err("unknown provider".into()),
+    };
+    if !known.iter().any(|(id, _)| *id == model) {
+        return Err("unknown model for provider".into());
+    }
+    std::fs::create_dir_all(oauth_dir).map_err(|e| e.to_string())?;
+    let blob = serde_json::to_vec(&serde_json::json!({
+        "provider": provider,
+        "model": model,
+    }))
+    .map_err(|e| e.to_string())?;
+    std::fs::write(oauth_dir.join("agent-settings.json"), blob).map_err(|e| e.to_string())
+}
+
 /// Minimal percent-decode for the loopback callback query (`+`→space, `%XX`→byte).
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -1167,8 +1280,7 @@ const CODEX_CALLBACK_DIAGNOSTICS_FILE: &str = "codex-debug.txt";
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn codex_callback_serve(
-    listener: std::net::TcpListener,
+struct CodexCallbackContext {
     oauth_dir: std::path::PathBuf,
     cfg: isyncyou_agent::oauth::CodexOAuthConfig,
     verifier: String,
@@ -1176,8 +1288,23 @@ fn codex_callback_serve(
     attempt_id: String,
     cancelled: Arc<AtomicBool>,
     attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
-) {
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn codex_callback_serve(listener: std::net::TcpListener, context: CodexCallbackContext) {
     use std::io::{Read, Write};
+    let CodexCallbackContext {
+        oauth_dir,
+        cfg,
+        verifier,
+        want_state,
+        attempt_id,
+        cancelled,
+        attempts,
+    } = context;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     if listener.set_nonblocking(true).is_err() {
         return;
@@ -1213,7 +1340,7 @@ fn codex_callback_serve(
             }
         }
         let ok = if state == want_state && !code.is_empty() {
-            match isyncyou_agent::http::HttpTransport::new()
+            match isyncyou_agent::http::HttpTransport::shared()
                 .map_err(|e| e.to_string())
                 .and_then(|http| {
                     isyncyou_agent::oauth::codex_exchange(&http, &cfg, &code, &verifier)
@@ -1234,6 +1361,13 @@ fn codex_callback_serve(
                             expires_at_ms,
                         },
                     )
+                    .and_then(|_| {
+                        store_agent_provider_selection(
+                            &oauth_dir,
+                            "codex",
+                            &isyncyou_agent::CodexConfig::default().model,
+                        )
+                    })
                     .is_ok()
                 }
                 Err(_) => false,
@@ -1253,7 +1387,7 @@ fn codex_callback_serve(
     // A stale callback thread may only clear the exact attempt it owns. A newer login
     // therefore cannot be erased by a late timeout/cancellation path.
     let mut attempts = attempts.lock().unwrap();
-    if matches!(attempts.get(&attempt_id), Some(OAuthAttempt::Codex { cancelled: current }) if Arc::ptr_eq(current, &cancelled))
+    if matches!(attempts.get(&attempt_id), Some(OAuthAttempt::Codex { cancelled: current, .. }) if Arc::ptr_eq(current, &cancelled))
     {
         attempts.remove(&attempt_id);
     }
@@ -1373,28 +1507,16 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
 
     /// Persist the switcher selection after validating it against the offered models.
     fn set_agent_settings(&self, provider: &str, model: &str) -> Result<(), String> {
-        let known = match provider {
-            "claude" => CLAUDE_MODELS,
-            "codex" => CODEX_MODELS,
-            _ => return Err("unknown provider".into()),
-        };
-        if !known.iter().any(|(id, _)| *id == model) {
-            return Err("unknown model for provider".into());
-        }
-        std::fs::create_dir_all(&self.oauth_dir).map_err(|e| e.to_string())?;
-        let blob = serde_json::to_vec(&serde_json::json!({
-            "provider": provider,
-            "model": model,
-        }))
-        .map_err(|e| e.to_string())?;
-        std::fs::write(self.oauth_dir.join("agent-settings.json"), blob).map_err(|e| e.to_string())
+        store_agent_provider_selection(&self.oauth_dir, provider, model)
     }
 
     fn claude_product_credential_state(&self) -> ProductCredentialState<StoredCredential> {
         match load_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID) {
             Ok(None) => ProductCredentialState::Absent,
             Ok(Some(secret)) => StoredCredential::from_json(secret.expose())
-                .map(classify_claude_product_credential)
+                .map(|credential| {
+                    classify_claude_product_credential_at(credential, (self.credential_now_ms)())
+                })
                 .unwrap_or(ProductCredentialState::PresentInvalid),
             Err(_) => ProductCredentialState::PresentInvalid,
         }
@@ -1410,7 +1532,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         let config = self
             .load_oauth_config()
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        let http = isyncyou_agent::http::HttpTransport::new()
+        let http = isyncyou_agent::http::HttpTransport::shared()
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         let refreshed = isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
@@ -1425,7 +1547,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 refreshed.refresh_token
             },
             expires_at_ms: if refreshed.expires_in > 0 {
-                now_ms().saturating_add(refreshed.expires_in.saturating_mul(1000))
+                (self.credential_now_ms)().saturating_add(refreshed.expires_in.saturating_mul(1000))
             } else {
                 0
             },
@@ -1510,7 +1632,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         match load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID) {
             Ok(None) => ProductCredentialState::Absent,
             Ok(Some(secret)) => CodexStoredCredential::from_json(secret.expose())
-                .map(classify_codex_product_credential)
+                .map(|credential| {
+                    classify_codex_product_credential_at(credential, (self.credential_now_ms)())
+                })
                 .unwrap_or(ProductCredentialState::PresentInvalid),
             Err(_) => ProductCredentialState::PresentInvalid,
         }
@@ -1524,7 +1648,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
         }
         let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
-        let http = isyncyou_agent::http::HttpTransport::new()
+        let http = isyncyou_agent::http::HttpTransport::shared()
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         let refreshed =
             isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
@@ -1545,7 +1669,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 refreshed.account_id
             },
             expires_at_ms: if refreshed.expires_in > 0 {
-                now_ms().saturating_add(refreshed.expires_in.saturating_mul(1000))
+                (self.credential_now_ms)().saturating_add(refreshed.expires_in.saturating_mul(1000))
             } else {
                 0
             },
@@ -1612,6 +1736,10 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// local CLI source, and the encrypted store is updated only by the existing atomic writer
     /// after a complete finite credential response has been validated.
     fn refresh_product_credential(&self, provider: &str) -> Result<&'static str, String> {
+        let _refresh = self
+            .credential_refresh_gate
+            .lock()
+            .map_err(|_| "reconnect_required".to_string())?;
         match provider {
             "claude" => match self.claude_product_credential_state() {
                 ProductCredentialState::PresentValid(_) => Ok("connected"),
@@ -1652,6 +1780,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         // second UI start cannot create a competing listener.
         let listener = {
             let mut attempts = self.oauth_attempts.lock().unwrap();
+            reap_oauth_attempts(&mut attempts);
             if attempts
                 .values()
                 .any(|attempt| matches!(attempt, OAuthAttempt::Codex { .. }))
@@ -1664,6 +1793,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 attempt_id.clone(),
                 OAuthAttempt::Codex {
                     cancelled: Arc::clone(&cancelled),
+                    expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
                 },
             );
             listener
@@ -1674,13 +1804,15 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         std::thread::spawn(move || {
             codex_callback_serve(
                 listener,
-                oauth_dir,
-                cfg,
-                verifier,
-                state,
-                callback_attempt_id,
-                cancelled,
-                attempts,
+                CodexCallbackContext {
+                    oauth_dir,
+                    cfg,
+                    verifier,
+                    want_state: state,
+                    attempt_id: callback_attempt_id,
+                    cancelled,
+                    attempts,
+                },
             )
         });
         Ok(isyncyou_webui::AgentOAuthStartResponse {
@@ -1739,6 +1871,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             Some(_permit) => {
                 // Do not consume the single-use mobile handle until the request has passed
                 // every local admission check and will actually run a probe.
+                if session_token.is_some() && request.snapshot_id.is_none() {
+                    return Err("mobile connectivity snapshot is required".into());
+                }
                 let consumed_snapshot = match request.snapshot_id.as_deref() {
                     Some(snapshot_id) => Some(consume_mobile_connectivity_snapshot(
                         snapshot_id,
@@ -1757,7 +1892,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 ))]
                 {
                     let observation = forced_observation.unwrap_or_else(|| {
-                        isyncyou_agent::http::HttpTransport::new()
+                        isyncyou_agent::http::HttpTransport::shared()
                             .ok()
                             .and_then(|http| {
                                 http.probe(isyncyou_agent::target_for(provider, purpose))
@@ -1807,9 +1942,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         {
-            return self
-                .refresh_product_credential(provider)
-                .map(str::to_string);
+            self.refresh_product_credential(provider)
+                .map(str::to_string)
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -1924,8 +2058,13 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             );
                         }
                         Err(e) => {
-                            let _ =
-                                hub.emit(&tid, isyncyou_agent::StreamEvent::Error(e.to_string()));
+                            let _ = e;
+                            let _ = hub.emit(
+                                &tid,
+                                isyncyou_agent::StreamEvent::Error(
+                                    "confirmation_unavailable".into(),
+                                ),
+                            );
                             let _ = hub.emit(
                                 &tid,
                                 isyncyou_agent::StreamEvent::done(
@@ -1936,7 +2075,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     }
                 }
                 Err(e) => {
-                    let _ = hub.emit(&tid, isyncyou_agent::StreamEvent::Error(e.to_string()));
+                    let _ = hub.emit(
+                        &tid,
+                        isyncyou_agent::StreamEvent::Error(agent_safe_turn_error(&e).into()),
+                    );
                     let _ = hub.emit(
                         &tid,
                         isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
@@ -2027,6 +2169,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         match provider {
             "codex" => self.codex_oauth_start(),
             "claude" => {
+                let mut attempts = self.oauth_attempts.lock().unwrap();
+                reap_oauth_attempts(&mut attempts);
+                if attempts
+                    .values()
+                    .any(|attempt| matches!(attempt, OAuthAttempt::Claude { .. }))
+                {
+                    return Err("Claude sign-in is already in progress".into());
+                }
                 let cfg = self.load_oauth_config()?;
                 // Loopback-primary (matches the real claude client): use the client's loopback
                 // redirect when supplied; fall back to the manual (copy-paste) redirect otherwise.
@@ -2040,10 +2190,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     .start(&cfg, redirect)
                     .map_err(|e| e.to_string())?;
                 let attempt_id = mint_cap_token();
-                self.oauth_attempts.lock().unwrap().insert(
+                attempts.insert(
                     attempt_id.clone(),
                     OAuthAttempt::Claude {
                         state: started.state,
+                        expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
                     },
                 );
                 Ok(isyncyou_webui::AgentOAuthStartResponse {
@@ -2063,11 +2214,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     fn oauth_cancel(&self, provider: &str, attempt_id: &str) -> Result<(), String> {
         let attempt = self.oauth_attempts.lock().unwrap().remove(attempt_id);
         match (provider, attempt) {
-            ("claude", Some(OAuthAttempt::Claude { state })) => {
+            ("claude", Some(OAuthAttempt::Claude { state, .. })) => {
                 let _ = self.oauth.cancel(&state);
                 Ok(())
             }
-            ("codex", Some(OAuthAttempt::Codex { cancelled })) => {
+            ("codex", Some(OAuthAttempt::Codex { cancelled, .. })) => {
                 cancelled.store(true, Ordering::Release);
                 Ok(())
             }
@@ -2096,15 +2247,17 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .oauth
             .take(&state)
             .ok_or("unknown or expired login — start the login again")?;
+        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
+            !matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == &state)
+        });
         let cfg = self.load_oauth_config()?;
-        let http = isyncyou_agent::http::HttpTransport::new().map_err(|e| e.to_string())?;
+        let http = isyncyou_agent::http::HttpTransport::shared()
+            .map_err(|_| "provider_connect_failed".to_string())?;
         let token =
             isyncyou_agent::oauth::exchange(&http, &cfg, &code, &verifier, &redirect_uri, &state)
-                .map_err(|e| e.to_string())?;
+                .map_err(|_| "oauth_exchange_failed".to_string())?;
         self.store_token(&token)?;
-        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
-            !matches!(attempt, OAuthAttempt::Claude { state: pending } if pending == &state)
-        });
+        self.set_agent_settings("claude", DEFAULT_MODEL)?;
         Ok("connected".to_string())
     }
 
@@ -2119,15 +2272,17 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .oauth
             .take(state)
             .ok_or("unknown or expired login state")?;
+        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
+            !matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == state)
+        });
         let cfg = self.load_oauth_config()?;
-        let http = isyncyou_agent::http::HttpTransport::new().map_err(|e| e.to_string())?;
+        let http = isyncyou_agent::http::HttpTransport::shared()
+            .map_err(|_| "provider_connect_failed".to_string())?;
         let token =
             isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri, state)
-                .map_err(|e| e.to_string())?;
+                .map_err(|_| "oauth_exchange_failed".to_string())?;
         self.store_token(&token)?;
-        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
-            !matches!(attempt, OAuthAttempt::Claude { state: pending } if pending == state)
-        });
+        self.set_agent_settings("claude", DEFAULT_MODEL)?;
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
 
@@ -2136,6 +2291,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn status_json(&self) -> String {
+        let _ = self.oauth.reap_expired();
+        if let Ok(mut attempts) = self.oauth_attempts.lock() {
+            reap_oauth_attempts(&mut attempts);
+        }
         let claude_state = self
             .product_credential_status("claude")
             .unwrap_or("reconnect_required");
@@ -2177,6 +2336,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "connected": claude || codex,
             "enabled": true,
             "provider": provider,
+            "selected_provider": sel_provider,
             "model": model,
             "claude": claude,
             "codex": codex,
@@ -3892,10 +4052,7 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["event"], "error");
-        assert_eq!(
-            events[0]["message"],
-            "provider error: the connected provider must be reconnected"
-        );
+        assert_eq!(events[0]["message"], "provider_request_failed");
         assert_eq!(events[1]["event"], "done");
         assert_eq!(events[1]["reason"], "error");
         let serialized = serde_json::to_string(&events).unwrap();
@@ -6478,7 +6635,7 @@ mod tests {
         };
 
         assert!(matches!(
-            classify_claude_product_credential(credential),
+            classify_claude_product_credential_at(credential, 1_000),
             ProductCredentialState::PresentNeedsRefresh(_)
         ));
     }
@@ -6697,6 +6854,61 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
+    fn successful_product_oauth_selection_uses_matching_provider_and_default_model() {
+        let root = apphost_credential_test_root("oauth-provider-selection");
+        let _ = std::fs::remove_dir_all(&root);
+
+        store_agent_provider_selection(
+            &root,
+            "codex",
+            &isyncyou_agent::CodexConfig::default().model,
+        )
+        .unwrap();
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let (provider, model) = agent.agent_settings();
+
+        assert_eq!(provider, "codex");
+        assert_eq!(model, isyncyou_agent::CodexConfig::default().model);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_status_keeps_selected_codex_provider_when_refresh_is_required() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("status-selected-codex-refresh");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.credential_now_ms = Arc::new(|| 10_000);
+        store_codex_blob(
+            &root,
+            &CodexStoredCredential {
+                access_token: "expired-codex-token".into(),
+                refresh_token: "refresh-codex-token".into(),
+                account_id: "acct_status".into(),
+                expires_at_ms: 10_001,
+            },
+        )
+        .unwrap();
+        agent.set_agent_settings("codex", "gpt-5.5").unwrap();
+
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        assert_eq!(status["selected_provider"], "codex");
+        assert_eq!(status["credential_state"]["codex"], "refresh_required");
+        assert_eq!(status["provider"], "");
+        assert_eq!(status["connected"], false);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
     fn agent_provider_selection_uses_fake_when_unconfigured() {
         let env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("agent-provider-fake");
@@ -6729,6 +6941,32 @@ mod tests {
         let err = isyncyou_webui::AgentHandler::oauth_start(&agent, "anthropic", "")
             .expect_err("legacy Anthropic provider id must be rejected");
         assert!(err.contains("unknown provider"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn second_oauth_start_for_same_provider_conflicts_until_cancel() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("agent-oauth-single-claude-attempt");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        let first = isyncyou_webui::AgentHandler::oauth_start_with_attempt(&agent, "claude", "")
+            .expect("first Claude attempt starts");
+        let second = isyncyou_webui::AgentHandler::oauth_start_with_attempt(&agent, "claude", "")
+            .expect_err("second active Claude attempt must conflict");
+        assert_eq!(second, "Claude sign-in is already in progress");
+
+        isyncyou_webui::AgentHandler::oauth_cancel(&agent, "claude", &first.attempt_id)
+            .expect("matching attempt cancels");
+        assert!(
+            isyncyou_webui::AgentHandler::oauth_start_with_attempt(&agent, "claude", "").is_ok(),
+            "a cancelled attempt must not block a fresh login"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7772,6 +8010,58 @@ mod tests {
             isyncyou_agent::ConnectivityPurpose::OAuthStart,
         )
         .is_err());
+    }
+
+    #[test]
+    fn mobile_connectivity_snapshot_rejects_destroyed_guard() {
+        let snapshot = isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: isyncyou_agent::RestrictBackgroundStatus::Disabled,
+            notifications_visible: true,
+            guard_ready: true,
+        };
+        let id = register_mobile_connectivity_snapshot(
+            "destroyed-session",
+            "destroyed-guard",
+            "oauth",
+            snapshot,
+            None,
+        )
+        .expect("snapshot is registered");
+
+        invalidate_mobile_connectivity_guard("destroyed-guard");
+
+        assert!(consume_mobile_connectivity_snapshot(
+            &id,
+            Some("destroyed-session"),
+            isyncyou_agent::ConnectivityPurpose::OAuthStart,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn connectivity_preflight_mobile_requires_snapshot_before_probe() {
+        let agent = DaemonAgent::new(
+            Config::default(),
+            PathBuf::from("/tmp/issue-640-no-snapshot"),
+        );
+        let result = isyncyou_webui::AgentHandler::connectivity_preflight_with_session(
+            &agent,
+            isyncyou_webui::AgentConnectivityPreflightRequest {
+                provider: "claude".into(),
+                purpose: "oauth_start".into(),
+                snapshot_id: None,
+            },
+            Some("mobile-session"),
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            "mobile connectivity snapshot is required"
+        );
     }
 
     #[cfg(feature = "agent-network-device-test-hooks")]

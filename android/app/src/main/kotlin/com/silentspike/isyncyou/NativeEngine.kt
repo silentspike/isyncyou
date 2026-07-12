@@ -142,4 +142,7 @@ object NativeEngine {
         notificationsVisible: Boolean,
         testHook: String,
     ): String
+
+    /** Invalidate every unconsumed native snapshot bound to an ended guard. */
+    external fun nativeInvalidateNetworkGuard(guardId: String)
 }

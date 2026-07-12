@@ -178,24 +178,25 @@ fn build_request(
 /// (`/api/v1/events`, `/api/v1/agent/stream`) are NOT served here — the bridge carries
 /// those streams over its own native push channel. Returns the response for the native
 /// side to post back on the message port.
-pub fn dispatch_message(
-    router: &Router,
-    method: &str,
-    target: &str,
-    cap_token: Option<String>,
-    session_token: Option<String>,
-    cookie: Option<String>,
-    content_type: Option<String>,
-    body: Vec<u8>,
-) -> ApiResponse {
+pub struct BridgeDispatchRequest<'a> {
+    pub method: &'a str,
+    pub target: &'a str,
+    pub cap_token: Option<String>,
+    pub session_token: Option<String>,
+    pub cookie: Option<String>,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+pub fn dispatch_message(router: &Router, request: BridgeDispatchRequest<'_>) -> ApiResponse {
     router.route(&build_request(
-        method,
-        target,
-        cap_token,
-        session_token,
-        cookie,
-        content_type,
-        body,
+        request.method,
+        request.target,
+        request.cap_token,
+        request.session_token,
+        request.cookie,
+        request.content_type,
+        request.body,
     ))
 }
 
@@ -240,13 +241,15 @@ pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
     };
     let resp = dispatch_message(
         router,
-        method,
-        path,
-        header("X-Capability-Token"),
-        header("X-Session-Token"),
-        header("Cookie"),
-        header("Content-Type"),
-        body,
+        BridgeDispatchRequest {
+            method,
+            target: path,
+            cap_token: header("X-Capability-Token"),
+            session_token: header("X-Session-Token"),
+            cookie: header("Cookie"),
+            content_type: header("Content-Type"),
+            body,
+        },
     );
     serde_json::json!({
         "t": "res",
@@ -1323,13 +1326,15 @@ mod tests {
         let open = Router::new(Config::default());
         let ok = dispatch_message(
             &open,
-            "GET",
-            "/api/v1/accounts",
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
+            BridgeDispatchRequest {
+                method: "GET",
+                target: "/api/v1/accounts",
+                cap_token: None,
+                session_token: None,
+                cookie: None,
+                content_type: None,
+                body: Vec::new(),
+            },
         );
         assert_eq!(ok.status, 200, "bridge GET should route");
         assert!(
@@ -1341,24 +1346,28 @@ mod tests {
         let gated = Router::new(Config::default()).with_session_token("sess-bridge".into());
         let denied = dispatch_message(
             &gated,
-            "GET",
-            "/api/v1/status",
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
+            BridgeDispatchRequest {
+                method: "GET",
+                target: "/api/v1/status",
+                cap_token: None,
+                session_token: None,
+                cookie: None,
+                content_type: None,
+                body: Vec::new(),
+            },
         );
         assert_eq!(denied.status, 401, "bridge without token must 401");
         let allowed = dispatch_message(
             &gated,
-            "GET",
-            "/api/v1/status",
-            None,
-            Some("sess-bridge".into()),
-            None,
-            None,
-            Vec::new(),
+            BridgeDispatchRequest {
+                method: "GET",
+                target: "/api/v1/status",
+                cap_token: None,
+                session_token: Some("sess-bridge".into()),
+                cookie: None,
+                content_type: None,
+                body: Vec::new(),
+            },
         );
         assert_ne!(allowed.status, 401, "bridge with token must pass the gate");
     }

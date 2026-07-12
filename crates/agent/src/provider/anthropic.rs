@@ -10,6 +10,8 @@ use crate::turn::{Message, Role};
 #[cfg(any(feature = "byo-api-providers", test))]
 use crate::AgentError;
 use serde_json::{json, Value};
+#[cfg(feature = "byo-api-providers")]
+use std::sync::Arc;
 
 #[cfg(feature = "byo-api-providers")]
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -139,7 +141,7 @@ mod live {
 
     /// Live Anthropic provider over the agent's own blocking HTTP transport.
     pub struct AnthropicProvider {
-        http: crate::http::HttpTransport,
+        http: Arc<crate::http::HttpTransport>,
         api_key: String,
         model: String,
         system: String,
@@ -153,7 +155,7 @@ mod live {
             system: impl Into<String>,
         ) -> Result<Self, AgentError> {
             Ok(Self {
-                http: crate::http::HttpTransport::new()?,
+                http: crate::http::HttpTransport::shared()?,
                 api_key: api_key.into(),
                 model: model.into(),
                 system: system.into(),
