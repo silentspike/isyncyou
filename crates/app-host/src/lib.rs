@@ -804,6 +804,7 @@ enum ResolvedProviderCredential {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[cfg(test)]
 impl ResolvedProviderCredential {
     fn satisfies_product_harness_readiness(&self) -> bool {
         matches!(
