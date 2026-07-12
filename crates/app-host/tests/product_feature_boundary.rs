@@ -10,6 +10,14 @@ fn read_repo(path: &str) -> String {
         .unwrap_or_else(|error| panic!("could not read tracked product source {path}: {error}"))
 }
 
+fn production_source_before_final_test_module(source: &str) -> &str {
+    let marker = "\n#[cfg(test)]\nmod tests {";
+    let final_tests = source
+        .rfind(marker)
+        .expect("app-host must keep one final cfg(test) module");
+    &source[..final_tests]
+}
+
 #[test]
 fn readme_does_not_advertise_subscription_experimental() {
     for path in [
@@ -35,7 +43,7 @@ fn readme_does_not_advertise_subscription_experimental() {
 #[test]
 fn product_sources_do_not_reference_local_cli_auth_paths() {
     let app_host = read_repo("crates/app-host/src/lib.rs");
-    let app_host_product = app_host.split("#[cfg(test)]").next().unwrap_or(&app_host);
+    let app_host_product = production_source_before_final_test_module(&app_host);
     let product_sources = [
         ("crates/app-host/src/lib.rs", app_host_product.to_string()),
         (
@@ -68,4 +76,26 @@ fn product_sources_do_not_reference_local_cli_auth_paths() {
             );
         }
     }
+}
+
+#[test]
+fn product_source_scan_keeps_production_after_early_cfg_test_items() {
+    let source = r#"
+#[cfg(test)]
+fn early_test_helper() {}
+
+fn production_after_helper() {
+    let _must_be_scanned = ".claude/.credentials.json";
+}
+
+#[cfg(test)]
+mod tests {
+    const TEST_ONLY: &str = ".codex/auth.json";
+}
+"#;
+
+    let production = production_source_before_final_test_module(source);
+
+    assert!(production.contains(".claude/.credentials.json"));
+    assert!(!production.contains(".codex/auth.json"));
 }

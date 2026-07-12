@@ -387,6 +387,11 @@ impl DaemonAgent {
         operation_policy: AgentOperationPolicy,
         gate: Arc<Mutex<()>>,
     ) -> Self {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        let _ = std::fs::remove_file(oauth_dir.join(CODEX_CALLBACK_DIAGNOSTICS_FILE));
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
         let confirmed_executor =
             agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
@@ -695,11 +700,33 @@ impl std::fmt::Display for ProviderCredentialResolutionError {
     feature = "agent-subscription-experimental"
 ))]
 fn credential_resolution_error_provider() -> Box<dyn isyncyou_agent::LlmProvider + Send> {
-    Box::new(isyncyou_agent::FakeProvider::new(vec![vec![
-        isyncyou_agent::AssistantBlock::Text(
-            "The connected AI provider needs to be reconnected before it can be used.".to_string(),
-        ),
-    ]]))
+    Box::new(CredentialResolutionErrorProvider)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+struct CredentialResolutionErrorProvider;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl isyncyou_agent::LlmProvider for CredentialResolutionErrorProvider {
+    fn name(&self) -> &str {
+        "credential-resolution-error"
+    }
+
+    fn next(
+        &mut self,
+        _history: &[isyncyou_agent::Message],
+        _emit: &mut dyn FnMut(isyncyou_agent::StreamEvent),
+    ) -> Result<Vec<isyncyou_agent::AssistantBlock>, isyncyou_agent::AgentError> {
+        Err(isyncyou_agent::AgentError::Provider(
+            "the connected provider must be reconnected".to_string(),
+        ))
+    }
 }
 
 #[cfg(any(
@@ -951,6 +978,55 @@ const CODEX_ERR_HTML: &str = "<!doctype html><meta charset=utf-8><title>Sign-in 
 align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Sign-in failed</h1>\
 <p style=color:#9aa3b2>Please return to iSyncYou and try connecting ChatGPT again.</p></div>";
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const CODEX_CALLBACK_DIAGNOSTICS_FILE: &str = "codex-debug.txt";
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Default)]
+struct CodexCallbackDiagnostics {
+    callback_received: bool,
+    state_present: bool,
+    code_present: bool,
+    state_matches: bool,
+    exchange_attempted: bool,
+    exchange_succeeded: bool,
+    credential_stored: bool,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn write_codex_callback_diagnostics(oauth_dir: &Path, diagnostics: &CodexCallbackDiagnostics) {
+    let value = serde_json::json!({
+        "callback_received": diagnostics.callback_received,
+        "state_present": diagnostics.state_present,
+        "code_present": diagnostics.code_present,
+        "state_matches": diagnostics.state_matches,
+        "exchange_attempted": diagnostics.exchange_attempted,
+        "exchange_succeeded": diagnostics.exchange_succeeded,
+        "credential_stored": diagnostics.credential_stored,
+    });
+    let Ok(mut bytes) = serde_json::to_vec_pretty(&value) else {
+        return;
+    };
+    bytes.push(b'\n');
+    let path = oauth_dir.join(CODEX_CALLBACK_DIAGNOSTICS_FILE);
+    if std::fs::write(&path, bytes).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 /// One-shot loopback callback server for the Codex OAuth (OpenAI registers the fixed
 /// `:1455` redirect). Waits for the browser to hit `/auth/callback?code=&state=`, verifies
 /// the CSRF `state`, exchanges the code, and persists the credential. Background thread;
@@ -998,38 +1074,16 @@ fn codex_callback_serve(
                 _ => {}
             }
         }
-        let mut dbg = format!(
-            "target={}\nstate_match={}\ncode_len={}\n",
-            &target[..target.len().min(120)],
-            state == want_state,
-            code.len()
-        );
-        // Diagnostic: raw TCP connect from THIS app process (uid) to key hosts, to separate a
-        // routing/connect block from a TLS/fingerprint stall.
-        for (label, addr) in [
-            ("cf_104", "104.18.41.241:443"),
-            ("cf_172", "172.64.146.15:443"),
-            ("google_8888", "8.8.8.8:443"),
-            ("anthropic", "160.79.104.10:443"),
-        ] {
-            if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
-                let r =
-                    std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5));
-                dbg.push_str(&format!(
-                    "tcp {label} = {}\n",
-                    match r {
-                        Ok(_) => "OK".to_string(),
-                        Err(e) => e.to_string(),
-                    }
-                ));
-            }
-        }
-        let ok = if state == want_state && !code.is_empty() {
+        let mut diagnostics = CodexCallbackDiagnostics {
+            callback_received: true,
+            state_present: !state.is_empty(),
+            code_present: !code.is_empty(),
+            state_matches: state == want_state,
+            ..Default::default()
+        };
+        let ok = if diagnostics.state_matches && diagnostics.code_present {
+            diagnostics.exchange_attempted = true;
             let doh = isyncyou_agent::http::doh_resolve("auth.openai.com");
-            match &doh {
-                Ok(ips) => dbg.push_str(&format!("doh_ips={ips:?}\n")),
-                Err(e) => dbg.push_str(&format!("doh_err={e}\n")),
-            }
             let mut ips = doh.unwrap_or_default();
             if ips.is_empty() {
                 // Stable Cloudflare anycast IPs for auth.openai.com — used when this network
@@ -1038,7 +1092,6 @@ fn codex_callback_serve(
                     std::net::IpAddr::from([104, 18, 41, 241]),
                     std::net::IpAddr::from([172, 64, 146, 15]),
                 ];
-                dbg.push_str("using hardcoded auth.openai.com IPs\n");
             }
             match isyncyou_agent::http::HttpTransport::new_resolving("auth.openai.com", &ips)
                 .map_err(|e| e.to_string())
@@ -1047,20 +1100,13 @@ fn codex_callback_serve(
                         .map_err(|e| e.to_string())
                 }) {
                 Ok(tok) => {
-                    dbg.push_str(&format!(
-                        "exchange=OK account_id={}\n",
-                        if tok.account_id.is_empty() {
-                            "EMPTY"
-                        } else {
-                            "present"
-                        }
-                    ));
+                    diagnostics.exchange_succeeded = true;
                     let expires_at_ms = if tok.expires_in > 0 {
                         now_ms() + tok.expires_in * 1000
                     } else {
                         0
                     };
-                    store_codex_blob(
+                    diagnostics.credential_stored = store_codex_blob(
                         &oauth_dir,
                         &CodexStoredCredential {
                             access_token: tok.access_token,
@@ -1069,18 +1115,15 @@ fn codex_callback_serve(
                             expires_at_ms,
                         },
                     )
-                    .is_ok()
+                    .is_ok();
+                    diagnostics.credential_stored
                 }
-                Err(e) => {
-                    dbg.push_str(&format!("exchange=ERR {e}\n"));
-                    false
-                }
+                Err(_) => false,
             }
         } else {
-            dbg.push_str("skipped: state/code check failed\n");
             false
         };
-        let _ = std::fs::write(oauth_dir.join("codex-debug.txt"), &dbg);
+        write_codex_callback_diagnostics(&oauth_dir, &diagnostics);
         let body = if ok { CODEX_OK_HTML } else { CODEX_ERR_HTML };
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3348,6 +3391,14 @@ mod tests {
         ))
     }
 
+    fn production_source_before_final_test_module(source: &str) -> &str {
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let final_tests = source
+            .rfind(marker)
+            .expect("app-host must keep one final cfg(test) module");
+        &source[..final_tests]
+    }
+
     #[cfg(any(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
@@ -3482,6 +3533,44 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, value).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn assert_product_credential_turn_fails_closed(agent: &DaemonAgent) {
+        assert_eq!(
+            agent.build_turn_provider("system").name(),
+            "credential-resolution-error"
+        );
+        let turn = isyncyou_webui::AgentHandler::start_turn(agent, "me", "hello").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(agent, &turn).expect("turn stream");
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("credential failure stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let done = event["event"].as_str() == Some("done");
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "provider error: the connected provider must be reconnected"
+        );
+        assert_eq!(events[1]["event"], "done");
+        assert_eq!(events[1]["reason"], "error");
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert!(!serialized.contains("complete"));
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("refresh_token"));
     }
 
     #[test]
@@ -5947,6 +6036,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn corrupt_product_credential_streams_error_and_done_error() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("corrupt-product-turn-error");
+        let oauth_dir = root.join("oauth");
+        store_agent_credential_blob(
+            &oauth_dir,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            b"not-the-product-credential-schema".to_vec(),
+        )
+        .unwrap();
+        let agent = DaemonAgent::new(Config::default(), oauth_dir);
+
+        assert_product_credential_turn_fails_closed(&agent);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(feature = "agent-subscription-experimental")]
     #[test]
     fn expired_product_credential_does_not_silently_switch_origin() {
@@ -5974,6 +6085,29 @@ mod tests {
             error,
             Some(ProviderCredentialResolutionError::ProductReconnectRequired)
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn expired_product_credential_streams_error_and_done_error() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("expired-product-turn-error");
+        let oauth_dir = root.join("oauth");
+        let agent = DaemonAgent::new(Config::default(), oauth_dir);
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "expired-product-token".into(),
+                refresh_token: String::new(),
+                expires_at_ms: 1,
+            })
+            .unwrap();
+
+        assert_product_credential_turn_fails_closed(&agent);
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6133,6 +6267,82 @@ mod tests {
         assert_eq!(loaded.client_id, official.client_id);
         assert_eq!(loaded.scopes, official.scopes);
         assert_eq!(loaded.manual_redirect_url, official.manual_redirect_url);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_callback_diagnostics_persist_only_safe_booleans() {
+        let root = apphost_credential_test_root("codex-safe-callback-diagnostics");
+        std::fs::create_dir_all(&root).unwrap();
+        write_codex_callback_diagnostics(
+            &root,
+            &CodexCallbackDiagnostics {
+                callback_received: true,
+                state_present: true,
+                code_present: true,
+                state_matches: false,
+                exchange_attempted: false,
+                exchange_succeeded: false,
+                credential_stored: false,
+            },
+        );
+
+        let bytes = std::fs::read(root.join(CODEX_CALLBACK_DIAGNOSTICS_FILE)).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "callback_received",
+                "code_present",
+                "credential_stored",
+                "exchange_attempted",
+                "exchange_succeeded",
+                "state_matches",
+                "state_present",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(value
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value.is_boolean()));
+        let text = String::from_utf8(bytes).unwrap();
+        for forbidden in ["/auth/callback", "code=", "state=", "target=", "error"] {
+            assert!(!text.contains(forbidden));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn daemon_agent_startup_removes_legacy_codex_callback_diagnostics() {
+        let root = apphost_credential_test_root("codex-legacy-diagnostics-cleanup");
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = root.join(CODEX_CALLBACK_DIAGNOSTICS_FILE);
+        std::fs::write(
+            &legacy,
+            "target=/auth/callback?code=secret&state=secret\nexchange=ERR secret",
+        )
+        .unwrap();
+
+        let _agent = DaemonAgent::new(Config::default(), root.clone());
+
+        assert!(!legacy.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6430,7 +6640,7 @@ mod tests {
     #[test]
     fn app_host_product_code_does_not_reference_legacy_byo_provider_types() {
         let src = include_str!("lib.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let production = production_source_before_final_test_module(src);
 
         for needle in [
             "AnthropicProvider",
