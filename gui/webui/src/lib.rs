@@ -4595,7 +4595,7 @@ impl Router {
             Err(e) => return ApiResponse::error(400, e),
         };
         match handler.oauth_start_with_attempt(provider, redirect) {
-            Ok(result) => ApiResponse::ok_json(&result),
+            Ok(result) => ApiResponse::ok_json(&serde_json::to_value(result).unwrap_or_default()),
             Err(e) => ApiResponse::error(500, &e),
         }
     }

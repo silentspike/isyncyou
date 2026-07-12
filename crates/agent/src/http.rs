@@ -403,7 +403,8 @@ mod live {
                 let deadline = tokio::time::Instant::now() + PROVIDER_TURN_TIMEOUT;
                 let response = within_deadline(deadline, PROVIDER_RESPONSE_TIMEOUT, req.send())
                     .await
-                    .map_err(async_transport_error)?;
+                    .map_err(async_transport_error)?
+                    .map_err(|error| AgentError::Transport(error.to_string()))?;
                 let status = response.status().as_u16();
                 let headers = filter_provider_header_pairs(
                     response
