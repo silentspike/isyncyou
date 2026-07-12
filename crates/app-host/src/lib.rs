@@ -1106,49 +1106,10 @@ const CODEX_CALLBACK_DIAGNOSTICS_FILE: &str = "codex-debug.txt";
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[derive(Default)]
-struct CodexCallbackDiagnostics {
-    callback_received: bool,
-    state_present: bool,
-    code_present: bool,
-    state_matches: bool,
-    exchange_attempted: bool,
-    exchange_succeeded: bool,
-    credential_stored: bool,
-}
-
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
-fn write_codex_callback_diagnostics(oauth_dir: &Path, diagnostics: &CodexCallbackDiagnostics) {
-    let value = serde_json::json!({
-        "callback_received": diagnostics.callback_received,
-        "state_present": diagnostics.state_present,
-        "code_present": diagnostics.code_present,
-        "state_matches": diagnostics.state_matches,
-        "exchange_attempted": diagnostics.exchange_attempted,
-        "exchange_succeeded": diagnostics.exchange_succeeded,
-        "credential_stored": diagnostics.credential_stored,
-    });
-    let Ok(mut bytes) = serde_json::to_vec_pretty(&value) else {
-        return;
-    };
-    bytes.push(b'\n');
-    let path = oauth_dir.join(CODEX_CALLBACK_DIAGNOSTICS_FILE);
-    if std::fs::write(&path, bytes).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-}
-
 /// One-shot loopback callback server for the Codex OAuth (OpenAI registers the fixed
 /// `:1455` redirect). Waits for the browser to hit `/auth/callback?code=&state=`, verifies
 /// the CSRF `state`, exchanges the code, and persists the credential. Background thread;
-/// gives up after 5 minutes.
+/// gives up after 5 minutes. It never persists callback diagnostics or target data.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -1162,24 +1123,27 @@ fn codex_callback_serve(
 ) {
     use std::io::{Read, Write};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    for stream in listener.incoming() {
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    while std::time::Instant::now() < deadline {
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(_) => return,
         };
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..n]);
-        let target = req
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .unwrap_or("");
-        if !target.starts_with("/auth/callback") {
+        let first_line = req.lines().next().unwrap_or("");
+        let mut parts = first_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("");
+        if method != "GET" || !target.starts_with("/auth/callback") {
             let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
             continue; // ignore favicon/others, keep waiting for the real callback
         }
@@ -1192,39 +1156,20 @@ fn codex_callback_serve(
                 _ => {}
             }
         }
-        let mut diagnostics = CodexCallbackDiagnostics {
-            callback_received: true,
-            state_present: !state.is_empty(),
-            code_present: !code.is_empty(),
-            state_matches: state == want_state,
-            ..Default::default()
-        };
-        let ok = if diagnostics.state_matches && diagnostics.code_present {
-            diagnostics.exchange_attempted = true;
-            let doh = isyncyou_agent::http::doh_resolve("auth.openai.com");
-            let mut ips = doh.unwrap_or_default();
-            if ips.is_empty() {
-                // Stable Cloudflare anycast IPs for auth.openai.com — used when this network
-                // blocks the app from reaching any DoH resolver.
-                ips = vec![
-                    std::net::IpAddr::from([104, 18, 41, 241]),
-                    std::net::IpAddr::from([172, 64, 146, 15]),
-                ];
-            }
-            match isyncyou_agent::http::HttpTransport::new_resolving("auth.openai.com", &ips)
+        let ok = if state == want_state && !code.is_empty() {
+            match isyncyou_agent::http::HttpTransport::new()
                 .map_err(|e| e.to_string())
                 .and_then(|http| {
                     isyncyou_agent::oauth::codex_exchange(&http, &cfg, &code, &verifier)
                         .map_err(|e| e.to_string())
                 }) {
                 Ok(tok) => {
-                    diagnostics.exchange_succeeded = true;
                     let expires_at_ms = if tok.expires_in > 0 {
                         now_ms() + tok.expires_in * 1000
                     } else {
                         0
                     };
-                    diagnostics.credential_stored = store_codex_blob(
+                    store_codex_blob(
                         &oauth_dir,
                         &CodexStoredCredential {
                             access_token: tok.access_token,
@@ -1233,18 +1178,16 @@ fn codex_callback_serve(
                             expires_at_ms,
                         },
                     )
-                    .is_ok();
-                    diagnostics.credential_stored
+                    .is_ok()
                 }
                 Err(_) => false,
             }
         } else {
             false
         };
-        write_codex_callback_diagnostics(&oauth_dir, &diagnostics);
         let body = if ok { CODEX_OK_HTML } else { CODEX_ERR_HTML };
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -1518,17 +1461,8 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
         }
         let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
-        let mut addresses =
-            isyncyou_agent::http::doh_resolve("auth.openai.com").unwrap_or_default();
-        if addresses.is_empty() {
-            addresses = vec![
-                std::net::IpAddr::from([104, 18, 41, 241]),
-                std::net::IpAddr::from([172, 64, 146, 15]),
-            ];
-        }
-        let http =
-            isyncyou_agent::http::HttpTransport::new_resolving("auth.openai.com", &addresses)
-                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let http = isyncyou_agent::http::HttpTransport::new()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         let refreshed =
             isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
                 .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
@@ -6532,61 +6466,6 @@ mod tests {
         assert_eq!(loaded.client_id, official.client_id);
         assert_eq!(loaded.scopes, official.scopes);
         assert_eq!(loaded.manual_redirect_url, official.manual_redirect_url);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(any(
-        feature = "agent-oauth-providers",
-        feature = "agent-subscription-experimental"
-    ))]
-    #[test]
-    fn codex_callback_diagnostics_persist_only_safe_booleans() {
-        let root = apphost_credential_test_root("codex-safe-callback-diagnostics");
-        std::fs::create_dir_all(&root).unwrap();
-        write_codex_callback_diagnostics(
-            &root,
-            &CodexCallbackDiagnostics {
-                callback_received: true,
-                state_present: true,
-                code_present: true,
-                state_matches: false,
-                exchange_attempted: false,
-                exchange_succeeded: false,
-                credential_stored: false,
-            },
-        );
-
-        let bytes = std::fs::read(root.join(CODEX_CALLBACK_DIAGNOSTICS_FILE)).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let keys = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            keys,
-            [
-                "callback_received",
-                "code_present",
-                "credential_stored",
-                "exchange_attempted",
-                "exchange_succeeded",
-                "state_matches",
-                "state_present",
-            ]
-            .into_iter()
-            .collect()
-        );
-        assert!(value
-            .as_object()
-            .unwrap()
-            .values()
-            .all(|value| value.is_boolean()));
-        let text = String::from_utf8(bytes).unwrap();
-        for forbidden in ["/auth/callback", "code=", "state=", "target=", "error"] {
-            assert!(!text.contains(forbidden));
-        }
         let _ = std::fs::remove_dir_all(root);
     }
 
