@@ -20,6 +20,31 @@ const MAX_MODEL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 256 * 1024;
 const SCOPE: &str = "local_cli_drift_only_not_product_auth";
 
+// These are the exact headers present on the provider request at the wire boundary.
+// Keep them aligned with the provider builders: Codex's HTTP client adds content-type
+// through `.json()`, while every other entry is emitted by `request_headers()`.
+const CLAUDE_REQUIRED_WIRE_HEADERS: &[&str] = &[
+    "accept",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "anthropic-version",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-app",
+    "x-claude-code-session-id",
+];
+const CODEX_REQUIRED_WIRE_HEADERS: &[&str] = &[
+    "accept",
+    "authorization",
+    "chatgpt-account-id",
+    "content-type",
+    "openai-beta",
+    "originator",
+    "user-agent",
+];
+const TRANSPORT_HEADERS: &[&str] = &["accept-encoding", "connection", "content-length", "host"];
+
 const SHARED_USAGE_FIELDS: &[&str] = &["input_tokens", "output_tokens"];
 const CLAUDE_USAGE_FIELDS: &[&str] = &[
     "cache_creation_input_tokens",
@@ -321,17 +346,6 @@ pub struct HeaderVisibility {
     pub stream_accept_present: bool,
 }
 
-impl HeaderVisibility {
-    fn any(&self) -> bool {
-        self.authorization_present
-            || self.billing_identity_present
-            || self.account_identity_present
-            || self.client_identity_present
-            || self.protocol_version_present
-            || self.stream_accept_present
-    }
-}
-
 #[derive(Debug, Default, Serialize)]
 pub struct WireVisibility {
     pub endpoint_observed: bool,
@@ -359,6 +373,8 @@ struct ReductionState {
     hosts: BTreeSet<&'static str>,
     paths: BTreeSet<&'static str>,
     headers: HeaderVisibility,
+    exact_headers: BTreeSet<&'static str>,
+    claude_billing_block_observed: bool,
     sentinel_observed: bool,
     structured_debug_observed: bool,
     review: ReviewMarkers,
@@ -429,8 +445,8 @@ pub fn reduce_capture(options: &DriftCaptureOptions) -> Result<DriftSummary, Dri
     }
 
     let model_catalog = inspect_model_catalogs(options)?;
-    let headers_observed = state.headers.any();
-    let endpoint_observed = !state.hosts.is_empty() && !state.paths.is_empty();
+    let headers_observed = complete_wire_identity_observed(options.provider, &state);
+    let endpoint_observed = expected_endpoint_observed(options.provider, &state);
     state.review.version = version != options.provider.compatibility_version();
     let drift_decision = if state.review.requires_update() {
         DriftDecision::ImplementationUpdateRequired
@@ -465,6 +481,35 @@ pub fn reduce_capture(options: &DriftCaptureOptions) -> Result<DriftSummary, Dri
         raw_retained: false,
         review: state.review,
     })
+}
+
+fn required_wire_headers(provider: CaptureProvider) -> &'static [&'static str] {
+    match provider {
+        CaptureProvider::Claude => CLAUDE_REQUIRED_WIRE_HEADERS,
+        CaptureProvider::Codex => CODEX_REQUIRED_WIRE_HEADERS,
+    }
+}
+
+fn complete_wire_identity_observed(provider: CaptureProvider, state: &ReductionState) -> bool {
+    let headers_complete = required_wire_headers(provider)
+        .iter()
+        .all(|header| state.exact_headers.contains(header));
+    headers_complete
+        && match provider {
+            CaptureProvider::Claude => state.claude_billing_block_observed,
+            CaptureProvider::Codex => true,
+        }
+}
+
+fn expected_endpoint_observed(provider: CaptureProvider, state: &ReductionState) -> bool {
+    match provider {
+        CaptureProvider::Claude => {
+            state.hosts.contains("api.anthropic.com") && state.paths.contains("messages")
+        }
+        CaptureProvider::Codex => {
+            state.hosts.contains("chatgpt.com") && state.paths.contains("codex_responses")
+        }
+    }
 }
 
 pub fn write_summary_atomic(
@@ -527,6 +572,16 @@ fn read_bounded(
     path: &Path,
     max_bytes: u64,
 ) -> Result<String, DriftCaptureError> {
+    let link_metadata = fs::symlink_metadata(path)
+        .map_err(|_| DriftCaptureError::new(provider, role, None, "input unavailable"))?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(DriftCaptureError::new(
+            provider,
+            role,
+            None,
+            "symlink input rejected",
+        ));
+    }
     let canonical = fs::canonicalize(path)
         .map_err(|_| DriftCaptureError::new(provider, role, None, "input unavailable"))?;
     if !canonical.starts_with("/tmp") {
@@ -766,7 +821,15 @@ fn inspect_request_object(
     }
     if let Some(headers) = object.get("headers").and_then(Value::as_object) {
         for header in headers.keys() {
-            inspect_header(header, state);
+            inspect_header(provider, header, state);
+        }
+    }
+    if provider == CaptureProvider::Claude {
+        inspect_claude_billing_block(object, state);
+        for key in ["body", "json"] {
+            if let Some(body) = object.get(key).and_then(Value::as_object) {
+                inspect_claude_billing_block(body, state);
+            }
         }
     }
 }
@@ -805,20 +868,65 @@ fn inspect_url(provider: CaptureProvider, raw: &str, state: &mut ReductionState)
     state.paths.insert(path);
 }
 
-fn inspect_header(header: &str, state: &mut ReductionState) {
-    match header.to_ascii_lowercase().as_str() {
+fn inspect_header(provider: CaptureProvider, header: &str, state: &mut ReductionState) {
+    let normalized = header.to_ascii_lowercase();
+    if TRANSPORT_HEADERS.contains(&normalized.as_str()) {
+        return;
+    }
+    let Some(required) = required_wire_headers(provider)
+        .iter()
+        .copied()
+        .find(|required| *required == normalized.as_str())
+    else {
+        state.review.header = true;
+        return;
+    };
+    state.exact_headers.insert(required);
+    match required {
         "authorization" => state.headers.authorization_present = true,
-        "x-anthropic-billing-header" => state.headers.billing_identity_present = true,
         "chatgpt-account-id" => state.headers.account_identity_present = true,
         "user-agent" | "x-app" | "x-claude-code-session-id" | "originator" => {
-            state.headers.client_identity_present = true
+            state.headers.client_identity_present = true;
         }
-        "anthropic-version" | "anthropic-beta" | "openai-beta" | "content-type" => {
-            state.headers.protocol_version_present = true
-        }
+        "anthropic-version"
+        | "anthropic-beta"
+        | "anthropic-dangerous-direct-browser-access"
+        | "openai-beta"
+        | "content-type" => state.headers.protocol_version_present = true,
         "accept" => state.headers.stream_accept_present = true,
-        "host" | "content-length" | "accept-encoding" | "connection" => {}
-        _ => state.review.header = true,
+        _ => {}
+    }
+}
+
+fn inspect_claude_billing_block(
+    object: &serde_json::Map<String, Value>,
+    state: &mut ReductionState,
+) {
+    let Some(system) = object.get("system") else {
+        return;
+    };
+    let Some(blocks) = system.as_array() else {
+        state.review.debug_shape = true;
+        return;
+    };
+    let Some(first_text) = blocks
+        .first()
+        .and_then(Value::as_object)
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+    else {
+        state.review.debug_shape = true;
+        return;
+    };
+    let expected = format!(
+        "x-anthropic-billing-header: cc_version={}.cab; cc_entrypoint=sdk-cli; cch=00000;",
+        CaptureProvider::Claude.compatibility_version()
+    );
+    if first_text == expected {
+        state.claude_billing_block_observed = true;
+        state.headers.billing_identity_present = true;
+    } else {
+        state.review.header = true;
     }
 }
 
@@ -962,6 +1070,71 @@ mod tests {
         serde_json::to_string(summary).unwrap()
     }
 
+    fn complete_claude_debug() -> Value {
+        serde_json::json!({
+            "request": {
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": CLAUDE_REQUIRED_WIRE_HEADERS
+                    .iter()
+                    .map(|header| ((*header).to_string(), Value::String("redacted".into())))
+                    .collect::<serde_json::Map<String, Value>>(),
+                "body": {
+                    "system": [{
+                        "type": "text",
+                        "text": format!(
+                            "x-anthropic-billing-header: cc_version={}.cab; cc_entrypoint=sdk-cli; cch=00000;",
+                            CaptureProvider::Claude.compatibility_version()
+                        )
+                    }]
+                }
+            }
+        })
+    }
+
+    fn complete_codex_debug() -> Value {
+        serde_json::json!({
+            "request": {
+                "url": "https://chatgpt.com/backend-api/codex/responses",
+                "headers": CODEX_REQUIRED_WIRE_HEADERS
+                    .iter()
+                    .map(|header| ((*header).to_string(), Value::String("redacted".into())))
+                    .collect::<serde_json::Map<String, Value>>()
+            }
+        })
+    }
+
+    fn options_with_debug(
+        dir: &Path,
+        provider: CaptureProvider,
+        debug: &Value,
+    ) -> DriftCaptureOptions {
+        let version = dir.join(format!("{}-version.txt", provider.name()));
+        let events = dir.join(format!("{}-events.jsonl", provider.name()));
+        let debug_file = dir.join(format!("{}-debug.json", provider.name()));
+        let (version_text, event_text) = match provider {
+            CaptureProvider::Claude => (
+                "2.1.207 (Claude Code)\n",
+                r#"{"type":"assistant","message":{"text":"issue-627-controlled-sentinel"}}"#,
+            ),
+            CaptureProvider::Codex => (
+                "codex-cli 0.144.1\n",
+                r#"{"type":"item.completed","item":{"text":"issue-627-controlled-sentinel"}}"#,
+            ),
+        };
+        write_private(&version, version_text);
+        write_private(&events, event_text);
+        write_private(&debug_file, &serde_json::to_string(debug).unwrap());
+        DriftCaptureOptions {
+            provider,
+            version_file: version,
+            event_file: events,
+            debug_file: Some(debug_file),
+            model_catalog: None,
+            bundled_model_catalog: None,
+            expected_sentinel: "issue-627-controlled-sentinel".into(),
+        }
+    }
+
     #[test]
     fn experimental_capture_redacts_authorization_and_account_ids() {
         let dir = fixture_dir();
@@ -1027,8 +1200,24 @@ mod tests {
 
         let error = reduce_capture(&options).unwrap_err().to_string();
 
-        assert!(error.contains("outside temporary root"));
+        assert!(error.contains("symlink input rejected"));
         assert!(!error.contains("hosts"));
+    }
+
+    #[test]
+    fn experimental_capture_rejects_symlink_within_tmp() {
+        let dir = fixture_dir();
+        let target = dir.path().join("private-version");
+        let link = dir.path().join("private-version-link");
+        write_private(&target, "2.1.207 (Claude Code)\n");
+        symlink(&target, &link).unwrap();
+        let mut options = claude_options(dir.path(), "{\"type\":\"assistant\"}");
+        options.version_file = link;
+
+        let error = reduce_capture(&options).unwrap_err().to_string();
+
+        assert!(error.contains("symlink input rejected"));
+        assert!(!error.contains("private-version"));
     }
 
     #[test]
@@ -1135,6 +1324,195 @@ mod tests {
         assert!(!text.contains("req-value"));
         assert!(!text.contains("sess-value"));
         assert!(!text.contains("thread-value"));
+    }
+
+    #[test]
+    fn experimental_capture_complete_claude_wire_is_no_drift() {
+        let dir = fixture_dir();
+        let summary = reduce_capture(&options_with_debug(
+            dir.path(),
+            CaptureProvider::Claude,
+            &complete_claude_debug(),
+        ))
+        .unwrap();
+
+        assert!(summary.wire.headers_observed);
+        assert!(summary.wire.headers.billing_identity_present);
+        assert_eq!(summary.drift_decision, DriftDecision::NoDrift);
+    }
+
+    #[test]
+    fn experimental_capture_complete_codex_wire_is_no_drift() {
+        let dir = fixture_dir();
+        let summary = reduce_capture(&options_with_debug(
+            dir.path(),
+            CaptureProvider::Codex,
+            &complete_codex_debug(),
+        ))
+        .unwrap();
+
+        assert!(summary.wire.headers_observed);
+        assert!(summary.wire.headers.account_identity_present);
+        assert_eq!(summary.drift_decision, DriftDecision::NoDrift);
+    }
+
+    #[test]
+    fn experimental_capture_required_headers_match_runtime_builders() {
+        let claude = crate::provider::subscription::SubscriptionProvider::new(
+            "token",
+            "model",
+            "system",
+            crate::provider::subscription::SubscriptionConfig::default(),
+        )
+        .unwrap();
+        let mut claude_headers = claude
+            .request_headers()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        claude_headers.sort();
+        assert_eq!(
+            claude_headers,
+            CLAUDE_REQUIRED_WIRE_HEADERS
+                .iter()
+                .map(|header| (*header).to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let codex = crate::provider::codex::CodexProvider::new(
+            "token",
+            "instructions",
+            crate::provider::codex::CodexConfig {
+                account_id: "account".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut codex_headers = codex
+            .request_headers()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        codex_headers.push("content-type".into());
+        codex_headers.sort();
+        assert_eq!(
+            codex_headers,
+            CODEX_REQUIRED_WIRE_HEADERS
+                .iter()
+                .map(|header| (*header).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn experimental_capture_authorization_only_is_not_safely_observable() {
+        let dir = fixture_dir();
+        let debug = serde_json::json!({
+            "request": {
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": {"authorization": "redacted"}
+            }
+        });
+        let summary = reduce_capture(&options_with_debug(
+            dir.path(),
+            CaptureProvider::Claude,
+            &debug,
+        ))
+        .unwrap();
+
+        assert!(summary.wire.headers.authorization_present);
+        assert!(!summary.wire.headers_observed);
+        assert_eq!(summary.drift_decision, DriftDecision::NotSafelyObservable);
+    }
+
+    #[test]
+    fn experimental_capture_each_missing_claude_header_is_not_safely_observable() {
+        for missing in CLAUDE_REQUIRED_WIRE_HEADERS {
+            let dir = fixture_dir();
+            let mut debug = complete_claude_debug();
+            debug["request"]["headers"]
+                .as_object_mut()
+                .unwrap()
+                .remove(*missing);
+
+            let summary = reduce_capture(&options_with_debug(
+                dir.path(),
+                CaptureProvider::Claude,
+                &debug,
+            ))
+            .unwrap();
+
+            assert!(!summary.wire.headers_observed, "missing {missing}");
+            assert_eq!(
+                summary.drift_decision,
+                DriftDecision::NotSafelyObservable,
+                "missing {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_capture_each_missing_codex_header_is_not_safely_observable() {
+        for missing in CODEX_REQUIRED_WIRE_HEADERS {
+            let dir = fixture_dir();
+            let mut debug = complete_codex_debug();
+            debug["request"]["headers"]
+                .as_object_mut()
+                .unwrap()
+                .remove(*missing);
+
+            let summary = reduce_capture(&options_with_debug(
+                dir.path(),
+                CaptureProvider::Codex,
+                &debug,
+            ))
+            .unwrap();
+
+            assert!(!summary.wire.headers_observed, "missing {missing}");
+            assert_eq!(
+                summary.drift_decision,
+                DriftDecision::NotSafelyObservable,
+                "missing {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_capture_missing_claude_billing_block_is_not_safely_observable() {
+        let dir = fixture_dir();
+        let mut debug = complete_claude_debug();
+        debug["request"].as_object_mut().unwrap().remove("body");
+
+        let summary = reduce_capture(&options_with_debug(
+            dir.path(),
+            CaptureProvider::Claude,
+            &debug,
+        ))
+        .unwrap();
+
+        assert!(!summary.wire.headers.billing_identity_present);
+        assert!(!summary.wire.headers_observed);
+        assert_eq!(summary.drift_decision, DriftDecision::NotSafelyObservable);
+    }
+
+    #[test]
+    fn experimental_capture_unexpected_header_requires_implementation_update() {
+        let dir = fixture_dir();
+        let mut debug = complete_codex_debug();
+        debug["request"]["headers"]["x-new-provider-identity"] = Value::String("redacted".into());
+
+        let summary = reduce_capture(&options_with_debug(
+            dir.path(),
+            CaptureProvider::Codex,
+            &debug,
+        ))
+        .unwrap();
+
+        assert_eq!(summary.manual_review_categories(), vec!["header"]);
+        assert_eq!(
+            summary.drift_decision,
+            DriftDecision::ImplementationUpdateRequired
+        );
     }
 
     #[test]
