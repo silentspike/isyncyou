@@ -7819,4 +7819,43 @@ mod tests {
         )
         .is_err());
     }
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn network_snapshot_hook_forces_redacted_preflight_failure_before_transport() {
+        let root = apphost_credential_test_root("network-hook-preflight");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let snapshot = isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: isyncyou_agent::RestrictBackgroundStatus::Disabled,
+            notifications_visible: true,
+            guard_ready: true,
+        };
+        let id = register_mobile_connectivity_snapshot(
+            "hook-session-preflight",
+            "hook-guard-preflight",
+            "oauth",
+            snapshot,
+            Some("tls_failed"),
+        )
+        .expect("hook snapshot is registered");
+        let response = agent
+            .connectivity_preflight_with_session(
+                isyncyou_webui::AgentConnectivityPreflightRequest {
+                    provider: "claude".into(),
+                    purpose: "oauth_start".into(),
+                    snapshot_id: Some(id),
+                },
+                Some("hook-session-preflight"),
+            )
+            .expect("forced diagnostic returns a closed response");
+        assert_eq!(response.status, "unavailable");
+        assert_eq!(response.code, "tls_failed");
+        assert!(!response.retryable);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -19,8 +19,14 @@ enum class NetworkDeviceTestHook(val wire: String) {
             if (!NativeEngine.nativeNetworkDeviceHooksEnabled()) {
                 null
             } else {
-                values().firstOrNull {
-                    it.wire == NativeEngine.nativeTakeNetworkDeviceTestHook(context.filesDir.absolutePath)
+                // `filesDir` is app-private but can be lazily created on a fresh install.
+                // Create only that fixed directory before native code opens the fixed hook file.
+                if (!context.filesDir.exists() && !context.filesDir.mkdirs()) {
+                    null
+                } else {
+                    values().firstOrNull {
+                        it.wire == NativeEngine.nativeTakeNetworkDeviceTestHook(context.filesDir.absolutePath)
+                    }
                 }
             }
         } catch (_: UnsatisfiedLinkError) {
