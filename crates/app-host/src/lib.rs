@@ -769,6 +769,7 @@ impl DaemonAgent {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[derive(Clone)]
 struct StoredCredential {
     access_token: String,
     refresh_token: String,
@@ -819,11 +820,187 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// #639: the current schema version of a persisted product credential blob. A blob without it
+/// (a legacy token-only blob from before #639) is treated as un-migratable and forces reconnect.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const PRODUCT_CREDENTIAL_SCHEMA_VERSION: u32 = 2;
+
+/// #639: whether a persisted product credential is usable, or has been marked (fail-closed) as
+/// requiring a fresh official OAuth. A failed refresh persists `ReconnectRequired` so the next
+/// status read reports reconnect rather than re-attempting a refresh in a loop.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialLifecycle {
+    Active,
+    ReconnectRequired { closed_code: String },
+}
+
+/// #639: the non-token metadata bound to a persisted product credential bundle (V2). It carries
+/// the identity of the credential (`generation`), the official-OAuth policy it was minted under
+/// (`policy_fingerprint`), and its `lifecycle`. `generation` is minted once at login and preserved
+/// across refresh; a credential identity change rotates it via a fresh login only.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProductBundleMeta {
+    generation: String,
+    policy_fingerprint: String,
+    lifecycle: CredentialLifecycle,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl ProductBundleMeta {
+    /// Fresh metadata for a brand-new login: a new random generation, the current official policy
+    /// fingerprint for `provider`, and an `Active` lifecycle.
+    fn fresh(provider: ProductProviderId) -> Self {
+        Self {
+            generation: uuid_v4(),
+            policy_fingerprint: oauth_policy_fingerprint(provider),
+            lifecycle: CredentialLifecycle::Active,
+        }
+    }
+
+    /// Merge these metadata keys into a token-only JSON object (`token_json`) to form the V2 blob.
+    /// Returns the token blob unchanged (best-effort) only if it is not a JSON object.
+    fn to_blob(&self, token_json: Vec<u8>) -> Vec<u8> {
+        let mut v: serde_json::Value = match serde_json::from_slice(&token_json) {
+            Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+            _ => return token_json,
+        };
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "schema_version".into(),
+                serde_json::json!(PRODUCT_CREDENTIAL_SCHEMA_VERSION),
+            );
+            obj.insert(
+                "credential_generation".into(),
+                serde_json::json!(self.generation),
+            );
+            obj.insert(
+                "oauth_policy_fingerprint".into(),
+                serde_json::json!(self.policy_fingerprint),
+            );
+            let (lifecycle, code) = match &self.lifecycle {
+                CredentialLifecycle::Active => ("active", String::new()),
+                CredentialLifecycle::ReconnectRequired { closed_code } => {
+                    ("reconnect_required", closed_code.clone())
+                }
+            };
+            obj.insert("lifecycle".into(), serde_json::json!(lifecycle));
+            obj.insert("reconnect_code".into(), serde_json::json!(code));
+        }
+        serde_json::to_vec(&v).unwrap_or(token_json)
+    }
+
+    /// Parse the V2 metadata from a stored blob. `None` for a legacy/incomplete blob (missing the
+    /// schema version or the generation) — the caller treats that as un-migratable → reconnect.
+    fn from_blob(raw: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        if v.get("schema_version").and_then(|x| x.as_u64())
+            != Some(PRODUCT_CREDENTIAL_SCHEMA_VERSION as u64)
+        {
+            return None;
+        }
+        let generation = v.get("credential_generation")?.as_str()?.to_string();
+        if generation.is_empty() {
+            return None;
+        }
+        let policy_fingerprint = v
+            .get("oauth_policy_fingerprint")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let lifecycle = match v
+            .get("lifecycle")
+            .and_then(|x| x.as_str())
+            .unwrap_or("active")
+        {
+            "active" => CredentialLifecycle::Active,
+            _ => CredentialLifecycle::ReconnectRequired {
+                closed_code: v
+                    .get("reconnect_code")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("reconnect_required")
+                    .to_string(),
+            },
+        };
+        Some(Self {
+            generation,
+            policy_fingerprint,
+            lifecycle,
+        })
+    }
+}
+
+/// #639: a random RFC-4122 v4 UUID string (from the crypto RNG) — the credential generation id.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn uuid_v4() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut b = [0u8; 16];
+    if SystemRandom::new().fill(&mut b).is_err() {
+        // Fail closed to a clearly-invalid, non-empty id rather than a guessable constant.
+        b = *b"isyncyou-rngbad!";
+    }
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
+}
+
+/// #639: a stable fingerprint of the compiled official OAuth policy tuple for `provider`
+/// (authorize/token endpoints, client id, redirect, scopes). Binding it into the activation record
+/// means a credential minted under a different (e.g. overridden) policy can never read as ready.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn oauth_policy_fingerprint(provider: ProductProviderId) -> String {
+    let tuple = match provider {
+        ProductProviderId::Claude => {
+            let c = isyncyou_agent::oauth::OAuthConfig::default();
+            format!(
+                "claude|{}|{}|{}|{}|{}",
+                c.authorize_url,
+                c.token_url,
+                c.client_id,
+                c.manual_redirect_url,
+                c.scopes.join(",")
+            )
+        }
+        ProductProviderId::Codex => {
+            let c = isyncyou_agent::oauth::CodexOAuthConfig::default();
+            format!(
+                "codex|{}|{}|{}|{}|{}",
+                c.authorize_url, c.token_url, c.client_id, c.redirect_uri, c.scope
+            )
+        }
+    };
+    let d = ring::digest::digest(&ring::digest::SHA256, tuple.as_bytes());
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The Codex/ChatGPT credential we persist (access + refresh + ChatGPT account id + expiry).
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[derive(Clone)]
 struct CodexStoredCredential {
     access_token: String,
     refresh_token: String,
@@ -1123,6 +1300,10 @@ fn complete_codex_refresh(
     };
     let account_id = if refreshed.account_id.is_empty() {
         current.account_id
+    } else if refreshed.account_id != current.account_id {
+        // #639: the ChatGPT account identity changed under a refresh — never silently switch or
+        // rotate the credential; force a fresh official OAuth (reconnect).
+        return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
     } else {
         refreshed.account_id
     };
@@ -1272,7 +1453,38 @@ fn load_agent_credential_blob(
     feature = "agent-subscription-experimental"
 ))]
 fn store_codex_blob(oauth_dir: &Path, cred: &CodexStoredCredential) -> Result<(), String> {
-    store_agent_credential_blob(oauth_dir, CODEX_CREDENTIAL_ID, cred.to_json())
+    // A bare `store_codex_blob` is a fresh login: mint a new generation (#639).
+    store_codex_bundle(
+        oauth_dir,
+        cred,
+        &ProductBundleMeta::fresh(ProductProviderId::Codex),
+    )
+}
+
+/// Persist a Codex credential with explicit V2 metadata (#639) — used by refresh to preserve the
+/// credential `generation` and to persist a `ReconnectRequired` lifecycle fail-closed.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn store_codex_bundle(
+    oauth_dir: &Path,
+    cred: &CodexStoredCredential,
+    meta: &ProductBundleMeta,
+) -> Result<(), String> {
+    store_agent_credential_blob(oauth_dir, CODEX_CREDENTIAL_ID, meta.to_blob(cred.to_json()))
+}
+
+/// Load the V2 metadata for a persisted product credential (#639); `None` if absent or legacy.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn load_product_bundle_meta(oauth_dir: &Path, id: &str) -> Option<ProductBundleMeta> {
+    match load_agent_credential_blob(oauth_dir, id) {
+        Ok(Some(secret)) => ProductBundleMeta::from_blob(secret.expose()),
+        _ => None,
+    }
 }
 
 #[cfg(any(
@@ -1547,7 +1759,22 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// Persist a subscription credential (access + refresh + expiry) at rest under a
     /// device-local key, so the daemon can refresh the access token itself.
     fn store_credential(&self, cred: &StoredCredential) -> Result<(), String> {
-        store_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID, cred.to_json())
+        // A bare `store_credential` is a fresh login: mint a new generation (#639).
+        self.store_claude_bundle(cred, &ProductBundleMeta::fresh(ProductProviderId::Claude))
+    }
+
+    /// Persist a Claude credential with explicit V2 metadata (#639) — used by refresh to preserve
+    /// the credential `generation` and to persist a `ReconnectRequired` lifecycle fail-closed.
+    fn store_claude_bundle(
+        &self,
+        cred: &StoredCredential,
+        meta: &ProductBundleMeta,
+    ) -> Result<(), String> {
+        store_agent_credential_blob(
+            &self.oauth_dir,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(cred.to_json()),
+        )
     }
 
     /// Persist the FULL token set from the OAuth code exchange (access + refresh + expiry) so
@@ -1621,11 +1848,20 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn claude_product_credential_state(&self) -> ProductCredentialState<StoredCredential> {
         match load_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID) {
             Ok(None) => ProductCredentialState::Absent,
-            Ok(Some(secret)) => StoredCredential::from_json(secret.expose())
-                .map(|credential| {
-                    classify_claude_product_credential_at(credential, (self.credential_now_ms)())
-                })
-                .unwrap_or(ProductCredentialState::PresentInvalid),
+            Ok(Some(secret)) => {
+                // #639: a legacy/incomplete blob (no V2 meta) or one marked ReconnectRequired is
+                // un-migratable and fails closed to reconnect — no silent upgrade, no refresh loop.
+                match ProductBundleMeta::from_blob(secret.expose()) {
+                    Some(meta) if meta.lifecycle == CredentialLifecycle::Active => {
+                        StoredCredential::from_json(secret.expose())
+                            .map(|c| {
+                                classify_claude_product_credential_at(c, (self.credential_now_ms)())
+                            })
+                            .unwrap_or(ProductCredentialState::PresentInvalid)
+                    }
+                    _ => ProductCredentialState::PresentInvalid,
+                }
+            }
             Err(_) => ProductCredentialState::PresentInvalid,
         }
     }
@@ -1642,13 +1878,45 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         let http = isyncyou_agent::http::HttpTransport::shared()
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        let refreshed = isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        let refreshed_credential =
-            complete_claude_refresh(credential, refreshed, (self.credential_now_ms)())?;
-        self.store_credential(&refreshed_credential)
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        Ok(refreshed_credential)
+        // #639: a refresh is not a new login — preserve the credential generation.
+        let generation = load_product_bundle_meta(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
+            .map(|m| m.generation)
+            .unwrap_or_else(uuid_v4);
+        let policy_fingerprint = oauth_policy_fingerprint(ProductProviderId::Claude);
+        let outcome = isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
+            .and_then(|refreshed| {
+                complete_claude_refresh(credential.clone(), refreshed, (self.credential_now_ms)())
+            });
+        match outcome {
+            Ok(refreshed_credential) => {
+                self.store_claude_bundle(
+                    &refreshed_credential,
+                    &ProductBundleMeta {
+                        generation,
+                        policy_fingerprint,
+                        lifecycle: CredentialLifecycle::Active,
+                    },
+                )
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+                Ok(refreshed_credential)
+            }
+            Err(e) => {
+                // #639: persist ReconnectRequired (fail-closed) so the next status reports reconnect
+                // instead of re-attempting a refresh loop on the same expired credential.
+                let _ = self.store_claude_bundle(
+                    &credential,
+                    &ProductBundleMeta {
+                        generation,
+                        policy_fingerprint,
+                        lifecycle: CredentialLifecycle::ReconnectRequired {
+                            closed_code: "refresh_failed".into(),
+                        },
+                    },
+                );
+                Err(e)
+            }
+        }
     }
 
     fn experimental_claude_credential(
@@ -1745,11 +2013,19 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn codex_product_credential_state(&self) -> ProductCredentialState<CodexStoredCredential> {
         match load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID) {
             Ok(None) => ProductCredentialState::Absent,
-            Ok(Some(secret)) => CodexStoredCredential::from_json(secret.expose())
-                .map(|credential| {
-                    classify_codex_product_credential_at(credential, (self.credential_now_ms)())
-                })
-                .unwrap_or(ProductCredentialState::PresentInvalid),
+            Ok(Some(secret)) => {
+                // #639: legacy/incomplete or ReconnectRequired -> fail closed to reconnect.
+                match ProductBundleMeta::from_blob(secret.expose()) {
+                    Some(meta) if meta.lifecycle == CredentialLifecycle::Active => {
+                        CodexStoredCredential::from_json(secret.expose())
+                            .map(|c| {
+                                classify_codex_product_credential_at(c, (self.credential_now_ms)())
+                            })
+                            .unwrap_or(ProductCredentialState::PresentInvalid)
+                    }
+                    _ => ProductCredentialState::PresentInvalid,
+                }
+            }
             Err(_) => ProductCredentialState::PresentInvalid,
         }
     }
@@ -1764,14 +2040,51 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
         let http = isyncyou_agent::http::HttpTransport::shared()
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        let refreshed =
+        // #639: preserve the credential generation across a refresh (a refresh is not a new login).
+        let generation = load_product_bundle_meta(&self.oauth_dir, CODEX_CREDENTIAL_ID)
+            .map(|m| m.generation)
+            .unwrap_or_else(uuid_v4);
+        let policy_fingerprint = oauth_policy_fingerprint(ProductProviderId::Codex);
+        let outcome =
             isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
+                .and_then(|refreshed| {
+                    complete_codex_refresh(
+                        credential.clone(),
+                        refreshed,
+                        (self.credential_now_ms)(),
+                    )
+                });
+        match outcome {
+            Ok(refreshed_credential) => {
+                store_codex_bundle(
+                    &self.oauth_dir,
+                    &refreshed_credential,
+                    &ProductBundleMeta {
+                        generation,
+                        policy_fingerprint,
+                        lifecycle: CredentialLifecycle::Active,
+                    },
+                )
                 .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        let refreshed_credential =
-            complete_codex_refresh(credential, refreshed, (self.credential_now_ms)())?;
-        store_codex_blob(&self.oauth_dir, &refreshed_credential)
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        Ok(refreshed_credential)
+                Ok(refreshed_credential)
+            }
+            Err(e) => {
+                // #639: persist ReconnectRequired (fail-closed) — no refresh loop.
+                let _ = store_codex_bundle(
+                    &self.oauth_dir,
+                    &credential,
+                    &ProductBundleMeta {
+                        generation,
+                        policy_fingerprint,
+                        lifecycle: CredentialLifecycle::ReconnectRequired {
+                            closed_code: "refresh_failed".into(),
+                        },
+                    },
+                );
+                Err(e)
+            }
+        }
     }
 
     fn experimental_codex_credential(
@@ -7199,6 +7512,124 @@ mod tests {
         assert_eq!(status["credential_state"]["codex"], "refresh_required");
         assert_eq!(status["provider"], "codex");
         assert_eq!(status["connected"], true);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_refresh_identity_change_requires_reconnect() {
+        let current = CodexStoredCredential {
+            access_token: "old".into(),
+            refresh_token: "r".into(),
+            account_id: "acct_original".into(),
+            expires_at_ms: 1,
+        };
+        let refreshed = isyncyou_agent::oauth::CodexTokens {
+            access_token: "new".into(),
+            refresh_token: "r2".into(),
+            account_id: "acct_DIFFERENT".into(),
+            expires_in: 3600,
+        };
+        // a changed ChatGPT account id under refresh must force reconnect, never silently switch.
+        assert!(matches!(
+            complete_codex_refresh(current, refreshed, 1000),
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        ));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn refresh_keeps_generation_and_is_not_an_onboarding_event() {
+        // Each login mints a fresh generation; re-persisting with explicit meta (the refresh path)
+        // preserves it. There is no journal write here — a refresh is a credential-lifecycle event.
+        let g1 = ProductBundleMeta::fresh(ProductProviderId::Claude).generation;
+        let g2 = ProductBundleMeta::fresh(ProductProviderId::Claude).generation;
+        assert_ne!(g1, g2, "each login mints a new generation");
+        let meta = ProductBundleMeta {
+            generation: g1.clone(),
+            policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
+            lifecycle: CredentialLifecycle::Active,
+        };
+        let blob = meta.to_blob(
+            StoredCredential {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at_ms: 9,
+            }
+            .to_json(),
+        );
+        let back = ProductBundleMeta::from_blob(&blob).unwrap();
+        assert_eq!(back.generation, g1, "refresh preserves the generation");
+        assert_eq!(back.lifecycle, CredentialLifecycle::Active);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn failed_refresh_drops_readiness_without_relogin_journal() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("failed-refresh-reconnect");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        // What a failed refresh persists: a ReconnectRequired lifecycle over a still-present token.
+        agent
+            .store_claude_bundle(
+                &StoredCredential {
+                    access_token: "tok".into(),
+                    refresh_token: "r".into(),
+                    expires_at_ms: u64::MAX,
+                },
+                &ProductBundleMeta {
+                    generation: uuid_v4(),
+                    policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
+                    lifecycle: CredentialLifecycle::ReconnectRequired {
+                        closed_code: "refresh_failed".into(),
+                    },
+                },
+            )
+            .unwrap();
+        // Readiness drops to reconnect (PresentInvalid), not refresh_required — no refresh loop.
+        assert!(matches!(
+            agent.claude_product_credential_state(),
+            ProductCredentialState::PresentInvalid
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn legacy_blob_without_v2_meta_reads_reconnect() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("legacy-blob-reconnect");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        // A pre-#639 token-only blob (no schema_version/generation) is un-migratable -> reconnect.
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            StoredCredential {
+                access_token: "tok".into(),
+                refresh_token: "r".into(),
+                expires_at_ms: u64::MAX,
+            }
+            .to_json(),
+        )
+        .unwrap();
+        assert!(matches!(
+            agent.claude_product_credential_state(),
+            ProductCredentialState::PresentInvalid
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
