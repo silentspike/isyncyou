@@ -1911,26 +1911,6 @@ enum ResolvedProviderCredential {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[cfg(test)]
-impl ResolvedProviderCredential {
-    fn satisfies_product_harness_readiness(&self) -> bool {
-        matches!(
-            self,
-            Self::Claude {
-                origin: ProviderCredentialOrigin::ProductCredentialStore,
-                ..
-            } | Self::Codex {
-                origin: ProviderCredentialOrigin::ProductCredentialStore,
-                ..
-            }
-        )
-    }
-}
-
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderCredentialResolutionError {
     ProductReconnectRequired,
@@ -8199,7 +8179,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(!resolved.satisfies_product_harness_readiness());
+        // #639: an experimental local-CLI credential never satisfies product readiness.
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8221,8 +8202,15 @@ mod tests {
             .unwrap();
 
         let resolved = agent.resolve_claude_credential().unwrap();
-
-        assert!(resolved.satisfies_product_harness_readiness());
+        assert!(matches!(
+            resolved,
+            ResolvedProviderCredential::Claude {
+                origin: ProviderCredentialOrigin::ProductCredentialStore,
+                ..
+            }
+        ));
+        // #639: readiness is the durable activation authority (provider_ready), not credential origin.
+        assert!(agent.provider_ready(ProductProviderId::Claude));
         let _ = std::fs::remove_dir_all(root);
     }
 
