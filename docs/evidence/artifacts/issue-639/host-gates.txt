@@ -1,0 +1,41 @@
+#639 S-AG.14 — host verification gates (remote build server, feature/ag-639)
+Pinned implementation commit: d5bee49 (see docs/evidence/issue-639-manifest.json)
+
+All commands run via `cargo remote -c` / `cargo-remote-fmt` (rustbuild), Node locally.
+
+GATE RESULTS
+------------
+cargo remote -c -- test --workspace --no-fail-fast .......... PASS (1296 passed, 0 failed)
+cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers ... PASS (198 passed)
+cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers ...... PASS (146 passed)
+cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental PASS (142 passed)
+cargo remote -c -- test -p isyncyou-webui .......................................... PASS (207 passed)
+cargo remote -c -- clippy --workspace --all-targets -- -D warnings ................. PASS
+cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings ......... PASS
+cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings PASS
+cargo remote -c -- clippy -p isyncyou-webui --all-targets -- -D warnings ........... PASS
+cargo remote -c -- clippy -p isyncyou-mobile --all-targets --no-default-features -- -D warnings ... PASS (was pre-existing-broken on base; fixed in d5bee49)
+cargo-remote-fmt --check .......................................................... CLEAN (CI fmt will pass)
+node --check gui/webui/src/app.js / tools/agent-ui-smoke.mjs / tools/agent-wizard-smoke.mjs .... OK
+node tools/agent-wizard-smoke.mjs ................................................. PASS (11/11 assertions)
+bash tools/verify-agent-experimental-boundary.sh feature-matrix ................... PASS
+bash tools/verify-agent-experimental-boundary.sh public-surface ................... PASS
+bash tools/verify-agent-experimental-boundary.sh release-exclusion ................ PASS (default APK sha256 bab36ef09b50027b9a0374387f9faa74dcae27a58ca259e9c3d3ddbb6b28defb; no experimental markers)
+cargo deny check .................................................................. PASS (advisories/bans/licenses/sources ok; only pre-existing duplicate warnings)
+gitleaks git --no-banner --redact ................................................. PASS (no leaks found)
+python3 tools/check_traceability.py ............................................... PASS (70 total, 1 planned = REQ-AGENT-014)
+
+ENVIRONMENT LIMITATIONS (documented honestly; not #639 acceptance blockers)
+---------------------------------------------------------------------------
+- Digest-pinned semgrep (semgrep/semgrep@sha256:a265d09a9ca712e6624aca09056304ce4314a695b7028d65c041dd53fd44c700
+  scan --config p/javascript --config p/kotlin --config p/secrets --config p/security-audit
+  --error --metrics=off gui/webui android): NOT RUN — the Docker daemon is unavailable in this
+  sandbox (`dial unix /var/run/docker.sock: no such file or directory`). Secret-safety of the new
+  JS is instead covered by gitleaks (no leaks) and the wizard-smoke DOM/localStorage/sessionStorage/
+  console scan (no secrets); to be run in CI where Docker is available.
+- Android default-APK unit/lint/instrumentation (`env -u ISY_CARGO_FEATURES ./gradlew clean
+  :app:testDebugUnitTest :app:lintDebug :app:assembleDebug` and connectedDebugAndroidTest): the
+  default APK is built by the release-exclusion gate above (sha recorded); the full Gradle
+  unit/lint/instrumentation + on-device handoff is the S-AG.14 device task (T14). #639 is a
+  host-first change (agent/app-host/webui); the mobile default build (features = agent-oauth-providers)
+  compiles and ships.

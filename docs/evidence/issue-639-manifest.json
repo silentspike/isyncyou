@@ -1,0 +1,165 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-13T16:10:54Z",
+  "commit": "d5bee49d8daaa653bad3cb6941e7bf61d30d304c",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Every provider round attests the request built from its current history.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "every_provider_round_attests_its_current_history",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/harness-boundary.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The SSE transport accepts only an attested provider request.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "transport_accepts_only_attested_provider_request",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/harness-boundary.txt"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A mutated header/body fails re-attestation and cannot reach the wire.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "attestation_cannot_be_reused_after_header_or_body_mutation",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/harness-boundary.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The retained provider-identity envelope keeps only the required fields.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "product_harness_retains_only_required_provider_identity_fields",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/harness-boundary.txt"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A not-ready product turn returns a closed 409 and creates no turn state.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "product_not_ready_returns_409_without_creating_turn_state",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/onboarding-state-trace.txt"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The gate never falls back to a non-selected (even ready) provider.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "invalid_selected_provider_never_falls_back",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/onboarding-state-trace.txt"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-014",
+      "claim": "An experimental local-CLI credential never sets product readiness.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental",
+      "test": "experimental_credential_never_sets_product_readiness",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/credential-store-proof.txt"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Official OAuth precedes credential encryption which precedes the harness transformation and ready.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "official_oauth_precedes_credential_encryption_and_harness_transformation",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/onboarding-state-trace.txt"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Startup recovery activates the existing generation without a re-exchange.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "crash_after_credential_write_resumes_activation_without_reexchange",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/onboarding-state-trace.txt"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-014",
+      "claim": "An interrupted attempt becomes error_redacted and is never resumed.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "interrupted_oauth_attempt_records_error_redacted",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/onboarding-state-trace.txt"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Completion and status share the product-runtime gate (no cross-revision read).",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "completion_and_status_share_the_product_runtime_gate",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/onboarding-state-trace.txt"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The status onboarding projection survives journal TTL from the durable activation.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "status_projection_correct_after_journal_ttl_expiry",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/onboarding-state-trace.txt"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-014",
+      "claim": "/oauth/complete is attempt-state-bound and Claude-only.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "oauth_complete_rejects_wrong_attempt_state_and_codex",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/credential-store-proof.txt"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A non-official OAuth policy override cannot satisfy the official handoff.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "product_oauth_override_cannot_satisfy_official_handoff",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/credential-store-proof.txt"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The first-run handoff wizard renders the ordered 8 steps and leaks no secret to the DOM/storage/console.",
+      "method": "command",
+      "command": "node tools/agent-wizard-smoke.mjs",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/wizard-smoke.json"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-014",
+      "claim": "All host gates (workspace test/clippy, feature/experimental/webui suites, fmt, boundary matrix, cargo deny, gitleaks, traceability) pass.",
+      "method": "command",
+      "command": "see host-gates.txt",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/host-gates.txt"
+    }
+  ]
+}
