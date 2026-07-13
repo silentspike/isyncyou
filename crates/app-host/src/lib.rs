@@ -963,16 +963,24 @@ impl DaemonAgent {
     ))]
     fn provider_onboarding(&self, provider: ProductProviderId) -> serde_json::Value {
         let (state, completed) = if self.provider_ready(provider) {
+            // Ready: all steps complete, derived from the durable activation (survives journal TTL).
             ("ready", ONBOARDING_SUCCESS_CHAIN.len())
-        } else if self.has_active_attempt(provider) {
-            ("in_progress", 0)
         } else {
             match self
                 .product_credential_status(provider.wire())
                 .unwrap_or("reconnect_required")
             {
                 "reconnect_required" | "refresh_required" => ("reconnect_required", 0),
-                _ => ("not_started", 0),
+                _ => {
+                    // #639 (F5): the in-progress step count is JOURNAL-DRIVEN — how many ordered
+                    // success-chain transitions the (TTL-bounded) journal has actually recorded.
+                    let completed = self.journal_completed_success_steps(provider);
+                    if self.has_active_attempt(provider) || completed > 0 {
+                        ("in_progress", completed)
+                    } else {
+                        ("not_started", 0)
+                    }
+                }
             }
         };
         let steps: Vec<serde_json::Value> = ONBOARDING_SUCCESS_CHAIN
@@ -981,6 +989,31 @@ impl DaemonAgent {
             .map(|(i, step)| serde_json::json!({ "key": step.wire(), "complete": i < completed }))
             .collect();
         serde_json::json!({ "state": state, "steps": steps })
+    }
+
+    /// #639 (F5): count the ordered success-chain transitions the generation-keyed journal has
+    /// actually recorded (TTL-bounded) — the journal-driven basis for the in-progress step count.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn journal_completed_success_steps(&self, provider: ProductProviderId) -> usize {
+        let credential_id = match provider {
+            ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+            ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+        };
+        let Some(meta) = load_product_bundle_meta(&self.oauth_dir, credential_id) else {
+            return 0;
+        };
+        let store_id =
+            OnboardingAttemptJournalV1::journal_store_id_for_generation(&meta.generation);
+        let Some(journal) = load_onboarding_journal_at(&self.oauth_dir, &store_id) else {
+            return 0;
+        };
+        ONBOARDING_SUCCESS_CHAIN
+            .iter()
+            .filter(|s| journal.has_state(**s))
+            .count()
     }
 
     /// #639 T9: the full onboarding projection block for `status_json`. `selected_provider` is null
@@ -1443,6 +1476,15 @@ const MAX_JOURNAL_ENVELOPE_BYTES: usize = 98_304;
 ))]
 const MAX_JOURNAL_TRANSITIONS: usize = 32;
 
+/// #639 (F5): onboarding journal TTL — transitions older than 8 minutes are reaped on load, and an
+/// all-expired journal reads as absent (the journal is expiry/recovery/evidence only, never the
+/// readiness authority, so its expiry never affects a ready provider).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const ONBOARDING_JOURNAL_TTL_MS: u64 = 8 * 60 * 1000;
+
 /// #639: the ordered product onboarding states (monotonic within one setup attempt). Ordering is
 /// proven by recorded transitions in the journal, not by an ordinal — `ErrorRedacted` is a terminal
 /// transition, never a "highest" state.
@@ -1608,6 +1650,9 @@ struct OnboardingTransition {
     state: ProductOnboardingState,
     generation: String,
     error_code: Option<String>,
+    /// #639 (F5): ms since the Unix epoch when this transition was recorded — drives the 8-min
+    /// journal TTL (the reaper drops transitions older than that on load).
+    recorded_at_ms: u64,
 }
 
 /// The bounded, authenticated per-attempt onboarding transition journal (#639). It is for expiry,
@@ -1676,6 +1721,7 @@ impl OnboardingAttemptJournalV1 {
                     "state": t.state.wire(),
                     "generation": t.generation,
                     "error_code": t.error_code,
+                    "recorded_at_ms": t.recorded_at_ms,
                 })
             })
             .collect();
@@ -1702,6 +1748,10 @@ impl OnboardingAttemptJournalV1 {
                     .get("error_code")
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string()),
+                recorded_at_ms: t
+                    .get("recorded_at_ms")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
             });
         }
         Some(Self { transitions })
@@ -1770,7 +1820,15 @@ fn load_onboarding_journal_at(
             MAX_JOURNAL_PLAINTEXT_BYTES,
         )
         .ok()??;
-    OnboardingAttemptJournalV1::from_json(secret.expose())
+    let mut journal = OnboardingAttemptJournalV1::from_json(secret.expose())?;
+    // #639 (F5): reap transitions older than the TTL; an all-expired (or legacy, unstamped) journal
+    // reads as absent.
+    let cutoff = now_ms().saturating_sub(ONBOARDING_JOURNAL_TTL_MS);
+    journal.transitions.retain(|t| t.recorded_at_ms >= cutoff);
+    if journal.transitions.is_empty() {
+        return None;
+    }
+    Some(journal)
 }
 
 /// Persist the onboarding attempt journal (#639), keyed by the opaque UI attempt id.
@@ -1844,6 +1902,7 @@ fn record_onboarding_attempt_transition(
         state,
         generation: String::new(),
         error_code,
+        recorded_at_ms: now_ms(),
     });
     let _ = store_onboarding_journal(oauth_dir, attempt_id, &journal);
 }
@@ -1871,6 +1930,7 @@ fn record_onboarding_generation_transitions(
                 state,
                 generation: generation.to_string(),
                 error_code: None,
+                recorded_at_ms: now_ms(),
             });
             changed = true;
         }
@@ -8647,6 +8707,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // #639 (F5 regression): the onboarding journal has an 8-min TTL — a stale journal is reaped on
+    // load (reads as absent) while a freshly recorded one survives.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn onboarding_journal_expires_after_ttl() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("journal-ttl");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A journal whose only transition is far older than the TTL.
+        let stale = OnboardingAttemptJournalV1 {
+            transitions: vec![OnboardingTransition {
+                state: ProductOnboardingState::OfficialSignInStarted,
+                generation: String::new(),
+                error_code: None,
+                recorded_at_ms: 1,
+            }],
+        };
+        store_onboarding_journal(&root, "attempt-old", &stale).unwrap();
+        assert!(load_onboarding_journal(&root, "attempt-old").is_none());
+        // A freshly recorded transition survives the reaper.
+        record_onboarding_attempt_transition(
+            &root,
+            "attempt-new",
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+        assert!(load_onboarding_journal(&root, "attempt-new").is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 (F5 regression): the in-progress onboarding projection is JOURNAL-DRIVEN — the completed
+    // step count equals the number of ordered success-chain transitions actually recorded.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn onboarding_projection_counts_journal_recorded_steps() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("journal-driven-projection");
+        let _ = std::fs::remove_dir_all(&root);
+        // A present (valid-token) bundle under a DIFFERENT policy so startup recovery does not
+        // auto-complete the chain (mismatched policy -> not activated -> not ready).
+        let meta = ProductBundleMeta {
+            generation: uuid_v4(),
+            policy_fingerprint: "other-policy".to_string(),
+            lifecycle: CredentialLifecycle::Active,
+        };
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(
+                StoredCredential {
+                    access_token: "t".into(),
+                    refresh_token: "r".into(),
+                    expires_at_ms: 9_999_999_999_999,
+                }
+                .to_json(),
+            ),
+        )
+        .unwrap();
+        // Record 3 of the 8 ordered success-chain steps into the generation journal.
+        record_onboarding_generation_transitions(
+            &root,
+            &meta.generation,
+            &ONBOARDING_SUCCESS_CHAIN[..3],
+        );
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        assert_eq!(
+            agent.journal_completed_success_steps(ProductProviderId::Claude),
+            3
+        );
+        let ob = agent.provider_onboarding(ProductProviderId::Claude);
+        assert_eq!(ob["state"], "in_progress");
+        let complete = ob["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["complete"] == true)
+            .count();
+        assert_eq!(complete, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // #639 (F3 regression): an ACTIVATED provider whose token merely needs refresh is admitted to the
     // gate's build/refresh path (not an immediate product_not_ready). provider_ready is false (token
     // needs refresh) but provider_activation_valid is true and the credential is classified
@@ -9474,6 +9623,7 @@ mod tests {
                 state: ProductOnboardingState::OfficialSignInStarted,
                 generation: format!("g{i}"),
                 error_code: None,
+                recorded_at_ms: now_ms(),
             });
         }
         assert_eq!(journal.transitions.len(), MAX_JOURNAL_TRANSITIONS);
