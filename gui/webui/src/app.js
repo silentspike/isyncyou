@@ -4798,6 +4798,7 @@ const AssistantState = {
   activeMessage: null,
   connectivityIssue: null,
   pendingConnectProvider: null,
+  pendingModelSelection: null,
 };
 
 function closeAssistantStream(_reason) {
@@ -4856,13 +4857,18 @@ async function acceptAgentPrivacyConsent(provider) {
     timestamp: new Date().toISOString(),
   };
   try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
-  const resumeConnect = AssistantState.pendingConnectProvider === consentProvider;
+  const pendingModel = AssistantState.pendingModelSelection;
+  const resumeModel = pendingModel && pendingModel.provider === consentProvider ? pendingModel : null;
+  const resumeConnect = !resumeModel && AssistantState.pendingConnectProvider === consentProvider;
   AssistantState.pendingConnectProvider = null;
+  AssistantState.pendingModelSelection = null;
   await renderAssistantView($("#view"));
-  if (resumeConnect) await startAiLogin(consentProvider);
+  if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model);
+  else if (resumeConnect) await startAiLogin(consentProvider);
 }
 function resetAgentPrivacyConsent() {
   AssistantState.pendingConnectProvider = null;
+  AssistantState.pendingModelSelection = null;
   try { localStorage.removeItem(AGENT_PRIVACY_CONSENT_KEY); } catch (_) {}
   renderAssistantView($("#view"));
 }
@@ -4956,6 +4962,10 @@ function renderAssistantChat(body, st) {
   const pendingConnect = AssistantState.pendingConnectProvider;
   if (pendingConnect && !agentPrivacyConsentAccepted(pendingConnect)) {
     chatNodes.splice(1, 0, renderAssistantConsentPanel([pendingConnect]));
+  }
+  const pendingModel = AssistantState.pendingModelSelection;
+  if (pendingModel && !agentPrivacyConsentAccepted(pendingModel.provider)) {
+    chatNodes.splice(1, 0, renderAssistantConsentPanel([pendingModel.provider]));
   }
   const diagnostic = renderConnectivityDiagnostic();
   if (diagnostic) body.append(diagnostic);
@@ -5107,6 +5117,7 @@ async function connectAgentProvider(provider) {
 }
 async function pickModel(provider, model) {
   if (!agentPrivacyConsentAccepted(provider)) {
+    AssistantState.pendingModelSelection = { provider: agentProviderConsentId(provider), model };
     toast("Review privacy consent for " + agentProviderLabel(provider), "err");
     renderAssistantView($("#view"));
     return;

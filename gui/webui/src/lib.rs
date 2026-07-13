@@ -9903,6 +9903,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_model_switch_resumes_after_provider_privacy_consent() {
+        for needle in [
+            "pendingModelSelection: null",
+            "AssistantState.pendingModelSelection = { provider: agentProviderConsentId(provider), model }",
+            "renderAssistantConsentPanel([pendingModel.provider])",
+            "if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing provider-consent model-switch invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn assistant_claude_manual_code_step_survives_connected_rerender() {
         for needle in [
             "data-agent-oauth-code-step\": \"claude\"",
