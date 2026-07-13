@@ -859,30 +859,31 @@ impl DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn provider_ready(&self, provider: ProductProviderId) -> bool {
-        let (present_valid, credential_id) = match provider {
-            ProductProviderId::Claude => (
-                matches!(
-                    self.claude_product_credential_state(),
-                    ProductCredentialState::PresentValid(_)
-                ),
-                SUBSCRIPTION_CREDENTIAL_ID,
-            ),
-            ProductProviderId::Codex => (
-                matches!(
-                    self.codex_product_credential_state(),
-                    ProductCredentialState::PresentValid(_)
-                ),
-                CODEX_CREDENTIAL_ID,
-            ),
+        // Status readiness = the durable activation is valid AND the token is currently valid.
+        self.provider_activation_valid(provider)
+            && matches!(
+                self.provider_credential_state_class(provider),
+                ProductCredentialState::PresentValid(())
+            )
+    }
+
+    /// #639 (F3): the DURABLE product activation is valid — a valid Active V2 bundle whose OWN policy
+    /// fingerprint matches the current official policy, a matching `ProductActivationV1`, and a
+    /// passing static harness attestation. This deliberately does NOT check token expiry: a turn may
+    /// proceed for an activated provider whose token merely needs refresh (the build path refreshes
+    /// it under the runtime gate), whereas status readiness (`provider_ready`) additionally requires
+    /// a currently-valid token.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn provider_activation_valid(&self, provider: ProductProviderId) -> bool {
+        let credential_id = match provider {
+            ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+            ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
         };
-        if !present_valid {
-            return false;
-        }
         let official_policy = oauth_policy_fingerprint(provider);
         let generation = match load_product_bundle_meta(&self.oauth_dir, credential_id) {
-            // #639 (policy-binding fix): the BUNDLE's own stored policy fingerprint must equal the
-            // current official policy — a bundle minted under a different OAuth policy can never be
-            // ready (and cannot be silently re-activated under the current policy).
             Some(meta)
                 if meta.lifecycle == CredentialLifecycle::Active
                     && meta.policy_fingerprint == official_policy =>
@@ -904,6 +905,32 @@ impl DaemonAgent {
             return false;
         }
         isyncyou_agent::attest_static_product_harness(harness_provider_for(provider)).is_ok()
+    }
+
+    /// The product credential state for `provider`, projected to unit so callers can match the class
+    /// (PresentValid / PresentNeedsRefresh / PresentInvalid / Absent) without the credential value.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn provider_credential_state_class(
+        &self,
+        provider: ProductProviderId,
+    ) -> ProductCredentialState<()> {
+        fn classify<T>(state: ProductCredentialState<T>) -> ProductCredentialState<()> {
+            match state {
+                ProductCredentialState::PresentValid(_) => ProductCredentialState::PresentValid(()),
+                ProductCredentialState::PresentNeedsRefresh(_) => {
+                    ProductCredentialState::PresentNeedsRefresh(())
+                }
+                ProductCredentialState::PresentInvalid => ProductCredentialState::PresentInvalid,
+                ProductCredentialState::Absent => ProductCredentialState::Absent,
+            }
+        }
+        match provider {
+            ProductProviderId::Claude => classify(self.claude_product_credential_state()),
+            ProductProviderId::Codex => classify(self.codex_product_credential_state()),
+        }
     }
 
     /// #639 T9: whether an official OAuth attempt for `provider` is currently in flight.
@@ -1051,14 +1078,23 @@ impl DaemonAgent {
             Some(id) => id,
             None => return Err(AgentStartTurnError::ProductNotReady),
         };
-        if self.provider_ready(selected) {
+        // #639 (F3): admit an ACTIVATED provider whose credential is present and either valid OR
+        // merely needs refresh — the build path (resolve_*_credential) refreshes a needs-refresh
+        // token under this same held gate, so an expiring token during a chat is refreshed atomically
+        // instead of failing closed with 409. A present-but-invalid/absent credential is not admitted.
+        let refreshable = matches!(
+            self.provider_credential_state_class(selected),
+            ProductCredentialState::PresentValid(())
+                | ProductCredentialState::PresentNeedsRefresh(())
+        );
+        if self.provider_activation_valid(selected) && refreshable {
             let built = match selected {
                 ProductProviderId::Claude => self.try_subscription_provider(system),
                 ProductProviderId::Codex => self.try_codex_provider(system),
             };
             return match built {
                 Ok(Some(provider)) => Ok(provider),
-                // Ready said yes but construction raced/failed — fail closed, never fall back.
+                // Activated but construction/refresh failed — fail closed, never fall back.
                 _ => Err(AgentStartTurnError::ProductNotReady),
             };
         }
@@ -8518,6 +8554,38 @@ mod tests {
         assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
         // Explicit activation of a mismatched-policy bundle also fails closed.
         assert!(activate_product(&root, ProductProviderId::Claude, &meta.generation).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 (F3 regression): an ACTIVATED provider whose token merely needs refresh is admitted to the
+    // gate's build/refresh path (not an immediate product_not_ready). provider_ready is false (token
+    // needs refresh) but provider_activation_valid is true and the credential is classified
+    // NeedsRefresh (refreshable), so start_turn refreshes under the gate instead of failing closed.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn activated_needs_refresh_credential_is_gate_admitted() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("needs-refresh-admitted");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.credential_now_ms = Arc::new(|| 10_000_000);
+        // Token expires within the 5-min refresh window (non-empty -> NeedsRefresh, not Invalid).
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "t".into(),
+                refresh_token: "r".into(),
+                expires_at_ms: 10_100_000,
+            })
+            .unwrap();
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        assert!(agent.provider_activation_valid(ProductProviderId::Claude));
+        assert!(matches!(
+            agent.provider_credential_state_class(ProductProviderId::Claude),
+            ProductCredentialState::PresentNeedsRefresh(())
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
