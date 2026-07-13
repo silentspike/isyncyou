@@ -1912,6 +1912,32 @@ mod tests {
     }
 
     #[test]
+    fn network_snapshot_registration_uses_engine_session_and_closed_guard_reason() {
+        let _guard = mobile_key_test_guard();
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let guard_id = "network-snapshot-mobile-test-guard";
+
+        let snapshot_id = register_network_snapshot(NetworkSnapshotRegistration {
+            guard_id,
+            reason: "agent_turn",
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: "disabled",
+            notifications_visible: true,
+            test_hook: None,
+        })
+        .expect("trusted native snapshot registration succeeds");
+
+        assert!(!snapshot_id.is_empty());
+        assert_ne!(snapshot_id, guard_id);
+        invalidate_network_guard(guard_id);
+    }
+
+    #[test]
     fn mobile_start_inner_fails_closed_without_encryption_ready() {
         let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();

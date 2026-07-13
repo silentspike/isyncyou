@@ -6931,6 +6931,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "https://auth.example/authorize?redirect_uri={redirect_uri}&state=st-1"
             ))
         }
+        fn oauth_cancel(&self, provider: &str, attempt_id: &str) -> Result<(), String> {
+            if provider == "claude" && attempt_id == "attempt-1" {
+                Ok(())
+            } else {
+                Err("oauth attempt is not active".into())
+            }
+        }
         fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
             Ok(format!("<html>connected code={code} state={state}</html>"))
         }
@@ -7451,6 +7458,53 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let missing = router.route(&missing);
         assert_eq!(missing.status, 400);
         assert!(String::from_utf8_lossy(&missing.body).contains("provider is required"));
+    }
+
+    #[test]
+    fn agent_oauth_cancel_is_session_cap_and_strict_json_gated() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("sess".into());
+        let request = || {
+            ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
+                .with_content_type(Some("application/json".into()))
+                .with_body(br#"{"provider":"claude","attempt_id":"attempt-1"}"#.to_vec())
+        };
+
+        assert_eq!(router.route(&request()).status, 401);
+        assert_eq!(
+            router
+                .route(&request().with_cap_token(Some("agentsecret".into())))
+                .status,
+            401
+        );
+
+        let authorized = request()
+            .with_session_token(Some("sess".into()))
+            .with_cap_token(Some("agentsecret".into()));
+        let response = router.route(&authorized);
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["cancelled"], true);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
+
+        let unknown_field = ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
+            .with_content_type(Some("application/json".into()))
+            .with_body(
+                br#"{"provider":"claude","attempt_id":"attempt-1","url":"forbidden"}"#.to_vec(),
+            )
+            .with_session_token(Some("sess".into()))
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&unknown_field).status, 400);
+
+        let wrong_attempt = ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
+            .with_content_type(Some("application/json".into()))
+            .with_body(br#"{"provider":"claude","attempt_id":"other"}"#.to_vec())
+            .with_session_token(Some("sess".into()))
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&wrong_attempt).status, 409);
     }
 
     #[test]
