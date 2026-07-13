@@ -14,6 +14,10 @@ pub use mobile_jobs::{
     MobileJobRunOutcome, MobileJobRuntime, MobileWorkerDeviceSnapshot,
 };
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 use isyncyou_agent::ProductProviderId;
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
@@ -579,7 +583,23 @@ pub struct DaemonAgent {
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
     last_usage: Arc<Mutex<Option<isyncyou_agent::Usage>>>,
+    // Read only by the gated product credential-refresh path; keep them without that feature so the
+    // no-oauth-feature build (mobile --no-default-features) compiles.
+    #[cfg_attr(
+        not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )),
+        allow(dead_code)
+    )]
     credential_now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    #[cfg_attr(
+        not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )),
+        allow(dead_code)
+    )]
     credential_refresh_gate: Mutex<()>,
     /// #639: the single in-process product-runtime gate. One hold spans selection + model +
     /// refresh + activation-check + attestation + provider construction (and the status readiness
@@ -1164,11 +1184,8 @@ impl StoredCredential {
     }
 }
 
-/// Ms since the Unix epoch (0 on a clock error).
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
+/// Ms since the Unix epoch (0 on a clock error). Always available (the non-gated `DaemonAgent`
+/// constructor seeds `credential_now_ms` with it), so the no-oauth-feature build compiles too.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3595,6 +3612,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .map(|result| result.authorize_url)
     }
 
+    // Gated like the other OAuth methods: without the product/experimental features the trait's
+    // default (login-not-enabled) applies, so the app-host compiles without agent-oauth-providers.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn oauth_cancel(&self, provider: &str, attempt_id: &str) -> Result<(), String> {
         let attempt = self.oauth_attempts.lock().unwrap().remove(attempt_id);
         match (provider, attempt) {
