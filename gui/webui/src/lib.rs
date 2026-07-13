@@ -232,12 +232,21 @@ fn is_json_content_type(content_type: Option<&str>) -> bool {
     })
 }
 
-fn no_store_json_error(status: u16, message: &str) -> ApiResponse {
-    let mut response = ApiResponse::error(status, message);
-    response
+fn with_no_store(mut response: ApiResponse) -> ApiResponse {
+    if !response
         .headers
-        .push(("Cache-Control".into(), "no-store".into()));
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+    {
+        response
+            .headers
+            .push(("Cache-Control".into(), "no-store".into()));
+    }
     response
+}
+
+fn no_store_json_error(status: u16, message: &str) -> ApiResponse {
+    with_no_store(ApiResponse::error(status, message))
 }
 
 /// A response ready to be written by any server adapter.
@@ -4600,19 +4609,19 @@ impl Router {
     fn agent_oauth_start(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
         // redirect is optional: the manual (copy-paste) flow uses the provider's manual
         // redirect, so the client need not supply a loopback origin.
         let redirect = req.q("redirect").unwrap_or("");
         let provider = match agent_oauth_provider_param(req.q("provider").unwrap_or("")) {
             Ok(p) => p,
-            Err(e) => return ApiResponse::error(400, e),
+            Err(e) => return no_store_json_error(400, e),
         };
-        match handler.oauth_start_with_attempt(provider, redirect) {
+        with_no_store(match handler.oauth_start_with_attempt(provider, redirect) {
             Ok(result) => ApiResponse::ok_json(&serde_json::to_value(result).unwrap_or_default()),
-            Err(e) => ApiResponse::error(500, &e),
-        }
+            Err(_) => ApiResponse::error(409, "oauth_start_failed"),
+        })
     }
 
     /// Cancel one active provider OAuth attempt. The body is deliberately strict so
@@ -4620,7 +4629,7 @@ impl Router {
     fn agent_oauth_cancel(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
         if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
             return no_store_json_error(400, "oauth cancel accepts JSON only");
@@ -4660,7 +4669,7 @@ impl Router {
     fn agent_oauth_complete(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
         // #639 T9: strict JSON only — the pasted code must never arrive as a URL/query param.
         if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
@@ -4725,16 +4734,16 @@ impl Router {
     fn agent_oauth_callback(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent.as_ref() {
             Some(h) => h,
-            None => return ApiResponse::error(404, "the agent is not enabled on this server"),
+            None => return no_store_json_error(404, "the agent is not enabled on this server"),
         };
         let (code, state) = match (req.q("code"), req.q("state")) {
             (Some(c), Some(s)) if !c.is_empty() && !s.is_empty() => (c, s),
-            _ => return ApiResponse::error(400, "code and state are required"),
+            _ => return no_store_json_error(400, "code and state are required"),
         };
-        match handler.oauth_callback(code, state) {
+        with_no_store(match handler.oauth_callback(code, state) {
             Ok(html) => ApiResponse::html(&html),
-            Err(e) => ApiResponse::error(400, &e),
-        }
+            Err(_) => ApiResponse::error(400, "oauth_callback_failed"),
+        })
     }
 
     /// The effective configuration the UI's settings view reads: engine-wide sync
@@ -6992,6 +7001,15 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             400
         );
+        // Serde's struct visitor rejects duplicate fields rather than accepting the last value.
+        assert_eq!(
+            router
+                .route(&json_post(
+                    r#"{"provider":"claude","attempt_id":"a","attempt_id":"b","pasted_code":"c#s"}"#
+                ))
+                .status,
+            400
+        );
         // A well-formed claude request reaches the handler and the response carries no-store.
         let resp = router.route(&json_post(
             r#"{"provider":"claude","attempt_id":"a","pasted_code":"c#s"}"#,
@@ -7000,6 +7018,89 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .headers
             .iter()
             .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+    }
+
+    #[test]
+    fn assistant_first_run_renders_handoff_wizard_from_host_readiness() {
+        let view_start = APP_JS
+            .find("async function renderAssistantView(view)")
+            .expect("assistant view");
+        let view_end = APP_JS[view_start..]
+            .find("const AGENT_ONBOARDING_STEPS")
+            .map(|offset| view_start + offset)
+            .expect("onboarding steps");
+        let view = &APP_JS[view_start..view_end];
+        assert!(view.contains("if (assistantSelectedReady(st)) renderAssistantChat(body, st);"));
+        assert!(!view.contains("if (st && st.connected)"));
+
+        let expected = [
+            "official_oauth_completed",
+            "credential_encrypted",
+            "retained_envelope_verified",
+            "default_harness_removed",
+            "m365_profile_activated",
+            "isyncyou_tool_connected",
+            "subscription_identity_set",
+            "ready",
+        ];
+        let mut previous = 0;
+        for key in expected {
+            let position = APP_JS
+                .find(&format!("[\"{key}\""))
+                .unwrap_or_else(|| panic!("missing wizard step {key}"));
+            assert!(position >= previous, "wizard step order drifted at {key}");
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn assistant_reconnect_uses_short_flow_after_onboarding() {
+        assert!(APP_JS.contains("const reconnect = state === \"reconnect_required\";"));
+        assert!(APP_JS
+            .contains("const stepsPanel = reconnect ? null : renderAssistantWizardSteps(node);"));
+        assert!(APP_JS
+            .contains("reconnect ? \"Reconnect your AI account\" : \"Connect your AI account\""));
+    }
+
+    #[test]
+    fn assistant_handoff_dom_logs_and_storage_do_not_contain_secrets() {
+        let start = APP_JS
+            .find("async function completeAiLogin()")
+            .expect("manual completion function");
+        let end = APP_JS[start..]
+            .find("const AssistantState")
+            .map(|offset| start + offset)
+            .expect("manual completion end");
+        let completion = &APP_JS[start..end];
+        assert!(completion.contains("if (inp) inp.value = \"\";"));
+        assert!(completion.contains("postJson(\"/api/v1/agent/oauth/complete\""));
+        for forbidden in [
+            "console.",
+            "localStorage",
+            "sessionStorage",
+            "qs({",
+            "innerHTML",
+        ] {
+            assert!(
+                !completion.contains(forbidden),
+                "manual OAuth completion must not use secret sink {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_turn_guard_releases_on_stream_error_and_route_teardown() {
+        let close_start = APP_JS
+            .find("function closeAssistantStream(_reason)")
+            .expect("stream close helper");
+        let close_end = APP_JS[close_start..]
+            .find("function rememberAssistantStatus")
+            .map(|offset| close_start + offset)
+            .expect("stream close helper end");
+        let close = &APP_JS[close_start..close_end];
+        assert!(close.contains("const turn = AssistantState.activeTurnId;"));
+        assert!(close.contains("if (turn) void finishTurnGuard(turn);"));
+        assert!(APP_JS.contains("TURN_GUARDS.set(turn, startingGuardId);"));
     }
 
     // #639 T9 AC3: the status response carries Cache-Control: no-store and never leaks a secret.
@@ -7622,6 +7723,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
+        assert!(ok.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
         // redirect is optional now (manual flow) -> still 200 without it
         let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=codex")
             .with_cap_token(Some("agentsecret".into()));
@@ -7631,6 +7735,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let unknown = router.route(&unknown);
         assert_eq!(unknown.status, 400);
         assert!(String::from_utf8_lossy(&unknown.body).contains("unknown provider"));
+        assert!(unknown.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
         let missing = ApiRequest::new("POST", "/api/v1/agent/oauth/start")
             .with_cap_token(Some("agentsecret".into()));
         let missing = router.route(&missing);
@@ -7708,6 +7815,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let r = router.route(&cb);
         assert_eq!(r.status, 200);
         assert!(String::from_utf8_lossy(&r.body).contains("connected code=abc"));
+        assert!(r.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
         // missing code/state -> 400
         let bad = ApiRequest::new("GET", "/callback?code=abc");
         assert_eq!(router.route(&bad).status, 400);
@@ -10049,7 +10159,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for needle in [
             "function confirmAgentPending(pendingId)",
             "function cancelAgentPending(pendingId)",
-            "function renderAgentPendingCard(pending)",
+            "function renderAgentPendingCard(pending, trackNode = true)",
             "AssistantState.pendingCardsById.set(pending.pending_id",
             "token: d.token || \"\"",
             "action_hash: d.action_hash || \"\"",
@@ -10063,8 +10173,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "record.status = \"error\"",
             "confirm.setAttribute(\"disabled\", \"disabled\")",
             "cancel.setAttribute(\"disabled\", \"disabled\")",
-            "\"data-agent-pending-confirm\": pending.pending_id || \"\"",
-            "\"data-agent-pending-cancel\": pending.pending_id || \"\"",
+            "\"data-agent-pending-confirm\": \"1\"",
+            "\"data-agent-pending-cancel\": \"1\"",
+            "\"data-agent-pending-card\": \"1\"",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -10090,6 +10201,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 && !pending_renderer.contains("sessionStorage"),
             "PendingAction renderer must not expose or persist secrets"
         );
+        for forbidden in [
+            "\"data-agent-pending-card\": pending.pending_id",
+            "\"data-agent-pending-confirm\": pending.pending_id",
+            "\"data-agent-pending-cancel\": pending.pending_id",
+        ] {
+            assert!(
+                !pending_renderer.contains(forbidden),
+                "PendingAction handles must not be serialized into DOM attributes: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -10261,7 +10382,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "data-agent-connectivity-settings",
             "nativeCall(\"openNetworkSettings\", { hint }",
             "const BRIDGE_STREAM_TIMEOUT_MS = 125000",
-            "if (st && st.selected_provider)",
+            "const onboardingProvider = st && st.onboarding && st.onboarding.selected_provider",
+            "const candidate = onboardingProvider || (st && st.selected_provider)",
             "if (error && error.connectivity)",
             "await cancelOAuthAttempt(\"claude\"); await finishAgentGuard()",
         ] {
@@ -10274,15 +10396,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             !APP_JS.contains("[provider]: \"reconnect_required\""),
             "a connectivity failure must not rewrite credential state"
         );
-        let effective = APP_JS
-            .find("if (st && st.provider)")
-            .expect("effective provider branch");
-        let selected = APP_JS
-            .find("if (st && st.selected_provider)")
-            .expect("selected provider branch");
         assert!(
-            effective < selected,
-            "the currently effective connected provider must win over a stale selection"
+            !APP_JS.contains("st.provider || st.selected_provider"),
+            "connectivity preflight must follow the host-selected onboarding provider without a runtime-provider fallback"
         );
     }
 

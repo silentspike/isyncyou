@@ -171,8 +171,8 @@ fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
     ev.to_public_json_string()
 }
 
-/// Default model for the in-app agent (override with `ISYNCYOU_AGENT_MODEL`). The
-/// subscription serves Sonnet/Opus; Sonnet is the cheaper default for general use.
+/// Default Claude model selected only after a successful official OAuth handoff. Runtime turns
+/// consume the encrypted product settings snapshot and never read an environment override.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -535,13 +535,32 @@ const OAUTH_ATTEMPT_TTL: std::time::Duration = std::time::Duration::from_secs(8 
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn reap_oauth_attempts(attempts: &mut HashMap<String, OAuthAttempt>) {
+fn reap_oauth_attempts(attempts: &mut HashMap<String, OAuthAttempt>, oauth_dir: &Path) {
     let now = std::time::Instant::now();
+    let expired: Vec<(String, ProductProviderId)> = attempts
+        .iter()
+        .filter_map(|(attempt_id, attempt)| {
+            let (expires_at, provider) = match attempt {
+                OAuthAttempt::Claude { expires_at, .. } => (expires_at, ProductProviderId::Claude),
+                OAuthAttempt::Codex { expires_at, .. } => (expires_at, ProductProviderId::Codex),
+            };
+            (*expires_at <= now).then(|| (attempt_id.clone(), provider))
+        })
+        .collect();
     attempts.retain(|_, attempt| match attempt {
         OAuthAttempt::Claude { expires_at, .. } | OAuthAttempt::Codex { expires_at, .. } => {
             *expires_at > now
         }
     });
+    for (attempt_id, provider) in expired {
+        record_onboarding_attempt_transition(
+            oauth_dir,
+            provider,
+            &attempt_id,
+            ProductOnboardingState::ErrorRedacted,
+            Some("expired".into()),
+        );
+    }
 }
 
 /// #639 T7: the typed reason a turn was refused before any turn state was created. It maps to a
@@ -569,10 +588,9 @@ impl AgentStartTurnError {
     }
 }
 
-/// The in-app agent handler (S-AG.6/#621). Drives a real turn: the product Claude/Codex
-/// OAuth provider path when the user has connected an account, otherwise a deterministic
-/// "not connected" message. Owns the stream hub + pending-action registry, so the model
-/// never holds a capability token.
+/// The in-app agent handler (S-AG.6/#621). Product turns require a host-attested
+/// Claude/Codex OAuth provider; deterministic providers are injected only by tests.
+/// Owns the stream hub + pending-action registry, so the model never holds a capability token.
 pub struct DaemonAgent {
     /// Source of each account's `archive_root` for the retrieval executor
     /// (`archive_root_for`); the restore path lands in #624.
@@ -662,7 +680,7 @@ impl DaemonAgent {
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
-        let _ = std::fs::remove_file(oauth_dir.join(CODEX_CALLBACK_DIAGNOSTICS_FILE));
+        remove_legacy_codex_callback_diagnostics(&oauth_dir);
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
         let confirmed_executor =
             agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
@@ -698,7 +716,11 @@ impl DaemonAgent {
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
-        agent.recover_product_onboarding();
+        {
+            reap_onboarding_journals_at(&agent.oauth_dir, now_ms());
+            recover_interrupted_onboarding_attempts(&agent.oauth_dir);
+            agent.recover_product_onboarding();
+        }
         agent
     }
 
@@ -769,7 +791,13 @@ impl DaemonAgent {
     /// Test-only provider-SELECTION probe (#639 T7): resolve the selected provider directly from
     /// stored credentials, without the product-runtime readiness gate. Production turns go through
     /// [`resolve_turn_provider`] / [`product_runtime_gate`]; this stays for selection unit tests.
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )
+    ))]
     fn build_turn_provider(&self, system: &str) -> Box<dyn isyncyou_agent::LlmProvider + Send> {
         #[cfg(test)]
         if let Some(script) = &self.test_provider_script {
@@ -785,11 +813,14 @@ impl DaemonAgent {
             // #639: the switcher selection drives which provider is built; there is NO
             // cross-provider fallback (an activated non-selected provider is never silently
             // substituted, fixing the old "falls back to the other" behavior).
-            let selected = self.agent_settings().0;
-            let built = match ProductProviderId::parse(&selected) {
-                Some(ProductProviderId::Codex) => self.try_codex_provider(system),
-                Some(ProductProviderId::Claude) => self.try_subscription_provider(system),
-                None => Ok(None),
+            let built = match self.agent_settings() {
+                Some(settings) if settings.provider == ProductProviderId::Codex => {
+                    self.try_codex_provider(system, &settings.model)
+                }
+                Some(settings) if settings.provider == ProductProviderId::Claude => {
+                    self.try_subscription_provider(system, &settings.model)
+                }
+                _ => Ok(None),
             };
             match built {
                 Ok(Some(provider)) => return provider,
@@ -839,13 +870,7 @@ impl DaemonAgent {
         )))]
         {
             let _ = system;
-            Ok(Box::new(isyncyou_agent::FakeProvider::new(vec![vec![
-                isyncyou_agent::AssistantBlock::Text(
-                    "The AI assistant isn't connected yet — open the Assistant tab and connect \
-                     your Claude account, then try again."
-                        .to_string(),
-                ),
-            ]])))
+            Err("product_not_ready".into())
         }
     }
 
@@ -859,12 +884,20 @@ impl DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn provider_ready(&self, provider: ProductProviderId) -> bool {
-        // Status readiness = the durable activation is valid AND the token is currently valid.
-        self.provider_activation_valid(provider)
-            && matches!(
-                self.provider_credential_state_class(provider),
-                ProductCredentialState::PresentValid(())
-            )
+        match provider {
+            ProductProviderId::Claude => match self.claude_product_bundle_state() {
+                ProductCredentialState::PresentValid((_, meta)) => {
+                    self.provider_activation_valid_for_meta(provider, &meta)
+                }
+                _ => false,
+            },
+            ProductProviderId::Codex => match self.codex_product_bundle_state() {
+                ProductCredentialState::PresentValid((_, meta)) => {
+                    self.provider_activation_valid_for_meta(provider, &meta)
+                }
+                _ => false,
+            },
+        }
     }
 
     /// #639 (F3): the DURABLE product activation is valid — a valid Active V2 bundle whose OWN policy
@@ -873,45 +906,63 @@ impl DaemonAgent {
     /// proceed for an activated provider whose token merely needs refresh (the build path refreshes
     /// it under the runtime gate), whereas status readiness (`provider_ready`) additionally requires
     /// a currently-valid token.
-    #[cfg(any(
+    #[cfg(all(
+        test,
         feature = "agent-oauth-providers",
-        feature = "agent-subscription-experimental"
+        not(feature = "agent-subscription-experimental")
     ))]
     fn provider_activation_valid(&self, provider: ProductProviderId) -> bool {
         let credential_id = match provider {
             ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
             ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
         };
-        let official_policy = oauth_policy_fingerprint(provider);
-        let generation = match load_product_bundle_meta(&self.oauth_dir, credential_id) {
-            Some(meta)
-                if meta.lifecycle == CredentialLifecycle::Active
-                    && meta.policy_fingerprint == official_policy =>
-            {
-                meta.generation
-            }
-            _ => return false,
+        let Some(meta) = load_product_bundle_meta(&self.oauth_dir, credential_id) else {
+            return false;
         };
+        self.provider_activation_valid_for_meta(provider, &meta)
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn provider_activation_valid_for_meta(
+        &self,
+        provider: ProductProviderId,
+        meta: &ProductBundleMeta,
+    ) -> bool {
+        let official_policy = oauth_policy_fingerprint(provider);
+        if meta.provider != provider
+            || meta.lifecycle != CredentialLifecycle::Active
+            || meta.policy_fingerprint != official_policy
+        {
+            return false;
+        }
         let activation = match load_product_activation(&self.oauth_dir, provider) {
             Some(activation) => activation,
             None => return false,
         };
         if !activation.matches(
             provider,
-            &generation,
+            &meta.generation,
             &official_policy,
             isyncyou_agent::HARNESS_CONTRACT_VERSION,
         ) {
             return false;
         }
-        isyncyou_agent::attest_static_product_harness(harness_provider_for(provider)).is_ok()
+        isyncyou_agent::attest_static_product_harness(
+            harness_provider_for(provider),
+            AGENT_SYSTEM_PROMPT,
+        )
+        .is_ok()
     }
 
     /// The product credential state for `provider`, projected to unit so callers can match the class
     /// (PresentValid / PresentNeedsRefresh / PresentInvalid / Absent) without the credential value.
-    #[cfg(any(
+    #[cfg(all(
+        test,
         feature = "agent-oauth-providers",
-        feature = "agent-subscription-experimental"
+        not(feature = "agent-subscription-experimental")
     ))]
     fn provider_credential_state_class(
         &self,
@@ -962,25 +1013,47 @@ impl DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn provider_onboarding(&self, provider: ProductProviderId) -> serde_json::Value {
-        let (state, completed) = if self.provider_ready(provider) {
+        let (state, completed, error_code) = if self.provider_ready(provider) {
             // Ready: all steps complete, derived from the durable activation (survives journal TTL).
-            ("ready", ONBOARDING_SUCCESS_CHAIN.len())
+            ("ready", ONBOARDING_SUCCESS_CHAIN.len(), None)
         } else {
-            match self
-                .product_credential_status(provider.wire())
-                .unwrap_or("reconnect_required")
-            {
-                "reconnect_required" | "refresh_required" => ("reconnect_required", 0),
-                _ => {
-                    // #639 (F5): the in-progress step count is JOURNAL-DRIVEN — how many ordered
-                    // success-chain transitions the (TTL-bounded) journal has actually recorded.
-                    let completed = self.journal_completed_success_steps(provider);
-                    if self.has_active_attempt(provider) || completed > 0 {
-                        ("in_progress", completed)
+            // A new official OAuth attempt must remain visible even when it is replacing an invalid
+            // credential. Otherwise reconnect would stay stuck at `reconnect_required` until the
+            // exchange had already completed. The attempt journal is bounded and evidence-only;
+            // readiness still comes exclusively from the durable activation above.
+            match latest_attempt_journal(&self.oauth_dir, provider) {
+                Ok(Some(journal)) => {
+                    if let Some(terminal) = journal.terminal_error() {
+                        (
+                            "error_redacted",
+                            0,
+                            Some(public_onboarding_error_code(terminal.error_code.as_deref())),
+                        )
+                    } else if let Some(last) = journal.transitions.last() {
+                        (last.state.wire(), 0, None)
                     } else {
-                        ("not_started", 0)
+                        ("not_started", 0, None)
                     }
                 }
+                Err(()) => ("error_redacted", 0, Some("journal_invalid")),
+                Ok(None) if self.has_active_attempt(provider) => {
+                    ("official_sign_in_started", 0, None)
+                }
+                Ok(None) => match self
+                    .product_credential_status(provider.wire())
+                    .unwrap_or("reconnect_required")
+                {
+                    "reconnect_required" | "refresh_required" => ("reconnect_required", 0, None),
+                    _ => match self.journal_completed_success_steps(provider) {
+                        Ok(completed) if completed > 0 => (
+                            ONBOARDING_SUCCESS_CHAIN[completed - 1].wire(),
+                            completed,
+                            None,
+                        ),
+                        Err(()) => ("error_redacted", 0, Some("journal_invalid")),
+                        Ok(_) => ("not_started", 0, None),
+                    },
+                },
             }
         };
         let steps: Vec<serde_json::Value> = ONBOARDING_SUCCESS_CHAIN
@@ -988,7 +1061,11 @@ impl DaemonAgent {
             .enumerate()
             .map(|(i, step)| serde_json::json!({ "key": step.wire(), "complete": i < completed }))
             .collect();
-        serde_json::json!({ "state": state, "steps": steps })
+        let mut result = serde_json::json!({ "state": state, "steps": steps });
+        if let Some(error_code) = error_code {
+            result["error_code"] = serde_json::Value::String(error_code.to_string());
+        }
+        result
     }
 
     /// #639 (F5): count the ordered success-chain transitions the generation-keyed journal has
@@ -997,23 +1074,22 @@ impl DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    fn journal_completed_success_steps(&self, provider: ProductProviderId) -> usize {
+    fn journal_completed_success_steps(&self, provider: ProductProviderId) -> Result<usize, ()> {
+        let _gate = onboarding_journal_gate().lock().map_err(|_| ())?;
+        let _file_gate = acquire_onboarding_journal_file_lock(&self.oauth_dir)?;
         let credential_id = match provider {
             ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
             ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
         };
         let Some(meta) = load_product_bundle_meta(&self.oauth_dir, credential_id) else {
-            return 0;
+            return Ok(0);
         };
         let store_id =
             OnboardingAttemptJournalV1::journal_store_id_for_generation(&meta.generation);
         let Some(journal) = load_onboarding_journal_at(&self.oauth_dir, &store_id) else {
-            return 0;
+            return Ok(0);
         };
-        ONBOARDING_SUCCESS_CHAIN
-            .iter()
-            .filter(|s| journal.has_state(**s))
-            .count()
+        journal.ordered_success_prefix()
     }
 
     /// #639 T9: the full onboarding projection block for `status_json`. `selected_provider` is null
@@ -1022,18 +1098,20 @@ impl DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    fn onboarding_projection(&self) -> serde_json::Value {
-        let selected = ProductProviderId::parse(&self.agent_settings().0);
+    fn onboarding_projection(&self, selected: Option<ProductProviderId>) -> serde_json::Value {
+        let claude = self.provider_onboarding(ProductProviderId::Claude);
+        let codex = self.provider_onboarding(ProductProviderId::Codex);
         let selected_state = match selected {
-            Some(provider) => self.provider_onboarding(provider)["state"].clone(),
+            Some(ProductProviderId::Claude) => claude["state"].clone(),
+            Some(ProductProviderId::Codex) => codex["state"].clone(),
             None => serde_json::Value::String("not_started".into()),
         };
         serde_json::json!({
             "selected_provider": selected.map(|p| p.wire()),
             "selected_state": selected_state,
             "providers": {
-                "claude": self.provider_onboarding(ProductProviderId::Claude),
-                "codex": self.provider_onboarding(ProductProviderId::Codex),
+                "claude": claude,
+                "codex": codex,
             },
         })
     }
@@ -1046,20 +1124,15 @@ impl DaemonAgent {
     fn try_experimental_only_provider(
         &self,
         provider: ProductProviderId,
+        model: &str,
         system: &str,
     ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
         match provider {
             ProductProviderId::Claude => {
-                if !matches!(
-                    self.claude_product_credential_state(),
-                    ProductCredentialState::Absent
-                ) {
-                    return None;
-                }
                 let credential = self.experimental_claude_credential().ok()??;
                 let provider = isyncyou_agent::SubscriptionProvider::new(
                     credential.access_token,
-                    self.model_for("claude"),
+                    model,
                     system,
                     self.subscription_config(),
                 )
@@ -1067,16 +1140,10 @@ impl DaemonAgent {
                 Some(Box::new(provider))
             }
             ProductProviderId::Codex => {
-                if !matches!(
-                    self.codex_product_credential_state(),
-                    ProductCredentialState::Absent
-                ) {
-                    return None;
-                }
                 let credential = self.experimental_codex_credential().ok()??;
                 let cfg = isyncyou_agent::CodexConfig {
                     account_id: credential.account_id,
-                    model: self.model_for("codex"),
+                    model: model.to_string(),
                     ..Default::default()
                 };
                 let provider =
@@ -1106,36 +1173,98 @@ impl DaemonAgent {
             .product_runtime_gate
             .lock()
             .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+        let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
+            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
         // Corrupt/unknown selection fails closed — never a default/alternative provider.
-        let selected = match ProductProviderId::parse(&self.agent_settings().0) {
-            Some(id) => id,
-            None => return Err(AgentStartTurnError::ProductNotReady),
-        };
-        // #639 (F3): admit an ACTIVATED provider whose credential is present and either valid OR
-        // merely needs refresh — the build path (resolve_*_credential) refreshes a needs-refresh
-        // token under this same held gate, so an expiring token during a chat is refreshed atomically
-        // instead of failing closed with 409. A present-but-invalid/absent credential is not admitted.
-        let refreshable = matches!(
-            self.provider_credential_state_class(selected),
-            ProductCredentialState::PresentValid(())
-                | ProductCredentialState::PresentNeedsRefresh(())
-        );
-        if self.provider_activation_valid(selected) && refreshable {
-            let built = match selected {
-                ProductProviderId::Claude => self.try_subscription_provider(system),
-                ProductProviderId::Codex => self.try_codex_provider(system),
-            };
-            return match built {
-                Ok(Some(provider)) => Ok(provider),
-                // Activated but construction/refresh failed — fail closed, never fall back.
-                _ => Err(AgentStartTurnError::ProductNotReady),
-            };
+        let settings = self
+            .agent_settings()
+            .ok_or(AgentStartTurnError::ProductNotReady)?;
+        let selected = settings.provider;
+        let _refresh = self
+            .credential_refresh_gate
+            .lock()
+            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+
+        match selected {
+            ProductProviderId::Claude => {
+                let state = self.claude_product_bundle_state();
+                let (credential, meta) = match state {
+                    ProductCredentialState::PresentValid(bundle) => bundle,
+                    ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                        if !self.provider_activation_valid_for_meta(selected, &meta) {
+                            return Err(AgentStartTurnError::ProductNotReady);
+                        }
+                        let refreshed = self
+                            .refresh_claude_product_credential_unlocked(credential, meta.clone())
+                            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                        (refreshed, meta)
+                    }
+                    ProductCredentialState::Absent => {
+                        #[cfg(feature = "agent-subscription-experimental")]
+                        if let Some(provider) =
+                            self.try_experimental_only_provider(selected, &settings.model, system)
+                        {
+                            return Ok(provider);
+                        }
+                        return Err(AgentStartTurnError::ProductNotReady);
+                    }
+                    ProductCredentialState::PresentInvalid => {
+                        return Err(AgentStartTurnError::ProductNotReady);
+                    }
+                };
+                if !self.provider_activation_valid_for_meta(selected, &meta) {
+                    return Err(AgentStartTurnError::ProductNotReady);
+                }
+                isyncyou_agent::SubscriptionProvider::new(
+                    credential.access_token,
+                    &settings.model,
+                    system,
+                    self.subscription_config(),
+                )
+                .map(|provider| Box::new(provider) as Box<dyn isyncyou_agent::LlmProvider + Send>)
+                .map_err(|_| AgentStartTurnError::ProductNotReady)
+            }
+            ProductProviderId::Codex => {
+                let state = self.codex_product_bundle_state();
+                let (credential, meta) = match state {
+                    ProductCredentialState::PresentValid(bundle) => bundle,
+                    ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                        if !self.provider_activation_valid_for_meta(selected, &meta) {
+                            return Err(AgentStartTurnError::ProductNotReady);
+                        }
+                        let refreshed = self
+                            .refresh_codex_product_credential_unlocked(credential, meta.clone())
+                            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                        (refreshed, meta)
+                    }
+                    ProductCredentialState::Absent => {
+                        #[cfg(feature = "agent-subscription-experimental")]
+                        if let Some(provider) =
+                            self.try_experimental_only_provider(selected, &settings.model, system)
+                        {
+                            return Ok(provider);
+                        }
+                        return Err(AgentStartTurnError::ProductNotReady);
+                    }
+                    ProductCredentialState::PresentInvalid => {
+                        return Err(AgentStartTurnError::ProductNotReady);
+                    }
+                };
+                if !self.provider_activation_valid_for_meta(selected, &meta) {
+                    return Err(AgentStartTurnError::ProductNotReady);
+                }
+                let config = isyncyou_agent::CodexConfig {
+                    account_id: credential.account_id,
+                    model: settings.model,
+                    ..Default::default()
+                };
+                isyncyou_agent::CodexProvider::new(credential.access_token, system, config)
+                    .map(|provider| {
+                        Box::new(provider) as Box<dyn isyncyou_agent::LlmProvider + Send>
+                    })
+                    .map_err(|_| AgentStartTurnError::ProductNotReady)
+            }
         }
-        #[cfg(feature = "agent-subscription-experimental")]
-        if let Some(provider) = self.try_experimental_only_provider(selected, system) {
-            return Ok(provider);
-        }
-        Err(AgentStartTurnError::ProductNotReady)
     }
 
     /// #639 T8: commit a successful official Claude OAuth atomically under the product-runtime gate:
@@ -1154,12 +1283,14 @@ impl DaemonAgent {
             .product_runtime_gate
             .lock()
             .map_err(|_| "product_busy".to_string())?;
+        let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)?;
         self.store_token(token)?;
         let generation = load_product_bundle_meta(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
             .map(|m| m.generation)
             .unwrap_or_default();
         record_onboarding_generation_transitions(
             &self.oauth_dir,
+            ProductProviderId::Claude,
             &generation,
             &ONBOARDING_SUCCESS_CHAIN,
         );
@@ -1178,6 +1309,10 @@ impl DaemonAgent {
     ))]
     fn recover_product_onboarding(&self) {
         let _gate = match self.product_runtime_gate.lock() {
+            Ok(gate) => gate,
+            Err(_) => return,
+        };
+        let _file_gate = match acquire_product_runtime_file_lock(&self.oauth_dir) {
             Ok(gate) => gate,
             Err(_) => return,
         };
@@ -1209,6 +1344,7 @@ impl DaemonAgent {
             }
             record_onboarding_generation_transitions(
                 &self.oauth_dir,
+                provider,
                 &meta.generation,
                 &ONBOARDING_SUCCESS_CHAIN,
             );
@@ -1252,12 +1388,8 @@ impl StoredCredential {
         let access_token = v.get("access_token")?.as_str()?.to_string();
         Some(Self {
             access_token,
-            refresh_token: v
-                .get("refresh_token")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-            expires_at_ms: v.get("expires_at_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+            refresh_token: v.get("refresh_token")?.as_str()?.to_string(),
+            expires_at_ms: v.get("expires_at_ms")?.as_u64()?,
         })
     }
 }
@@ -1302,6 +1434,7 @@ enum CredentialLifecycle {
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProductBundleMeta {
+    provider: ProductProviderId,
     generation: String,
     policy_fingerprint: String,
     lifecycle: CredentialLifecycle,
@@ -1314,12 +1447,13 @@ struct ProductBundleMeta {
 impl ProductBundleMeta {
     /// Fresh metadata for a brand-new login: a new random generation, the current official policy
     /// fingerprint for `provider`, and an `Active` lifecycle.
-    fn fresh(provider: ProductProviderId) -> Self {
-        Self {
-            generation: uuid_v4(),
+    fn fresh(provider: ProductProviderId) -> Result<Self, String> {
+        Ok(Self {
+            provider,
+            generation: uuid_v4()?,
             policy_fingerprint: oauth_policy_fingerprint(provider),
             lifecycle: CredentialLifecycle::Active,
-        }
+        })
     }
 
     /// Merge these metadata keys into a token-only JSON object (`token_json`) to form the V2 blob.
@@ -1333,6 +1467,10 @@ impl ProductBundleMeta {
             obj.insert(
                 "schema_version".into(),
                 serde_json::json!(PRODUCT_CREDENTIAL_SCHEMA_VERSION),
+            );
+            obj.insert(
+                "provider_id".into(),
+                serde_json::json!(self.provider.wire()),
             );
             obj.insert(
                 "credential_generation".into(),
@@ -1356,37 +1494,77 @@ impl ProductBundleMeta {
 
     /// Parse the V2 metadata from a stored blob. `None` for a legacy/incomplete blob (missing the
     /// schema version or the generation) — the caller treats that as un-migratable → reconnect.
-    fn from_blob(raw: &[u8]) -> Option<Self> {
+    fn from_blob(raw: &[u8], expected_provider: ProductProviderId) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
         if v.get("schema_version").and_then(|x| x.as_u64())
             != Some(PRODUCT_CREDENTIAL_SCHEMA_VERSION as u64)
         {
             return None;
         }
-        let generation = v.get("credential_generation")?.as_str()?.to_string();
-        if generation.is_empty() {
+        let provider = ProductProviderId::parse(v.get("provider_id")?.as_str()?)?;
+        if provider != expected_provider {
             return None;
         }
-        let policy_fingerprint = v
-            .get("oauth_policy_fingerprint")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let lifecycle = match v
-            .get("lifecycle")
-            .and_then(|x| x.as_str())
-            .unwrap_or("active")
+        let expected_keys: BTreeSet<&str> = match provider {
+            ProductProviderId::Claude => [
+                "access_token",
+                "credential_generation",
+                "expires_at_ms",
+                "lifecycle",
+                "oauth_policy_fingerprint",
+                "provider_id",
+                "reconnect_code",
+                "refresh_token",
+                "schema_version",
+            ]
+            .into_iter()
+            .collect(),
+            ProductProviderId::Codex => [
+                "access_token",
+                "account_id",
+                "credential_generation",
+                "expires_at_ms",
+                "lifecycle",
+                "oauth_policy_fingerprint",
+                "provider_id",
+                "reconnect_code",
+                "refresh_token",
+                "schema_version",
+            ]
+            .into_iter()
+            .collect(),
+        };
+        if v.as_object()?
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected_keys
         {
-            "active" => CredentialLifecycle::Active,
-            _ => CredentialLifecycle::ReconnectRequired {
-                closed_code: v
-                    .get("reconnect_code")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("reconnect_required")
-                    .to_string(),
-            },
+            return None;
+        }
+        let generation = v.get("credential_generation")?.as_str()?.to_string();
+        if !is_uuid_v4(&generation) {
+            return None;
+        }
+        let policy_fingerprint = v.get("oauth_policy_fingerprint")?.as_str()?.to_string();
+        if !is_lower_hex(&policy_fingerprint, 64) {
+            return None;
+        }
+        let reconnect_code = v.get("reconnect_code")?.as_str()?;
+        let lifecycle = match v.get("lifecycle")?.as_str()? {
+            "active" if reconnect_code.is_empty() => CredentialLifecycle::Active,
+            "reconnect_required" => {
+                if reconnect_code.is_empty() {
+                    return None;
+                }
+                CredentialLifecycle::ReconnectRequired {
+                    closed_code: reconnect_code.to_string(),
+                }
+            }
+            _ => return None,
         };
         Some(Self {
+            provider,
             generation,
             policy_fingerprint,
             lifecycle,
@@ -1394,25 +1572,52 @@ impl ProductBundleMeta {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn is_uuid_v4(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes.iter().enumerate().all(|(index, &byte)| {
+            matches!(index, 8 | 13 | 18 | 23) || matches!(byte, b'0'..=b'9' | b'a'..=b'f')
+        })
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// #639: a random RFC-4122 v4 UUID string (from the crypto RNG) — the credential generation id.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn uuid_v4() -> String {
+fn uuid_v4() -> Result<String, String> {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut b = [0u8; 16];
-    // #639 (rng fail-closed fix): a secure-RNG failure is an unrecoverable security fault — abort
-    // rather than mint a deterministic, guessable credential generation.
     SystemRandom::new()
         .fill(&mut b)
-        .expect("secure RNG unavailable — refusing to mint a credential generation");
+        .map_err(|_| "credential_generation_unavailable".to_string())?;
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant
-    format!(
+    Ok(format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    )
+    ))
 }
 
 /// #639: a stable fingerprint of the compiled official OAuth policy tuple for `provider`
@@ -1475,6 +1680,33 @@ const MAX_JOURNAL_ENVELOPE_BYTES: usize = 98_304;
     feature = "agent-subscription-experimental"
 ))]
 const MAX_JOURNAL_TRANSITIONS: usize = 32;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const MAX_JOURNAL_INDEX_ENTRIES: usize = 64;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn onboarding_journal_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn acquire_onboarding_journal_file_lock(oauth_dir: &Path) -> Result<isyncyou_agent::FileLock, ()> {
+    match isyncyou_agent::FileLock::try_acquire_exclusive(
+        &oauth_dir.join(".onboarding-journal.lock"),
+    ) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) | Err(_) => Err(()),
+    }
+}
 
 /// #639 (F5): onboarding journal TTL — transitions older than 8 minutes are reaped on load, and an
 /// all-expired journal reads as absent (the journal is expiry/recovery/evidence only, never the
@@ -1566,16 +1798,29 @@ impl ProductActivationV1 {
         .unwrap_or_default()
     }
 
-    fn from_json(raw: &[u8]) -> Option<Self> {
+    fn from_json(raw: &[u8], expected_provider: ProductProviderId) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
-        if v.get("schema_version").and_then(|x| x.as_u64()) != Some(1) {
+        if v.get("schema_version").and_then(|x| x.as_u64()) != Some(1)
+            || v.as_object().map(|object| object.len()) != Some(5)
+        {
+            return None;
+        }
+        let provider_id = v.get("provider_id")?.as_str()?.to_string();
+        let credential_generation = v.get("credential_generation")?.as_str()?.to_string();
+        let oauth_policy_fingerprint = v.get("oauth_policy_fingerprint")?.as_str()?.to_string();
+        let harness_contract_version =
+            u32::try_from(v.get("harness_contract_version")?.as_u64()?).ok()?;
+        if provider_id != expected_provider.wire()
+            || !is_uuid_v4(&credential_generation)
+            || !is_lower_hex(&oauth_policy_fingerprint, 64)
+        {
             return None;
         }
         Some(Self {
-            provider_id: v.get("provider_id")?.as_str()?.to_string(),
-            credential_generation: v.get("credential_generation")?.as_str()?.to_string(),
-            oauth_policy_fingerprint: v.get("oauth_policy_fingerprint")?.as_str()?.to_string(),
-            harness_contract_version: v.get("harness_contract_version")?.as_u64()? as u32,
+            provider_id,
+            credential_generation,
+            oauth_policy_fingerprint,
+            harness_contract_version,
         })
     }
 
@@ -1636,7 +1881,7 @@ fn load_product_activation(
             MAX_JOURNAL_PLAINTEXT_BYTES,
         )
         .ok()??;
-    ProductActivationV1::from_json(secret.expose())
+    ProductActivationV1::from_json(secret.expose(), provider)
 }
 
 /// A single recorded onboarding transition (#639). It never carries OAuth state/verifier/code/url —
@@ -1671,6 +1916,130 @@ struct OnboardingAttemptJournalV1 {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnboardingJournalKind {
+    Attempt,
+    Generation,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OnboardingJournalIndexEntry {
+    store_id: String,
+    kind: OnboardingJournalKind,
+    expires_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OnboardingJournalIndexV1 {
+    entries: Vec<OnboardingJournalIndexEntry>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl OnboardingJournalIndexV1 {
+    fn store_id(provider: ProductProviderId) -> String {
+        format!("journal-index:{}", provider.wire())
+    }
+
+    fn upsert(&mut self, entry: OnboardingJournalIndexEntry) -> Vec<String> {
+        self.entries
+            .retain(|existing| existing.store_id != entry.store_id);
+        self.entries.push(entry);
+        self.entries.sort_by_key(|entry| entry.updated_at_ms);
+        if self.entries.len() > MAX_JOURNAL_INDEX_ENTRIES {
+            return self
+                .entries
+                .drain(0..self.entries.len() - MAX_JOURNAL_INDEX_ENTRIES)
+                .map(|entry| entry.store_id)
+                .collect();
+        }
+        Vec::new()
+    }
+
+    fn to_json(&self) -> Vec<u8> {
+        let entries: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "store_id": entry.store_id,
+                    "kind": match entry.kind {
+                        OnboardingJournalKind::Attempt => "attempt",
+                        OnboardingJournalKind::Generation => "generation",
+                    },
+                    "expires_at_ms": entry.expires_at_ms,
+                    "updated_at_ms": entry.updated_at_ms,
+                })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "schema_version": 1, "entries": entries }))
+            .unwrap_or_default()
+    }
+
+    fn from_json(raw: &[u8]) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        if value.as_object().map(|object| object.len()) != Some(2)
+            || value.get("schema_version").and_then(|v| v.as_u64()) != Some(1)
+        {
+            return None;
+        }
+        let source = value.get("entries")?.as_array()?;
+        if source.len() > MAX_JOURNAL_INDEX_ENTRIES {
+            return None;
+        }
+        let mut entries = Vec::with_capacity(source.len());
+        for value in source {
+            if value.as_object().map(|object| object.len()) != Some(4) {
+                return None;
+            }
+            let store_id = value.get("store_id")?.as_str()?.to_string();
+            if !store_id.starts_with("journal:")
+                || store_id.len() != "journal:".len() + 64
+                || !is_lower_hex(&store_id["journal:".len()..], 64)
+                || entries
+                    .iter()
+                    .any(|entry: &OnboardingJournalIndexEntry| entry.store_id == store_id)
+            {
+                return None;
+            }
+            let kind = match value.get("kind")?.as_str()? {
+                "attempt" => OnboardingJournalKind::Attempt,
+                "generation" => OnboardingJournalKind::Generation,
+                _ => return None,
+            };
+            let expires_at_ms = value.get("expires_at_ms")?.as_u64()?;
+            let updated_at_ms = value.get("updated_at_ms")?.as_u64()?;
+            if updated_at_ms == 0
+                || expires_at_ms != updated_at_ms.saturating_add(ONBOARDING_JOURNAL_TTL_MS)
+            {
+                return None;
+            }
+            entries.push(OnboardingJournalIndexEntry {
+                store_id,
+                kind,
+                expires_at_ms,
+                updated_at_ms,
+            });
+        }
+        Some(Self { entries })
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 impl OnboardingAttemptJournalV1 {
     /// The store id for `attempt_id`: a domain-separated hash, never the raw attempt id. Used for
     /// the pre-credential (in-flight) phase, keyed by the opaque UI attempt.
@@ -1699,8 +2068,30 @@ impl OnboardingAttemptJournalV1 {
         )
     }
 
+    #[cfg(all(test, not(feature = "agent-subscription-experimental")))]
     fn has_state(&self, state: ProductOnboardingState) -> bool {
         self.transitions.iter().any(|t| t.state == state)
+    }
+
+    fn ordered_success_prefix(&self) -> Result<usize, ()> {
+        if self.transitions.len() > ONBOARDING_SUCCESS_CHAIN.len() {
+            return Err(());
+        }
+        for (index, transition) in self.transitions.iter().enumerate() {
+            if transition.state != ONBOARDING_SUCCESS_CHAIN[index]
+                || transition.generation.is_empty()
+                || transition.error_code.is_some()
+            {
+                return Err(());
+            }
+        }
+        Ok(self.transitions.len())
+    }
+
+    fn terminal_error(&self) -> Option<&OnboardingTransition> {
+        self.transitions
+            .last()
+            .filter(|transition| transition.state == ProductOnboardingState::ErrorRedacted)
     }
 
     /// Append a transition, keeping only the most recent `MAX_JOURNAL_TRANSITIONS` (compaction).
@@ -1731,27 +2122,48 @@ impl OnboardingAttemptJournalV1 {
 
     fn from_json(raw: &[u8]) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
-        if v.get("schema_version").and_then(|x| x.as_u64()) != Some(1) {
+        if v.as_object().map(|object| object.len()) != Some(2)
+            || v.get("schema_version").and_then(|x| x.as_u64()) != Some(1)
+        {
             return None;
         }
-        let mut transitions = Vec::new();
-        for t in v.get("transitions").and_then(|x| x.as_array())? {
+        let source = v.get("transitions").and_then(|x| x.as_array())?;
+        if source.len() > MAX_JOURNAL_TRANSITIONS {
+            return None;
+        }
+        let mut transitions = Vec::with_capacity(source.len());
+        for (index, t) in source.iter().enumerate() {
+            if t.as_object().map(|object| object.len()) != Some(4) {
+                return None;
+            }
             let state = onboarding_state_from_wire(t.get("state").and_then(|x| x.as_str())?)?;
+            let generation = t.get("generation")?.as_str()?.to_string();
+            let error_code = match t.get("error_code")? {
+                serde_json::Value::Null => None,
+                value => Some(value.as_str()?.to_string()),
+            };
+            let recorded_at_ms = t.get("recorded_at_ms")?.as_u64()?;
+            if recorded_at_ms == 0 {
+                return None;
+            }
+            match state {
+                ProductOnboardingState::OfficialSignInStarted
+                    if generation.is_empty() && error_code.is_none() => {}
+                ProductOnboardingState::ErrorRedacted
+                    if generation.is_empty()
+                        && error_code.as_deref().is_some_and(is_onboarding_error_code)
+                        && index + 1 == source.len() => {}
+                state
+                    if ONBOARDING_SUCCESS_CHAIN.contains(&state)
+                        && is_uuid_v4(&generation)
+                        && error_code.is_none() => {}
+                _ => return None,
+            }
             transitions.push(OnboardingTransition {
                 state,
-                generation: t
-                    .get("generation")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                error_code: t
-                    .get("error_code")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
-                recorded_at_ms: t
-                    .get("recorded_at_ms")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0),
+                generation,
+                error_code,
+                recorded_at_ms,
             });
         }
         Some(Self { transitions })
@@ -1778,6 +2190,42 @@ fn onboarding_state_from_wire(wire: &str) -> Option<ProductOnboardingState> {
         "error_redacted" => ErrorRedacted,
         _ => return None,
     })
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn public_onboarding_error_code(code: Option<&str>) -> &'static str {
+    match code {
+        Some("cancelled") => "cancelled",
+        Some("expired") => "expired",
+        Some("interrupted") => "interrupted",
+        Some("policy_unavailable") => "policy_unavailable",
+        Some("transport_unavailable") => "transport_unavailable",
+        Some("exchange_failed") => "exchange_failed",
+        Some("commit_failed") => "commit_failed",
+        Some("journal_invalid") => "journal_invalid",
+        _ => "onboarding_failed",
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn is_onboarding_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "cancelled"
+            | "expired"
+            | "interrupted"
+            | "policy_unavailable"
+            | "transport_unavailable"
+            | "exchange_failed"
+            | "commit_failed"
+            | "journal_invalid"
+    )
 }
 
 /// Persist an onboarding journal at a precomputed store id (#639) — bounded, authenticated, atomic.
@@ -1836,6 +2284,7 @@ fn load_onboarding_journal_at(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[cfg(test)]
 fn store_onboarding_journal(
     oauth_dir: &Path,
     attempt_id: &str,
@@ -1861,6 +2310,220 @@ fn load_onboarding_journal(
         oauth_dir,
         &OnboardingAttemptJournalV1::journal_store_id(attempt_id),
     )
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn load_onboarding_journal_index(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+) -> Result<OnboardingJournalIndexV1, ()> {
+    if !agent_credential_store_exists(oauth_dir) {
+        return Ok(OnboardingJournalIndexV1::default());
+    }
+    let store = agent_credential_store(oauth_dir).map_err(|_| ())?;
+    let Some(secret) = store
+        .get_bounded(
+            isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+            &OnboardingJournalIndexV1::store_id(provider),
+            MAX_JOURNAL_ENVELOPE_BYTES,
+            MAX_JOURNAL_PLAINTEXT_BYTES,
+        )
+        .map_err(|_| ())?
+    else {
+        return Ok(OnboardingJournalIndexV1::default());
+    };
+    OnboardingJournalIndexV1::from_json(secret.expose()).ok_or(())
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn store_onboarding_journal_index(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+    index: &OnboardingJournalIndexV1,
+) -> Result<(), String> {
+    let store = agent_credential_store(oauth_dir)?;
+    if index.entries.is_empty() {
+        return store
+            .delete(
+                isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+                &OnboardingJournalIndexV1::store_id(provider),
+            )
+            .map_err(credential_store_error);
+    }
+    store
+        .put(
+            isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+            &OnboardingJournalIndexV1::store_id(provider),
+            &isyncyou_agent::Secret::new(index.to_json()),
+        )
+        .map_err(credential_store_error)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn store_indexed_onboarding_journal(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+    store_id: &str,
+    kind: OnboardingJournalKind,
+    journal: &OnboardingAttemptJournalV1,
+    recorded_at_ms: u64,
+) -> Result<(), String> {
+    let mut index = load_onboarding_journal_index(oauth_dir, provider)
+        .map_err(|_| "onboarding journal index is invalid".to_string())?;
+    let evicted = index.upsert(OnboardingJournalIndexEntry {
+        store_id: store_id.to_string(),
+        kind,
+        expires_at_ms: recorded_at_ms.saturating_add(ONBOARDING_JOURNAL_TTL_MS),
+        updated_at_ms: recorded_at_ms,
+    });
+    let store = agent_credential_store(oauth_dir)?;
+
+    // Journals are evidence-only. Delete entries evicted by the hard index bound before publishing
+    // the new index, so an interrupted write cannot leave an ever-growing set of unindexed files.
+    for evicted_id in evicted {
+        store
+            .delete(
+                isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+                &evicted_id,
+            )
+            .map_err(credential_store_error)?;
+    }
+    store_onboarding_journal_index(oauth_dir, provider, &index)?;
+    if let Err(error) = store_onboarding_journal_at(oauth_dir, store_id, journal) {
+        index.entries.retain(|entry| entry.store_id != store_id);
+        let _ = store_onboarding_journal_index(oauth_dir, provider, &index);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn reap_onboarding_journals_at(oauth_dir: &Path, now: u64) {
+    let Ok(_gate) = onboarding_journal_gate().lock() else {
+        return;
+    };
+    let Ok(_file_gate) = acquire_onboarding_journal_file_lock(oauth_dir) else {
+        return;
+    };
+    if !agent_credential_store_exists(oauth_dir) {
+        return;
+    }
+    let Ok(store) = agent_credential_store(oauth_dir) else {
+        return;
+    };
+    for provider in ProductProviderId::ALL {
+        let Ok(mut index) = load_onboarding_journal_index(oauth_dir, provider) else {
+            continue;
+        };
+        // The index is written before its journal so a failed journal write can be rolled back. A
+        // process crash in that narrow window leaves a dangling index entry; remove it on startup
+        // and status reaping instead of projecting `journal_invalid` forever.
+        let expired_or_dangling: Vec<String> = index
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.expires_at_ms <= now
+                    || load_onboarding_journal_at(oauth_dir, &entry.store_id).is_none()
+            })
+            .map(|entry| entry.store_id.clone())
+            .collect();
+        index
+            .entries
+            .retain(|entry| !expired_or_dangling.contains(&entry.store_id));
+        for store_id in expired_or_dangling {
+            let _ = store.delete(
+                isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+                &store_id,
+            );
+        }
+        let _ = store_onboarding_journal_index(oauth_dir, provider, &index);
+    }
+}
+
+/// A process restart loses the PKCE verifier and OAuth state held in memory. Any still-live,
+/// nonterminal attempt journal therefore cannot be resumed and is closed with a redacted terminal
+/// transition. The hashed store id is sufficient; raw attempt ids are neither recovered nor stored.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn recover_interrupted_onboarding_attempts(oauth_dir: &Path) {
+    let Ok(_gate) = onboarding_journal_gate().lock() else {
+        return;
+    };
+    let Ok(_file_gate) = acquire_onboarding_journal_file_lock(oauth_dir) else {
+        return;
+    };
+    for provider in ProductProviderId::ALL {
+        let Ok(index) = load_onboarding_journal_index(oauth_dir, provider) else {
+            continue;
+        };
+        let attempt_store_ids: Vec<String> = index
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == OnboardingJournalKind::Attempt)
+            .map(|entry| entry.store_id.clone())
+            .collect();
+        for store_id in attempt_store_ids {
+            let Some(mut journal) = load_onboarding_journal_at(oauth_dir, &store_id) else {
+                continue;
+            };
+            if journal.terminal_error().is_some() {
+                continue;
+            }
+            let recorded_at_ms = now_ms();
+            journal.push(OnboardingTransition {
+                state: ProductOnboardingState::ErrorRedacted,
+                generation: String::new(),
+                error_code: Some("interrupted".into()),
+                recorded_at_ms,
+            });
+            let _ = store_indexed_onboarding_journal(
+                oauth_dir,
+                provider,
+                &store_id,
+                OnboardingJournalKind::Attempt,
+                &journal,
+                recorded_at_ms,
+            );
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn latest_attempt_journal(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+) -> Result<Option<OnboardingAttemptJournalV1>, ()> {
+    let _gate = onboarding_journal_gate().lock().map_err(|_| ())?;
+    let _file_gate = acquire_onboarding_journal_file_lock(oauth_dir)?;
+    let index = load_onboarding_journal_index(oauth_dir, provider)?;
+    let latest = index
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == OnboardingJournalKind::Attempt)
+        .max_by_key(|entry| entry.updated_at_ms);
+    match latest {
+        Some(entry) => load_onboarding_journal_at(oauth_dir, &entry.store_id)
+            .map(Some)
+            .ok_or(()),
+        None => Ok(None),
+    }
 }
 
 /// The ordered onboarding chain recorded once a successful official OAuth is committed and the
@@ -1890,10 +2553,18 @@ const ONBOARDING_SUCCESS_CHAIN: [ProductOnboardingState; 8] = [
 ))]
 fn record_onboarding_attempt_transition(
     oauth_dir: &Path,
+    provider: ProductProviderId,
     attempt_id: &str,
     state: ProductOnboardingState,
     error_code: Option<String>,
 ) {
+    let Ok(_gate) = onboarding_journal_gate().lock() else {
+        return;
+    };
+    let Ok(_file_gate) = acquire_onboarding_journal_file_lock(oauth_dir) else {
+        return;
+    };
+    let store_id = OnboardingAttemptJournalV1::journal_store_id(attempt_id);
     let mut journal =
         load_onboarding_journal(oauth_dir, attempt_id).unwrap_or(OnboardingAttemptJournalV1 {
             transitions: vec![],
@@ -1904,7 +2575,14 @@ fn record_onboarding_attempt_transition(
         error_code,
         recorded_at_ms: now_ms(),
     });
-    let _ = store_onboarding_journal(oauth_dir, attempt_id, &journal);
+    let _ = store_indexed_onboarding_journal(
+        oauth_dir,
+        provider,
+        &store_id,
+        OnboardingJournalKind::Attempt,
+        &journal,
+        now_ms(),
+    );
 }
 
 /// Append one or more ordered transitions to the generation-keyed journal (#639), skipping any that
@@ -1915,9 +2593,16 @@ fn record_onboarding_attempt_transition(
 ))]
 fn record_onboarding_generation_transitions(
     oauth_dir: &Path,
+    provider: ProductProviderId,
     generation: &str,
     states: &[ProductOnboardingState],
 ) {
+    let Ok(_gate) = onboarding_journal_gate().lock() else {
+        return;
+    };
+    let Ok(_file_gate) = acquire_onboarding_journal_file_lock(oauth_dir) else {
+        return;
+    };
     let store_id = OnboardingAttemptJournalV1::journal_store_id_for_generation(generation);
     let mut journal =
         load_onboarding_journal_at(oauth_dir, &store_id).unwrap_or(OnboardingAttemptJournalV1 {
@@ -1925,7 +2610,19 @@ fn record_onboarding_generation_transitions(
         });
     let mut changed = false;
     for &state in states {
-        if !journal.has_state(state) {
+        let Some(chain_index) = ONBOARDING_SUCCESS_CHAIN
+            .iter()
+            .position(|item| *item == state)
+        else {
+            break;
+        };
+        if chain_index < journal.transitions.len() {
+            if journal.transitions[chain_index].state != state {
+                break;
+            }
+            continue;
+        }
+        if chain_index == journal.transitions.len() {
             journal.push(OnboardingTransition {
                 state,
                 generation: generation.to_string(),
@@ -1933,20 +2630,37 @@ fn record_onboarding_generation_transitions(
                 recorded_at_ms: now_ms(),
             });
             changed = true;
+        } else {
+            break;
         }
     }
     if changed {
-        let _ = store_onboarding_journal_at(oauth_dir, &store_id, &journal);
+        let _ = store_indexed_onboarding_journal(
+            oauth_dir,
+            provider,
+            &store_id,
+            OnboardingJournalKind::Generation,
+            &journal,
+            now_ms(),
+        );
     }
 }
 
-// #639 (review): the cross-process product-runtime FILE lock is NOT wired. The in-process
-// `product_runtime_gate` mutex provides the intra-process atomicity the acceptance criteria require
-// (a single desktop/mobile daemon owns the encrypted store). A daemon-lifetime `flock` is not held,
-// so this build makes NO cross-process single-runtime guarantee, and the earlier dead wrapper +
-// its unit test have been removed rather than imply one. (`isyncyou_agent::FileLock` remains an
-// available primitive; wiring it into the infallible constructor + a fail-closed degraded mode is a
-// separate, test-invasive change and is out of scope here.)
+/// Acquire the cross-process side of the product-runtime transaction gate. The in-process mutex is
+/// always taken first; this short-lived lock then spans one complete settings/credential/activation
+/// snapshot or write transaction. A competing daemon fails closed instead of reading a mixed
+/// revision. Browser sign-in and provider network calls never hold this lock.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn acquire_product_runtime_file_lock(oauth_dir: &Path) -> Result<isyncyou_agent::FileLock, String> {
+    match isyncyou_agent::FileLock::try_acquire_exclusive(&oauth_dir.join(".product-runtime.lock"))
+    {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) | Err(_) => Err("product_busy".to_string()),
+    }
+}
 
 /// The Codex/ChatGPT credential we persist (access + refresh + ChatGPT account id + expiry).
 #[cfg(any(
@@ -1965,6 +2679,7 @@ struct CodexStoredCredential {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderCredentialOrigin {
     ProductCredentialStore,
@@ -1986,6 +2701,7 @@ enum ProductCredentialState<T> {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderKind {
     Claude,
@@ -1996,6 +2712,7 @@ enum ProviderKind {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[cfg(test)]
 enum ResolvedProviderCredential {
     Claude {
         origin: ProviderCredentialOrigin,
@@ -2019,6 +2736,7 @@ enum ProviderCredentialResolutionError {
     ExperimentalUnsupportedPlatform,
     #[cfg(feature = "agent-subscription-experimental")]
     ExperimentalCredentialRejected,
+    #[cfg(test)]
     ProviderUnavailable,
 }
 
@@ -2034,6 +2752,7 @@ impl std::fmt::Display for ProviderCredentialResolutionError {
             Self::ExperimentalUnsupportedPlatform => "experimental_platform_unsupported",
             #[cfg(feature = "agent-subscription-experimental")]
             Self::ExperimentalCredentialRejected => "experimental_credential_rejected",
+            #[cfg(test)]
             Self::ProviderUnavailable => "provider_unavailable",
         };
         write!(f, "agent provider unavailable: {reason}")
@@ -2289,17 +3008,9 @@ impl CodexStoredCredential {
         let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
         Some(Self {
             access_token: v.get("access_token")?.as_str()?.to_string(),
-            refresh_token: v
-                .get("refresh_token")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-            account_id: v
-                .get("account_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-            expires_at_ms: v.get("expires_at_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+            refresh_token: v.get("refresh_token")?.as_str()?.to_string(),
+            account_id: v.get("account_id")?.as_str()?.to_string(),
+            expires_at_ms: v.get("expires_at_ms")?.as_u64()?,
         })
     }
 }
@@ -2377,6 +3088,17 @@ fn store_agent_credential_blob(oauth_dir: &Path, id: &str, bytes: Vec<u8>) -> Re
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+const MAX_PRODUCT_CREDENTIAL_PLAINTEXT_BYTES: usize = 128 * 1024;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const MAX_PRODUCT_CREDENTIAL_ENVELOPE_BYTES: usize = 192 * 1024;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn load_agent_credential_blob(
     oauth_dir: &Path,
     id: &str,
@@ -2385,7 +3107,12 @@ fn load_agent_credential_blob(
         return Ok(None);
     }
     agent_credential_store(oauth_dir)?
-        .get(isyncyou_agent::SecretClass::ProviderOAuthRefresh, id)
+        .get_bounded(
+            isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+            id,
+            MAX_PRODUCT_CREDENTIAL_ENVELOPE_BYTES,
+            MAX_PRODUCT_CREDENTIAL_PLAINTEXT_BYTES,
+        )
         .map_err(credential_store_error)
 }
 
@@ -2394,12 +3121,13 @@ fn load_agent_credential_blob(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn store_codex_blob(oauth_dir: &Path, cred: &CodexStoredCredential) -> Result<(), String> {
+fn store_codex_blob(oauth_dir: &Path, cred: &CodexStoredCredential) -> Result<String, String> {
     // A bare `store_codex_blob` is a fresh login: mint a new generation (#639), then activate the
     // product path for that generation (attest -> durable ProductActivationV1).
-    let meta = ProductBundleMeta::fresh(ProductProviderId::Codex);
+    let meta = ProductBundleMeta::fresh(ProductProviderId::Codex)?;
     store_codex_bundle(oauth_dir, cred, &meta)?;
-    activate_product(oauth_dir, ProductProviderId::Codex, &meta.generation)
+    activate_product(oauth_dir, ProductProviderId::Codex, &meta.generation)?;
+    Ok(meta.generation)
 }
 
 /// Persist a Codex credential with explicit V2 metadata (#639) — used by refresh to preserve the
@@ -2459,8 +3187,11 @@ fn activate_product(
                 && meta.generation == generation => {}
         _ => return Err("credential policy/generation does not match the official policy".into()),
     }
-    isyncyou_agent::attest_static_product_harness(harness_provider_for(provider))
-        .map_err(|_| "harness_attestation_failed".to_string())?;
+    isyncyou_agent::attest_static_product_harness(
+        harness_provider_for(provider),
+        AGENT_SYSTEM_PROMPT,
+    )
+    .map_err(|_| "harness_attestation_failed".to_string())?;
     let activation = ProductActivationV1 {
         provider_id: provider.wire().to_string(),
         credential_generation: generation.to_string(),
@@ -2476,10 +3207,81 @@ fn activate_product(
     feature = "agent-subscription-experimental"
 ))]
 fn load_product_bundle_meta(oauth_dir: &Path, id: &str) -> Option<ProductBundleMeta> {
+    let provider = match id {
+        SUBSCRIPTION_CREDENTIAL_ID => ProductProviderId::Claude,
+        CODEX_CREDENTIAL_ID => ProductProviderId::Codex,
+        _ => return None,
+    };
     match load_agent_credential_blob(oauth_dir, id) {
-        Ok(Some(secret)) => ProductBundleMeta::from_blob(secret.expose()),
+        Ok(Some(secret)) => ProductBundleMeta::from_blob(secret.expose(), provider),
         _ => None,
     }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const PRODUCT_SETTINGS_ID: &str = "selected-provider-model";
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const MAX_PRODUCT_SETTINGS_PLAINTEXT_BYTES: usize = 4_096;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const MAX_PRODUCT_SETTINGS_ENVELOPE_BYTES: usize = 8_192;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentSettingsSnapshot {
+    provider: ProductProviderId,
+    model: String,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn provider_has_model(provider: ProductProviderId, model: &str) -> bool {
+    let known = match provider {
+        ProductProviderId::Claude => CLAUDE_MODELS,
+        ProductProviderId::Codex => CODEX_MODELS,
+    };
+    known.iter().any(|(id, _)| *id == model)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn load_agent_provider_selection(oauth_dir: &Path) -> Option<AgentSettingsSnapshot> {
+    if !agent_credential_store_exists(oauth_dir) {
+        return None;
+    }
+    let store = agent_credential_store(oauth_dir).ok()?;
+    let secret = store
+        .get_bounded(
+            isyncyou_agent::SecretClass::ProductSettings,
+            PRODUCT_SETTINGS_ID,
+            MAX_PRODUCT_SETTINGS_ENVELOPE_BYTES,
+            MAX_PRODUCT_SETTINGS_PLAINTEXT_BYTES,
+        )
+        .ok()??;
+    let value: serde_json::Value = serde_json::from_slice(secret.expose()).ok()?;
+    if value.get("schema_version").and_then(|v| v.as_u64()) != Some(1)
+        || value.as_object().map(|v| v.len()) != Some(3)
+    {
+        return None;
+    }
+    let provider = ProductProviderId::parse(value.get("provider")?.as_str()?)?;
+    let model = value.get("model")?.as_str()?.to_string();
+    provider_has_model(provider, &model).then_some(AgentSettingsSnapshot { provider, model })
 }
 
 #[cfg(any(
@@ -2491,21 +3293,24 @@ fn store_agent_provider_selection(
     provider: &str,
     model: &str,
 ) -> Result<(), String> {
-    let known = match ProductProviderId::parse(provider) {
-        Some(ProductProviderId::Claude) => CLAUDE_MODELS,
-        Some(ProductProviderId::Codex) => CODEX_MODELS,
-        None => return Err("unknown provider".into()),
-    };
-    if !known.iter().any(|(id, _)| *id == model) {
+    let provider =
+        ProductProviderId::parse(provider).ok_or_else(|| "unknown provider".to_string())?;
+    if !provider_has_model(provider, model) {
         return Err("unknown model for provider".into());
     }
-    std::fs::create_dir_all(oauth_dir).map_err(|e| e.to_string())?;
     let blob = serde_json::to_vec(&serde_json::json!({
-        "provider": provider,
+        "schema_version": 1,
+        "provider": provider.wire(),
         "model": model,
     }))
     .map_err(|e| e.to_string())?;
-    std::fs::write(oauth_dir.join("agent-settings.json"), blob).map_err(|e| e.to_string())
+    agent_credential_store(oauth_dir)?
+        .put(
+            isyncyou_agent::SecretClass::ProductSettings,
+            PRODUCT_SETTINGS_ID,
+            &isyncyou_agent::Secret::new(blob),
+        )
+        .map_err(credential_store_error)
 }
 
 /// Minimal percent-decode for the loopback callback query (`+`→space, `%XX`→byte).
@@ -2565,7 +3370,36 @@ align-items:center;justify-content:center;margin:0\"><div style=text-align:cente
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-const CODEX_CALLBACK_DIAGNOSTICS_FILE: &str = "codex-debug.txt";
+const LEGACY_CODEX_CALLBACK_DIAGNOSTICS_NAME_SHA256: [u8; 32] = [
+    0x0f, 0x19, 0x11, 0xfa, 0xf8, 0x32, 0xc0, 0xd2, 0xe7, 0x9e, 0xa6, 0x9b, 0x96, 0x2b, 0xd0, 0x28,
+    0x9e, 0x0c, 0xec, 0x4a, 0x3b, 0x0e, 0x2c, 0x4b, 0xbc, 0xb3, 0x2e, 0x3f, 0x9a, 0xbd, 0xcf, 0x10,
+];
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn remove_legacy_codex_callback_diagnostics(oauth_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(oauth_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let digest = ring::digest::digest(&ring::digest::SHA256, name.as_bytes());
+        let is_regular_file = entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false);
+        if is_regular_file
+            && digest.as_ref() == LEGACY_CODEX_CALLBACK_DIAGNOSTICS_NAME_SHA256.as_slice()
+        {
+            let _ = std::fs::remove_file(entry.path());
+            break;
+        }
+    }
+}
 
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -2610,6 +3444,52 @@ fn codex_callback_serve(listener: std::net::TcpListener, context: CodexCallbackC
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+fn claim_codex_callback_attempt(
+    attempts: &Arc<Mutex<HashMap<String, OAuthAttempt>>>,
+    attempt_id: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> bool {
+    let Ok(mut attempts) = attempts.lock() else {
+        return false;
+    };
+    let owned = matches!(
+        attempts.get(attempt_id),
+        Some(OAuthAttempt::Codex { cancelled: current, .. })
+            if Arc::ptr_eq(current, cancelled) && !cancelled.load(Ordering::Acquire)
+    );
+    if owned {
+        attempts.remove(attempt_id);
+    }
+    owned
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn remove_owned_codex_attempt(
+    attempts: &Arc<Mutex<HashMap<String, OAuthAttempt>>>,
+    attempt_id: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> bool {
+    let Ok(mut attempts) = attempts.lock() else {
+        return false;
+    };
+    let owned = matches!(
+        attempts.get(attempt_id),
+        Some(OAuthAttempt::Codex { cancelled: current, .. })
+            if Arc::ptr_eq(current, cancelled)
+    );
+    if owned {
+        attempts.remove(attempt_id);
+    }
+    owned
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn codex_callback_serve_until(
     listener: std::net::TcpListener,
     context: CodexCallbackContext,
@@ -2626,116 +3506,160 @@ fn codex_callback_serve_until(
         attempts,
         product_runtime_gate,
     } = context;
-    if listener.set_nonblocking(true).is_err() {
-        return;
-    }
+    let mut claimed = false;
     let mut completed = false;
-    while std::time::Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
-        let mut stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut terminal_code = None;
+    if listener.set_nonblocking(true).is_ok() {
+        while std::time::Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let mut parts = first_line.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let path = target
+                .split_once('?')
+                .map(|(path, _)| path)
+                .unwrap_or(target);
+            if method != "GET" || path != "/auth/callback" {
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
                 continue;
             }
-            Err(_) => break,
-        };
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let first_line = req.lines().next().unwrap_or("");
-        let mut parts = first_line.split_whitespace();
-        let method = parts.next().unwrap_or("");
-        let target = parts.next().unwrap_or("");
-        if method != "GET" || !target.starts_with("/auth/callback") {
-            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
-            continue; // ignore favicon/others, keep waiting for the real callback
-        }
-        let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let (mut code, mut state) = (String::new(), String::new());
-        for pair in query.split('&') {
-            match pair.split_once('=') {
-                Some(("code", v)) => code = pct_decode(v),
-                Some(("state", v)) => state = pct_decode(v),
-                _ => {}
+            let query = target.split_once('?').map(|(_, query)| query).unwrap_or("");
+            let (mut code, mut state) = (None, None);
+            let mut duplicate_or_unknown = false;
+            for pair in query.split('&') {
+                match pair.split_once('=') {
+                    Some(("code", value)) if code.is_none() => code = Some(pct_decode(value)),
+                    Some(("state", value)) if state.is_none() => state = Some(pct_decode(value)),
+                    _ => duplicate_or_unknown = true,
+                }
             }
-        }
-        let ok = if state == want_state && !code.is_empty() {
-            match isyncyou_agent::http::HttpTransport::shared()
-                .map_err(|e| e.to_string())
+            let valid_callback = !duplicate_or_unknown
+                && code.as_deref().is_some_and(|value| !value.is_empty())
+                && state.as_deref() == Some(want_state.as_str());
+            if !valid_callback {
+                let body = CODEX_ERR_HTML;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                continue;
+            }
+
+            // The callback and cancel/reap paths race only here. Whoever removes this exact
+            // pointer-bound attempt first owns the terminal result; a late callback has no authority
+            // to exchange or persist credentials.
+            if !claim_codex_callback_attempt(&attempts, &attempt_id, &cancelled) {
+                let body = CODEX_ERR_HTML;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                break;
+            }
+            claimed = true;
+            let exchange = isyncyou_agent::http::HttpTransport::shared()
+                .map_err(|_| ())
                 .and_then(|http| {
-                    isyncyou_agent::oauth::codex_exchange(&http, &cfg, &code, &verifier)
-                        .map_err(|e| e.to_string())
-                }) {
-                Ok(tok) => {
-                    let expires_at_ms = if tok.expires_in > 0 {
-                        now_ms() + tok.expires_in * 1000
+                    isyncyou_agent::oauth::codex_exchange(
+                        &http,
+                        &cfg,
+                        code.as_deref().unwrap_or_default(),
+                        &verifier,
+                    )
+                    .map_err(|_| ())
+                });
+            let ok = match exchange {
+                Ok(token) => {
+                    let expires_at_ms = if token.expires_in > 0 {
+                        now_ms() + token.expires_in * 1000
                     } else {
                         0
                     };
-                    // #639 T8: hold the shared product-runtime gate across the credential write +
-                    // activation + journal so status/turn cannot read a half-written revision.
-                    let _gate = product_runtime_gate.lock();
-                    let stored = store_codex_blob(
-                        &oauth_dir,
-                        &CodexStoredCredential {
-                            access_token: tok.access_token,
-                            refresh_token: tok.refresh_token,
-                            account_id: tok.account_id,
-                            expires_at_ms,
+                    let committed = match product_runtime_gate.lock() {
+                        Ok(_gate) => match acquire_product_runtime_file_lock(&oauth_dir) {
+                            Ok(_file_gate) => (|| -> Result<(), String> {
+                                let generation = store_codex_blob(
+                                    &oauth_dir,
+                                    &CodexStoredCredential {
+                                        access_token: token.access_token,
+                                        refresh_token: token.refresh_token,
+                                        account_id: token.account_id,
+                                        expires_at_ms,
+                                    },
+                                )?;
+                                record_onboarding_generation_transitions(
+                                    &oauth_dir,
+                                    ProductProviderId::Codex,
+                                    &generation,
+                                    &ONBOARDING_SUCCESS_CHAIN,
+                                );
+                                store_agent_provider_selection(
+                                    &oauth_dir,
+                                    "codex",
+                                    &isyncyou_agent::CodexConfig::default().model,
+                                )
+                            })()
+                            .is_ok(),
+                            Err(_) => false,
                         },
-                    )
-                    .and_then(|_| {
-                        store_agent_provider_selection(
-                            &oauth_dir,
-                            "codex",
-                            &isyncyou_agent::CodexConfig::default().model,
-                        )
-                    })
-                    .is_ok();
-                    if stored {
-                        let generation = load_product_bundle_meta(&oauth_dir, CODEX_CREDENTIAL_ID)
-                            .map(|meta| meta.generation)
-                            .unwrap_or_default();
-                        record_onboarding_generation_transitions(
-                            &oauth_dir,
-                            &generation,
-                            &ONBOARDING_SUCCESS_CHAIN,
-                        );
+                        Err(_) => false,
+                    };
+                    if committed {
                         completed = true;
+                    } else {
+                        terminal_code = Some("commit_failed");
                     }
-                    stored
+                    committed
                 }
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
-        let body = if ok { CODEX_OK_HTML } else { CODEX_ERR_HTML };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        break;
+                Err(()) => {
+                    terminal_code = Some("exchange_failed");
+                    false
+                }
+            };
+            let body = if ok { CODEX_OK_HTML } else { CODEX_ERR_HTML };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            break;
+        }
     }
-    // #639 T8: an attempt that ended without completing and was not user-cancelled (timeout /
-    // stale callback / lost verifier) is a terminal, redacted transition — never resumed.
-    if !completed && !cancelled.load(Ordering::Acquire) {
+
+    // If no callback claimed the attempt, timeout/listener failure may terminate only the exact
+    // entry still owned by this thread. Cancel and the TTL reaper remove it first and own their
+    // already-recorded terminal state, preventing a second terminal transition.
+    if !claimed
+        && remove_owned_codex_attempt(&attempts, &attempt_id, &cancelled)
+        && !cancelled.load(Ordering::Acquire)
+    {
+        terminal_code = Some("interrupted");
+    }
+    if claimed && !completed && terminal_code.is_none() {
+        terminal_code = Some("interrupted");
+    }
+    if let Some(code) = terminal_code {
         record_onboarding_attempt_transition(
             &oauth_dir,
+            ProductProviderId::Codex,
             &attempt_id,
             ProductOnboardingState::ErrorRedacted,
-            Some("interrupted".to_string()),
+            Some(code.to_string()),
         );
-    }
-    // A stale callback thread may only clear the exact attempt it owns. A newer login
-    // therefore cannot be erased by a late timeout/cancellation path.
-    let mut attempts = attempts.lock().unwrap();
-    if matches!(attempts.get(&attempt_id), Some(OAuthAttempt::Codex { cancelled: current, .. }) if Arc::ptr_eq(current, &cancelled))
-    {
-        attempts.remove(&attempt_id);
     }
 }
 
@@ -2787,7 +3711,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn store_credential(&self, cred: &StoredCredential) -> Result<(), String> {
         // A bare `store_credential` is a fresh login: mint a new generation (#639), then activate
         // the product path for that generation (attest -> durable ProductActivationV1).
-        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude)?;
         self.store_claude_bundle(cred, &meta)?;
         activate_product(&self.oauth_dir, ProductProviderId::Claude, &meta.generation)
     }
@@ -2827,46 +3751,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         })
     }
 
-    /// The persisted provider+model selection (the switcher), falling back to the env
-    /// override then the in-repo default. Stored next to the credential store.
-    fn agent_settings(&self) -> (String, String) {
-        let default_provider = if std::env::var("ISYNCYOU_AGENT_PROVIDER").as_deref() == Ok("codex")
-        {
-            "codex"
-        } else {
-            "claude"
-        };
-        if let Ok(s) = std::fs::read_to_string(self.oauth_dir.join("agent-settings.json")) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                let provider = v
-                    .get("provider")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or(default_provider)
-                    .to_string();
-                let model = v
-                    .get("model")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                return (provider, model);
-            }
-        }
-        (default_provider.to_string(), String::new())
-    }
-
-    /// The model to use for `provider`: the current selection if it names that provider,
-    /// else that provider's default (env override for Claude, in-repo default otherwise).
-    fn model_for(&self, provider: &str) -> String {
-        let (sel_provider, sel_model) = self.agent_settings();
-        if provider == sel_provider && !sel_model.is_empty() {
-            return sel_model;
-        }
-        match ProductProviderId::parse(provider) {
-            Some(ProductProviderId::Codex) => isyncyou_agent::CodexConfig::default().model,
-            _ => {
-                std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
-            }
-        }
+    /// The one authenticated provider/model snapshot consumed by status and the runtime gate.
+    /// Missing, malformed, unknown, or legacy plaintext settings are unconfigured; there is no
+    /// environment/default fallback that could silently select another product identity.
+    fn agent_settings(&self) -> Option<AgentSettingsSnapshot> {
+        load_agent_provider_selection(&self.oauth_dir)
     }
 
     /// Persist the switcher selection after validating it against the offered models.
@@ -2874,19 +3763,32 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         store_agent_provider_selection(&self.oauth_dir, provider, model)
     }
 
-    fn claude_product_credential_state(&self) -> ProductCredentialState<StoredCredential> {
+    fn claude_product_bundle_state(
+        &self,
+    ) -> ProductCredentialState<(StoredCredential, ProductBundleMeta)> {
         match load_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID) {
             Ok(None) => ProductCredentialState::Absent,
             Ok(Some(secret)) => {
-                // #639: a legacy/incomplete blob (no V2 meta) or one marked ReconnectRequired is
-                // un-migratable and fails closed to reconnect — no silent upgrade, no refresh loop.
-                match ProductBundleMeta::from_blob(secret.expose()) {
-                    Some(meta) if meta.lifecycle == CredentialLifecycle::Active => {
-                        StoredCredential::from_json(secret.expose())
-                            .map(|c| {
-                                classify_claude_product_credential_at(c, (self.credential_now_ms)())
-                            })
-                            .unwrap_or(ProductCredentialState::PresentInvalid)
+                match ProductBundleMeta::from_blob(secret.expose(), ProductProviderId::Claude) {
+                    Some(meta)
+                        if meta.lifecycle == CredentialLifecycle::Active
+                            && meta.policy_fingerprint
+                                == oauth_policy_fingerprint(ProductProviderId::Claude) =>
+                    {
+                        match StoredCredential::from_json(secret.expose()).map(|credential| {
+                            classify_claude_product_credential_at(
+                                credential,
+                                (self.credential_now_ms)(),
+                            )
+                        }) {
+                            Some(ProductCredentialState::PresentValid(credential)) => {
+                                ProductCredentialState::PresentValid((credential, meta))
+                            }
+                            Some(ProductCredentialState::PresentNeedsRefresh(credential)) => {
+                                ProductCredentialState::PresentNeedsRefresh((credential, meta))
+                            }
+                            _ => ProductCredentialState::PresentInvalid,
+                        }
                     }
                     _ => ProductCredentialState::PresentInvalid,
                 }
@@ -2895,23 +3797,59 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
+    fn claude_product_credential_state(&self) -> ProductCredentialState<StoredCredential> {
+        match self.claude_product_bundle_state() {
+            ProductCredentialState::Absent => ProductCredentialState::Absent,
+            ProductCredentialState::PresentValid((credential, _)) => {
+                ProductCredentialState::PresentValid(credential)
+            }
+            ProductCredentialState::PresentNeedsRefresh((credential, _)) => {
+                ProductCredentialState::PresentNeedsRefresh(credential)
+            }
+            ProductCredentialState::PresentInvalid => ProductCredentialState::PresentInvalid,
+        }
+    }
+
     fn refresh_claude_product_credential_unlocked(
         &self,
         credential: StoredCredential,
+        mut meta: ProductBundleMeta,
     ) -> Result<StoredCredential, ProviderCredentialResolutionError> {
-        if credential.refresh_token.is_empty() {
+        let official_policy = oauth_policy_fingerprint(ProductProviderId::Claude);
+        if meta.provider != ProductProviderId::Claude
+            || meta.lifecycle != CredentialLifecycle::Active
+            || meta.policy_fingerprint != official_policy
+        {
+            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                closed_code: "oauth_policy_changed".into(),
+            };
+            let _ = self.store_claude_bundle(&credential, &meta);
             return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
         }
-        let config = self
-            .load_oauth_config()
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        let http = isyncyou_agent::http::HttpTransport::shared()
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        // #639: a refresh is not a new login — preserve the credential generation.
-        let generation = load_product_bundle_meta(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
-            .map(|m| m.generation)
-            .unwrap_or_else(uuid_v4);
-        let policy_fingerprint = oauth_policy_fingerprint(ProductProviderId::Claude);
+        if credential.refresh_token.trim().is_empty() {
+            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                closed_code: "refresh_failed".into(),
+            };
+            let _ = self.store_claude_bundle(&credential, &meta);
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
+        let config = self.load_oauth_config().map_err(|_| {
+            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                closed_code: "oauth_policy_changed".into(),
+            };
+            let _ = self.store_claude_bundle(&credential, &meta);
+            ProviderCredentialResolutionError::ProductReconnectRequired
+        })?;
+        let http = match isyncyou_agent::http::HttpTransport::shared() {
+            Ok(http) => http,
+            Err(_) => {
+                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                    closed_code: "refresh_failed".into(),
+                };
+                let _ = self.store_claude_bundle(&credential, &meta);
+                return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+            }
+        };
         let outcome = isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
             .and_then(|refreshed| {
@@ -2919,35 +3857,23 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             });
         match outcome {
             Ok(refreshed_credential) => {
-                self.store_claude_bundle(
-                    &refreshed_credential,
-                    &ProductBundleMeta {
-                        generation,
-                        policy_fingerprint,
-                        lifecycle: CredentialLifecycle::Active,
-                    },
-                )
-                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+                self.store_claude_bundle(&refreshed_credential, &meta)
+                    .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
                 Ok(refreshed_credential)
             }
             Err(e) => {
                 // #639: persist ReconnectRequired (fail-closed) so the next status reports reconnect
                 // instead of re-attempting a refresh loop on the same expired credential.
-                let _ = self.store_claude_bundle(
-                    &credential,
-                    &ProductBundleMeta {
-                        generation,
-                        policy_fingerprint,
-                        lifecycle: CredentialLifecycle::ReconnectRequired {
-                            closed_code: "refresh_failed".into(),
-                        },
-                    },
-                );
+                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                    closed_code: "refresh_failed".into(),
+                };
+                let _ = self.store_claude_bundle(&credential, &meta);
                 Err(e)
             }
         }
     }
 
+    #[cfg(any(test, feature = "agent-subscription-experimental"))]
     fn experimental_claude_credential(
         &self,
     ) -> Result<Option<StoredCredential>, ProviderCredentialResolutionError> {
@@ -2972,6 +3898,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
+    #[cfg(test)]
     fn resolve_claude_credential(
         &self,
     ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
@@ -2979,15 +3906,16 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .credential_refresh_gate
             .lock()
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        match self.claude_product_credential_state() {
-            ProductCredentialState::PresentValid(credential) => {
+        match self.claude_product_bundle_state() {
+            ProductCredentialState::PresentValid((credential, _meta)) => {
                 Ok(ResolvedProviderCredential::Claude {
                     origin: ProviderCredentialOrigin::ProductCredentialStore,
                     credential,
                 })
             }
-            ProductCredentialState::PresentNeedsRefresh(credential) => {
-                let credential = self.refresh_claude_product_credential_unlocked(credential)?;
+            ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                let credential =
+                    self.refresh_claude_product_credential_unlocked(credential, meta)?;
                 Ok(ResolvedProviderCredential::Claude {
                     origin: ProviderCredentialOrigin::ProductCredentialStore,
                     credential,
@@ -3014,9 +3942,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     }
 
     /// Build the Claude provider from one origin-bound credential bundle.
+    #[cfg(test)]
     fn try_subscription_provider(
         &self,
         system: &str,
+        model: &str,
     ) -> Result<
         Option<Box<dyn isyncyou_agent::LlmProvider + Send>>,
         ProviderCredentialResolutionError,
@@ -3031,7 +3961,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         };
         let p = isyncyou_agent::SubscriptionProvider::new(
             credential.access_token,
-            self.model_for("claude"),
+            model,
             system,
             self.subscription_config(),
         )
@@ -3039,18 +3969,32 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         Ok(Some(Box::new(p)))
     }
 
-    fn codex_product_credential_state(&self) -> ProductCredentialState<CodexStoredCredential> {
+    fn codex_product_bundle_state(
+        &self,
+    ) -> ProductCredentialState<(CodexStoredCredential, ProductBundleMeta)> {
         match load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID) {
             Ok(None) => ProductCredentialState::Absent,
             Ok(Some(secret)) => {
-                // #639: legacy/incomplete or ReconnectRequired -> fail closed to reconnect.
-                match ProductBundleMeta::from_blob(secret.expose()) {
-                    Some(meta) if meta.lifecycle == CredentialLifecycle::Active => {
-                        CodexStoredCredential::from_json(secret.expose())
-                            .map(|c| {
-                                classify_codex_product_credential_at(c, (self.credential_now_ms)())
-                            })
-                            .unwrap_or(ProductCredentialState::PresentInvalid)
+                match ProductBundleMeta::from_blob(secret.expose(), ProductProviderId::Codex) {
+                    Some(meta)
+                        if meta.lifecycle == CredentialLifecycle::Active
+                            && meta.policy_fingerprint
+                                == oauth_policy_fingerprint(ProductProviderId::Codex) =>
+                    {
+                        match CodexStoredCredential::from_json(secret.expose()).map(|credential| {
+                            classify_codex_product_credential_at(
+                                credential,
+                                (self.credential_now_ms)(),
+                            )
+                        }) {
+                            Some(ProductCredentialState::PresentValid(credential)) => {
+                                ProductCredentialState::PresentValid((credential, meta))
+                            }
+                            Some(ProductCredentialState::PresentNeedsRefresh(credential)) => {
+                                ProductCredentialState::PresentNeedsRefresh((credential, meta))
+                            }
+                            _ => ProductCredentialState::PresentInvalid,
+                        }
                     }
                     _ => ProductCredentialState::PresentInvalid,
                 }
@@ -3059,21 +4003,53 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
+    fn codex_product_credential_state(&self) -> ProductCredentialState<CodexStoredCredential> {
+        match self.codex_product_bundle_state() {
+            ProductCredentialState::Absent => ProductCredentialState::Absent,
+            ProductCredentialState::PresentValid((credential, _)) => {
+                ProductCredentialState::PresentValid(credential)
+            }
+            ProductCredentialState::PresentNeedsRefresh((credential, _)) => {
+                ProductCredentialState::PresentNeedsRefresh(credential)
+            }
+            ProductCredentialState::PresentInvalid => ProductCredentialState::PresentInvalid,
+        }
+    }
+
     fn refresh_codex_product_credential_unlocked(
         &self,
         credential: CodexStoredCredential,
+        mut meta: ProductBundleMeta,
     ) -> Result<CodexStoredCredential, ProviderCredentialResolutionError> {
-        if credential.refresh_token.is_empty() {
+        let official_policy = oauth_policy_fingerprint(ProductProviderId::Codex);
+        if meta.provider != ProductProviderId::Codex
+            || meta.lifecycle != CredentialLifecycle::Active
+            || meta.policy_fingerprint != official_policy
+        {
+            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                closed_code: "oauth_policy_changed".into(),
+            };
+            let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
+        if credential.refresh_token.trim().is_empty() {
+            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                closed_code: "refresh_failed".into(),
+            };
+            let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
             return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
         }
         let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
-        let http = isyncyou_agent::http::HttpTransport::shared()
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        // #639: preserve the credential generation across a refresh (a refresh is not a new login).
-        let generation = load_product_bundle_meta(&self.oauth_dir, CODEX_CREDENTIAL_ID)
-            .map(|m| m.generation)
-            .unwrap_or_else(uuid_v4);
-        let policy_fingerprint = oauth_policy_fingerprint(ProductProviderId::Codex);
+        let http = match isyncyou_agent::http::HttpTransport::shared() {
+            Ok(http) => http,
+            Err(_) => {
+                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                    closed_code: "refresh_failed".into(),
+                };
+                let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
+                return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+            }
+        };
         let outcome =
             isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
                 .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
@@ -3086,36 +4062,22 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 });
         match outcome {
             Ok(refreshed_credential) => {
-                store_codex_bundle(
-                    &self.oauth_dir,
-                    &refreshed_credential,
-                    &ProductBundleMeta {
-                        generation,
-                        policy_fingerprint,
-                        lifecycle: CredentialLifecycle::Active,
-                    },
-                )
-                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+                store_codex_bundle(&self.oauth_dir, &refreshed_credential, &meta)
+                    .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
                 Ok(refreshed_credential)
             }
             Err(e) => {
                 // #639: persist ReconnectRequired (fail-closed) — no refresh loop.
-                let _ = store_codex_bundle(
-                    &self.oauth_dir,
-                    &credential,
-                    &ProductBundleMeta {
-                        generation,
-                        policy_fingerprint,
-                        lifecycle: CredentialLifecycle::ReconnectRequired {
-                            closed_code: "refresh_failed".into(),
-                        },
-                    },
-                );
+                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                    closed_code: "refresh_failed".into(),
+                };
+                let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
                 Err(e)
             }
         }
     }
 
+    #[cfg(any(test, feature = "agent-subscription-experimental"))]
     fn experimental_codex_credential(
         &self,
     ) -> Result<Option<CodexStoredCredential>, ProviderCredentialResolutionError> {
@@ -3141,6 +4103,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
+    #[cfg(test)]
     fn resolve_codex_credential(
         &self,
     ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
@@ -3148,15 +4111,16 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .credential_refresh_gate
             .lock()
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        match self.codex_product_credential_state() {
-            ProductCredentialState::PresentValid(credential) => {
+        match self.codex_product_bundle_state() {
+            ProductCredentialState::PresentValid((credential, _meta)) => {
                 Ok(ResolvedProviderCredential::Codex {
                     origin: ProviderCredentialOrigin::ProductCredentialStore,
                     credential,
                 })
             }
-            ProductCredentialState::PresentNeedsRefresh(credential) => {
-                let credential = self.refresh_codex_product_credential_unlocked(credential)?;
+            ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                let credential =
+                    self.refresh_codex_product_credential_unlocked(credential, meta)?;
                 Ok(ResolvedProviderCredential::Codex {
                     origin: ProviderCredentialOrigin::ProductCredentialStore,
                     credential,
@@ -3212,15 +4176,17 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .product_runtime_gate
             .lock()
             .map_err(|_| "reconnect_required".to_string())?;
+        let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
+            .map_err(|_| "reconnect_required".to_string())?;
         let _refresh = self
             .credential_refresh_gate
             .lock()
             .map_err(|_| "reconnect_required".to_string())?;
         match ProductProviderId::parse(provider) {
-            Some(ProductProviderId::Claude) => match self.claude_product_credential_state() {
+            Some(ProductProviderId::Claude) => match self.claude_product_bundle_state() {
                 ProductCredentialState::PresentValid(_) => Ok("connected"),
-                ProductCredentialState::PresentNeedsRefresh(credential) => self
-                    .refresh_claude_product_credential_unlocked(credential)
+                ProductCredentialState::PresentNeedsRefresh((credential, meta)) => self
+                    .refresh_claude_product_credential_unlocked(credential, meta)
                     .map(|_| "connected")
                     .map_err(|_| "reconnect_required".into()),
                 ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
@@ -3232,14 +4198,15 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 let force_refresh = take_codex_refresh_for_device_test();
                 #[cfg(not(feature = "agent-network-device-test-hooks"))]
                 let force_refresh = false;
-                match self.codex_product_credential_state() {
-                    ProductCredentialState::PresentValid(credential) if force_refresh => self
-                        .refresh_codex_product_credential_unlocked(credential)
-                        .map(|_| "connected")
-                        .map_err(|_| "reconnect_required".into()),
+                match self.codex_product_bundle_state() {
+                    ProductCredentialState::PresentValid((credential, meta)) if force_refresh => {
+                        self.refresh_codex_product_credential_unlocked(credential, meta)
+                            .map(|_| "connected")
+                            .map_err(|_| "reconnect_required".into())
+                    }
                     ProductCredentialState::PresentValid(_) => Ok("connected"),
-                    ProductCredentialState::PresentNeedsRefresh(credential) => self
-                        .refresh_codex_product_credential_unlocked(credential)
+                    ProductCredentialState::PresentNeedsRefresh((credential, meta)) => self
+                        .refresh_codex_product_credential_unlocked(credential, meta)
                         .map(|_| "connected")
                         .map_err(|_| "reconnect_required".into()),
                     ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
@@ -3265,8 +4232,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         // The registered callback port and active-attempt check are owned together so a
         // second UI start cannot create a competing listener.
         let listener = {
-            let mut attempts = self.oauth_attempts.lock().unwrap();
-            reap_oauth_attempts(&mut attempts);
+            let mut attempts = self
+                .oauth_attempts
+                .lock()
+                .map_err(|_| "oauth_start_failed".to_string())?;
+            reap_oauth_attempts(&mut attempts, &self.oauth_dir);
             if attempts
                 .values()
                 .any(|attempt| matches!(attempt, OAuthAttempt::Codex { .. }))
@@ -3287,6 +4257,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         // #639 T8: record the official sign-in start into the attempt-keyed journal.
         record_onboarding_attempt_transition(
             &self.oauth_dir,
+            ProductProviderId::Codex,
             &attempt_id,
             ProductOnboardingState::OfficialSignInStarted,
             None,
@@ -3317,9 +4288,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     }
 
     /// Build the Codex (ChatGPT) provider if credentials are available.
+    #[cfg(test)]
     fn try_codex_provider(
         &self,
         instructions: &str,
+        model: &str,
     ) -> Result<
         Option<Box<dyn isyncyou_agent::LlmProvider + Send>>,
         ProviderCredentialResolutionError,
@@ -3334,7 +4307,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         };
         let cfg = isyncyou_agent::CodexConfig {
             account_id: credential.account_id,
-            model: self.model_for("codex"),
+            model: model.to_string(),
             ..Default::default()
         };
         let provider =
@@ -3667,8 +4640,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         match ProductProviderId::parse(provider) {
             Some(ProductProviderId::Codex) => self.codex_oauth_start(),
             Some(ProductProviderId::Claude) => {
-                let mut attempts = self.oauth_attempts.lock().unwrap();
-                reap_oauth_attempts(&mut attempts);
+                let mut attempts = self
+                    .oauth_attempts
+                    .lock()
+                    .map_err(|_| "oauth_start_failed".to_string())?;
+                reap_oauth_attempts(&mut attempts, &self.oauth_dir);
                 if attempts
                     .values()
                     .any(|attempt| matches!(attempt, OAuthAttempt::Claude { .. }))
@@ -3698,6 +4674,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 // #639 T8: record the official sign-in start into the attempt-keyed journal.
                 record_onboarding_attempt_transition(
                     &self.oauth_dir,
+                    ProductProviderId::Claude,
                     &attempt_id,
                     ProductOnboardingState::OfficialSignInStarted,
                     None,
@@ -3723,37 +4700,55 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn oauth_cancel(&self, provider: &str, attempt_id: &str) -> Result<(), String> {
-        let attempt = self.oauth_attempts.lock().unwrap().remove(attempt_id);
+        // Validate and remove under one lock. A mismatched provider never creates the old
+        // remove/reinsert race where a concurrent callback could observe the attempt as absent.
+        let attempt = {
+            let mut attempts = self
+                .oauth_attempts
+                .lock()
+                .map_err(|_| "oauth attempt store is unavailable".to_string())?;
+            let matches_provider = matches!(
+                (provider, attempts.get(attempt_id)),
+                ("claude", Some(OAuthAttempt::Claude { .. }))
+                    | ("codex", Some(OAuthAttempt::Codex { .. }))
+            );
+            if !matches_provider {
+                return Err(if attempts.contains_key(attempt_id) {
+                    "oauth attempt does not match provider"
+                } else {
+                    "oauth attempt is not active"
+                }
+                .into());
+            }
+            attempts
+                .remove(attempt_id)
+                .ok_or_else(|| "oauth attempt is not active".to_string())?
+        };
         match (provider, attempt) {
-            ("claude", Some(OAuthAttempt::Claude { state, .. })) => {
+            ("claude", OAuthAttempt::Claude { state, .. }) => {
                 let _ = self.oauth.cancel(&state);
                 // #639 T8: a cancelled in-flight attempt is a terminal, redacted transition.
                 record_onboarding_attempt_transition(
                     &self.oauth_dir,
+                    ProductProviderId::Claude,
                     attempt_id,
                     ProductOnboardingState::ErrorRedacted,
                     Some("cancelled".to_string()),
                 );
                 Ok(())
             }
-            ("codex", Some(OAuthAttempt::Codex { cancelled, .. })) => {
+            ("codex", OAuthAttempt::Codex { cancelled, .. }) => {
                 cancelled.store(true, Ordering::Release);
                 record_onboarding_attempt_transition(
                     &self.oauth_dir,
+                    ProductProviderId::Codex,
                     attempt_id,
                     ProductOnboardingState::ErrorRedacted,
                     Some("cancelled".to_string()),
                 );
                 Ok(())
             }
-            (_, Some(attempt)) => {
-                self.oauth_attempts
-                    .lock()
-                    .unwrap()
-                    .insert(attempt_id.to_string(), attempt);
-                Err("oauth attempt does not match provider".into())
-            }
-            _ => Err("oauth attempt is not active".into()),
+            _ => Err("oauth attempt does not match provider".into()),
         }
     }
 
@@ -3767,10 +4762,26 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     fn oauth_complete(&self, attempt_id: &str, pasted: &str) -> Result<String, String> {
         let (code, state_opt) = isyncyou_agent::oauth::parse_pasted_code(pasted);
         let state = state_opt.ok_or("the pasted code is missing its #state part")?;
+        let fail = |closed_code: &str, wire_error: &str| -> Result<String, String> {
+            record_onboarding_attempt_transition(
+                &self.oauth_dir,
+                ProductProviderId::Claude,
+                attempt_id,
+                ProductOnboardingState::ErrorRedacted,
+                Some(closed_code.to_string()),
+            );
+            Err(wire_error.to_string())
+        };
         // #639 T9: bind the pasted code to the named attempt — the attempt must exist, be a Claude
         // attempt, and its server-side state must equal the embedded #state (no cross-attempt reuse).
-        {
-            let attempts = self.oauth_attempts.lock().unwrap();
+        // Claim the OAuth-manager entry and remove the attempt while holding the attempt lock, using
+        // the same attempts -> OAuth-manager lock order as start/cancel. Cancel and completion now
+        // have one linearization point and cannot consume/reinsert each other's state.
+        let pending = {
+            let mut attempts = self
+                .oauth_attempts
+                .lock()
+                .map_err(|_| "the sign-in state is unavailable".to_string())?;
             let bound = matches!(
                 attempts.get(attempt_id),
                 Some(OAuthAttempt::Claude { state: pending, .. }) if pending == &state
@@ -3778,27 +4789,17 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if !bound {
                 return Err("the pasted code does not match this sign-in".into());
             }
-        }
-        let (verifier, redirect_uri) = self
-            .oauth
-            .take(&state)
-            .ok_or("unknown or expired login — start the login again")?;
-        self.oauth_attempts.lock().unwrap().retain(|id, attempt| {
-            id != attempt_id
-                && !matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == &state)
-        });
+            let pending = self.oauth.take(&state);
+            attempts.remove(attempt_id);
+            pending
+        };
+        let (verifier, redirect_uri) = match pending {
+            Some(pending) => pending,
+            None => return fail("interrupted", "provider_connect_failed"),
+        };
         // #639 (F5): once the attempt is consumed, ANY failure of the exchange/commit is a terminal,
         // redacted transition for this attempt (the manual Claude flow has no callback thread to do
         // it), so a failed sign-in is durably recorded as error_redacted and is never resumed.
-        let fail = |code: &str, err: &str| -> Result<String, String> {
-            record_onboarding_attempt_transition(
-                &self.oauth_dir,
-                attempt_id,
-                ProductOnboardingState::ErrorRedacted,
-                Some(code.to_string()),
-            );
-            Err(err.to_string())
-        };
         let cfg = match self.load_oauth_config() {
             Ok(cfg) => cfg,
             Err(_) => return fail("policy_unavailable", "provider_connect_failed"),
@@ -3831,20 +4832,61 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
-        let (verifier, redirect_uri) = self
-            .oauth
-            .take(state)
-            .ok_or("unknown or expired login state")?;
-        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
-            !matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == state)
-        });
-        let cfg = self.load_oauth_config()?;
-        let http = isyncyou_agent::http::HttpTransport::shared()
-            .map_err(|_| "provider_connect_failed".to_string())?;
-        let token =
-            isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri, state)
-                .map_err(|_| "oauth_exchange_failed".to_string())?;
-        self.commit_claude_oauth_success(&token)?;
+        // The loopback callback must name a currently active Claude attempt, not merely a state
+        // that happens to remain in the OAuth manager. This gives failures a durable attempt-keyed
+        // terminal journal entry and prevents a stale callback from consuming another flow.
+        let (attempt_id, pending) = {
+            let mut attempts = self
+                .oauth_attempts
+                .lock()
+                .map_err(|_| "oauth_callback_failed".to_string())?;
+            let attempt_id = attempts
+                .iter()
+                .find_map(|(attempt_id, attempt)| {
+                    matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == state)
+                        .then(|| attempt_id.clone())
+                })
+                .ok_or_else(|| "oauth_callback_failed".to_string())?;
+            let pending = self.oauth.take(state);
+            attempts.remove(&attempt_id);
+            (attempt_id, pending)
+        };
+        let fail = |closed_code: &str, wire_error: &str| -> Result<String, String> {
+            record_onboarding_attempt_transition(
+                &self.oauth_dir,
+                ProductProviderId::Claude,
+                &attempt_id,
+                ProductOnboardingState::ErrorRedacted,
+                Some(closed_code.to_string()),
+            );
+            Err(wire_error.to_string())
+        };
+        let (verifier, redirect_uri) = match pending {
+            Some(pending) => pending,
+            None => return fail("interrupted", "oauth_callback_failed"),
+        };
+        let cfg = match self.load_oauth_config() {
+            Ok(cfg) => cfg,
+            Err(_) => return fail("policy_unavailable", "provider_connect_failed"),
+        };
+        let http = match isyncyou_agent::http::HttpTransport::shared() {
+            Ok(http) => http,
+            Err(_) => return fail("transport_unavailable", "provider_connect_failed"),
+        };
+        let token = match isyncyou_agent::oauth::exchange(
+            &http,
+            &cfg,
+            code,
+            &verifier,
+            &redirect_uri,
+            state,
+        ) {
+            Ok(token) => token,
+            Err(_) => return fail("exchange_failed", "oauth_exchange_failed"),
+        };
+        if self.commit_claude_oauth_success(&token).is_err() {
+            return fail("commit_failed", "oauth_commit_failed");
+        }
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
 
@@ -3855,36 +4897,78 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     fn status_json(&self) -> String {
         let _ = self.oauth.reap_expired();
         if let Ok(mut attempts) = self.oauth_attempts.lock() {
-            reap_oauth_attempts(&mut attempts);
+            reap_oauth_attempts(&mut attempts, &self.oauth_dir);
         }
+        reap_onboarding_journals_at(&self.oauth_dir, now_ms());
         // #639 (F2): take the ENTIRE status snapshot — credential_state, per-provider readiness,
         // the selected provider, and the onboarding projection — under ONE product-runtime-gate hold,
         // so a concurrent set_model / OAuth completion / turn build can never make status report a
         // mix of two revisions. (Readiness is host-verified: Active policy-bound bundle + matching
         // activation + static attestation, not credential presence; experimental never qualifies.)
-        let (claude_state, codex_state, sel_provider, claude, codex, onboarding) = {
-            let _gate = self.product_runtime_gate.lock();
-            let claude_state = self
-                .product_credential_status("claude")
-                .unwrap_or("reconnect_required");
-            let codex_state = self
-                .product_credential_status("codex")
-                .unwrap_or("reconnect_required");
-            let (sel_provider, _) = self.agent_settings();
-            (
-                claude_state,
-                codex_state,
-                sel_provider,
-                self.provider_ready(ProductProviderId::Claude),
-                self.provider_ready(ProductProviderId::Codex),
-                self.onboarding_projection(),
-            )
+        let (claude_state, codex_state, settings, claude, codex, onboarding) = {
+            match self.product_runtime_gate.lock() {
+                Ok(_gate) => match acquire_product_runtime_file_lock(&self.oauth_dir) {
+                    Ok(_file_gate) => {
+                        let claude_state = self
+                            .product_credential_status("claude")
+                            .unwrap_or("reconnect_required");
+                        let codex_state = self
+                            .product_credential_status("codex")
+                            .unwrap_or("reconnect_required");
+                        let settings = self.agent_settings();
+                        let selected = settings.as_ref().map(|settings| settings.provider);
+                        (
+                            claude_state,
+                            codex_state,
+                            settings,
+                            self.provider_ready(ProductProviderId::Claude),
+                            self.provider_ready(ProductProviderId::Codex),
+                            self.onboarding_projection(selected),
+                        )
+                    }
+                    Err(_) => failed_product_status_snapshot(),
+                },
+                Err(_) => failed_product_status_snapshot(),
+            }
         };
+        fn failed_product_status_snapshot() -> (
+            &'static str,
+            &'static str,
+            Option<AgentSettingsSnapshot>,
+            bool,
+            bool,
+            serde_json::Value,
+        ) {
+            let failed_provider = || {
+                serde_json::json!({
+                    "state": "error_redacted",
+                    "error_code": "onboarding_failed",
+                    "steps": ONBOARDING_SUCCESS_CHAIN.iter().map(|step| {
+                        serde_json::json!({ "key": step.wire(), "complete": false })
+                    }).collect::<Vec<_>>(),
+                })
+            };
+            (
+                "reconnect_required",
+                "reconnect_required",
+                None,
+                false,
+                false,
+                serde_json::json!({
+                    "selected_provider": serde_json::Value::Null,
+                    "selected_state": "error_redacted",
+                    "providers": {
+                        "claude": failed_provider(),
+                        "codex": failed_provider(),
+                    },
+                }),
+            )
+        }
         let reconnect_required =
             claude_state == "reconnect_required" || codex_state == "reconnect_required";
         // The selected provider alone drives `connected` + `provider`; there is no fall-back to
         // the other provider, and an unparseable selection reads not-connected (fail-closed).
-        let selected_id = ProductProviderId::parse(&sel_provider);
+        let selected_id = settings.as_ref().map(|settings| settings.provider);
         let connected = match selected_id {
             Some(ProductProviderId::Claude) => claude,
             Some(ProductProviderId::Codex) => codex,
@@ -3894,11 +4978,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             Some(id) => id.wire(),
             None => "",
         };
-        let model = if provider.is_empty() {
-            String::new()
-        } else {
-            self.model_for(provider)
-        };
+        let model = settings
+            .as_ref()
+            .map(|settings| settings.model.clone())
+            .unwrap_or_default();
+        let selected_provider = selected_id.map(ProductProviderId::wire).unwrap_or("");
         let list = |models: &[(&str, &str)]| -> serde_json::Value {
             models
                 .iter()
@@ -3909,7 +4993,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "connected": connected,
             "enabled": true,
             "provider": provider,
-            "selected_provider": sel_provider,
+            "selected_provider": selected_provider,
             "model": model,
             "claude": claude,
             "codex": codex,
@@ -3938,6 +5022,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .product_runtime_gate
             .lock()
             .map_err(|_| "product_busy".to_string())?;
+        let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)?;
         self.set_agent_settings(provider, model)
     }
 }
@@ -5493,7 +6578,7 @@ mod tests {
             let guard = APP_HOST_CREDENTIAL_ENV_TEST_LOCK
                 .get_or_init(|| StdMutex::new(()))
                 .lock()
-                .unwrap();
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let saved = Self::env_keys()
                 .iter()
                 .copied()
@@ -5615,11 +6700,6 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     fn assert_product_credential_turn_fails_closed(agent: &DaemonAgent) {
-        // The credential still resolves to the error provider for the selection probe (unchanged).
-        assert_eq!(
-            agent.build_turn_provider("system").name(),
-            "credential-resolution-error"
-        );
         // #639 T7: a not-ready product credential fails closed AT THE GATE — start_turn returns the
         // closed `product_not_ready` code and creates NO turn state (no stream slot, no provider
         // call, no streamed error/done turn). This is the source of the router's 409.
@@ -8097,7 +9177,7 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
-    fn corrupt_product_credential_streams_error_and_done_error() {
+    fn corrupt_product_credential_rejects_turn_without_stream() {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("corrupt-product-turn-error");
         let oauth_dir = root.join("oauth");
@@ -8149,7 +9229,7 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
-    fn expired_product_credential_streams_error_and_done_error() {
+    fn expired_product_credential_rejects_turn_without_stream() {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("expired-product-turn-error");
         let oauth_dir = root.join("oauth");
@@ -8484,7 +9564,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let agent = DaemonAgent::new(Config::default(), root.clone());
         // A bundle written WITHOUT activation (envelope not yet verified via attestation) is not ready.
-        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
         store_agent_credential_blob(
             &root,
             SUBSCRIPTION_CREDENTIAL_ID,
@@ -8586,7 +9666,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut agent = DaemonAgent::new(Config::default(), root.clone());
         agent.credential_now_ms = Arc::new(|| 10_000);
-        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
         store_agent_credential_blob(
             &root,
             SUBSCRIPTION_CREDENTIAL_ID,
@@ -8631,8 +9711,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         // An Active V2 bundle minted under a DIFFERENT OAuth policy (valid, far-future token).
         let meta = ProductBundleMeta {
-            generation: uuid_v4(),
-            policy_fingerprint: "some-other-official-policy".to_string(),
+            provider: ProductProviderId::Claude,
+            generation: uuid_v4().unwrap(),
+            policy_fingerprint: "0".repeat(64),
             lifecycle: CredentialLifecycle::Active,
         };
         store_agent_credential_blob(
@@ -8656,6 +9737,178 @@ mod tests {
         // Explicit activation of a mismatched-policy bundle also fails closed.
         assert!(activate_product(&root, ProductProviderId::Claude, &meta.generation).is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn mismatched_policy_bundle_refresh_never_relabels_or_recovers() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("mismatched-policy-refresh");
+        let _ = std::fs::remove_dir_all(&root);
+        let credential = StoredCredential {
+            access_token: "expired".into(),
+            refresh_token: "refresh".into(),
+            expires_at_ms: 1,
+        };
+        let old_policy = "1".repeat(64);
+        let meta = ProductBundleMeta {
+            provider: ProductProviderId::Claude,
+            generation: uuid_v4().unwrap(),
+            policy_fingerprint: old_policy.clone(),
+            lifecycle: CredentialLifecycle::Active,
+        };
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(credential.to_json()),
+        )
+        .unwrap();
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        // The policy mismatch is rejected before transport construction or refresh. Persisted
+        // metadata keeps the original policy/generation and becomes reconnect-required.
+        assert!(matches!(
+            agent.refresh_claude_product_credential_unlocked(credential, meta.clone()),
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        ));
+        let persisted = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        assert_eq!(persisted.generation, meta.generation);
+        assert_eq!(persisted.policy_fingerprint, old_policy);
+        assert_eq!(
+            persisted.lifecycle,
+            CredentialLifecycle::ReconnectRequired {
+                closed_code: "oauth_policy_changed".into()
+            }
+        );
+
+        let restarted = DaemonAgent::new(Config::default(), root.clone());
+        assert!(!restarted.provider_ready(ProductProviderId::Claude));
+        assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn missing_refresh_secret_persists_reconnect_lifecycle_for_both_providers() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("missing-refresh-secret");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        let claude = StoredCredential {
+            access_token: "expiring".into(),
+            refresh_token: String::new(),
+            expires_at_ms: 1,
+        };
+        let claude_meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
+        agent.store_claude_bundle(&claude, &claude_meta).unwrap();
+        assert!(matches!(
+            agent.refresh_claude_product_credential_unlocked(claude, claude_meta.clone()),
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        ));
+        let persisted = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        assert_eq!(persisted.provider, ProductProviderId::Claude);
+        assert_eq!(persisted.generation, claude_meta.generation);
+        assert_eq!(
+            persisted.lifecycle,
+            CredentialLifecycle::ReconnectRequired {
+                closed_code: "refresh_failed".into()
+            }
+        );
+
+        let codex = CodexStoredCredential {
+            access_token: "expiring".into(),
+            refresh_token: String::new(),
+            account_id: "account".into(),
+            expires_at_ms: 1,
+        };
+        let codex_meta = ProductBundleMeta::fresh(ProductProviderId::Codex).unwrap();
+        store_codex_bundle(&root, &codex, &codex_meta).unwrap();
+        assert!(matches!(
+            agent.refresh_codex_product_credential_unlocked(codex, codex_meta.clone()),
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        ));
+        let persisted = load_product_bundle_meta(&root, CODEX_CREDENTIAL_ID).unwrap();
+        assert_eq!(persisted.provider, ProductProviderId::Codex);
+        assert_eq!(persisted.generation, codex_meta.generation);
+        assert_eq!(
+            persisted.lifecycle,
+            CredentialLifecycle::ReconnectRequired {
+                closed_code: "refresh_failed".into()
+            }
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn incomplete_v2_bundle_metadata_is_rejected() {
+        let base = serde_json::json!({
+            "schema_version": PRODUCT_CREDENTIAL_SCHEMA_VERSION,
+            "provider_id": "claude",
+            "credential_generation": uuid_v4().unwrap(),
+            "oauth_policy_fingerprint": oauth_policy_fingerprint(ProductProviderId::Claude),
+            "lifecycle": "active",
+            "reconnect_code": "",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at_ms": 1234,
+        });
+        for missing in [
+            "access_token",
+            "provider_id",
+            "credential_generation",
+            "expires_at_ms",
+            "oauth_policy_fingerprint",
+            "lifecycle",
+            "reconnect_code",
+            "refresh_token",
+        ] {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().remove(missing);
+            assert!(ProductBundleMeta::from_blob(
+                &serde_json::to_vec(&value).unwrap(),
+                ProductProviderId::Claude,
+            )
+            .is_none());
+        }
+        let mut unknown = base;
+        unknown["lifecycle"] = serde_json::json!("unknown");
+        assert!(ProductBundleMeta::from_blob(
+            &serde_json::to_vec(&unknown).unwrap(),
+            ProductProviderId::Claude,
+        )
+        .is_none());
+        unknown["lifecycle"] = serde_json::json!("active");
+        unknown["provider_id"] = serde_json::json!("codex");
+        assert!(ProductBundleMeta::from_blob(
+            &serde_json::to_vec(&unknown).unwrap(),
+            ProductProviderId::Claude,
+        )
+        .is_none());
+        unknown["provider_id"] = serde_json::json!("claude");
+        unknown["credential_generation"] = serde_json::json!("not-a-uuid");
+        assert!(ProductBundleMeta::from_blob(
+            &serde_json::to_vec(&unknown).unwrap(),
+            ProductProviderId::Claude,
+        )
+        .is_none());
+        unknown["credential_generation"] = serde_json::json!(uuid_v4().unwrap());
+        unknown["default_client_metadata"] = serde_json::json!({"workspace": "/tmp"});
+        assert!(ProductBundleMeta::from_blob(
+            &serde_json::to_vec(&unknown).unwrap(),
+            ProductProviderId::Claude,
+        )
+        .is_none());
     }
 
     // #639 (F5 regression): a failed Claude manual completion records a durable error_redacted
@@ -8702,8 +9955,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // #639 (F5 regression): the onboarding journal has an 8-min TTL — a stale journal is reaped on
-    // load (reads as absent) while a freshly recorded one survives.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn claude_loopback_callback_failure_records_terminal_attempt() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("claude-loopback-terminal-failure");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let attempt_id = "loopback-attempt";
+        let state = "loopback-state";
+        agent.oauth_attempts.lock().unwrap().insert(
+            attempt_id.into(),
+            OAuthAttempt::Claude {
+                state: state.into(),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            attempt_id,
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+
+        // No matching verifier exists in AgentOAuth, modeling restart/lost in-memory state.
+        assert!(isyncyou_webui::AgentHandler::oauth_callback(&agent, "code", state).is_err());
+        assert!(!agent
+            .oauth_attempts
+            .lock()
+            .unwrap()
+            .contains_key(attempt_id));
+        let journal = load_onboarding_journal(&root, attempt_id).expect("terminal journal");
+        let terminal = journal.transitions.last().unwrap();
+        assert_eq!(terminal.state, ProductOnboardingState::ErrorRedacted);
+        assert_eq!(terminal.error_code.as_deref(), Some("interrupted"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 (F5 regression): the onboarding journal has an 8-min TTL — a stale indexed journal is
+    // physically deleted, while a freshly recorded one survives.
     #[cfg(all(
         feature = "agent-oauth-providers",
         not(feature = "agent-subscription-experimental")
@@ -8724,15 +10018,129 @@ mod tests {
             }],
         };
         store_onboarding_journal(&root, "attempt-old", &stale).unwrap();
+        let stale_store_id = OnboardingAttemptJournalV1::journal_store_id("attempt-old");
+        let mut index = OnboardingJournalIndexV1::default();
+        let _ = index.upsert(OnboardingJournalIndexEntry {
+            store_id: stale_store_id.clone(),
+            kind: OnboardingJournalKind::Attempt,
+            expires_at_ms: 1 + ONBOARDING_JOURNAL_TTL_MS,
+            updated_at_ms: 1,
+        });
+        store_onboarding_journal_index(&root, ProductProviderId::Claude, &index).unwrap();
+        let store = agent_credential_store(&root).unwrap();
+        assert!(store
+            .get(
+                isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+                &stale_store_id,
+            )
+            .unwrap()
+            .is_some());
         assert!(load_onboarding_journal(&root, "attempt-old").is_none());
+        reap_onboarding_journals_at(&root, 2 + ONBOARDING_JOURNAL_TTL_MS);
+        assert!(store
+            .get(
+                isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+                &stale_store_id,
+            )
+            .unwrap()
+            .is_none());
+        assert!(
+            load_onboarding_journal_index(&root, ProductProviderId::Claude)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         // A freshly recorded transition survives the reaper.
         record_onboarding_attempt_transition(
             &root,
+            ProductProviderId::Claude,
             "attempt-new",
             ProductOnboardingState::OfficialSignInStarted,
             None,
         );
         assert!(load_onboarding_journal(&root, "attempt-new").is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn onboarding_journal_reaper_removes_crash_dangling_index_entry() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("journal-dangling-index");
+        let _ = std::fs::remove_dir_all(&root);
+        let missing_store_id = OnboardingAttemptJournalV1::journal_store_id("crashed-write");
+        let mut index = OnboardingJournalIndexV1::default();
+        let now = now_ms();
+        let _ = index.upsert(OnboardingJournalIndexEntry {
+            store_id: missing_store_id,
+            kind: OnboardingJournalKind::Attempt,
+            expires_at_ms: now.saturating_add(ONBOARDING_JOURNAL_TTL_MS),
+            updated_at_ms: now,
+        });
+        store_onboarding_journal_index(&root, ProductProviderId::Claude, &index).unwrap();
+
+        reap_onboarding_journals_at(&root, now);
+
+        assert!(
+            load_onboarding_journal_index(&root, ProductProviderId::Claude)
+                .unwrap()
+                .entries
+                .is_empty(),
+            "startup reaping must repair an index published before its journal"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn onboarding_journal_cross_process_lock_refuses_competing_write() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("journal-cross-process-lock");
+        let _ = std::fs::remove_dir_all(&root);
+        let attempt_id = "serialized-attempt";
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            attempt_id,
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+        let held = acquire_onboarding_journal_file_lock(&root).unwrap();
+
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            attempt_id,
+            ProductOnboardingState::ErrorRedacted,
+            Some("interrupted".into()),
+        );
+        let journal = load_onboarding_journal(&root, attempt_id).unwrap();
+        assert_eq!(
+            journal.transitions.len(),
+            1,
+            "competing write must fail closed"
+        );
+
+        drop(held);
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            attempt_id,
+            ProductOnboardingState::ErrorRedacted,
+            Some("interrupted".into()),
+        );
+        let journal = load_onboarding_journal(&root, attempt_id).unwrap();
+        assert_eq!(
+            journal.transitions.len(),
+            2,
+            "write resumes after lock release"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8747,11 +10155,13 @@ mod tests {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("journal-driven-projection");
         let _ = std::fs::remove_dir_all(&root);
-        // A present (valid-token) bundle under a DIFFERENT policy so startup recovery does not
-        // auto-complete the chain (mismatched policy -> not activated -> not ready).
+        // Construct first so startup recovery has no bundle to auto-activate. The later fixture is
+        // policy-valid; progress must not rely on a credential the product runtime would reject.
+        let agent = DaemonAgent::new(Config::default(), root.clone());
         let meta = ProductBundleMeta {
-            generation: uuid_v4(),
-            policy_fingerprint: "other-policy".to_string(),
+            provider: ProductProviderId::Claude,
+            generation: uuid_v4().unwrap(),
+            policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
             lifecycle: CredentialLifecycle::Active,
         };
         store_agent_credential_blob(
@@ -8770,17 +10180,17 @@ mod tests {
         // Record 3 of the 8 ordered success-chain steps into the generation journal.
         record_onboarding_generation_transitions(
             &root,
+            ProductProviderId::Claude,
             &meta.generation,
             &ONBOARDING_SUCCESS_CHAIN[..3],
         );
-        let agent = DaemonAgent::new(Config::default(), root.clone());
         assert!(!agent.provider_ready(ProductProviderId::Claude));
         assert_eq!(
             agent.journal_completed_success_steps(ProductProviderId::Claude),
-            3
+            Ok(3)
         );
         let ob = agent.provider_onboarding(ProductProviderId::Claude);
-        assert_eq!(ob["state"], "in_progress");
+        assert_eq!(ob["state"], "retained_envelope_verified");
         let complete = ob["steps"]
             .as_array()
             .unwrap()
@@ -8788,6 +10198,212 @@ mod tests {
             .filter(|s| s["complete"] == true)
             .count();
         assert_eq!(complete, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn onboarding_journal_index_evicts_and_deletes_oldest_object() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("journal-index-bound");
+        let _ = std::fs::remove_dir_all(&root);
+        let base = now_ms();
+        let mut first_store_id = String::new();
+        for index in 0..=MAX_JOURNAL_INDEX_ENTRIES {
+            let attempt_id = format!("attempt-{index}");
+            let store_id = OnboardingAttemptJournalV1::journal_store_id(&attempt_id);
+            if index == 0 {
+                first_store_id.clone_from(&store_id);
+            }
+            let journal = OnboardingAttemptJournalV1 {
+                transitions: vec![OnboardingTransition {
+                    state: ProductOnboardingState::OfficialSignInStarted,
+                    generation: String::new(),
+                    error_code: None,
+                    recorded_at_ms: base + index as u64,
+                }],
+            };
+            store_indexed_onboarding_journal(
+                &root,
+                ProductProviderId::Claude,
+                &store_id,
+                OnboardingJournalKind::Attempt,
+                &journal,
+                base + index as u64,
+            )
+            .unwrap();
+        }
+        let index = load_onboarding_journal_index(&root, ProductProviderId::Claude).unwrap();
+        assert_eq!(index.entries.len(), MAX_JOURNAL_INDEX_ENTRIES);
+        assert!(!index
+            .entries
+            .iter()
+            .any(|entry| entry.store_id == first_store_id));
+        assert!(agent_credential_store(&root)
+            .unwrap()
+            .get(
+                isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+                &first_store_id,
+            )
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn onboarding_journal_parser_rejects_oversize_and_noncanonical_records() {
+        let started = serde_json::json!({
+            "state": "official_sign_in_started",
+            "generation": "",
+            "error_code": null,
+            "recorded_at_ms": 1,
+        });
+        let oversized = serde_json::json!({
+            "schema_version": 1,
+            "transitions": vec![started.clone(); MAX_JOURNAL_TRANSITIONS + 1],
+        });
+        assert!(
+            OnboardingAttemptJournalV1::from_json(&serde_json::to_vec(&oversized).unwrap())
+                .is_none()
+        );
+
+        let unknown_error = serde_json::json!({
+            "schema_version": 1,
+            "transitions": [{
+                "state": "error_redacted",
+                "generation": "",
+                "error_code": "raw_provider_error",
+                "recorded_at_ms": 1,
+            }],
+        });
+        assert!(OnboardingAttemptJournalV1::from_json(
+            &serde_json::to_vec(&unknown_error).unwrap()
+        )
+        .is_none());
+
+        let noncanonical_generation = serde_json::json!({
+            "schema_version": 1,
+            "transitions": [{
+                "state": "official_oauth_completed",
+                "generation": "not-a-uuid",
+                "error_code": null,
+                "recorded_at_ms": 1,
+            }],
+        });
+        assert!(OnboardingAttemptJournalV1::from_json(
+            &serde_json::to_vec(&noncanonical_generation).unwrap()
+        )
+        .is_none());
+
+        let extra_field = serde_json::json!({
+            "schema_version": 1,
+            "transitions": [{
+                "state": "official_sign_in_started",
+                "generation": "",
+                "error_code": null,
+                "recorded_at_ms": 1,
+                "raw_error": "forbidden",
+            }],
+        });
+        assert!(
+            OnboardingAttemptJournalV1::from_json(&serde_json::to_vec(&extra_field).unwrap())
+                .is_none()
+        );
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn terminal_attempt_projects_closed_error_redacted_state() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("journal-terminal-projection");
+        let _ = std::fs::remove_dir_all(&root);
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            "attempt-terminal",
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            "attempt-terminal",
+            ProductOnboardingState::ErrorRedacted,
+            Some("exchange_failed".into()),
+        );
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let onboarding = agent.provider_onboarding(ProductProviderId::Claude);
+        assert_eq!(onboarding["state"], "error_redacted");
+        assert_eq!(onboarding["error_code"], "exchange_failed");
+        assert!(!onboarding.to_string().contains("attempt-terminal"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn gapped_generation_journal_fails_closed_in_status_projection() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("journal-gap-projection");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let meta = ProductBundleMeta {
+            provider: ProductProviderId::Claude,
+            generation: uuid_v4().unwrap(),
+            policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
+            lifecycle: CredentialLifecycle::Active,
+        };
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(
+                StoredCredential {
+                    access_token: "t".into(),
+                    refresh_token: "r".into(),
+                    expires_at_ms: 9_999_999_999_999,
+                }
+                .to_json(),
+            ),
+        )
+        .unwrap();
+        let store_id =
+            OnboardingAttemptJournalV1::journal_store_id_for_generation(&meta.generation);
+        let malformed = OnboardingAttemptJournalV1 {
+            transitions: vec![OnboardingTransition {
+                state: ProductOnboardingState::CredentialEncrypted,
+                generation: meta.generation.clone(),
+                error_code: None,
+                recorded_at_ms: now_ms(),
+            }],
+        };
+        store_indexed_onboarding_journal(
+            &root,
+            ProductProviderId::Claude,
+            &store_id,
+            OnboardingJournalKind::Generation,
+            &malformed,
+            now_ms(),
+        )
+        .unwrap();
+        assert_eq!(
+            agent.journal_completed_success_steps(ProductProviderId::Claude),
+            Err(())
+        );
+        let onboarding = agent.provider_onboarding(ProductProviderId::Claude);
+        assert_eq!(onboarding["state"], "error_redacted");
+        assert_eq!(onboarding["error_code"], "journal_invalid");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8890,7 +10506,7 @@ mod tests {
     fn daemon_agent_startup_removes_legacy_codex_callback_diagnostics() {
         let root = apphost_credential_test_root("codex-legacy-diagnostics-cleanup");
         std::fs::create_dir_all(&root).unwrap();
-        let legacy = root.join(CODEX_CALLBACK_DIAGNOSTICS_FILE);
+        let legacy = root.join(["codex", "debug.txt"].join("-"));
         std::fs::write(
             &legacy,
             "target=/auth/callback?code=secret&state=secret\nexchange=ERR secret",
@@ -8945,6 +10561,170 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_callback_claim_is_pointer_bound_and_refuses_cancelled_attempt() {
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        attempts.lock().unwrap().insert(
+            "claimable".into(),
+            OAuthAttempt::Codex {
+                cancelled: Arc::clone(&cancelled),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        assert!(claim_codex_callback_attempt(
+            &attempts,
+            "claimable",
+            &cancelled
+        ));
+        assert!(!attempts.lock().unwrap().contains_key("claimable"));
+
+        let cancelled = Arc::new(AtomicBool::new(true));
+        attempts.lock().unwrap().insert(
+            "cancelled".into(),
+            OAuthAttempt::Codex {
+                cancelled: Arc::clone(&cancelled),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        assert!(!claim_codex_callback_attempt(
+            &attempts,
+            "cancelled",
+            &cancelled
+        ));
+        assert!(attempts.lock().unwrap().contains_key("cancelled"));
+
+        let stale_owner = Arc::new(AtomicBool::new(false));
+        assert!(!claim_codex_callback_attempt(
+            &attempts,
+            "cancelled",
+            &stale_owner
+        ));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_wrong_state_callback_does_not_consume_attempt() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_id = "wrong-state".to_string();
+        attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            OAuthAttempt::Codex {
+                cancelled: Arc::clone(&cancelled),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        let root = apphost_credential_test_root("codex-wrong-state-survives");
+        let _ = std::fs::remove_dir_all(&root);
+        let context = CodexCallbackContext {
+            oauth_dir: root.clone(),
+            cfg: isyncyou_agent::oauth::CodexOAuthConfig::default(),
+            verifier: "verifier".into(),
+            want_state: "expected".into(),
+            attempt_id: attempt_id.clone(),
+            cancelled: Arc::clone(&cancelled),
+            attempts: Arc::clone(&attempts),
+            product_runtime_gate: Arc::new(Mutex::new(())),
+        };
+        let server = std::thread::spawn(move || {
+            codex_callback_serve_until(
+                listener,
+                context,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            );
+        });
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .write_all(
+                b"GET /auth/callback?code=ignored&state=wrong HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("200 OK"));
+        assert!(attempts.lock().unwrap().contains_key(&attempt_id));
+
+        cancelled.store(true, Ordering::Release);
+        assert!(remove_owned_codex_attempt(
+            &attempts,
+            &attempt_id,
+            &cancelled
+        ));
+        server.join().unwrap();
+        assert!(load_onboarding_journal(&root, &attempt_id).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_cancel_and_callback_cleanup_record_one_terminal_transition() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("codex-cancel-single-terminal");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_id = "cancel-race".to_string();
+        agent.oauth_attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            OAuthAttempt::Codex {
+                cancelled: Arc::clone(&cancelled),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Codex,
+            &attempt_id,
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+        let context = CodexCallbackContext {
+            oauth_dir: root.clone(),
+            cfg: isyncyou_agent::oauth::CodexOAuthConfig::default(),
+            verifier: "verifier".into(),
+            want_state: "state".into(),
+            attempt_id: attempt_id.clone(),
+            cancelled,
+            attempts: Arc::clone(&agent.oauth_attempts),
+            product_runtime_gate: Arc::clone(&agent.product_runtime_gate),
+        };
+        let server = std::thread::spawn(move || {
+            codex_callback_serve_until(
+                listener,
+                context,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            );
+        });
+        isyncyou_webui::AgentHandler::oauth_cancel(&agent, "codex", &attempt_id).unwrap();
+        server.join().unwrap();
+
+        let journal = load_onboarding_journal(&root, &attempt_id).expect("cancel journal");
+        let terminal: Vec<_> = journal
+            .transitions
+            .iter()
+            .filter(|transition| transition.state == ProductOnboardingState::ErrorRedacted)
+            .collect();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].error_code.as_deref(), Some("cancelled"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // #639 T8 AC1: crash window "after V2-write, before activation" — startup recovery activates the
     // EXISTING generation without a re-exchange (no new login, same generation).
     #[cfg(all(
@@ -8962,7 +10742,7 @@ mod tests {
             refresh_token: "resumed-refresh".into(),
             expires_at_ms: 9_999_999_999_999,
         };
-        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
         store_agent_credential_blob(
             &root,
             SUBSCRIPTION_CREDENTIAL_ID,
@@ -9012,7 +10792,7 @@ mod tests {
             refresh_token: "r".into(),
             expires_at_ms: 9_999_999_999_999,
         };
-        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
         store_agent_credential_blob(
             &root,
             SUBSCRIPTION_CREDENTIAL_ID,
@@ -9059,9 +10839,17 @@ mod tests {
         // The in-flight attempt had recorded its official sign-in start.
         record_onboarding_attempt_transition(
             &root,
+            ProductProviderId::Codex,
             &attempt_id,
             ProductOnboardingState::OfficialSignInStarted,
             None,
+        );
+        attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            OAuthAttempt::Codex {
+                cancelled: Arc::clone(&cancelled),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
         );
         let context = CodexCallbackContext {
             oauth_dir: root.clone(),
@@ -9081,6 +10869,33 @@ mod tests {
         let journal = load_onboarding_journal(&root, &attempt_id).expect("attempt journal");
         assert!(journal.has_state(ProductOnboardingState::ErrorRedacted));
         let terminal = journal.transitions.last().unwrap();
+        assert_eq!(terminal.state, ProductOnboardingState::ErrorRedacted);
+        assert_eq!(terminal.error_code.as_deref(), Some("interrupted"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn startup_marks_unresumable_oauth_attempt_interrupted() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("startup-interrupted-attempt");
+        let _ = std::fs::remove_dir_all(&root);
+        let attempt_id = "lost-in-memory-attempt";
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            attempt_id,
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+
+        let _agent = DaemonAgent::new(Config::default(), root.clone());
+
+        let journal = load_onboarding_journal(&root, attempt_id).expect("attempt journal");
+        let terminal = journal.transitions.last().expect("terminal transition");
         assert_eq!(terminal.state, ProductOnboardingState::ErrorRedacted);
         assert_eq!(terminal.error_code.as_deref(), Some("interrupted"));
         let _ = std::fs::remove_dir_all(root);
@@ -9114,6 +10929,68 @@ mod tests {
         drop(guard);
         // Once released, the status read completes against a single consistent revision.
         assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        unix,
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn cross_process_product_lock_makes_status_and_settings_write_fail_closed() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("cross-process-product-gate");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let held = acquire_product_runtime_file_lock(&root).unwrap();
+
+        assert_eq!(
+            isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL).unwrap_err(),
+            "product_busy"
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        assert_eq!(status["connected"], false);
+        assert_eq!(status["onboarding"]["selected_state"], "error_redacted");
+
+        drop(held);
+        isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn poisoned_product_runtime_gate_makes_status_fail_closed() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("poisoned-product-gate-status");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let gate = Arc::clone(&agent.product_runtime_gate);
+        assert!(std::thread::spawn(move || {
+            let _guard = gate.lock().unwrap();
+            panic!("poison product runtime gate for fail-closed regression");
+        })
+        .join()
+        .is_err());
+
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        assert_eq!(status["connected"], false);
+        assert_eq!(status["selected_provider"], "");
+        assert_eq!(status["credential_state"]["claude"], "reconnect_required");
+        assert_eq!(status["credential_state"]["codex"], "reconnect_required");
+        assert_eq!(
+            status["onboarding"]["providers"]["claude"]["state"],
+            "error_redacted"
+        );
+        assert_eq!(
+            status["onboarding"]["providers"]["codex"]["error_code"],
+            "onboarding_failed"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9218,6 +11095,7 @@ mod tests {
                 expires_at_ms: now_ms() + 3_600_000,
             })
             .unwrap();
+        agent.set_agent_settings("claude", DEFAULT_MODEL).unwrap();
 
         let provider = agent.build_turn_provider("system");
 
@@ -9269,10 +11147,54 @@ mod tests {
         )
         .unwrap();
         let agent = DaemonAgent::new(Config::default(), root.clone());
-        let (provider, model) = agent.agent_settings();
+        let settings = agent.agent_settings().expect("valid settings snapshot");
 
-        assert_eq!(provider, "codex");
-        assert_eq!(model, isyncyou_agent::CodexConfig::default().model);
+        assert_eq!(settings.provider, ProductProviderId::Codex);
+        assert_eq!(settings.model, isyncyou_agent::CodexConfig::default().model);
+        assert!(!root.join("agent-settings.json").exists());
+        let on_disk = std::fs::read_dir(agent_credential_config(&root).store_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<String>();
+        assert!(!on_disk.contains(r#""provider":"codex""#));
+        assert!(!on_disk.contains(&isyncyou_agent::CodexConfig::default().model));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn missing_or_corrupt_product_settings_never_use_environment_or_default_fallback() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("settings-fail-closed");
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("ISYNCYOU_AGENT_PROVIDER", "codex");
+        std::env::set_var("ISYNCYOU_AGENT_MODEL", "gpt-5.5");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        assert!(agent.agent_settings().is_none());
+
+        agent_credential_store(&root)
+            .unwrap()
+            .put(
+                isyncyou_agent::SecretClass::ProductSettings,
+                PRODUCT_SETTINGS_ID,
+                &isyncyou_agent::Secret::new(
+                    br#"{"schema_version":1,"provider":"codex","model":"unknown"}"#.to_vec(),
+                ),
+            )
+            .unwrap();
+        assert!(agent.agent_settings().is_none());
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        assert_eq!(status["selected_provider"], "");
+        assert_eq!(status["model"], "");
+        assert_eq!(
+            status["onboarding"]["selected_provider"],
+            serde_json::Value::Null
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9416,7 +11338,7 @@ mod tests {
         assert_eq!(status["claude"], false);
         // The walled experimental turn path is still available.
         assert!(agent
-            .try_experimental_only_provider(ProductProviderId::Claude, "system")
+            .try_experimental_only_provider(ProductProviderId::Claude, DEFAULT_MODEL, "system")
             .is_some());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -9454,10 +11376,15 @@ mod tests {
     fn refresh_keeps_generation_and_is_not_an_onboarding_event() {
         // Each login mints a fresh generation; re-persisting with explicit meta (the refresh path)
         // preserves it. There is no journal write here — a refresh is a credential-lifecycle event.
-        let g1 = ProductBundleMeta::fresh(ProductProviderId::Claude).generation;
-        let g2 = ProductBundleMeta::fresh(ProductProviderId::Claude).generation;
+        let g1 = ProductBundleMeta::fresh(ProductProviderId::Claude)
+            .unwrap()
+            .generation;
+        let g2 = ProductBundleMeta::fresh(ProductProviderId::Claude)
+            .unwrap()
+            .generation;
         assert_ne!(g1, g2, "each login mints a new generation");
         let meta = ProductBundleMeta {
+            provider: ProductProviderId::Claude,
             generation: g1.clone(),
             policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
             lifecycle: CredentialLifecycle::Active,
@@ -9470,7 +11397,7 @@ mod tests {
             }
             .to_json(),
         );
-        let back = ProductBundleMeta::from_blob(&blob).unwrap();
+        let back = ProductBundleMeta::from_blob(&blob, ProductProviderId::Claude).unwrap();
         assert_eq!(back.generation, g1, "refresh preserves the generation");
         assert_eq!(back.lifecycle, CredentialLifecycle::Active);
     }
@@ -9494,7 +11421,8 @@ mod tests {
                     expires_at_ms: u64::MAX,
                 },
                 &ProductBundleMeta {
-                    generation: uuid_v4(),
+                    provider: ProductProviderId::Claude,
+                    generation: uuid_v4().unwrap(),
                     policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
                     lifecycle: CredentialLifecycle::ReconnectRequired {
                         closed_code: "refresh_failed".into(),
@@ -9545,41 +11473,43 @@ mod tests {
     ))]
     #[test]
     fn activation_matches_requires_policy_and_contract_version() {
+        let generation = uuid_v4().unwrap();
+        let policy = oauth_policy_fingerprint(ProductProviderId::Claude);
         let a = ProductActivationV1 {
             provider_id: "claude".into(),
-            credential_generation: "gen-1".into(),
-            oauth_policy_fingerprint: "fp-official".into(),
+            credential_generation: generation.clone(),
+            oauth_policy_fingerprint: policy.clone(),
             harness_contract_version: HARNESS_CONTRACT_VERSION,
         };
         assert!(a.matches(
             ProductProviderId::Claude,
-            "gen-1",
-            "fp-official",
+            &generation,
+            &policy,
             HARNESS_CONTRACT_VERSION
         ));
         // generation alone is not enough — policy + contract + provider must all match.
         assert!(!a.matches(
             ProductProviderId::Claude,
             "gen-2",
-            "fp-official",
+            &policy,
             HARNESS_CONTRACT_VERSION
         ));
         assert!(!a.matches(
             ProductProviderId::Claude,
-            "gen-1",
+            &generation,
             "fp-override",
             HARNESS_CONTRACT_VERSION
         ));
         assert!(!a.matches(
             ProductProviderId::Claude,
-            "gen-1",
-            "fp-official",
+            &generation,
+            &policy,
             HARNESS_CONTRACT_VERSION + 1
         ));
         assert!(!a.matches(
             ProductProviderId::Codex,
-            "gen-1",
-            "fp-official",
+            &generation,
+            &policy,
             HARNESS_CONTRACT_VERSION
         ));
         // round-trip through the encrypted store
@@ -9604,7 +11534,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let activation = ProductActivationV1 {
             provider_id: "claude".into(),
-            credential_generation: "gen-keep".into(),
+            credential_generation: uuid_v4().unwrap(),
             oauth_policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
             harness_contract_version: HARNESS_CONTRACT_VERSION,
         };
@@ -9616,9 +11546,9 @@ mod tests {
         for i in 0..(MAX_JOURNAL_TRANSITIONS + 20) {
             journal.push(OnboardingTransition {
                 state: ProductOnboardingState::OfficialSignInStarted,
-                generation: format!("g{i}"),
+                generation: String::new(),
                 error_code: None,
-                recorded_at_ms: now_ms(),
+                recorded_at_ms: now_ms() + i as u64,
             });
         }
         assert_eq!(journal.transitions.len(), MAX_JOURNAL_TRANSITIONS);
@@ -9654,7 +11584,7 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
-    fn agent_provider_selection_uses_fake_when_unconfigured() {
+    fn test_only_provider_selection_probe_uses_fake_when_unconfigured() {
         let env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("agent-provider-fake");
         let _ = std::fs::remove_dir_all(&root);
@@ -9666,6 +11596,27 @@ mod tests {
         let provider = agent.build_turn_provider("system");
 
         assert_eq!(provider.name(), "fake");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )))]
+    #[test]
+    fn product_turn_without_provider_feature_never_returns_fake_success() {
+        let root = std::env::temp_dir().join(format!(
+            "isyncyou-app-host-no-provider-feature-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        assert_eq!(
+            isyncyou_webui::AgentHandler::start_turn(&agent, "me", "hello").unwrap_err(),
+            "product_not_ready"
+        );
+        assert_eq!(agent.seq.load(Ordering::SeqCst), 0);
+        assert!(agent.streams.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9872,6 +11823,64 @@ mod tests {
 
         assert!(!source.contains(&method));
         assert!(!source.contains(&route));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_credential_load_rejects_oversized_plaintext() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("bounded-product-credential");
+        let _ = std::fs::remove_dir_all(&root);
+        agent_credential_store(&root)
+            .unwrap()
+            .put(
+                isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+                SUBSCRIPTION_CREDENTIAL_ID,
+                &isyncyou_agent::Secret::new(vec![
+                    b'x';
+                    MAX_PRODUCT_CREDENTIAL_PLAINTEXT_BYTES + 1
+                ]),
+            )
+            .unwrap();
+
+        assert!(load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID).is_err());
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        assert!(matches!(
+            agent.claude_product_credential_state(),
+            ProductCredentialState::PresentInvalid
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_runtime_gate_uses_one_bundle_snapshot_per_provider_branch() {
+        let source = production_source_before_final_test_module(include_str!("lib.rs"));
+        let start = source
+            .find("    fn product_runtime_gate(")
+            .expect("runtime gate exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("    /// #639 T8: commit a successful official Claude OAuth")
+            .expect("runtime gate end marker exists");
+        let gate = &tail[..end];
+
+        assert_eq!(
+            gate.matches("self.claude_product_bundle_state()").count(),
+            1
+        );
+        assert_eq!(gate.matches("self.codex_product_bundle_state()").count(), 1);
+        assert!(!gate.contains("provider_credential_state_class"));
+        assert!(!gate.contains("try_subscription_provider"));
+        assert!(!gate.contains("try_codex_provider"));
+        assert!(!gate.contains("resolve_claude_credential"));
+        assert!(!gate.contains("resolve_codex_credential"));
     }
 
     #[cfg(any(

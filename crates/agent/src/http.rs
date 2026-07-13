@@ -400,25 +400,7 @@ mod live {
             Ok((status, text))
         }
 
-        /// POST a JSON body and parse the response as Server-Sent Events. Successful
-        /// response bodies are streamed to `on_event` and not retained.
-        /// The product entry point (#639): send a fully **attested** provider request. Only an
-        /// [`AttestedProviderRequest`](crate::provider::AttestedProviderRequest) — built and
-        /// validated by `build_attested_provider_request` — can be sent this way, so an un-attested
-        /// `(url, headers, body)` cannot reach the backend through the product path.
-        #[cfg(any(
-            feature = "agent-oauth-providers",
-            feature = "agent-subscription-experimental"
-        ))]
-        pub fn post_attested_sse(
-            &self,
-            request: &crate::provider::AttestedProviderRequest,
-            on_event: &mut dyn FnMut(SseEvent) -> bool,
-        ) -> Result<ProviderHttpResponse, AgentError> {
-            self.post_json_sse(request.url(), request.headers(), request.body(), on_event)
-        }
-
-        pub fn post_json_sse(
+        pub(super) fn post_json_sse(
             &self,
             url: &str,
             headers: &[(String, String)],
@@ -517,6 +499,39 @@ mod live {
                 .text()
                 .map_err(|_| AgentError::Transport("provider_response_read_failed".into()))?;
             Ok((status, text))
+        }
+    }
+
+    /// The transport capability held by product providers. Unlike [`HttpTransport`], this type has
+    /// no raw JSON/form/probe API: its only send operation requires the private, immutable request
+    /// value produced by the runtime harness attestation. OAuth and explicitly enabled legacy BYO
+    /// providers use `HttpTransport` separately and cannot be confused with this product capability.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    pub(crate) struct ProductHttpTransport {
+        inner: Arc<HttpTransport>,
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    impl ProductHttpTransport {
+        pub(crate) fn shared() -> Result<Self, AgentError> {
+            Ok(Self {
+                inner: HttpTransport::shared()?,
+            })
+        }
+
+        pub(crate) fn post_attested_sse(
+            &self,
+            request: &crate::provider::AttestedProviderRequest,
+            on_event: &mut dyn FnMut(SseEvent) -> bool,
+        ) -> Result<ProviderHttpResponse, AgentError> {
+            self.inner
+                .post_json_sse(request.url(), request.headers(), request.body(), on_event)
         }
     }
 
@@ -653,6 +668,14 @@ mod live {
 
 #[cfg(feature = "http")]
 pub use live::HttpTransport;
+#[cfg(all(
+    feature = "http",
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
+))]
+pub(crate) use live::ProductHttpTransport;
 
 #[cfg(test)]
 mod tests {

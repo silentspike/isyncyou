@@ -14,12 +14,11 @@ use crate::turn::{Message, Role};
 use crate::AgentError;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// Verified Codex-CLI mimicry recipe.
 pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const ORIGINATOR: &str = "codex_cli_rs";
-const OPENAI_BETA: &str = "responses=experimental";
+pub(super) const ORIGINATOR: &str = "codex_cli_rs";
+pub(super) const OPENAI_BETA: &str = "responses=experimental";
 pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.1";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 
@@ -48,7 +47,7 @@ impl Default for CodexConfig {
 
 /// The agent's single tool in the Responses `function` shape (vs Anthropic's
 /// `input_schema`). Reuses the same name/description/schema so behaviour matches.
-fn responses_tools() -> Value {
+pub(super) fn responses_tools() -> Value {
     let s = tool_schema();
     json!([{
         "type": "function",
@@ -242,7 +241,7 @@ mod live {
 
     /// Live ChatGPT/Codex subscription provider over the agent's blocking HTTP transport.
     pub struct CodexProvider {
-        http: Arc<crate::http::HttpTransport>,
+        http: crate::http::ProductHttpTransport,
         access_token: String,
         instructions: String,
         cfg: CodexConfig,
@@ -256,7 +255,7 @@ mod live {
             cfg: CodexConfig,
         ) -> Result<Self, AgentError> {
             Ok(Self {
-                http: crate::http::HttpTransport::shared()?,
+                http: crate::http::ProductHttpTransport::shared()?,
                 access_token: access_token.into(),
                 instructions: instructions.into(),
                 cfg,
@@ -300,7 +299,12 @@ mod live {
         ) -> Result<Vec<AssistantBlock>, AgentError> {
             // #639: attest THIS round's request, then send only the attested object.
             let attested = crate::provider::build_attested_provider_request(
-                crate::provider::HarnessProvider::Codex,
+                crate::provider::ProviderRequestBinding::Codex {
+                    access_token: &self.access_token,
+                    account_id: &self.cfg.account_id,
+                    model: &self.cfg.model,
+                    instructions: &self.instructions,
+                },
                 self.cfg.responses_url.clone(),
                 self.request_headers(),
                 build_request(&self.cfg.model, &self.instructions, history),

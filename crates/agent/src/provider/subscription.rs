@@ -14,12 +14,11 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 /// Default Claude-Code mimicry recipe (verified from the real client, 2026-06-27).
 pub(crate) const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(super) const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 pub(crate) const DEFAULT_CLI_VERSION: &str = "2.1.207";
 
 /// #639 (F4): the exact retained billing-envelope block text the product harness must carry
@@ -68,31 +67,33 @@ impl SubscriptionConfig {
 }
 
 /// A random UUIDv4 string for `x-claude-code-session-id` (the real client uses `uuid4()`).
-fn uuid_v4() -> String {
+fn uuid_v4() -> Result<String, AgentError> {
     let mut b = [0u8; 16];
-    let _ = SystemRandom::new().fill(&mut b);
+    SystemRandom::new()
+        .fill(&mut b)
+        .map_err(|_| AgentError::Provider("provider session RNG unavailable".into()))?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    format!(
+    Ok(format!(
         "{}-{}-{}-{}-{}",
         h(&b[0..4]),
         h(&b[4..6]),
         h(&b[6..8]),
         h(&b[8..10]),
         h(&b[10..16])
-    )
+    ))
 }
 
 /// The Claude OAuth-compatible provider. Holds the app-obtained OAuth token and the
 /// recipe config; shapes each request to the Claude Code-compatible wire format.
 pub struct SubscriptionProvider {
-    http: Arc<crate::http::HttpTransport>,
+    http: crate::http::ProductHttpTransport,
     access_token: String,
     model: String,
     system: String,
-    session_id: String,
-    cfg: SubscriptionConfig,
+    pub(super) session_id: String,
+    pub(super) cfg: SubscriptionConfig,
     pub last_usage: Usage,
 }
 
@@ -104,11 +105,11 @@ impl SubscriptionProvider {
         cfg: SubscriptionConfig,
     ) -> Result<Self, AgentError> {
         Ok(Self {
-            http: crate::http::HttpTransport::shared()?,
+            http: crate::http::ProductHttpTransport::shared()?,
             access_token: access_token.into(),
             model: model.into(),
             system: system.into(),
-            session_id: uuid_v4(),
+            session_id: uuid_v4()?,
             cfg,
             last_usage: Usage::default(),
         })
@@ -324,7 +325,14 @@ impl LlmProvider for SubscriptionProvider {
         // #639: build + attest the exact request for THIS round's history, then send only the
         // attested object — the transport's product path accepts nothing un-attested.
         let attested = crate::provider::build_attested_provider_request(
-            crate::provider::HarnessProvider::Claude,
+            crate::provider::ProviderRequestBinding::Claude {
+                access_token: &self.access_token,
+                session_id: &self.session_id,
+                account_uuid: &self.cfg.account_uuid,
+                device_id: &self.cfg.device_id,
+                model: &self.model,
+                system: &self.system,
+            },
             self.cfg.messages_url.clone(),
             self.request_headers(),
             self.request_body(history),
@@ -536,7 +544,7 @@ mod tests {
 
     #[test]
     fn uuid_v4_has_version_and_variant_bits() {
-        let u = uuid_v4();
+        let u = uuid_v4().unwrap();
         let parts: Vec<&str> = u.split('-').collect();
         assert_eq!(parts.len(), 5);
         assert!(parts[2].starts_with('4')); // version 4

@@ -102,10 +102,7 @@ pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-pub use provider::{
-    attest_static_product_harness, build_attested_provider_request, AttestedProviderRequest,
-    HarnessProvider, HARNESS_CONTRACT_VERSION,
-};
+pub use provider::{attest_static_product_harness, HarnessProvider, HARNESS_CONTRACT_VERSION};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
 

@@ -1,9 +1,9 @@
-//! A best-effort exclusive advisory file lock (#639).
+//! An exclusive advisory file lock (#639).
 //!
 //! Held for the lifetime of the returned guard (dropping it, including on process exit/crash,
-//! releases the lock via the closed fd). Used to serialize the product runtime across processes:
-//! a second product runtime that cannot take the lock **fails closed** rather than racing the
-//! credential store / activation record.
+//! releases the lock via the closed fd). Used to serialize product credential transactions and
+//! onboarding-journal transactions across processes. A competing transaction that cannot take its
+//! domain lock fails closed rather than racing encrypted store updates.
 
 use std::path::Path;
 
@@ -19,8 +19,7 @@ impl FileLock {
     /// `Ok(None)` if another holder already owns it (the caller must fail closed), `Err` on I/O error.
     #[cfg(unix)]
     pub fn try_acquire_exclusive(path: &Path) -> std::io::Result<Option<FileLock>> {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -30,39 +29,43 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)?;
-        // LOCK_EX | LOCK_NB: exclusive, do not block — a held lock returns EWOULDBLOCK.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(Some(FileLock { _file: file }));
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "runtime lock is not an owner-controlled regular file",
+            ));
         }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
-            _ => Err(err),
-        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Self::try_lock_file(file)
     }
 
     #[cfg(not(unix))]
     pub fn try_acquire_exclusive(path: &Path) -> std::io::Result<Option<FileLock>> {
-        // No portable advisory lock; create-new gives a coarse single-holder guard.
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => Ok(Some(FileLock { _file: file })),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-            Err(e) => Err(e),
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        Self::try_lock_file(file)
+    }
+
+    fn try_lock_file(file: std::fs::File) -> std::io::Result<Option<FileLock>> {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(FileLock { _file: file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
         }
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::FileLock;
 
@@ -80,5 +83,16 @@ mod tests {
         drop(first);
         // after release, it can be re-acquired
         assert!(FileLock::try_acquire_exclusive(&path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_lock_path_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"not a lock").unwrap();
+        let path = tmp.path().join(".product-runtime.lock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(FileLock::try_acquire_exclusive(&path).is_err());
     }
 }

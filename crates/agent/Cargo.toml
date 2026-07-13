@@ -38,6 +38,9 @@ isyncyou-graph = { path = "../graph", default-features = false, optional = true 
 # in the default product build, not only under the experimental feature. libc is already in
 # the workspace graph transitively; making it direct here is minimal.
 libc = { version = "0.2" }
+# Cross-platform advisory product-runtime lock. Unlike a create-new sentinel, the OS releases this
+# automatically after a process crash.
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

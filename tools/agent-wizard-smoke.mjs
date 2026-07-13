@@ -14,7 +14,11 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO = path.resolve(path.dirname(__filename), "..");
-const OUT_DIR = process.env.ISY_WIZARD_OUT || path.join(REPO, "docs/evidence/artifacts/issue-639");
+const outFlag = process.argv.indexOf("--out");
+if (outFlag >= 0 && !process.argv[outFlag + 1]) throw new Error("--out requires a directory");
+const OUT_DIR = outFlag >= 0
+  ? path.resolve(REPO, process.argv[outFlag + 1])
+  : process.env.ISY_WIZARD_OUT || path.join(REPO, "docs/evidence/artifacts/issue-639");
 const AGENT_CAP = "fixture-agent-cap";
 const readText = (p) => fs.readFileSync(path.join(REPO, p), "utf8");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -68,16 +72,44 @@ function startServer(scenario) {
   );
   const indexHtml = readText("gui/webui/src/index.html");
   const appCss = readText("gui/webui/src/app.css");
-  const server = http.createServer((req, res) => {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/") return text(res, 200, indexHtml, "text/html; charset=utf-8");
     if (req.method === "GET" && url.pathname === "/app.css") return text(res, 200, appCss, "text/css; charset=utf-8");
     if (req.method === "GET" && url.pathname === "/app.js") return text(res, 200, appJs, "text/javascript; charset=utf-8");
     if (url.pathname === "/api/v1/agent/status") return json(res, 200, statusFor(scenario));
     if (url.pathname === "/api/v1/agent/connectivity/preflight") return json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
+    if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/start") {
+      if (scenario === "invalid_oauth_start") {
+        return json(res, 200, { attempt_id: "attempt-invalid-response" });
+      }
+      return json(res, 200, {
+        attempt_id: "attempt-fixture",
+        authorize_url: `${url.origin}/fixture-auth`,
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/complete") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch (_) {}
+      requests.push({
+        route: "oauth_complete",
+        json: !!parsed,
+        provider: parsed && parsed.provider,
+        attempt_id_present: !!(parsed && parsed.attempt_id),
+        pasted_code_present: !!(parsed && parsed.pasted_code),
+        query_empty: url.search === "",
+      });
+      return json(res, 200, { connected: true });
+    }
+    if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/cancel") {
+      return json(res, 200, { cancelled: true });
+    }
     return json(res, 404, { error: "not found" });
   });
-  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port })));
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port, requests })));
 }
 
 async function openAssistant(page, origin) {
@@ -124,7 +156,7 @@ async function main() {
     }
     // --- AC3: DOM, storage, and console carry no secret after a simulated code paste.
     {
-      const { server, port } = await startServer("first_run");
+      const { server, port, requests } = await startServer("first_run");
       const origin = `http://127.0.0.1:${port}`;
       const page = await browser.newPage();
       const consoleText = [];
@@ -142,10 +174,55 @@ async function main() {
       const storage = await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }));
       record("pasted code is not in localStorage/sessionStorage", !storage.includes(SECRET), { keys: Object.keys(JSON.parse(storage).local) });
       record("no secret in console output", !consoleText.join("\n").includes(SECRET));
-      // After clearing (completeAiLogin clears the input immediately), the value is gone.
-      await page.evaluate(() => { const i = document.getElementById("asst-code"); if (i) i.value = ""; });
-      const clearedVal = await page.locator('#asst-code').inputValue();
-      record("code input is cleared", clearedVal === "", { clearedVal });
+      await page.getByRole("button", { name: "Finish connecting" }).click();
+      await page.waitForFunction(() => !document.getElementById("asst-code") || document.getElementById("asst-code").value === "");
+      record("completion path clears the code input", true);
+      record("completion posts one strict JSON body with no query secret",
+        requests.length === 1
+        && requests[0].route === "oauth_complete"
+        && requests[0].json
+        && requests[0].provider === "claude"
+        && requests[0].attempt_id_present
+        && requests[0].pasted_code_present
+        && requests[0].query_empty,
+        { request_count: requests.length, contract: requests[0] || null });
+      await page.close();
+      server.close();
+    }
+    // --- AC4: an incomplete OAuth-start response cancels its attempt and releases its guard.
+    {
+      const { server, port } = await startServer("invalid_oauth_start");
+      const origin = `http://127.0.0.1:${port}`;
+      const page = await browser.newPage();
+      await openAssistant(page, origin);
+      await page.evaluate(() => {
+        localStorage.setItem("isy_agent_privacy_consent_v1", JSON.stringify({
+          version: 1,
+          accepted: true,
+          provider: "claude",
+        }));
+        window.__wizardGuardEvents = [];
+        beginNetworkGuard = async () => {
+          window.__wizardGuardEvents.push("begin");
+          return "guard-invalid-response";
+        };
+        endNetworkGuard = async (guardId) => {
+          window.__wizardGuardEvents.push(`end:${guardId}`);
+        };
+        runConnectivityPreflight = async () => ({ status: "ready" });
+      });
+      await page.evaluate(() => startAiLogin("claude"));
+      const cleanup = await page.evaluate(() => ({
+        events: window.__wizardGuardEvents,
+        attempt_retained: OAUTH_ATTEMPTS.has("claude"),
+        guard_retained: AGENT_GUARD_ID !== null,
+      }));
+      record("invalid OAuth start response releases the exact guard",
+        cleanup.events.join(",") === "begin,end:guard-invalid-response", cleanup);
+      record("invalid OAuth start response clears the server attempt",
+        cleanup.attempt_retained === false, cleanup);
+      record("invalid OAuth start response clears local guard ownership",
+        cleanup.guard_retained === false, cleanup);
       await page.close();
       server.close();
     }

@@ -288,7 +288,7 @@ pub enum HarnessProvider {
     feature = "agent-subscription-experimental"
 ))]
 #[derive(Debug, Clone)]
-pub struct AttestedProviderRequest {
+pub(crate) struct AttestedProviderRequest {
     url: String,
     headers: Vec<(String, String)>,
     body: serde_json::Value,
@@ -299,14 +299,50 @@ pub struct AttestedProviderRequest {
     feature = "agent-subscription-experimental"
 ))]
 impl AttestedProviderRequest {
-    pub fn url(&self) -> &str {
+    pub(crate) fn url(&self) -> &str {
         &self.url
     }
-    pub fn headers(&self) -> &[(String, String)] {
+    pub(crate) fn headers(&self) -> &[(String, String)] {
         &self.headers
     }
-    pub fn body(&self) -> &serde_json::Value {
+    pub(crate) fn body(&self) -> &serde_json::Value {
         &self.body
+    }
+}
+
+/// Values already owned by a concrete product provider and bound into this round's attestation.
+/// Callers cannot substitute a different token, account, model, or prompt after construction.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+pub(crate) enum ProviderRequestBinding<'a> {
+    Claude {
+        access_token: &'a str,
+        session_id: &'a str,
+        account_uuid: &'a str,
+        device_id: &'a str,
+        model: &'a str,
+        system: &'a str,
+    },
+    Codex {
+        access_token: &'a str,
+        account_id: &'a str,
+        model: &'a str,
+        instructions: &'a str,
+    },
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl ProviderRequestBinding<'_> {
+    fn provider(&self) -> HarnessProvider {
+        match self {
+            Self::Claude { .. } => HarnessProvider::Claude,
+            Self::Codex { .. } => HarnessProvider::Codex,
+        }
     }
 }
 
@@ -367,40 +403,42 @@ fn reject_forbidden_components(value: &serde_json::Value) -> Result<(), AgentErr
     Ok(())
 }
 
-/// The request `tools` must be exactly one tool named `isyncyou`.
+/// The request `tools` must be the exact provider-specific projection of the single canonical
+/// `isyncyou` schema. Name/count-only checks would allow a widened input contract.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn attest_single_isyncyou_tool(tools: Option<&serde_json::Value>) -> Result<(), AgentError> {
-    let arr = tools
-        .and_then(|t| t.as_array())
-        .ok_or_else(|| harness_violation("tools must be an array"))?;
-    if arr.len() != 1 {
-        return Err(harness_violation("exactly one tool is allowed"));
-    }
-    let name = arr[0]
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or_default();
-    if name != crate::tool::TOOL_NAME {
-        return Err(harness_violation("the only tool must be `isyncyou`"));
+fn attest_single_isyncyou_tool(
+    provider: HarnessProvider,
+    tools: Option<&serde_json::Value>,
+) -> Result<(), AgentError> {
+    let expected = match provider {
+        HarnessProvider::Claude => serde_json::json!([crate::tool::tool_schema()]),
+        HarnessProvider::Codex => codex::responses_tools(),
+    };
+    if tools != Some(&expected) {
+        return Err(harness_violation(
+            "tool schema is not the canonical isyncyou schema",
+        ));
     }
     Ok(())
 }
 
-/// Every mandatory header name (case-insensitive) must be present.
+/// Header order, names, and values are part of the retained provider envelope. This also rejects
+/// extra/duplicate headers and binds auth/account identity to the provider instance.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn require_headers(headers: &[(String, String)], required: &[&str]) -> Result<(), AgentError> {
-    for name in required {
-        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)) {
-            return Err(harness_violation(&format!(
-                "mandatory header missing: {name}"
-            )));
-        }
+fn require_exact_headers(
+    headers: &[(String, String)],
+    expected: Vec<(String, String)>,
+) -> Result<(), AgentError> {
+    if headers != expected.as_slice() {
+        return Err(harness_violation(
+            "provider headers differ from the exact envelope",
+        ));
     }
     Ok(())
 }
@@ -425,26 +463,6 @@ fn reject_duplicate_headers(headers: &[(String, String)]) -> Result<(), AgentErr
     Ok(())
 }
 
-/// #639 (F4): the `authorization` header must be a bearer credential — its value format is bound
-/// (the token itself is credential-specific and is not, and must not be, hardcoded here).
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
-fn require_bearer_authorization(headers: &[(String, String)]) -> Result<(), AgentError> {
-    let value = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or_default();
-    if !value.starts_with("Bearer ") || value.len() <= "Bearer ".len() {
-        return Err(harness_violation(
-            "authorization must be a non-empty bearer token",
-        ));
-    }
-    Ok(())
-}
-
 /// Validate a provider request against the positive harness allowlist — exact top-level keys,
 /// exactly one `isyncyou` tool, the retained envelope invariants (Claude billing block first,
 /// Codex `store:false`), streaming, and all mandatory headers. No default-client component may appear.
@@ -453,22 +471,42 @@ fn require_bearer_authorization(headers: &[(String, String)]) -> Result<(), Agen
     feature = "agent-subscription-experimental"
 ))]
 fn attest_product_harness(
-    provider: HarnessProvider,
+    binding: &ProviderRequestBinding<'_>,
     url: &str,
     headers: &[(String, String)],
     body: &serde_json::Value,
 ) -> Result<(), AgentError> {
+    let provider = binding.provider();
     reject_forbidden_components(body)?;
     reject_duplicate_headers(headers)?;
-    require_bearer_authorization(headers)?;
     let obj = body
         .as_object()
         .ok_or_else(|| harness_violation("request body must be an object"))?;
     let keys: std::collections::BTreeSet<&str> = obj.keys().map(|k| k.as_str()).collect();
     let stream_true = obj.get("stream") == Some(&serde_json::Value::Bool(true));
-    attest_single_isyncyou_tool(obj.get("tools"))?;
+    attest_single_isyncyou_tool(provider, obj.get("tools"))?;
     match provider {
         HarnessProvider::Claude => {
+            let ProviderRequestBinding::Claude {
+                access_token,
+                session_id,
+                account_uuid,
+                device_id,
+                model,
+                system: expected_system,
+            } = binding
+            else {
+                return Err(harness_violation("claude binding mismatch"));
+            };
+            if access_token.is_empty()
+                || session_id.is_empty()
+                || model.is_empty()
+                || expected_system.is_empty()
+            {
+                return Err(harness_violation(
+                    "claude binding contains an empty required value",
+                ));
+            }
             // #639 (F4): the request URL is bound exactly to the official endpoint.
             if url != subscription::MESSAGES_URL {
                 return Err(harness_violation(
@@ -511,21 +549,96 @@ fn attest_product_harness(
                     "claude billing block must be first and exactly the official envelope",
                 ));
             }
+            let expected_prompt = serde_json::json!({
+                "type": "text",
+                "text": expected_system,
+                "cache_control": { "type": "ephemeral" },
+            });
+            if system.get(1) != Some(&expected_prompt) {
+                return Err(harness_violation(
+                    "claude prompt block differs from the selected harness",
+                ));
+            }
+            if obj.get("model").and_then(|v| v.as_str()) != Some(*model)
+                || obj.get("max_tokens").and_then(|v| v.as_u64()) != Some(4096)
+                || !obj.get("messages").is_some_and(|v| v.is_array())
+            {
+                return Err(harness_violation(
+                    "claude protocol fields differ from the request binding",
+                ));
+            }
+            let metadata = obj
+                .get("metadata")
+                .and_then(|v| v.as_object())
+                .filter(|v| v.len() == 1)
+                .and_then(|v| v.get("user_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+                .and_then(|v| v.as_object().cloned())
+                .ok_or_else(|| {
+                    harness_violation("claude metadata is not the closed identity object")
+                })?;
+            let metadata_keys: std::collections::BTreeSet<&str> =
+                metadata.keys().map(String::as_str).collect();
+            if metadata_keys
+                != std::collections::BTreeSet::from(["account_uuid", "device_id", "session_id"])
+                || metadata.get("session_id").and_then(|v| v.as_str()) != Some(*session_id)
+                || metadata.get("account_uuid").and_then(|v| v.as_str()) != Some(*account_uuid)
+                || metadata.get("device_id").and_then(|v| v.as_str()) != Some(*device_id)
+            {
+                return Err(harness_violation(
+                    "claude metadata identity differs from the binding",
+                ));
+            }
             if !stream_true {
                 return Err(harness_violation("claude stream must be true"));
             }
-            require_headers(
+            require_exact_headers(
                 headers,
-                &[
-                    "authorization",
-                    "anthropic-version",
-                    "anthropic-beta",
-                    "content-type",
-                    "accept",
+                vec![
+                    ("authorization".into(), format!("Bearer {access_token}")),
+                    (
+                        "anthropic-version".into(),
+                        subscription::ANTHROPIC_VERSION.into(),
+                    ),
+                    ("anthropic-beta".into(), subscription::ANTHROPIC_BETA.into()),
+                    (
+                        "anthropic-dangerous-direct-browser-access".into(),
+                        "true".into(),
+                    ),
+                    (
+                        "user-agent".into(),
+                        format!(
+                            "claude-cli/{} (external, sdk-cli)",
+                            subscription::DEFAULT_CLI_VERSION
+                        ),
+                    ),
+                    ("x-app".into(), "cli".into()),
+                    ("x-claude-code-session-id".into(), (*session_id).to_string()),
+                    ("content-type".into(), "application/json".into()),
+                    ("accept".into(), "text/event-stream".into()),
                 ],
             )?;
         }
         HarnessProvider::Codex => {
+            let ProviderRequestBinding::Codex {
+                access_token,
+                account_id,
+                model,
+                instructions,
+            } = binding
+            else {
+                return Err(harness_violation("codex binding mismatch"));
+            };
+            if access_token.is_empty()
+                || account_id.is_empty()
+                || model.is_empty()
+                || instructions.is_empty()
+            {
+                return Err(harness_violation(
+                    "codex binding contains an empty required value",
+                ));
+            }
             // #639 (F4): the request URL is bound exactly to the official endpoint.
             if url != codex::RESPONSES_URL {
                 return Err(harness_violation(
@@ -552,17 +665,31 @@ fn attest_product_harness(
             if obj.get("store") != Some(&serde_json::Value::Bool(false)) {
                 return Err(harness_violation("codex store must be false"));
             }
+            if obj.get("model").and_then(|v| v.as_str()) != Some(*model)
+                || obj.get("instructions").and_then(|v| v.as_str()) != Some(*instructions)
+                || !obj.get("input").is_some_and(|v| v.is_array())
+                || obj.get("parallel_tool_calls") != Some(&serde_json::Value::Bool(false))
+                || obj.get("tool_choice").and_then(|v| v.as_str()) != Some("auto")
+            {
+                return Err(harness_violation(
+                    "codex protocol fields differ from the request binding",
+                ));
+            }
             if !stream_true {
                 return Err(harness_violation("codex stream must be true"));
             }
-            require_headers(
+            require_exact_headers(
                 headers,
-                &[
-                    "authorization",
-                    "chatgpt-account-id",
-                    "openai-beta",
-                    "originator",
-                    "accept",
+                vec![
+                    ("authorization".into(), format!("Bearer {access_token}")),
+                    ("chatgpt-account-id".into(), (*account_id).to_string()),
+                    ("originator".into(), codex::ORIGINATOR.into()),
+                    ("openai-beta".into(), codex::OPENAI_BETA.into()),
+                    (
+                        "user-agent".into(),
+                        format!("{}/{}", codex::ORIGINATOR, codex::DEFAULT_CLI_VERSION),
+                    ),
+                    ("accept".into(), "text/event-stream".into()),
                 ],
             )?;
         }
@@ -577,13 +704,13 @@ fn attest_product_harness(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-pub fn build_attested_provider_request(
-    provider: HarnessProvider,
+pub(crate) fn build_attested_provider_request(
+    binding: ProviderRequestBinding<'_>,
     url: String,
     headers: Vec<(String, String)>,
     body: serde_json::Value,
 ) -> Result<AttestedProviderRequest, AgentError> {
-    attest_product_harness(provider, &url, &headers, &body)?;
+    attest_product_harness(&binding, &url, &headers, &body)?;
     Ok(AttestedProviderRequest { url, headers, body })
 }
 
@@ -597,19 +724,31 @@ pub fn build_attested_provider_request(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-pub fn attest_static_product_harness(provider: HarnessProvider) -> Result<(), AgentError> {
-    const PROBE_SYSTEM: &str = "iSyncYou static harness attestation probe";
+pub fn attest_static_product_harness(
+    provider: HarnessProvider,
+    expected_system: &str,
+) -> Result<(), AgentError> {
+    if expected_system.is_empty() {
+        return Err(harness_violation("static harness system prompt is empty"));
+    }
     let history: [crate::turn::Message; 0] = [];
     match provider {
         HarnessProvider::Claude => {
             let p = subscription::SubscriptionProvider::new(
                 "static-attestation-probe",
                 "static-attestation",
-                PROBE_SYSTEM,
+                expected_system,
                 subscription::SubscriptionConfig::default(),
             )?;
             attest_product_harness(
-                provider,
+                &ProviderRequestBinding::Claude {
+                    access_token: "static-attestation-probe",
+                    session_id: &p.session_id,
+                    account_uuid: &p.cfg.account_uuid,
+                    device_id: &p.cfg.device_id,
+                    model: "static-attestation",
+                    system: expected_system,
+                },
                 subscription::MESSAGES_URL,
                 &p.request_headers(),
                 &p.request_body(&history),
@@ -618,14 +757,26 @@ pub fn attest_static_product_harness(provider: HarnessProvider) -> Result<(), Ag
         HarnessProvider::Codex => {
             let p = codex::CodexProvider::new(
                 "static-attestation-probe",
-                PROBE_SYSTEM,
-                codex::CodexConfig::default(),
+                expected_system,
+                codex::CodexConfig {
+                    account_id: "static-account-binding".into(),
+                    ..Default::default()
+                },
             )?;
             attest_product_harness(
-                provider,
+                &ProviderRequestBinding::Codex {
+                    access_token: "static-attestation-probe",
+                    account_id: "static-account-binding",
+                    model: &codex::CodexConfig::default().model,
+                    instructions: expected_system,
+                },
                 codex::RESPONSES_URL,
                 &p.request_headers(),
-                &codex::build_request("static-attestation", PROBE_SYSTEM, &history),
+                &codex::build_request(
+                    &codex::CodexConfig::default().model,
+                    expected_system,
+                    &history,
+                ),
             )
         }
     }
@@ -895,7 +1046,7 @@ mod tests {
     ))]
     fn valid_claude_request(message: &str) -> (String, Vec<(String, String)>, serde_json::Value) {
         let history = [crate::turn::Message::user(message)];
-        let provider = subscription::SubscriptionProvider::new(
+        let mut provider = subscription::SubscriptionProvider::new(
             "claude-oauth-token",
             "claude-test",
             "iSyncYou controlled system prompt",
@@ -906,6 +1057,7 @@ mod tests {
             },
         )
         .unwrap();
+        provider.session_id = "11111111-1111-4111-8111-111111111111".into();
         (
             subscription::MESSAGES_URL.to_string(),
             provider.request_headers(),
@@ -939,6 +1091,35 @@ mod tests {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
+    fn attest_test_request(
+        provider: HarnessProvider,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: serde_json::Value,
+    ) -> Result<AttestedProviderRequest, AgentError> {
+        let binding = match provider {
+            HarnessProvider::Claude => ProviderRequestBinding::Claude {
+                access_token: "claude-oauth-token",
+                session_id: "11111111-1111-4111-8111-111111111111",
+                account_uuid: "account-identity",
+                device_id: "device-identity",
+                model: "claude-test",
+                system: "iSyncYou controlled system prompt",
+            },
+            HarnessProvider::Codex => ProviderRequestBinding::Codex {
+                access_token: "codex-oauth-token",
+                account_id: "codex-account-identity",
+                model: "codex-test",
+                instructions: "iSyncYou controlled system prompt",
+            },
+        };
+        build_attested_provider_request(binding, url, headers, body)
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn every_provider_round_attests_its_current_history() {
         // Two rounds with different histories each produce a freshly attested request whose body
@@ -949,8 +1130,7 @@ mod tests {
                     HarnessProvider::Claude => valid_claude_request(message),
                     HarnessProvider::Codex => valid_codex_request(message),
                 };
-                let attested =
-                    build_attested_provider_request(provider_kind, url, headers, body).unwrap();
+                let attested = attest_test_request(provider_kind, url, headers, body).unwrap();
                 assert!(
                     serde_json::to_string(attested.body())
                         .unwrap()
@@ -967,12 +1147,12 @@ mod tests {
     ))]
     #[test]
     fn transport_accepts_only_attested_provider_request() {
-        // The only way to obtain an AttestedProviderRequest (the sole value the transport accepts)
+        // The only way to obtain an AttestedProviderRequest (the sole value the product transport accepts)
         // is through build_attested_provider_request, which validates the plan. A conforming plan
         // yields one whose accessors expose exactly the attested url/headers/body; a non-conforming
         // plan yields none.
         let (url, headers, body) = valid_claude_request("controlled user request");
-        let attested = build_attested_provider_request(
+        let attested = attest_test_request(
             HarnessProvider::Claude,
             url.clone(),
             headers.clone(),
@@ -989,8 +1169,7 @@ mod tests {
             .unwrap()
             .insert("mcp_servers".into(), json!(["default-client-mcp"]));
         assert!(
-            build_attested_provider_request(HarnessProvider::Claude, url, headers, forbidden)
-                .is_err(),
+            attest_test_request(HarnessProvider::Claude, url, headers, forbidden).is_err(),
             "transport must not receive an attested request for a non-conforming plan"
         );
     }
@@ -1004,7 +1183,7 @@ mod tests {
         // AttestedProviderRequest is immutable (private fields, no setters): any header/body change
         // forces a rebuild, and the rebuild re-attests — a mutated plan cannot be re-attested.
         let (url, headers, body) = valid_codex_request("controlled user request");
-        build_attested_provider_request(
+        attest_test_request(
             HarnessProvider::Codex,
             url.clone(),
             headers.clone(),
@@ -1019,7 +1198,7 @@ mod tests {
             .unwrap()
             .insert("store".into(), json!(true));
         assert!(
-            build_attested_provider_request(
+            attest_test_request(
                 HarnessProvider::Codex,
                 url.clone(),
                 headers.clone(),
@@ -1035,8 +1214,7 @@ mod tests {
             .filter(|(k, _)| !k.eq_ignore_ascii_case("authorization"))
             .collect();
         assert!(
-            build_attested_provider_request(HarnessProvider::Codex, url, mutated_headers, body)
-                .is_err(),
+            attest_test_request(HarnessProvider::Codex, url, mutated_headers, body).is_err(),
             "mutated headers must fail re-attestation"
         );
     }
@@ -1049,7 +1227,7 @@ mod tests {
     fn attestation_rejects_each_claude_field_mutation() {
         let base = || valid_claude_request("controlled user request");
         let attest = |headers: Vec<(String, String)>, body: serde_json::Value| {
-            build_attested_provider_request(
+            attest_test_request(
                 HarnessProvider::Claude,
                 subscription::MESSAGES_URL.to_string(),
                 headers,
@@ -1092,6 +1270,16 @@ mod tests {
         b["tools"][0]["name"] = json!("not-isyncyou");
         assert!(attest(h, b).is_err(), "renamed tool must fail");
 
+        // Widened tool schema.
+        let (_, h, mut b) = base();
+        b["tools"][0]["input_schema"]["additionalProperties"] = json!(true);
+        assert!(attest(h, b).is_err(), "changed tool schema must fail");
+
+        // Prompt differs from the binding.
+        let (_, h, mut b) = base();
+        b["system"][1]["text"] = json!("different system prompt");
+        assert!(attest(h, b).is_err(), "changed prompt must fail");
+
         // Missing mandatory header.
         let (_, h, b) = base();
         let stripped: Vec<_> = h
@@ -1099,6 +1287,30 @@ mod tests {
             .filter(|(k, _)| !k.eq_ignore_ascii_case("anthropic-version"))
             .collect();
         assert!(attest(stripped, b).is_err(), "missing header must fail");
+
+        // Wrong mandatory value and an extra header are both rejected by the exact envelope.
+        let (_, mut h, b) = base();
+        h[1].1 = "2099-01-01".into();
+        assert!(attest(h, b).is_err(), "wrong header value must fail");
+        let (_, mut h, b) = base();
+        h.push(("x-extra".into(), "not-allowed".into()));
+        assert!(attest(h, b).is_err(), "extra header must fail");
+
+        // The retained metadata identity is bound to this provider instance, not only to the
+        // expected field names.
+        let (_, h, mut b) = base();
+        let mut identity: serde_json::Value =
+            serde_json::from_str(b["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        identity["account_uuid"] = json!("different-account");
+        b["metadata"]["user_id"] = json!(identity.to_string());
+        assert!(attest(h, b).is_err(), "changed account identity must fail");
+
+        let (_, h, mut b) = base();
+        let mut identity: serde_json::Value =
+            serde_json::from_str(b["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        identity["device_id"] = json!("different-device");
+        b["metadata"]["user_id"] = json!(identity.to_string());
+        assert!(attest(h, b).is_err(), "changed device identity must fail");
     }
 
     #[cfg(any(
@@ -1109,7 +1321,7 @@ mod tests {
     fn attestation_rejects_each_codex_field_mutation() {
         let base = || valid_codex_request("controlled user request");
         let attest = |headers: Vec<(String, String)>, body: serde_json::Value| {
-            build_attested_provider_request(
+            attest_test_request(
                 HarnessProvider::Codex,
                 codex::RESPONSES_URL.to_string(),
                 headers,
@@ -1137,6 +1349,14 @@ mod tests {
         b["tools"][0]["name"] = json!("not-isyncyou");
         assert!(attest(h, b).is_err(), "renamed tool must fail");
 
+        let (_, h, mut b) = base();
+        b["tools"][0]["parameters"]["additionalProperties"] = json!(true);
+        assert!(attest(h, b).is_err(), "changed tool schema must fail");
+
+        let (_, h, mut b) = base();
+        b["instructions"] = json!("different instructions");
+        assert!(attest(h, b).is_err(), "changed instructions must fail");
+
         // Missing mandatory account header.
         let (_, h, b) = base();
         let stripped: Vec<_> = h
@@ -1147,6 +1367,13 @@ mod tests {
             attest(stripped, b).is_err(),
             "missing account header must fail"
         );
+
+        let (_, mut h, b) = base();
+        h[1].1 = "other-account".into();
+        assert!(attest(h, b).is_err(), "changed account binding must fail");
+        let (_, mut h, b) = base();
+        h.push(("x-extra".into(), "not-allowed".into()));
+        assert!(attest(h, b).is_err(), "extra header must fail");
     }
 
     // #639 (F4): the runtime attestation binds the URL, the EXACT billing envelope, rejects
@@ -1159,7 +1386,7 @@ mod tests {
     fn attestation_binds_url_exact_billing_and_header_integrity() {
         // Wrong URL is rejected for both providers.
         let (_, h, b) = valid_claude_request("q");
-        assert!(build_attested_provider_request(
+        assert!(attest_test_request(
             HarnessProvider::Claude,
             "https://evil.example/v1/messages".into(),
             h,
@@ -1167,7 +1394,7 @@ mod tests {
         )
         .is_err());
         let (_, h, b) = valid_codex_request("q");
-        assert!(build_attested_provider_request(
+        assert!(attest_test_request(
             HarnessProvider::Codex,
             "https://evil.example/responses".into(),
             h,
@@ -1180,12 +1407,12 @@ mod tests {
         b["system"][0]["text"] = json!(
             "x-anthropic-billing-header: cc_version=9.9.9.cab; cc_entrypoint=sdk-cli; cch=00000;"
         );
-        assert!(build_attested_provider_request(HarnessProvider::Claude, url, h, b).is_err());
+        assert!(attest_test_request(HarnessProvider::Claude, url, h, b).is_err());
 
         // A duplicate header is rejected.
         let (url, mut h, b) = valid_claude_request("q");
         h.push(("anthropic-version".into(), "sneaky".into()));
-        assert!(build_attested_provider_request(HarnessProvider::Claude, url, h, b).is_err());
+        assert!(attest_test_request(HarnessProvider::Claude, url, h, b).is_err());
 
         // A non-bearer authorization is rejected.
         let (url, h, b) = valid_claude_request("q");
@@ -1199,12 +1426,11 @@ mod tests {
                 }
             })
             .collect();
-        assert!(build_attested_provider_request(HarnessProvider::Claude, url, mutated, b).is_err());
+        assert!(attest_test_request(HarnessProvider::Claude, url, mutated, b).is_err());
     }
 
-    // #639 (F4): the PRODUCT provider path sends only ATTESTED requests — subscription.rs and
-    // codex.rs must drive the transport exclusively through post_attested_sse (which accepts only an
-    // AttestedProviderRequest) and never call the raw post_json_sse primitive directly.
+    // #639 (F4): product providers hold only ProductHttpTransport and send only ATTESTED requests.
+    // They cannot access the general OAuth/BYO transport through their stored transport capability.
     #[cfg(any(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
@@ -1220,8 +1446,16 @@ mod tests {
                 "product provider must send via post_attested_sse"
             );
             assert!(
+                src.contains("crate::http::ProductHttpTransport"),
+                "product provider must hold only the restricted product transport"
+            );
+            assert!(
                 !src.contains("post_json_sse"),
                 "product provider must not call the un-attested post_json_sse directly"
+            );
+            assert!(
+                !src.contains("crate::http::HttpTransport::shared"),
+                "product provider must not acquire the general OAuth/BYO transport"
             );
         }
     }

@@ -36,6 +36,8 @@ pub enum SecretClass {
     ProductActivation,
     /// #639: the authenticated per-attempt onboarding transition journal.
     OnboardingAttemptJournal,
+    /// #639: the closed product provider/model selection consumed by the runtime gate.
+    ProductSettings,
 }
 
 impl SecretClass {
@@ -46,6 +48,7 @@ impl SecretClass {
             SecretClass::SessionPairingKey => "session-pairing-key",
             SecretClass::ProductActivation => "product-activation",
             SecretClass::OnboardingAttemptJournal => "onboarding-attempt-journal",
+            SecretClass::ProductSettings => "product-settings",
         }
     }
 }

@@ -4639,6 +4639,7 @@ function agentCredentialState(st, provider) {
 
 async function refreshAssistantCredentialIfRequired(st) {
   const provider = agentActiveProvider(st);
+  if (!provider) return st;
   if (agentCredentialState(st, provider) !== "refresh_required") return st;
   let guardId = null;
   try {
@@ -4681,8 +4682,12 @@ async function startAiLogin(provider) {
     if (redirect) params.redirect = redirect;
     const manualCodeFlow = provider === "claude" && !redirect;
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url || !d.attempt_id) { toast("Could not start sign-in"); return; }
-    OAUTH_ATTEMPTS.set(provider, d.attempt_id);
+    // Remember a server-created attempt before validating the rest of the response so the
+    // common failure path can cancel it. Never return from here with the FGS lease live.
+    if (d && d.attempt_id) OAUTH_ATTEMPTS.set(provider, d.attempt_id);
+    if (!d || !d.authorize_url || !d.attempt_id) {
+      throw new Error("oauth_start_invalid_response");
+    }
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
@@ -4725,7 +4730,7 @@ async function pollAgentStatus(n, provider) {
   }
   try {
     const s = await api("/api/v1/agent/status");
-    const connected = provider === "codex" ? !!(s && s.codex) : !!(s && s.claude);
+    const connected = assistantProviderReady(s, provider);
     if (connected) {
       AGENT_POLL_ON = false;
       OAUTH_ATTEMPTS.delete(provider);
@@ -4800,6 +4805,7 @@ const AssistantState = {
   activeTurnId: null,
   activeStream: null,
   pendingCardsById: new Map(),
+  pendingCardNodesById: new Map(),
   lastUsage: null,
   model: null,
   draft: "",
@@ -4812,6 +4818,7 @@ const AssistantState = {
 
 function closeAssistantStream(_reason) {
   const stream = AssistantState.activeStream;
+  const turn = AssistantState.activeTurnId;
   AssistantState.activeStream = null;
   AssistantState.activeTurnId = null;
   AssistantState.activeMessage = null;
@@ -4819,6 +4826,7 @@ function closeAssistantStream(_reason) {
   if (stream) {
     try { stream.close(); } catch (_) {}
   }
+  if (turn) void finishTurnGuard(turn);
 }
 
 function rememberAssistantStatus(st) {
@@ -4829,8 +4837,8 @@ function rememberAssistantStatus(st) {
     : null;
 }
 
-function assistantCanUse() {
-  return !!CAP.agent && !!App.account;
+function assistantCanUse(st) {
+  return !!CAP.agent && !!App.account && assistantSelectedReady(st);
 }
 
 const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
@@ -4840,12 +4848,21 @@ function agentProviderConsentId(provider) {
   if (provider === "codex") return "codex";
   return provider || "claude";
 }
+function agentSelectedProvider(st) {
+  const onboardingProvider = st && st.onboarding && st.onboarding.selected_provider;
+  const candidate = onboardingProvider || (st && st.selected_provider);
+  return candidate === "claude" || candidate === "codex" ? candidate : null;
+}
 function agentActiveProvider(st) {
-  if (st && st.provider) return agentProviderConsentId(st.provider);
-  if (st && st.selected_provider) return agentProviderConsentId(st.selected_provider);
-  if (st && st.claude) return "claude";
-  if (st && st.codex) return "codex";
-  return "claude";
+  return agentSelectedProvider(st);
+}
+function assistantProviderReady(st, provider) {
+  const node = assistantOnboardingFor(st, provider);
+  return !!node && node.state === "ready";
+}
+function assistantSelectedReady(st) {
+  const provider = agentSelectedProvider(st);
+  return !!provider && assistantProviderReady(st, provider);
 }
 function readAgentPrivacyConsent() {
   try { return JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {}; }
@@ -4915,10 +4932,9 @@ async function renderAssistantView(view) {
   // #639 T7/T10: `connected` is now host-verified per-provider readiness (provider_ready of the
   // selected provider), so the chat vs. wizard split is driven by host readiness, not credential
   // presence. The manual code step keys off the in-flight attempt + the per-provider onboarding state.
-  if (st && st.connected) renderAssistantChat(body, st);
+  if (assistantSelectedReady(st)) renderAssistantChat(body, st);
   else renderAssistantWizard(body, st);
-  const claudeReady = !!(st && st.onboarding && st.onboarding.providers
-    && st.onboarding.providers.claude && st.onboarding.providers.claude.state === "ready");
+  const claudeReady = assistantProviderReady(st, "claude");
   if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
 }
 
@@ -5052,7 +5068,9 @@ function renderAssistantComposer(_st) {
   const provider = agentActiveProvider(_st || AssistantState.status);
   const disabledReason = !CAP.agent ? "Assistant unavailable"
     : (!App.account ? "Select an account first"
-      : (!agentPrivacyConsentAccepted(provider) ? "Review privacy consent first" : ""));
+      : (!assistantSelectedReady(_st || AssistantState.status) ? "Reconnect your AI account"
+        : (!agentPrivacyConsentAccepted(provider) ? "Review privacy consent first"
+          : (AssistantState.busy ? "Wait for the active turn" : ""))));
   const input = el("textarea", {
     id: "asst-input",
     class: "input assistant-input",
@@ -5140,14 +5158,16 @@ function agentModelSwitcher(st) {
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
   };
-  addGroup("claude", st.claude);
-  addGroup("codex", st.codex);
-  if (!st.claude) {
+  const claudeReady = assistantProviderReady(st, "claude");
+  const codexReady = assistantProviderReady(st, "codex");
+  addGroup("claude", claudeReady);
+  addGroup("codex", codexReady);
+  if (!claudeReady) {
     rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "claude", onclick: () => connectAgentProvider("claude") },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect Claude…" })));
   }
-  if (!st.codex) {
+  if (!codexReady) {
     rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectAgentProvider("codex") },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
@@ -5207,7 +5227,7 @@ async function connectCodex() {
 async function pollCodexStatus(n) {
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.codex) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
+    if (assistantProviderReady(s, "codex")) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
   if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
   else await finishCodexGuard();
@@ -5396,11 +5416,18 @@ function pendingRecord(pendingId) {
 }
 
 function rerenderPendingCards(pendingId) {
-  document.querySelectorAll("[data-agent-pending-card]").forEach((node) => {
-    if (node.getAttribute("data-agent-pending-card") !== pendingId) return;
-    const record = pendingRecord(pendingId);
-    if (record) node.replaceWith(renderAgentPendingCard(record));
+  const record = pendingRecord(pendingId);
+  const nodes = AssistantState.pendingCardNodesById.get(pendingId);
+  if (!record || !nodes) return;
+  const replacements = new Set();
+  nodes.forEach((node) => {
+    if (!node.isConnected) return;
+    const replacement = renderAgentPendingCard(record, false);
+    node.replaceWith(replacement);
+    replacements.add(replacement);
   });
+  if (replacements.size) AssistantState.pendingCardNodesById.set(pendingId, replacements);
+  else AssistantState.pendingCardNodesById.delete(pendingId);
 }
 
 function pendingStatus(pending) {
@@ -5457,22 +5484,22 @@ async function cancelAgentPending(pendingId) {
   rerenderPendingCards(pendingId);
 }
 
-function renderAgentPendingCard(pending) {
+function renderAgentPendingCard(pending, trackNode = true) {
   const status = pendingStatus(pending);
   const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
   const done = status === "confirmed" || status === "cancelled";
   const waiting = status === "confirming" || status === "cancelling";
   const confirmDisabled = waiting || done || status === "expired";
   const cancelDisabled = waiting || done;
-  const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": pending.pending_id || "" },
+  const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": "1" },
     icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
-  const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": pending.pending_id || "" },
+  const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": "1" },
     icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
   if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
   if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
-  return el("div", {
+  const card = el("div", {
     class: "asst-pending-card " + status,
-    "data-agent-pending-card": pending.pending_id || "",
+    "data-agent-pending-card": "1",
   },
     el("div", { class: "asst-pending-head" },
       icon("shield-check", "icon-sm"),
@@ -5482,6 +5509,12 @@ function renderAgentPendingCard(pending) {
     pending.result ? el("div", { class: "asst-pending-result", text: pending.result }) : null,
     pending.error ? el("div", { class: "asst-pending-error", text: pending.error }) : null,
     el("div", { class: "asst-pending-actions" }, confirm, cancel));
+  if (trackNode && pending.pending_id) {
+    const nodes = AssistantState.pendingCardNodesById.get(pending.pending_id) || new Set();
+    nodes.add(card);
+    AssistantState.pendingCardNodesById.set(pending.pending_id, nodes);
+  }
+  return card;
 }
 
 function renderAssistantMessage(m) {
@@ -5596,7 +5629,12 @@ function agentSendFromInput() {
 // Start a turn and stream its tokens into a fresh assistant bubble.
 async function agentSend(text) {
   const log = $("#asst-log"); if (!log) return;
-  if (!assistantCanUse()) { toast("Assistant is unavailable for this account", "err"); return; }
+  if (!assistantCanUse(AssistantState.status)) {
+    toast("Reconnect the selected AI account before sending", "err");
+    renderAssistantView($("#view"));
+    return;
+  }
+  if (AssistantState.busy) { toast("Wait for the active turn", "err"); return; }
   const provider = agentActiveProvider(AssistantState.status);
   if (!agentPrivacyConsentAccepted(provider)) {
     toast("Review privacy consent for " + agentProviderLabel(provider), "err");
@@ -5727,11 +5765,13 @@ async function agentSend(text) {
   }
   AssistantState.activeTurnId = turn;
   if (BRIDGE && startingGuardId) {
+    // Own the starting lease immediately. Even an ambiguous native bind response must be released
+    // on terminal/error/route teardown rather than lingering until its deadline.
+    TURN_GUARDS.set(turn, startingGuardId);
     try {
-      const bound = await nativeCall("bindNetworkGuard", { guard_id: startingGuardId, turn }, NATIVE_TIMEOUT_MS);
-      if (bound && bound.ok) TURN_GUARDS.set(turn, startingGuardId);
+      await nativeCall("bindNetworkGuard", { guard_id: startingGuardId, turn }, NATIVE_TIMEOUT_MS);
     } catch (_) {
-      // A lost bind response is ambiguous. Keep the short starting lease for native expiry.
+      // A lost bind response is ambiguous; local ownership still guarantees terminal cleanup.
     }
   }
 
@@ -5743,8 +5783,11 @@ async function agentSend(text) {
   const finish = (msg, terminalReason) => {
     clearThinking();
     if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
-    else { try { stream.close(); } catch (_) {} }
-    if (terminalReason) void finishTurnGuard(turn);
+    else {
+      try { stream.close(); } catch (_) {}
+      void finishTurnGuard(turn);
+    }
+    void terminalReason;
     if (!asst.text && msg) setText(msg);
   };
   const turnState = {

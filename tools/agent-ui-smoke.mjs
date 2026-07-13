@@ -1,4 +1,4 @@
-// Deterministic Assistant UI smoke for #622.
+// Deterministic Assistant UI smoke for #622/#639.
 //
 // Starts a local fixture server, serves the real app assets, drives the Assistant
 // tab through Playwright, and writes screenshots plus a JSON evidence report.
@@ -11,7 +11,13 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO = path.resolve(path.dirname(__filename), "..");
-const OUT_DIR = path.join(REPO, "docs/evidence/artifacts/issue-622");
+const outFlag = process.argv.indexOf("--out");
+if (outFlag >= 0 && !process.argv[outFlag + 1]) {
+  throw new Error("--out requires a directory");
+}
+const OUT_DIR = outFlag >= 0
+  ? path.resolve(REPO, process.argv[outFlag + 1])
+  : path.join(REPO, "docs/evidence/artifacts/issue-622");
 const AGENT_CAP = "fixture-agent-cap";
 const ACCOUNT = "fixture";
 
@@ -100,7 +106,7 @@ async function sendStream(res, scenario, turn) {
     await sleep(30);
     sendSseMessage(res, { event: "done", reason: "complete" });
   } else if (scenario === "error") {
-    sendSseMessage(res, { event: "error", message: "Fixture stream failure" });
+    sendSseMessage(res, { event: "error", message: "raw-fixture-provider-error" });
     await sleep(30);
     sendSseMessage(res, { event: "done", reason: "error" });
   } else {
@@ -130,6 +136,8 @@ function makeFixtureServer(evidence) {
   let agentConnected = false;
   let agentProvider = "claude";
   let agentModel = "claude-sonnet-4";
+  let onboardingMode = "not_started";
+  let oauthAttemptSeq = 0;
   let turnSeq = 0;
   const turns = new Map();
   const state = {
@@ -147,23 +155,27 @@ function makeFixtureServer(evidence) {
     "default_harness_removed", "m365_profile_activated", "isyncyou_tool_connected",
     "subscription_identity_set", "ready",
   ];
-  const onboardingNode = (ready) => ({
-    state: ready ? "ready" : "not_started",
-    steps: onboardingStepKeys.map((key) => ({ key, complete: ready })),
+  const onboardingNode = (provider) => ({
+    state: agentConnected && agentProvider === provider ? "ready"
+      : provider === agentProvider ? onboardingMode : "not_started",
+    steps: onboardingStepKeys.map((key) => ({
+      key,
+      complete: agentConnected && agentProvider === provider,
+    })),
   });
   const statusBody = () => ({
     enabled: true,
     connected: agentConnected,
     provider: agentProvider,
     model: agentModel,
-    claude: agentConnected,
-    codex: false,
+    claude: agentConnected && agentProvider === "claude",
+    codex: agentConnected && agentProvider === "codex",
     onboarding: {
       selected_provider: agentProvider || "claude",
-      selected_state: agentConnected ? "ready" : "not_started",
+      selected_state: agentConnected ? "ready" : onboardingMode,
       providers: {
-        claude: onboardingNode(agentConnected),
-        codex: onboardingNode(false),
+        claude: onboardingNode("claude"),
+        codex: onboardingNode("codex"),
       },
     },
     models: {
@@ -225,12 +237,22 @@ function makeFixtureServer(evidence) {
         res.write(": fixture-ready\n\n");
       } else if (req.method === "GET" && url.pathname === "/api/v1/agent/status") {
         json(res, 200, statusBody());
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/connectivity/preflight") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/start") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         state.oauthStarts.push(Object.fromEntries(url.searchParams.entries()));
         agentConnected = true;
         agentProvider = url.searchParams.get("provider") === "codex" ? "codex" : "claude";
-        json(res, 200, { authorize_url: `http://${req.headers.host}/fixture-auth-complete` });
+        onboardingMode = "ready";
+        json(res, 200, {
+          authorize_url: `http://${req.headers.host}/fixture-auth-complete`,
+          attempt_id: `fixture-attempt-${++oauthAttemptSeq}`,
+        });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/cancel") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        json(res, 200, { cancelled: true });
       } else if (req.method === "GET" && url.pathname === "/fixture-auth-complete") {
         text(
           res,
@@ -286,7 +308,14 @@ function makeFixtureServer(evidence) {
       else res.end();
     }
   });
-  return { server, state };
+  return {
+    server,
+    state,
+    setOnboardingMode(mode) {
+      onboardingMode = mode;
+      agentConnected = mode === "ready";
+    },
+  };
 }
 
 function assert(evidence, name, ok, details = {}) {
@@ -409,6 +438,24 @@ async function main() {
     evidence.screenshots.setup_consent = await screenshot(page, "setup-consent.png");
     evidence.screenshots.desktop_assistant = await screenshot(page, "desktop-assistant.png");
 
+    await page.setViewportSize({ width: 720, height: 900 });
+    const wizardNoOverflow = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
+    assert(evidence, "720px wizard has no horizontal overflow", wizardNoOverflow);
+    evidence.screenshots.wizard_720 = await screenshot(page, "wizard-720.png");
+
+    fixture.setOnboardingMode("reconnect_required");
+    await page.goto(`${origin}/?reconnect-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-agent-wizard="reconnect_required"]', { timeout: 10000 });
+    assert(evidence, "reconnect uses the short host-driven flow",
+      (await page.locator('[data-agent-wizard="reconnect_required"]').innerText()).includes("Reconnect")
+      && await page.locator('[data-agent-wizard="reconnect_required"] [data-testid="agent-wizard-steps"]').count() === 0);
+    evidence.screenshots.reconnect_720 = await screenshot(page, "reconnect-720.png");
+
+    fixture.setOnboardingMode("not_started");
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`${origin}/?first-run-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
+
     await page.locator('[data-agent-consent-accept="claude"]').click();
     const consent = await page.evaluate(() => JSON.parse(localStorage.getItem("isy_agent_privacy_consent_v1") || "{}"));
     assert(evidence, "consent localStorage is versioned", consent.version === 1 && consent.accepted === true && consent.provider === "claude", consent);
@@ -431,6 +478,17 @@ async function main() {
     assert(evidence, "oauth start posted once", fixture.state.oauthStarts.length === 1, fixture.state.oauthStarts);
     assert(evidence, "oauth start used same-origin fixture route", evidence.browser_requests.some((r) => r.method === "POST" && r.url.startsWith(`${origin}/api/v1/agent/oauth/start`)));
     assert(evidence, "auth launch stayed on fixture origin", evidence.external_launches.every((row) => row.url.startsWith(origin)), evidence.external_launches);
+    const secretSurfaces = await page.evaluate(() => ({
+      html: document.documentElement.outerHTML,
+      local: Object.fromEntries(Object.keys(localStorage).map((key) => [key, localStorage.getItem(key)])),
+      session: Object.fromEntries(Object.keys(sessionStorage).map((key) => [key, sessionStorage.getItem(key)])),
+    }));
+    const secretSurfaceText = JSON.stringify({
+      ...secretSurfaces,
+      console_errors: evidence.console_errors,
+    });
+    assert(evidence, "handoff DOM console and storage exclude capability and attempt secrets",
+      !secretSurfaceText.includes(AGENT_CAP) && !secretSurfaceText.includes("fixture-attempt-"));
 
     await page.locator('[data-testid="agent-input"]').fill("Find the quarterly brief");
     await page.locator('[data-testid="agent-send"]').click();
@@ -457,13 +515,17 @@ async function main() {
 
     await page.locator('[data-testid="agent-input"]').fill("Please delete the stale fixture item");
     await page.locator('[data-testid="agent-send"]').click();
-    await page.waitForSelector('[data-agent-pending-card="pending-turn-2"]', { timeout: 10000 });
-    assert(evidence, "pending card appears", await page.locator('[data-agent-pending-card="pending-turn-2"]').isVisible());
+    await page.waitForSelector('[data-agent-pending-card="1"]', { timeout: 10000 });
+    const confirmCard = page.locator('[data-agent-pending-card="1"]').last();
+    assert(evidence, "pending card appears", await confirmCard.isVisible());
     assert(evidence, "no confirm before click", fixture.state.confirmPosts.length === 0);
-    const pendingHtml = await page.locator('[data-agent-pending-card="pending-turn-2"]').evaluate((el) => el.outerHTML);
-    assert(evidence, "pending DOM excludes token and hash", !pendingHtml.includes("fixture-token-") && !pendingHtml.includes("fixture-hash-"));
+    const pendingHtml = await confirmCard.evaluate((el) => el.outerHTML);
+    assert(evidence, "pending DOM excludes token hash and pending handle",
+      !pendingHtml.includes("fixture-token-")
+      && !pendingHtml.includes("fixture-hash-")
+      && !pendingHtml.includes("pending-turn-2"));
     evidence.screenshots.pending_confirm = await screenshot(page, "pending-confirm.png");
-    await page.locator('[data-agent-pending-card="pending-turn-2"]').getByRole("button", { name: "Confirm" }).click();
+    await confirmCard.getByRole("button", { name: "Confirm" }).click();
     await page.waitForFunction(() => document.body.innerText.includes("Confirmed by fixture"), null, { timeout: 10000 });
     assert(evidence, "confirm posts once with pending token action_hash", fixture.state.confirmPosts.length === 1
       && fixture.state.confirmPosts[0].pending
@@ -472,16 +534,20 @@ async function main() {
 
     await page.locator('[data-testid="agent-input"]').fill("Please cancel the delete fixture item");
     await page.locator('[data-testid="agent-send"]').click();
-    await page.waitForSelector('[data-agent-pending-card="pending-turn-3"]', { timeout: 10000 });
-    await page.locator('[data-agent-pending-card="pending-turn-3"]').getByRole("button", { name: "Cancel" }).click();
-    await page.waitForFunction(() => document.querySelector('[data-agent-pending-card="pending-turn-3"]')?.classList.contains("cancelled"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.querySelectorAll('[data-agent-pending-card="1"]').length >= 2, null, { timeout: 10000 });
+    const cancelCard = page.locator('[data-agent-pending-card="1"]').last();
+    await cancelCard.getByRole("button", { name: "Cancel" }).click();
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-agent-pending-card="1"]')).at(-1)?.classList.contains("cancelled"), null, { timeout: 10000 });
     assert(evidence, "cancel posts once for separate turn", fixture.state.cancelPosts.length === 1 && fixture.state.cancelPosts[0].turn, fixture.state.cancelPosts);
     evidence.screenshots.pending_cancel = await screenshot(page, "pending-cancel.png");
 
     await page.locator('[data-testid="agent-input"]').fill("trigger error");
     await page.locator('[data-testid="agent-send"]').click();
-    await page.waitForFunction(() => document.body.innerText.includes("Fixture stream failure"), null, { timeout: 10000 });
-    assert(evidence, "error stream renders inline", (await pageText(page)).includes("Fixture stream failure"));
+    await page.waitForFunction(() => document.body.innerText.includes("The assistant could not complete this request."), null, { timeout: 10000 });
+    const errorText = await pageText(page);
+    assert(evidence, "error stream renders only redacted safe copy",
+      errorText.includes("The assistant could not complete this request.")
+      && !errorText.includes("raw-fixture-provider-error"));
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`${origin}/?mobile-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
