@@ -877,6 +877,78 @@ impl DaemonAgent {
         isyncyou_agent::attest_static_product_harness(harness_provider_for(provider)).is_ok()
     }
 
+    /// #639 T9: whether an official OAuth attempt for `provider` is currently in flight.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn has_active_attempt(&self, provider: ProductProviderId) -> bool {
+        self.oauth_attempts
+            .lock()
+            .map(|attempts| {
+                attempts.values().any(|attempt| {
+                    matches!(
+                        (provider, attempt),
+                        (ProductProviderId::Claude, OAuthAttempt::Claude { .. })
+                            | (ProductProviderId::Codex, OAuthAttempt::Codex { .. })
+                    )
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// #639 T9: the per-provider onboarding projection for the wizard — `{state, steps[]}`. It is
+    /// derived from the DURABLE authority first (a ready provider reports all 8 steps complete
+    /// regardless of the journal, so the projection survives journal TTL), then an in-flight attempt,
+    /// then credential presence. It never leaks any token/account/OAuth value.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn provider_onboarding(&self, provider: ProductProviderId) -> serde_json::Value {
+        let (state, completed) = if self.provider_ready(provider) {
+            ("ready", ONBOARDING_SUCCESS_CHAIN.len())
+        } else if self.has_active_attempt(provider) {
+            ("in_progress", 0)
+        } else {
+            match self
+                .product_credential_status(provider.wire())
+                .unwrap_or("reconnect_required")
+            {
+                "reconnect_required" | "refresh_required" => ("reconnect_required", 0),
+                _ => ("not_started", 0),
+            }
+        };
+        let steps: Vec<serde_json::Value> = ONBOARDING_SUCCESS_CHAIN
+            .iter()
+            .enumerate()
+            .map(|(i, step)| serde_json::json!({ "key": step.wire(), "complete": i < completed }))
+            .collect();
+        serde_json::json!({ "state": state, "steps": steps })
+    }
+
+    /// #639 T9: the full onboarding projection block for `status_json`. `selected_provider` is null
+    /// for a corrupt/unknown settings record (fail-closed), never a default/alternative provider.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn onboarding_projection(&self) -> serde_json::Value {
+        let selected = ProductProviderId::parse(&self.agent_settings().0);
+        let selected_state = match selected {
+            Some(provider) => self.provider_onboarding(provider)["state"].clone(),
+            None => serde_json::Value::String("not_started".into()),
+        };
+        serde_json::json!({
+            "selected_provider": selected.map(|p| p.wire()),
+            "selected_state": selected_state,
+            "providers": {
+                "claude": self.provider_onboarding(ProductProviderId::Claude),
+                "codex": self.provider_onboarding(ProductProviderId::Codex),
+            },
+        })
+    }
+
     /// #639 T7 / #627: build a provider from the EXPERIMENTAL local-CLI credential only. Compiled
     /// solely under the experimental opt-in, it never reads the product store and only resolves on
     /// an `Absent` product state (a present-but-invalid bundle fails closed). It never sets product
@@ -3565,15 +3637,28 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    fn oauth_complete(&self, pasted: &str) -> Result<String, String> {
+    fn oauth_complete(&self, attempt_id: &str, pasted: &str) -> Result<String, String> {
         let (code, state_opt) = isyncyou_agent::oauth::parse_pasted_code(pasted);
         let state = state_opt.ok_or("the pasted code is missing its #state part")?;
+        // #639 T9: bind the pasted code to the named attempt — the attempt must exist, be a Claude
+        // attempt, and its server-side state must equal the embedded #state (no cross-attempt reuse).
+        {
+            let attempts = self.oauth_attempts.lock().unwrap();
+            let bound = matches!(
+                attempts.get(attempt_id),
+                Some(OAuthAttempt::Claude { state: pending, .. }) if pending == &state
+            );
+            if !bound {
+                return Err("the pasted code does not match this sign-in".into());
+            }
+        }
         let (verifier, redirect_uri) = self
             .oauth
             .take(&state)
             .ok_or("unknown or expired login — start the login again")?;
-        self.oauth_attempts.lock().unwrap().retain(|_, attempt| {
-            !matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == &state)
+        self.oauth_attempts.lock().unwrap().retain(|id, attempt| {
+            id != attempt_id
+                && !matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == &state)
         });
         let cfg = self.load_oauth_config()?;
         let http = isyncyou_agent::http::HttpTransport::shared()
@@ -3676,6 +3761,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         if let Some(usage) = self.last_usage.lock().unwrap().as_ref() {
             status["usage"] = usage.to_public_json();
         }
+        // #639 T9: the per-provider onboarding projection drives the first-run wizard. It survives
+        // journal TTL (a ready provider reports all steps complete from the durable activation).
+        status["onboarding"] = self.onboarding_projection();
         status.to_string()
     }
 
@@ -8434,6 +8522,90 @@ mod tests {
         drop(guard);
         // Once released, the status read completes against a single consistent revision.
         assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T9 AC1: manual completion binds the pasted code to the named attempt — a wrong embedded
+    // #state, a wrong/absent attempt id, or a missing #state is rejected, and the attempt survives.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn oauth_complete_rejects_wrong_attempt_state_and_codex() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("oauth-complete-binding");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.oauth_attempts.lock().unwrap().insert(
+            "attempt-1".into(),
+            OAuthAttempt::Claude {
+                state: "S1".into(),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        // Wrong embedded #state.
+        assert!(
+            isyncyou_webui::AgentHandler::oauth_complete(&agent, "attempt-1", "code#S2").is_err()
+        );
+        // Wrong attempt id (state matches but the id does not name the attempt).
+        assert!(
+            isyncyou_webui::AgentHandler::oauth_complete(&agent, "missing", "code#S1").is_err()
+        );
+        // Missing #state entirely.
+        assert!(
+            isyncyou_webui::AgentHandler::oauth_complete(&agent, "attempt-1", "code-no-state")
+                .is_err()
+        );
+        // A mismatched completion never consumes the attempt.
+        assert!(agent
+            .oauth_attempts
+            .lock()
+            .unwrap()
+            .contains_key("attempt-1"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T9 AC2: the onboarding projection is derived from the durable activation, so a ready
+    // provider still reports all 8 steps complete AFTER the attempt journal's TTL has expired.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn status_projection_correct_after_journal_ttl_expiry() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("status-projection-ttl");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.credential_now_ms = Arc::new(|| 10_000);
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "t".into(),
+                refresh_token: "r".into(),
+                expires_at_ms: 3_610_000,
+            })
+            .unwrap();
+        agent.set_agent_settings("claude", DEFAULT_MODEL).unwrap();
+        // No attempt journal is present (TTL-reaped / never persisted) — projection uses activation.
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        let onboarding = &status["onboarding"];
+        assert_eq!(onboarding["selected_provider"], "claude");
+        assert_eq!(onboarding["selected_state"], "ready");
+        let claude = &onboarding["providers"]["claude"];
+        assert_eq!(claude["state"], "ready");
+        let steps = claude["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 8);
+        assert!(steps.iter().all(|s| s["complete"] == true));
+        // Codex is untouched -> not_started, no steps complete.
+        let codex = &onboarding["providers"]["codex"];
+        assert_eq!(codex["state"], "not_started");
+        assert!(codex["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["complete"] == false));
         let _ = std::fs::remove_dir_all(root);
     }
 

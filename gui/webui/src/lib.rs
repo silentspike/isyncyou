@@ -446,6 +446,17 @@ pub struct AgentOAuthCancelRequest {
     pub attempt_id: String,
 }
 
+/// #639 T9: closed manual-completion request for the Claude copy-paste OAuth flow. The pasted code
+/// crosses the boundary only transiently in this body (never a URL/query/log). `deny_unknown_fields`
+/// plus serde's derived struct deserializer reject unknown AND duplicate keys.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOAuthCompleteRequest {
+    pub provider: String,
+    pub attempt_id: String,
+    pub pasted_code: String,
+}
+
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
 /// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
 /// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
@@ -528,9 +539,10 @@ pub trait AgentHandler: Send + Sync {
         Err("subscription login is not enabled on this server".into())
     }
 
-    /// Manual-login completion: the operator pastes the `code#state`
-    /// that the provider showed; the handler exchanges it and stores the token.
-    fn oauth_complete(&self, _pasted: &str) -> Result<String, String> {
+    /// Manual-login completion (Claude only): the operator pastes the `code#state` the provider
+    /// showed; `attempt_id` binds it to the server-side attempt whose state must match the embedded
+    /// `#state`. The handler exchanges it and stores the token.
+    fn oauth_complete(&self, _attempt_id: &str, _pasted: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
 
@@ -4576,8 +4588,9 @@ impl Router {
         ApiResponse {
             status: 200,
             content_type: "application/json".into(),
+            // #639 T9: status carries onboarding/credential state — never let a WebView cache it.
+            headers: vec![("Cache-Control".into(), "no-store".into())],
             body: body.into_bytes(),
-            headers: Vec::new(),
         }
     }
 
@@ -4649,13 +4662,42 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let code = match req.q("code") {
-            Some(c) if !c.is_empty() => c,
-            _ => return ApiResponse::error(400, "code is required"),
+        // #639 T9: strict JSON only — the pasted code must never arrive as a URL/query param.
+        if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "oauth complete accepts JSON only");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid oauth complete request"),
         };
-        match handler.oauth_complete(code) {
-            Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
-            Err(e) => ApiResponse::error(400, &e),
+        // deny_unknown_fields + serde's derived struct deserializer reject unknown/duplicate keys.
+        let request = match serde_json::from_str::<AgentOAuthCompleteRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid oauth complete request"),
+        };
+        // Manual completion is the Claude copy-paste flow ONLY; Codex ends via its loopback callback.
+        if request.provider != "claude" {
+            return no_store_json_error(400, "oauth complete is claude-only");
+        }
+        if request.attempt_id.is_empty()
+            || request.attempt_id.len() > 128
+            || request.pasted_code.is_empty()
+            || request.pasted_code.len() > AGENT_STRICT_JSON_MAX_BYTES
+        {
+            return no_store_json_error(400, "invalid oauth complete request");
+        }
+        match handler.oauth_complete(&request.attempt_id, &request.pasted_code) {
+            Ok(_) => {
+                let mut response = ApiResponse::ok_json(&json!({ "connected": true }));
+                response
+                    .headers
+                    .push(("Cache-Control".into(), "no-store".into()));
+                response
+            }
+            Err(_) => no_store_json_error(400, "oauth complete failed"),
         }
     }
 
@@ -6914,6 +6956,74 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         assert_eq!(resp.status, 409);
         assert!(String::from_utf8_lossy(&resp.body).contains("product_not_ready"));
+    }
+
+    // #639 T9 AC1: /oauth/complete is strict JSON and Claude-only. A query-param code, a codex
+    // provider, an unknown field, and a non-JSON content type are all rejected at the edge (400).
+    #[test]
+    fn oauth_complete_route_is_strict_json_claude_only() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let json_post = |body: &str| {
+            ApiRequest::new("POST", "/api/v1/agent/oauth/complete")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(body.as_bytes().to_vec())
+        };
+        // A pasted code as a URL/query param is rejected (must be a JSON body).
+        let query = ApiRequest::new("POST", "/api/v1/agent/oauth/complete?code=abc%23state")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&query).status, 400);
+        // Codex may not use this route.
+        assert_eq!(
+            router
+                .route(&json_post(
+                    r#"{"provider":"codex","attempt_id":"a","pasted_code":"c#s"}"#
+                ))
+                .status,
+            400
+        );
+        // Unknown field is rejected (deny_unknown_fields).
+        assert_eq!(
+            router
+                .route(&json_post(
+                    r#"{"provider":"claude","attempt_id":"a","pasted_code":"c#s","x":1}"#
+                ))
+                .status,
+            400
+        );
+        // A well-formed claude request reaches the handler and the response carries no-store.
+        let resp = router.route(&json_post(
+            r#"{"provider":"claude","attempt_id":"a","pasted_code":"c#s"}"#,
+        ));
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+    }
+
+    // #639 T9 AC3: the status response carries Cache-Control: no-store and never leaks a secret.
+    #[test]
+    fn status_carries_no_store_and_no_secrets() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let resp = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+        let body = String::from_utf8_lossy(&resp.body);
+        for secret in [
+            "access_token",
+            "refresh_token",
+            "account_id",
+            "authorization",
+            "Bearer",
+            "verifier",
+            "pkce",
+        ] {
+            assert!(!body.contains(secret), "status leaked {secret}");
+        }
     }
 
     struct FakeAgent;
