@@ -3732,13 +3732,40 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             id != attempt_id
                 && !matches!(attempt, OAuthAttempt::Claude { state: pending, .. } if pending == &state)
         });
-        let cfg = self.load_oauth_config()?;
-        let http = isyncyou_agent::http::HttpTransport::shared()
-            .map_err(|_| "provider_connect_failed".to_string())?;
-        let token =
-            isyncyou_agent::oauth::exchange(&http, &cfg, &code, &verifier, &redirect_uri, &state)
-                .map_err(|_| "oauth_exchange_failed".to_string())?;
-        self.commit_claude_oauth_success(&token)?;
+        // #639 (F5): once the attempt is consumed, ANY failure of the exchange/commit is a terminal,
+        // redacted transition for this attempt (the manual Claude flow has no callback thread to do
+        // it), so a failed sign-in is durably recorded as error_redacted and is never resumed.
+        let fail = |code: &str, err: &str| -> Result<String, String> {
+            record_onboarding_attempt_transition(
+                &self.oauth_dir,
+                attempt_id,
+                ProductOnboardingState::ErrorRedacted,
+                Some(code.to_string()),
+            );
+            Err(err.to_string())
+        };
+        let cfg = match self.load_oauth_config() {
+            Ok(cfg) => cfg,
+            Err(_) => return fail("policy_unavailable", "provider_connect_failed"),
+        };
+        let http = match isyncyou_agent::http::HttpTransport::shared() {
+            Ok(http) => http,
+            Err(_) => return fail("transport_unavailable", "provider_connect_failed"),
+        };
+        let token = match isyncyou_agent::oauth::exchange(
+            &http,
+            &cfg,
+            &code,
+            &verifier,
+            &redirect_uri,
+            &state,
+        ) {
+            Ok(token) => token,
+            Err(_) => return fail("exchange_failed", "oauth_exchange_failed"),
+        };
+        if let Err(e) = self.commit_claude_oauth_success(&token) {
+            return fail("commit_failed", &e);
+        }
         Ok("connected".to_string())
     }
 
@@ -8573,6 +8600,50 @@ mod tests {
         assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
         // Explicit activation of a mismatched-policy bundle also fails closed.
         assert!(activate_product(&root, ProductProviderId::Claude, &meta.generation).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 (F5 regression): a failed Claude manual completion records a durable error_redacted
+    // transition for the attempt (the manual flow has no callback thread to do it). Forced without
+    // network: a good official config lets oauth_start store the verifier, then a non-official
+    // override makes load_oauth_config fail inside oauth_complete on the exchange path.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn claude_oauth_complete_records_error_redacted_on_failure() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("claude-complete-error-redacted");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        // Start a Claude attempt under the official config (no network; PKCE + state only).
+        let started =
+            isyncyou_webui::AgentHandler::oauth_start_with_attempt(&agent, "claude", "").unwrap();
+        let attempt_id = started.attempt_id;
+        let state = {
+            let attempts = agent.oauth_attempts.lock().unwrap();
+            match attempts.get(&attempt_id) {
+                Some(OAuthAttempt::Claude { state, .. }) => state.clone(),
+                _ => panic!("claude attempt missing"),
+            }
+        };
+        // Now make the OAuth policy fail to load so the exchange path fails closed (no network).
+        std::fs::write(
+            root.join("agent-oauth.json"),
+            r#"{"authorize_url":"https://provider.invalid/a","token_url":"https://provider.invalid/t","client_id":"x","scopes":["y"],"manual_redirect_url":"https://provider.invalid/c"}"#,
+        )
+        .unwrap();
+        let err = isyncyou_webui::AgentHandler::oauth_complete(
+            &agent,
+            &attempt_id,
+            &format!("somecode#{state}"),
+        )
+        .unwrap_err();
+        assert_eq!(err, "provider_connect_failed");
+        let journal = load_onboarding_journal(&root, &attempt_id).expect("attempt journal");
+        assert!(journal.has_state(ProductOnboardingState::ErrorRedacted));
         let _ = std::fs::remove_dir_all(root);
     }
 
