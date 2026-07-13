@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "scope": "issue_640_hook_diagnostic_plumbing_only",
+  "observed_at": "2026-07-13T08:02:00Z",
+  "implementation_commit": "b1c0ef7ebf8653dc2388bfa91688e4e1412e434d",
+  "hook_apk_sha256": "1367cc617fecffe50c49011e75bb9e821cf470ee62c3e70b27809c725a4092fa",
+  "forced_code": "no_validated_network",
+  "public_code": "no_validated_network",
+  "settings_hint": "internet_panel",
+  "retry_action_present": true,
+  "settings_action_present": true,
+  "provider_turn_created": false,
+  "hook_consumed_once": true,
+  "system_internet_panel_opened": true,
+  "eligible_as_real_network_loss_evidence": false,
+  "hook_screenshot_retained": false,
+  "raw_network_or_platform_output_retained": false,
+  "result": "pass"
+}

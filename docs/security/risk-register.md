@@ -89,7 +89,7 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Risk** | Android backgrounds the app during provider OAuth or an active streamed turn; connectivity failure is misdiagnosed or leaks transport details; refresh failure silently changes credential origin. |
 | **Impact** | High — sign-in or turns can fail silently, and unsafe diagnostics or fallback can expose provider/network data or misrepresent authentication state. |
 | **Mitigation** | #640 uses reason-bound, acknowledged, bounded `dataSync` foreground leases; a session/capability-gated provider-purpose preflight emits only closed codes; mobile snapshots are single-use and bound to the active engine session and guard; status is network-free; explicit refresh atomically persists only complete credentials and fails closed. Codex callbacks are loopback-only, cancellable, one-shot, and leave no callback diagnostics or fixed-routing residue. Default artifacts exclude the separate diagnostic hook. |
-| **Status** | **In progress** — host, UI, and artifact boundaries are implemented; REQ-AGENT-013 remains planned until the current Pixel and evidence-manifest closeout is complete. Design: [ADR-007](../adr/007-agent-architecture.md). |
+| **Status** | **Mitigated / monitored** — host, UI, artifact, official OAuth, guarded refresh, and streamed-turn evidence is recorded in [the #640 manifest](../evidence/issue-640-manifest.json). Residual Android scheduling, provider, and network-policy drift remains monitored; a foreground service mitigates priority loss but does not guarantee reachability. Design: [ADR-007](../adr/007-agent-architecture.md). |
 
 ---
 

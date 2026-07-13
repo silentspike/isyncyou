@@ -1,0 +1,17 @@
+Issue: #640 callback, routing, settings, and feature-boundary scan
+Implementation commit: b9d2570eba4e0ab7e9c7d960bf7cd30af9fc445b
+Result: PASS
+
+python3 tools/verify-agent-network-boundary.py returned 8/8 passing checks:
+- mobile default excludes agent-network-device-test-hooks
+- app-host default excludes agent-network-device-test-hooks
+- Android accepts the hook only through the bounded test-feature allowlist
+- release workflows do not activate the hook or all features
+- the legacy Codex diagnostics filename is cleanup-only
+- production callback transport contains no fixed-IP, DoH, or local-address routing residue
+- WebUI forwards only a closed Settings hint
+- WebUI renders code-specific retry diagnostics
+
+Cargo metadata confirmed that the mobile default feature list excludes the hook and that
+the explicit mobile hook feature forwards only to the app-host hook feature. The default
+APK binary scan independently confirmed that the deliberate hook marker is absent.

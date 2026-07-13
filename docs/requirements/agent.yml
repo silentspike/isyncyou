@@ -342,7 +342,7 @@ requirements:
       redacted diagnostic codes. Credential status is network-free; an explicit refresh
       either atomically persists a complete encrypted product credential or returns a
       reconnect-required error without local fallback or FakeProvider success. (S-AG.15, #640)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Foreground guards are service-owned, reason-bound, bounded, and survive Activity recreation.
@@ -351,4 +351,17 @@ requirements:
       - Status checks do not refresh credentials; explicit refresh persists only a complete encrypted product credential and fails closed on error.
       - Codex callback attempts are loopback-only, cancellable, bounded, and never persist callback URLs or diagnostics.
       - Default mobile artifacts exclude network diagnostic hooks; a separate hook artifact proves only diagnostic plumbing.
-    verified_by: []
+    verified_by:
+      - test: reasonsShareOneForegroundServiceUntilLastLeaseEnds
+      - test: networkCriticalGuardStartsAndStopsDeclaredDataSyncService
+      - test: connectivity_preflight_selects_distinct_oauth_turn_and_refresh_targets
+      - test: connectivity_preflight_route_requires_cap_strict_json_and_no_store
+      - test: network_snapshot_registration_uses_engine_session_and_closed_guard_reason
+      - test: agent_status_keeps_selected_codex_provider_when_refresh_is_required
+      - test: product_credential_refresh_uses_injected_clock_and_finite_expiry
+      - test: partial_refresh_response_never_replaces_last_complete_encrypted_credential
+      - test: concurrent_refresh_for_one_provider_is_serialized
+      - test: codex_callback_blocking_accept_cannot_outlive_deadline
+      - test: codex_refresh_device_hook_is_one_shot_and_does_not_change_the_clock
+      - test: networkPreflightHookIsFeatureGatedOwnerOnlyAndOneShot
+      - file: docs/evidence/issue-640-manifest.json

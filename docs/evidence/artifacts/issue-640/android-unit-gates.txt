@@ -1,0 +1,20 @@
+Issue: #640 Android network guard and diagnostic gates
+Implementation commit: b9d2570eba4e0ab7e9c7d960bf7cd30af9fc445b
+Result: PASS
+Executed: 2026-07-13
+
+- (cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest :app:lintDebug): PASS
+- (cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug): PASS
+- NetworkCriticalGuardInstrumentedTest on the default APK: PASS, 1 test
+- NetworkPreflightHookInstrumentedTest on the hook APK: PASS, 1 test
+- A clean default APK was rebuilt and reinstalled after the hook test: PASS
+- Default APK excludes the deliberate hook marker: PASS
+- Hook APK includes the deliberate hook marker: PASS
+- Before instrumentation cleanup, the real refreshed Codex credential survived a clean
+  default-APK reinstall and process restart, then completed a guarded StoreArchive turn: PASS
+- The later connected-instrumentation install cleared debug app data by design. The final
+  clean default APK is therefore unconfigured; this happened after the refresh proof and
+  is not represented as credential persistence.
+
+The instrumentation record contains no device serial, account identity, OAuth callback,
+token, provider endpoint, IP address, or raw platform dump.

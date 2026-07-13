@@ -1,0 +1,190 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-13T09:56:00Z",
+  "commit": "b9d2570eba4e0ab7e9c7d960bf7cd30af9fc445b",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Overlapping OAuth, refresh, and turn reasons share one foreground service until the last bounded lease ends.",
+      "method": "test",
+      "command": "(cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest)",
+      "test": "reasonsShareOneForegroundServiceUntilLastLeaseEnds",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/android-unit-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-013",
+      "claim": "The default APK starts and stops the declared dataSync network-critical foreground service on the Pixel.",
+      "method": "test",
+      "command": "(cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.NetworkCriticalGuardInstrumentedTest)",
+      "test": "networkCriticalGuardStartsAndStopsDeclaredDataSyncService",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/android-unit-gates.txt"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Connectivity preflight selects a closed compiled target for every provider and purpose pair.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers connectivity_preflight_selects_distinct_oauth_turn_and_refresh_targets -- --nocapture",
+      "test": "connectivity_preflight_selects_distinct_oauth_turn_and_refresh_targets",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Provider transport uses separate compiled response, idle-read, and overall turn deadlines.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers provider_transport_timeout_policy_has_distinct_response_idle_and_turn_bounds -- --nocapture",
+      "test": "provider_transport_timeout_policy_has_distinct_response_idle_and_turn_bounds",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-013",
+      "claim": "The preflight route requires session/capability gates, strict bounded JSON, and no-store responses.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui connectivity_preflight_route_requires_cap_strict_json_and_no_store -- --nocapture",
+      "test": "connectivity_preflight_route_requires_cap_strict_json_and_no_store",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Mobile connectivity snapshots are opaque one-shot handles bound to the engine session and closed guard reason.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-mobile network_snapshot_registration_uses_engine_session_and_closed_guard_reason -- --nocapture",
+      "test": "network_snapshot_registration_uses_engine_session_and_closed_guard_reason",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Status preserves the selected Codex provider and reports refresh_required without performing token refresh.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_status_keeps_selected_codex_provider_when_refresh_is_required -- --nocapture",
+      "test": "agent_status_keeps_selected_codex_provider_when_refresh_is_required",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Credential refresh uses an injected clock and produces a complete finite credential before persistence.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers product_credential_refresh_uses_injected_clock_and_finite_expiry -- --nocapture",
+      "test": "product_credential_refresh_uses_injected_clock_and_finite_expiry",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-013",
+      "claim": "A deliberately incomplete refresh response returns reconnect-required and cannot replace the last complete encrypted product credential.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers partial_refresh_response_never_replaces_last_complete_encrypted_credential -- --nocapture",
+      "test": "partial_refresh_response_never_replaces_last_complete_encrypted_credential",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Concurrent refreshes for one provider are serialized.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers concurrent_refresh_for_one_provider_is_serialized -- --nocapture",
+      "test": "concurrent_refresh_for_one_provider_is_serialized",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-013",
+      "claim": "A blocked Codex callback accept cannot outlive the owning attempt deadline.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_callback_blocking_accept_cannot_outlive_deadline -- --nocapture",
+      "test": "codex_callback_blocking_accept_cannot_outlive_deadline",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/host-gates.txt"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-013",
+      "claim": "The current default APK completed official system-browser Codex OAuth while the OAuth guard remained active and stored an encrypted product credential.",
+      "method": "probe",
+      "command": "Physical Pixel product OAuth through the app, system browser, callback listener, and closed status readback under device-lock ag-640",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/device-oauth.json"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-013",
+      "claim": "A controlled read-only StoreArchive turn completed once while the default APK was backgrounded and the foreground guard remained active until terminal completion.",
+      "method": "probe",
+      "command": "Physical Pixel default-APK controlled background streamed turn with closed CDP event counters and foreground-service readback",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/device-long-turn.json"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-013",
+      "claim": "The separate hook APK exposes an owner-only one-shot diagnostic hook and consumes it once.",
+      "method": "test",
+      "command": "(cd android && ISY_CARGO_FEATURES=agent-network-device-test-hooks ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.NetworkPreflightHookInstrumentedTest)",
+      "test": "networkPreflightHookIsFeatureGatedOwnerOnlyAndOneShot",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/hook-apk-scan.json"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-013",
+      "claim": "The hook APK renders the closed no_validated_network diagnostic with Retry and Settings, consumes the hook, opens the system Internet panel, and creates no provider turn.",
+      "method": "probe",
+      "command": "Physical Pixel hook-APK one-shot no_validated_network UI probe followed by system-dialog focus and hook-consumption readback",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/device-preflight-hook.json"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-013",
+      "claim": "The independently rebuilt default APK excludes the deliberate network diagnostic hook marker; credential persistence is proven separately before the later instrumentation cleanup.",
+      "method": "command",
+      "command": "(cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug) && python3 tools/agent-network-device-probe.py --apk android/app/build/outputs/apk/debug/app-debug.apk --scope default --output /tmp/isyncyou-640-default-device-probe.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/default-apk-scan.json"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-013",
+      "claim": "Production sources and feature graphs contain no callback diagnostic writer, fixed-IP/DoH routing residue, unsafe Settings action, idle callback listener, or default hook activation.",
+      "method": "command",
+      "command": "python3 tools/verify-agent-network-boundary.py",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/source-cleanup.txt"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-013",
+      "claim": "The current default APK completed the official system-browser Claude OAuth code flow and then completed a guarded read-only StoreArchive turn through the Claude product provider.",
+      "method": "probe",
+      "command": "Physical Pixel default-APK Claude OAuth code flow followed by a controlled no-match StoreArchive turn with closed event counters and foreground-service readback",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/device-oauth.json"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-013",
+      "claim": "A one-shot JNI-only hook marked the existing Codex product credential refresh-required without injecting time or credentials; the normal guarded refresh route performed a real provider refresh, atomically changed one encrypted credential file, and the clean default APK loaded it after restart and completed a guarded StoreArchive turn.",
+      "method": "probe",
+      "command": "Physical Pixel hook-APK one-shot refresh-due arming followed by normal guard, snapshot, product refresh route, metadata-only encrypted-store comparison, clean default-APK restart, and controlled StoreArchive turn",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-640/token-refresh.json"
+    }
+  ]
+}

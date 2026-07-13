@@ -1,0 +1,37 @@
+Issue: #640 network-critical Agent flows
+Implementation commit: b9d2570eba4e0ab7e9c7d960bf7cd30af9fc445b
+Result: PASS
+Executed: 2026-07-13
+
+Rust and WebUI gates:
+- cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers connectivity_preflight_ -- --nocapture: PASS, non-zero tests
+- cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers provider_transport_timeout_ -- --nocapture: PASS, non-zero tests
+- cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers product_credential_ -- --nocapture: PASS, non-zero tests
+- cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_status_ -- --nocapture: PASS, non-zero tests
+- agent_status_keeps_selected_codex_provider_when_refresh_is_required: PASS
+- codex_refresh_device_hook_is_one_shot_and_does_not_change_the_clock: PASS
+- cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_callback_ -- --nocapture: PASS, non-zero tests
+- codex_callback_blocking_accept_cannot_outlive_deadline: PASS
+- cargo remote -c -- test -p isyncyou-webui connectivity_preflight_ -- --nocapture: PASS, non-zero tests
+- cargo remote -c -- test -p isyncyou-webui agent_oauth_cancel_ -- --nocapture: PASS, non-zero tests
+- cargo remote -c -- test -p isyncyou-mobile network_snapshot_ -- --nocapture: PASS, non-zero tests
+- cargo remote -c -- test -p isyncyou-mobile --features agent-network-device-test-hooks -- --nocapture: PASS
+- cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental: PASS
+- cargo remote -c -- test --workspace --no-fail-fast: PASS
+- cargo remote -c -- clippy --workspace --all-targets -- -D warnings: PASS
+- feature Clippy for Agent/app-host OAuth, app-host experimental, app-host/mobile hook, and WebUI: PASS
+- cargo-remote-fmt --check: PASS
+- cargo deny check: PASS
+- node --check gui/webui/src/app.js: PASS
+- npm ci: PASS, zero reported vulnerabilities
+- node tools/agent-network-ui-smoke.mjs: PASS, 6 assertions
+- python3 -m unittest tools.test_agent_network_device_probe: PASS
+- python3 -m unittest tools.test_verify_agent_network_boundary: PASS
+- python3 tools/verify-agent-network-boundary.py: PASS, 8 checks
+- go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12: PASS
+- pinned pr-dev Semgrep image: an earlier implementation run exited 0 with zero findings
+  and one visible WebUI rule timeout; the final local replay was intentionally left to the
+  authoritative pr-dev runner after the local container run was stopped
+
+No local provider credential, callback query, account identity, provider URL, IP address,
+device serial, raw provider response, or raw Android diagnostic is retained here.
