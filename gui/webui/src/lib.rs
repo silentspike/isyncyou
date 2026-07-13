@@ -10113,7 +10113,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "\"data-agent-model-connect\": \"codex\"",
             "async function connectAgentProvider(provider)",
             "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
-            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
             "await post(\"/api/v1/agent/model?\" + qs({ provider, model }), CAP.agent);",
             "const st = await api(\"/api/v1/agent/status\");",
             "rememberAssistantStatus(st);",
@@ -10154,7 +10154,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for needle in [
             "data-agent-oauth-code-step\": \"claude\"",
             "body.prepend(card);",
-            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
             "await cancelOAuthAttempt(\"claude\");",
         ] {
             assert!(

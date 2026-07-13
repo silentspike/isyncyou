@@ -8203,31 +8203,244 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(any(
+    // #639 T11: the ordered wire states recorded in the generation journal after an injected OAuth
+    // token is committed. The injected token IS the OAuth-exchange output (not a pre-seeded "already
+    // stored" credential), so this proves ordering through the real commit path.
+    #[cfg(all(
         feature = "agent-oauth-providers",
-        feature = "agent-subscription-experimental"
+        not(feature = "agent-subscription-experimental")
+    ))]
+    fn commit_injected_claude_oauth(agent: &DaemonAgent, access: &str) -> (String, Vec<String>) {
+        let token = isyncyou_agent::oauth::RefreshedToken {
+            access_token: access.to_string(),
+            refresh_token: "injected-refresh".to_string(),
+            expires_in: 3_600,
+        };
+        agent.commit_claude_oauth_success(&token).unwrap();
+        let generation = load_product_bundle_meta(&agent.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
+            .unwrap()
+            .generation;
+        let store_id = OnboardingAttemptJournalV1::journal_store_id_for_generation(&generation);
+        let journal = load_onboarding_journal_at(&agent.oauth_dir, &store_id).unwrap();
+        let states = journal
+            .transitions
+            .iter()
+            .map(|t| t.state.wire().to_string())
+            .collect();
+        (generation, states)
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    fn state_index(states: &[String], wire: &str) -> usize {
+        states
+            .iter()
+            .position(|s| s == wire)
+            .unwrap_or_else(|| panic!("state {wire} missing from journal: {states:?}"))
+    }
+
+    // #639 T11 (replaces the old seed-only oauth_completes_before_custom_harness_transformation):
+    // an injected official OAuth is committed through the real path; the generation journal proves
+    // official sign-in precedes credential encryption which precedes the harness transformation and
+    // the terminal ready. Readiness is false before and true after — no seeded store is claimed.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
     ))]
     #[test]
-    fn oauth_completes_before_custom_harness_transformation() {
+    fn official_oauth_precedes_credential_encryption_and_harness_transformation() {
         let _env = AppHostCredentialEnvGuard::new();
-        let root = apphost_credential_test_root("oauth-before-custom-harness");
+        let root = apphost_credential_test_root("oauth-precedes-transformation");
+        let _ = std::fs::remove_dir_all(&root);
         let agent = DaemonAgent::new(Config::default(), root.clone());
+        // No credential yet: the product path is not ready and no turn provider builds.
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        assert_ne!(agent.build_turn_provider("system").name(), "subscription");
 
-        assert_eq!(agent.build_turn_provider("custom harness").name(), "fake");
-        agent
-            .store_credential(&StoredCredential {
-                access_token: "completed-product-oauth-token".into(),
-                refresh_token: String::new(),
-                expires_at_ms: now_ms() + 3_600_000,
-            })
-            .unwrap();
-        let resolved = agent.resolve_claude_credential().unwrap();
-
-        assert!(resolved.satisfies_product_harness_readiness());
+        let (_generation, states) = commit_injected_claude_oauth(&agent, "official-exchange-token");
         assert_eq!(
-            agent.build_turn_provider("custom harness").name(),
-            "subscription"
+            states.first().map(String::as_str),
+            Some("official_oauth_completed")
         );
+        assert!(
+            state_index(&states, "official_oauth_completed")
+                < state_index(&states, "credential_encrypted")
+        );
+        assert!(state_index(&states, "credential_encrypted") < state_index(&states, "ready"));
+        assert_eq!(states.last().map(String::as_str), Some("ready"));
+        // Only now is the product path ready and the real provider built.
+        assert!(agent.provider_ready(ProductProviderId::Claude));
+        assert_eq!(agent.build_turn_provider("system").name(), "subscription");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T11: credential encryption is recorded before the harness activation steps.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn credential_encrypted_before_harness_activation() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("encrypted-before-activation");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let (_g, states) = commit_injected_claude_oauth(&agent, "t");
+        assert!(
+            state_index(&states, "credential_encrypted")
+                < state_index(&states, "m365_profile_activated")
+        );
+        assert!(
+            state_index(&states, "credential_encrypted")
+                < state_index(&states, "isyncyou_tool_connected")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T11: the custom harness (ready) is blocked until the retained envelope is verified.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn custom_harness_blocked_before_retained_envelope_verified() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("blocked-before-retained-envelope");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        // A bundle written WITHOUT activation (envelope not yet verified via attestation) is not ready.
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(
+                StoredCredential {
+                    access_token: "t".into(),
+                    refresh_token: "r".into(),
+                    expires_at_ms: 9_999_999_999_999,
+                }
+                .to_json(),
+            ),
+        )
+        .unwrap();
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        // After the full commit the ordering places retained-envelope verification before ready.
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let (_g, states) = commit_injected_claude_oauth(&agent, "t");
+        assert!(state_index(&states, "retained_envelope_verified") < state_index(&states, "ready"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T11: the custom harness is blocked until the default harness is removed.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn custom_harness_blocked_before_default_harness_removed() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("blocked-before-default-removed");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let (_g, states) = commit_injected_claude_oauth(&agent, "t");
+        assert!(state_index(&states, "default_harness_removed") < state_index(&states, "ready"));
+        assert!(
+            state_index(&states, "credential_encrypted")
+                < state_index(&states, "default_harness_removed")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T11: the custom harness is enabled (ready) only after the subscription identity is set.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn custom_harness_enabled_only_after_subscription_identity_set() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("enabled-after-subscription-identity");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let (_g, states) = commit_injected_claude_oauth(&agent, "t");
+        assert!(state_index(&states, "subscription_identity_set") < state_index(&states, "ready"));
+        assert_eq!(states.last().map(String::as_str), Some("ready"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T11: a corrupt product credential requires reconnect and never falls back to a local CLI
+    // credential in the product (oauth-only) build.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn corrupt_product_credential_requires_reconnect_without_local_fallback() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("corrupt-requires-reconnect");
+        let _ = std::fs::remove_dir_all(&root);
+        // A legacy/corrupt blob (no V2 meta) is un-migratable -> PresentInvalid.
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            b"{\"access_token\":\"legacy-only\"}".to_vec(),
+        )
+        .unwrap();
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        assert_eq!(
+            agent.product_credential_status("claude").unwrap(),
+            "reconnect_required"
+        );
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        // No local-CLI fallback in the product build: the turn fails closed.
+        assert!(isyncyou_webui::AgentHandler::start_turn(&agent, "me", "hi").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T11: a non-official OAuth policy (an override) cannot satisfy the official handoff — an
+    // activation whose policy fingerprint is not the official one never reads ready.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn product_oauth_override_cannot_satisfy_official_handoff() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("override-cannot-satisfy-handoff");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.credential_now_ms = Arc::new(|| 10_000);
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(
+                StoredCredential {
+                    access_token: "t".into(),
+                    refresh_token: "r".into(),
+                    expires_at_ms: 3_610_000,
+                }
+                .to_json(),
+            ),
+        )
+        .unwrap();
+        // Activation minted under a NON-official policy fingerprint (an override).
+        store_product_activation(
+            &root,
+            ProductProviderId::Claude,
+            &ProductActivationV1 {
+                provider_id: ProductProviderId::Claude.wire().to_string(),
+                credential_generation: meta.generation.clone(),
+                oauth_policy_fingerprint: "not-the-official-policy".to_string(),
+                harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
+            },
+        )
+        .unwrap();
+        // The activation's policy fingerprint does not match the official one -> not ready.
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
         let _ = std::fs::remove_dir_all(root);
     }
 
