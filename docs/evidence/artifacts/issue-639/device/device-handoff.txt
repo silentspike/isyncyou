@@ -32,3 +32,12 @@ valid Active V2 bundle + a matching ProductActivationV1 + a passing static harne
 via a REAL official OAuth handoff on-device. Screens are the mobile (~720px-equivalent) evidence.
 Screenshots: docs/evidence/artifacts/issue-639/device/*.png (secret-free; keyboard/clipboard
 chips were dismissed/cleared before capture).
+
+ON-DEVICE INSTRUMENTATION (device-lock ag-639, Pixel 8 Pro)
+-----------------------------------------------------------
+- ./gradlew :app:connectedDebugAndroidTest (AgentCredentialKeyStoreInstrumentedTest) -> BUILD
+  SUCCESSFUL, 3 tests on Pixel 8 Pro (the encrypted agent credential Keystore path, relevant to #639).
+- ./gradlew :app:connectedDebugAndroidTest (NetworkCriticalGuardInstrumentedTest) -> BUILD SUCCESSFUL,
+  1 test on Pixel 8 Pro (the dataSync foreground guard the agent flows use).
+The #639 default APK therefore passes on-device instrumentation for these representative,
+non-interactive classes. #639 adds no new instrumentation classes.

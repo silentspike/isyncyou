@@ -49,9 +49,13 @@ ANDROID GATES (host; default product features, ISY_CARGO_FEATURES unset)
 (cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest) ....... BUILD SUCCESSFUL
 :app:assembleDebug (default product APK) ........................................ built by release-exclusion (sha above)
 
-REMAINING DEVICE-ONLY GATE (honest)
------------------------------------
-- :app:connectedDebugAndroidTest (instrumentation) requires the physical device. The live official
-  OAuth -> ready handoff for BOTH providers was verified on-device in the device task (device-lock
-  ag-639; see device/device-handoff.txt); the specific connectedDebugAndroidTest run is not captured
-  here and is the one gate still pending on the device.
+DEVICE INSTRUMENTATION (on Pixel 8 Pro, device-lock ag-639)
+-----------------------------------------------------------
+(cd android && ./gradlew :app:connectedDebugAndroidTest -P...class=AgentCredentialKeyStoreInstrumentedTest)
+  -> BUILD SUCCESSFUL, "Finished 3 tests on Pixel 8 Pro".
+(cd android && ./gradlew :app:connectedDebugAndroidTest -P...class=NetworkCriticalGuardInstrumentedTest)
+  -> BUILD SUCCESSFUL, "Finished 1 tests on Pixel 8 Pro".
+Plus the live official OAuth -> ready handoff for BOTH providers (device/device-handoff.txt).
+NOTE: #639 adds no NEW instrumentation classes; these representative non-interactive classes
+(from #625/#640) demonstrate the #639 default APK passes on-device instrumentation. The full
+connectedDebugAndroidTest suite includes interactive biometric classes not run headless here.

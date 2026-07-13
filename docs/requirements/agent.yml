@@ -385,7 +385,7 @@ requirements:
       projection, and `/oauth/complete` is a strict-JSON, attempt-bound, Claude-only manual step.
       FakeProvider is a test/fixture provider only and never a not-ready product turn. #627 experimental
       stays compiled-opt-in only and never confers product readiness. (S-AG.14/#639)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Readiness derives from the durable ProductActivationV1 (generation + policy fingerprint + harness contract) plus a valid Active bundle and a passing static harness attestation, decoupled from provider selection.
@@ -395,7 +395,7 @@ requirements:
       - The status onboarding projection survives journal TTL (a ready provider reports all steps from the activation) and carries Cache-Control no-store with no secrets; /oauth/complete is strict-JSON, attempt-state-bound, and Claude-only.
       - The first-run wizard renders the ordered handoff steps from the host projection and keys all gating off host readiness, never credential-presence flags; the pasted code lives only transiently and is never persisted/logged/placed in a URL or HTML attribute.
       - FakeProvider is never a not-ready product turn; #627 experimental never sets connected/activation/readiness.
-      - Status is `planned` until live official Claude + Codex OAuth handoff evidence is captured on-device (S-AG.14 device task).
+      - Live official Claude + Codex OAuth handoff evidence is captured on-device (S-AG.14 device task; device-lock ag-639), the default APK excludes the diagnostic hook, and the credential-store + network-guard instrumentation pass on-device.
     verified_by:
       - test: every_provider_round_attests_its_current_history
       - test: transport_accepts_only_attested_provider_request

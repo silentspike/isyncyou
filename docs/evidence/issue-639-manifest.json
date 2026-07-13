@@ -284,6 +284,24 @@
       "command": "cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:lintDebug :app:testDebugUnitTest",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-639/semgrep-scan.txt"
+    },
+    {
+      "id": "EV-030",
+      "requirement": "REQ-AGENT-014",
+      "claim": "On-device (Pixel 8 Pro, device-lock ag-639): the #639 default APK passes AgentCredentialKeyStoreInstrumentedTest (3 tests) via connectedDebugAndroidTest.",
+      "method": "command",
+      "command": "cd android && ./gradlew :app:connectedDebugAndroidTest -P...class=AgentCredentialKeyStoreInstrumentedTest",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/device/device-handoff.txt"
+    },
+    {
+      "id": "EV-031",
+      "requirement": "REQ-AGENT-014",
+      "claim": "On-device: the #639 default APK passes NetworkCriticalGuardInstrumentedTest (1 test) via connectedDebugAndroidTest.",
+      "method": "command",
+      "command": "cd android && ./gradlew :app:connectedDebugAndroidTest -P...class=NetworkCriticalGuardInstrumentedTest",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/device/device-handoff.txt"
     }
   ]
 }
