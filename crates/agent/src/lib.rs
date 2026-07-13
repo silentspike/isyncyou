@@ -38,6 +38,7 @@ pub mod oauth;
 pub mod product_provider;
 pub mod provider;
 pub mod retrieval;
+pub mod runtime_lock;
 pub mod secrets;
 pub mod session;
 mod session_crypto;
@@ -58,6 +59,7 @@ pub use error::AgentError;
 pub use product_provider::ProductProviderId;
 pub use provider::{AssistantBlock, DoneReason, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
+pub use runtime_lock::FileLock;
 pub use secrets::{
     provider_api_key_secret_id, provider_oauth_refresh_secret_id, set_process_credential_key,
     AgentCredentialStore, AtRestKey, CredentialKeySource, CredentialStore, CredentialStoreConfig,

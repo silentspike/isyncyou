@@ -995,6 +995,377 @@ fn oauth_policy_fingerprint(provider: ProductProviderId) -> String {
     d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// #639: the iSyncYou harness contract version the runtime attestation enforces (T6). The
+/// activation record binds it so a credential activated under an older harness contract cannot
+/// read as ready after the contract changes without a re-attestation (T4/T8).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+// #639: the activation/journal/lock storage below is wired into the runtime by T7 (gate),
+// T8 (journal transitions) and T9 (status); it reads as dead in the lib target until then.
+#[allow(dead_code)]
+const HARNESS_CONTRACT_VERSION: u32 = 1;
+
+/// #639: journal bounds — a hard cap the bounded reader enforces before allocation.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+const MAX_JOURNAL_PLAINTEXT_BYTES: usize = 65_536;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+const MAX_JOURNAL_ENVELOPE_BYTES: usize = 98_304;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+const MAX_JOURNAL_TRANSITIONS: usize = 32;
+
+/// #639: the ordered product onboarding states (monotonic within one setup attempt). Ordering is
+/// proven by recorded transitions in the journal, not by an ordinal — `ErrorRedacted` is a terminal
+/// transition, never a "highest" state.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum ProductOnboardingState {
+    NotStarted,
+    OfficialSignInStarted,
+    OfficialOauthCompleted,
+    CredentialEncrypted,
+    RetainedEnvelopeVerified,
+    DefaultHarnessRemoved,
+    M365ProfileActivated,
+    IsyncyouToolConnected,
+    SubscriptionIdentitySet,
+    Ready,
+    ErrorRedacted,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+impl ProductOnboardingState {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::OfficialSignInStarted => "official_sign_in_started",
+            Self::OfficialOauthCompleted => "official_oauth_completed",
+            Self::CredentialEncrypted => "credential_encrypted",
+            Self::RetainedEnvelopeVerified => "retained_envelope_verified",
+            Self::DefaultHarnessRemoved => "default_harness_removed",
+            Self::M365ProfileActivated => "m365_profile_activated",
+            Self::IsyncyouToolConnected => "isyncyou_tool_connected",
+            Self::SubscriptionIdentitySet => "subscription_identity_set",
+            Self::Ready => "ready",
+            Self::ErrorRedacted => "error_redacted",
+        }
+    }
+}
+
+/// #639: the durable, authenticated product-activation record — the ONLY persisted readiness
+/// authority. It binds the credential `generation`, the official-OAuth `policy_fingerprint`, and
+/// the `harness_contract_version`; readiness additionally requires a valid Active V2 bundle and a
+/// fresh runtime attestation (T6/T7). Stored in the encrypted CredentialStore (authenticated via
+/// its AAD-bound class), id `activation:<provider>`.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct ProductActivationV1 {
+    provider_id: String,
+    credential_generation: String,
+    oauth_policy_fingerprint: String,
+    harness_contract_version: u32,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+impl ProductActivationV1 {
+    fn activation_store_id(provider: ProductProviderId) -> String {
+        format!("activation:{}", provider.wire())
+    }
+
+    fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "provider_id": self.provider_id,
+            "credential_generation": self.credential_generation,
+            "oauth_policy_fingerprint": self.oauth_policy_fingerprint,
+            "harness_contract_version": self.harness_contract_version,
+        }))
+        .unwrap_or_default()
+    }
+
+    fn from_json(raw: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        if v.get("schema_version").and_then(|x| x.as_u64()) != Some(1) {
+            return None;
+        }
+        Some(Self {
+            provider_id: v.get("provider_id")?.as_str()?.to_string(),
+            credential_generation: v.get("credential_generation")?.as_str()?.to_string(),
+            oauth_policy_fingerprint: v.get("oauth_policy_fingerprint")?.as_str()?.to_string(),
+            harness_contract_version: v.get("harness_contract_version")?.as_u64()? as u32,
+        })
+    }
+
+    /// Whether this activation authorizes readiness for `provider` at the given credential
+    /// `generation`, official `policy_fingerprint`, and harness `contract_version`. All four must
+    /// match — a generation match alone is not enough.
+    fn matches(
+        &self,
+        provider: ProductProviderId,
+        generation: &str,
+        policy_fingerprint: &str,
+        contract_version: u32,
+    ) -> bool {
+        self.provider_id == provider.wire()
+            && self.credential_generation == generation
+            && self.oauth_policy_fingerprint == policy_fingerprint
+            && self.harness_contract_version == contract_version
+    }
+}
+
+/// Persist a product activation record (#639) under the dedicated activation secret class.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+fn store_product_activation(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+    activation: &ProductActivationV1,
+) -> Result<(), String> {
+    agent_credential_store(oauth_dir)?
+        .put(
+            isyncyou_agent::SecretClass::ProductActivation,
+            &ProductActivationV1::activation_store_id(provider),
+            &isyncyou_agent::Secret::new(activation.to_json()),
+        )
+        .map_err(credential_store_error)
+}
+
+/// Load the product activation record (#639); `None` if absent/legacy/undecryptable.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+fn load_product_activation(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+) -> Option<ProductActivationV1> {
+    if !agent_credential_store_exists(oauth_dir) {
+        return None;
+    }
+    let store = agent_credential_store(oauth_dir).ok()?;
+    let secret = store
+        .get_bounded(
+            isyncyou_agent::SecretClass::ProductActivation,
+            &ProductActivationV1::activation_store_id(provider),
+            MAX_JOURNAL_ENVELOPE_BYTES,
+            MAX_JOURNAL_PLAINTEXT_BYTES,
+        )
+        .ok()??;
+    ProductActivationV1::from_json(secret.expose())
+}
+
+/// A single recorded onboarding transition (#639). It never carries OAuth state/verifier/code/url —
+/// only the reached state, the credential generation it belongs to, and an optional closed error code.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct OnboardingTransition {
+    state: ProductOnboardingState,
+    generation: String,
+    error_code: Option<String>,
+}
+
+/// The bounded, authenticated per-attempt onboarding transition journal (#639). It is for expiry,
+/// crash recovery, and evidence only — never the readiness authority. Capped at
+/// `MAX_JOURNAL_TRANSITIONS` transitions; the encrypted blob is bounded-read at load.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct OnboardingAttemptJournalV1 {
+    transitions: Vec<OnboardingTransition>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+impl OnboardingAttemptJournalV1 {
+    /// The store id for `attempt_id`: a domain-separated hash, never the raw attempt id.
+    fn journal_store_id(attempt_id: &str) -> String {
+        let d = ring::digest::digest(
+            &ring::digest::SHA256,
+            format!("isyncyou-onboarding-attempt-v1:{attempt_id}").as_bytes(),
+        );
+        format!(
+            "journal:{}",
+            d.as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
+    }
+
+    /// Append a transition, keeping only the most recent `MAX_JOURNAL_TRANSITIONS` (compaction).
+    fn push(&mut self, transition: OnboardingTransition) {
+        self.transitions.push(transition);
+        let len = self.transitions.len();
+        if len > MAX_JOURNAL_TRANSITIONS {
+            self.transitions.drain(0..len - MAX_JOURNAL_TRANSITIONS);
+        }
+    }
+
+    fn to_json(&self) -> Vec<u8> {
+        let arr: Vec<serde_json::Value> = self
+            .transitions
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "state": t.state.wire(),
+                    "generation": t.generation,
+                    "error_code": t.error_code,
+                })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "schema_version": 1, "transitions": arr }))
+            .unwrap_or_default()
+    }
+
+    fn from_json(raw: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        if v.get("schema_version").and_then(|x| x.as_u64()) != Some(1) {
+            return None;
+        }
+        let mut transitions = Vec::new();
+        for t in v.get("transitions").and_then(|x| x.as_array())? {
+            let state = onboarding_state_from_wire(t.get("state").and_then(|x| x.as_str())?)?;
+            transitions.push(OnboardingTransition {
+                state,
+                generation: t
+                    .get("generation")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                error_code: t
+                    .get("error_code")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string()),
+            });
+        }
+        Some(Self { transitions })
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+fn onboarding_state_from_wire(wire: &str) -> Option<ProductOnboardingState> {
+    use ProductOnboardingState::*;
+    Some(match wire {
+        "not_started" => NotStarted,
+        "official_sign_in_started" => OfficialSignInStarted,
+        "official_oauth_completed" => OfficialOauthCompleted,
+        "credential_encrypted" => CredentialEncrypted,
+        "retained_envelope_verified" => RetainedEnvelopeVerified,
+        "default_harness_removed" => DefaultHarnessRemoved,
+        "m365_profile_activated" => M365ProfileActivated,
+        "isyncyou_tool_connected" => IsyncyouToolConnected,
+        "subscription_identity_set" => SubscriptionIdentitySet,
+        "ready" => Ready,
+        "error_redacted" => ErrorRedacted,
+        _ => return None,
+    })
+}
+
+/// Persist the onboarding attempt journal (#639) — bounded transitions, authenticated + atomic.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+fn store_onboarding_journal(
+    oauth_dir: &Path,
+    attempt_id: &str,
+    journal: &OnboardingAttemptJournalV1,
+) -> Result<(), String> {
+    agent_credential_store(oauth_dir)?
+        .put(
+            isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+            &OnboardingAttemptJournalV1::journal_store_id(attempt_id),
+            &isyncyou_agent::Secret::new(journal.to_json()),
+        )
+        .map_err(credential_store_error)
+}
+
+/// Load the onboarding attempt journal (#639) with hard size bounds (`get_bounded`).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+fn load_onboarding_journal(
+    oauth_dir: &Path,
+    attempt_id: &str,
+) -> Option<OnboardingAttemptJournalV1> {
+    if !agent_credential_store_exists(oauth_dir) {
+        return None;
+    }
+    let store = agent_credential_store(oauth_dir).ok()?;
+    let secret = store
+        .get_bounded(
+            isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+            &OnboardingAttemptJournalV1::journal_store_id(attempt_id),
+            MAX_JOURNAL_ENVELOPE_BYTES,
+            MAX_JOURNAL_PLAINTEXT_BYTES,
+        )
+        .ok()??;
+    OnboardingAttemptJournalV1::from_json(secret.expose())
+}
+
+/// Try to acquire the exclusive product-runtime lock (#639). `Ok(None)` -> another product runtime
+/// holds it; the caller fails closed. Held for the returned guard's lifetime.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[allow(dead_code)]
+fn try_acquire_product_runtime_lock(
+    oauth_dir: &Path,
+) -> std::io::Result<Option<isyncyou_agent::FileLock>> {
+    isyncyou_agent::FileLock::try_acquire_exclusive(&oauth_dir.join(".product-runtime.lock"))
+}
+
 /// The Codex/ChatGPT credential we persist (access + refresh + ChatGPT account id + expiry).
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -7630,6 +8001,109 @@ mod tests {
             agent.claude_product_credential_state(),
             ProductCredentialState::PresentInvalid
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn activation_matches_requires_policy_and_contract_version() {
+        let a = ProductActivationV1 {
+            provider_id: "claude".into(),
+            credential_generation: "gen-1".into(),
+            oauth_policy_fingerprint: "fp-official".into(),
+            harness_contract_version: HARNESS_CONTRACT_VERSION,
+        };
+        assert!(a.matches(
+            ProductProviderId::Claude,
+            "gen-1",
+            "fp-official",
+            HARNESS_CONTRACT_VERSION
+        ));
+        // generation alone is not enough — policy + contract + provider must all match.
+        assert!(!a.matches(
+            ProductProviderId::Claude,
+            "gen-2",
+            "fp-official",
+            HARNESS_CONTRACT_VERSION
+        ));
+        assert!(!a.matches(
+            ProductProviderId::Claude,
+            "gen-1",
+            "fp-override",
+            HARNESS_CONTRACT_VERSION
+        ));
+        assert!(!a.matches(
+            ProductProviderId::Claude,
+            "gen-1",
+            "fp-official",
+            HARNESS_CONTRACT_VERSION + 1
+        ));
+        assert!(!a.matches(
+            ProductProviderId::Codex,
+            "gen-1",
+            "fp-official",
+            HARNESS_CONTRACT_VERSION
+        ));
+        // round-trip through the encrypted store
+        let root = apphost_credential_test_root("activation-roundtrip");
+        let _ = std::fs::remove_dir_all(&root);
+        store_product_activation(&root, ProductProviderId::Claude, &a).unwrap();
+        assert_eq!(
+            load_product_activation(&root, ProductProviderId::Claude),
+            Some(a)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn ready_activation_survives_attempt_journal_compaction() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("activation-survives-journal");
+        let _ = std::fs::remove_dir_all(&root);
+        let activation = ProductActivationV1 {
+            provider_id: "claude".into(),
+            credential_generation: "gen-keep".into(),
+            oauth_policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
+            harness_contract_version: HARNESS_CONTRACT_VERSION,
+        };
+        store_product_activation(&root, ProductProviderId::Claude, &activation).unwrap();
+        // hammer the bounded journal past its cap; it compacts to MAX_JOURNAL_TRANSITIONS.
+        let mut journal = OnboardingAttemptJournalV1 {
+            transitions: Vec::new(),
+        };
+        for i in 0..(MAX_JOURNAL_TRANSITIONS + 20) {
+            journal.push(OnboardingTransition {
+                state: ProductOnboardingState::OfficialSignInStarted,
+                generation: format!("g{i}"),
+                error_code: None,
+            });
+        }
+        assert_eq!(journal.transitions.len(), MAX_JOURNAL_TRANSITIONS);
+        store_onboarding_journal(&root, "attempt-xyz", &journal).unwrap();
+        assert_eq!(
+            load_onboarding_journal(&root, "attempt-xyz")
+                .unwrap()
+                .transitions
+                .len(),
+            MAX_JOURNAL_TRANSITIONS
+        );
+        // The durable activation record (readiness authority) is unaffected by journal churn.
+        assert_eq!(
+            load_product_activation(&root, ProductProviderId::Claude),
+            Some(activation)
+        );
+        // The runtime lock is exclusive: a second concurrent holder fails closed.
+        let lock = try_acquire_product_runtime_lock(&root).unwrap();
+        assert!(lock.is_some());
+        assert!(try_acquire_product_runtime_lock(&root).unwrap().is_none());
+        drop(lock);
         let _ = std::fs::remove_dir_all(root);
     }
 

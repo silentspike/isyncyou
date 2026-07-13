@@ -287,6 +287,24 @@ impl AgentCredentialStore {
         }
     }
 
+    /// Bounded, no-follow load (#639) — see [`CredentialStore::get_bounded`].
+    pub fn get_bounded(
+        &self,
+        class: SecretClass,
+        id: &str,
+        max_envelope_bytes: usize,
+        max_plaintext_bytes: usize,
+    ) -> Result<Option<Secret>, AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => {
+                store.get_bounded(class, id, max_envelope_bytes, max_plaintext_bytes)
+            }
+            AgentCredentialStore::Local(store) => {
+                store.get_bounded(class, id, max_envelope_bytes, max_plaintext_bytes)
+            }
+        }
+    }
+
     pub fn delete(&self, class: SecretClass, id: &str) -> Result<(), AgentError> {
         match self {
             AgentCredentialStore::Provided(store) => store.delete(class, id),
