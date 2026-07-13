@@ -1,20 +1,23 @@
 Issue: #640 Android network guard and diagnostic gates
-Implementation commit: b9d2570eba4e0ab7e9c7d960bf7cd30af9fc445b
+Implementation commit: 7c5ff3699c27e7212abf0d9ed2d915b095243125
 Result: PASS
 Executed: 2026-07-13
 
-- (cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest :app:lintDebug): PASS
-- (cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug): PASS
-- NetworkCriticalGuardInstrumentedTest on the default APK: PASS, 1 test
+- Default-feature JVM unit tests and lint: PASS
+- Clean default-feature APK assembly: PASS
+- Full default connected instrumentation: PASS, 14 executed tests and 5 intentional
+  feature/precondition skips, zero failures
+- The hook-only instrumentation test skips in the default graph instead of requiring a
+  test feature in the product APK: PASS
 - NetworkPreflightHookInstrumentedTest on the hook APK: PASS, 1 test
-- A clean default APK was rebuilt and reinstalled after the hook test: PASS
-- Default APK excludes the deliberate hook marker: PASS
+- A clean default APK was rebuilt and reinstalled after hook diagnostics and refresh: PASS
+- Default APK excludes the deliberate hook and #627 local-client markers: PASS
 - Hook APK includes the deliberate hook marker: PASS
-- Before instrumentation cleanup, the real refreshed Codex credential survived a clean
-  default-APK reinstall and process restart, then completed a guarded StoreArchive turn: PASS
-- The later connected-instrumentation install cleared debug app data by design. The final
-  clean default APK is therefore unconfigured; this happened after the refresh proof and
-  is not represented as credential persistence.
+- The real refreshed Codex credential survived hook-to-default replacement and process
+  restart, then completed a guarded StoreArchive tool roundtrip: PASS
+- The final installed default APK retains connected Claude and Codex product credentials:
+  PASS
 
-The instrumentation record contains no device serial, account identity, OAuth callback,
-token, provider endpoint, IP address, or raw platform dump.
+Instrumentation ran before the final live OAuth/turn/refresh matrix, so its cleanup did not
+invalidate the committed device evidence. No device serial, account identity, OAuth
+callback, token, provider endpoint, IP address, or raw platform dump is retained.

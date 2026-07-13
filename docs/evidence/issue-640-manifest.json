@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-13T09:56:00Z",
-  "commit": "b9d2570eba4e0ab7e9c7d960bf7cd30af9fc445b",
+  "generated_at": "2026-07-13T10:53:13Z",
+  "commit": "7c5ff3699c27e7212abf0d9ed2d915b095243125",
   "entries": [
     {
       "id": "EV-001",
@@ -144,16 +144,16 @@
     {
       "id": "EV-015",
       "requirement": "REQ-AGENT-013",
-      "claim": "The hook APK renders the closed no_validated_network diagnostic with Retry and Settings, consumes the hook, opens the system Internet panel, and creates no provider turn.",
+      "claim": "The hook APK renders the closed no_validated_network diagnostic with Retry and a trusted Settings action, consumes the hook, and reaches no provider tool execution.",
       "method": "probe",
-      "command": "Physical Pixel hook-APK one-shot no_validated_network UI probe followed by system-dialog focus and hook-consumption readback",
+      "command": "Physical Pixel hook-APK one-shot no_validated_network UI probe followed by trusted Settings invocation and hook-consumption readback",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-640/device-preflight-hook.json"
     },
     {
       "id": "EV-016",
       "requirement": "REQ-AGENT-013",
-      "claim": "The independently rebuilt default APK excludes the deliberate network diagnostic hook marker; credential persistence is proven separately before the later instrumentation cleanup.",
+      "claim": "The independently rebuilt and finally installed default APK excludes the deliberate network diagnostic and #627 local-client markers while preserving both encrypted product credentials after the hook run.",
       "method": "command",
       "command": "(cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug) && python3 tools/agent-network-device-probe.py --apk android/app/build/outputs/apk/debug/app-debug.apk --scope default --output /tmp/isyncyou-640-default-device-probe.json",
       "result": "pass",
@@ -171,9 +171,9 @@
     {
       "id": "EV-018",
       "requirement": "REQ-AGENT-013",
-      "claim": "The current default APK completed the official system-browser Claude OAuth code flow and then completed a guarded read-only StoreArchive turn through the Claude product provider.",
+      "claim": "The current default APK completed the official system-browser Claude OAuth code flow and then completed a guarded read-only StoreArchive tool turn through the Claude product provider.",
       "method": "probe",
-      "command": "Physical Pixel default-APK Claude OAuth code flow followed by a controlled no-match StoreArchive turn with closed event counters and foreground-service readback",
+      "command": "Physical Pixel default-APK Claude OAuth code flow followed by a controlled StoreArchive tool turn with closed event counters and foreground-service readback",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-640/device-oauth.json"
     },

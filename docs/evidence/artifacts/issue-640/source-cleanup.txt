@@ -1,5 +1,5 @@
 Issue: #640 callback, routing, settings, and feature-boundary scan
-Implementation commit: b9d2570eba4e0ab7e9c7d960bf7cd30af9fc445b
+Implementation commit: 7c5ff3699c27e7212abf0d9ed2d915b095243125
 Result: PASS
 
 python3 tools/verify-agent-network-boundary.py returned 8/8 passing checks:
@@ -13,5 +13,7 @@ python3 tools/verify-agent-network-boundary.py returned 8/8 passing checks:
 - WebUI renders code-specific retry diagnostics
 
 Cargo metadata confirmed that the mobile default feature list excludes the hook and that
-the explicit mobile hook feature forwards only to the app-host hook feature. The default
-APK binary scan independently confirmed that the deliberate hook marker is absent.
+the explicit mobile hook feature forwards only to the app-host hook feature. A fresh default
+APK binary scan independently found no deliberate hook, #627 local-client fallback, or
+subscription-import marker. At final idle readback the foreground guard and Codex loopback
+listener were both absent.
