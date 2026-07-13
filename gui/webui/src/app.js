@@ -4760,7 +4760,7 @@ function showCodeStep() {
     el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
     el("h2", { style: "margin:.3rem 0 .5rem", text: "Paste your code" }),
     el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.3rem;max-width:27rem", text: "After you approve in the browser, copy the code it shows and paste it here to finish connecting." }),
-    el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
+    el("input", { id: "asst-code", type: "password", autocomplete: "off", spellcheck: "false", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
     el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
       el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
       el("button", { class: "btn", onclick: async () => { await cancelOAuthAttempt("claude"); await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
@@ -4772,8 +4772,17 @@ async function completeAiLogin() {
   const inp = document.getElementById("asst-code");
   const code = inp && inp.value.trim();
   if (!code) { toast("Paste the code first"); return; }
+  const attemptId = OAUTH_ATTEMPTS.get("claude");
+  if (!attemptId) { toast("Start sign-in again.", "err"); return; }
+  // #639 T10: the pasted code crosses the boundary only in this strict-JSON body — never a URL/query
+  // param, never persisted. Clear the input immediately so it does not linger in the DOM.
+  if (inp) inp.value = "";
   try {
-    await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    await postJson("/api/v1/agent/oauth/complete", CAP.agent, {
+      provider: "claude",
+      attempt_id: attemptId,
+      pasted_code: code,
+    });
     OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
     toast("Connected!");
@@ -4903,23 +4912,79 @@ async function renderAssistantView(view) {
   } catch (_) { st = {}; }
   rememberAssistantStatus(st);
   clear(body);
+  // #639 T7/T10: `connected` is now host-verified per-provider readiness (provider_ready of the
+  // selected provider), so the chat vs. wizard split is driven by host readiness, not credential
+  // presence. The manual code step keys off the in-flight attempt + the per-provider onboarding state.
   if (st && st.connected) renderAssistantChat(body, st);
-  else renderAssistantSetup(body, st);
-  if (OAUTH_ATTEMPTS.has("claude") && !(st && st.claude)) showCodeStep();
+  else renderAssistantWizard(body, st);
+  const claudeReady = !!(st && st.onboarding && st.onboarding.providers
+    && st.onboarding.providers.claude && st.onboarding.providers.claude.state === "ready");
+  if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
 }
 
-// The connect card (shown until an AI account is connected).
-function renderAssistantSetup(body, st) {
+// #639 T10: the ordered official-sign-in -> custom-harness handoff steps the wizard proves. Keys
+// mirror the host onboarding wire states (status_json.onboarding.providers[p].steps).
+const AGENT_ONBOARDING_STEPS = [
+  ["official_oauth_completed", "Official sign-in"],
+  ["credential_encrypted", "Credential encrypted"],
+  ["retained_envelope_verified", "Provider identity retained"],
+  ["default_harness_removed", "Default assistant removed"],
+  ["m365_profile_activated", "iSyncYou M365 profile activated"],
+  ["isyncyou_tool_connected", "iSyncYou tool connected"],
+  ["subscription_identity_set", "Subscription identity set"],
+  ["ready", "Ready"],
+];
+
+// The per-provider onboarding projection from the host status (never trusts the client).
+function assistantOnboardingFor(st, provider) {
+  const ob = st && st.onboarding;
+  if (!ob || !ob.providers) return null;
+  return ob.providers[provider] || null;
+}
+
+// The provider whose handoff the wizard should surface: the host-selected one, else Claude.
+function assistantWizardProvider(st) {
+  const sel = st && st.onboarding && st.onboarding.selected_provider;
+  return sel === "codex" ? "codex" : "claude";
+}
+
+// The ordered step list, marking each complete from the host projection (condense-not-reorder).
+function renderAssistantWizardSteps(node) {
+  const steps = (node && Array.isArray(node.steps)) ? node.steps : [];
+  const completeByKey = {};
+  steps.forEach((s) => { if (s && s.key) completeByKey[s.key] = s.complete === true; });
+  return el("ol", { class: "assistant-wizard-steps", "data-testid": "agent-wizard-steps", "data-agent-wizard-steps": "1" },
+    AGENT_ONBOARDING_STEPS.map(([key, label], i) => {
+      const done = completeByKey[key] === true;
+      return el("li", {
+        class: "assistant-wizard-step" + (done ? " is-complete" : ""),
+        "data-agent-wizard-step": key,
+        "data-complete": done ? "1" : "0",
+      },
+        el("span", { class: "assistant-wizard-step-num", text: done ? "✓" : String(i + 1) }),
+        el("span", { class: "assistant-wizard-step-label", text: label }));
+    }));
+}
+
+// #639 T10: the state-driven first-run handoff wizard (replaces the old direct-connect card). It
+// reads only the host onboarding projection (per-provider readiness), never st.claude/st.codex.
+function renderAssistantWizard(body, st) {
   const unavailable = !CAP.agent;
   const claudeAllowed = agentPrivacyConsentAccepted("claude");
   const codexAllowed = agentPrivacyConsentAccepted("codex");
+  const wizardProvider = assistantWizardProvider(st);
+  const node = assistantOnboardingFor(st, wizardProvider);
+  const state = node && node.state ? node.state : "not_started";
+  const reconnect = state === "reconnect_required";
   const hint = unavailable
     ? "Assistant is not available in this build."
-    : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login.";
+    : reconnect
+      ? "Your subscription needs to be reconnected. iSyncYou opens your device browser for the official login again."
+      : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login, then hands off to the iSyncYou assistant.";
   const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => startAiLogin("claude"), "data-testid": "agent-connect-claude" },
-    icon("sparkles", "icon-sm"), "Connect Claude");
+    icon("sparkles", "icon-sm"), reconnect && wizardProvider === "claude" ? "Reconnect Claude" : "Connect Claude");
   const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => startAiLogin("codex"), "data-testid": "agent-connect-codex" },
-    icon("sparkles", "icon-sm"), "Connect ChatGPT");
+    icon("sparkles", "icon-sm"), reconnect && wizardProvider === "codex" ? "Reconnect ChatGPT" : "Connect ChatGPT");
   if (unavailable || !claudeAllowed) {
     claude.setAttribute("disabled", "disabled");
   }
@@ -4929,11 +4994,15 @@ function renderAssistantSetup(body, st) {
   body.append(el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }));
   const diagnostic = renderConnectivityDiagnostic();
   if (diagnostic) body.append(diagnostic);
+  // A reconnect is a shorter flow (same host invariants): condense the ordered steps to the
+  // official sign-in + ready endpoints rather than repeating the full first-run sequence.
+  const stepsPanel = reconnect ? null : renderAssistantWizardSteps(node);
   body.append(
-    el("div", { id: "asst-connect-card", class: "assistant-setup", "data-agent-setup": "1", "data-testid": "agent-setup" },
+    el("div", { id: "asst-connect-card", class: "assistant-setup assistant-wizard", "data-agent-setup": "1", "data-agent-wizard": state, "data-testid": "agent-setup" },
       el("div", { class: "assistant-setup-icon" }, icon("sparkles")),
-      el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
+      el("h2", { style: "margin:.3rem 0 .5rem", text: reconnect ? "Reconnect your AI account" : "Connect your AI account" }),
       el("p", { class: "dim assistant-setup-copy", text: hint }),
+      stepsPanel,
       renderAssistantConsentPanel(["claude", "codex"]),
       el("div", { class: "assistant-setup-actions" }, claude, codex),
       st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,

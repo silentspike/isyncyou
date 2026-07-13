@@ -141,6 +141,16 @@ function makeFixtureServer(evidence) {
     streamScenarios: [],
   };
 
+  // #639 T10: the host onboarding projection the wizard renders (per-provider readiness + steps).
+  const onboardingStepKeys = [
+    "official_oauth_completed", "credential_encrypted", "retained_envelope_verified",
+    "default_harness_removed", "m365_profile_activated", "isyncyou_tool_connected",
+    "subscription_identity_set", "ready",
+  ];
+  const onboardingNode = (ready) => ({
+    state: ready ? "ready" : "not_started",
+    steps: onboardingStepKeys.map((key) => ({ key, complete: ready })),
+  });
   const statusBody = () => ({
     enabled: true,
     connected: agentConnected,
@@ -148,6 +158,14 @@ function makeFixtureServer(evidence) {
     model: agentModel,
     claude: agentConnected,
     codex: false,
+    onboarding: {
+      selected_provider: agentProvider || "claude",
+      selected_state: agentConnected ? "ready" : "not_started",
+      providers: {
+        claude: onboardingNode(agentConnected),
+        codex: onboardingNode(false),
+      },
+    },
     models: {
       claude: [
         { id: "claude-sonnet-4", label: "Claude Sonnet 4" },
@@ -379,6 +397,15 @@ async function main() {
     assert(evidence, "connect disabled before consent", await page.locator('[data-testid="agent-connect-codex"]').isDisabled());
     assert(evidence, "BYO key row absent", await page.locator('[data-agent-byo-key="unavailable"]').count() === 0);
     assert(evidence, "no editable secret input in setup", await page.locator('input[type="password"], input[name*="key" i], textarea[name*="key" i]').count() === 0);
+    // #639 T10: the first-run handoff wizard renders the ordered official-sign-in -> ready steps.
+    const wizardStepCount = await page.locator('[data-testid="agent-wizard-steps"] [data-agent-wizard-step]').count();
+    assert(evidence, "handoff wizard renders 8 ordered steps", wizardStepCount === 8, { wizardStepCount });
+    const wizardStepOrder = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('[data-testid="agent-wizard-steps"] [data-agent-wizard-step]'))
+        .map((node) => node.getAttribute("data-agent-wizard-step")));
+    assert(evidence, "wizard steps are the ordered handoff sequence",
+      wizardStepOrder.join(",") === "official_oauth_completed,credential_encrypted,retained_envelope_verified,default_harness_removed,m365_profile_activated,isyncyou_tool_connected,subscription_identity_set,ready",
+      wizardStepOrder);
     evidence.screenshots.setup_consent = await screenshot(page, "setup-consent.png");
     evidence.screenshots.desktop_assistant = await screenshot(page, "desktop-assistant.png");
 
