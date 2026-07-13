@@ -155,10 +155,12 @@ requirements:
       loaded from encrypted host/mobile credential storage. Product builds must not
       ask for BYO Anthropic/OpenAI API keys, must not use `ProviderApiKey` as the
       product setup path, and must not read local `~/.claude` or `~/.codex` CLI auth.
-      FakeProvider remains the deterministic CI/unconfigured fallback only. The
-      local CLI credential fallback and private wire-drift capture stay separated
-      under #627/default-off `agent-subscription-experimental`. (S-AG.2/#617,
-      S-AG.8/#623, S-AG.12/#627)
+      FakeProvider is a deterministic test/fixture provider only — it is NOT an
+      unconfigured product turn: a not-ready product turn fails closed with a typed
+      ProductNotReady (#639), never a FakeProvider response. The local CLI credential
+      fallback and private wire-drift capture stay separated under #627/default-off
+      `agent-subscription-experimental`. (S-AG.2/#617, S-AG.8/#623, S-AG.12/#627,
+      S-AG.14/#639)
     status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
@@ -365,3 +367,47 @@ requirements:
       - test: codex_refresh_device_hook_is_one_shot_and_does_not_change_the_clock
       - test: networkPreflightHookIsFeatureGatedOwnerOnlyAndOneShot
       - file: docs/evidence/issue-640-manifest.json
+
+  - id: REQ-AGENT-014
+    title: First-run official OAuth → visible, host-enforced custom-harness handoff
+    statement: >
+      Product agent readiness is a durable, authenticated activation authority, not credential
+      presence. `provider_ready(p)` requires a valid Active V2 credential bundle, a
+      `ProductActivationV1` matching its credential generation + the official-OAuth policy
+      fingerprint + the harness contract version, and a passing static harness attestation; every
+      provider round additionally re-attests the actually-sent request. A single product-runtime gate
+      spans selection + readiness + provider construction and runs before any turn-id/stream/archive,
+      returning a typed `ProductNotReady` mapped to a closed 409. The official OAuth flow records an
+      ordered, authenticated onboarding journal (official sign-in → credential encrypted → retained
+      envelope verified → default harness removed → M365 profile activated → iSyncYou tool connected →
+      subscription identity set → ready), with defined crash-window recovery; a refresh is a V2
+      lifecycle event only. The first-run wizard renders that ordered handoff from the host onboarding
+      projection, and `/oauth/complete` is a strict-JSON, attempt-bound, Claude-only manual step.
+      FakeProvider is a test/fixture provider only and never a not-ready product turn. #627 experimental
+      stays compiled-opt-in only and never confers product readiness. (S-AG.14/#639)
+    status: planned
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Readiness derives from the durable ProductActivationV1 (generation + policy fingerprint + harness contract) plus a valid Active bundle and a passing static harness attestation, decoupled from provider selection.
+      - Every provider round builds and consumes a freshly attested request over its current history; the transport accepts only an attested request and rejects any header/body mutation.
+      - The single product-runtime gate runs before turn-id/stream/archive; a not-ready product turn returns a typed ProductNotReady → closed 409 and creates no turn state, with no cross-provider fallback.
+      - The OAuth flow records ordered onboarding-journal transitions; crash windows are defined and recovered (activation resumes without re-exchange; interrupted attempts become error_redacted and are never resumed); refresh never touches the attempt journal.
+      - The status onboarding projection survives journal TTL (a ready provider reports all steps from the activation) and carries Cache-Control no-store with no secrets; /oauth/complete is strict-JSON, attempt-state-bound, and Claude-only.
+      - The first-run wizard renders the ordered handoff steps from the host projection and keys all gating off host readiness, never credential-presence flags; the pasted code lives only transiently and is never persisted/logged/placed in a URL or HTML attribute.
+      - FakeProvider is never a not-ready product turn; #627 experimental never sets connected/activation/readiness.
+      - Status is `planned` until live official Claude + Codex OAuth handoff evidence is captured on-device (S-AG.14 device task).
+    verified_by:
+      - test: every_provider_round_attests_its_current_history
+      - test: transport_accepts_only_attested_provider_request
+      - test: attestation_cannot_be_reused_after_header_or_body_mutation
+      - test: product_not_ready_returns_409_without_creating_turn_state
+      - test: invalid_selected_provider_never_falls_back
+      - test: experimental_credential_never_sets_product_readiness
+      - test: crash_after_credential_write_resumes_activation_without_reexchange
+      - test: interrupted_oauth_attempt_records_error_redacted
+      - test: completion_and_status_share_the_product_runtime_gate
+      - test: status_projection_correct_after_journal_ttl_expiry
+      - test: oauth_complete_rejects_wrong_attempt_state_and_codex
+      - test: official_oauth_precedes_credential_encryption_and_harness_transformation
+      - test: activation_matches_requires_policy_and_contract_version
+      - test: product_oauth_override_cannot_satisfy_official_handoff
