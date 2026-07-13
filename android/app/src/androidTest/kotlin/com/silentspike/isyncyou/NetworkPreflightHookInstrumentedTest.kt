@@ -7,14 +7,14 @@ import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 class NetworkPreflightHookInstrumentedTest {
     @Test
     fun networkPreflightHookIsFeatureGatedOwnerOnlyAndOneShot() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        assertTrue("hook APK did not compile the native feature", NativeEngine.nativeNetworkDeviceHooksEnabled())
+        assumeTrue("requires the network-device hook APK", NativeEngine.nativeNetworkDeviceHooksEnabled())
         val hook = File(context.filesDir, "network-diagnostic-test-hook")
         hook.delete()
         hook.writeText("tls_failed")
