@@ -3149,6 +3149,14 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// local CLI source, and the encrypted store is updated only by the existing atomic writer
     /// after a complete finite credential response has been validated.
     fn refresh_product_credential(&self, provider: &str) -> Result<&'static str, String> {
+        // #639 (F2): the explicit refresh route shares the product-runtime gate (lock order: gate
+        // BEFORE credential_refresh_gate, matching the turn-build path) so a refresh cannot race a
+        // status snapshot / set_model / completion into a mixed revision. (The turn-build path already
+        // holds the gate and refreshes via the *_unlocked helpers, so it does not re-enter here.)
+        let _gate = self
+            .product_runtime_gate
+            .lock()
+            .map_err(|_| "reconnect_required".to_string())?;
         let _refresh = self
             .credential_refresh_gate
             .lock()
@@ -3767,26 +3775,31 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         if let Ok(mut attempts) = self.oauth_attempts.lock() {
             reap_oauth_attempts(&mut attempts);
         }
-        let claude_state = self
-            .product_credential_status("claude")
-            .unwrap_or("reconnect_required");
-        let codex_state = self
-            .product_credential_status("codex")
-            .unwrap_or("reconnect_required");
-        let reconnect_required =
-            claude_state == "reconnect_required" || codex_state == "reconnect_required";
-        let (sel_provider, _) = self.agent_settings();
-        // #639 T7: readiness is host-verified (valid Active bundle + a matching durable activation
-        // + a passing static harness attestation), NOT credential presence, and is decoupled from
-        // selection. A held product-runtime gate gives a snapshot consistent with a concurrent
-        // turn build. An experimental local credential can never qualify.
-        let (claude, codex) = {
+        // #639 (F2): take the ENTIRE status snapshot — credential_state, per-provider readiness,
+        // the selected provider, and the onboarding projection — under ONE product-runtime-gate hold,
+        // so a concurrent set_model / OAuth completion / turn build can never make status report a
+        // mix of two revisions. (Readiness is host-verified: Active policy-bound bundle + matching
+        // activation + static attestation, not credential presence; experimental never qualifies.)
+        let (claude_state, codex_state, sel_provider, claude, codex, onboarding) = {
             let _gate = self.product_runtime_gate.lock();
+            let claude_state = self
+                .product_credential_status("claude")
+                .unwrap_or("reconnect_required");
+            let codex_state = self
+                .product_credential_status("codex")
+                .unwrap_or("reconnect_required");
+            let (sel_provider, _) = self.agent_settings();
             (
+                claude_state,
+                codex_state,
+                sel_provider,
                 self.provider_ready(ProductProviderId::Claude),
                 self.provider_ready(ProductProviderId::Codex),
+                self.onboarding_projection(),
             )
         };
+        let reconnect_required =
+            claude_state == "reconnect_required" || codex_state == "reconnect_required";
         // The selected provider alone drives `connected` + `provider`; there is no fall-back to
         // the other provider, and an unparseable selection reads not-connected (fail-closed).
         let selected_id = ProductProviderId::parse(&sel_provider);
@@ -3827,7 +3840,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         }
         // #639 T9: the per-provider onboarding projection drives the first-run wizard. It survives
         // journal TTL (a ready provider reports all steps complete from the durable activation).
-        status["onboarding"] = self.onboarding_projection();
+        status["onboarding"] = onboarding;
         status.to_string()
     }
 
@@ -3837,6 +3850,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn set_model(&self, provider: &str, model: &str) -> Result<(), String> {
+        // #639 (F2): the selection write shares the product-runtime gate, so a status snapshot or a
+        // turn build never observes a selection that is inconsistent with the readiness it just read.
+        let _gate = self
+            .product_runtime_gate
+            .lock()
+            .map_err(|_| "product_busy".to_string())?;
         self.set_agent_settings(provider, model)
     }
 }
