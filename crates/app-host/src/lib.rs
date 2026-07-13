@@ -1344,8 +1344,9 @@ const CODEX_CALLBACK_DIAGNOSTICS_FILE: &str = "codex-debug.txt";
 ))]
 /// One-shot loopback callback server for the Codex OAuth (OpenAI registers the fixed
 /// `:1455` redirect). Waits for the browser to hit `/auth/callback?code=&state=`, verifies
-/// the CSRF `state`, exchanges the code, and persists the credential. Background thread;
-/// gives up after 5 minutes. It never persists callback diagnostics or target data.
+/// the CSRF `state`, exchanges the code, and persists the credential. The background
+/// thread uses the same bounded lifetime as its owning OAuth attempt. It never persists
+/// callback diagnostics or target data.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -1365,6 +1366,22 @@ struct CodexCallbackContext {
     feature = "agent-subscription-experimental"
 ))]
 fn codex_callback_serve(listener: std::net::TcpListener, context: CodexCallbackContext) {
+    codex_callback_serve_until(
+        listener,
+        context,
+        std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+    );
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn codex_callback_serve_until(
+    listener: std::net::TcpListener,
+    context: CodexCallbackContext,
+    deadline: std::time::Instant,
+) {
     use std::io::{Read, Write};
     let CodexCallbackContext {
         oauth_dir,
@@ -1375,7 +1392,6 @@ fn codex_callback_serve(listener: std::net::TcpListener, context: CodexCallbackC
         cancelled,
         attempts,
     } = context;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     if listener.set_nonblocking(true).is_err() {
         return;
     }
@@ -6982,6 +6998,47 @@ mod tests {
         let _agent = DaemonAgent::new(Config::default(), root.clone());
 
         assert!(!legacy.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_callback_blocking_accept_cannot_outlive_deadline() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_id = "deadline-test".to_string();
+        attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            OAuthAttempt::Codex {
+                cancelled: Arc::clone(&cancelled),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        let root = apphost_credential_test_root("codex-callback-deadline");
+        let _ = std::fs::remove_dir_all(&root);
+        let context = CodexCallbackContext {
+            oauth_dir: root.clone(),
+            cfg: isyncyou_agent::oauth::CodexOAuthConfig::default(),
+            verifier: "verifier".into(),
+            want_state: "state".into(),
+            attempt_id: attempt_id.clone(),
+            cancelled,
+            attempts: Arc::clone(&attempts),
+        };
+        let started = std::time::Instant::now();
+
+        codex_callback_serve_until(
+            listener,
+            context,
+            started + std::time::Duration::from_millis(75),
+        );
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!attempts.lock().unwrap().contains_key(&attempt_id));
         let _ = std::fs::remove_dir_all(root);
     }
 
