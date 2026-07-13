@@ -1940,18 +1940,13 @@ fn record_onboarding_generation_transitions(
     }
 }
 
-/// Try to acquire the exclusive product-runtime lock (#639). `Ok(None)` -> another product runtime
-/// holds it; the caller fails closed. Held for the returned guard's lifetime.
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
-#[allow(dead_code)]
-fn try_acquire_product_runtime_lock(
-    oauth_dir: &Path,
-) -> std::io::Result<Option<isyncyou_agent::FileLock>> {
-    isyncyou_agent::FileLock::try_acquire_exclusive(&oauth_dir.join(".product-runtime.lock"))
-}
+// #639 (review): the cross-process product-runtime FILE lock is NOT wired. The in-process
+// `product_runtime_gate` mutex provides the intra-process atomicity the acceptance criteria require
+// (a single desktop/mobile daemon owns the encrypted store). A daemon-lifetime `flock` is not held,
+// so this build makes NO cross-process single-runtime guarantee, and the earlier dead wrapper +
+// its unit test have been removed rather than imply one. (`isyncyou_agent::FileLock` remains an
+// available primitive; wiring it into the infallible constructor + a fail-closed degraded mode is a
+// separate, test-invasive change and is out of scope here.)
 
 /// The Codex/ChatGPT credential we persist (access + refresh + ChatGPT account id + expiry).
 #[cfg(any(
@@ -9640,11 +9635,6 @@ mod tests {
             load_product_activation(&root, ProductProviderId::Claude),
             Some(activation)
         );
-        // The runtime lock is exclusive: a second concurrent holder fails closed.
-        let lock = try_acquire_product_runtime_lock(&root).unwrap();
-        assert!(lock.is_some());
-        assert!(try_acquire_product_runtime_lock(&root).unwrap().is_none());
-        drop(lock);
         let _ = std::fs::remove_dir_all(root);
     }
 
