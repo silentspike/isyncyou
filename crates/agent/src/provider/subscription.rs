@@ -17,10 +17,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Default Claude-Code mimicry recipe (verified from the real client, 2026-06-27).
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
+pub(crate) const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 pub(crate) const DEFAULT_CLI_VERSION: &str = "2.1.207";
+
+/// #639 (F4): the exact retained billing-envelope block text the product harness must carry
+/// (bound EXACTLY by the runtime attestation, not merely prefix-checked).
+pub(crate) fn expected_product_billing_block() -> String {
+    format!(
+        "x-anthropic-billing-header: cc_version={}.cab; cc_entrypoint=sdk-cli; cch=00000;",
+        DEFAULT_CLI_VERSION
+    )
+}
 
 /// The subscription wire configuration. Defaults to the verified Claude-Code recipe; the
 /// operator may override the CLI version or supply account identity for `metadata.user_id`.

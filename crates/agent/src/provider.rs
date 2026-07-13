@@ -405,6 +405,46 @@ fn require_headers(headers: &[(String, String)], required: &[&str]) -> Result<()
     Ok(())
 }
 
+/// #639 (F4): no header name may appear more than once (case-insensitive) — a duplicate could
+/// smuggle a second, unattested value past a name-only check.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn reject_duplicate_headers(headers: &[(String, String)]) -> Result<(), AgentError> {
+    for i in 0..headers.len() {
+        for j in (i + 1)..headers.len() {
+            if headers[i].0.eq_ignore_ascii_case(&headers[j].0) {
+                return Err(harness_violation(&format!(
+                    "duplicate header: {}",
+                    headers[i].0
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #639 (F4): the `authorization` header must be a bearer credential — its value format is bound
+/// (the token itself is credential-specific and is not, and must not be, hardcoded here).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn require_bearer_authorization(headers: &[(String, String)]) -> Result<(), AgentError> {
+    let value = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_default();
+    if !value.starts_with("Bearer ") || value.len() <= "Bearer ".len() {
+        return Err(harness_violation(
+            "authorization must be a non-empty bearer token",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a provider request against the positive harness allowlist — exact top-level keys,
 /// exactly one `isyncyou` tool, the retained envelope invariants (Claude billing block first,
 /// Codex `store:false`), streaming, and all mandatory headers. No default-client component may appear.
@@ -414,10 +454,13 @@ fn require_headers(headers: &[(String, String)], required: &[&str]) -> Result<()
 ))]
 fn attest_product_harness(
     provider: HarnessProvider,
+    url: &str,
     headers: &[(String, String)],
     body: &serde_json::Value,
 ) -> Result<(), AgentError> {
     reject_forbidden_components(body)?;
+    reject_duplicate_headers(headers)?;
+    require_bearer_authorization(headers)?;
     let obj = body
         .as_object()
         .ok_or_else(|| harness_violation("request body must be an object"))?;
@@ -426,6 +469,12 @@ fn attest_product_harness(
     attest_single_isyncyou_tool(obj.get("tools"))?;
     match provider {
         HarnessProvider::Claude => {
+            // #639 (F4): the request URL is bound exactly to the official endpoint.
+            if url != subscription::MESSAGES_URL {
+                return Err(harness_violation(
+                    "claude request URL is not the official endpoint",
+                ));
+            }
             let allowed: std::collections::BTreeSet<&str> = [
                 "max_tokens",
                 "messages",
@@ -456,9 +505,10 @@ fn attest_product_harness(
                 .and_then(|b| b.get("text"))
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
-            if !first.starts_with("x-anthropic-billing-header") {
+            // #639 (F4): the retained billing block is bound EXACTLY (not merely by prefix).
+            if first != subscription::expected_product_billing_block() {
                 return Err(harness_violation(
-                    "claude billing block must be first and unchanged",
+                    "claude billing block must be first and exactly the official envelope",
                 ));
             }
             if !stream_true {
@@ -476,6 +526,12 @@ fn attest_product_harness(
             )?;
         }
         HarnessProvider::Codex => {
+            // #639 (F4): the request URL is bound exactly to the official endpoint.
+            if url != codex::RESPONSES_URL {
+                return Err(harness_violation(
+                    "codex request URL is not the official endpoint",
+                ));
+            }
             let allowed: std::collections::BTreeSet<&str> = [
                 "input",
                 "instructions",
@@ -527,7 +583,7 @@ pub fn build_attested_provider_request(
     headers: Vec<(String, String)>,
     body: serde_json::Value,
 ) -> Result<AttestedProviderRequest, AgentError> {
-    attest_product_harness(provider, &headers, &body)?;
+    attest_product_harness(provider, &url, &headers, &body)?;
     Ok(AttestedProviderRequest { url, headers, body })
 }
 
@@ -552,7 +608,12 @@ pub fn attest_static_product_harness(provider: HarnessProvider) -> Result<(), Ag
                 PROBE_SYSTEM,
                 subscription::SubscriptionConfig::default(),
             )?;
-            attest_product_harness(provider, &p.request_headers(), &p.request_body(&history))
+            attest_product_harness(
+                provider,
+                subscription::MESSAGES_URL,
+                &p.request_headers(),
+                &p.request_body(&history),
+            )
         }
         HarnessProvider::Codex => {
             let p = codex::CodexProvider::new(
@@ -562,6 +623,7 @@ pub fn attest_static_product_harness(provider: HarnessProvider) -> Result<(), Ag
             )?;
             attest_product_harness(
                 provider,
+                codex::RESPONSES_URL,
                 &p.request_headers(),
                 &codex::build_request("static-attestation", PROBE_SYSTEM, &history),
             )
@@ -573,6 +635,10 @@ pub fn attest_static_product_harness(provider: HarnessProvider) -> Result<(), Ag
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     use std::collections::BTreeSet;
 
     #[cfg(any(
@@ -841,7 +907,7 @@ mod tests {
         )
         .unwrap();
         (
-            "https://api.anthropic.example/v1/messages".into(),
+            subscription::MESSAGES_URL.to_string(),
             provider.request_headers(),
             provider.request_body(&history),
         )
@@ -863,7 +929,7 @@ mod tests {
         )
         .unwrap();
         (
-            "https://api.openai.example/v1/responses".into(),
+            codex::RESPONSES_URL.to_string(),
             provider.request_headers(),
             codex::build_request("codex-test", "iSyncYou controlled system prompt", &history),
         )
@@ -985,7 +1051,7 @@ mod tests {
         let attest = |headers: Vec<(String, String)>, body: serde_json::Value| {
             build_attested_provider_request(
                 HarnessProvider::Claude,
-                "https://api.anthropic.example/v1/messages".into(),
+                subscription::MESSAGES_URL.to_string(),
                 headers,
                 body,
             )
@@ -1045,7 +1111,7 @@ mod tests {
         let attest = |headers: Vec<(String, String)>, body: serde_json::Value| {
             build_attested_provider_request(
                 HarnessProvider::Codex,
-                "https://api.openai.example/v1/responses".into(),
+                codex::RESPONSES_URL.to_string(),
                 headers,
                 body,
             )
@@ -1081,6 +1147,83 @@ mod tests {
             attest(stripped, b).is_err(),
             "missing account header must fail"
         );
+    }
+
+    // #639 (F4): the runtime attestation binds the URL, the EXACT billing envelope, rejects
+    // duplicate headers, and requires a bearer authorization — not just header names.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn attestation_binds_url_exact_billing_and_header_integrity() {
+        // Wrong URL is rejected for both providers.
+        let (_, h, b) = valid_claude_request("q");
+        assert!(build_attested_provider_request(
+            HarnessProvider::Claude,
+            "https://evil.example/v1/messages".into(),
+            h,
+            b
+        )
+        .is_err());
+        let (_, h, b) = valid_codex_request("q");
+        assert!(build_attested_provider_request(
+            HarnessProvider::Codex,
+            "https://evil.example/responses".into(),
+            h,
+            b
+        )
+        .is_err());
+
+        // A tampered billing block (right prefix, wrong content) is rejected (exact, not prefix).
+        let (url, h, mut b) = valid_claude_request("q");
+        b["system"][0]["text"] = json!(
+            "x-anthropic-billing-header: cc_version=9.9.9.cab; cc_entrypoint=sdk-cli; cch=00000;"
+        );
+        assert!(build_attested_provider_request(HarnessProvider::Claude, url, h, b).is_err());
+
+        // A duplicate header is rejected.
+        let (url, mut h, b) = valid_claude_request("q");
+        h.push(("anthropic-version".into(), "sneaky".into()));
+        assert!(build_attested_provider_request(HarnessProvider::Claude, url, h, b).is_err());
+
+        // A non-bearer authorization is rejected.
+        let (url, h, b) = valid_claude_request("q");
+        let mutated: Vec<(String, String)> = h
+            .into_iter()
+            .map(|(k, v)| {
+                if k.eq_ignore_ascii_case("authorization") {
+                    (k, "Basic abc".into())
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
+        assert!(build_attested_provider_request(HarnessProvider::Claude, url, mutated, b).is_err());
+    }
+
+    // #639 (F4): the PRODUCT provider path sends only ATTESTED requests — subscription.rs and
+    // codex.rs must drive the transport exclusively through post_attested_sse (which accepts only an
+    // AttestedProviderRequest) and never call the raw post_json_sse primitive directly.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_providers_send_only_attested_requests() {
+        for src in [
+            include_str!("provider/subscription.rs"),
+            include_str!("provider/codex.rs"),
+        ] {
+            assert!(
+                src.contains("post_attested_sse"),
+                "product provider must send via post_attested_sse"
+            );
+            assert!(
+                !src.contains("post_json_sse"),
+                "product provider must not call the un-attested post_json_sse directly"
+            );
+        }
     }
 
     #[test]

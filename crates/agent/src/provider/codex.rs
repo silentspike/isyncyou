@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// Verified Codex-CLI mimicry recipe.
-const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_BETA: &str = "responses=experimental";
 pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.1";
