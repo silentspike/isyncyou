@@ -592,7 +592,7 @@ pub struct DaemonAgent {
         )),
         allow(dead_code)
     )]
-    product_runtime_gate: Mutex<()>,
+    product_runtime_gate: Arc<Mutex<()>>,
     seq: AtomicU64,
     /// Directory holding the app OAuth credential store and an optional local
     /// `agent-oauth.json` policy assertion. Product builds reject any tuple that differs
@@ -646,7 +646,7 @@ impl DaemonAgent {
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
         let confirmed_executor =
             agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
-        Self {
+        let agent = Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
             pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
@@ -656,7 +656,7 @@ impl DaemonAgent {
             last_usage: Arc::new(Mutex::new(None)),
             credential_now_ms: Arc::new(now_ms),
             credential_refresh_gate: Mutex::new(()),
-            product_runtime_gate: Mutex::new(()),
+            product_runtime_gate: Arc::new(Mutex::new(())),
             seq: AtomicU64::new(0),
             oauth_dir,
             #[cfg(any(
@@ -671,7 +671,15 @@ impl DaemonAgent {
             oauth_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_provider_script: None,
-        }
+        };
+        // #639 T8: recover any product onboarding interrupted by a crash before the durable
+        // authority (bundle + activation + terminal journal entry) was fully written.
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        agent.recover_product_onboarding();
+        agent
     }
 
     #[cfg(test)]
@@ -959,6 +967,83 @@ impl DaemonAgent {
         }
         Err(AgentStartTurnError::ProductNotReady)
     }
+
+    /// #639 T8: commit a successful official Claude OAuth atomically under the product-runtime gate:
+    /// write the encrypted V2 credential (fresh generation) + activation, record the ordered success
+    /// chain to the generation journal, then persist the selection. Holding the gate here means a
+    /// concurrent status/turn read can never observe a half-written credential/activation revision.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn commit_claude_oauth_success(
+        &self,
+        token: &isyncyou_agent::oauth::RefreshedToken,
+    ) -> Result<(), String> {
+        let _gate = self
+            .product_runtime_gate
+            .lock()
+            .map_err(|_| "product_busy".to_string())?;
+        self.store_token(token)?;
+        let generation = load_product_bundle_meta(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
+            .map(|m| m.generation)
+            .unwrap_or_default();
+        record_onboarding_generation_transitions(
+            &self.oauth_dir,
+            &generation,
+            &ONBOARDING_SUCCESS_CHAIN,
+        );
+        self.set_agent_settings("claude", DEFAULT_MODEL)?;
+        Ok(())
+    }
+
+    /// #639 T8: startup crash-window recovery over the DURABLE authority (bundle + activation),
+    /// never re-running OAuth. For each product provider with a valid Active V2 bundle:
+    /// window 2 (bundle written, activation missing) -> re-attest + write the matching activation
+    /// for the bundle's generation; window 2/3 -> ensure the generation journal carries the full
+    /// success chain (the missing terminal transition is added). Run once at construction.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn recover_product_onboarding(&self) {
+        let _gate = match self.product_runtime_gate.lock() {
+            Ok(gate) => gate,
+            Err(_) => return,
+        };
+        for provider in [ProductProviderId::Claude, ProductProviderId::Codex] {
+            let credential_id = match provider {
+                ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+                ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+            };
+            let meta = match load_product_bundle_meta(&self.oauth_dir, credential_id) {
+                Some(meta) if meta.lifecycle == CredentialLifecycle::Active => meta,
+                _ => continue,
+            };
+            let policy = oauth_policy_fingerprint(provider);
+            let activation_matches = load_product_activation(&self.oauth_dir, provider)
+                .map(|activation| {
+                    activation.matches(
+                        provider,
+                        &meta.generation,
+                        &policy,
+                        isyncyou_agent::HARNESS_CONTRACT_VERSION,
+                    )
+                })
+                .unwrap_or(false);
+            if !activation_matches
+                && activate_product(&self.oauth_dir, provider, &meta.generation).is_err()
+            {
+                // A harness that no longer attests refuses activation; leave it not ready.
+                continue;
+            }
+            record_onboarding_generation_transitions(
+                &self.oauth_dir,
+                &meta.generation,
+                &ONBOARDING_SUCCESS_CHAIN,
+            );
+        }
+    }
 }
 
 /// The app OAuth credential we persist: access token, refresh token, and the access
@@ -1211,19 +1296,16 @@ const HARNESS_CONTRACT_VERSION: u32 = 1;
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 const MAX_JOURNAL_PLAINTEXT_BYTES: usize = 65_536;
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 const MAX_JOURNAL_ENVELOPE_BYTES: usize = 98_304;
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 const MAX_JOURNAL_TRANSITIONS: usize = 32;
 
 /// #639: the ordered product onboarding states (monotonic within one setup attempt). Ordering is
@@ -1234,7 +1316,6 @@ const MAX_JOURNAL_TRANSITIONS: usize = 32;
     feature = "agent-subscription-experimental"
 ))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum ProductOnboardingState {
     NotStarted,
     OfficialSignInStarted,
@@ -1253,7 +1334,6 @@ enum ProductOnboardingState {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 impl ProductOnboardingState {
     fn wire(self) -> &'static str {
         match self {
@@ -1389,7 +1469,6 @@ fn load_product_activation(
     feature = "agent-subscription-experimental"
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 struct OnboardingTransition {
     state: ProductOnboardingState,
     generation: String,
@@ -1404,7 +1483,6 @@ struct OnboardingTransition {
     feature = "agent-subscription-experimental"
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 struct OnboardingAttemptJournalV1 {
     transitions: Vec<OnboardingTransition>,
 }
@@ -1413,13 +1491,24 @@ struct OnboardingAttemptJournalV1 {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 impl OnboardingAttemptJournalV1 {
-    /// The store id for `attempt_id`: a domain-separated hash, never the raw attempt id.
+    /// The store id for `attempt_id`: a domain-separated hash, never the raw attempt id. Used for
+    /// the pre-credential (in-flight) phase, keyed by the opaque UI attempt.
     fn journal_store_id(attempt_id: &str) -> String {
+        Self::hashed_store_id("isyncyou-onboarding-attempt-v1", attempt_id)
+    }
+
+    /// The store id for a credential `generation`: a distinct domain-separated hash. Used for the
+    /// durable (post-credential) phase, so startup crash recovery can find the journal by the
+    /// bundle's generation after the in-memory attempt id is gone (§6 windows 2/3, §9 projection).
+    fn journal_store_id_for_generation(generation: &str) -> String {
+        Self::hashed_store_id("isyncyou-onboarding-generation-v1", generation)
+    }
+
+    fn hashed_store_id(domain: &str, value: &str) -> String {
         let d = ring::digest::digest(
             &ring::digest::SHA256,
-            format!("isyncyou-onboarding-attempt-v1:{attempt_id}").as_bytes(),
+            format!("{domain}:{value}").as_bytes(),
         );
         format!(
             "journal:{}",
@@ -1428,6 +1517,10 @@ impl OnboardingAttemptJournalV1 {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         )
+    }
+
+    fn has_state(&self, state: ProductOnboardingState) -> bool {
+        self.transitions.iter().any(|t| t.state == state)
     }
 
     /// Append a transition, keeping only the most recent `MAX_JOURNAL_TRANSITIONS` (compaction).
@@ -1484,7 +1577,6 @@ impl OnboardingAttemptJournalV1 {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 fn onboarding_state_from_wire(wire: &str) -> Option<ProductOnboardingState> {
     use ProductOnboardingState::*;
     Some(match wire {
@@ -1503,35 +1595,33 @@ fn onboarding_state_from_wire(wire: &str) -> Option<ProductOnboardingState> {
     })
 }
 
-/// Persist the onboarding attempt journal (#639) — bounded transitions, authenticated + atomic.
+/// Persist an onboarding journal at a precomputed store id (#639) — bounded, authenticated, atomic.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
-fn store_onboarding_journal(
+fn store_onboarding_journal_at(
     oauth_dir: &Path,
-    attempt_id: &str,
+    store_id: &str,
     journal: &OnboardingAttemptJournalV1,
 ) -> Result<(), String> {
     agent_credential_store(oauth_dir)?
         .put(
             isyncyou_agent::SecretClass::OnboardingAttemptJournal,
-            &OnboardingAttemptJournalV1::journal_store_id(attempt_id),
+            store_id,
             &isyncyou_agent::Secret::new(journal.to_json()),
         )
         .map_err(credential_store_error)
 }
 
-/// Load the onboarding attempt journal (#639) with hard size bounds (`get_bounded`).
+/// Load an onboarding journal at a precomputed store id (#639) with hard size bounds.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
-fn load_onboarding_journal(
+fn load_onboarding_journal_at(
     oauth_dir: &Path,
-    attempt_id: &str,
+    store_id: &str,
 ) -> Option<OnboardingAttemptJournalV1> {
     if !agent_credential_store_exists(oauth_dir) {
         return None;
@@ -1540,12 +1630,119 @@ fn load_onboarding_journal(
     let secret = store
         .get_bounded(
             isyncyou_agent::SecretClass::OnboardingAttemptJournal,
-            &OnboardingAttemptJournalV1::journal_store_id(attempt_id),
+            store_id,
             MAX_JOURNAL_ENVELOPE_BYTES,
             MAX_JOURNAL_PLAINTEXT_BYTES,
         )
         .ok()??;
     OnboardingAttemptJournalV1::from_json(secret.expose())
+}
+
+/// Persist the onboarding attempt journal (#639), keyed by the opaque UI attempt id.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn store_onboarding_journal(
+    oauth_dir: &Path,
+    attempt_id: &str,
+    journal: &OnboardingAttemptJournalV1,
+) -> Result<(), String> {
+    store_onboarding_journal_at(
+        oauth_dir,
+        &OnboardingAttemptJournalV1::journal_store_id(attempt_id),
+        journal,
+    )
+}
+
+/// Load the onboarding attempt journal (#639), keyed by the opaque UI attempt id.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn load_onboarding_journal(
+    oauth_dir: &Path,
+    attempt_id: &str,
+) -> Option<OnboardingAttemptJournalV1> {
+    load_onboarding_journal_at(
+        oauth_dir,
+        &OnboardingAttemptJournalV1::journal_store_id(attempt_id),
+    )
+}
+
+/// The ordered onboarding chain recorded once a successful official OAuth is committed and the
+/// product is activated (#639): official OAuth completed -> credential encrypted -> retained
+/// envelope verified -> default harness removed -> M365 profile activated -> iSyncYou tool
+/// connected -> subscription identity set -> ready.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const ONBOARDING_SUCCESS_CHAIN: [ProductOnboardingState; 8] = [
+    ProductOnboardingState::OfficialOauthCompleted,
+    ProductOnboardingState::CredentialEncrypted,
+    ProductOnboardingState::RetainedEnvelopeVerified,
+    ProductOnboardingState::DefaultHarnessRemoved,
+    ProductOnboardingState::M365ProfileActivated,
+    ProductOnboardingState::IsyncyouToolConnected,
+    ProductOnboardingState::SubscriptionIdentitySet,
+    ProductOnboardingState::Ready,
+];
+
+/// Append an in-flight transition to the attempt-keyed journal (#639). Best-effort: the journal is
+/// evidence/recovery only, never the readiness authority, so a write failure never blocks the flow.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn record_onboarding_attempt_transition(
+    oauth_dir: &Path,
+    attempt_id: &str,
+    state: ProductOnboardingState,
+    error_code: Option<String>,
+) {
+    let mut journal =
+        load_onboarding_journal(oauth_dir, attempt_id).unwrap_or(OnboardingAttemptJournalV1 {
+            transitions: vec![],
+        });
+    journal.push(OnboardingTransition {
+        state,
+        generation: String::new(),
+        error_code,
+    });
+    let _ = store_onboarding_journal(oauth_dir, attempt_id, &journal);
+}
+
+/// Append one or more ordered transitions to the generation-keyed journal (#639), skipping any that
+/// are already present so recovery is idempotent. Best-effort (evidence only).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn record_onboarding_generation_transitions(
+    oauth_dir: &Path,
+    generation: &str,
+    states: &[ProductOnboardingState],
+) {
+    let store_id = OnboardingAttemptJournalV1::journal_store_id_for_generation(generation);
+    let mut journal =
+        load_onboarding_journal_at(oauth_dir, &store_id).unwrap_or(OnboardingAttemptJournalV1 {
+            transitions: vec![],
+        });
+    let mut changed = false;
+    for &state in states {
+        if !journal.has_state(state) {
+            journal.push(OnboardingTransition {
+                state,
+                generation: generation.to_string(),
+                error_code: None,
+            });
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = store_onboarding_journal_at(oauth_dir, &store_id, &journal);
+    }
 }
 
 /// Try to acquire the exclusive product-runtime lock (#639). `Ok(None)` -> another product runtime
@@ -2206,6 +2403,10 @@ struct CodexCallbackContext {
     attempt_id: String,
     cancelled: Arc<AtomicBool>,
     attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
+    /// #639 T8: the shared product-runtime gate. The callback holds it while it writes the
+    /// credential + activation + journal so a concurrent status/turn read cannot observe a
+    /// half-written revision; it is NOT held during the browser sign-in wait.
+    product_runtime_gate: Arc<Mutex<()>>,
 }
 
 #[cfg(any(
@@ -2238,10 +2439,12 @@ fn codex_callback_serve_until(
         attempt_id,
         cancelled,
         attempts,
+        product_runtime_gate,
     } = context;
     if listener.set_nonblocking(true).is_err() {
         return;
     }
+    let mut completed = false;
     while std::time::Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -2285,7 +2488,10 @@ fn codex_callback_serve_until(
                     } else {
                         0
                     };
-                    store_codex_blob(
+                    // #639 T8: hold the shared product-runtime gate across the credential write +
+                    // activation + journal so status/turn cannot read a half-written revision.
+                    let _gate = product_runtime_gate.lock();
+                    let stored = store_codex_blob(
                         &oauth_dir,
                         &CodexStoredCredential {
                             access_token: tok.access_token,
@@ -2301,7 +2507,19 @@ fn codex_callback_serve_until(
                             &isyncyou_agent::CodexConfig::default().model,
                         )
                     })
-                    .is_ok()
+                    .is_ok();
+                    if stored {
+                        let generation = load_product_bundle_meta(&oauth_dir, CODEX_CREDENTIAL_ID)
+                            .map(|meta| meta.generation)
+                            .unwrap_or_default();
+                        record_onboarding_generation_transitions(
+                            &oauth_dir,
+                            &generation,
+                            &ONBOARDING_SUCCESS_CHAIN,
+                        );
+                        completed = true;
+                    }
+                    stored
                 }
                 Err(_) => false,
             }
@@ -2316,6 +2534,16 @@ fn codex_callback_serve_until(
         );
         let _ = stream.write_all(resp.as_bytes());
         break;
+    }
+    // #639 T8: an attempt that ended without completing and was not user-cancelled (timeout /
+    // stale callback / lost verifier) is a terminal, redacted transition — never resumed.
+    if !completed && !cancelled.load(Ordering::Acquire) {
+        record_onboarding_attempt_transition(
+            &oauth_dir,
+            &attempt_id,
+            ProductOnboardingState::ErrorRedacted,
+            Some("interrupted".to_string()),
+        );
     }
     // A stale callback thread may only clear the exact attempt it owns. A newer login
     // therefore cannot be erased by a late timeout/cancellation path.
@@ -2863,9 +3091,17 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             );
             listener
         };
+        // #639 T8: record the official sign-in start into the attempt-keyed journal.
+        record_onboarding_attempt_transition(
+            &self.oauth_dir,
+            &attempt_id,
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
         let oauth_dir = self.oauth_dir.clone();
         let attempts = Arc::clone(&self.oauth_attempts);
         let callback_attempt_id = attempt_id.clone();
+        let product_runtime_gate = Arc::clone(&self.product_runtime_gate);
         std::thread::spawn(move || {
             codex_callback_serve(
                 listener,
@@ -2877,6 +3113,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     attempt_id: callback_attempt_id,
                     cancelled,
                     attempts,
+                    product_runtime_gate,
                 },
             )
         });
@@ -3265,6 +3502,13 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
                     },
                 );
+                // #639 T8: record the official sign-in start into the attempt-keyed journal.
+                record_onboarding_attempt_transition(
+                    &self.oauth_dir,
+                    &attempt_id,
+                    ProductOnboardingState::OfficialSignInStarted,
+                    None,
+                );
                 Ok(isyncyou_webui::AgentOAuthStartResponse {
                     authorize_url: started.authorize_url,
                     attempt_id,
@@ -3284,10 +3528,23 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         match (provider, attempt) {
             ("claude", Some(OAuthAttempt::Claude { state, .. })) => {
                 let _ = self.oauth.cancel(&state);
+                // #639 T8: a cancelled in-flight attempt is a terminal, redacted transition.
+                record_onboarding_attempt_transition(
+                    &self.oauth_dir,
+                    attempt_id,
+                    ProductOnboardingState::ErrorRedacted,
+                    Some("cancelled".to_string()),
+                );
                 Ok(())
             }
             ("codex", Some(OAuthAttempt::Codex { cancelled, .. })) => {
                 cancelled.store(true, Ordering::Release);
+                record_onboarding_attempt_transition(
+                    &self.oauth_dir,
+                    attempt_id,
+                    ProductOnboardingState::ErrorRedacted,
+                    Some("cancelled".to_string()),
+                );
                 Ok(())
             }
             (_, Some(attempt)) => {
@@ -3324,8 +3581,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let token =
             isyncyou_agent::oauth::exchange(&http, &cfg, &code, &verifier, &redirect_uri, &state)
                 .map_err(|_| "oauth_exchange_failed".to_string())?;
-        self.store_token(&token)?;
-        self.set_agent_settings("claude", DEFAULT_MODEL)?;
+        self.commit_claude_oauth_success(&token)?;
         Ok("connected".to_string())
     }
 
@@ -3349,8 +3605,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let token =
             isyncyou_agent::oauth::exchange(&http, &cfg, code, &verifier, &redirect_uri, state)
                 .map_err(|_| "oauth_exchange_failed".to_string())?;
-        self.store_token(&token)?;
-        self.set_agent_settings("claude", DEFAULT_MODEL)?;
+        self.commit_claude_oauth_success(&token)?;
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
 
@@ -7995,6 +8250,7 @@ mod tests {
             attempt_id: attempt_id.clone(),
             cancelled,
             attempts: Arc::clone(&attempts),
+            product_runtime_gate: Arc::new(Mutex::new(())),
         };
         let started = std::time::Instant::now();
 
@@ -8006,6 +8262,178 @@ mod tests {
 
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(!attempts.lock().unwrap().contains_key(&attempt_id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T8 AC1: crash window "after V2-write, before activation" — startup recovery activates the
+    // EXISTING generation without a re-exchange (no new login, same generation).
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn crash_after_credential_write_resumes_activation_without_reexchange() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("crash-window-2");
+        let _ = std::fs::remove_dir_all(&root);
+        // Simulate the crash: only the V2 bundle was written, activation was not.
+        let cred = StoredCredential {
+            access_token: "resumed-token".into(),
+            refresh_token: "resumed-refresh".into(),
+            expires_at_ms: 9_999_999_999_999,
+        };
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(cred.to_json()),
+        )
+        .unwrap();
+        assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
+        // Constructing the agent runs startup recovery.
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let activation = load_product_activation(&root, ProductProviderId::Claude)
+            .expect("activation recovered without re-OAuth");
+        // Same generation => no new login/exchange happened.
+        assert_eq!(activation.credential_generation, meta.generation);
+        assert!(agent.provider_ready(ProductProviderId::Claude));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T8 AC2: crash window 1 (nothing written) recovers nothing and stays not ready.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn crash_before_credential_write_leaves_provider_not_ready() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("crash-window-1");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T8 AC2: crash window 3 (bundle + matching activation, terminal journal entry missing) —
+    // startup recovery appends the missing Ready transition to the generation journal.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn crash_after_activation_recovers_terminal_journal_transition() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("crash-window-3");
+        let _ = std::fs::remove_dir_all(&root);
+        let cred = StoredCredential {
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            expires_at_ms: 9_999_999_999_999,
+        };
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(cred.to_json()),
+        )
+        .unwrap();
+        store_product_activation(
+            &root,
+            ProductProviderId::Claude,
+            &ProductActivationV1 {
+                provider_id: ProductProviderId::Claude.wire().to_string(),
+                credential_generation: meta.generation.clone(),
+                oauth_policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
+                harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
+            },
+        )
+        .unwrap();
+        let store_id =
+            OnboardingAttemptJournalV1::journal_store_id_for_generation(&meta.generation);
+        assert!(load_onboarding_journal_at(&root, &store_id).is_none());
+        let _agent = DaemonAgent::new(Config::default(), root.clone());
+        let journal =
+            load_onboarding_journal_at(&root, &store_id).expect("generation journal recovered");
+        assert!(journal.has_state(ProductOnboardingState::Ready));
+        assert!(journal.has_state(ProductOnboardingState::OfficialOauthCompleted));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T8 AC2: an interrupted attempt (callback timed out, not completed, not cancelled) is a
+    // terminal, redacted transition in the attempt-keyed journal — never resumed.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn interrupted_oauth_attempt_records_error_redacted() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_id = "interrupted-attempt".to_string();
+        let root = apphost_credential_test_root("crash-window-4");
+        let _ = std::fs::remove_dir_all(&root);
+        // The in-flight attempt had recorded its official sign-in start.
+        record_onboarding_attempt_transition(
+            &root,
+            &attempt_id,
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+        let context = CodexCallbackContext {
+            oauth_dir: root.clone(),
+            cfg: isyncyou_agent::oauth::CodexOAuthConfig::default(),
+            verifier: "verifier".into(),
+            want_state: "state".into(),
+            attempt_id: attempt_id.clone(),
+            cancelled,
+            attempts: Arc::clone(&attempts),
+            product_runtime_gate: Arc::new(Mutex::new(())),
+        };
+        codex_callback_serve_until(
+            listener,
+            context,
+            std::time::Instant::now() + std::time::Duration::from_millis(75),
+        );
+        let journal = load_onboarding_journal(&root, &attempt_id).expect("attempt journal");
+        assert!(journal.has_state(ProductOnboardingState::ErrorRedacted));
+        let terminal = journal.transitions.last().unwrap();
+        assert_eq!(terminal.state, ProductOnboardingState::ErrorRedacted);
+        assert_eq!(terminal.error_code.as_deref(), Some("interrupted"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T8 AC3: the product completion path and status read share the product-runtime gate, so a
+    // status/turn read can never observe a half-written credential/activation revision.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn completion_and_status_share_the_product_runtime_gate() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("gate-shared-status");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = Arc::new(DaemonAgent::new(Config::default(), root.clone()));
+        // Hold the same gate the codex callback / commit path holds during a completion.
+        let gate = Arc::clone(&agent.product_runtime_gate);
+        let guard = gate.lock().unwrap();
+        let probe = Arc::clone(&agent);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let status = isyncyou_webui::AgentHandler::status_json(probe.as_ref());
+            let _ = tx.send(status);
+        });
+        // While a completion holds the gate, the status read cannot finish.
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err());
+        drop(guard);
+        // Once released, the status read completes against a single consistent revision.
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
 
