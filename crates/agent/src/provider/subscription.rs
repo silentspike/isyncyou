@@ -312,27 +312,28 @@ impl LlmProvider for SubscriptionProvider {
         history: &[Message],
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<Vec<AssistantBlock>, AgentError> {
-        // Reuse the official Messages shaping; only system blocks + headers + metadata differ.
-        let body = self.request_body(history);
+        // #639: build + attest the exact request for THIS round's history, then send only the
+        // attested object — the transport's product path accepts nothing un-attested.
+        let attested = crate::provider::build_attested_provider_request(
+            crate::provider::HarnessProvider::Claude,
+            self.cfg.messages_url.clone(),
+            self.request_headers(),
+            self.request_body(history),
+        )?;
         let mut state = ClaudeStreamState::default();
         let mut parse_error: Option<AgentError> = None;
-        let response = self.http.post_json_sse(
-            &self.cfg.messages_url,
-            &self.request_headers(),
-            &body,
-            &mut |event| {
-                if parse_error.is_some() {
-                    return false;
-                }
-                let advances_turn = sse_event_advances_turn(&event.data);
-                match apply_claude_sse_event(&event.data, &mut state) {
-                    Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
-                    Ok(None) => {}
-                    Err(e) => parse_error = Some(e),
-                }
-                advances_turn
-            },
-        )?;
+        let response = self.http.post_attested_sse(&attested, &mut |event| {
+            if parse_error.is_some() {
+                return false;
+            }
+            let advances_turn = sse_event_advances_turn(&event.data);
+            match apply_claude_sse_event(&event.data, &mut state) {
+                Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                Ok(None) => {}
+                Err(e) => parse_error = Some(e),
+            }
+            advances_turn
+        })?;
         if response.status == 401 || response.status == 403 {
             return Err(AgentError::Provider(
                 "subscription: unauthorized — connect Claude again".into(),

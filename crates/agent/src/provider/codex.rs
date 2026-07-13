@@ -298,35 +298,31 @@ mod live {
             history: &[Message],
             emit: &mut dyn FnMut(StreamEvent),
         ) -> Result<Vec<AssistantBlock>, AgentError> {
-            let body = build_request(&self.cfg.model, &self.instructions, history);
+            // #639: attest THIS round's request, then send only the attested object.
+            let attested = crate::provider::build_attested_provider_request(
+                crate::provider::HarnessProvider::Codex,
+                self.cfg.responses_url.clone(),
+                self.request_headers(),
+                build_request(&self.cfg.model, &self.instructions, history),
+            )?;
             let mut text = String::new();
             let mut tools: Vec<CodexToolArgs> = Vec::new();
             let mut usage = Usage::default();
             let mut failure: Option<String> = None;
             let mut parse_error: Option<AgentError> = None;
-            let response = self.http.post_json_sse(
-                &self.cfg.responses_url,
-                &self.request_headers(),
-                &body,
-                &mut |event| {
-                    if parse_error.is_some() {
-                        return false;
-                    }
-                    let advances_turn = sse_event_advances_turn(&event.data);
-                    match apply_sse_event(
-                        &event.data,
-                        &mut text,
-                        &mut tools,
-                        &mut usage,
-                        &mut failure,
-                    ) {
-                        Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
-                        Ok(None) => {}
-                        Err(e) => parse_error = Some(e),
-                    }
-                    advances_turn
-                },
-            )?;
+            let response = self.http.post_attested_sse(&attested, &mut |event| {
+                if parse_error.is_some() {
+                    return false;
+                }
+                let advances_turn = sse_event_advances_turn(&event.data);
+                match apply_sse_event(&event.data, &mut text, &mut tools, &mut usage, &mut failure)
+                {
+                    Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                    Ok(None) => {}
+                    Err(e) => parse_error = Some(e),
+                }
+                advances_turn
+            })?;
             if response.status == 401 || response.status == 403 {
                 return Err(AgentError::Provider(
                     "codex: unauthorized — connect ChatGPT again".into(),

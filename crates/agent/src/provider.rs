@@ -2,6 +2,11 @@
 //! [`FakeProvider`] is the deterministic CI provider (no real LLM tokens).
 
 use crate::tool::ToolAction;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+use crate::AgentError;
 use std::collections::BTreeMap;
 
 /// Why a turn stream reached its terminal `done` event.
@@ -253,6 +258,279 @@ pub mod openai;
 pub mod subscription;
 pub use fake::FakeProvider;
 
+// ------------------------------------------------------------------ #639 T6: runtime attestation
+
+/// The iSyncYou harness contract version the runtime attestation enforces (#639). Bound into the
+/// product activation record so a credential activated under an older contract cannot read as ready.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+pub const HARNESS_CONTRACT_VERSION: u32 = 1;
+
+/// Which provider's positive harness allowlist to enforce.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessProvider {
+    Claude,
+    Codex,
+}
+
+/// A request the transport is allowed to send (#639). It can ONLY be produced by
+/// [`build_attested_provider_request`], which validates it against the positive harness allowlist,
+/// so a caller cannot hand the transport an un-attested `(Value, headers)`. It is immutable: any
+/// header/body change requires building — and re-attesting — a fresh request.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone)]
+pub struct AttestedProviderRequest {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl AttestedProviderRequest {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+    pub fn body(&self) -> &serde_json::Value {
+        &self.body
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn harness_violation(msg: &str) -> AgentError {
+    AgentError::Provider(format!("harness attestation failed: {msg}"))
+}
+
+/// The default-client components that must never appear anywhere in a product request.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const FORBIDDEN_HARNESS_KEYS: &[&str] = &[
+    "client_context",
+    "commands",
+    "cwd",
+    "default_system_prompt",
+    "filesystem",
+    "history",
+    "mcp",
+    "mcp_servers",
+    "memories",
+    "plugins",
+    "rules",
+    "shell",
+    "skills",
+    "system_prompt",
+    "workspace",
+];
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn reject_forbidden_components(value: &serde_json::Value) -> Result<(), AgentError> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, nested) in object {
+                if FORBIDDEN_HARNESS_KEYS.contains(&key.as_str()) {
+                    return Err(harness_violation(&format!(
+                        "default-client component present: {key}"
+                    )));
+                }
+                reject_forbidden_components(nested)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                reject_forbidden_components(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The request `tools` must be exactly one tool named `isyncyou`.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn attest_single_isyncyou_tool(tools: Option<&serde_json::Value>) -> Result<(), AgentError> {
+    let arr = tools
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| harness_violation("tools must be an array"))?;
+    if arr.len() != 1 {
+        return Err(harness_violation("exactly one tool is allowed"));
+    }
+    let name = arr[0]
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or_default();
+    if name != crate::tool::TOOL_NAME {
+        return Err(harness_violation("the only tool must be `isyncyou`"));
+    }
+    Ok(())
+}
+
+/// Every mandatory header name (case-insensitive) must be present.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn require_headers(headers: &[(String, String)], required: &[&str]) -> Result<(), AgentError> {
+    for name in required {
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            return Err(harness_violation(&format!(
+                "mandatory header missing: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a provider request against the positive harness allowlist — exact top-level keys,
+/// exactly one `isyncyou` tool, the retained envelope invariants (Claude billing block first,
+/// Codex `store:false`), streaming, and all mandatory headers. No default-client component may appear.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn attest_product_harness(
+    provider: HarnessProvider,
+    headers: &[(String, String)],
+    body: &serde_json::Value,
+) -> Result<(), AgentError> {
+    reject_forbidden_components(body)?;
+    let obj = body
+        .as_object()
+        .ok_or_else(|| harness_violation("request body must be an object"))?;
+    let keys: std::collections::BTreeSet<&str> = obj.keys().map(|k| k.as_str()).collect();
+    let stream_true = obj.get("stream") == Some(&serde_json::Value::Bool(true));
+    attest_single_isyncyou_tool(obj.get("tools"))?;
+    match provider {
+        HarnessProvider::Claude => {
+            let allowed: std::collections::BTreeSet<&str> = [
+                "max_tokens",
+                "messages",
+                "metadata",
+                "model",
+                "stream",
+                "system",
+                "tools",
+            ]
+            .into_iter()
+            .collect();
+            if keys != allowed {
+                return Err(harness_violation(
+                    "claude request has non-allowlisted top-level keys",
+                ));
+            }
+            let system = obj
+                .get("system")
+                .and_then(|s| s.as_array())
+                .ok_or_else(|| harness_violation("claude system must be a block array"))?;
+            if system.len() != 2 {
+                return Err(harness_violation(
+                    "claude system must be the billing block + one prompt",
+                ));
+            }
+            let first = system
+                .first()
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+            if !first.starts_with("x-anthropic-billing-header") {
+                return Err(harness_violation(
+                    "claude billing block must be first and unchanged",
+                ));
+            }
+            if !stream_true {
+                return Err(harness_violation("claude stream must be true"));
+            }
+            require_headers(
+                headers,
+                &[
+                    "authorization",
+                    "anthropic-version",
+                    "anthropic-beta",
+                    "content-type",
+                    "accept",
+                ],
+            )?;
+        }
+        HarnessProvider::Codex => {
+            let allowed: std::collections::BTreeSet<&str> = [
+                "input",
+                "instructions",
+                "model",
+                "parallel_tool_calls",
+                "store",
+                "stream",
+                "tool_choice",
+                "tools",
+            ]
+            .into_iter()
+            .collect();
+            if keys != allowed {
+                return Err(harness_violation(
+                    "codex request has non-allowlisted top-level keys",
+                ));
+            }
+            if obj.get("store") != Some(&serde_json::Value::Bool(false)) {
+                return Err(harness_violation("codex store must be false"));
+            }
+            if !stream_true {
+                return Err(harness_violation("codex stream must be true"));
+            }
+            require_headers(
+                headers,
+                &[
+                    "authorization",
+                    "chatgpt-account-id",
+                    "openai-beta",
+                    "originator",
+                    "accept",
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Build + attest the exact request that will be sent this round (#639). `next()` calls this per
+/// round with its **current history**, so what the transport sends is always freshly attested. On
+/// any violation it returns `Err` and no request is produced.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+pub fn build_attested_provider_request(
+    provider: HarnessProvider,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+) -> Result<AttestedProviderRequest, AgentError> {
+    attest_product_harness(provider, &headers, &body)?;
+    Ok(AttestedProviderRequest { url, headers, body })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +780,268 @@ mod tests {
                 "tool_choice".into(),
                 "tools".into(),
             ])
+        );
+    }
+
+    // ---------------------------------------------------------------- #639 T6: attestation tests
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn valid_claude_request(message: &str) -> (String, Vec<(String, String)>, serde_json::Value) {
+        let history = [crate::turn::Message::user(message)];
+        let provider = subscription::SubscriptionProvider::new(
+            "claude-oauth-token",
+            "claude-test",
+            "iSyncYou controlled system prompt",
+            subscription::SubscriptionConfig {
+                account_uuid: "account-identity".into(),
+                device_id: "device-identity".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (
+            "https://api.anthropic.example/v1/messages".into(),
+            provider.request_headers(),
+            provider.request_body(&history),
+        )
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn valid_codex_request(message: &str) -> (String, Vec<(String, String)>, serde_json::Value) {
+        let history = [crate::turn::Message::user(message)];
+        let provider = codex::CodexProvider::new(
+            "codex-oauth-token",
+            "iSyncYou controlled system prompt",
+            codex::CodexConfig {
+                account_id: "codex-account-identity".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (
+            "https://api.openai.example/v1/responses".into(),
+            provider.request_headers(),
+            codex::build_request("codex-test", "iSyncYou controlled system prompt", &history),
+        )
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn every_provider_round_attests_its_current_history() {
+        // Two rounds with different histories each produce a freshly attested request whose body
+        // reflects THAT round's history — attestation is not a one-time static gate.
+        for provider_kind in [HarnessProvider::Claude, HarnessProvider::Codex] {
+            for message in ["first round request", "second round request"] {
+                let (url, headers, body) = match provider_kind {
+                    HarnessProvider::Claude => valid_claude_request(message),
+                    HarnessProvider::Codex => valid_codex_request(message),
+                };
+                let attested =
+                    build_attested_provider_request(provider_kind, url, headers, body).unwrap();
+                assert!(
+                    serde_json::to_string(attested.body())
+                        .unwrap()
+                        .contains(message),
+                    "{provider_kind:?} attested body must carry the current round's history"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn transport_accepts_only_attested_provider_request() {
+        // The only way to obtain an AttestedProviderRequest (the sole value the transport accepts)
+        // is through build_attested_provider_request, which validates the plan. A conforming plan
+        // yields one whose accessors expose exactly the attested url/headers/body; a non-conforming
+        // plan yields none.
+        let (url, headers, body) = valid_claude_request("controlled user request");
+        let attested = build_attested_provider_request(
+            HarnessProvider::Claude,
+            url.clone(),
+            headers.clone(),
+            body.clone(),
+        )
+        .unwrap();
+        assert_eq!(attested.url(), url);
+        assert_eq!(attested.headers(), headers.as_slice());
+        assert_eq!(attested.body(), &body);
+
+        let mut forbidden = body;
+        forbidden
+            .as_object_mut()
+            .unwrap()
+            .insert("mcp_servers".into(), json!(["default-client-mcp"]));
+        assert!(
+            build_attested_provider_request(HarnessProvider::Claude, url, headers, forbidden)
+                .is_err(),
+            "transport must not receive an attested request for a non-conforming plan"
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn attestation_cannot_be_reused_after_header_or_body_mutation() {
+        // AttestedProviderRequest is immutable (private fields, no setters): any header/body change
+        // forces a rebuild, and the rebuild re-attests — a mutated plan cannot be re-attested.
+        let (url, headers, body) = valid_codex_request("controlled user request");
+        build_attested_provider_request(
+            HarnessProvider::Codex,
+            url.clone(),
+            headers.clone(),
+            body.clone(),
+        )
+        .expect("baseline plan attests");
+
+        // Body mutation: store:false -> true (retained-envelope invariant broken).
+        let mut mutated_body = body.clone();
+        mutated_body
+            .as_object_mut()
+            .unwrap()
+            .insert("store".into(), json!(true));
+        assert!(
+            build_attested_provider_request(
+                HarnessProvider::Codex,
+                url.clone(),
+                headers.clone(),
+                mutated_body,
+            )
+            .is_err(),
+            "mutated body must fail re-attestation"
+        );
+
+        // Header mutation: drop the mandatory authorization header.
+        let mutated_headers: Vec<(String, String)> = headers
+            .into_iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("authorization"))
+            .collect();
+        assert!(
+            build_attested_provider_request(HarnessProvider::Codex, url, mutated_headers, body)
+                .is_err(),
+            "mutated headers must fail re-attestation"
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn attestation_rejects_each_claude_field_mutation() {
+        let base = || valid_claude_request("controlled user request");
+        let attest = |headers: Vec<(String, String)>, body: serde_json::Value| {
+            build_attested_provider_request(
+                HarnessProvider::Claude,
+                "https://api.anthropic.example/v1/messages".into(),
+                headers,
+                body,
+            )
+        };
+
+        // Extra top-level key.
+        let (_, h, mut b) = base();
+        b.as_object_mut().unwrap().insert("extra".into(), json!(1));
+        assert!(attest(h, b).is_err(), "extra top-level key must fail");
+
+        // Billing block no longer first.
+        let (_, h, mut b) = base();
+        let sys = b["system"].as_array().unwrap().clone();
+        b["system"] = json!([sys[1].clone(), sys[0].clone()]);
+        assert!(attest(h, b).is_err(), "reordered system blocks must fail");
+
+        // System length != 2 (inject a third block).
+        let (_, h, mut b) = base();
+        b["system"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"text","text":"smuggled"}));
+        assert!(attest(h, b).is_err(), "extra system block must fail");
+
+        // stream not true.
+        let (_, h, mut b) = base();
+        b["stream"] = json!(false);
+        assert!(attest(h, b).is_err(), "stream:false must fail");
+
+        // More than one tool.
+        let (_, h, mut b) = base();
+        let tool = b["tools"][0].clone();
+        b["tools"] = json!([tool.clone(), tool]);
+        assert!(attest(h, b).is_err(), "second tool must fail");
+
+        // Wrong tool name.
+        let (_, h, mut b) = base();
+        b["tools"][0]["name"] = json!("not-isyncyou");
+        assert!(attest(h, b).is_err(), "renamed tool must fail");
+
+        // Missing mandatory header.
+        let (_, h, b) = base();
+        let stripped: Vec<_> = h
+            .into_iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("anthropic-version"))
+            .collect();
+        assert!(attest(stripped, b).is_err(), "missing header must fail");
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn attestation_rejects_each_codex_field_mutation() {
+        let base = || valid_codex_request("controlled user request");
+        let attest = |headers: Vec<(String, String)>, body: serde_json::Value| {
+            build_attested_provider_request(
+                HarnessProvider::Codex,
+                "https://api.openai.example/v1/responses".into(),
+                headers,
+                body,
+            )
+        };
+
+        // store:false -> true.
+        let (_, h, mut b) = base();
+        b["store"] = json!(true);
+        assert!(attest(h, b).is_err(), "store:true must fail");
+
+        // Extra top-level key.
+        let (_, h, mut b) = base();
+        b.as_object_mut().unwrap().insert("extra".into(), json!(1));
+        assert!(attest(h, b).is_err(), "extra top-level key must fail");
+
+        // stream not true.
+        let (_, h, mut b) = base();
+        b["stream"] = json!(false);
+        assert!(attest(h, b).is_err(), "stream:false must fail");
+
+        // Wrong tool name.
+        let (_, h, mut b) = base();
+        b["tools"][0]["name"] = json!("not-isyncyou");
+        assert!(attest(h, b).is_err(), "renamed tool must fail");
+
+        // Missing mandatory account header.
+        let (_, h, b) = base();
+        let stripped: Vec<_> = h
+            .into_iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("chatgpt-account-id"))
+            .collect();
+        assert!(
+            attest(stripped, b).is_err(),
+            "missing account header must fail"
         );
     }
 

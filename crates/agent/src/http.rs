@@ -402,6 +402,22 @@ mod live {
 
         /// POST a JSON body and parse the response as Server-Sent Events. Successful
         /// response bodies are streamed to `on_event` and not retained.
+        /// The product entry point (#639): send a fully **attested** provider request. Only an
+        /// [`AttestedProviderRequest`](crate::provider::AttestedProviderRequest) — built and
+        /// validated by `build_attested_provider_request` — can be sent this way, so an un-attested
+        /// `(url, headers, body)` cannot reach the backend through the product path.
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        pub fn post_attested_sse(
+            &self,
+            request: &crate::provider::AttestedProviderRequest,
+            on_event: &mut dyn FnMut(SseEvent) -> bool,
+        ) -> Result<ProviderHttpResponse, AgentError> {
+            self.post_json_sse(request.url(), request.headers(), request.body(), on_event)
+        }
+
         pub fn post_json_sse(
             &self,
             url: &str,
