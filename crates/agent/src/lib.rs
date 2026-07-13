@@ -98,6 +98,14 @@ pub use provider::codex::{CodexConfig, CodexProvider};
 pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
 #[cfg(feature = "byo-api-providers")]
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+pub use provider::{
+    attest_static_product_harness, build_attested_provider_request, AttestedProviderRequest,
+    HarnessProvider, HARNESS_CONTRACT_VERSION,
+};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
 

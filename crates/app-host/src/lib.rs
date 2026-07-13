@@ -193,19 +193,6 @@ const CLAUDE_MODELS: &[(&str, &str)] = &[
 ))]
 const CODEX_MODELS: &[(&str, &str)] = &[("gpt-5.5", "GPT-5.5"), ("gpt-5.4", "GPT-5.4")];
 
-/// A turn-provider builder (a `DaemonAgent` method): given the system prompt, return a
-/// boxed provider if its credentials are present.
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
-type ProviderBuilder = fn(
-    &DaemonAgent,
-    &str,
-) -> Result<
-    Option<Box<dyn isyncyou_agent::LlmProvider + Send>>,
-    ProviderCredentialResolutionError,
->;
 #[cfg(test)]
 type TestProviderScript = Arc<Mutex<Option<Vec<Vec<isyncyou_agent::AssistantBlock>>>>>;
 
@@ -553,6 +540,31 @@ fn reap_oauth_attempts(attempts: &mut HashMap<String, OAuthAttempt>) {
     });
 }
 
+/// #639 T7: the typed reason a turn was refused before any turn state was created. It maps to a
+/// closed wire code the router turns into a specific HTTP status (never a blanket 500).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentStartTurnError {
+    /// The selected product provider is not host-verified ready (no valid activated credential),
+    /// and no experimental fallback applies. Closed wire code `product_not_ready` -> HTTP 409.
+    ProductNotReady,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl AgentStartTurnError {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::ProductNotReady => "product_not_ready",
+        }
+    }
+}
+
 /// The in-app agent handler (S-AG.6/#621). Drives a real turn: the product Claude/Codex
 /// OAuth provider path when the user has connected an account, otherwise a deterministic
 /// "not connected" message. Owns the stream hub + pending-action registry, so the model
@@ -569,6 +581,18 @@ pub struct DaemonAgent {
     last_usage: Arc<Mutex<Option<isyncyou_agent::Usage>>>,
     credential_now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
     credential_refresh_gate: Mutex<()>,
+    /// #639: the single in-process product-runtime gate. One hold spans selection + model +
+    /// refresh + activation-check + attestation + provider construction (and the status readiness
+    /// read + the selection write), so status and a turn can never observe credential and
+    /// activation from different revisions. Lock order: this gate BEFORE `credential_refresh_gate`.
+    #[cfg_attr(
+        not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )),
+        allow(dead_code)
+    )]
+    product_runtime_gate: Mutex<()>,
     seq: AtomicU64,
     /// Directory holding the app OAuth credential store and an optional local
     /// `agent-oauth.json` policy assertion. Product builds reject any tuple that differs
@@ -632,6 +656,7 @@ impl DaemonAgent {
             last_usage: Arc::new(Mutex::new(None)),
             credential_now_ms: Arc::new(now_ms),
             credential_refresh_gate: Mutex::new(()),
+            product_runtime_gate: Mutex::new(()),
             seq: AtomicU64::new(0),
             oauth_dir,
             #[cfg(any(
@@ -713,9 +738,10 @@ impl DaemonAgent {
         self.streams.lock().unwrap().len()
     }
 
-    /// Pick the turn provider: a connected product OAuth provider when a token is present,
-    /// otherwise a deterministic "not connected" message so the UI still streams a clear
-    /// instruction instead of erroring.
+    /// Test-only provider-SELECTION probe (#639 T7): resolve the selected provider directly from
+    /// stored credentials, without the product-runtime readiness gate. Production turns go through
+    /// [`resolve_turn_provider`] / [`product_runtime_gate`]; this stays for selection unit tests.
+    #[cfg(test)]
     fn build_turn_provider(&self, system: &str) -> Box<dyn isyncyou_agent::LlmProvider + Send> {
         #[cfg(test)]
         if let Some(script) = &self.test_provider_script {
@@ -728,20 +754,16 @@ impl DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         {
-            // Provider preference comes from the in-app switcher (persisted), falling back
-            // to the env override; either falls back to the other if only one is connected.
-            let prefer_codex = self.agent_settings().0 == "codex";
-            let (first, second): (ProviderBuilder, ProviderBuilder) = if prefer_codex {
-                (Self::try_codex_provider, Self::try_subscription_provider)
-            } else {
-                (Self::try_subscription_provider, Self::try_codex_provider)
+            // #639: the switcher selection drives which provider is built; there is NO
+            // cross-provider fallback (an activated non-selected provider is never silently
+            // substituted, fixing the old "falls back to the other" behavior).
+            let selected = self.agent_settings().0;
+            let built = match ProductProviderId::parse(&selected) {
+                Some(ProductProviderId::Codex) => self.try_codex_provider(system),
+                Some(ProductProviderId::Claude) => self.try_subscription_provider(system),
+                None => Ok(None),
             };
-            match first(self, system) {
-                Ok(Some(provider)) => return provider,
-                Err(_) => return credential_resolution_error_provider(),
-                Ok(None) => {}
-            }
-            match second(self, system) {
+            match built {
                 Ok(Some(provider)) => return provider,
                 Err(_) => return credential_resolution_error_provider(),
                 Ok(None) => {}
@@ -759,6 +781,183 @@ impl DaemonAgent {
                     .to_string(),
             ),
         ]]))
+    }
+
+    /// #639 T7: resolve the provider a turn will use, applying the product-runtime gate. A test
+    /// script (CI) and the no-product-feature build bypass the gate with a deterministic provider;
+    /// the product build returns the closed error code on not-ready so `start_turn` can reject the
+    /// turn before creating any turn state.
+    fn resolve_turn_provider(
+        &self,
+        system: &str,
+    ) -> Result<Box<dyn isyncyou_agent::LlmProvider + Send>, String> {
+        #[cfg(test)]
+        if let Some(script) = &self.test_provider_script {
+            if let Some(script) = script.lock().unwrap().take() {
+                return Ok(Box::new(isyncyou_agent::FakeProvider::new(script)));
+            }
+        }
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            self.product_runtime_gate(system)
+                .map_err(|e| e.wire().to_string())
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = system;
+            Ok(Box::new(isyncyou_agent::FakeProvider::new(vec![vec![
+                isyncyou_agent::AssistantBlock::Text(
+                    "The AI assistant isn't connected yet — open the Assistant tab and connect \
+                     your Claude account, then try again."
+                        .to_string(),
+                ),
+            ]])))
+        }
+    }
+
+    /// #639 T7: per-provider PRODUCT readiness, DECOUPLED from selection. `true` only when a valid
+    /// **Active** V2 bundle is present (not needs-refresh / invalid / absent / experimental) AND a
+    /// durable `ProductActivationV1` matches its credential generation + the official policy
+    /// fingerprint + the harness contract version AND the shipped static harness still attests.
+    /// An experimental local-CLI credential can never satisfy this (it has no bundle/activation).
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn provider_ready(&self, provider: ProductProviderId) -> bool {
+        let (present_valid, credential_id) = match provider {
+            ProductProviderId::Claude => (
+                matches!(
+                    self.claude_product_credential_state(),
+                    ProductCredentialState::PresentValid(_)
+                ),
+                SUBSCRIPTION_CREDENTIAL_ID,
+            ),
+            ProductProviderId::Codex => (
+                matches!(
+                    self.codex_product_credential_state(),
+                    ProductCredentialState::PresentValid(_)
+                ),
+                CODEX_CREDENTIAL_ID,
+            ),
+        };
+        if !present_valid {
+            return false;
+        }
+        let generation = match load_product_bundle_meta(&self.oauth_dir, credential_id) {
+            Some(meta) if meta.lifecycle == CredentialLifecycle::Active => meta.generation,
+            _ => return false,
+        };
+        let activation = match load_product_activation(&self.oauth_dir, provider) {
+            Some(activation) => activation,
+            None => return false,
+        };
+        if !activation.matches(
+            provider,
+            &generation,
+            &oauth_policy_fingerprint(provider),
+            isyncyou_agent::HARNESS_CONTRACT_VERSION,
+        ) {
+            return false;
+        }
+        isyncyou_agent::attest_static_product_harness(harness_provider_for(provider)).is_ok()
+    }
+
+    /// #639 T7 / #627: build a provider from the EXPERIMENTAL local-CLI credential only. Compiled
+    /// solely under the experimental opt-in, it never reads the product store and only resolves on
+    /// an `Absent` product state (a present-but-invalid bundle fails closed). It never sets product
+    /// readiness/activation — it exists so the experimental turn stays available, walled off.
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn try_experimental_only_provider(
+        &self,
+        provider: ProductProviderId,
+        system: &str,
+    ) -> Option<Box<dyn isyncyou_agent::LlmProvider + Send>> {
+        match provider {
+            ProductProviderId::Claude => {
+                if !matches!(
+                    self.claude_product_credential_state(),
+                    ProductCredentialState::Absent
+                ) {
+                    return None;
+                }
+                let credential = self.experimental_claude_credential().ok()??;
+                let provider = isyncyou_agent::SubscriptionProvider::new(
+                    credential.access_token,
+                    self.model_for("claude"),
+                    system,
+                    self.subscription_config(),
+                )
+                .ok()?;
+                Some(Box::new(provider))
+            }
+            ProductProviderId::Codex => {
+                if !matches!(
+                    self.codex_product_credential_state(),
+                    ProductCredentialState::Absent
+                ) {
+                    return None;
+                }
+                let credential = self.experimental_codex_credential().ok()??;
+                let cfg = isyncyou_agent::CodexConfig {
+                    account_id: credential.account_id,
+                    model: self.model_for("codex"),
+                    ..Default::default()
+                };
+                let provider =
+                    isyncyou_agent::CodexProvider::new(credential.access_token, system, cfg)
+                        .ok()?;
+                Some(Box::new(provider))
+            }
+        }
+    }
+
+    /// #639 T7: the single atomic product-runtime gate for building a turn's provider. One hold of
+    /// `product_runtime_gate` spans selection + readiness (activation + attestation) + provider
+    /// construction — status and a turn can never read credential and activation from different
+    /// revisions, and there is no second settings/credential read. It runs BEFORE any turn-id /
+    /// stream-slot / archive resolution: a rejected turn creates none of that state. The PRODUCT
+    /// path uses ONLY the selected provider and ONLY when host-verified ready (no fallback). #627
+    /// experimental is a separate, compiled-in-only path that never confers product readiness.
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn product_runtime_gate(
+        &self,
+        system: &str,
+    ) -> Result<Box<dyn isyncyou_agent::LlmProvider + Send>, AgentStartTurnError> {
+        let _gate = self
+            .product_runtime_gate
+            .lock()
+            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+        // Corrupt/unknown selection fails closed — never a default/alternative provider.
+        let selected = match ProductProviderId::parse(&self.agent_settings().0) {
+            Some(id) => id,
+            None => return Err(AgentStartTurnError::ProductNotReady),
+        };
+        if self.provider_ready(selected) {
+            let built = match selected {
+                ProductProviderId::Claude => self.try_subscription_provider(system),
+                ProductProviderId::Codex => self.try_codex_provider(system),
+            };
+            return match built {
+                Ok(Some(provider)) => Ok(provider),
+                // Ready said yes but construction raced/failed — fail closed, never fall back.
+                _ => Err(AgentStartTurnError::ProductNotReady),
+            };
+        }
+        #[cfg(feature = "agent-subscription-experimental")]
+        if let Some(provider) = self.try_experimental_only_provider(selected, system) {
+            return Ok(provider);
+        }
+        Err(AgentStartTurnError::ProductNotReady)
     }
 }
 
@@ -1083,7 +1282,6 @@ impl ProductOnboardingState {
     feature = "agent-subscription-experimental"
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 struct ProductActivationV1 {
     provider_id: String,
     credential_generation: String,
@@ -1095,7 +1293,6 @@ struct ProductActivationV1 {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 impl ProductActivationV1 {
     fn activation_store_id(provider: ProductProviderId) -> String {
         format!("activation:{}", provider.wire())
@@ -1147,7 +1344,6 @@ impl ProductActivationV1 {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 fn store_product_activation(
     oauth_dir: &Path,
     provider: ProductProviderId,
@@ -1167,7 +1363,6 @@ fn store_product_activation(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[allow(dead_code)]
 fn load_product_activation(
     oauth_dir: &Path,
     provider: ProductProviderId,
@@ -1478,23 +1673,32 @@ impl std::fmt::Display for ProviderCredentialResolutionError {
     }
 }
 
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
+#[cfg(all(
+    test,
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
 ))]
 fn credential_resolution_error_provider() -> Box<dyn isyncyou_agent::LlmProvider + Send> {
     Box::new(CredentialResolutionErrorProvider)
 }
 
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
+#[cfg(all(
+    test,
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
 ))]
 struct CredentialResolutionErrorProvider;
 
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
+#[cfg(all(
+    test,
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
 ))]
 impl isyncyou_agent::LlmProvider for CredentialResolutionErrorProvider {
     fn name(&self) -> &str {
@@ -1824,12 +2028,11 @@ fn load_agent_credential_blob(
     feature = "agent-subscription-experimental"
 ))]
 fn store_codex_blob(oauth_dir: &Path, cred: &CodexStoredCredential) -> Result<(), String> {
-    // A bare `store_codex_blob` is a fresh login: mint a new generation (#639).
-    store_codex_bundle(
-        oauth_dir,
-        cred,
-        &ProductBundleMeta::fresh(ProductProviderId::Codex),
-    )
+    // A bare `store_codex_blob` is a fresh login: mint a new generation (#639), then activate the
+    // product path for that generation (attest -> durable ProductActivationV1).
+    let meta = ProductBundleMeta::fresh(ProductProviderId::Codex);
+    store_codex_bundle(oauth_dir, cred, &meta)?;
+    activate_product(oauth_dir, ProductProviderId::Codex, &meta.generation)
 }
 
 /// Persist a Codex credential with explicit V2 metadata (#639) — used by refresh to preserve the
@@ -1844,6 +2047,45 @@ fn store_codex_bundle(
     meta: &ProductBundleMeta,
 ) -> Result<(), String> {
     store_agent_credential_blob(oauth_dir, CODEX_CREDENTIAL_ID, meta.to_blob(cred.to_json()))
+}
+
+/// Map a product provider to the agent crate's harness attestation discriminant (#639).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn harness_provider_for(provider: ProductProviderId) -> isyncyou_agent::HarnessProvider {
+    match provider {
+        ProductProviderId::Claude => isyncyou_agent::HarnessProvider::Claude,
+        ProductProviderId::Codex => isyncyou_agent::HarnessProvider::Codex,
+    }
+}
+
+/// #639: turn a freshly persisted, successful-OAuth credential into product readiness. This is the
+/// `attestation -> ProductActivation` step of the onboarding contract: attest the SHIPPED harness
+/// against `HARNESS_CONTRACT_VERSION`, then persist a durable `ProductActivationV1` binding this
+/// credential `generation` to the official policy fingerprint and the harness contract. A harness
+/// that has drifted from the contract refuses activation (fail-closed) — the provider stays not
+/// ready. A refresh keeps the same generation and does NOT re-activate (the activation still
+/// matches); only a fresh login mints a new generation and activates it.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn activate_product(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+    generation: &str,
+) -> Result<(), String> {
+    isyncyou_agent::attest_static_product_harness(harness_provider_for(provider))
+        .map_err(|_| "harness_attestation_failed".to_string())?;
+    let activation = ProductActivationV1 {
+        provider_id: provider.wire().to_string(),
+        credential_generation: generation.to_string(),
+        oauth_policy_fingerprint: oauth_policy_fingerprint(provider),
+        harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
+    };
+    store_product_activation(oauth_dir, provider, &activation)
 }
 
 /// Load the V2 metadata for a persisted product credential (#639); `None` if absent or legacy.
@@ -2130,8 +2372,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// Persist a subscription credential (access + refresh + expiry) at rest under a
     /// device-local key, so the daemon can refresh the access token itself.
     fn store_credential(&self, cred: &StoredCredential) -> Result<(), String> {
-        // A bare `store_credential` is a fresh login: mint a new generation (#639).
-        self.store_claude_bundle(cred, &ProductBundleMeta::fresh(ProductProviderId::Claude))
+        // A bare `store_credential` is a fresh login: mint a new generation (#639), then activate
+        // the product path for that generation (attest -> durable ProductActivationV1).
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude);
+        self.store_claude_bundle(cred, &meta)?;
+        activate_product(&self.oauth_dir, ProductProviderId::Claude, &meta.generation)
     }
 
     /// Persist a Claude credential with explicit V2 metadata (#639) — used by refresh to preserve
@@ -2776,6 +3021,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     }
 
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String> {
+        // #639 T7: resolve + gate the provider BEFORE any turn-id / stream-slot / archive
+        // resolution. A not-ready product turn returns the closed error here and creates no turn
+        // state, no stream, no archive, and makes no provider call.
+        let system = format!("{AGENT_SYSTEM_PROMPT}\n\nActive account: {account}.");
+        let mut provider = self.resolve_turn_provider(&system)?;
+
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let turn_id = format!("turn-{n}-{}", unix_now());
         let rx_events = self.hub.open(&turn_id, 256);
@@ -2800,17 +3051,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 },
             );
         }
-        // Build the provider on this thread (it may read the local token), then run the
-        // turn on a background thread streaming events into the hub.
+        // Run the turn on a background thread streaming events into the hub.
         let hub = self.hub.clone();
         let tid = turn_id.clone();
-        let system = format!("{AGENT_SYSTEM_PROMPT}\n\nActive account: {account}.");
         let prompt = prompt.to_string();
         // Resolve the account's archive root now (reads config on this thread), so the
         // turn thread can build the real store-backed retrieval executor for it.
         let account_id = account.to_string();
         let archive_root = self.archive_root_for(&account_id);
-        let mut provider = self.build_turn_provider(&system);
         let pending = self.pending.clone();
         let last_usage = Arc::clone(&self.last_usage);
         std::thread::spawn(move || {
@@ -3121,25 +3369,31 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let codex_state = self
             .product_credential_status("codex")
             .unwrap_or("reconnect_required");
-        let claude = claude_state == "connected";
-        let codex = codex_state == "connected";
         let reconnect_required =
             claude_state == "reconnect_required" || codex_state == "reconnect_required";
-        // #639 owns the visible onboarding state machine. Keep its readiness input
-        // origin-aware here so an experimental local credential can never qualify.
-        let _product_harness_readiness = claude || codex;
         let (sel_provider, _) = self.agent_settings();
-        // Keep a configured selected provider effective while it needs refresh/reconnect so
-        // the UI never refreshes a different connected provider by accident. If the selection
-        // is absent, fall back to whichever product provider is connected (Claude preferred).
-        let provider = if sel_provider == "codex" && codex_state != "unconfigured" {
-            "codex"
-        } else if (sel_provider == "claude" && claude_state != "unconfigured") || claude {
-            "claude"
-        } else if codex {
-            "codex"
-        } else {
-            ""
+        // #639 T7: readiness is host-verified (valid Active bundle + a matching durable activation
+        // + a passing static harness attestation), NOT credential presence, and is decoupled from
+        // selection. A held product-runtime gate gives a snapshot consistent with a concurrent
+        // turn build. An experimental local credential can never qualify.
+        let (claude, codex) = {
+            let _gate = self.product_runtime_gate.lock();
+            (
+                self.provider_ready(ProductProviderId::Claude),
+                self.provider_ready(ProductProviderId::Codex),
+            )
+        };
+        // The selected provider alone drives `connected` + `provider`; there is no fall-back to
+        // the other provider, and an unparseable selection reads not-connected (fail-closed).
+        let selected_id = ProductProviderId::parse(&sel_provider);
+        let connected = match selected_id {
+            Some(ProductProviderId::Claude) => claude,
+            Some(ProductProviderId::Codex) => codex,
+            None => false,
+        };
+        let provider = match selected_id {
+            Some(id) => id.wire(),
+            None => "",
         };
         let model = if provider.is_empty() {
             String::new()
@@ -3153,7 +3407,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .collect()
         };
         let mut status = serde_json::json!({
-            "connected": claude || codex,
+            "connected": connected,
             "enabled": true,
             "provider": provider,
             "selected_provider": sel_provider,
@@ -4853,34 +5107,18 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     fn assert_product_credential_turn_fails_closed(agent: &DaemonAgent) {
+        // The credential still resolves to the error provider for the selection probe (unchanged).
         assert_eq!(
             agent.build_turn_provider("system").name(),
             "credential-resolution-error"
         );
-        let turn = isyncyou_webui::AgentHandler::start_turn(agent, "me", "hello").unwrap();
-        let rx = isyncyou_webui::AgentHandler::open_stream(agent, &turn).expect("turn stream");
-        let mut events = Vec::new();
-        for _ in 0..4 {
-            let line = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("credential failure stream event");
-            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
-            let done = event["event"].as_str() == Some("done");
-            events.push(event);
-            if done {
-                break;
-            }
-        }
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event"], "error");
-        assert_eq!(events[0]["message"], "provider_request_failed");
-        assert_eq!(events[1]["event"], "done");
-        assert_eq!(events[1]["reason"], "error");
-        let serialized = serde_json::to_string(&events).unwrap();
-        assert!(!serialized.contains("complete"));
-        assert!(!serialized.contains("access_token"));
-        assert!(!serialized.contains("refresh_token"));
+        // #639 T7: a not-ready product credential fails closed AT THE GATE — start_turn returns the
+        // closed `product_not_ready` code and creates NO turn state (no stream slot, no provider
+        // call, no streamed error/done turn). This is the source of the router's 409.
+        let err = isyncyou_webui::AgentHandler::start_turn(agent, "me", "hello").unwrap_err();
+        assert_eq!(err, "product_not_ready");
+        assert_eq!(agent.unopened_stream_count_for_tests(), 0);
+        assert!(isyncyou_webui::AgentHandler::open_stream(agent, "turn-0-0").is_none());
     }
 
     #[test]
@@ -7881,8 +8119,113 @@ mod tests {
         assert_eq!(status["selected_provider"], "codex");
         assert_eq!(status["credential_state"]["claude"], "connected");
         assert_eq!(status["credential_state"]["codex"], "refresh_required");
+        // #639 T7: the selection is KEPT on codex (no silent switch to the connected claude), and
+        // `connected` now reflects the SELECTED provider's host-verified readiness only. Codex needs
+        // refresh -> not ready -> connected:false (the UI prompts reconnect), even though claude is
+        // separately ready. The old behavior falsely reported connected:true via the other provider.
         assert_eq!(status["provider"], "codex");
-        assert_eq!(status["connected"], true);
+        assert_eq!(status["connected"], false);
+        assert_eq!(status["codex"], false);
+        assert_eq!(status["claude"], true);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T7 AC1: a not-ready product turn is refused at the gate with the closed code and
+    // creates no turn state (no stream slot). The router maps the code to 409 (webui test).
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn product_not_ready_returns_409_without_creating_turn_state() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("gate-not-ready-409");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        // No product credential -> the default-selected claude is not host-verified ready.
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        let err = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "hello").unwrap_err();
+        assert_eq!(err, "product_not_ready");
+        assert_eq!(agent.unopened_stream_count_for_tests(), 0);
+        assert!(isyncyou_webui::AgentHandler::open_stream(&agent, "turn-0-0").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T7 AC2: when the SELECTED provider is not ready, the gate never falls back to the other
+    // (even a fully ready) provider — the turn fails closed and `connected` reflects the selection.
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn invalid_selected_provider_never_falls_back() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("gate-no-fallback");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.credential_now_ms = Arc::new(|| 10_000);
+        // Claude is fully ready + activated.
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "ready-claude-token".into(),
+                refresh_token: "ready-claude-refresh".into(),
+                expires_at_ms: 3_610_000,
+            })
+            .unwrap();
+        assert!(agent.provider_ready(ProductProviderId::Claude));
+        // The selection is codex, which has no credential and is not ready.
+        agent.set_agent_settings("codex", "gpt-5.5").unwrap();
+        assert!(!agent.provider_ready(ProductProviderId::Codex));
+        // No fallback to the ready claude: the turn fails closed and creates no turn state.
+        let err = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "hi").unwrap_err();
+        assert_eq!(err, "product_not_ready");
+        assert_eq!(agent.unopened_stream_count_for_tests(), 0);
+        // The selection probe never builds the non-selected claude provider either.
+        assert_ne!(agent.build_turn_provider("system").name(), "subscription");
+        // Status: connected reflects the selected codex only; claude stays independently ready.
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        assert_eq!(status["selected_provider"], "codex");
+        assert_eq!(status["connected"], false);
+        assert_eq!(status["provider"], "codex");
+        assert_eq!(status["codex"], false);
+        assert_eq!(status["claude"], true);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 T7 AC3 / #627: an experimental local-CLI credential is never product-ready and never
+    // sets `connected`, but the walled experimental turn path stays available (compiled opt-in).
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn experimental_credential_never_sets_product_readiness() {
+        let env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("experimental-never-ready");
+        let _ = std::fs::remove_dir_all(&root);
+        let local_claude = root.join("local-claude");
+        write_local_cli_fixture(
+            &local_claude.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"experimental-only-token"}}"#,
+        );
+        env.set_claude_config_dir(&local_claude);
+        let agent = DaemonAgent::new(Config::default(), root.join("oauth"));
+        // The experimental credential resolves via the local-CLI origin...
+        assert!(matches!(
+            agent.resolve_claude_credential().unwrap(),
+            ResolvedProviderCredential::Claude {
+                origin: ProviderCredentialOrigin::ExperimentalLocalCli,
+                ..
+            }
+        ));
+        // ...but it is NEVER product-ready and never sets connected.
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        assert_eq!(status["connected"], false);
+        assert_eq!(status["claude"], false);
+        // The walled experimental turn path is still available.
+        assert!(agent
+            .try_experimental_only_provider(ProductProviderId::Claude, "system")
+            .is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 

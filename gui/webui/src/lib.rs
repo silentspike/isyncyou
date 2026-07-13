@@ -4424,6 +4424,8 @@ impl Router {
         };
         match handler.start_turn(account, prompt) {
             Ok(turn_id) => ApiResponse::ok_json(&json!({ "turn": turn_id })),
+            // #639: a host-verified not-ready product turn is a closed 409, not a blanket 500.
+            Err(e) if e == "product_not_ready" => ApiResponse::error(409, &e),
             Err(e) => ApiResponse::error(500, &e),
         }
     }
@@ -6882,6 +6884,36 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             jobs.cancelled.lock().unwrap().as_slice(),
             &[("a".to_string(), "job-1".to_string())]
         );
+    }
+
+    /// #639 T7: a handler whose product turn is refused with the closed `product_not_ready` code.
+    struct ProductNotReadyAgent;
+    impl AgentHandler for ProductNotReadyAgent {
+        fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
+            Err("product_not_ready".into())
+        }
+        fn confirm(&self, _p: &str, _t: &str, _h: &str) -> Result<String, String> {
+            Err("n/a".into())
+        }
+        fn cancel(&self, _t: &str) {}
+        fn open_stream(&self, _t: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+    }
+
+    #[test]
+    fn product_not_ready_turn_maps_to_409_not_500() {
+        let (_d, router) = setup();
+        let router = router.with_agent(
+            std::sync::Arc::new(ProductNotReadyAgent),
+            "agentsecret".into(),
+        );
+        let resp = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
+                .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(resp.status, 409);
+        assert!(String::from_utf8_lossy(&resp.body).contains("product_not_ready"));
     }
 
     struct FakeAgent;

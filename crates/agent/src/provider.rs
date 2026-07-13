@@ -531,6 +531,44 @@ pub fn build_attested_provider_request(
     Ok(AttestedProviderRequest { url, headers, body })
 }
 
+/// #639 T7: the STATIC harness attestation used by product readiness. It proves the SHIPPED
+/// harness (fixed system template + single `isyncyou` tool + provider envelope) for `provider`
+/// still conforms to `HARNESS_CONTRACT_VERSION`, independent of any credential or history. It is a
+/// defense-in-depth guard distinct from the per-round [`build_attested_provider_request`] that
+/// authorizes each actually-sent request: a build whose harness has drifted from the contract can
+/// never read as ready. Placeholder credentials are used only to materialize the request shape.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+pub fn attest_static_product_harness(provider: HarnessProvider) -> Result<(), AgentError> {
+    const PROBE_SYSTEM: &str = "iSyncYou static harness attestation probe";
+    let history: [crate::turn::Message; 0] = [];
+    match provider {
+        HarnessProvider::Claude => {
+            let p = subscription::SubscriptionProvider::new(
+                "static-attestation-probe",
+                "static-attestation",
+                PROBE_SYSTEM,
+                subscription::SubscriptionConfig::default(),
+            )?;
+            attest_product_harness(provider, &p.request_headers(), &p.request_body(&history))
+        }
+        HarnessProvider::Codex => {
+            let p = codex::CodexProvider::new(
+                "static-attestation-probe",
+                PROBE_SYSTEM,
+                codex::CodexConfig::default(),
+            )?;
+            attest_product_harness(
+                provider,
+                &p.request_headers(),
+                &codex::build_request("static-attestation", PROBE_SYSTEM, &history),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
