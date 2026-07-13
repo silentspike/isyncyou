@@ -105,6 +105,13 @@ object NativeEngine {
     external fun nativeTakeNetworkDeviceTestHook(filesDir: String): String
 
     /**
+     * Arm one real Codex credential refresh in the feature-enabled evidence APK. The native
+     * implementation consumes a separate owner-only app-private file and is absent from the
+     * default APK; WebView, HTTP, and bridge code cannot call it.
+     */
+    external fun nativeArmCodexRefreshDeviceTestHook(filesDir: String): Boolean
+
+    /**
      * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
      * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,
      * or `not_found`.

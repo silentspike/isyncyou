@@ -1009,6 +1009,27 @@ fn product_credential_state_wire<T>(state: &ProductCredentialState<T>) -> &'stat
     }
 }
 
+/// Default-off device evidence seam. It can only be armed through the JNI-only mobile
+/// test hook and forces one real Codex refresh attempt without changing the credential
+/// clock or exposing credential metadata to WebView/HTTP callers.
+#[cfg(feature = "agent-network-device-test-hooks")]
+static FORCE_CODEX_REFRESH_FOR_DEVICE_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+pub fn arm_codex_refresh_for_device_test() {
+    FORCE_CODEX_REFRESH_FOR_DEVICE_TEST.store(true, Ordering::SeqCst);
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn codex_refresh_for_device_test_is_armed() -> bool {
+    FORCE_CODEX_REFRESH_FOR_DEVICE_TEST.load(Ordering::SeqCst)
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn take_codex_refresh_for_device_test() -> bool {
+    FORCE_CODEX_REFRESH_FOR_DEVICE_TEST.swap(false, Ordering::SeqCst)
+}
+
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -1818,9 +1839,20 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             "claude" => Ok(product_credential_state_wire(
                 &self.claude_product_credential_state(),
             )),
-            "codex" => Ok(product_credential_state_wire(
-                &self.codex_product_credential_state(),
-            )),
+            "codex" => {
+                #[cfg(feature = "agent-network-device-test-hooks")]
+                if codex_refresh_for_device_test_is_armed()
+                    && !matches!(
+                        self.codex_product_credential_state(),
+                        ProductCredentialState::Absent | ProductCredentialState::PresentInvalid
+                    )
+                {
+                    return Ok("refresh_required");
+                }
+                Ok(product_credential_state_wire(
+                    &self.codex_product_credential_state(),
+                ))
+            }
             _ => Err("unknown provider".into()),
         }
     }
@@ -1844,16 +1876,26 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     Err("reconnect_required".into())
                 }
             },
-            "codex" => match self.codex_product_credential_state() {
-                ProductCredentialState::PresentValid(_) => Ok("connected"),
-                ProductCredentialState::PresentNeedsRefresh(credential) => self
-                    .refresh_codex_product_credential_unlocked(credential)
-                    .map(|_| "connected")
-                    .map_err(|_| "reconnect_required".into()),
-                ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
-                    Err("reconnect_required".into())
+            "codex" => {
+                #[cfg(feature = "agent-network-device-test-hooks")]
+                let force_refresh = take_codex_refresh_for_device_test();
+                #[cfg(not(feature = "agent-network-device-test-hooks"))]
+                let force_refresh = false;
+                match self.codex_product_credential_state() {
+                    ProductCredentialState::PresentValid(credential) if force_refresh => self
+                        .refresh_codex_product_credential_unlocked(credential)
+                        .map(|_| "connected")
+                        .map_err(|_| "reconnect_required".into()),
+                    ProductCredentialState::PresentValid(_) => Ok("connected"),
+                    ProductCredentialState::PresentNeedsRefresh(credential) => self
+                        .refresh_codex_product_credential_unlocked(credential)
+                        .map(|_| "connected")
+                        .map_err(|_| "reconnect_required".into()),
+                    ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
+                        Err("reconnect_required".into())
+                    }
                 }
-            },
+            }
             _ => Err("unknown provider".into()),
         }
     }
@@ -2402,12 +2444,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         // origin-aware here so an experimental local credential can never qualify.
         let _product_harness_readiness = claude || codex;
         let (sel_provider, _) = self.agent_settings();
-        // Effective provider: the selection if it is connected, else whichever is
-        // (Claude preferred). A selected+connected Claude is already covered by the
-        // `else if claude` arm, so it needs no separate branch.
-        let provider = if sel_provider == "codex" && codex {
+        // Keep a configured selected provider effective while it needs refresh/reconnect so
+        // the UI never refreshes a different connected provider by accident. If the selection
+        // is absent, fall back to whichever product provider is connected (Claude preferred).
+        let provider = if sel_provider == "codex" && codex_state != "unconfigured" {
             "codex"
-        } else if claude {
+        } else if (sel_provider == "claude" && claude_state != "unconfigured") || claude {
             "claude"
         } else if codex {
             "codex"
@@ -3832,6 +3874,8 @@ pub fn with_mobile_full_node_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    use isyncyou_webui::AgentHandler;
     use isyncyou_webui::ApiRequest;
     use std::sync::{Mutex as StdMutex, OnceLock as StdOnceLock};
 
@@ -7128,6 +7172,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut agent = DaemonAgent::new(Config::default(), root.clone());
         agent.credential_now_ms = Arc::new(|| 10_000);
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "valid-claude-token".into(),
+                refresh_token: "valid-claude-refresh".into(),
+                expires_at_ms: 3_610_000,
+            })
+            .unwrap();
         store_codex_blob(
             &root,
             &CodexStoredCredential {
@@ -7143,10 +7194,22 @@ mod tests {
         let status: serde_json::Value =
             serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
         assert_eq!(status["selected_provider"], "codex");
+        assert_eq!(status["credential_state"]["claude"], "connected");
         assert_eq!(status["credential_state"]["codex"], "refresh_required");
-        assert_eq!(status["provider"], "");
-        assert_eq!(status["connected"], false);
+        assert_eq!(status["provider"], "codex");
+        assert_eq!(status["connected"], true);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn codex_refresh_device_hook_is_one_shot_and_does_not_change_the_clock() {
+        let _ = take_codex_refresh_for_device_test();
+        arm_codex_refresh_for_device_test();
+
+        assert!(codex_refresh_for_device_test_is_armed());
+        assert!(take_codex_refresh_for_device_test());
+        assert!(!codex_refresh_for_device_test_is_armed());
     }
 
     #[cfg(any(

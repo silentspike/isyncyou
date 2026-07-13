@@ -273,6 +273,13 @@ class MainActivity : FragmentActivity() {
         // Refresh the device conditions on return to the foreground (cheap; the engine's offline
         // pass reads the latest each cycle). Safe before the engine is up — it only sets a global.
         pushDeviceState()
+        try {
+            if (NativeEngine.nativeNetworkDeviceHooksEnabled()) {
+                NativeEngine.nativeArmCodexRefreshDeviceTestHook(filesDir.absolutePath)
+            }
+        } catch (_: UnsatisfiedLinkError) {
+            // The default product library intentionally omits the refresh evidence hook.
+        }
         if (sessionToken.isNotEmpty()) bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
     }
 

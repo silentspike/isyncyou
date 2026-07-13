@@ -56,7 +56,10 @@ agent-credential-store-self-test = []
 mobile-job-device-test-hooks = ["isyncyou-app-host/mobile-job-device-test-hooks"]
 # TEST/EVIDENCE ONLY, default-OFF (#640): bounded JNI-only network diagnostic
 # branches. Product and release APKs never enable this feature.
-agent-network-device-test-hooks = ["isyncyou-app-host/agent-network-device-test-hooks"]
+agent-network-device-test-hooks = [
+    "agent-oauth-providers",
+    "isyncyou-app-host/agent-network-device-test-hooks",
+]
 
 [dev-dependencies]
 tempfile = "3"

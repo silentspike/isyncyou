@@ -1586,15 +1586,17 @@ pub static ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER: &[u8] = b"ISY_AGENT_NETWORK_DEV
 /// Consume one app-private #640 diagnostic hook. This is deliberately JNI-only: WebView,
 /// HTTP, bridge payloads, and capability tokens cannot select a diagnostic branch.
 #[cfg(feature = "agent-network-device-test-hooks")]
-fn take_network_device_test_hook(files_dir: &str) -> String {
+fn take_private_device_test_hook(
+    files_dir: &str,
+    hook_file: &str,
+    allowed_values: &[&str],
+) -> String {
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::Path;
 
     const MAX_HOOK_BYTES: u64 = 128;
-    const HOOK_FILE: &str = "network-diagnostic-test-hook";
-
     let root = Path::new(files_dir);
     if !root.is_absolute()
         || root.components().any(|component| {
@@ -1612,7 +1614,7 @@ fn take_network_device_test_hook(files_dir: &str) -> String {
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return String::new();
     }
-    let path = root.join(HOOK_FILE);
+    let path = root.join(hook_file);
     let Ok(pre_open_meta) = std::fs::symlink_metadata(&path) else {
         return String::new();
     };
@@ -1650,14 +1652,41 @@ fn take_network_device_test_hook(files_dir: &str) -> String {
     let Ok(value) = std::str::from_utf8(&bytes) else {
         return String::new();
     };
-    match value.trim() {
-        "no_validated_network"
-        | "connect_timeout"
-        | "tls_failed"
-        | "http_failed"
-        | "foreground_guard_unavailable" => value.trim().to_string(),
-        _ => String::new(),
+    let value = value.trim();
+    if allowed_values.contains(&value) {
+        value.to_string()
+    } else {
+        String::new()
     }
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn take_network_device_test_hook(files_dir: &str) -> String {
+    take_private_device_test_hook(
+        files_dir,
+        "network-diagnostic-test-hook",
+        &[
+            "no_validated_network",
+            "connect_timeout",
+            "tls_failed",
+            "http_failed",
+            "foreground_guard_unavailable",
+        ],
+    )
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn arm_codex_refresh_device_test_hook(files_dir: &str) -> bool {
+    if take_private_device_test_hook(
+        files_dir,
+        "credential-refresh-test-hook",
+        &["codex_refresh_due"],
+    ) != "codex_refresh_due"
+    {
+        return false;
+    }
+    isyncyou_app_host::arm_codex_refresh_for_device_test();
+    true
 }
 
 #[no_mangle]
@@ -1692,6 +1721,20 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeTakeNetw
         .map(|path| take_network_device_test_hook(&path))
         .unwrap_or_default();
     jni_new_string(&mut env, value)
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmCodexRefreshDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jboolean {
+    jni_get_string(&mut env, &files_dir)
+        .map(|path| arm_codex_refresh_device_test_hook(&path))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1734,6 +1777,32 @@ mod tests {
             !hook.exists(),
             "a non-owner-only hook is consumed and rejected"
         );
+    }
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn codex_refresh_device_hook_value_is_closed_and_one_shot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("credential-refresh-test-hook");
+        std::fs::write(&hook, "codex_refresh_due\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_private_device_test_hook(
+                dir.path().to_str().unwrap(),
+                "credential-refresh-test-hook",
+                &["codex_refresh_due"],
+            ),
+            "codex_refresh_due"
+        );
+        assert!(!hook.exists());
+        assert!(take_private_device_test_hook(
+            dir.path().to_str().unwrap(),
+            "credential-refresh-test-hook",
+            &["codex_refresh_due"],
+        )
+        .is_empty());
     }
 
     #[test]

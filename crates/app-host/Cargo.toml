@@ -61,4 +61,4 @@ agent-subscription-experimental = [
 mobile-job-device-test-hooks = []
 # TEST/EVIDENCE ONLY, default-OFF (#640): enables JNI-only network diagnostic
 # hooks in mobile builds. It never creates an HTTP/WebView/router surface.
-agent-network-device-test-hooks = []
+agent-network-device-test-hooks = ["agent-oauth-providers"]
