@@ -92,6 +92,26 @@ object NativeEngine {
     external fun nativeAgentCredentialStoreSelfTest(filesDir: String, sentinel: String): String
 
     /**
+     * #640 test/evidence hook marker. This method is present only in a deliberately
+     * feature-enabled test APK and is not callable from WebView, HTTP, or the bridge.
+     */
+    external fun nativeNetworkDeviceHooksEnabled(): Boolean
+
+    /**
+     * #640 test/evidence hook input. Available only in the explicitly feature-enabled
+     * native library and never reachable from WebView, HTTP, or the bridge. Native code
+     * consumes the fixed app-private file before returning one closed diagnostic category.
+     */
+    external fun nativeTakeNetworkDeviceTestHook(filesDir: String): String
+
+    /**
+     * Arm one real Codex credential refresh in the feature-enabled evidence APK. The native
+     * implementation consumes a separate owner-only app-private file and is absent from the
+     * default APK; WebView, HTTP, and bridge code cannot call it.
+     */
+    external fun nativeArmCodexRefreshDeviceTestHook(filesDir: String): Boolean
+
+    /**
      * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
      * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,
      * or `not_found`.
@@ -113,4 +133,23 @@ object NativeEngine {
      * charging-only). May be called any time; the latest value wins.
      */
     external fun nativeDeviceState(metered: Boolean, charging: Boolean, freeBytes: Long)
+
+    /**
+     * Register a one-shot Rust-owned handle for a connectivity snapshot captured only after
+     * Kotlin has validated the active foreground guard. The returned value is opaque to JS.
+     */
+    external fun nativeRegisterNetworkSnapshot(
+        guardId: String,
+        reason: String,
+        activeNetwork: Boolean,
+        internetCapability: Boolean,
+        validatedCapability: Boolean,
+        metered: Boolean,
+        restrictBackground: String,
+        notificationsVisible: Boolean,
+        testHook: String,
+    ): String
+
+    /** Invalidate every unconsumed native snapshot bound to an ended guard. */
+    external fun nativeInvalidateNetworkGuard(guardId: String)
 }

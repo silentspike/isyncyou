@@ -99,6 +99,16 @@ The constraints that force the shape of this decision:
    backpressure/timeout). The existing SSE path only emits a `change` ping and is not a
    token stream.
 
+9. **Network-critical Android flows.** Product OAuth, explicit credential refresh, and
+   active streamed turns acquire a bounded, acknowledged `dataSync` foreground-service
+   lease before network work. The service is an execution-priority mitigation, not a
+   claim that every network path is reachable. A provider/purpose-allowlisted preflight
+   returns only closed diagnostic codes; mobile observations cross the WebView boundary
+   as single-use, session/guard/reason-bound handles rather than raw device state.
+   Credential status is network-free, refresh is explicit and serialized, and a present
+   invalid product credential fails closed without local-client or FakeProvider fallback.
+   Default product artifacts exclude the separate diagnostic hook (REQ-AGENT-013, #640).
+
 ## Consequences
 
 - **Cost:** a new crate, a second HTTP client (small, blocking, rustls), and a genuinely

@@ -332,7 +332,10 @@ let _bridgeSeq = 0;
 const BRIDGE_TIMEOUT_MS = 15000;
 const NATIVE_TIMEOUT_MS = 5000;
 const BIO_TIMEOUT_MS = 120000;
-const BRIDGE_STREAM_TIMEOUT_MS = BRIDGE_TIMEOUT_MS;
+// Provider transport permits 60s to first response and 120s of SSE read idleness.
+// Keep the bridge watchdog just beyond that policy; the native stream also emits
+// 20-second pings, so a healthy long turn remains observable while backgrounded.
+const BRIDGE_STREAM_TIMEOUT_MS = 125000;
 const _bridgePending = new Map(); // request/native id -> { resolve, reject, timer }
 const _bridgeStreams = new Map(); // stream id -> onEvent handler
 const _bioPending = new Map();    // biometric request id -> { resolve, timer } (#0.6)
@@ -538,6 +541,13 @@ async function request(method, path, opts) {
 }
 async function api(path) { return request("GET", path); }
 async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
+async function postJson(path, capToken, value) {
+  return request("POST", path, {
+    capToken,
+    body: JSON.stringify(value),
+    headers: { "Content-Type": "application/json" },
+  });
+}
 /* Base64-encode raw bytes (Uint8Array) in fromCharCode-safe chunks (#657). The mobile bridge
    body is text-only, so a binary upload rides base64; serve.rs decodes on X-Body-Encoding. */
 function bytesToBase64(bytes) {
@@ -4506,10 +4516,81 @@ async function openExternalAuth(url, kind, opts) {
   }
   openDesktopExternal(url, !!(opts && opts.newTab));
 }
-async function beginNetworkGuard() {
+async function beginNetworkGuard(reason) {
   if (!BRIDGE) return null;
-  const d = await nativeCall("beginNetworkGuard", {}, NATIVE_TIMEOUT_MS);
+  const d = await nativeCall("beginNetworkGuard", { reason }, NATIVE_TIMEOUT_MS);
   return d && d.guard_id ? d.guard_id : null;
+}
+async function captureNetworkSnapshot(guardId) {
+  if (!BRIDGE || !guardId) return null;
+  const d = await nativeCall("captureNetworkSnapshot", { guard_id: guardId }, NATIVE_TIMEOUT_MS);
+  return d && d.snapshot_id ? d.snapshot_id : null;
+}
+async function runConnectivityPreflight(provider, purpose, guardId) {
+  const body = { provider, purpose };
+  if (BRIDGE) {
+    const snapshotId = await captureNetworkSnapshot(guardId);
+    if (!snapshotId) throw new Error("network_guard_unavailable");
+    body.snapshot_id = snapshotId;
+  }
+  const result = await postJson("/api/v1/agent/connectivity/preflight", CAP.agent, body);
+  if (!result || result.status !== "ready") {
+    const error = new Error((result && result.code) || "connectivity_unavailable");
+    error.connectivity = result || null;
+    throw error;
+  }
+  clearConnectivityIssue();
+  return result;
+}
+const CONNECTIVITY_COPY = {
+  no_validated_network: "Connect to the internet, then try again.",
+  restricted_metered_background: "Allow background data for iSyncYou, then try again.",
+  foreground_guard_unavailable: "iSyncYou could not keep this network action active.",
+  connect_failed: "The provider could not be reached.",
+  connect_timed_out: "The provider took too long to respond.",
+  tls_failed: "A secure connection to the provider could not be established.",
+  http_failed: "The provider is temporarily unavailable.",
+  name_resolution_failed: "The provider address could not be resolved.",
+  connectivity_unavailable: "Connectivity could not be verified.",
+};
+function rememberConnectivityIssue(error, retry) {
+  const d = error && error.connectivity;
+  const code = d && CONNECTIVITY_COPY[d.code] ? d.code : "connectivity_unavailable";
+  AssistantState.connectivityIssue = {
+    code,
+    retryable: !!(d && d.retryable),
+    settings_hint: d && d.settings_hint ? d.settings_hint : "none",
+    retry: typeof retry === "function" ? retry : null,
+  };
+}
+function clearConnectivityIssue() {
+  AssistantState.connectivityIssue = null;
+}
+async function openConnectivitySettings(hint) {
+  const allowed = ["internet_panel", "background_data", "app_details", "battery_settings"];
+  if (!BRIDGE || !allowed.includes(hint)) return;
+  try { await nativeCall("openNetworkSettings", { hint }, NATIVE_TIMEOUT_MS); }
+  catch (_) { toast("Settings are unavailable", "err"); }
+}
+function renderConnectivityDiagnostic() {
+  const issue = AssistantState.connectivityIssue;
+  if (!issue) return null;
+  const actions = [];
+  if (issue.retryable && issue.retry) {
+    actions.push(el("button", { class: "btn sm", type: "button", onclick: async () => {
+      const retry = issue.retry;
+      clearConnectivityIssue();
+      await retry();
+    }, "data-agent-connectivity-retry": "1" }, icon("refresh-cw", "icon-sm"), "Retry"));
+  }
+  if (BRIDGE && issue.settings_hint !== "none") {
+    actions.push(el("button", { class: "btn ghost sm", type: "button", onclick: () => openConnectivitySettings(issue.settings_hint), "data-agent-connectivity-settings": issue.settings_hint }, icon("settings", "icon-sm"), "Settings"));
+  }
+  return el("div", { class: "assistant-consent", "data-agent-connectivity": issue.code },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Connection needs attention" }),
+      el("p", { class: "dim", text: CONNECTIVITY_COPY[issue.code] })),
+    actions.length ? el("div", { class: "assistant-consent-actions" }, actions) : null);
 }
 async function endNetworkGuard(guardId) {
   if (!BRIDGE || !guardId) return;
@@ -4518,6 +4599,8 @@ async function endNetworkGuard(guardId) {
 
 let AGENT_GUARD_ID = null;
 let CODEX_GUARD_ID = null;
+const TURN_GUARDS = new Map();
+const OAUTH_ATTEMPTS = new Map();
 async function finishAgentGuard() {
   const id = AGENT_GUARD_ID;
   AGENT_GUARD_ID = null;
@@ -4528,6 +4611,53 @@ async function finishCodexGuard() {
   CODEX_GUARD_ID = null;
   await endNetworkGuard(id);
 }
+async function finishOAuthGuard(provider) {
+  if (provider === "codex") await finishCodexGuard();
+  else await finishAgentGuard();
+}
+async function cancelOAuthAttempt(provider) {
+  const attemptId = OAUTH_ATTEMPTS.get(provider);
+  OAUTH_ATTEMPTS.delete(provider);
+  if (!attemptId) return;
+  try {
+    await postJson("/api/v1/agent/oauth/cancel", CAP.agent, {
+      provider,
+      attempt_id: attemptId,
+    });
+  } catch (_) {}
+}
+async function finishTurnGuard(turnId) {
+  const guardId = TURN_GUARDS.get(turnId);
+  TURN_GUARDS.delete(turnId);
+  await endNetworkGuard(guardId);
+}
+
+function agentCredentialState(st, provider) {
+  const states = st && st.credential_state;
+  return states && typeof states === "object" ? states[provider] : "";
+}
+
+async function refreshAssistantCredentialIfRequired(st) {
+  const provider = agentActiveProvider(st);
+  if (agentCredentialState(st, provider) !== "refresh_required") return st;
+  let guardId = null;
+  try {
+    guardId = await beginNetworkGuard("credential_refresh");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "refresh", guardId);
+    await postJson("/api/v1/agent/credential/refresh", CAP.agent, { provider });
+    return await api("/api/v1/agent/status");
+  } catch (error) {
+    if (error && error.connectivity) {
+      rememberConnectivityIssue(error, () => renderAssistantView($("#view")));
+      return st;
+    }
+    return await api("/api/v1/agent/status").catch(() => st);
+  } finally {
+    await endNetworkGuard(guardId);
+  }
+}
+
 function localCallbackRedirect(host) {
   return location.port ? `http://${host}:${location.port}/callback` : "";
 }
@@ -4541,29 +4671,40 @@ async function startAiLogin(provider) {
   }
   let guardId = null;
   try {
+    guardId = await beginNetworkGuard("oauth");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    if (provider === "codex") CODEX_GUARD_ID = guardId;
+    else AGENT_GUARD_ID = guardId;
+    await runConnectivityPreflight(provider, "oauth_start", guardId);
     const params = { provider };
     const redirect = localCallbackRedirect("localhost");
     if (redirect) params.redirect = redirect;
     const manualCodeFlow = provider === "claude" && !redirect;
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
+    if (!d || !d.authorize_url || !d.attempt_id) { toast("Could not start sign-in"); return; }
+    OAUTH_ATTEMPTS.set(provider, d.attempt_id);
     if (manualCodeFlow) showCodeStep();
-    else showWaitingStep();          // waiting UI + poll; completes when /callback fires
+    else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    guardId = await beginNetworkGuard();
-    AGENT_GUARD_ID = guardId;
     await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
+    await cancelOAuthAttempt(provider);
     if (guardId) await endNetworkGuard(guardId);
     if (AGENT_GUARD_ID === guardId) AGENT_GUARD_ID = null;
-    toast("Sign-in unavailable: " + (e.message || e));
+    if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
+    if (e && e.connectivity) {
+      rememberConnectivityIssue(e, () => startAiLogin(provider));
+      renderAssistantView($("#view"));
+    } else {
+      toast("Sign-in unavailable", "err");
+    }
   }
 }
 
 // After the browser login the engine's /callback stores the token; poll status until
 // connected, then switch to the chat.
 let AGENT_POLL_ON = false;
-function showWaitingStep() {
+function showWaitingStep(provider) {
   const card = document.getElementById("asst-connect-card");
   if (card) {
     clear(card).append(
@@ -4573,22 +4714,48 @@ function showWaitingStep() {
       el("div", { class: "skel", style: "height:8px;width:60%;margin:0 auto;border-radius:4px" }),
     );
   }
-  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0); }
+  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0, provider); }
 }
-async function pollAgentStatus(n) {
-  if (App.route !== "assistant") { AGENT_POLL_ON = false; await finishAgentGuard(); return; }
+async function pollAgentStatus(n, provider) {
+  if (App.route !== "assistant") {
+    AGENT_POLL_ON = false;
+    await cancelOAuthAttempt(provider);
+    await finishOAuthGuard(provider);
+    return;
+  }
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.connected) { AGENT_POLL_ON = false; await finishAgentGuard(); toast("Connected!"); renderAssistantView($("#view")); return; }
+    const connected = provider === "codex" ? !!(s && s.codex) : !!(s && s.claude);
+    if (connected) {
+      AGENT_POLL_ON = false;
+      OAUTH_ATTEMPTS.delete(provider);
+      await finishOAuthGuard(provider);
+      toast("Connected!");
+      renderAssistantView($("#view"));
+      return;
+    }
   } catch (_) {}
-  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1), 2000); }
-  else { AGENT_POLL_ON = false; await finishAgentGuard(); }
+  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1, provider), 2000); }
+  else {
+    AGENT_POLL_ON = false;
+    await cancelOAuthAttempt(provider);
+    await finishOAuthGuard(provider);
+  }
 }
 
 // Swap the connect card to the "paste your code" step.
 function showCodeStep() {
-  const card = document.getElementById("asst-connect-card");
-  if (!card) return;
+  let card = document.getElementById("asst-connect-card");
+  if (!card) {
+    const body = document.getElementById("asst-body");
+    if (!body) return;
+    card = el("div", {
+      id: "asst-connect-card",
+      class: "assistant-setup",
+      "data-agent-oauth-code-step": "claude",
+    });
+    body.prepend(card);
+  }
   clear(card).append(
     el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
     el("h2", { style: "margin:.3rem 0 .5rem", text: "Paste your code" }),
@@ -4596,7 +4763,7 @@ function showCodeStep() {
     el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
     el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
       el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
-      el("button", { class: "btn", onclick: async () => { await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
+      el("button", { class: "btn", onclick: async () => { await cancelOAuthAttempt("claude"); await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
     ),
   );
 }
@@ -4607,12 +4774,14 @@ async function completeAiLogin() {
   if (!code) { toast("Paste the code first"); return; }
   try {
     await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
     toast("Connected!");
     renderAssistantView($("#view"));   // re-fetch status -> switches to chat
   } catch (e) {
+    await cancelOAuthAttempt("claude");
     await finishAgentGuard();
-    toast("Couldn't connect: " + (e.message || e));
+    toast("Couldn't connect. Start sign-in again.", "err");
   }
 }
 
@@ -4627,6 +4796,9 @@ const AssistantState = {
   draft: "",
   busy: false,
   activeMessage: null,
+  connectivityIssue: null,
+  pendingConnectProvider: null,
+  pendingModelSelection: null,
 };
 
 function closeAssistantStream(_reason) {
@@ -4661,6 +4833,7 @@ function agentProviderConsentId(provider) {
 }
 function agentActiveProvider(st) {
   if (st && st.provider) return agentProviderConsentId(st.provider);
+  if (st && st.selected_provider) return agentProviderConsentId(st.selected_provider);
   if (st && st.claude) return "claude";
   if (st && st.codex) return "codex";
   return "claude";
@@ -4675,17 +4848,27 @@ function agentPrivacyConsentAccepted(provider) {
     && c.accepted === true
     && c.provider === agentProviderConsentId(provider);
 }
-function acceptAgentPrivacyConsent(provider) {
+async function acceptAgentPrivacyConsent(provider) {
+  const consentProvider = agentProviderConsentId(provider);
   const record = {
     version: AGENT_PRIVACY_CONSENT_VERSION,
     accepted: true,
-    provider: agentProviderConsentId(provider),
+    provider: consentProvider,
     timestamp: new Date().toISOString(),
   };
   try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
-  renderAssistantView($("#view"));
+  const pendingModel = AssistantState.pendingModelSelection;
+  const resumeModel = pendingModel && pendingModel.provider === consentProvider ? pendingModel : null;
+  const resumeConnect = !resumeModel && AssistantState.pendingConnectProvider === consentProvider;
+  AssistantState.pendingConnectProvider = null;
+  AssistantState.pendingModelSelection = null;
+  await renderAssistantView($("#view"));
+  if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model);
+  else if (resumeConnect) await startAiLogin(consentProvider);
 }
 function resetAgentPrivacyConsent() {
+  AssistantState.pendingConnectProvider = null;
+  AssistantState.pendingModelSelection = null;
   try { localStorage.removeItem(AGENT_PRIVACY_CONSENT_KEY); } catch (_) {}
   renderAssistantView($("#view"));
 }
@@ -4714,11 +4897,15 @@ async function renderAssistantView(view) {
   body.append(el("div", { class: "assistant-loading" },
     el("div", { class: "skel", style: "height:20px;width:50%" })));
   let st = {};
-  try { st = await api("/api/v1/agent/status"); } catch (_) { st = {}; }
+  try {
+    st = await api("/api/v1/agent/status");
+    st = await refreshAssistantCredentialIfRequired(st);
+  } catch (_) { st = {}; }
   rememberAssistantStatus(st);
   clear(body);
   if (st && st.connected) renderAssistantChat(body, st);
   else renderAssistantSetup(body, st);
+  if (OAUTH_ATTEMPTS.has("claude") && !(st && st.claude)) showCodeStep();
 }
 
 // The connect card (shown until an AI account is connected).
@@ -4739,8 +4926,10 @@ function renderAssistantSetup(body, st) {
   if (unavailable || !codexAllowed) {
     codex.setAttribute("disabled", "disabled");
   }
+  body.append(el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }));
+  const diagnostic = renderConnectivityDiagnostic();
+  if (diagnostic) body.append(diagnostic);
   body.append(
-    el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
     el("div", { id: "asst-connect-card", class: "assistant-setup", "data-agent-setup": "1", "data-testid": "agent-setup" },
       el("div", { class: "assistant-setup-icon" }, icon("sparkles")),
       el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
@@ -4770,6 +4959,16 @@ function renderAssistantChat(body, st) {
     renderAssistantComposer(st),
   ];
   if (!hasConsent) chatNodes.splice(1, 0, renderAssistantConsentPanel([provider]));
+  const pendingConnect = AssistantState.pendingConnectProvider;
+  if (pendingConnect && !agentPrivacyConsentAccepted(pendingConnect)) {
+    chatNodes.splice(1, 0, renderAssistantConsentPanel([pendingConnect]));
+  }
+  const pendingModel = AssistantState.pendingModelSelection;
+  if (pendingModel && !agentPrivacyConsentAccepted(pendingModel.provider)) {
+    chatNodes.splice(1, 0, renderAssistantConsentPanel([pendingModel.provider]));
+  }
+  const diagnostic = renderConnectivityDiagnostic();
+  if (diagnostic) body.append(diagnostic);
   body.append(...chatNodes);
   const log = $("#asst-log");
   if (!AssistantState.transcript.length) {
@@ -4874,8 +5073,13 @@ function agentModelSwitcher(st) {
   };
   addGroup("claude", st.claude);
   addGroup("codex", st.codex);
+  if (!st.claude) {
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "claude", onclick: () => connectAgentProvider("claude") },
+      el("span", { class: "mdl-plus" }, "＋"),
+      el("span", { class: "mdl-lbl", text: "Connect Claude…" })));
+  }
   if (!st.codex) {
-    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectCodex() },
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectAgentProvider("codex") },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
   }
@@ -4903,8 +5107,17 @@ function agentModelSwitcher(st) {
   wrap.append(trigger, el("div", { class: "mdl-panel", role: "listbox" }, ...rows));
   return wrap;
 }
+async function connectAgentProvider(provider) {
+  if (!agentPrivacyConsentAccepted(provider)) {
+    AssistantState.pendingConnectProvider = agentProviderConsentId(provider);
+    await renderAssistantView($("#view"));
+    return;
+  }
+  await startAiLogin(provider);
+}
 async function pickModel(provider, model) {
   if (!agentPrivacyConsentAccepted(provider)) {
+    AssistantState.pendingModelSelection = { provider: agentProviderConsentId(provider), model };
     toast("Review privacy consent for " + agentProviderLabel(provider), "err");
     renderAssistantView($("#view"));
     return;
@@ -4920,28 +5133,7 @@ async function pickModel(provider, model) {
   }
 }
 async function connectCodex() {
-  if (!agentPrivacyConsentAccepted("codex")) {
-    toast("Review privacy consent for ChatGPT", "err");
-    renderAssistantView($("#view"));
-    return;
-  }
-  let guardId = null;
-  try {
-    const params = { provider: "codex" };
-    const redirect = localCallbackRedirect("127.0.0.1");
-    if (redirect) params.redirect = redirect;
-    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
-    toast("Opening ChatGPT sign-in…");
-    guardId = await beginNetworkGuard();
-    CODEX_GUARD_ID = guardId;
-    await openExternalAuth(d.authorize_url, "agent_authorize");
-    pollCodexStatus(0);
-  } catch (e) {
-    if (guardId) await endNetworkGuard(guardId);
-    if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
-    toast("ChatGPT sign-in unavailable: " + (e.message || e));
-  }
+  await connectAgentProvider("codex");
 }
 async function pollCodexStatus(n) {
   try {
@@ -5239,6 +5431,25 @@ function renderAssistantMessage(m) {
   return el("div", { class: "assistant-message" + (isUser ? " user" : ""), "data-agent-message": m.role || "assistant" }, bubble);
 }
 
+function agentSafeErrorCopy(code) {
+  const known = {
+    assistant_tool_arguments_invalid: "The assistant requested an invalid operation.",
+    provider_request_failed: "The provider could not complete this request.",
+    provider_connect_timed_out: "The provider took too long to respond.",
+    provider_response_timed_out: "The provider did not begin responding in time.",
+    provider_stream_idle_timed_out: "The provider stopped responding.",
+    provider_tls_failed: "A secure provider connection could not be established.",
+    provider_name_resolution_failed: "The provider address could not be resolved.",
+    provider_connect_failed: "The provider could not be reached.",
+    provider_stream_read_failed: "The provider stream ended unexpectedly.",
+    provider_stream_ended_without_event: "The provider returned no usable response.",
+    provider_response_read_failed: "The provider response could not be read.",
+    provider_transport_failed: "The provider connection failed.",
+    confirmation_unavailable: "Confirmation is temporarily unavailable.",
+  };
+  return known[code] || "The assistant could not complete this request.";
+}
+
 function handleAgentEvent(message, turnState) {
   const d = message || {};
   switch (d.event) {
@@ -5288,7 +5499,7 @@ function handleAgentEvent(message, turnState) {
       break;
     }
     case "error":
-      turnState.addError(d.message || "Stream error");
+      turnState.addError(agentSafeErrorCopy(d.message));
       break;
     case "done": {
       const reason = d.reason || "complete";
@@ -5418,32 +5629,53 @@ async function agentSend(text) {
   };
 
   let turn;
+  let startingGuardId = null;
   try {
+    startingGuardId = await beginNetworkGuard("agent_turn");
+    if (BRIDGE && !startingGuardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "turn_start", startingGuardId);
     const r = await post("/api/v1/agent/turn?" + qs({ account: App.account, prompt: text }), CAP.agent);
     turn = r && r.turn;
   } catch (e) {
+    await endNetworkGuard(startingGuardId);
     AssistantState.busy = false;
     AssistantState.activeMessage = null;
-    setText("Error: " + (e.message || e));
+    if (e && e.connectivity) {
+      rememberConnectivityIssue(e, () => agentSend(text));
+      setText(CONNECTIVITY_COPY[AssistantState.connectivityIssue.code]);
+      renderAssistantView($("#view"));
+    } else {
+      setText("The assistant could not start this turn.");
+    }
     return;
   }
   if (!turn) {
+    await endNetworkGuard(startingGuardId);
     AssistantState.busy = false;
     AssistantState.activeMessage = null;
     setText("Error: could not start the turn");
     return;
   }
   AssistantState.activeTurnId = turn;
+  if (BRIDGE && startingGuardId) {
+    try {
+      const bound = await nativeCall("bindNetworkGuard", { guard_id: startingGuardId, turn }, NATIVE_TIMEOUT_MS);
+      if (bound && bound.ok) TURN_GUARDS.set(turn, startingGuardId);
+    } catch (_) {
+      // A lost bind response is ambiguous. Keep the short starting lease for native expiry.
+    }
+  }
 
   const url = "/api/v1/agent/stream?" + qs({ turn });
   // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
   // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
   // event or a stream drop ends the turn.
   let stream;
-  const finish = (msg) => {
+  const finish = (msg, terminalReason) => {
     clearThinking();
     if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
     else { try { stream.close(); } catch (_) {} }
+    if (terminalReason) void finishTurnGuard(turn);
     if (!asst.text && msg) setText(msg);
   };
   const turnState = {

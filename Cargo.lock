@@ -1567,6 +1567,7 @@ version = "1.0.0"
 dependencies = [
  "argon2",
  "base64",
+ "futures-util",
  "isyncyou-connectors",
  "isyncyou-core",
  "isyncyou-graph",
@@ -1574,10 +1575,12 @@ dependencies = [
  "libc",
  "reqwest",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -1750,6 +1753,7 @@ dependencies = [
  "isyncyou-store",
  "isyncyou-webui",
  "jni",
+ "libc",
  "serde_json",
  "tempfile",
 ]
@@ -1808,6 +1812,7 @@ dependencies = [
  "isyncyou-connectors",
  "isyncyou-core",
  "isyncyou-store",
+ "serde",
  "serde_json",
  "tempfile",
 ]
@@ -3088,12 +3093,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -3839,6 +3846,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-util"
+version = "0.7.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "toml"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4234,6 +4254,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

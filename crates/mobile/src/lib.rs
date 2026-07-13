@@ -525,8 +525,18 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     let Some(router) = router else {
         return Vec::new();
     };
-    let resp =
-        isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
+    let resp = isyncyou_webui::dispatch_message(
+        &router,
+        isyncyou_webui::BridgeDispatchRequest {
+            method: "GET",
+            target: path,
+            cap_token: None,
+            session_token: None,
+            cookie,
+            content_type: None,
+            body: Vec::new(),
+        },
+    );
     frame_response(resp)
 }
 
@@ -675,6 +685,49 @@ pub fn session_token() -> Option<String> {
         .ok()?
         .as_ref()
         .map(|s| s.session_token.clone())
+}
+
+/// Register a Kotlin-captured connectivity snapshot for one mobile preflight. Kotlin validates
+/// the foreground guard before this JNI-owned call; JavaScript receives only the opaque result.
+struct NetworkSnapshotRegistration<'a> {
+    guard_id: &'a str,
+    reason: &'a str,
+    active_network: bool,
+    internet_capability: bool,
+    validated_capability: bool,
+    metered: bool,
+    restrict_background: &'a str,
+    notifications_visible: bool,
+    test_hook: Option<&'a str>,
+}
+
+fn register_network_snapshot(input: NetworkSnapshotRegistration<'_>) -> Result<String, String> {
+    let restrict_background = match input.restrict_background {
+        "disabled" => isyncyou_agent::RestrictBackgroundStatus::Disabled,
+        "whitelisted" => isyncyou_agent::RestrictBackgroundStatus::Whitelisted,
+        "enabled" => isyncyou_agent::RestrictBackgroundStatus::Enabled,
+        _ => isyncyou_agent::RestrictBackgroundStatus::Unknown,
+    };
+    let session_token = session_token().ok_or_else(|| "engine not started".to_string())?;
+    isyncyou_app_host::register_mobile_connectivity_snapshot(
+        &session_token,
+        input.guard_id,
+        input.reason,
+        isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: input.active_network,
+            internet_capability: input.internet_capability,
+            validated_capability: input.validated_capability,
+            metered: input.metered,
+            restrict_background,
+            notifications_visible: input.notifications_visible,
+            guard_ready: true,
+        },
+        input.test_hook,
+    )
+}
+
+pub fn invalidate_network_guard(guard_id: &str) {
+    isyncyou_app_host::invalidate_mobile_connectivity_guard(guard_id);
 }
 
 /// Record a successful native `BiometricPrompt` for a pending destructive action
@@ -1207,6 +1260,59 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDeviceSt
     set_device_state(metered, charging, free_bytes.max(0) as u64);
 }
 
+/// JNI: register a one-shot, session-bound Android connectivity snapshot. No raw snapshot
+/// fields are returned to WebView JavaScript; callers receive only an opaque handle.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeRegisterNetworkSnapshot<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    guard_id: jni::objects::JString<'local>,
+    reason: jni::objects::JString<'local>,
+    active_network: jni::sys::jboolean,
+    internet_capability: jni::sys::jboolean,
+    validated_capability: jni::sys::jboolean,
+    metered: jni::sys::jboolean,
+    restrict_background: jni::objects::JString<'local>,
+    notifications_visible: jni::sys::jboolean,
+    test_hook: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let result = (|| {
+        let guard_id = jni_get_string(&mut env, &guard_id)?;
+        let reason = jni_get_string(&mut env, &reason)?;
+        let restrict_background = jni_get_string(&mut env, &restrict_background)?;
+        let test_hook = jni_get_string(&mut env, &test_hook)?;
+        register_network_snapshot(NetworkSnapshotRegistration {
+            guard_id: &guard_id,
+            reason: &reason,
+            active_network,
+            internet_capability,
+            validated_capability,
+            metered,
+            restrict_background: &restrict_background,
+            notifications_visible,
+            test_hook: (!test_hook.is_empty()).then_some(test_hook.as_str()),
+        })
+        .ok()
+    })()
+    .unwrap_or_default();
+    jni_new_string(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeInvalidateNetworkGuard<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    guard_id: jni::objects::JString<'local>,
+) {
+    if let Some(guard_id) = jni_get_string(&mut env, &guard_id) {
+        invalidate_network_guard(&guard_id);
+    }
+}
+
 /// JNI: answer one in-process bridge request (#0A). Kotlin passes the JSON request
 /// envelope from the `WebMessageListener` and posts the returned JSON envelope back on the
 /// message port — no loopback TCP port is used. SECURITY: never logs tokens or bodies.
@@ -1469,9 +1575,235 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
     jni_new_string(&mut env, out)
 }
 
+/// #640 evidence marker. It is intentionally JNI-only and has no WebView, bridge, HTTP,
+/// or router caller. The fixed marker lets the device harness distinguish a hook APK from a
+/// rebuilt default APK without relying on Cargo feature names surviving link-time stripping.
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER: &[u8] = b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
+
+/// Consume one app-private #640 diagnostic hook. This is deliberately JNI-only: WebView,
+/// HTTP, bridge payloads, and capability tokens cannot select a diagnostic branch.
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn take_private_device_test_hook(
+    files_dir: &str,
+    hook_file: &str,
+    allowed_values: &[&str],
+) -> String {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Path;
+
+    const MAX_HOOK_BYTES: u64 = 128;
+    let root = Path::new(files_dir);
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return String::new();
+    }
+    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
+        return String::new();
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return String::new();
+    }
+    let path = root.join(hook_file);
+    let Ok(pre_open_meta) = std::fs::symlink_metadata(&path) else {
+        return String::new();
+    };
+    if pre_open_meta.file_type().is_symlink()
+        || !pre_open_meta.is_file()
+        || pre_open_meta.len() > MAX_HOOK_BYTES
+        || pre_open_meta.mode() & 0o077 != 0
+        || pre_open_meta.uid() != unsafe { libc::geteuid() }
+    {
+        let _ = std::fs::remove_file(&path);
+        return String::new();
+    }
+
+    let mut bytes = Vec::with_capacity(pre_open_meta.len() as usize);
+    let read_result = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .and_then(|mut file| {
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || meta.len() > MAX_HOOK_BYTES
+                || meta.mode() & 0o077 != 0
+                || meta.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(std::io::Error::other("invalid hook file"));
+            }
+            file.read_to_end(&mut bytes)
+        });
+    // The hook is always one-shot, including malformed or failed reads.
+    let _ = std::fs::remove_file(&path);
+    if read_result.is_err() || bytes.len() > MAX_HOOK_BYTES as usize {
+        return String::new();
+    }
+    let Ok(value) = std::str::from_utf8(&bytes) else {
+        return String::new();
+    };
+    let value = value.trim();
+    if allowed_values.contains(&value) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn take_network_device_test_hook(files_dir: &str) -> String {
+    take_private_device_test_hook(
+        files_dir,
+        "network-diagnostic-test-hook",
+        &[
+            "no_validated_network",
+            "connect_timeout",
+            "tls_failed",
+            "http_failed",
+            "foreground_guard_unavailable",
+        ],
+    )
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn arm_codex_refresh_device_test_hook(files_dir: &str) -> bool {
+    if take_private_device_test_hook(
+        files_dir,
+        "credential-refresh-test-hook",
+        &["codex_refresh_due"],
+    ) != "codex_refresh_due"
+    {
+        return false;
+    }
+    isyncyou_app_host::arm_codex_refresh_for_device_test();
+    true
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkDeviceHooksEnabled<
+    'local,
+>(
+    _env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+) -> jni::sys::jboolean {
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    {
+        // Keep the marker referenced in the executable path so binary scans can prove the
+        // hook/default split. Returning a boolean avoids exposing any diagnostic control.
+        !ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER.is_empty()
+    }
+    #[cfg(not(feature = "agent-network-device-test-hooks"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeTakeNetworkDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let value = jni_get_string(&mut env, &files_dir)
+        .map(|path| take_network_device_test_hook(&path))
+        .unwrap_or_default();
+    jni_new_string(&mut env, value)
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmCodexRefreshDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jboolean {
+    jni_get_string(&mut env, &files_dir)
+        .map(|path| arm_codex_refresh_device_test_hook(&path))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn network_device_hook_is_one_shot_and_rejects_unsafe_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("network-diagnostic-test-hook");
+        std::fs::write(&hook, "connect_timeout\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_network_device_test_hook(dir.path().to_str().unwrap()),
+            "connect_timeout"
+        );
+        assert!(!hook.exists(), "a valid hook must be consumed exactly once");
+        assert!(
+            take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty(),
+            "a consumed hook cannot be replayed"
+        );
+
+        let target = dir.path().join("outside");
+        std::fs::write(&target, "tls_failed").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &hook).unwrap();
+        assert!(take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty());
+        assert!(
+            !hook.exists(),
+            "a rejected symlink is removed without following it"
+        );
+
+        std::fs::write(&hook, "http_failed").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty());
+        assert!(
+            !hook.exists(),
+            "a non-owner-only hook is consumed and rejected"
+        );
+    }
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn codex_refresh_device_hook_value_is_closed_and_one_shot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("credential-refresh-test-hook");
+        std::fs::write(&hook, "codex_refresh_due\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_private_device_test_hook(
+                dir.path().to_str().unwrap(),
+                "credential-refresh-test-hook",
+                &["codex_refresh_due"],
+            ),
+            "codex_refresh_due"
+        );
+        assert!(!hook.exists());
+        assert!(take_private_device_test_hook(
+            dir.path().to_str().unwrap(),
+            "credential-refresh-test-hook",
+            &["codex_refresh_due"],
+        )
+        .is_empty());
+    }
 
     #[test]
     fn mobile_product_has_no_local_cli_experimental_feature() {
@@ -1493,6 +1825,7 @@ mod tests {
             "agent-session-kdf-bench",
             "agent-credential-store-self-test",
             "mobile-job-device-test-hooks",
+            "agent-network-device-test-hooks",
         ];
         let allowlist = gradle
             .split_once("val allowedCargoTestFeatures = setOf(")
@@ -1645,6 +1978,32 @@ mod tests {
         start_engine(path).expect("idempotent restart");
         let tok2 = session_token().expect("token present");
         assert_eq!(tok1, tok2, "second start must reuse the running engine");
+    }
+
+    #[test]
+    fn network_snapshot_registration_uses_engine_session_and_closed_guard_reason() {
+        let _guard = mobile_key_test_guard();
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let guard_id = "network-snapshot-mobile-test-guard";
+
+        let snapshot_id = register_network_snapshot(NetworkSnapshotRegistration {
+            guard_id,
+            reason: "agent_turn",
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: "disabled",
+            notifications_visible: true,
+            test_hook: None,
+        })
+        .expect("trusted native snapshot registration succeeds");
+
+        assert!(!snapshot_id.is_empty());
+        assert_ne!(snapshot_id, guard_id);
+        invalidate_network_guard(guard_id);
     }
 
     #[test]

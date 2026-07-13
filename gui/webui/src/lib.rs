@@ -32,7 +32,7 @@ mod serve;
 mod view;
 pub use serve::{
     bind_loopback, dispatch_message, format_http, handle_bridge_request, parse_request_line, serve,
-    serve_listener, serve_listener_shared,
+    serve_listener, serve_listener_shared, BridgeDispatchRequest,
 };
 #[cfg(unix)]
 pub use serve::{default_unix_socket_path, serve_unix};
@@ -95,6 +95,9 @@ pub struct ApiRequest {
     /// The `X-Session-Token` header value (#89 mobile profile): required on every
     /// `/api/v1/*` route when the Router runs with a session token.
     pub session_token: Option<String>,
+    /// Normalized inbound `Content-Type`. Only newly introduced JSON routes depend on
+    /// this; legacy query/body routes intentionally retain their existing contract.
+    pub content_type: Option<String>,
     /// The request body bytes (#0A transport). Empty for the query-string GETs that
     /// make up today's API; carried so a body-bearing request survives **both**
     /// transports — HTTP (`serve.rs` reads it instead of draining) and the Android
@@ -123,6 +126,7 @@ impl ApiRequest {
             query,
             cap_token: None,
             session_token: None,
+            content_type: None,
             body: Vec::new(),
         }
     }
@@ -136,6 +140,13 @@ impl ApiRequest {
     /// Attach the captured `X-Session-Token` header (builder style, #89).
     pub fn with_session_token(mut self, token: Option<String>) -> Self {
         self.session_token = token;
+        self
+    }
+
+    /// Attach the normalized request content type (builder style, shared by HTTP and
+    /// the Android bridge).
+    pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
+        self.content_type = content_type;
         self
     }
 
@@ -196,6 +207,37 @@ fn agent_oauth_provider_param(provider: &str) -> Result<&'static str, &'static s
         "" => Err("provider is required"),
         _ => Err("unknown provider"),
     }
+}
+
+const AGENT_STRICT_JSON_MAX_BYTES: usize = 8 * 1024;
+
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    let mut parts = content_type.split(';');
+    if !parts
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return false;
+    }
+    parts.all(|parameter| {
+        let parameter = parameter.trim();
+        parameter.is_empty()
+            || parameter.split_once('=').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("charset")
+                    && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+            })
+    })
+}
+
+fn no_store_json_error(status: u16, message: &str) -> ApiResponse {
+    let mut response = ApiResponse::error(status, message);
+    response
+        .headers
+        .push(("Cache-Control".into(), "no-store".into()));
+    response
 }
 
 /// A response ready to be written by any server adapter.
@@ -359,6 +401,51 @@ pub struct AgentPendingBinding {
     pub item: String,
 }
 
+/// The only provider/purpose pairs accepted by the connectivity preflight route.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConnectivityPreflightRequest {
+    pub provider: String,
+    pub purpose: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+}
+
+/// Redacted connectivity result returned to the Assistant. Values are closed enums;
+/// transport errors, host names, URLs, and snapshot fields never cross this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgentConnectivityPreflightResponse {
+    pub status: String,
+    pub code: String,
+    pub retryable: bool,
+    pub settings_hint: String,
+}
+
+/// Closed request for the explicitly user-triggered product credential refresh. It is separate
+/// from status polling so an ordinary Assistant render cannot create provider network traffic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCredentialRefreshRequest {
+    pub provider: String,
+}
+
+/// A provider OAuth start result. `attempt_id` is opaque and exists only so the
+/// initiating UI can cancel the exact server-side attempt without handling OAuth
+/// state, codes, or callback URLs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgentOAuthStartResponse {
+    pub authorize_url: String,
+    pub attempt_id: String,
+}
+
+/// Closed cancellation request for one provider OAuth attempt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOAuthCancelRequest {
+    pub provider: String,
+    pub attempt_id: String,
+}
+
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
 /// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
 /// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
@@ -384,11 +471,54 @@ pub trait AgentHandler: Send + Sync {
     /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
 
+    /// Run a closed provider connectivity preflight. The router parses the strict JSON
+    /// request and the handler returns only the closed diagnostic response.
+    fn connectivity_preflight(
+        &self,
+        _request: AgentConnectivityPreflightRequest,
+    ) -> Result<AgentConnectivityPreflightResponse, String> {
+        Err("connectivity preflight is not enabled on this server".into())
+    }
+
+    /// Same preflight with the Router-authenticated session token. Desktop handlers can use
+    /// the default implementation; mobile handlers consume a one-shot native snapshot that is
+    /// bound to this token before doing any network I/O.
+    fn connectivity_preflight_with_session(
+        &self,
+        request: AgentConnectivityPreflightRequest,
+        _session_token: Option<&str>,
+    ) -> Result<AgentConnectivityPreflightResponse, String> {
+        self.connectivity_preflight(request)
+    }
+
+    /// Refresh a configured product OAuth credential. The handler returns only its closed
+    /// post-operation state; provider errors and token details never reach the router.
+    fn credential_refresh(&self, _provider: &str) -> Result<String, String> {
+        Err("credential refresh is not enabled on this server".into())
+    }
+
     /// Agent provider OAuth login. Begin a device OAuth login for
     /// `provider`; `redirect_uri` is the loopback callback the browser returns to
     /// (the client supplies its own origin). Returns the authorize URL the UI opens
     /// in the **system browser**. Default: not available (handler opted out).
     fn oauth_start(&self, _provider: &str, _redirect_uri: &str) -> Result<String, String> {
+        Err("subscription login is not enabled on this server".into())
+    }
+    /// Structured OAuth start used by current product clients. The compatibility default
+    /// keeps older handlers usable while still returning an opaque, non-secret attempt id.
+    fn oauth_start_with_attempt(
+        &self,
+        provider: &str,
+        redirect_uri: &str,
+    ) -> Result<AgentOAuthStartResponse, String> {
+        let authorize_url = self.oauth_start(provider, redirect_uri)?;
+        Ok(AgentOAuthStartResponse {
+            authorize_url,
+            attempt_id: String::new(),
+        })
+    }
+    /// Cancel an OAuth attempt. Implementations must only cancel the matching opaque id.
+    fn oauth_cancel(&self, _provider: &str, _attempt_id: &str) -> Result<(), String> {
         Err("subscription login is not enabled on this server".into())
     }
     /// Agent provider OAuth callback. The system browser returns here with
@@ -1784,7 +1914,10 @@ impl Router {
                 "/api/v1/agent/turn" | "/api/v1/agent/chat" => self.agent_turn(req),
                 "/api/v1/agent/confirm" => self.agent_confirm(req),
                 "/api/v1/agent/cancel" => self.agent_cancel(req),
+                "/api/v1/agent/connectivity/preflight" => self.agent_connectivity_preflight(req),
+                "/api/v1/agent/credential/refresh" => self.agent_credential_refresh(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
+                "/api/v1/agent/oauth/cancel" => self.agent_oauth_cancel(req),
                 "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
                 "/api/v1/agent/model" => self.agent_set_model(req),
                 _ => ApiResponse::error(405, "method not allowed"),
@@ -4347,6 +4480,90 @@ impl Router {
         ApiResponse::ok_json(&json!({ "cancelled": turn }))
     }
 
+    /// Run a bounded, redacted connectivity preflight. This is deliberately the only
+    /// new #640 JSON route in this change; legacy agent routes remain query-based until
+    /// their separate hardening work lands.
+    fn agent_connectivity_preflight(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(mut e) => {
+                e.headers.push(("Cache-Control".into(), "no-store".into()));
+                return e;
+            }
+        };
+        if !req.query.is_empty() {
+            return no_store_json_error(400, "connectivity preflight accepts JSON only");
+        }
+        if !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "application/json content type is required");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid JSON request body"),
+        };
+        let request = match serde_json::from_str::<AgentConnectivityPreflightRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid connectivity preflight request"),
+        };
+        let response = match handler
+            .connectivity_preflight_with_session(request, req.session_token.as_deref())
+        {
+            Ok(response) => response,
+            Err(_) => return no_store_json_error(503, "connectivity preflight unavailable"),
+        };
+        let mut response =
+            ApiResponse::ok_json(&serde_json::to_value(response).unwrap_or_else(|_| {
+                json!({
+                    "status": "unavailable",
+                    "code": "connectivity_unavailable",
+                    "retryable": true,
+                    "settings_hint": "none",
+                })
+            }));
+        response
+            .headers
+            .push(("Cache-Control".into(), "no-store".into()));
+        response
+    }
+
+    /// Explicit product credential refresh. This uses the same strict, bounded JSON contract as
+    /// connectivity preflight but deliberately never accepts snapshot, URL, or token fields.
+    fn agent_credential_refresh(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(mut e) => {
+                e.headers.push(("Cache-Control".into(), "no-store".into()));
+                return e;
+            }
+        };
+        if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "credential refresh accepts JSON only");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid JSON request body"),
+        };
+        let request = match serde_json::from_str::<AgentCredentialRefreshRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid credential refresh request"),
+        };
+        let state = match handler.credential_refresh(&request.provider) {
+            Ok(state) => state,
+            Err(_) => return no_store_json_error(409, "reconnect_required"),
+        };
+        let mut response = ApiResponse::ok_json(&json!({ "credential_state": state }));
+        response
+            .headers
+            .push(("Cache-Control".into(), "no-store".into()));
+        response
+    }
+
     /// Agent connection status as JSON (`{connected, model?}`). Read-only; returns
     /// `enabled:false` when no agent is wired so the UI can hide the assistant entirely.
     fn agent_status(&self, _req: &ApiRequest) -> ApiResponse {
@@ -4377,9 +4594,49 @@ impl Router {
             Ok(p) => p,
             Err(e) => return ApiResponse::error(400, e),
         };
-        match handler.oauth_start(provider, redirect) {
-            Ok(url) => ApiResponse::ok_json(&json!({ "authorize_url": url })),
+        match handler.oauth_start_with_attempt(provider, redirect) {
+            Ok(result) => ApiResponse::ok_json(&serde_json::to_value(result).unwrap_or_default()),
             Err(e) => ApiResponse::error(500, &e),
+        }
+    }
+
+    /// Cancel one active provider OAuth attempt. The body is deliberately strict so
+    /// callback state, verifier, and URLs never cross the WebView boundary.
+    fn agent_oauth_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "oauth cancel accepts JSON only");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid oauth cancel request"),
+        };
+        let request = match serde_json::from_str::<AgentOAuthCancelRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid oauth cancel request"),
+        };
+        let provider = match agent_oauth_provider_param(&request.provider) {
+            Ok(provider) => provider,
+            Err(e) => return no_store_json_error(400, e),
+        };
+        if request.attempt_id.is_empty() || request.attempt_id.len() > 128 {
+            return no_store_json_error(400, "invalid oauth cancel request");
+        }
+        match handler.oauth_cancel(provider, &request.attempt_id) {
+            Ok(()) => {
+                let mut response = ApiResponse::ok_json(&json!({ "cancelled": true }));
+                response
+                    .headers
+                    .push(("Cache-Control".into(), "no-store".into()));
+                response
+            }
+            Err(_) => no_store_json_error(409, "oauth attempt is not active"),
         }
     }
 
@@ -6648,10 +6905,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             tx.send("{\"event\":\"token\",\"text\":\"hi\"}".into()).ok();
             Some(rx)
         }
+        fn connectivity_preflight(
+            &self,
+            request: AgentConnectivityPreflightRequest,
+        ) -> Result<AgentConnectivityPreflightResponse, String> {
+            if request.provider != "claude" || request.purpose != "turn_start" {
+                return Err("unsupported test request".into());
+            }
+            Ok(AgentConnectivityPreflightResponse {
+                status: "ready".into(),
+                code: "ready".into(),
+                retryable: false,
+                settings_hint: "none".into(),
+            })
+        }
+        fn credential_refresh(&self, provider: &str) -> Result<String, String> {
+            if provider == "claude" {
+                Ok("connected".into())
+            } else {
+                Err("reconnect_required".into())
+            }
+        }
         fn oauth_start(&self, _provider: &str, redirect_uri: &str) -> Result<String, String> {
             Ok(format!(
                 "https://auth.example/authorize?redirect_uri={redirect_uri}&state=st-1"
             ))
+        }
+        fn oauth_cancel(&self, provider: &str, attempt_id: &str) -> Result<(), String> {
+            if provider == "claude" && attempt_id == "attempt-1" {
+                Ok(())
+            } else {
+                Err("oauth attempt is not active".into())
+            }
         }
         fn oauth_callback(&self, code: &str, state: &str) -> Result<String, String> {
             Ok(format!("<html>connected code={code} state={state}</html>"))
@@ -6725,6 +7010,103 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
             None
         }
+    }
+
+    #[test]
+    fn connectivity_preflight_route_requires_cap_strict_json_and_no_store() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let valid = || {
+            ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json; charset=utf-8".into()))
+                .with_body(b"{\"provider\":\"claude\",\"purpose\":\"turn_start\"}".to_vec())
+        };
+
+        let denied = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_content_type(Some("application/json".into()))
+                .with_body(b"{}".to_vec()),
+        );
+        assert_eq!(denied.status, 401);
+        assert!(denied
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+
+        let wrong_type = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("text/plain".into()))
+                .with_body(b"{}".to_vec()),
+        );
+        assert_eq!(wrong_type.status, 400);
+        assert!(wrong_type
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+
+        let extra_field = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    b"{\"provider\":\"claude\",\"purpose\":\"turn_start\",\"host\":\"example\"}"
+                        .to_vec(),
+                ),
+        );
+        assert_eq!(extra_field.status, 400);
+
+        let duplicate_field = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    b"{\"provider\":\"claude\",\"provider\":\"codex\",\"purpose\":\"turn_start\"}"
+                        .to_vec(),
+                ),
+        );
+        assert_eq!(duplicate_field.status, 400);
+
+        let ready = router.route(&valid());
+        assert_eq!(ready.status, 200);
+        assert_eq!(body_json(&ready)["code"], "ready");
+        assert!(ready
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+    }
+
+    #[test]
+    fn credential_refresh_route_requires_cap_strict_json_and_no_store() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let valid = || {
+            ApiRequest::new("POST", "/api/v1/agent/credential/refresh")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(b"{\"provider\":\"claude\"}".to_vec())
+        };
+
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("POST", "/api/v1/agent/credential/refresh"))
+                .status,
+            401
+        );
+        let response = router.route(&valid());
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["credential_state"], "connected");
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+
+        let malformed = ApiRequest::new("POST", "/api/v1/agent/credential/refresh")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(b"{\"provider\":\"claude\",\"extra\":true}".to_vec());
+        assert_eq!(router.route(&malformed).status, 400);
     }
 
     #[test]
@@ -7076,6 +7458,53 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let missing = router.route(&missing);
         assert_eq!(missing.status, 400);
         assert!(String::from_utf8_lossy(&missing.body).contains("provider is required"));
+    }
+
+    #[test]
+    fn agent_oauth_cancel_is_session_cap_and_strict_json_gated() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("sess".into());
+        let request = || {
+            ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
+                .with_content_type(Some("application/json".into()))
+                .with_body(br#"{"provider":"claude","attempt_id":"attempt-1"}"#.to_vec())
+        };
+
+        assert_eq!(router.route(&request()).status, 401);
+        assert_eq!(
+            router
+                .route(&request().with_cap_token(Some("agentsecret".into())))
+                .status,
+            401
+        );
+
+        let authorized = request()
+            .with_session_token(Some("sess".into()))
+            .with_cap_token(Some("agentsecret".into()));
+        let response = router.route(&authorized);
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["cancelled"], true);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
+
+        let unknown_field = ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
+            .with_content_type(Some("application/json".into()))
+            .with_body(
+                br#"{"provider":"claude","attempt_id":"attempt-1","url":"forbidden"}"#.to_vec(),
+            )
+            .with_session_token(Some("sess".into()))
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&unknown_field).status, 400);
+
+        let wrong_attempt = ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
+            .with_content_type(Some("application/json".into()))
+            .with_body(br#"{"provider":"claude","attempt_id":"other"}"#.to_vec())
+            .with_session_token(Some("sess".into()))
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&wrong_attempt).status, 409);
     }
 
     #[test]
@@ -9502,7 +9931,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "const list = models[prov] || [];",
             "if (!connected || !list.length) return;",
             "\"data-agent-model-option\": val",
+            "\"data-agent-model-connect\": \"claude\"",
             "\"data-agent-model-connect\": \"codex\"",
+            "async function connectAgentProvider(provider)",
+            "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
             "await post(\"/api/v1/agent/model?\" + qs({ provider, model }), CAP.agent);",
             "const st = await api(\"/api/v1/agent/status\");",
             "rememberAssistantStatus(st);",
@@ -9524,15 +9957,45 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_model_switch_resumes_after_provider_privacy_consent() {
+        for needle in [
+            "pendingModelSelection: null",
+            "AssistantState.pendingModelSelection = { provider: agentProviderConsentId(provider), model }",
+            "renderAssistantConsentPanel([pendingModel.provider])",
+            "if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing provider-consent model-switch invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_claude_manual_code_step_survives_connected_rerender() {
+        for needle in [
+            "data-agent-oauth-code-step\": \"claude\"",
+            "body.prepend(card);",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
+            "await cancelOAuthAttempt(\"claude\");",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing persistent Claude manual-code invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn assistant_setup_consent_is_required_and_non_secret() {
         for needle in [
             "const AGENT_PRIVACY_CONSENT_KEY = \"isy_agent_privacy_consent_v1\";",
             "const AGENT_PRIVACY_CONSENT_VERSION = 1;",
             "function agentPrivacyConsentAccepted(provider)",
-            "function acceptAgentPrivacyConsent(provider)",
+            "async function acceptAgentPrivacyConsent(provider)",
             "version: AGENT_PRIVACY_CONSENT_VERSION",
             "accepted: true",
-            "provider: agentProviderConsentId(provider)",
+            "provider: consentProvider",
             "timestamp: new Date().toISOString()",
             "localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record))",
             "function renderAssistantConsentPanel(providers)",
@@ -9541,7 +10004,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "\"data-agent-consent-reset\": \"1\"",
             "if (!agentPrivacyConsentAccepted(consentProvider))",
             "if (!agentPrivacyConsentAccepted(provider))",
-            "if (!agentPrivacyConsentAccepted(\"codex\"))",
+            "const consentProvider = agentProviderConsentId(provider);",
             "if (!agentPrivacyConsentAccepted(provider)) {",
             "Review privacy consent first",
             "renderAssistantConsentPanel([provider])",
@@ -9610,6 +10073,39 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "Assistant product source exposes experimental credential import: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn app_js_renders_closed_connectivity_retry_and_settings_actions() {
+        for needle in [
+            "function renderConnectivityDiagnostic()",
+            "data-agent-connectivity-retry",
+            "data-agent-connectivity-settings",
+            "nativeCall(\"openNetworkSettings\", { hint }",
+            "const BRIDGE_STREAM_TIMEOUT_MS = 125000",
+            "if (st && st.selected_provider)",
+            "if (error && error.connectivity)",
+            "await cancelOAuthAttempt(\"claude\"); await finishAgentGuard()",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js missing #640 connectivity invariant: {needle}"
+            );
+        }
+        assert!(
+            !APP_JS.contains("[provider]: \"reconnect_required\""),
+            "a connectivity failure must not rewrite credential state"
+        );
+        let effective = APP_JS
+            .find("if (st && st.provider)")
+            .expect("effective provider branch");
+        let selected = APP_JS
+            .find("if (st && st.selected_provider)")
+            .expect("selected provider branch");
+        assert!(
+            effective < selected,
+            "the currently effective connected provider must win over a stale selection"
+        );
     }
 
     #[test]
@@ -9763,15 +10259,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "Claude on appassets must detect the manual code flow when no loopback redirect exists"
         );
         assert!(
-            APP_JS.contains("if (manualCodeFlow) showCodeStep();\n    else showWaitingStep();"),
+            APP_JS.contains(
+                "if (manualCodeFlow) showCodeStep();\n    else showWaitingStep(provider);"
+            ),
             "manual Claude OAuth must show the paste-code UI instead of a polling-only wait screen"
         );
         assert!(
-            APP_JS.contains("await finishAgentGuard();\n    toast(\"Connected!\");"),
+            APP_JS.contains(
+                "OAUTH_ATTEMPTS.delete(\"claude\");\n    await finishAgentGuard();\n    toast(\"Connected!\");"
+            ),
             "manual OAuth completion must clean up the network guard after a successful code exchange"
         );
         assert!(
-            APP_JS.contains("await finishAgentGuard(); renderAssistantView($(\"#view\"));"),
+            APP_JS.contains(
+                "await cancelOAuthAttempt(\"claude\"); await finishAgentGuard(); renderAssistantView($(\"#view\"));"
+            ),
             "manual OAuth cancellation must clean up the network guard"
         );
     }

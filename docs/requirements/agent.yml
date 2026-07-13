@@ -206,7 +206,6 @@ requirements:
       - test: experimental_capture_each_missing_codex_header_is_not_safely_observable
       - test: experimental_capture_required_headers_match_runtime_builders
       - test: experimental_capture_rejects_symlink_within_tmp
-      - test: codex_callback_diagnostics_persist_only_safe_booleans
       - test: daemon_agent_startup_removes_legacy_codex_callback_diagnostics
       - test: product_source_scan_keeps_production_after_early_cfg_test_items
       - test: mobile_product_has_no_local_cli_experimental_feature
@@ -334,3 +333,35 @@ requirements:
       - test: agent_confirm_revalidates_action_before_execution
       - test: agent_confirm_result_summary_is_json_and_redacted
       - file: docs/evidence/issue-624-manifest.json
+  - id: REQ-AGENT-013
+    title: Network-critical product OAuth and streamed turns remain diagnosable on Android
+    statement: >
+      Android product OAuth, explicit credential refresh, and active streamed Agent turns
+      acquire an acknowledged, bounded dataSync foreground-service lease before their
+      network-critical work. A session- and capability-gated preflight returns only closed,
+      redacted diagnostic codes. Credential status is network-free; an explicit refresh
+      either atomically persists a complete encrypted product credential or returns a
+      reconnect-required error without local fallback or FakeProvider success. (S-AG.15, #640)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Foreground guards are service-owned, reason-bound, bounded, and survive Activity recreation.
+      - Preflight input is provider/purpose allowlisted, unauthenticated, bounded, and returns no host, URL, token, IP, or raw transport text.
+      - Mobile preflight consumes a one-shot native guard/session-bound snapshot; WebUI cannot supply raw device state.
+      - Status checks do not refresh credentials; explicit refresh persists only a complete encrypted product credential and fails closed on error.
+      - Codex callback attempts are loopback-only, cancellable, bounded, and never persist callback URLs or diagnostics.
+      - Default mobile artifacts exclude network diagnostic hooks; a separate hook artifact proves only diagnostic plumbing.
+    verified_by:
+      - test: reasonsShareOneForegroundServiceUntilLastLeaseEnds
+      - test: networkCriticalGuardStartsAndStopsDeclaredDataSyncService
+      - test: connectivity_preflight_selects_distinct_oauth_turn_and_refresh_targets
+      - test: connectivity_preflight_route_requires_cap_strict_json_and_no_store
+      - test: network_snapshot_registration_uses_engine_session_and_closed_guard_reason
+      - test: agent_status_keeps_selected_codex_provider_when_refresh_is_required
+      - test: product_credential_refresh_uses_injected_clock_and_finite_expiry
+      - test: partial_refresh_response_never_replaces_last_complete_encrypted_credential
+      - test: concurrent_refresh_for_one_provider_is_serialized
+      - test: codex_callback_blocking_accept_cannot_outlive_deadline
+      - test: codex_refresh_device_hook_is_one_shot_and_does_not_change_the_clock
+      - test: networkPreflightHookIsFeatureGatedOwnerOnlyAndOneShot
+      - file: docs/evidence/issue-640-manifest.json

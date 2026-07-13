@@ -107,6 +107,85 @@ class BridgeMessagePolicyTest {
             ),
             "missing_guard_id",
         )
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "native")
+                    .put("id", "n6")
+                    .put("op", "beginNetworkGuard")
+                    .put("payload", JSONObject())
+                    .toString(),
+            ),
+            "missing_or_unknown_guard_reason",
+        )
+        assertValid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "native")
+                    .put("id", "n7")
+                    .put("op", "beginNetworkGuard")
+                    .put("payload", JSONObject().put("reason", "oauth"))
+                    .toString(),
+            ),
+            "native",
+            "n7",
+        )
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "native")
+                    .put("id", "n8")
+                    .put("op", "bindNetworkGuard")
+                    .put("payload", JSONObject().put("guard_id", "g").put("turn", "bad turn"))
+                    .toString(),
+            ),
+            "invalid_turn",
+        )
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "native")
+                    .put("id", "n9")
+                    .put("op", "openNetworkSettings")
+                    .put("payload", JSONObject().put("hint", "arbitrary"))
+                    .toString(),
+            ),
+            "missing_or_unknown_settings_hint",
+        )
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "native")
+                    .put("id", "n10")
+                    .put("op", "captureNetworkSnapshot")
+                    .put("payload", JSONObject())
+                    .toString(),
+            ),
+            "missing_guard_id",
+        )
+        assertValid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "native")
+                    .put("id", "n11")
+                    .put("op", "captureNetworkSnapshot")
+                    .put("payload", JSONObject().put("guard_id", "guard"))
+                    .toString(),
+            ),
+            "native",
+            "n11",
+        )
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "native")
+                    .put("id", "n12")
+                    .put("op", "arbitrary")
+                    .put("payload", JSONObject())
+                    .toString(),
+            ),
+            "unknown_native_op",
+        )
     }
 
     @Test

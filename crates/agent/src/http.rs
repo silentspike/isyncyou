@@ -6,7 +6,7 @@
 use crate::AgentError;
 #[cfg(any(feature = "http", test))]
 use std::collections::BTreeMap;
-#[cfg(any(feature = "http", test))]
+#[cfg(test)]
 use std::io::Read;
 
 #[cfg(any(feature = "http", test))]
@@ -181,7 +181,7 @@ impl SseDecoder {
     }
 }
 
-#[cfg(any(feature = "http", test))]
+#[cfg(test)]
 fn read_sse_stream(
     mut reader: impl Read,
     on_event: &mut dyn FnMut(SseEvent),
@@ -254,7 +254,7 @@ fn body_preview_from_bytes(bytes: &[u8], truncated: bool) -> Option<String> {
     Some(preview)
 }
 
-#[cfg(any(feature = "http", test))]
+#[cfg(test)]
 fn read_body_preview(mut reader: impl Read) -> Result<Option<String>, AgentError> {
     let mut buf = Vec::with_capacity(MAX_PROVIDER_BODY_PREVIEW_BYTES);
     let mut chunk = [0u8; 1024];
@@ -280,84 +280,75 @@ fn read_body_preview(mut reader: impl Read) -> Result<Option<String>, AgentError
 #[cfg(feature = "http")]
 mod live {
     use super::{
-        filter_provider_header_pairs, read_body_preview, read_sse_stream, ProviderHttpResponse,
-        SseEvent,
+        filter_provider_header_pairs, ProviderHttpResponse, SseDecoder, SseEvent,
+        MAX_PROVIDER_BODY_PREVIEW_BYTES,
     };
+    use crate::connectivity::{ProbeObservation, ProbeTarget};
     use crate::AgentError;
+    use futures_util::StreamExt;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
 
-    /// Resolve `host`'s A records via **DNS-over-HTTPS to `1.1.1.1`**. Android forbids apps
-    /// from doing raw DNS (UDP → `EPERM`) and its platform resolver intermittently `EAI_NODATA`s
-    /// for Cloudflare-fronted hosts (`auth.openai.com`) from app threads; a plain HTTPS call to
-    /// the literal IP `1.1.1.1` (no DNS needed, cert valid for `1.1.1.1`) works within those
-    /// rules. Returns the resolved IPs (empty on any failure → caller falls back to platform DNS).
-    pub fn doh_resolve(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
-        use std::error::Error;
-        use std::net::{IpAddr, SocketAddr};
-        // Google's public DoH, reached by PINNING `dns.google` to its stable well-known IPs
-        // (8.8.8.8 / 8.8.4.4). This needs neither the platform resolver (which app-side can't
-        // look up AAAA-bearing hosts like auth.openai.com / dns.google) nor raw UDP DNS
-        // (EPERM on Android). SNI/Host stay `dns.google`, so the cert validates normally.
-        // Some networks block app access to public DNS *server* IPs (8.8.8.8 / 1.1.1.1),
-        // but not Cloudflare's general web range — so reach Cloudflare's DoH by pinning
-        // `cloudflare-dns.com` to its web IPs (reachable wherever the site itself is).
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(8))
-            .resolve(
-                "cloudflare-dns.com",
-                SocketAddr::new(IpAddr::from([104, 16, 248, 249]), 443),
-            )
-            .resolve(
-                "cloudflare-dns.com",
-                SocketAddr::new(IpAddr::from([104, 16, 249, 249]), 443),
-            )
-            .build()
-            .map_err(|e| e.to_string())?;
-        let text = client
-            .get(format!(
-                "https://cloudflare-dns.com/dns-query?name={host}&type=A"
-            ))
-            .header("accept", "application/dns-json")
-            .send()
-            .map_err(|e| {
-                let mut m = e.to_string();
-                let mut s = e.source();
-                while let Some(x) = s {
-                    m.push_str(&format!(" | {x}"));
-                    s = x.source();
-                }
-                m
-            })?
-            .text()
-            .map_err(|e| e.to_string())?;
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        Ok(v.get("Answer")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    // type 1 = A record
-                    .filter(|e| e.get("type").and_then(|t| t.as_u64()) == Some(1))
-                    .filter_map(|e| {
-                        e.get("data")
-                            .and_then(|d| d.as_str())
-                            .and_then(|s| s.parse().ok())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
+    /// Compiled policy for product provider traffic. Callers cannot override these values.
+    pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const PROVIDER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const PROVIDER_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    pub const PROVIDER_TURN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+    pub const PREFLIGHT_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 
     /// A minimal blocking JSON-over-HTTPS client (reqwest + rustls). Providers build
     /// their own request bodies and headers; this just sends and returns status+body.
     pub struct HttpTransport {
         client: reqwest::blocking::Client,
+        probe_client: reqwest::blocking::Client,
+        sse_client: reqwest::Client,
+        sse_runtime: tokio::runtime::Runtime,
     }
 
     impl HttpTransport {
         pub fn new() -> Result<Self, AgentError> {
             let client = reqwest::blocking::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PROVIDER_TURN_TIMEOUT)
                 .build()
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
-            Ok(Self { client })
+                .map_err(|_| {
+                    AgentError::Transport("provider_transport_initialization_failed".into())
+                })?;
+            let probe_client = reqwest::blocking::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .timeout(PREFLIGHT_TOTAL_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| {
+                    AgentError::Transport("provider_transport_initialization_failed".into())
+                })?;
+            let sse_client = async_sse_client_builder().build().map_err(|_| {
+                AgentError::Transport("provider_transport_initialization_failed".into())
+            })?;
+            let sse_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| {
+                    AgentError::Transport("provider_transport_initialization_failed".into())
+                })?;
+            Ok(Self {
+                client,
+                probe_client,
+                sse_client,
+                sse_runtime,
+            })
+        }
+
+        /// Reuse one transport for the lifetime of the app process. Provider requests
+        /// remain logically independent, while DNS, TLS sessions, connection pools, and
+        /// the async runtime stay warm between turns and credential refreshes.
+        pub fn shared() -> Result<Arc<Self>, AgentError> {
+            static SHARED: OnceLock<Arc<HttpTransport>> = OnceLock::new();
+            if let Some(transport) = SHARED.get() {
+                return Ok(Arc::clone(transport));
+            }
+            let transport = Arc::new(Self::new()?);
+            Ok(Arc::clone(SHARED.get_or_init(|| transport)))
         }
 
         fn ensure_test_network_allowed() -> Result<(), AgentError> {
@@ -370,27 +361,19 @@ mod live {
             Ok(())
         }
 
-        /// Like [`new`], but pins `host` to the given IPs (from [`doh_resolve`]) so the
-        /// platform resolver is bypassed. The TLS SNI/Host stays `host`, so the cert still
-        /// validates. Use for hosts Android's app-thread resolver can't look up
-        /// (`auth.openai.com`). Empty `ips` → behaves like [`new`] (platform resolver).
-        pub fn new_resolving(host: &str, ips: &[std::net::IpAddr]) -> Result<Self, AgentError> {
-            use std::net::SocketAddr;
-            use std::time::Duration;
-            let addrs: Vec<SocketAddr> = ips
-                .iter()
-                .copied()
-                .filter(|ip| ip.is_ipv4())
-                .map(|ip| SocketAddr::new(ip, 443))
-                .collect();
-            let client = reqwest::blocking::Client::builder()
-                .no_proxy()
-                .connect_timeout(Duration::from_secs(6))
-                .timeout(Duration::from_secs(30))
-                .resolve_to_addrs(host, &addrs)
-                .build()
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
-            Ok(Self { client })
+        /// Run one unauthenticated, no-redirect provider reachability probe. The target
+        /// table is closed and neither the URL nor raw reqwest error leaves this module.
+        pub fn probe(&self, target: ProbeTarget) -> Result<ProbeObservation, AgentError> {
+            Self::ensure_test_network_allowed()?;
+            let mut request = self.probe_client.get(probe_target_url(target));
+            for (name, value) in probe_request_headers() {
+                request = request.header(name, value);
+            }
+            let result = request.send();
+            match result {
+                Ok(response) => Ok(ProbeObservation::HttpStatus(response.status().as_u16())),
+                Err(error) => Ok(probe_observation_for_reqwest_error(&error)),
+            }
         }
 
         /// POST a JSON body with the given headers; returns `(status, body_text)`.
@@ -401,17 +384,19 @@ mod live {
             body: &serde_json::Value,
         ) -> Result<(u16, String), AgentError> {
             Self::ensure_test_network_allowed()?;
-            let mut req = self.client.post(url).json(body);
+            let mut req = self
+                .client
+                .post(url)
+                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
             }
-            let resp = req
-                .send()
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
+            let resp = req.send().map_err(safe_reqwest_transport_error)?;
             let status = resp.status().as_u16();
             let text = resp
                 .text()
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
+                .map_err(|_| AgentError::Transport("provider_response_read_failed".into()))?;
             Ok((status, text))
         }
 
@@ -422,35 +407,77 @@ mod live {
             url: &str,
             headers: &[(String, String)],
             body: &serde_json::Value,
-            on_event: &mut dyn FnMut(SseEvent),
+            on_event: &mut dyn FnMut(SseEvent) -> bool,
         ) -> Result<ProviderHttpResponse, AgentError> {
             Self::ensure_test_network_allowed()?;
-            let mut req = self.client.post(url).json(body);
+            let mut req = self.sse_client.post(url).json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
             }
-            let mut resp = req
-                .send()
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
-            let status = resp.status().as_u16();
-            let headers = filter_provider_header_pairs(
-                resp.headers()
-                    .iter()
-                    .filter_map(|(k, v)| v.to_str().ok().map(|value| (k.as_str(), value))),
-            );
-            if !(200..=299).contains(&status) {
-                let body_preview = read_body_preview(&mut resp)?;
-                return Ok(ProviderHttpResponse {
+            self.sse_runtime.block_on(async {
+                let started_at = tokio::time::Instant::now();
+                let deadline = started_at + PROVIDER_TURN_TIMEOUT;
+                let first_event_deadline = started_at + PROVIDER_RESPONSE_TIMEOUT;
+                let response =
+                    within_deadline(first_event_deadline, PROVIDER_RESPONSE_TIMEOUT, req.send())
+                        .await
+                        .map_err(|_| provider_timeout("provider_response_timed_out"))?
+                        .map_err(safe_reqwest_transport_error)?;
+                let status = response.status().as_u16();
+                let headers = filter_provider_header_pairs(
+                    response
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|value| (k.as_str(), value))),
+                );
+                if !(200..=299).contains(&status) {
+                    let body_preview = read_body_preview_async(response, deadline).await?;
+                    return Ok(ProviderHttpResponse {
+                        status,
+                        headers,
+                        body_preview,
+                    });
+                }
+                let mut stream = response.bytes_stream();
+                let mut decoder = SseDecoder::new();
+                let mut saw_any_event = false;
+                let mut saw_progress = false;
+                let mut event_deadline = first_event_deadline;
+                loop {
+                    let phase_deadline = deadline.min(event_deadline);
+                    let (phase_timeout, timeout_code) = provider_stream_wait_policy(saw_progress);
+                    let next = within_deadline(phase_deadline, phase_timeout, stream.next())
+                        .await
+                        .map_err(|_| provider_timeout(timeout_code))?;
+                    let Some(chunk) = next else {
+                        break;
+                    };
+                    let chunk = chunk
+                        .map_err(|_| AgentError::Transport("provider_stream_read_failed".into()))?;
+                    let mut chunk_had_progress = false;
+                    decoder.push_bytes(&chunk, &mut |event| {
+                        saw_any_event = true;
+                        chunk_had_progress |= on_event(event);
+                    })?;
+                    if chunk_had_progress {
+                        saw_progress = true;
+                        event_deadline = tokio::time::Instant::now() + PROVIDER_SSE_IDLE_TIMEOUT;
+                    }
+                }
+                decoder.finish(&mut |event| {
+                    saw_any_event = true;
+                    let _ = on_event(event);
+                })?;
+                if !saw_any_event {
+                    return Err(AgentError::Transport(
+                        "provider_stream_ended_without_event".into(),
+                    ));
+                }
+                Ok(ProviderHttpResponse {
                     status,
                     headers,
-                    body_preview,
-                });
-            }
-            read_sse_stream(&mut resp, on_event)?;
-            Ok(ProviderHttpResponse {
-                status,
-                headers,
-                body_preview: None,
+                    body_preview: None,
+                })
             })
         }
 
@@ -462,33 +489,163 @@ mod live {
             form: &[(&str, &str)],
         ) -> Result<(u16, String), AgentError> {
             Self::ensure_test_network_allowed()?;
-            let resp = self.client.post(url).form(form).send().map_err(|e| {
-                use std::error::Error;
-                let mut msg = e.to_string();
-                let mut src = e.source();
-                while let Some(s) = src {
-                    msg.push_str(&format!(" | {s}"));
-                    src = s.source();
-                }
-                AgentError::Transport(msg)
-            })?;
+            let resp = self
+                .client
+                .post(url)
+                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .form(form)
+                .send()
+                .map_err(safe_reqwest_transport_error)?;
             let status = resp.status().as_u16();
             let text = resp
                 .text()
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
+                .map_err(|_| AgentError::Transport("provider_response_read_failed".into()))?;
             Ok((status, text))
         }
+    }
+
+    fn probe_target_url(target: ProbeTarget) -> &'static str {
+        match target {
+            ProbeTarget::ClaudeOAuth => "https://claude.com/cai/oauth/authorize",
+            ProbeTarget::ClaudeInference => "https://api.anthropic.com/v1/messages",
+            ProbeTarget::CodexOAuth => "https://auth.openai.com/",
+            ProbeTarget::CodexInference => "https://chatgpt.com/backend-api/codex/responses",
+        }
+    }
+
+    pub(super) fn probe_request_headers() -> [(&'static str, &'static str); 1] {
+        [("accept", "application/json")]
+    }
+
+    fn async_sse_client_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder().connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+    }
+
+    fn error_source_is_tls(error: &(dyn std::error::Error + 'static)) -> bool {
+        if error.is::<rustls::Error>() {
+            return true;
+        }
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            if io
+                .get_ref()
+                .is_some_and(|inner| inner.is::<rustls::Error>())
+            {
+                return true;
+            }
+        }
+        error.source().is_some_and(error_source_is_tls)
+    }
+
+    fn error_source_is_dns(error: &(dyn std::error::Error + 'static)) -> bool {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::AddrNotAvailable
+            ) {
+                return true;
+            }
+        }
+        error.source().is_some_and(error_source_is_dns)
+    }
+
+    pub(super) fn probe_observation_for_error_source(
+        timed_out: bool,
+        error: &(dyn std::error::Error + 'static),
+    ) -> ProbeObservation {
+        if timed_out {
+            ProbeObservation::ConnectTimedOut
+        } else if error_source_is_tls(error) {
+            ProbeObservation::TlsFailed
+        } else if error_source_is_dns(error) {
+            ProbeObservation::NameResolutionFailed
+        } else {
+            ProbeObservation::ConnectFailed
+        }
+    }
+
+    fn probe_observation_for_reqwest_error(error: &reqwest::Error) -> ProbeObservation {
+        probe_observation_for_error_source(error.is_timeout(), error)
+    }
+
+    fn safe_reqwest_transport_error(error: reqwest::Error) -> AgentError {
+        let code = match probe_observation_for_reqwest_error(&error) {
+            ProbeObservation::ConnectTimedOut => "provider_connect_timed_out",
+            ProbeObservation::TlsFailed => "provider_tls_failed",
+            ProbeObservation::NameResolutionFailed => "provider_name_resolution_failed",
+            _ => "provider_connect_failed",
+        };
+        AgentError::Transport(code.into())
+    }
+
+    pub(super) async fn within_deadline<T>(
+        deadline: tokio::time::Instant,
+        limit: Duration,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, ()> {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(());
+        }
+        let remaining = deadline.duration_since(now);
+        let timeout = remaining.min(limit);
+        tokio::time::timeout(timeout, future).await.map_err(|_| ())
+    }
+
+    fn provider_timeout(code: &'static str) -> AgentError {
+        AgentError::Transport(code.into())
+    }
+
+    pub(super) fn provider_stream_wait_policy(saw_event: bool) -> (Duration, &'static str) {
+        if saw_event {
+            (PROVIDER_SSE_IDLE_TIMEOUT, "provider_stream_idle_timed_out")
+        } else {
+            (PROVIDER_RESPONSE_TIMEOUT, "provider_response_timed_out")
+        }
+    }
+
+    async fn read_body_preview_async(
+        response: reqwest::Response,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<String>, AgentError> {
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::with_capacity(MAX_PROVIDER_BODY_PREVIEW_BYTES);
+        let mut truncated = false;
+        loop {
+            let next = within_deadline(deadline, PROVIDER_SSE_IDLE_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| provider_timeout("provider_stream_idle_timed_out"))?;
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk =
+                chunk.map_err(|_| AgentError::Transport("provider_stream_read_failed".into()))?;
+            let remaining = MAX_PROVIDER_BODY_PREVIEW_BYTES.saturating_sub(bytes.len());
+            if chunk.len() > remaining {
+                bytes.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() == MAX_PROVIDER_BODY_PREVIEW_BYTES {
+                truncated = true;
+                break;
+            }
+        }
+        Ok(super::body_preview_from_bytes(&bytes, truncated))
     }
 }
 
 #[cfg(feature = "http")]
-pub use live::{doh_resolve, HttpTransport};
+pub use live::HttpTransport;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[cfg(feature = "http")]
+    static HTTP_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(feature = "http")]
     struct EnvRestore {
@@ -559,6 +716,19 @@ mod tests {
         assert_eq!(events[0].data, "hello\nworld");
         assert_eq!(events[1].event, None);
         assert_eq!(events[1].data, "[DONE]");
+    }
+
+    #[test]
+    fn provider_sse_keepalive_comments_do_not_count_as_events() {
+        let mut decoder = SseDecoder::new();
+        let mut events = Vec::new();
+        decoder
+            .push_bytes(b": keepalive\n\n: still-alive\n\n", &mut |event| {
+                events.push(event)
+            })
+            .unwrap();
+        decoder.finish(&mut |event| events.push(event)).unwrap();
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -634,6 +804,136 @@ mod tests {
         assert!(preview.ends_with("[truncated]"));
     }
 
+    #[cfg(feature = "http")]
+    #[test]
+    fn provider_transport_timeout_policy_has_distinct_response_idle_and_turn_bounds() {
+        assert_eq!(live::PROVIDER_CONNECT_TIMEOUT.as_secs(), 10);
+        assert_eq!(live::PROVIDER_RESPONSE_TIMEOUT.as_secs(), 60);
+        assert_eq!(live::PROVIDER_SSE_IDLE_TIMEOUT.as_secs(), 120);
+        assert_eq!(live::PROVIDER_TURN_TIMEOUT.as_secs(), 20 * 60);
+        assert!(live::PROVIDER_RESPONSE_TIMEOUT < live::PROVIDER_SSE_IDLE_TIMEOUT);
+        assert!(live::PROVIDER_SSE_IDLE_TIMEOUT < live::PROVIDER_TURN_TIMEOUT);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn provider_transport_is_hot_for_process_lifetime() {
+        let first = HttpTransport::shared().unwrap();
+        let second = HttpTransport::shared().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn provider_transport_hot_runtime_drives_local_sse_io() {
+        use std::io::{Read, Write};
+
+        let _guard = HTTP_TEST_ENV_LOCK.lock().unwrap();
+        assert!(std::env::var_os("ISYNCYOU_AGENT_TEST_BLOCK_NETWORK").is_none());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      connection: close\r\n\r\ndata: {\"type\":\"response.completed\"}\n\n",
+                )
+                .unwrap();
+        });
+
+        let transport = HttpTransport::shared().unwrap();
+        let mut events = Vec::new();
+        let response = transport
+            .post_json_sse(
+                &format!("http://{address}/responses"),
+                &[],
+                &serde_json::json!({}),
+                &mut |event| {
+                    events.push(event.data);
+                    true
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(events, [r#"{"type":"response.completed"}"#]);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn provider_stream_first_event_uses_response_deadline_not_idle_deadline() {
+        assert_eq!(
+            live::provider_stream_wait_policy(false),
+            (
+                live::PROVIDER_RESPONSE_TIMEOUT,
+                "provider_response_timed_out"
+            )
+        );
+        assert_eq!(
+            live::provider_stream_wait_policy(true),
+            (
+                live::PROVIDER_SSE_IDLE_TIMEOUT,
+                "provider_stream_idle_timed_out"
+            )
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn provider_transport_expired_deadline_rejects_already_ready_chunk() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let expired = tokio::time::Instant::now();
+            let result = live::within_deadline(
+                expired,
+                std::time::Duration::from_secs(120),
+                std::future::ready(42),
+            )
+            .await;
+            assert_eq!(result, Err(()));
+        });
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn preflight_transport_never_sends_authorization_or_cookie() {
+        for (name, _) in live::probe_request_headers() {
+            let name = name.to_ascii_lowercase();
+            assert_ne!(name, "authorization");
+            assert_ne!(name, "cookie");
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn connectivity_preflight_classifies_name_resolution_failure_without_error_text() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "private resolver details must not be parsed",
+        );
+        assert_eq!(
+            live::probe_observation_for_error_source(false, &error),
+            crate::connectivity::ProbeObservation::NameResolutionFailed
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn connectivity_preflight_classifies_tls_failure_without_error_text() {
+        let error = rustls::Error::General("private certificate details".into());
+        assert_eq!(
+            live::probe_observation_for_error_source(false, &error),
+            crate::connectivity::ProbeObservation::TlsFailed
+        );
+    }
+
     struct ChunkReader {
         chunks: Vec<&'static [u8]>,
         pos: usize,
@@ -675,6 +975,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn non_live_provider_tests_fail_on_unexpected_network() {
+        let _guard = HTTP_TEST_ENV_LOCK.lock().unwrap();
         let _env = EnvRestore::set("ISYNCYOU_AGENT_TEST_BLOCK_NETWORK", "1");
         let http = HttpTransport::new().unwrap();
         let err = http
