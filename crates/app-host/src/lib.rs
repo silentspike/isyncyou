@@ -878,8 +878,17 @@ impl DaemonAgent {
         if !present_valid {
             return false;
         }
+        let official_policy = oauth_policy_fingerprint(provider);
         let generation = match load_product_bundle_meta(&self.oauth_dir, credential_id) {
-            Some(meta) if meta.lifecycle == CredentialLifecycle::Active => meta.generation,
+            // #639 (policy-binding fix): the BUNDLE's own stored policy fingerprint must equal the
+            // current official policy — a bundle minted under a different OAuth policy can never be
+            // ready (and cannot be silently re-activated under the current policy).
+            Some(meta)
+                if meta.lifecycle == CredentialLifecycle::Active
+                    && meta.policy_fingerprint == official_policy =>
+            {
+                meta.generation
+            }
             _ => return false,
         };
         let activation = match load_product_activation(&self.oauth_dir, provider) {
@@ -889,7 +898,7 @@ impl DaemonAgent {
         if !activation.matches(
             provider,
             &generation,
-            &oauth_policy_fingerprint(provider),
+            &official_policy,
             isyncyou_agent::HARNESS_CONTRACT_VERSION,
         ) {
             return false;
@@ -1324,10 +1333,11 @@ impl ProductBundleMeta {
 fn uuid_v4() -> String {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut b = [0u8; 16];
-    if SystemRandom::new().fill(&mut b).is_err() {
-        // Fail closed to a clearly-invalid, non-empty id rather than a guessable constant.
-        b = *b"isyncyou-rngbad!";
-    }
+    // #639 (rng fail-closed fix): a secure-RNG failure is an unrecoverable security fault — abort
+    // rather than mint a deterministic, guessable credential generation.
+    SystemRandom::new()
+        .fill(&mut b)
+        .expect("secure RNG unavailable — refusing to mint a credential generation");
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant
     format!(
@@ -2343,12 +2353,27 @@ fn activate_product(
     provider: ProductProviderId,
     generation: &str,
 ) -> Result<(), String> {
+    let credential_id = match provider {
+        ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+        ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+    };
+    let official_policy = oauth_policy_fingerprint(provider);
+    // #639 (policy-binding fix): only activate a bundle whose OWN stored policy fingerprint (and
+    // generation) matches — recovery must never re-bless a bundle minted under a different OAuth
+    // policy by stamping the current policy onto a fresh activation.
+    match load_product_bundle_meta(oauth_dir, credential_id) {
+        Some(meta)
+            if meta.lifecycle == CredentialLifecycle::Active
+                && meta.policy_fingerprint == official_policy
+                && meta.generation == generation => {}
+        _ => return Err("credential policy/generation does not match the official policy".into()),
+    }
     isyncyou_agent::attest_static_product_harness(harness_provider_for(provider))
         .map_err(|_| "harness_attestation_failed".to_string())?;
     let activation = ProductActivationV1 {
         provider_id: provider.wire().to_string(),
         credential_generation: generation.to_string(),
-        oauth_policy_fingerprint: oauth_policy_fingerprint(provider),
+        oauth_policy_fingerprint: official_policy,
         harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
     };
     store_product_activation(oauth_dir, provider, &activation)
@@ -8452,6 +8477,47 @@ mod tests {
         .unwrap();
         // The activation's policy fingerprint does not match the official one -> not ready.
         assert!(!agent.provider_ready(ProductProviderId::Claude));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // #639 (policy-binding regression): a bundle whose OWN stored policy fingerprint differs from
+    // the official one is never made ready — not by provider_ready and not by startup recovery
+    // (which must refuse to re-bless it under the current policy).
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn mismatched_policy_bundle_is_never_recovered_to_ready() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("mismatched-policy-bundle");
+        let _ = std::fs::remove_dir_all(&root);
+        // An Active V2 bundle minted under a DIFFERENT OAuth policy (valid, far-future token).
+        let meta = ProductBundleMeta {
+            generation: uuid_v4(),
+            policy_fingerprint: "some-other-official-policy".to_string(),
+            lifecycle: CredentialLifecycle::Active,
+        };
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(
+                StoredCredential {
+                    access_token: "t".into(),
+                    refresh_token: "r".into(),
+                    expires_at_ms: 9_999_999_999_999,
+                }
+                .to_json(),
+            ),
+        )
+        .unwrap();
+        // Constructing the agent runs startup recovery.
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        // Recovery must NOT have activated it, and readiness must be false.
+        assert!(!agent.provider_ready(ProductProviderId::Claude));
+        assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
+        // Explicit activation of a mismatched-policy bundle also fails closed.
+        assert!(activate_product(&root, ProductProviderId::Claude, &meta.generation).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
