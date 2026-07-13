@@ -7301,6 +7301,42 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn unknown_agent_provider_identifier_returns_400() {
+        // #639: the closed product provider id is the allowlist. Aliases (anthropic/openai) and
+        // any unknown value are rejected at the API edge with 400 — no normalization to a product id.
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        for bad in ["anthropic", "openai", "gpt", "", "Claude"] {
+            let req = ApiRequest::new("POST", &format!("/api/v1/agent/oauth/start?provider={bad}"))
+                .with_cap_token(Some("agentsecret".into()));
+            assert_eq!(
+                router.route(&req).status,
+                400,
+                "provider {bad:?} must be rejected with 400"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_connect_posts_claude_and_codex_provider_ids() {
+        // #639: the two accepted connect provider ids are exactly `claude` and `codex`.
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        for good in ["claude", "codex"] {
+            let req = ApiRequest::new(
+                "POST",
+                &format!("/api/v1/agent/oauth/start?provider={good}"),
+            )
+            .with_cap_token(Some("agentsecret".into()));
+            assert_eq!(
+                router.route(&req).status,
+                200,
+                "provider {good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn mobile_agent_confirm_requires_biometric_before_agent_token_consumption() {
         let (_d, router) = setup();
         let agent = std::sync::Arc::new(RecordingAgent::backup());

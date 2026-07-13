@@ -14,6 +14,7 @@ pub use mobile_jobs::{
     MobileJobRunOutcome, MobileJobRuntime, MobileWorkerDeviceSnapshot,
 };
 
+use isyncyou_agent::ProductProviderId;
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
@@ -1283,10 +1284,10 @@ fn store_agent_provider_selection(
     provider: &str,
     model: &str,
 ) -> Result<(), String> {
-    let known = match provider {
-        "claude" => CLAUDE_MODELS,
-        "codex" => CODEX_MODELS,
-        _ => return Err("unknown provider".into()),
+    let known = match ProductProviderId::parse(provider) {
+        Some(ProductProviderId::Claude) => CLAUDE_MODELS,
+        Some(ProductProviderId::Codex) => CODEX_MODELS,
+        None => return Err("unknown provider".into()),
     };
     if !known.iter().any(|(id, _)| *id == model) {
         return Err("unknown model for provider".into());
@@ -1604,8 +1605,8 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         if provider == sel_provider && !sel_model.is_empty() {
             return sel_model;
         }
-        match provider {
-            "codex" => isyncyou_agent::CodexConfig::default().model,
+        match ProductProviderId::parse(provider) {
+            Some(ProductProviderId::Codex) => isyncyou_agent::CodexConfig::default().model,
             _ => {
                 std::env::var("ISYNCYOU_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
             }
@@ -1835,11 +1836,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// Side-effect-free product status. Local CLI fallback is intentionally absent here: it is
     /// not product readiness, and this method must never perform a network refresh.
     fn product_credential_status(&self, provider: &str) -> Result<&'static str, String> {
-        match provider {
-            "claude" => Ok(product_credential_state_wire(
+        match ProductProviderId::parse(provider) {
+            Some(ProductProviderId::Claude) => Ok(product_credential_state_wire(
                 &self.claude_product_credential_state(),
             )),
-            "codex" => {
+            Some(ProductProviderId::Codex) => {
                 #[cfg(feature = "agent-network-device-test-hooks")]
                 if codex_refresh_for_device_test_is_armed()
                     && !matches!(
@@ -1853,7 +1854,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     &self.codex_product_credential_state(),
                 ))
             }
-            _ => Err("unknown provider".into()),
+            None => Err("unknown provider".into()),
         }
     }
 
@@ -1865,8 +1866,8 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .credential_refresh_gate
             .lock()
             .map_err(|_| "reconnect_required".to_string())?;
-        match provider {
-            "claude" => match self.claude_product_credential_state() {
+        match ProductProviderId::parse(provider) {
+            Some(ProductProviderId::Claude) => match self.claude_product_credential_state() {
                 ProductCredentialState::PresentValid(_) => Ok("connected"),
                 ProductCredentialState::PresentNeedsRefresh(credential) => self
                     .refresh_claude_product_credential_unlocked(credential)
@@ -1876,7 +1877,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     Err("reconnect_required".into())
                 }
             },
-            "codex" => {
+            Some(ProductProviderId::Codex) => {
                 #[cfg(feature = "agent-network-device-test-hooks")]
                 let force_refresh = take_codex_refresh_for_device_test();
                 #[cfg(not(feature = "agent-network-device-test-hooks"))]
@@ -1896,7 +1897,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     }
                 }
             }
-            _ => Err("unknown provider".into()),
+            None => Err("unknown provider".into()),
         }
     }
 
@@ -2301,9 +2302,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         provider: &str,
         redirect_uri: &str,
     ) -> Result<isyncyou_webui::AgentOAuthStartResponse, String> {
-        match provider {
-            "codex" => self.codex_oauth_start(),
-            "claude" => {
+        match ProductProviderId::parse(provider) {
+            Some(ProductProviderId::Codex) => self.codex_oauth_start(),
+            Some(ProductProviderId::Claude) => {
                 let mut attempts = self.oauth_attempts.lock().unwrap();
                 reap_oauth_attempts(&mut attempts);
                 if attempts
@@ -2337,7 +2338,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     attempt_id,
                 })
             }
-            _ => Err("unknown provider".into()),
+            None => Err("unknown provider".into()),
         }
     }
 

@@ -35,6 +35,7 @@ pub mod http;
     feature = "agent-subscription-experimental"
 ))]
 pub mod oauth;
+pub mod product_provider;
 pub mod provider;
 pub mod retrieval;
 pub mod secrets;
@@ -54,6 +55,7 @@ pub use connectivity::{
     ConnectivityPurpose, ProbeLimiter, ProbeObservation, RestrictBackgroundStatus,
 };
 pub use error::AgentError;
+pub use product_provider::ProductProviderId;
 pub use provider::{AssistantBlock, DoneReason, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
 pub use secrets::{
