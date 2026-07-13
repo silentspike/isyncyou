@@ -160,6 +160,42 @@
       "command": "see host-gates.txt",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-639/host-gates.txt"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The default product APK (sha bab36ef...) excludes the diagnostic hook (0 hits in native libs).",
+      "method": "command",
+      "command": "unzip lib/* + grep hook markers",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/device/device-handoff.txt"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-014",
+      "claim": "On-device: a real official ChatGPT/Codex OAuth (auth.openai.com) completed to Connected/ready via the loopback callback (no raw-token seeding).",
+      "method": "example",
+      "command": "on-device live login (device-lock ag-639)",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/device/02-codex-connected-720.png"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-014",
+      "claim": "On-device: a real official Claude OAuth (claude.ai/oauth/authorize) completed to Connected/ready via the strict-JSON attempt-bound manual code (type=password).",
+      "method": "example",
+      "command": "on-device live login (device-lock ag-639)",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/device/03-claude-connected-720.png"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-014",
+      "claim": "On-device: the wizard renders the reconnect short flow, proving #639 fail-closed for a pre-existing credential without a matching activation.",
+      "method": "example",
+      "command": "on-device (device-lock ag-639)",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/device/01-wizard-reconnect-720.png"
     }
   ]
 }
