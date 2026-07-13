@@ -1,0 +1,50 @@
+#639 S-AG.14 current-tree recheck
+=================================
+
+Implementation commit: a84b286569be88a672f9c6a67eb7ad55b6360a61
+Collected: 2026-07-13T21:14:45Z
+
+CURRENT IMPLEMENTATION GATES
+----------------------------
+- cargo remote -c -- test --workspace --no-fail-fast: PASS
+- isyncyou-agent with http,agent-oauth-providers: PASS (201 tests)
+- isyncyou-app-host with agent-oauth-providers: PASS
+- isyncyou-app-host with agent-subscription-experimental: PASS
+- isyncyou-webui: PASS (212 tests)
+- workspace, product-feature, experimental-feature, and mobile-no-default Clippy: PASS
+- cargo-remote-fmt --check: PASS
+- npm ci and node syntax checks: PASS
+- agent UI smoke: PASS (33 assertions)
+- onboarding wizard smoke: PASS (15 assertions)
+- feature-matrix, public-surface, and release-exclusion boundary modes: PASS
+- cargo deny check: PASS (advisories, bans, licenses, and sources)
+- staged Gitleaks scan: PASS
+- Semgrep: 0 findings. The broad scan timed out one JavaScript rule on app.js; an immediate
+  single-file rerun with a 60-second rule timeout completed 83 applicable rules with 0 findings.
+- Default-feature Android unit tests, lint, and assembleDebug: BUILD SUCCESSFUL
+- Default product APK sha256:
+  9d8f4d1fc8bcb14a8c86999c77dcf9cbd99dfa94fe9deb9005fac514335ca6d6
+- Release-exclusion product build: PASS; experimental markers absent.
+
+CURRENT DEVICE/LIVE STATUS
+--------------------------
+- The current-tree connectedDebugAndroidTest attempt did not run because Gradle reported
+  "No connected devices". This is a blocked observation, not a passing device gate.
+- Official Claude and Codex OAuth were not repeated against a84b286569be88a672f9c6a67eb7ad55b6360a61.
+- The retained screenshots and device-handoff.txt are historical evidence for implementation
+  commit d5bee49d8daaa653bad3cb6941e7bf61d30d304c only. They demonstrate the prior live flow but do
+  not attest the current implementation commit or current APK hash.
+- REQ-AGENT-014 therefore remains planned until a default APK from the current implementation
+  commit completes the required on-device instrumentation and both official OAuth handoffs.
+
+RECHECKED FIXES
+---------------
+- Product readiness and provider construction share one in-process gate and an owner-controlled,
+  no-follow cross-process file lock; competing transactions fail closed.
+- Product credential and activation reads are bounded and use one snapshot through turn build.
+- Startup closes unresumable OAuth attempts as error_redacted(interrupted).
+- Onboarding-journal index updates are cross-process serialized and reap dangling crash entries.
+- /oauth/complete rejects oversized framing, duplicate Content-Length, and Transfer-Encoding before
+  route allocation; the native bridge applies the same strict body cap.
+- Invalid OAuth-start responses cancel any server attempt and release the exact Android foreground
+  guard instead of leaking ownership.

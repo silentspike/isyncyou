@@ -1,5 +1,8 @@
 #639 S-AG.14 — host verification gates (feature/ag-639). Regenerated after the owner-review fixes.
-Pinned implementation commit: see docs/evidence/issue-639-manifest.json (commit field).
+Historical implementation commit: c0e5a2a4368599d5cef7274bc747f40f9f924bc8.
+
+PROVENANCE: this is the earlier c0e5a2a-era gate record. It is retained for audit history and does
+not attest the later implementation commit. See current-tree-recheck.txt for the a84b286 recheck.
 
 All Rust commands run via `cargo remote -c` / `cargo-remote-fmt` (rustbuild); Node local; semgrep via
 the digest-pinned Docker image; Android via ./gradlew.

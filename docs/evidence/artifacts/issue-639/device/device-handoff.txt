@@ -2,6 +2,11 @@
 token, refresh, account id, IP, or device serial). Device: Pixel 8 Pro (husky), USB,
 device-lock ag-639. Default DEBUG product APK com.silentspike.isyncyou.debug.
 
+PROVENANCE: this live evidence was captured against implementation commit
+d5bee49d8daaa653bad3cb6941e7bf61d30d304c. It is retained as historical flow evidence; it does
+not attest implementation commit a84b286569be88a672f9c6a67eb7ad55b6360a61 or its APK. See
+../current-tree-recheck.txt for the current blocked device status.
+
 DEFAULT PRODUCT APK
 -------------------
 - sha256 = bab36ef09b50027b9a0374387f9faa74dcae27a58ca259e9c3d3ddbb6b28defb

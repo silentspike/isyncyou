@@ -187,8 +187,8 @@ requirements:
       - test: agent_provider_selection_uses_stored_codex_oauth_credential
       - test: credential_store_preferred_over_desktop_cli_fallback
       - test: corrupt_product_credential_does_not_fall_through_to_local_cli
-      - test: corrupt_product_credential_streams_error_and_done_error
-      - test: expired_product_credential_streams_error_and_done_error
+      - test: corrupt_product_credential_rejects_turn_without_stream
+      - test: expired_product_credential_rejects_turn_without_stream
       - test: expired_product_credential_refresh_preserves_product_origin
       - test: experimental_local_cli_does_not_satisfy_product_harness_readiness
       - test: product_harness_requires_encrypted_app_oauth_credential
@@ -385,7 +385,7 @@ requirements:
       projection, and `/oauth/complete` is a strict-JSON, attempt-bound, Claude-only manual step.
       FakeProvider is a test/fixture provider only and never a not-ready product turn. #627 experimental
       stays compiled-opt-in only and never confers product readiness. (S-AG.14/#639)
-    status: implemented
+    status: planned
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Readiness derives from the durable ProductActivationV1 (generation + policy fingerprint + harness contract) plus a valid Active bundle and a passing static harness attestation, decoupled from provider selection.
