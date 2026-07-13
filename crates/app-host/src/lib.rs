@@ -963,10 +963,7 @@ impl isyncyou_agent::LlmProvider for CredentialResolutionErrorProvider {
     }
 }
 
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
+#[cfg(all(test, feature = "agent-subscription-experimental"))]
 fn resolve_product_or_local<T>(
     state: ProductCredentialState<T>,
     refresh: impl FnOnce(T) -> Result<T, ProviderCredentialResolutionError>,
@@ -1054,6 +1051,79 @@ fn classify_codex_product_credential_at(
     } else {
         ProductCredentialState::PresentValid(credential)
     }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn complete_claude_refresh(
+    current: StoredCredential,
+    refreshed: isyncyou_agent::oauth::RefreshedToken,
+    now_ms: u64,
+) -> Result<StoredCredential, ProviderCredentialResolutionError> {
+    let refresh_token = if refreshed.refresh_token.is_empty() {
+        current.refresh_token
+    } else {
+        refreshed.refresh_token
+    };
+    let lifetime_ms = refreshed
+        .expires_in
+        .checked_mul(1000)
+        .filter(|lifetime| *lifetime > 0)
+        .ok_or(ProviderCredentialResolutionError::ProductReconnectRequired)?;
+    let expires_at_ms = now_ms
+        .checked_add(lifetime_ms)
+        .ok_or(ProviderCredentialResolutionError::ProductReconnectRequired)?;
+    if refreshed.access_token.trim().is_empty() || refresh_token.trim().is_empty() {
+        return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+    }
+    Ok(StoredCredential {
+        access_token: refreshed.access_token,
+        refresh_token,
+        expires_at_ms,
+    })
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn complete_codex_refresh(
+    current: CodexStoredCredential,
+    refreshed: isyncyou_agent::oauth::CodexTokens,
+    now_ms: u64,
+) -> Result<CodexStoredCredential, ProviderCredentialResolutionError> {
+    let refresh_token = if refreshed.refresh_token.is_empty() {
+        current.refresh_token
+    } else {
+        refreshed.refresh_token
+    };
+    let account_id = if refreshed.account_id.is_empty() {
+        current.account_id
+    } else {
+        refreshed.account_id
+    };
+    let lifetime_ms = refreshed
+        .expires_in
+        .checked_mul(1000)
+        .filter(|lifetime| *lifetime > 0)
+        .ok_or(ProviderCredentialResolutionError::ProductReconnectRequired)?;
+    let expires_at_ms = now_ms
+        .checked_add(lifetime_ms)
+        .ok_or(ProviderCredentialResolutionError::ProductReconnectRequired)?;
+    if refreshed.access_token.trim().is_empty()
+        || refresh_token.trim().is_empty()
+        || account_id.trim().is_empty()
+    {
+        return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+    }
+    Ok(CodexStoredCredential {
+        access_token: refreshed.access_token,
+        refresh_token,
+        account_id,
+        expires_at_ms,
+    })
 }
 
 #[cfg(any(
@@ -1522,7 +1592,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
-    fn refresh_claude_product_credential(
+    fn refresh_claude_product_credential_unlocked(
         &self,
         credential: StoredCredential,
     ) -> Result<StoredCredential, ProviderCredentialResolutionError> {
@@ -1536,22 +1606,8 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         let refreshed = isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        if refreshed.access_token.is_empty() {
-            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
-        }
-        let refreshed_credential = StoredCredential {
-            access_token: refreshed.access_token,
-            refresh_token: if refreshed.refresh_token.is_empty() {
-                credential.refresh_token
-            } else {
-                refreshed.refresh_token
-            },
-            expires_at_ms: if refreshed.expires_in > 0 {
-                (self.credential_now_ms)().saturating_add(refreshed.expires_in.saturating_mul(1000))
-            } else {
-                0
-            },
-        };
+        let refreshed_credential =
+            complete_claude_refresh(credential, refreshed, (self.credential_now_ms)())?;
         self.store_credential(&refreshed_credential)
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         Ok(refreshed_credential)
@@ -1584,15 +1640,35 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn resolve_claude_credential(
         &self,
     ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
-        let resolved = resolve_product_or_local(
-            self.claude_product_credential_state(),
-            |credential| self.refresh_claude_product_credential(credential),
-            || self.experimental_claude_credential(),
-        )?;
-        Ok(match resolved {
-            Some((origin, credential)) => ResolvedProviderCredential::Claude { origin, credential },
-            None => ResolvedProviderCredential::Unconfigured(ProviderKind::Claude),
-        })
+        let _refresh = self
+            .credential_refresh_gate
+            .lock()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        match self.claude_product_credential_state() {
+            ProductCredentialState::PresentValid(credential) => {
+                Ok(ResolvedProviderCredential::Claude {
+                    origin: ProviderCredentialOrigin::ProductCredentialStore,
+                    credential,
+                })
+            }
+            ProductCredentialState::PresentNeedsRefresh(credential) => {
+                let credential = self.refresh_claude_product_credential_unlocked(credential)?;
+                Ok(ResolvedProviderCredential::Claude {
+                    origin: ProviderCredentialOrigin::ProductCredentialStore,
+                    credential,
+                })
+            }
+            ProductCredentialState::PresentInvalid => {
+                Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+            }
+            ProductCredentialState::Absent => Ok(match self.experimental_claude_credential()? {
+                Some(credential) => ResolvedProviderCredential::Claude {
+                    origin: ProviderCredentialOrigin::ExperimentalLocalCli,
+                    credential,
+                },
+                None => ResolvedProviderCredential::Unconfigured(ProviderKind::Claude),
+            }),
+        }
     }
 
     /// The minimized Claude request config. Local client account/device metadata is not
@@ -1640,7 +1716,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
-    fn refresh_codex_product_credential(
+    fn refresh_codex_product_credential_unlocked(
         &self,
         credential: CodexStoredCredential,
     ) -> Result<CodexStoredCredential, ProviderCredentialResolutionError> {
@@ -1653,27 +1729,8 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         let refreshed =
             isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
                 .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-        if refreshed.access_token.is_empty() {
-            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
-        }
-        let refreshed_credential = CodexStoredCredential {
-            access_token: refreshed.access_token,
-            refresh_token: if refreshed.refresh_token.is_empty() {
-                credential.refresh_token
-            } else {
-                refreshed.refresh_token
-            },
-            account_id: if refreshed.account_id.is_empty() {
-                credential.account_id
-            } else {
-                refreshed.account_id
-            },
-            expires_at_ms: if refreshed.expires_in > 0 {
-                (self.credential_now_ms)().saturating_add(refreshed.expires_in.saturating_mul(1000))
-            } else {
-                0
-            },
-        };
+        let refreshed_credential =
+            complete_codex_refresh(credential, refreshed, (self.credential_now_ms)())?;
         store_codex_blob(&self.oauth_dir, &refreshed_credential)
             .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         Ok(refreshed_credential)
@@ -1707,15 +1764,35 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn resolve_codex_credential(
         &self,
     ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
-        let resolved = resolve_product_or_local(
-            self.codex_product_credential_state(),
-            |credential| self.refresh_codex_product_credential(credential),
-            || self.experimental_codex_credential(),
-        )?;
-        Ok(match resolved {
-            Some((origin, credential)) => ResolvedProviderCredential::Codex { origin, credential },
-            None => ResolvedProviderCredential::Unconfigured(ProviderKind::Codex),
-        })
+        let _refresh = self
+            .credential_refresh_gate
+            .lock()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        match self.codex_product_credential_state() {
+            ProductCredentialState::PresentValid(credential) => {
+                Ok(ResolvedProviderCredential::Codex {
+                    origin: ProviderCredentialOrigin::ProductCredentialStore,
+                    credential,
+                })
+            }
+            ProductCredentialState::PresentNeedsRefresh(credential) => {
+                let credential = self.refresh_codex_product_credential_unlocked(credential)?;
+                Ok(ResolvedProviderCredential::Codex {
+                    origin: ProviderCredentialOrigin::ProductCredentialStore,
+                    credential,
+                })
+            }
+            ProductCredentialState::PresentInvalid => {
+                Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+            }
+            ProductCredentialState::Absent => Ok(match self.experimental_codex_credential()? {
+                Some(credential) => ResolvedProviderCredential::Codex {
+                    origin: ProviderCredentialOrigin::ExperimentalLocalCli,
+                    credential,
+                },
+                None => ResolvedProviderCredential::Unconfigured(ProviderKind::Codex),
+            }),
+        }
     }
 
     /// Side-effect-free product status. Local CLI fallback is intentionally absent here: it is
@@ -1744,7 +1821,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             "claude" => match self.claude_product_credential_state() {
                 ProductCredentialState::PresentValid(_) => Ok("connected"),
                 ProductCredentialState::PresentNeedsRefresh(credential) => self
-                    .refresh_claude_product_credential(credential)
+                    .refresh_claude_product_credential_unlocked(credential)
                     .map(|_| "connected")
                     .map_err(|_| "reconnect_required".into()),
                 ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
@@ -1754,7 +1831,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             "codex" => match self.codex_product_credential_state() {
                 ProductCredentialState::PresentValid(_) => Ok("connected"),
                 ProductCredentialState::PresentNeedsRefresh(credential) => self
-                    .refresh_codex_product_credential(credential)
+                    .refresh_codex_product_credential_unlocked(credential)
                     .map(|_| "connected")
                     .map_err(|_| "reconnect_required".into()),
                 ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
@@ -6638,6 +6715,117 @@ mod tests {
             classify_claude_product_credential_at(credential, 1_000),
             ProductCredentialState::PresentNeedsRefresh(_)
         ));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_credential_refresh_uses_injected_clock_and_finite_expiry() {
+        let refreshed = complete_claude_refresh(
+            StoredCredential {
+                access_token: "old-access".into(),
+                refresh_token: "old-refresh".into(),
+                expires_at_ms: 1,
+            },
+            isyncyou_agent::oauth::RefreshedToken {
+                access_token: "new-access".into(),
+                refresh_token: String::new(),
+                expires_in: 60,
+            },
+            42_000,
+        )
+        .unwrap();
+
+        assert_eq!(refreshed.access_token, "new-access");
+        assert_eq!(refreshed.refresh_token, "old-refresh");
+        assert_eq!(refreshed.expires_at_ms, 102_000);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn partial_refresh_response_never_replaces_last_complete_encrypted_credential() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("partial-refresh-no-write");
+        let oauth_dir = root.join("oauth");
+        let agent = DaemonAgent::new(Config::default(), oauth_dir.clone());
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "complete-access".into(),
+                refresh_token: "complete-refresh".into(),
+                expires_at_ms: 99_000,
+            })
+            .unwrap();
+
+        let incomplete = complete_claude_refresh(
+            StoredCredential {
+                access_token: "complete-access".into(),
+                refresh_token: "complete-refresh".into(),
+                expires_at_ms: 99_000,
+            },
+            isyncyou_agent::oauth::RefreshedToken {
+                access_token: "partial-access".into(),
+                refresh_token: String::new(),
+                expires_in: 0,
+            },
+            50_000,
+        );
+        assert!(matches!(
+            incomplete,
+            Err(ProviderCredentialResolutionError::ProductReconnectRequired)
+        ));
+
+        let stored = load_agent_credential_blob(&oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
+            .unwrap()
+            .unwrap();
+        let stored = StoredCredential::from_json(stored.expose()).unwrap();
+        assert_eq!(stored.access_token, "complete-access");
+        assert_eq!(stored.refresh_token, "complete-refresh");
+        assert_eq!(stored.expires_at_ms, 99_000);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn concurrent_refresh_for_one_provider_is_serialized() {
+        let root = apphost_credential_test_root("refresh-serialization");
+        let agent = Arc::new(DaemonAgent::new(Config::default(), root.clone()));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = agent.clone();
+        let first_worker = std::thread::spawn(move || {
+            let _guard = first.credential_refresh_gate.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let second = agent.clone();
+        let second_worker = std::thread::spawn(move || {
+            let _guard = second.credential_refresh_gate.lock().unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a second refresh must wait for the first refresh gate"
+        );
+        release_tx.send(()).unwrap();
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        first_worker.join().unwrap();
+        second_worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(feature = "agent-subscription-experimental")]
