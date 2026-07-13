@@ -82,6 +82,15 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Mitigation** | #623 product builds load app OAuth credentials from the encrypted iSyncYou CredentialStore. The owner-approved compliance model begins with official provider OAuth, preserves the required auth/billing/subscription identity envelope unchanged and in its provider-required position, removes every other default-client prompt/tool/skill/plugin/MCP/rule/memory/history/context component, and installs only the iSyncYou M365 prompt and single `isyncyou` tool. Exact-position/absence tests freeze that boundary. Product sources ignore local CLI auth and reject OAuth endpoint/client/scope overrides. #627's desktop-only fallback is explicit, default-off, never satisfies product readiness, never persists local credentials, and is absent from mobile/release feature graphs and built artifacts. Its allowlist reducer commits only bounded summaries; raw captures are deleted. See [the experimental boundary](../experimental/agent-local-cli-fallback.md) and [#627 evidence](../evidence/issue-627-manifest.json). |
 | **Status** | **Accepted / monitored** — #623 product OAuth and StoreArchive evidence is complete. Residual technical risk remains for provider wire drift, credential leakage, accidental experimental-feature shipping, and defects in the retained-versus-removed harness boundary. The #627 version/capture process monitors those risks without treating local CLI auth as product evidence. Design: [ADR-007](../adr/007-agent-architecture.md). |
 
+## R9 — Android network-critical Agent flow interruption
+
+| | |
+|---|---|
+| **Risk** | Android backgrounds the app during provider OAuth or an active streamed turn; connectivity failure is misdiagnosed or leaks transport details; refresh failure silently changes credential origin. |
+| **Impact** | High — sign-in or turns can fail silently, and unsafe diagnostics or fallback can expose provider/network data or misrepresent authentication state. |
+| **Mitigation** | #640 uses reason-bound, acknowledged, bounded `dataSync` foreground leases; a session/capability-gated provider-purpose preflight emits only closed codes; mobile snapshots are single-use and bound to the active engine session and guard; status is network-free; explicit refresh atomically persists only complete credentials and fails closed. Codex callbacks are loopback-only, cancellable, one-shot, and leave no callback diagnostics or fixed-routing residue. Default artifacts exclude the separate diagnostic hook. |
+| **Status** | **Mitigated / monitored** — host, UI, artifact, official OAuth, guarded refresh, and streamed-turn evidence is recorded in [the #640 manifest](../evidence/issue-640-manifest.json). Residual Android scheduling, provider, and network-policy drift remains monitored; a foreground service mitigates priority loss but does not guarantee reachability. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
 ---
 
 ## How this register is maintained

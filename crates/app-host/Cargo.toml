@@ -59,3 +59,6 @@ agent-subscription-experimental = [
 # TEST/EVIDENCE ONLY, default-OFF: bounded app-private hold points for mobile
 # process-death recovery evidence. Never reachable from the product router.
 mobile-job-device-test-hooks = []
+# TEST/EVIDENCE ONLY, default-OFF (#640): enables JNI-only network diagnostic
+# hooks in mobile builds. It never creates an HTTP/WebView/router surface.
+agent-network-device-test-hooks = ["agent-oauth-providers"]

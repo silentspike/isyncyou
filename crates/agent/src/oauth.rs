@@ -17,6 +17,9 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+const PENDING_LOGIN_TTL: Duration = Duration::from_secs(8 * 60);
 
 /// OAuth endpoints/client. Defaults to the public Claude OAuth client (PKCE public
 /// client — these are not secrets). Product callers must enforce this exact tuple.
@@ -118,6 +121,7 @@ pub fn build_authorize_url(
 struct PendingLogin {
     verifier: String,
     redirect_uri: String,
+    expires_at: Instant,
 }
 
 /// Tracks in-flight logins between [`AgentOAuth::start`] and the browser callback.
@@ -157,11 +161,25 @@ impl AgentOAuth {
 
     /// Take the pending login for `state` (single-use), returning (verifier, redirect_uri).
     pub fn take(&self, state: &str) -> Option<(String, String)> {
-        self.pending
-            .lock()
-            .unwrap()
-            .remove(state)
-            .map(|p| (p.verifier, p.redirect_uri))
+        let now = Instant::now();
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|_, login| login.expires_at > now);
+        pending.remove(state).map(|p| (p.verifier, p.redirect_uri))
+    }
+
+    /// Forget one pending login without exchanging it. The opaque browser-facing state
+    /// never leaves the host; callers use this only after matching their own attempt id.
+    pub fn cancel(&self, state: &str) -> bool {
+        self.pending.lock().unwrap().remove(state).is_some()
+    }
+
+    /// Remove expired verifier/state pairs without exposing their values.
+    pub fn reap_expired(&self) -> usize {
+        let now = Instant::now();
+        let mut pending = self.pending.lock().unwrap();
+        let before = pending.len();
+        pending.retain(|_, login| login.expires_at > now);
+        before.saturating_sub(pending.len())
     }
 }
 
@@ -171,11 +189,15 @@ trait PendingInsert {
 }
 impl PendingInsert for Mutex<HashMap<String, PendingLogin>> {
     fn borrow_insert(&self, state: &str, verifier: String, redirect_uri: &str) {
-        self.lock().unwrap().insert(
+        let now = Instant::now();
+        let mut pending = self.lock().unwrap();
+        pending.retain(|_, login| login.expires_at > now);
+        pending.insert(
             state.to_string(),
             PendingLogin {
                 verifier,
                 redirect_uri: redirect_uri.to_string(),
+                expires_at: now + PENDING_LOGIN_TTL,
             },
         );
     }

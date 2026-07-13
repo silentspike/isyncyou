@@ -14,6 +14,7 @@ use crate::turn::{Message, Role};
 use crate::AgentError;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 /// Verified Codex-CLI mimicry recipe.
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -178,6 +179,22 @@ fn apply_sse_event(
     Ok(None)
 }
 
+fn sse_event_advances_turn(data: &str) -> bool {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|event_type| {
+            matches!(
+                event_type.as_str(),
+                "response.output_text.delta"
+                    | "response.output_item.done"
+                    | "response.completed"
+                    | "response.failed"
+                    | "error"
+            )
+        })
+}
+
 fn finish_sse_blocks(
     text: String,
     tools: Vec<CodexToolArgs>,
@@ -225,7 +242,7 @@ mod live {
 
     /// Live ChatGPT/Codex subscription provider over the agent's blocking HTTP transport.
     pub struct CodexProvider {
-        http: crate::http::HttpTransport,
+        http: Arc<crate::http::HttpTransport>,
         access_token: String,
         instructions: String,
         cfg: CodexConfig,
@@ -239,7 +256,7 @@ mod live {
             cfg: CodexConfig,
         ) -> Result<Self, AgentError> {
             Ok(Self {
-                http: crate::http::HttpTransport::new()?,
+                http: crate::http::HttpTransport::shared()?,
                 access_token: access_token.into(),
                 instructions: instructions.into(),
                 cfg,
@@ -293,8 +310,9 @@ mod live {
                 &body,
                 &mut |event| {
                     if parse_error.is_some() {
-                        return;
+                        return false;
                     }
+                    let advances_turn = sse_event_advances_turn(&event.data);
                     match apply_sse_event(
                         &event.data,
                         &mut text,
@@ -306,6 +324,7 @@ mod live {
                         Ok(None) => {}
                         Err(e) => parse_error = Some(e),
                     }
+                    advances_turn
                 },
             )?;
             if response.status == 401 || response.status == 403 {
@@ -471,6 +490,19 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         assert!(tools.is_empty());
         assert_eq!(usage, Usage::default());
         assert!(failure.is_none());
+    }
+
+    #[test]
+    fn codex_status_events_do_not_satisfy_response_or_extend_idle_deadline() {
+        assert!(!sse_event_advances_turn(
+            r#"{"type":"response.in_progress"}"#
+        ));
+        assert!(sse_event_advances_turn(
+            r#"{"type":"response.output_text.delta","delta":"ok"}"#
+        ));
+        assert!(sse_event_advances_turn(
+            r#"{"type":"response.completed","response":{}}"#
+        ));
     }
 
     #[test]

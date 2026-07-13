@@ -14,6 +14,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Default Claude-Code mimicry recipe (verified from the real client, 2026-06-27).
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
@@ -77,7 +78,7 @@ fn uuid_v4() -> String {
 /// The Claude OAuth-compatible provider. Holds the app-obtained OAuth token and the
 /// recipe config; shapes each request to the Claude Code-compatible wire format.
 pub struct SubscriptionProvider {
-    http: crate::http::HttpTransport,
+    http: Arc<crate::http::HttpTransport>,
     access_token: String,
     model: String,
     system: String,
@@ -94,7 +95,7 @@ impl SubscriptionProvider {
         cfg: SubscriptionConfig,
     ) -> Result<Self, AgentError> {
         Ok(Self {
-            http: crate::http::HttpTransport::new()?,
+            http: crate::http::HttpTransport::shared()?,
             access_token: access_token.into(),
             model: model.into(),
             system: system.into(),
@@ -268,6 +269,23 @@ fn apply_claude_sse_event(
     Ok(None)
 }
 
+fn sse_event_advances_turn(data: &str) -> bool {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|event_type| {
+            matches!(
+                event_type.as_str(),
+                "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "message_delta"
+                    | "message_stop"
+                    | "error"
+            )
+        })
+}
+
 fn finish_claude_stream(
     state: ClaudeStreamState,
 ) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
@@ -304,13 +322,15 @@ impl LlmProvider for SubscriptionProvider {
             &body,
             &mut |event| {
                 if parse_error.is_some() {
-                    return;
+                    return false;
                 }
+                let advances_turn = sse_event_advances_turn(&event.data);
                 match apply_claude_sse_event(&event.data, &mut state) {
                     Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
                     Ok(None) => {}
                     Err(e) => parse_error = Some(e),
                 }
+                advances_turn
             },
         )?;
         if response.status == 401 || response.status == 403 {
@@ -435,6 +455,17 @@ mod tests {
 
         assert_eq!(delta.as_deref(), Some("hello"));
         assert_eq!(state.text, "hello");
+    }
+
+    #[test]
+    fn claude_status_events_do_not_satisfy_response_or_extend_idle_deadline() {
+        assert!(!sse_event_advances_turn(
+            r#"{"type":"message_start","message":{}}"#
+        ));
+        assert!(sse_event_advances_turn(
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}"#
+        ));
+        assert!(sse_event_advances_turn(r#"{"type":"message_stop"}"#));
     }
 
     #[test]

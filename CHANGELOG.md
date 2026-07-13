@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Network-critical Agent flow boundary (#640)**
+- `android`+`agent`+`app-host`+`webui`: added acknowledged, service-owned foreground
+  guards for provider OAuth and streamed turns, strict redacted connectivity preflight,
+  side-effect-free credential status with explicit fail-closed refresh, cancellable Codex
+  callback attempts, and a separate default-off diagnostic hook artifact.
+
 **Experimental local Agent credential boundary**
 - `agent`+`app-host`: isolated #627's unsupported Linux desktop local-client
   credential fallback behind an explicit default-off daemon feature, removed the

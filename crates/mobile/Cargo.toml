@@ -20,6 +20,7 @@ isyncyou-engine = { path = "../engine", default-features = false }
 isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 jni = "0.22"
+libc = "0.2"
 
 [features]
 # Android ships SQLCipher (#0B): the vendored-OpenSSL arm64 cross-build works via
@@ -53,6 +54,12 @@ agent-credential-store-self-test = []
 # TEST/EVIDENCE ONLY, default-OFF: propagate bounded native mobile-job hold
 # points to app-host. Never enabled by product/release builds.
 mobile-job-device-test-hooks = ["isyncyou-app-host/mobile-job-device-test-hooks"]
+# TEST/EVIDENCE ONLY, default-OFF (#640): bounded JNI-only network diagnostic
+# branches. Product and release APKs never enable this feature.
+agent-network-device-test-hooks = [
+    "agent-oauth-providers",
+    "isyncyou-app-host/agent-network-device-test-hooks",
+]
 
 [dev-dependencies]
 tempfile = "3"

@@ -31,6 +31,7 @@ pub enum SyncError {
     Malformed(String),
     #[error("remote: {0}")]
     Remote(String),
+    #[cfg(feature = "http")]
     #[error("graph: {0}")]
     Graph(#[source] isyncyou_graph::http::UploadError),
     #[error("HTTP {0}")]

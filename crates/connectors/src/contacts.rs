@@ -236,10 +236,11 @@ pub fn backup_contact_photos<F: BytesFetcher>(
                 report.bytes += bytes.len() as u64;
             }
             // No photo set on this contact (or no body) -> skip, don't fail.
+            #[cfg(feature = "http")]
             Err(SyncError::Graph(isyncyou_graph::http::UploadError::Http {
                 status: 404, ..
-            }))
-            | Err(SyncError::HttpStatus(404)) => report.skipped += 1,
+            })) => report.skipped += 1,
+            Err(SyncError::HttpStatus(404)) => report.skipped += 1,
             Err(e) => return Err(e),
         }
     }

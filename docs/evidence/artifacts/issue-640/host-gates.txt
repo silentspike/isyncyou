@@ -1,0 +1,35 @@
+Issue: #640 network-critical Agent flows
+Implementation commit: 7c5ff3699c27e7212abf0d9ed2d915b095243125
+Result: PASS; the required pr-dev Semgrep job remains the authoritative remote SAST gate
+Executed: 2026-07-13
+
+Rust and WebUI gates:
+- connectivity_preflight_ with agent-oauth-providers: PASS, 8 tests
+- product_credential_refresh_ with agent-oauth-providers: PASS, 1 test
+- partial_refresh_response_ with agent-oauth-providers: PASS, 1 test
+- concurrent_refresh_ with agent-oauth-providers: PASS, 1 test
+- codex_callback_ with agent-oauth-providers: PASS, 2 tests
+- WebUI agent_ filter: PASS, 17 tests
+- cargo remote -c -- test --workspace --no-fail-fast: PASS
+- cargo remote -c -- clippy --workspace --all-targets -- -D warnings: PASS
+- feature Clippy for Agent and app-host OAuth graphs: PASS
+- cargo-remote-fmt --check: PASS
+- cargo deny check: PASS; configured duplicate-version warnings only
+- go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12: PASS
+- node --check gui/webui/src/app.js: PASS
+- npm ci: PASS, zero reported vulnerabilities
+- node tools/agent-network-ui-smoke.mjs: PASS, 6 assertions
+- python3 -m unittest tools.test_verify_agent_network_boundary tools.test_agent_network_device_probe: PASS, 2 tests
+- python3 tools/verify-agent-network-boundary.py: PASS, 8 checks
+- python3 tools/check_traceability.py: PASS
+- clean tracked-tree Gitleaks no-git scan: PASS, no leaks
+- git diff --check: PASS
+
+The final implementation commit adds only the Android hook-instrumentation scope gate to
+the Rust-tested tree. Both default and hook instrumentation variants were then executed on
+that exact commit. The local pinned Semgrep container could not start because this host has
+no Docker daemon; no Semgrep PASS is claimed here, and the PR may merge only after the
+required GitHub semgrep job succeeds.
+
+No local provider credential, callback query, account identity, provider URL, IP address,
+device serial, raw provider response, or raw Android diagnostic is retained here.
