@@ -1913,7 +1913,9 @@ mod tests {
             .expect("mobile defaults close")
             .0;
         assert!(!defaults.contains("agent-account-lifecycle-device-test-hooks"));
-        assert!(!cfg!(feature = "agent-account-lifecycle-device-test-hooks"));
+        assert!(!std::hint::black_box(cfg!(
+            feature = "agent-account-lifecycle-device-test-hooks"
+        )));
     }
 
     #[test]

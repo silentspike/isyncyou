@@ -950,6 +950,13 @@ pub struct DaemonAgent {
     confirmed_executor: Arc<dyn AgentConfirmedActionExecutor>,
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
+    #[cfg_attr(
+        not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )),
+        allow(dead_code)
+    )]
     last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
     #[cfg(any(
         feature = "agent-oauth-providers",
@@ -1054,6 +1061,7 @@ impl DaemonAgent {
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
         let confirmed_executor =
             agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
+        #[allow(unused_mut)]
         let mut agent = Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
@@ -3696,12 +3704,22 @@ fn account_lifecycle_revoke_outcome_for_device_test() -> Option<isyncyou_agent::
         })
 }
 
-#[cfg(not(feature = "agent-account-lifecycle-device-test-hooks"))]
+#[cfg(all(
+    not(feature = "agent-account-lifecycle-device-test-hooks"),
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
+))]
 fn account_lifecycle_revoke_outcome_for_device_test() -> Option<isyncyou_agent::oauth::RevokeOutcome>
 {
     None
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn account_lifecycle_revoke_checkpoint_for_device_test() {
     #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
     {
@@ -3718,6 +3736,10 @@ fn account_lifecycle_revoke_checkpoint_for_device_test() {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn force_candidate_validation_failure_for_device_test() -> bool {
     #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
     {
@@ -6404,6 +6426,10 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn account_lifecycle_projection(
     agent: &DaemonAgent,
     provider: ProductProviderId,
@@ -6648,6 +6674,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let account_id = account.to_string();
         let archive_root = self.archive_root_for(&account_id);
         let pending = self.pending.clone();
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         let last_usage = Arc::clone(&self.last_usage);
         let turn_thread = std::thread::Builder::new()
             .name(format!("agent-turn-{n}"))
@@ -6667,11 +6697,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         hub.emit(&tid, ev);
                     },
                 );
+                #[cfg(any(
+                    feature = "agent-oauth-providers",
+                    feature = "agent-subscription-experimental"
+                ))]
                 if let Some(usage) = provider.last_usage() {
-                    #[cfg(any(
-                        feature = "agent-oauth-providers",
-                        feature = "agent-subscription-experimental"
-                    ))]
                     if let Some(provider_id) = provider_id {
                         last_usage.lock().unwrap().insert(provider_id, usage);
                     }
