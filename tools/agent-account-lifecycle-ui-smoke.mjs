@@ -225,8 +225,9 @@ async function main() {
     const source = asset("gui/webui/src/app.js").toString("utf8");
     const cleanup = source.indexOf('node.state !== "candidate_cleanup"');
     const oauthEnd = source.indexOf("await finishOAuthGuard(provider);", cleanup);
-    const revokeResume = source.indexOf('await resumeAccountLifecycle(provider, node, "retry_revoke")', cleanup);
+    const revokeResume = source.indexOf('return await resumeAccountLifecycle(provider, node, "retry_revoke")', cleanup);
     check(report, "candidate cleanup ends OAuth guard before fresh revoke resume", cleanup >= 0 && oauthEnd > cleanup && revokeResume > oauthEnd);
+    check(report, "candidate cleanup keeps polling after a transient callback lease race", source.includes("if (!result) {") && source.includes("return false;") && revokeResume > oauthEnd);
     check(report, "lifecycle UI contains no token-delete affordance", !/delete\s+token|access_token|refresh_token/i.test(source.slice(source.indexOf("function renderAssistantLifecycleControls"))));
     check(report, "both providers use the same candidate cleanup controller", PROVIDERS.every((provider) => source.includes(`handleCandidateCleanupStatus(s, "${provider}")`) || provider === "claude" && source.includes("handleCandidateCleanupStatus(s, provider)")));
     report.ok = true;

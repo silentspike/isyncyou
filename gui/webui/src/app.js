@@ -4822,14 +4822,15 @@ async function resumeAccountLifecycle(provider, node, action) {
   const result = await runLifecycleResume(provider, node, action);
   if (!result) {
     await renderAssistantView($("#view"));
-    return;
+    return false;
   }
   if (result.state === "awaiting_oauth_login" && (result.mode === "reconnect" || result.mode === "switch")) {
     await startAiLogin(provider, result.operation_id);
-    return;
+    return true;
   }
   if (result.code === "same_account_selected") toast("The same account was selected; the account was not switched.", "err");
   await renderAssistantView($("#view"));
+  return true;
 }
 
 async function handleCandidateCleanupStatus(status, provider) {
@@ -4842,11 +4843,12 @@ async function handleCandidateCleanupStatus(status, provider) {
   await finishOAuthGuard(provider);
   toast(node.mode === "switch" ? "The selected account could not be activated. Cleaning up the new sign-in." : "The new sign-in could not be activated. Cleaning it up.", "err");
   try {
-    await resumeAccountLifecycle(provider, node, "retry_revoke");
+    // The callback can briefly retain its exclusive activation lease after publishing this
+    // state. Returning false keeps the status poll alive for an idempotent guarded retry.
+    return await resumeAccountLifecycle(provider, node, "retry_revoke");
   } finally {
     AssistantState.lifecycleAutoResume.delete(operationId);
   }
-  return true;
 }
 
 function lifecycleActionButton(label, iconName, attrs, handler, disabled) {
