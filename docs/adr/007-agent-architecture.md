@@ -138,6 +138,25 @@ The constraints that force the shape of this decision:
     and never sets `connected`/activation/readiness; **FakeProvider** is a test/fixture provider only,
     never an unconfigured product turn.
 
+14. **Reversible product-account lifecycle (REQ-AGENT-015, S-AG.16/#645).** Disconnect,
+    Reconnect, and verified-identity Switch are durable provider-scoped operations rather than
+    local token deletion. A provider lifecycle lease excludes same-provider turns, refresh, OAuth,
+    and maintenance while a mutation is active. An encrypted authority record reserves a monotonic
+    fence and stable installation-bound idempotency key before the journal is published; even the
+    earliest prepared state makes product readiness false. Revocation records its request target
+    separately from the provider's scope guarantee. A confirmed response is persisted before
+    provider-scoped credential, activation, usage, settings, and onboarding state are removed;
+    an ambiguous or failed response retains encrypted grant authority in a non-ready state.
+
+    Reconnect revokes and cleans the prior generation before opening OAuth. Connect, Reconnect, and
+    Switch persist every exchange result first as an encrypted non-ready candidate. Candidate
+    identity validation and activation happen only afterward; a rejected candidate is itself a
+    separate revoke leg and is retained when its revoke result is unknown. Codex account switching
+    requires a strictly validated signed subject. Claude exposes no mutating Switch operation until
+    an equivalent verified identity contract exists. On Android, every revoke leg uses the bounded
+    `credential_revoke` foreground guard and a one-shot session/guard/purpose-bound network
+    snapshot. Default product artifacts exclude deterministic lifecycle test hooks.
+
 ## Consequences
 
 - **Cost:** a new crate, a second HTTP client (small, blocking, rustls), and a genuinely
