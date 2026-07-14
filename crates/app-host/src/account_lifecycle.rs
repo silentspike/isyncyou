@@ -6,6 +6,7 @@ use isyncyou_agent::ProductProviderId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub(crate) const INSTALLATION_PLAINTEXT_MAX: usize = 4 * 1024;
 pub(crate) const AUTHORITY_PLAINTEXT_MAX: usize = 32 * 1024;
@@ -41,6 +42,16 @@ pub(crate) enum AccountLifecycleRoute {
     OAuthStart,
 }
 
+impl AccountLifecycleRoute {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Logout => "logout",
+            Self::LifecycleResume => "lifecycle_resume",
+            Self::OAuthStart => "oauth_start",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AccountLifecycleMode {
@@ -48,6 +59,17 @@ pub(crate) enum AccountLifecycleMode {
     Disconnect,
     Reconnect,
     Switch,
+}
+
+impl AccountLifecycleMode {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Disconnect => "disconnect",
+            Self::Reconnect => "reconnect",
+            Self::Switch => "switch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +247,182 @@ pub(crate) enum OAuthCandidateState {
     Promoted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderOperationKind {
+    Turn,
+    Refresh,
+    Lifecycle,
+    OAuthActivation,
+    Maintenance,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderLeaseCounts {
+    pub shared: usize,
+    pub exclusive: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ProviderLeaseRegistry {
+    counts: Mutex<BTreeMap<ProductProviderId, ProviderLeaseCounts>>,
+}
+
+impl ProviderLeaseRegistry {
+    pub(crate) fn acquire_shared(
+        self: &Arc<Self>,
+        root: &Path,
+        provider: ProductProviderId,
+        operation_id: String,
+        kind: ProviderOperationKind,
+    ) -> Result<ProviderOperationLease, LifecycleRecordError> {
+        validate_operation_id(&operation_id)?;
+        let lock =
+            isyncyou_agent::FileLock::try_acquire_shared(&provider_lock_path(root, provider))
+                .map_err(|_| LifecycleRecordError::Store)?
+                .ok_or(LifecycleRecordError::Busy)?;
+        let mut counts = self
+            .counts
+            .lock()
+            .map_err(|_| LifecycleRecordError::Store)?;
+        let value = counts.entry(provider).or_default();
+        value.shared = value
+            .shared
+            .checked_add(1)
+            .ok_or(LifecycleRecordError::CountLimit)?;
+        drop(counts);
+        Ok(ProviderOperationLease {
+            provider,
+            operation_id,
+            kind,
+            exclusive: false,
+            registry: Arc::clone(self),
+            _file_lock: lock,
+        })
+    }
+
+    pub(crate) fn acquire_exclusive(
+        self: &Arc<Self>,
+        root: &Path,
+        provider: ProductProviderId,
+        operation_id: String,
+        kind: ProviderOperationKind,
+    ) -> Result<ProviderOperationLease, LifecycleRecordError> {
+        validate_operation_id(&operation_id)?;
+        let lock =
+            isyncyou_agent::FileLock::try_acquire_exclusive(&provider_lock_path(root, provider))
+                .map_err(|_| LifecycleRecordError::Store)?
+                .ok_or(LifecycleRecordError::Busy)?;
+        let mut counts = self
+            .counts
+            .lock()
+            .map_err(|_| LifecycleRecordError::Store)?;
+        let value = counts.entry(provider).or_default();
+        value.exclusive = value
+            .exclusive
+            .checked_add(1)
+            .ok_or(LifecycleRecordError::CountLimit)?;
+        drop(counts);
+        Ok(ProviderOperationLease {
+            provider,
+            operation_id,
+            kind,
+            exclusive: true,
+            registry: Arc::clone(self),
+            _file_lock: lock,
+        })
+    }
+
+    pub(crate) fn counts(&self, provider: ProductProviderId) -> ProviderLeaseCounts {
+        self.counts
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(&provider).copied())
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) struct ProviderOperationLease {
+    provider: ProductProviderId,
+    operation_id: String,
+    kind: ProviderOperationKind,
+    exclusive: bool,
+    registry: Arc<ProviderLeaseRegistry>,
+    _file_lock: isyncyou_agent::FileLock,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LifecycleDiagnostics {
+    audit_failures: std::sync::atomic::AtomicU32,
+}
+
+impl LifecycleDiagnostics {
+    pub(crate) fn record_audit_failure(&self) {
+        let _ = self.audit_failures.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |value| {
+                if value == u32::MAX {
+                    None
+                } else {
+                    Some(value + 1)
+                }
+            },
+        );
+    }
+
+    pub(crate) fn audit_failures(&self) -> u32 {
+        self.audit_failures
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl ProviderOperationLease {
+    pub(crate) fn provider(&self) -> ProductProviderId {
+        self.provider
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(crate) fn kind(&self) -> ProviderOperationKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Debug for ProviderOperationLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderOperationLease")
+            .field("provider", &self.provider)
+            .field("kind", &self.kind)
+            .field("exclusive", &self.exclusive)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ProviderOperationLease {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.registry.counts.lock() else {
+            return;
+        };
+        let Some(value) = counts.get_mut(&self.provider) else {
+            return;
+        };
+        if self.exclusive {
+            value.exclusive = value.exclusive.saturating_sub(1);
+        } else {
+            value.shared = value.shared.saturating_sub(1);
+        }
+        if value.shared == 0 && value.exclusive == 0 {
+            counts.remove(&self.provider);
+        }
+    }
+}
+
+fn provider_lock_path(root: &Path, provider: ProductProviderId) -> PathBuf {
+    root.join(format!(".provider-lifecycle-{}.lock", provider.wire()))
+}
+
 impl std::fmt::Debug for OAuthCandidateV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthCandidateV1")
@@ -245,6 +443,34 @@ pub(crate) enum LifecycleRecordError {
     Store,
     Busy,
     MissingInstallationPrincipal,
+    IdempotencyConflict,
+    OperationInProgress,
+    StaleFence,
+    ReceiptCapacityExhausted,
+}
+
+impl LifecycleRecordError {
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::Busy | Self::OperationInProgress => "provider_busy",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::EpochExhausted => "lifecycle_epoch_exhausted",
+            Self::StaleFence => "stale_lifecycle_fence",
+            Self::ReceiptCapacityExhausted => "receipt_capacity_exhausted",
+            Self::MissingInstallationPrincipal | Self::Store => "lifecycle_unavailable",
+            Self::Invalid | Self::SizeLimit | Self::CountLimit | Self::InvalidTransition => {
+                "lifecycle_invalid"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BeginLifecycleOperation {
+    pub operation_id: String,
+    pub operation_etag: String,
+    pub journal_record_id: String,
+    pub idempotent_replay: bool,
 }
 
 pub(crate) struct InstallationContext {
@@ -371,6 +597,62 @@ impl LifecycleRepository {
         })
     }
 
+    /// Read the existing lifecycle authority without creating, reaping, or recovering state.
+    /// Status/readiness paths use this method so they remain mutation-free.
+    pub(crate) fn load_existing(
+        &self,
+    ) -> Result<Option<InstallationContext>, LifecycleRecordError> {
+        const INSTALLATION_ID: &str = "installation";
+        let installation = self
+            .store
+            .get_bounded(
+                isyncyou_agent::SecretClass::AccountLifecycleInstallation,
+                INSTALLATION_ID,
+                INSTALLATION_ENVELOPE_MAX,
+                INSTALLATION_PLAINTEXT_MAX,
+            )
+            .map_err(|_| LifecycleRecordError::Store)?;
+        let Some(installation) = installation else {
+            if directory_contains_class(&self.store_dir, "account-lifecycle-authority__")? {
+                return Err(LifecycleRecordError::MissingInstallationPrincipal);
+            }
+            return Ok(None);
+        };
+        let installation: AccountLifecycleInstallationV1 =
+            parse_bounded(installation.expose(), INSTALLATION_PLAINTEXT_MAX)?;
+        if installation.version != SCHEMA_VERSION
+            || !installation.installation_principal_initialized
+            || validate_b64url(&installation.installation_principal, NONCE_LEN).is_err()
+        {
+            return Err(LifecycleRecordError::MissingInstallationPrincipal);
+        }
+        let authority = self
+            .store
+            .get_bounded(
+                isyncyou_agent::SecretClass::AccountLifecycleAuthority,
+                &installation.installation_principal,
+                AUTHORITY_ENVELOPE_MAX,
+                AUTHORITY_PLAINTEXT_MAX,
+            )
+            .map_err(|_| LifecycleRecordError::Store)?
+            .ok_or(LifecycleRecordError::MissingInstallationPrincipal)?;
+        let authority = parse_bounded(authority.expose(), AUTHORITY_PLAINTEXT_MAX)?;
+        validate_authority(&authority)?;
+        Ok(Some(InstallationContext {
+            principal: installation.installation_principal,
+            authority,
+        }))
+    }
+
+    pub(crate) fn provider_blocked(
+        &self,
+        provider: ProductProviderId,
+    ) -> Result<bool, LifecycleRecordError> {
+        Ok(self
+            .load_existing()?
+            .is_some_and(|context| context.authority.active_operations.contains_key(&provider)))
+    }
+
     pub(crate) fn put_authority(
         &self,
         principal: &str,
@@ -450,6 +732,476 @@ impl LifecycleRepository {
         )
     }
 
+    pub(crate) fn load_journal(
+        &self,
+        id: &str,
+    ) -> Result<Option<AccountLifecycleJournalV1>, LifecycleRecordError> {
+        validate_b64url(id, DIGEST_LEN)?;
+        let Some(secret) = self
+            .store
+            .get_bounded(
+                isyncyou_agent::SecretClass::AccountLifecycleJournal,
+                id,
+                JOURNAL_ENVELOPE_MAX,
+                JOURNAL_PLAINTEXT_MAX,
+            )
+            .map_err(|_| LifecycleRecordError::Store)?
+        else {
+            return Ok(None);
+        };
+        let journal = parse_bounded(secret.expose(), JOURNAL_PLAINTEXT_MAX)?;
+        validate_journal(&journal)?;
+        Ok(Some(journal))
+    }
+
+    pub(crate) fn delete_journal(&self, id: &str) -> Result<(), LifecycleRecordError> {
+        validate_b64url(id, DIGEST_LEN)?;
+        self.store
+            .delete_durable(isyncyou_agent::SecretClass::AccountLifecycleJournal, id)
+            .map_err(|_| LifecycleRecordError::Store)
+    }
+
+    /// Recreate only the Prepared journal already committed in the authority. This closes the
+    /// authority-before-journal crash window without consulting mutable provider configuration.
+    pub(crate) fn recover_active_journal(
+        &self,
+        provider: ProductProviderId,
+        now_ms: u64,
+    ) -> Result<Option<AccountLifecycleJournalV1>, LifecycleRecordError> {
+        let context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        let Some(active) = context.authority.active_operations.get(&provider) else {
+            return Ok(None);
+        };
+        if let Some(journal) = self.load_journal(&active.journal_record_id)? {
+            return Ok(Some(journal));
+        }
+        validate_prepared(&active.prepared)?;
+        let journal = AccountLifecycleJournalV1 {
+            version: SCHEMA_VERSION,
+            prepared: active.prepared.clone(),
+            lease_owner_nonce: random_b64url(16)?,
+            operation_etag: active.operation_etag.clone(),
+            phase: AccountLifecyclePhase::Prepared,
+            revoke_leg: 0,
+            revoked_grant: None,
+            revoke_request_target: None,
+            revoke_scope_guarantee: None,
+            attempt_count: 0,
+            in_flight_until_ms: 0,
+            created_at_ms: active.prepared.prepared_at_ms,
+            updated_at_ms: now_ms.max(active.prepared.prepared_at_ms),
+            closed_code: None,
+        };
+        self.write_journal_fenced(&active.journal_record_id, &journal)?;
+        Ok(Some(journal))
+    }
+
+    pub(crate) fn begin_disconnect(
+        &self,
+        provider: ProductProviderId,
+        request_id: &str,
+        generation: &str,
+        subject_digest: Option<&str>,
+        target: RevokeRequestTarget,
+        scope: RevokeScopeGuarantee,
+        now_ms: u64,
+    ) -> Result<BeginLifecycleOperation, LifecycleRecordError> {
+        validate_request_id(request_id)?;
+        if !is_uuid_v4(generation)
+            || subject_digest.is_some_and(|value| validate_b64url(value, DIGEST_LEN).is_err())
+        {
+            return Err(LifecycleRecordError::Invalid);
+        }
+        let mut context = self.initialize()?;
+        let idempotency_key = self.derive_tag(
+            b"isyncyou/account-lifecycle-idempotency/v1",
+            &[
+                context.principal.as_bytes(),
+                AccountLifecycleRoute::Logout.wire().as_bytes(),
+                request_id.as_bytes(),
+            ],
+        )?;
+        let payload_digest = self.derive_tag(
+            b"isyncyou/account-lifecycle-payload/v1",
+            &[
+                provider.wire().as_bytes(),
+                AccountLifecycleMode::Disconnect.wire().as_bytes(),
+                generation.as_bytes(),
+                revoke_target_wire(target).as_bytes(),
+                revoke_scope_wire(scope).as_bytes(),
+            ],
+        )?;
+        if let Some(existing) = context.authority.active_operations.get(&provider) {
+            if existing.prepared.idempotency_key == idempotency_key {
+                if existing.prepared.payload_digest != payload_digest {
+                    return Err(LifecycleRecordError::IdempotencyConflict);
+                }
+                return Ok(BeginLifecycleOperation {
+                    operation_id: existing.prepared.operation_id.clone(),
+                    operation_etag: existing.operation_etag.clone(),
+                    journal_record_id: existing.journal_record_id.clone(),
+                    idempotent_replay: true,
+                });
+            }
+            return Err(LifecycleRecordError::OperationInProgress);
+        }
+        if context.authority.active_operations.len() >= ProductProviderId::ALL.len() {
+            return Err(LifecycleRecordError::CountLimit);
+        }
+        let receipt_id = self.receipt_index_id(&context.principal, provider)?;
+        if let Some(index) = self.load_receipt_index(&receipt_id)? {
+            for receipt in index.receipts {
+                if receipt.idempotency_key == idempotency_key {
+                    if receipt.payload_digest != payload_digest {
+                        return Err(LifecycleRecordError::IdempotencyConflict);
+                    }
+                    return Ok(BeginLifecycleOperation {
+                        operation_id: receipt.operation_id,
+                        operation_etag: receipt.operation_etag,
+                        journal_record_id: self.derive_tag(
+                            b"isyncyou/account-lifecycle-journal-id/v1",
+                            &[
+                                context.principal.as_bytes(),
+                                provider.wire().as_bytes(),
+                                b"terminal",
+                            ],
+                        )?,
+                        idempotent_replay: true,
+                    });
+                }
+            }
+        }
+        let lifecycle_epoch = next_epoch(context.authority.lifecycle_epoch)?;
+        let fence_epoch = next_epoch(context.authority.fence_epoch)?;
+        let operation_id = mint_operation_id()?;
+        let operation_etag = self.derive_tag(
+            b"isyncyou/account-lifecycle-operation-etag/v1",
+            &[
+                context.principal.as_bytes(),
+                provider.wire().as_bytes(),
+                operation_id.as_bytes(),
+                &lifecycle_epoch.to_be_bytes(),
+                &fence_epoch.to_be_bytes(),
+            ],
+        )?;
+        let journal_record_id = self.derive_tag(
+            b"isyncyou/account-lifecycle-journal-id/v1",
+            &[
+                context.principal.as_bytes(),
+                provider.wire().as_bytes(),
+                operation_id.as_bytes(),
+            ],
+        )?;
+        let credential_etag = self.derive_tag(
+            b"isyncyou/account-lifecycle-credential-etag/v1",
+            &[
+                context.principal.as_bytes(),
+                provider.wire().as_bytes(),
+                generation.as_bytes(),
+                &lifecycle_epoch.to_be_bytes(),
+            ],
+        )?;
+        let prepared = PreparedOperationV1 {
+            version: SCHEMA_VERSION,
+            provider,
+            operation_id: operation_id.clone(),
+            route: AccountLifecycleRoute::Logout,
+            request_id_hash: self.derive_tag(
+                b"isyncyou/account-lifecycle-request-id/v1",
+                &[request_id.as_bytes()],
+            )?,
+            idempotency_key,
+            payload_digest,
+            mode: AccountLifecycleMode::Disconnect,
+            lifecycle_epoch,
+            fence_epoch,
+            lifecycle_key_version: context.authority.lifecycle_key_version,
+            credential_etag: Some(credential_etag.clone()),
+            prior_generation: Some(generation.to_string()),
+            prior_subject_digest: subject_digest.map(str::to_string),
+            revoke_spec_version: 1,
+            initial_revoke_request_target: Some(target),
+            initial_revoke_scope_guarantee: Some(scope),
+            prepared_at_ms: now_ms,
+        };
+        let active = ActiveOperationRefV1 {
+            prepared: prepared.clone(),
+            operation_etag: operation_etag.clone(),
+            journal_record_id: journal_record_id.clone(),
+        };
+        context.authority.lifecycle_epoch = lifecycle_epoch;
+        context.authority.fence_epoch = fence_epoch;
+        context
+            .authority
+            .current_credential_etags
+            .insert(provider, credential_etag);
+        context.authority.active_operations.insert(provider, active);
+        self.put_authority(&context.principal, &context.authority)?;
+
+        let journal = AccountLifecycleJournalV1 {
+            version: SCHEMA_VERSION,
+            prepared,
+            lease_owner_nonce: random_b64url(16)?,
+            operation_etag: operation_etag.clone(),
+            phase: AccountLifecyclePhase::Prepared,
+            revoke_leg: 0,
+            revoked_grant: None,
+            revoke_request_target: None,
+            revoke_scope_guarantee: None,
+            attempt_count: 0,
+            in_flight_until_ms: 0,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            closed_code: None,
+        };
+        self.put_journal(&journal_record_id, &journal)?;
+        Ok(BeginLifecycleOperation {
+            operation_id,
+            operation_etag,
+            journal_record_id,
+            idempotent_replay: false,
+        })
+    }
+
+    pub(crate) fn write_journal_fenced(
+        &self,
+        id: &str,
+        journal: &AccountLifecycleJournalV1,
+    ) -> Result<(), LifecycleRecordError> {
+        let context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        let active = context
+            .authority
+            .active_operations
+            .get(&journal.prepared.provider)
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        if active.prepared.operation_id != journal.prepared.operation_id
+            || active.operation_etag != journal.operation_etag
+            || active.journal_record_id != id
+            || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
+            || context.authority.fence_epoch != journal.prepared.fence_epoch
+        {
+            return Err(LifecycleRecordError::StaleFence);
+        }
+        self.put_journal(id, journal)
+    }
+
+    pub(crate) fn start_active_revoke(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let mut journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if !matches!(
+            journal.phase,
+            AccountLifecyclePhase::Prepared | AccountLifecyclePhase::RevokeOutcomeUnknown
+        ) {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        if journal.revoke_leg == 0 {
+            journal.revoke_leg = 1;
+            journal.revoked_grant = Some(RevokedGrantRef::ActiveCredential {
+                generation: journal
+                    .prepared
+                    .prior_generation
+                    .clone()
+                    .ok_or(LifecycleRecordError::Invalid)?,
+            });
+            journal.revoke_request_target = journal.prepared.initial_revoke_request_target;
+            journal.revoke_scope_guarantee = journal.prepared.initial_revoke_scope_guarantee;
+        }
+        journal.phase = AccountLifecyclePhase::RevokeInFlight;
+        journal.attempt_count = journal
+            .attempt_count
+            .checked_add(1)
+            .filter(|value| *value <= MAX_ATTEMPTS)
+            .ok_or(LifecycleRecordError::CountLimit)?;
+        journal.in_flight_until_ms = now_ms.saturating_add(2 * 60 * 1_000);
+        journal.updated_at_ms = now_ms;
+        journal.closed_code = None;
+        self.write_journal_fenced(id, &journal)?;
+        Ok(journal)
+    }
+
+    pub(crate) fn publish_revoke_outcome(
+        &self,
+        id: &str,
+        confirmed: bool,
+        code: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let mut journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if journal.phase != AccountLifecyclePhase::RevokeInFlight || !valid_closed_code(code) {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        journal.phase = if confirmed {
+            AccountLifecyclePhase::RevokedPendingCleanup
+        } else {
+            AccountLifecyclePhase::RevokeOutcomeUnknown
+        };
+        journal.in_flight_until_ms = 0;
+        journal.updated_at_ms = now_ms;
+        journal.closed_code = Some(code.to_string());
+        self.write_journal_fenced(id, &journal)?;
+        Ok(journal)
+    }
+
+    pub(crate) fn complete_disconnect(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleReceiptV1, LifecycleRecordError> {
+        let mut journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if !matches!(
+            journal.phase,
+            AccountLifecyclePhase::RevokedPendingCleanup | AccountLifecyclePhase::Disconnected
+        ) {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        if journal.phase == AccountLifecyclePhase::RevokedPendingCleanup {
+            journal.phase = AccountLifecyclePhase::Disconnected;
+            journal.in_flight_until_ms = 0;
+            journal.updated_at_ms = now_ms;
+            journal.closed_code = Some("disconnected".into());
+            self.write_journal_fenced(id, &journal)?;
+        }
+
+        let mut context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        let receipt = disconnect_receipt(&journal, now_ms);
+        let receipt_id = self.receipt_index_id(&context.principal, journal.prepared.provider)?;
+        let mut index =
+            self.load_receipt_index(&receipt_id)?
+                .unwrap_or(AccountLifecycleReceiptIndexV1 {
+                    version: SCHEMA_VERSION,
+                    provider: journal.prepared.provider,
+                    lifecycle_epoch: journal.prepared.lifecycle_epoch,
+                    receipts: Vec::new(),
+                });
+        let existing_receipt = index
+            .receipts
+            .iter()
+            .find(|existing| existing.operation_id == receipt.operation_id);
+        if let Some(existing) = existing_receipt {
+            if existing.operation_etag != receipt.operation_etag
+                || existing.idempotency_key != receipt.idempotency_key
+                || existing.payload_digest != receipt.payload_digest
+            {
+                return Err(LifecycleRecordError::StaleFence);
+            }
+        } else {
+            if index.receipts.len() >= MAX_RECEIPTS {
+                return Err(LifecycleRecordError::ReceiptCapacityExhausted);
+            }
+            index.lifecycle_epoch = journal.prepared.lifecycle_epoch;
+            index.receipts.push(receipt.clone());
+            self.put_receipt_index(&receipt_id, &index)?;
+        }
+
+        let active = context
+            .authority
+            .active_operations
+            .get(&journal.prepared.provider);
+        if let Some(active) = active {
+            if active.prepared.operation_id != journal.prepared.operation_id
+                || active.operation_etag != journal.operation_etag
+                || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
+                || context.authority.fence_epoch != journal.prepared.fence_epoch
+            {
+                return Err(LifecycleRecordError::StaleFence);
+            }
+        } else {
+            self.delete_journal(id)?;
+            return Ok(receipt);
+        }
+
+        if let Some(etag) = context
+            .authority
+            .current_credential_etags
+            .remove(&journal.prepared.provider)
+        {
+            let retired = context
+                .authority
+                .retired_credential_etags
+                .entry(journal.prepared.provider)
+                .or_default();
+            if !retired.contains(&etag) {
+                if retired.len() >= MAX_RETIRED_ETAGS {
+                    return Err(LifecycleRecordError::ReceiptCapacityExhausted);
+                }
+                retired.push(etag);
+            }
+        }
+        context
+            .authority
+            .active_operations
+            .remove(&journal.prepared.provider);
+        self.put_authority(&context.principal, &context.authority)?;
+        self.delete_journal(id)?;
+        Ok(receipt)
+    }
+
+    fn load_receipt_index(
+        &self,
+        id: &str,
+    ) -> Result<Option<AccountLifecycleReceiptIndexV1>, LifecycleRecordError> {
+        let Some(secret) = self
+            .store
+            .get_bounded(
+                isyncyou_agent::SecretClass::AccountLifecycleReceiptIndex,
+                id,
+                RECEIPT_INDEX_ENVELOPE_MAX,
+                RECEIPT_INDEX_PLAINTEXT_MAX,
+            )
+            .map_err(|_| LifecycleRecordError::Store)?
+        else {
+            return Ok(None);
+        };
+        let index = parse_bounded(secret.expose(), RECEIPT_INDEX_PLAINTEXT_MAX)?;
+        validate_receipts(&index)?;
+        Ok(Some(index))
+    }
+
+    fn receipt_index_id(
+        &self,
+        principal: &str,
+        provider: ProductProviderId,
+    ) -> Result<String, LifecycleRecordError> {
+        self.derive_tag(
+            b"isyncyou/account-lifecycle-receipt-id/v1",
+            &[principal.as_bytes(), provider.wire().as_bytes()],
+        )
+    }
+
+    fn derive_tag(
+        &self,
+        domain: &'static [u8],
+        fields: &[&[u8]],
+    ) -> Result<String, LifecycleRecordError> {
+        use base64::Engine;
+        let mut message = Vec::new();
+        for field in fields {
+            let len = u32::try_from(field.len()).map_err(|_| LifecycleRecordError::SizeLimit)?;
+            message.extend_from_slice(&len.to_be_bytes());
+            message.extend_from_slice(field);
+        }
+        let tag = self
+            .store
+            .domain_hmac(domain, &message)
+            .map_err(|_| LifecycleRecordError::Store)?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag))
+    }
+
     fn put_record<T: Serialize>(
         &self,
         class: isyncyou_agent::SecretClass,
@@ -462,6 +1214,29 @@ impl LifecycleRepository {
         self.store
             .put_bounded(class, id, &isyncyou_agent::Secret::new(bytes), envelope_max)
             .map_err(|_| LifecycleRecordError::Store)
+    }
+}
+
+fn disconnect_receipt(
+    journal: &AccountLifecycleJournalV1,
+    completed_at_ms: u64,
+) -> AccountLifecycleReceiptV1 {
+    AccountLifecycleReceiptV1 {
+        version: SCHEMA_VERSION,
+        operation_id: journal.prepared.operation_id.clone(),
+        operation_etag: journal.operation_etag.clone(),
+        route: journal.prepared.route,
+        mode: journal.prepared.mode,
+        idempotency_key: journal.prepared.idempotency_key.clone(),
+        payload_digest: journal.prepared.payload_digest.clone(),
+        prior_generation: journal.prepared.prior_generation.clone(),
+        result_generation: None,
+        completed_revoke_legs: journal.revoke_leg,
+        lifecycle_epoch: journal.prepared.lifecycle_epoch,
+        fence_epoch: journal.prepared.fence_epoch,
+        lifecycle_key_version: journal.prepared.lifecycle_key_version,
+        terminal_code: "disconnected".into(),
+        completed_at_ms,
     }
 }
 
@@ -810,6 +1585,22 @@ fn valid_closed_code(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+fn revoke_target_wire(value: RevokeRequestTarget) -> &'static str {
+    match value {
+        RevokeRequestTarget::RefreshToken => "refresh_token",
+        RevokeRequestTarget::AccessToken => "access_token",
+    }
+}
+
+fn revoke_scope_wire(value: RevokeScopeGuarantee) -> &'static str {
+    match value {
+        RevokeScopeGuarantee::GuaranteedTokenSession => "guaranteed_token_session",
+        RevokeScopeGuarantee::ObservedTokenSession => "observed_token_session",
+        RevokeScopeGuarantee::Unknown => "unknown",
+        RevokeScopeGuarantee::FullGrant => "full_grant",
+    }
+}
+
 fn validate_b64url(value: &str, exact_len: usize) -> Result<(), LifecycleRecordError> {
     if value.len() != exact_len
         || !value
@@ -910,6 +1701,53 @@ mod tests {
             )
             .then_some(1_000),
         }
+    }
+
+    fn begin_disconnect_fixture(
+        repository: &LifecycleRepository,
+        request_id: &str,
+    ) -> BeginLifecycleOperation {
+        repository
+            .begin_disconnect(
+                ProductProviderId::Codex,
+                request_id,
+                "123e4567-e89b-42d3-a456-426614174001",
+                Some(&"s".repeat(43)),
+                RevokeRequestTarget::RefreshToken,
+                RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            )
+            .unwrap()
+    }
+
+    fn assert_prepared_blocks_provider(repository: &LifecycleRepository) {
+        assert!(repository
+            .provider_blocked(ProductProviderId::Codex)
+            .unwrap());
+    }
+
+    fn advance_to_revoke_in_flight(
+        repository: &LifecycleRepository,
+        operation: &BeginLifecycleOperation,
+    ) -> AccountLifecycleJournalV1 {
+        repository
+            .start_active_revoke(&operation.journal_record_id, 2_000)
+            .unwrap()
+    }
+
+    fn advance_to_cleanup(
+        repository: &LifecycleRepository,
+        operation: &BeginLifecycleOperation,
+    ) -> AccountLifecycleJournalV1 {
+        advance_to_revoke_in_flight(repository, operation);
+        repository
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                true,
+                "revoke_confirmed",
+                3_000,
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1232,6 +2070,487 @@ mod tests {
         assert!(candidate_reapable(&value, 31 * 24 * 60 * 60 * 1_000));
         value.state = OAuthCandidateState::Promoted;
         assert!(candidate_reapable(&value, 31 * 24 * 60 * 60 * 1_000));
+    }
+
+    #[test]
+    fn prepared_journal_blocks_provider_before_disconnecting_bundle_write() {
+        let root = temp_root("prepared-blocks");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174010");
+        assert_prepared_blocks_provider(&repository(&root));
+        assert_eq!(
+            repository(&root)
+                .load_journal(&operation.journal_record_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            AccountLifecyclePhase::Prepared
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_process_fence_cannot_publish_readiness_or_cleanup() {
+        let root = temp_root("stale-fence");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174011");
+        let mut stale = advance_to_revoke_in_flight(&repo, &operation);
+        let mut context = repo.load_existing().unwrap().unwrap();
+        context.authority.fence_epoch += 1;
+        repo.put_authority(context.principal(), &context.authority)
+            .unwrap();
+        stale.phase = AccountLifecyclePhase::RevokedPendingCleanup;
+        assert_eq!(
+            repo.write_journal_fenced(&operation.journal_record_id, &stale),
+            Err(LifecycleRecordError::StaleFence)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_after_each_disconnect_publication_window_is_fail_closed_and_idempotent() {
+        let root = temp_root("recovery-windows");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174012");
+        for expected in [
+            AccountLifecyclePhase::Prepared,
+            AccountLifecyclePhase::RevokeInFlight,
+            AccountLifecyclePhase::RevokedPendingCleanup,
+        ] {
+            let reopened = repository(&root);
+            assert_prepared_blocks_provider(&reopened);
+            assert_eq!(
+                reopened
+                    .load_journal(&operation.journal_record_id)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                expected
+            );
+            match expected {
+                AccountLifecyclePhase::Prepared => {
+                    advance_to_revoke_in_flight(&reopened, &operation);
+                }
+                AccountLifecyclePhase::RevokeInFlight => {
+                    reopened
+                        .publish_revoke_outcome(
+                            &operation.journal_record_id,
+                            true,
+                            "revoke_confirmed",
+                            3_000,
+                        )
+                        .unwrap();
+                }
+                AccountLifecyclePhase::RevokedPendingCleanup => break,
+                _ => unreachable!(),
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_authority_reservation_before_journal_blocks_provider_and_recovers() {
+        let root = temp_root("authority-before-journal");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174013");
+        repo.delete_journal(&operation.journal_record_id).unwrap();
+        let reopened = repository(&root);
+        assert_prepared_blocks_provider(&reopened);
+        let context = reopened.load_existing().unwrap().unwrap();
+        let active = &context.authority.active_operations[&ProductProviderId::Codex];
+        assert_eq!(active.prepared.operation_id, operation.operation_id);
+        assert_eq!(active.journal_record_id, operation.journal_record_id);
+        let recovered = reopened
+            .recover_active_journal(ProductProviderId::Codex, 2_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.phase, AccountLifecyclePhase::Prepared);
+        assert_eq!(recovered.prepared, active.prepared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_prepared_before_bundle_write_blocks_provider_and_resumes() {
+        let root = temp_root("prepared-resume");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174014");
+        let reopened = repository(&root);
+        assert_prepared_blocks_provider(&reopened);
+        assert_eq!(
+            reopened
+                .start_active_revoke(&operation.journal_record_id, 2_000)
+                .unwrap()
+                .phase,
+            AccountLifecyclePhase::RevokeInFlight
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_disconnecting_before_revoke_claim_resumes() {
+        let root = temp_root("disconnecting-resume");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174015");
+        assert_eq!(
+            repository(&root)
+                .start_active_revoke(&operation.journal_record_id, 2_000)
+                .unwrap()
+                .attempt_count,
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_revoke_inflight_before_response_stays_outcome_unknown() {
+        let root = temp_root("revoke-inflight");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174016");
+        advance_to_revoke_in_flight(&repo, &operation);
+        let unknown = repo
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                false,
+                "revoke_interrupted",
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(unknown.phase, AccountLifecyclePhase::RevokeOutcomeUnknown);
+        assert_prepared_blocks_provider(&repository(&root));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_provider_2xx_before_outcome_commit_retries_without_cleanup() {
+        let root = temp_root("provider-2xx-window");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174017");
+        advance_to_revoke_in_flight(&repo, &operation);
+        let reopened = repository(&root);
+        assert_eq!(
+            reopened
+                .load_journal(&operation.journal_record_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            AccountLifecyclePhase::RevokeInFlight
+        );
+        assert!(reopened
+            .start_active_revoke(&operation.journal_record_id, 4_000)
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_revoked_pending_cleanup_resumes_without_provider_call() {
+        let root = temp_root("cleanup-resume");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174018");
+        advance_to_cleanup(&repo, &operation);
+        let receipt = repository(&root)
+            .complete_disconnect(&operation.journal_record_id, 4_000)
+            .unwrap();
+        assert_eq!(receipt.terminal_code, "disconnected");
+        assert!(!repository(&root)
+            .provider_blocked(ProductProviderId::Codex)
+            .unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_all_deletes_before_receipt_writes_terminal_receipt() {
+        let root = temp_root("all-deletes-before-receipt");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174021");
+        advance_to_cleanup(&repo, &operation);
+        let receipt = repository(&root)
+            .complete_disconnect(&operation.journal_record_id, 4_000)
+            .unwrap();
+        assert_eq!(receipt.operation_id, operation.operation_id);
+        assert_eq!(receipt.terminal_code, "disconnected");
+        assert!(!repository(&root)
+            .provider_blocked(ProductProviderId::Codex)
+            .unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_receipt_before_authority_release_retires_etag_once() {
+        let root = temp_root("receipt-before-authority-release");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174022");
+        let mut journal = advance_to_cleanup(&repo, &operation);
+        journal.phase = AccountLifecyclePhase::Disconnected;
+        journal.updated_at_ms = 4_000;
+        journal.closed_code = Some("disconnected".into());
+        repo.write_journal_fenced(&operation.journal_record_id, &journal)
+            .unwrap();
+        let context = repo.load_existing().unwrap().unwrap();
+        let receipt = disconnect_receipt(&journal, 4_000);
+        let receipt_id = repo
+            .receipt_index_id(context.principal(), ProductProviderId::Codex)
+            .unwrap();
+        repo.put_receipt_index(
+            &receipt_id,
+            &AccountLifecycleReceiptIndexV1 {
+                version: SCHEMA_VERSION,
+                provider: ProductProviderId::Codex,
+                lifecycle_epoch: journal.prepared.lifecycle_epoch,
+                receipts: vec![receipt],
+            },
+        )
+        .unwrap();
+
+        repository(&root)
+            .complete_disconnect(&operation.journal_record_id, 5_000)
+            .unwrap();
+        let authority = repository(&root)
+            .load_existing()
+            .unwrap()
+            .unwrap()
+            .authority;
+        assert_eq!(
+            authority.retired_credential_etags[&ProductProviderId::Codex].len(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_receipt_before_compaction_compacts_idempotently() {
+        let root = temp_root("receipt-before-compaction");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174023");
+        let mut disconnected = advance_to_cleanup(&repo, &operation);
+        disconnected.phase = AccountLifecyclePhase::Disconnected;
+        disconnected.updated_at_ms = 4_000;
+        disconnected.closed_code = Some("disconnected".into());
+        repo.write_journal_fenced(&operation.journal_record_id, &disconnected)
+            .unwrap();
+        repo.complete_disconnect(&operation.journal_record_id, 5_000)
+            .unwrap();
+
+        // Simulate an already-published terminal journal surviving a crash after authority
+        // retirement. The existing receipt is authoritative and no duplicate is appended.
+        repository(&root)
+            .put_journal(&operation.journal_record_id, &disconnected)
+            .unwrap();
+        repository(&root)
+            .complete_disconnect(&operation.journal_record_id, 6_000)
+            .unwrap();
+        let context = repository(&root).load_existing().unwrap().unwrap();
+        let receipt_id = repo
+            .receipt_index_id(context.principal(), ProductProviderId::Codex)
+            .unwrap();
+        assert_eq!(
+            repository(&root)
+                .load_receipt_index(&receipt_id)
+                .unwrap()
+                .unwrap()
+                .receipts
+                .len(),
+            1
+        );
+        assert!(repository(&root)
+            .load_journal(&operation.journal_record_id)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disconnect_repeated_request_is_idempotent() {
+        let root = temp_root("idempotent-active");
+        let repo = repository(&root);
+        let request_id = "123e4567-e89b-42d3-a456-426614174019";
+        let first = begin_disconnect_fixture(&repo, request_id);
+        let second = begin_disconnect_fixture(&repository(&root), request_id);
+        assert!(second.idempotent_replay);
+        assert_eq!(first.operation_id, second.operation_id);
+        assert_eq!(first.operation_etag, second.operation_etag);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disconnect_same_request_id_with_different_payload_conflicts() {
+        let root = temp_root("idempotency-conflict");
+        let repo = repository(&root);
+        let request_id = "123e4567-e89b-42d3-a456-426614174020";
+        begin_disconnect_fixture(&repo, request_id);
+        assert_eq!(
+            repo.begin_disconnect(
+                ProductProviderId::Codex,
+                request_id,
+                "123e4567-e89b-42d3-a456-426614174099",
+                Some(&"s".repeat(43)),
+                RevokeRequestTarget::RefreshToken,
+                RevokeScopeGuarantee::ObservedTokenSession,
+                2_000,
+            ),
+            Err(LifecycleRecordError::IdempotencyConflict)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disconnect_idempotency_survives_webview_session_restart() {
+        let root = temp_root("idempotency-restart");
+        let request_id = "123e4567-e89b-42d3-a456-426614174021";
+        let first = begin_disconnect_fixture(&repository(&root), request_id);
+        let replay = begin_disconnect_fixture(&repository(&root), request_id);
+        assert!(replay.idempotent_replay);
+        assert_eq!(first.operation_id, replay.operation_id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_or_corrupt_installation_principal_fails_closed_without_new_operation_identity() {
+        let root = temp_root("corrupt-principal-operation");
+        let repo = repository(&root);
+        repo.initialize().unwrap();
+        repo.store
+            .delete_durable(
+                isyncyou_agent::SecretClass::AccountLifecycleInstallation,
+                "installation",
+            )
+            .unwrap();
+        assert!(matches!(
+            repository(&root).begin_disconnect(
+                ProductProviderId::Codex,
+                "123e4567-e89b-42d3-a456-426614174022",
+                "123e4567-e89b-42d3-a456-426614174001",
+                None,
+                RevokeRequestTarget::RefreshToken,
+                RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            ),
+            Err(LifecycleRecordError::MissingInstallationPrincipal)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_lifecycle_status_is_read_only_and_never_runs_maintenance() {
+        let root = temp_root("status-read-only");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174023");
+        let before = std::fs::read_dir(root.join("agent-credentials"))
+            .unwrap()
+            .count();
+        assert!(repo.provider_blocked(ProductProviderId::Codex).unwrap());
+        assert_eq!(
+            repo.load_journal(&operation.journal_record_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            AccountLifecyclePhase::Prepared
+        );
+        assert_eq!(
+            before,
+            std::fs::read_dir(root.join("agent-credentials"))
+                .unwrap()
+                .count()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_lifecycle_maintenance_never_resolves_revoke_unknown_by_time() {
+        let root = temp_root("unknown-retained");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174024");
+        advance_to_revoke_in_flight(&repo, &operation);
+        repo.publish_revoke_outcome(&operation.journal_record_id, false, "revoke_timeout", 3_000)
+            .unwrap();
+        assert_eq!(
+            repository(&root)
+                .load_journal(&operation.journal_record_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            AccountLifecyclePhase::RevokeOutcomeUnknown
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_lifecycle_maintenance_never_resolves_or_reaps_exchange_unknown() {
+        let mut value = journal(AccountLifecycleMode::Connect);
+        value.phase = AccountLifecyclePhase::ExchangeOutcomeUnknown;
+        value.updated_at_ms = 1;
+        value.in_flight_until_ms = 0;
+        assert!(validate_journal(&value).is_ok());
+        assert!(!transition_allowed(
+            AccountLifecycleMode::Connect,
+            AccountLifecyclePhase::ExchangeOutcomeUnknown,
+            AccountLifecyclePhase::Completed
+        ));
+    }
+
+    #[test]
+    fn provider_lifecycle_file_lock_excludes_real_child_process() {
+        const CHILD_ENV: &str = "ISY645_LOCK_CHILD";
+        if let Ok(path) = std::env::var(CHILD_ENV) {
+            assert!(
+                isyncyou_agent::FileLock::try_acquire_exclusive(Path::new(&path))
+                    .unwrap()
+                    .is_none()
+            );
+            return;
+        }
+        let root = temp_root("child-lock");
+        let path = provider_lock_path(&root, ProductProviderId::Codex);
+        let _held = isyncyou_agent::FileLock::try_acquire_shared(&path)
+            .unwrap()
+            .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("account_lifecycle::tests::provider_lifecycle_file_lock_excludes_real_child_process")
+            .arg("--nocapture")
+            .env(CHILD_ENV, &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disconnect_cross_process_lease_prevents_parallel_revoke_attempts() {
+        let root = temp_root("cross-process-contract");
+        let registry = Arc::new(ProviderLeaseRegistry::default());
+        let operation = mint_operation_id().unwrap();
+        let _lease = registry
+            .acquire_exclusive(
+                &root,
+                ProductProviderId::Codex,
+                operation,
+                ProviderOperationKind::Lifecycle,
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.acquire_exclusive(
+                &root,
+                ProductProviderId::Codex,
+                mint_operation_id().unwrap(),
+                ProviderOperationKind::Lifecycle,
+            ),
+            Err(LifecycleRecordError::Busy)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_lifecycle_audit_failure_increments_only_bounded_diagnostics_counter() {
+        let diagnostics = LifecycleDiagnostics::default();
+        diagnostics.record_audit_failure();
+        diagnostics.record_audit_failure();
+        assert_eq!(diagnostics.audit_failures(), 2);
+        diagnostics
+            .audit_failures
+            .store(u32::MAX, std::sync::atomic::Ordering::Release);
+        diagnostics.record_audit_failure();
+        assert_eq!(diagnostics.audit_failures(), u32::MAX);
+        assert!(!format!("{diagnostics:?}").contains("token"));
     }
 
     #[test]

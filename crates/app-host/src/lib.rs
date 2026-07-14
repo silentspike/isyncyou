@@ -24,16 +24,12 @@ pub use mobile_jobs::{
     MobileJobRunOutcome, MobileJobRuntime, MobileWorkerDeviceSnapshot,
 };
 
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
 use isyncyou_agent::ProductProviderId;
 use isyncyou_connectors::ProgressSink;
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
 use isyncyou_webui::{OfflineModeRisk, OneDriveMoveRisk};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -518,6 +514,225 @@ fn consume_mobile_connectivity_snapshot(
 struct AgentStreamSlot {
     rx: std::sync::mpsc::Receiver<String>,
     created_at_ms: u64,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    provider: Option<ProductProviderId>,
+}
+
+struct PreparedTurnProvider {
+    provider: Box<dyn isyncyou_agent::LlmProvider + Send>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    provider_id: Option<ProductProviderId>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    operation_lease: Option<account_lifecycle::ProviderOperationLease>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+struct LifecycleMaintenanceRuntime {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl LifecycleMaintenanceRuntime {
+    fn spawn(
+        oauth_dir: PathBuf,
+        provider_leases: Arc<account_lifecycle::ProviderLeaseRegistry>,
+        last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+        oauth: Arc<isyncyou_agent::AgentOAuth>,
+        oauth_attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
+    ) -> Self {
+        Self::spawn_with_interval(
+            oauth_dir,
+            provider_leases,
+            last_usage,
+            oauth,
+            oauth_attempts,
+            std::time::Duration::from_secs(60),
+        )
+    }
+
+    fn spawn_with_interval(
+        oauth_dir: PathBuf,
+        provider_leases: Arc<account_lifecycle::ProviderLeaseRegistry>,
+        last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+        oauth: Arc<isyncyou_agent::AgentOAuth>,
+        oauth_attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
+        interval: std::time::Duration,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name("agent-account-lifecycle-maintenance".into())
+            .spawn(move || {
+                run_account_maintenance_once(
+                    &oauth_dir,
+                    &provider_leases,
+                    &last_usage,
+                    &oauth,
+                    &oauth_attempts,
+                );
+                loop {
+                    match rx.recv_timeout(interval) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            run_account_maintenance_once(
+                                &oauth_dir,
+                                &provider_leases,
+                                &last_usage,
+                                &oauth,
+                                &oauth_attempts,
+                            );
+                        }
+                    }
+                }
+                run_account_maintenance_once(
+                    &oauth_dir,
+                    &provider_leases,
+                    &last_usage,
+                    &oauth,
+                    &oauth_attempts,
+                );
+            })
+            .ok();
+        Self {
+            stop: Some(tx),
+            join,
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn run_account_maintenance_once(
+    oauth_dir: &Path,
+    provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
+    last_usage: &Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+    oauth: &isyncyou_agent::AgentOAuth,
+    oauth_attempts: &Arc<Mutex<HashMap<String, OAuthAttempt>>>,
+) {
+    let _ = oauth.reap_expired();
+    if let Ok(mut attempts) = oauth_attempts.lock() {
+        reap_oauth_attempts(&mut attempts, oauth_dir);
+    }
+    reap_onboarding_journals_at(oauth_dir, now_ms());
+    run_lifecycle_maintenance_once(oauth_dir, provider_leases, last_usage);
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl Drop for LifecycleMaintenanceRuntime {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn run_lifecycle_maintenance_once(
+    oauth_dir: &Path,
+    provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
+    last_usage: &Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+) {
+    run_lifecycle_maintenance_once_at(oauth_dir, provider_leases, last_usage, now_ms());
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn run_lifecycle_maintenance_once_at(
+    oauth_dir: &Path,
+    provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
+    last_usage: &Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+    maintenance_now_ms: u64,
+) {
+    let Ok(repository) = account_lifecycle_repository(oauth_dir) else {
+        return;
+    };
+    let Ok(Some(context)) = repository.load_existing() else {
+        return;
+    };
+    for (provider, active) in context.authority.active_operations {
+        let Ok(maintenance_id) = account_lifecycle::mint_operation_id() else {
+            continue;
+        };
+        let Ok(_lease) = provider_leases.acquire_exclusive(
+            oauth_dir,
+            provider,
+            maintenance_id,
+            account_lifecycle::ProviderOperationKind::Maintenance,
+        ) else {
+            continue;
+        };
+        let Ok(Some(current)) = repository.load_existing() else {
+            continue;
+        };
+        let Some(current_active) = current.authority.active_operations.get(&provider) else {
+            continue;
+        };
+        if current_active.operation_etag != active.operation_etag
+            || current_active.prepared.fence_epoch != active.prepared.fence_epoch
+        {
+            continue;
+        }
+        let Ok(Some(journal)) = repository.recover_active_journal(provider, maintenance_now_ms)
+        else {
+            continue;
+        };
+        match journal.phase {
+            account_lifecycle::AccountLifecyclePhase::RevokedPendingCleanup
+            | account_lifecycle::AccountLifecyclePhase::Disconnected => {
+                if delete_provider_product_state_durable(oauth_dir, provider).is_ok()
+                    && repository
+                        .complete_disconnect(&active.journal_record_id, maintenance_now_ms)
+                        .is_ok()
+                {
+                    if let Ok(mut usage) = last_usage.lock() {
+                        usage.remove(&provider);
+                    }
+                }
+            }
+            account_lifecycle::AccountLifecyclePhase::RevokeInFlight
+                if journal.in_flight_until_ms != 0
+                    && journal.in_flight_until_ms <= maintenance_now_ms =>
+            {
+                let _ = repository.publish_revoke_outcome(
+                    &active.journal_record_id,
+                    false,
+                    "revoke_interrupted",
+                    maintenance_now_ms,
+                );
+            }
+            account_lifecycle::AccountLifecyclePhase::RevokeOutcomeUnknown
+            | account_lifecycle::AccountLifecyclePhase::ExchangeOutcomeUnknown => {}
+            _ => {}
+        }
+    }
 }
 
 #[cfg(any(
@@ -598,6 +813,37 @@ impl AgentStartTurnError {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountLifecycleResult {
+    state: &'static str,
+    code: &'static str,
+    retryable: bool,
+    operation_id: Option<String>,
+    operation_etag: Option<String>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn revoke_failure_wire(code: isyncyou_agent::oauth::RevokeFailureCode) -> &'static str {
+    use isyncyou_agent::oauth::RevokeFailureCode::*;
+    match code {
+        InvalidCredential => "revoke_invalid_credential",
+        ConnectTimedOut => "revoke_connect_timed_out",
+        NameResolutionFailed => "revoke_name_resolution_failed",
+        TlsFailed => "revoke_tls_failed",
+        ConnectFailed => "revoke_connect_failed",
+        RateLimited => "revoke_rate_limited",
+        ProviderUnavailable => "revoke_provider_unavailable",
+        Rejected => "revoke_rejected",
+    }
+}
+
 /// The in-app agent handler (S-AG.6/#621). Product turns require a host-attested
 /// Claude/Codex OAuth provider; deterministic providers are injected only by tests.
 /// Owns the stream hub + pending-action registry, so the model never holds a capability token.
@@ -610,7 +856,22 @@ pub struct DaemonAgent {
     confirmed_executor: Arc<dyn AgentConfirmedActionExecutor>,
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
-    last_usage: Arc<Mutex<Option<isyncyou_agent::Usage>>>,
+    last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    provider_leases: Arc<account_lifecycle::ProviderLeaseRegistry>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    lifecycle_initialized: bool,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    lifecycle_maintenance: Option<LifecycleMaintenanceRuntime>,
     // Read only by the gated product credential-refresh path; keep them without that feature so the
     // no-oauth-feature build (mobile --no-default-features) compiles.
     #[cfg_attr(
@@ -658,7 +919,7 @@ pub struct DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    oauth: isyncyou_agent::AgentOAuth,
+    oauth: Arc<isyncyou_agent::AgentOAuth>,
     /// Opaque UI attempt ids map to private OAuth state or cancellation flags. They are
     /// process-local, short-lived, and never serialized into status/audit output.
     #[cfg(any(
@@ -694,14 +955,29 @@ impl DaemonAgent {
         let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
         let confirmed_executor =
             agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
-        let agent = Self {
+        let mut agent = Self {
             cfg,
             hub: Arc::new(isyncyou_agent::AgentStreamHub::new()),
             pending: Arc::new(isyncyou_agent::PendingRegistry::new()),
             confirmed_executor,
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
-            last_usage: Arc::new(Mutex::new(None)),
+            last_usage: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
+            provider_leases: Arc::new(account_lifecycle::ProviderLeaseRegistry::default()),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
+            lifecycle_initialized: initialize_account_lifecycle(&oauth_dir),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
+            lifecycle_maintenance: None,
             credential_now_ms: Arc::new(now_ms),
             credential_refresh_gate: Mutex::new(()),
             product_runtime_gate: Arc::new(Mutex::new(())),
@@ -711,7 +987,7 @@ impl DaemonAgent {
                 feature = "agent-oauth-providers",
                 feature = "agent-subscription-experimental"
             ))]
-            oauth: isyncyou_agent::AgentOAuth::new(),
+            oauth: Arc::new(isyncyou_agent::AgentOAuth::new()),
             #[cfg(any(
                 feature = "agent-oauth-providers",
                 feature = "agent-subscription-experimental"
@@ -730,6 +1006,13 @@ impl DaemonAgent {
             reap_onboarding_journals_at(&agent.oauth_dir, now_ms());
             recover_interrupted_onboarding_attempts(&agent.oauth_dir);
             agent.recover_product_onboarding();
+            agent.lifecycle_maintenance = Some(LifecycleMaintenanceRuntime::spawn(
+                agent.oauth_dir.clone(),
+                Arc::clone(&agent.provider_leases),
+                Arc::clone(&agent.last_usage),
+                Arc::clone(&agent.oauth),
+                Arc::clone(&agent.oauth_attempts),
+            ));
         }
         agent
     }
@@ -856,14 +1139,23 @@ impl DaemonAgent {
     /// script (CI) and the no-product-feature build bypass the gate with a deterministic provider;
     /// the product build returns the closed error code on not-ready so `start_turn` can reject the
     /// turn before creating any turn state.
-    fn resolve_turn_provider(
-        &self,
-        system: &str,
-    ) -> Result<Box<dyn isyncyou_agent::LlmProvider + Send>, String> {
+    fn resolve_turn_provider(&self, system: &str) -> Result<PreparedTurnProvider, String> {
         #[cfg(test)]
         if let Some(script) = &self.test_provider_script {
             if let Some(script) = script.lock().unwrap().take() {
-                return Ok(Box::new(isyncyou_agent::FakeProvider::new(script)));
+                return Ok(PreparedTurnProvider {
+                    provider: Box::new(isyncyou_agent::FakeProvider::new(script)),
+                    #[cfg(any(
+                        feature = "agent-oauth-providers",
+                        feature = "agent-subscription-experimental"
+                    ))]
+                    provider_id: None,
+                    #[cfg(any(
+                        feature = "agent-oauth-providers",
+                        feature = "agent-subscription-experimental"
+                    ))]
+                    operation_lease: None,
+                });
             }
         }
         #[cfg(any(
@@ -894,6 +1186,9 @@ impl DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn provider_ready(&self, provider: ProductProviderId) -> bool {
+        if self.lifecycle_provider_blocked(provider) {
+            return false;
+        }
         match provider {
             ProductProviderId::Claude => match self.claude_product_bundle_state() {
                 ProductCredentialState::PresentValid((_, meta)) => {
@@ -908,6 +1203,23 @@ impl DaemonAgent {
                 _ => false,
             },
         }
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn lifecycle_provider_blocked(&self, provider: ProductProviderId) -> bool {
+        if !self.lifecycle_initialized {
+            return true;
+        }
+        account_lifecycle_repository(&self.oauth_dir)
+            .and_then(|repository| {
+                repository
+                    .provider_blocked(provider)
+                    .map_err(|_| "lifecycle_unavailable".to_string())
+            })
+            .unwrap_or(true)
     }
 
     /// #639 (F3): the DURABLE product activation is valid — a valid Active V2 bundle whose OWN policy
@@ -941,6 +1253,9 @@ impl DaemonAgent {
         provider: ProductProviderId,
         meta: &ProductBundleMeta,
     ) -> bool {
+        if self.lifecycle_provider_blocked(provider) {
+            return false;
+        }
         let official_policy = oauth_policy_fingerprint(provider);
         if meta.provider != provider
             || meta.lifecycle != CredentialLifecycle::Active
@@ -1178,103 +1493,241 @@ impl DaemonAgent {
     fn product_runtime_gate(
         &self,
         system: &str,
-    ) -> Result<Box<dyn isyncyou_agent::LlmProvider + Send>, AgentStartTurnError> {
-        let _gate = self
-            .product_runtime_gate
-            .lock()
+    ) -> Result<PreparedTurnProvider, AgentStartTurnError> {
+        enum CredentialSnapshot {
+            Claude(StoredCredential),
+            Codex(CodexStoredCredential),
+        }
+
+        // Preliminary read selects only the provider enum; no credential material survives it.
+        let selected = {
+            let _gate = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
+                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            self.agent_settings()
+                .map(|settings| settings.provider)
+                .ok_or(AgentStartTurnError::ProductNotReady)?
+        };
+        let operation_id = account_lifecycle::mint_operation_id()
             .map_err(|_| AgentStartTurnError::ProductNotReady)?;
-        let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
-            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
-        // Corrupt/unknown selection fails closed — never a default/alternative provider.
-        let settings = self
-            .agent_settings()
-            .ok_or(AgentStartTurnError::ProductNotReady)?;
-        let selected = settings.provider;
-        let _refresh = self
-            .credential_refresh_gate
-            .lock()
+        let exclusive = self
+            .provider_leases
+            .acquire_exclusive(
+                &self.oauth_dir,
+                selected,
+                operation_id.clone(),
+                account_lifecycle::ProviderOperationKind::Refresh,
+            )
             .map_err(|_| AgentStartTurnError::ProductNotReady)?;
 
-        match selected {
-            ProductProviderId::Claude => {
-                let state = self.claude_product_bundle_state();
-                let (credential, meta) = match state {
-                    ProductCredentialState::PresentValid(bundle) => bundle,
-                    ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
-                        if !self.provider_activation_valid_for_meta(selected, &meta) {
-                            return Err(AgentStartTurnError::ProductNotReady);
-                        }
-                        let refreshed = self
-                            .refresh_claude_product_credential_unlocked(credential, meta.clone())
-                            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
-                        (refreshed, meta)
-                    }
-                    ProductCredentialState::Absent => {
-                        #[cfg(feature = "agent-subscription-experimental")]
-                        if let Some(provider) =
-                            self.try_experimental_only_provider(selected, &settings.model, system)
-                        {
-                            return Ok(provider);
-                        }
-                        return Err(AgentStartTurnError::ProductNotReady);
-                    }
-                    ProductCredentialState::PresentInvalid => {
-                        return Err(AgentStartTurnError::ProductNotReady);
-                    }
-                };
-                if !self.provider_activation_valid_for_meta(selected, &meta) {
-                    return Err(AgentStartTurnError::ProductNotReady);
-                }
-                isyncyou_agent::SubscriptionProvider::new(
-                    credential.access_token,
-                    &settings.model,
-                    system,
-                    self.subscription_config(),
-                )
-                .map(|provider| Box::new(provider) as Box<dyn isyncyou_agent::LlmProvider + Send>)
-                .map_err(|_| AgentStartTurnError::ProductNotReady)
+        let (settings, generation, credential) = {
+            let _gate = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            let _refresh = self
+                .credential_refresh_gate
+                .lock()
+                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
+                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            let settings = self
+                .agent_settings()
+                .filter(|settings| settings.provider == selected)
+                .ok_or(AgentStartTurnError::ProductNotReady)?;
+            if self.lifecycle_provider_blocked(selected) {
+                return Err(AgentStartTurnError::ProductNotReady);
             }
-            ProductProviderId::Codex => {
-                let state = self.codex_product_bundle_state();
-                let (credential, meta) = match state {
-                    ProductCredentialState::PresentValid(bundle) => bundle,
-                    ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
-                        if !self.provider_activation_valid_for_meta(selected, &meta) {
+            match selected {
+                ProductProviderId::Claude => {
+                    let state = self.claude_product_bundle_state();
+                    let (credential, meta) = match state {
+                        ProductCredentialState::PresentValid(bundle) => bundle,
+                        ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                            if !self.provider_activation_valid_for_meta(selected, &meta) {
+                                return Err(AgentStartTurnError::ProductNotReady);
+                            }
+                            // The provider lifecycle lease and refresh serializer remain held, but
+                            // the short product snapshot locks must never span provider I/O.
+                            drop(_file_gate);
+                            drop(_gate);
+                            let refreshed = self
+                                .refresh_claude_product_credential_unlocked(
+                                    credential,
+                                    meta.clone(),
+                                )
+                                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                            (refreshed, meta)
+                        }
+                        ProductCredentialState::Absent => {
+                            #[cfg(feature = "agent-subscription-experimental")]
+                            if let Some(provider) = self.try_experimental_only_provider(
+                                selected,
+                                &settings.model,
+                                system,
+                            ) {
+                                drop(_file_gate);
+                                drop(_refresh);
+                                drop(_gate);
+                                drop(exclusive);
+                                let lease = self
+                                    .provider_leases
+                                    .acquire_shared(
+                                        &self.oauth_dir,
+                                        selected,
+                                        operation_id,
+                                        account_lifecycle::ProviderOperationKind::Turn,
+                                    )
+                                    .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                return Ok(PreparedTurnProvider {
+                                    provider,
+                                    provider_id: Some(selected),
+                                    operation_lease: Some(lease),
+                                });
+                            }
                             return Err(AgentStartTurnError::ProductNotReady);
                         }
-                        let refreshed = self
-                            .refresh_codex_product_credential_unlocked(credential, meta.clone())
-                            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
-                        (refreshed, meta)
-                    }
-                    ProductCredentialState::Absent => {
-                        #[cfg(feature = "agent-subscription-experimental")]
-                        if let Some(provider) =
-                            self.try_experimental_only_provider(selected, &settings.model, system)
-                        {
-                            return Ok(provider);
+                        ProductCredentialState::PresentInvalid => {
+                            return Err(AgentStartTurnError::ProductNotReady);
                         }
+                    };
+                    if !self.provider_activation_valid_for_meta(selected, &meta) {
                         return Err(AgentStartTurnError::ProductNotReady);
                     }
-                    ProductCredentialState::PresentInvalid => {
-                        return Err(AgentStartTurnError::ProductNotReady);
-                    }
-                };
-                if !self.provider_activation_valid_for_meta(selected, &meta) {
-                    return Err(AgentStartTurnError::ProductNotReady);
+                    (
+                        settings,
+                        meta.generation,
+                        CredentialSnapshot::Claude(credential),
+                    )
                 }
-                let config = isyncyou_agent::CodexConfig {
-                    account_id: credential.account_id,
-                    model: settings.model,
-                    ..Default::default()
-                };
-                isyncyou_agent::CodexProvider::new(credential.access_token, system, config)
+                ProductProviderId::Codex => {
+                    let state = self.codex_product_bundle_state();
+                    let (credential, meta) = match state {
+                        ProductCredentialState::PresentValid(bundle) => bundle,
+                        ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                            if !self.provider_activation_valid_for_meta(selected, &meta) {
+                                return Err(AgentStartTurnError::ProductNotReady);
+                            }
+                            // Revalidation happens after the exclusive-to-shared handoff below.
+                            drop(_file_gate);
+                            drop(_gate);
+                            let refreshed = self
+                                .refresh_codex_product_credential_unlocked(credential, meta.clone())
+                                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                            (refreshed, meta)
+                        }
+                        ProductCredentialState::Absent => {
+                            #[cfg(feature = "agent-subscription-experimental")]
+                            if let Some(provider) = self.try_experimental_only_provider(
+                                selected,
+                                &settings.model,
+                                system,
+                            ) {
+                                drop(_file_gate);
+                                drop(_refresh);
+                                drop(_gate);
+                                drop(exclusive);
+                                let lease = self
+                                    .provider_leases
+                                    .acquire_shared(
+                                        &self.oauth_dir,
+                                        selected,
+                                        operation_id,
+                                        account_lifecycle::ProviderOperationKind::Turn,
+                                    )
+                                    .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                return Ok(PreparedTurnProvider {
+                                    provider,
+                                    provider_id: Some(selected),
+                                    operation_lease: Some(lease),
+                                });
+                            }
+                            return Err(AgentStartTurnError::ProductNotReady);
+                        }
+                        ProductCredentialState::PresentInvalid => {
+                            return Err(AgentStartTurnError::ProductNotReady);
+                        }
+                    };
+                    if !self.provider_activation_valid_for_meta(selected, &meta) {
+                        return Err(AgentStartTurnError::ProductNotReady);
+                    }
+                    (
+                        settings,
+                        meta.generation,
+                        CredentialSnapshot::Codex(credential),
+                    )
+                }
+            }
+        };
+        drop(exclusive);
+
+        let shared = self
+            .provider_leases
+            .acquire_shared(
+                &self.oauth_dir,
+                selected,
+                operation_id,
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+        let provider = {
+            let _gate = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
+                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            if self.lifecycle_provider_blocked(selected)
+                || self.agent_settings().is_none_or(|current| {
+                    current.provider != selected || current.model != settings.model
+                })
+            {
+                return Err(AgentStartTurnError::ProductNotReady);
+            }
+            let credential_id = match selected {
+                ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+                ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+            };
+            if load_product_bundle_meta(&self.oauth_dir, credential_id)
+                .is_none_or(|meta| meta.generation != generation)
+            {
+                return Err(AgentStartTurnError::ProductNotReady);
+            }
+            match credential {
+                CredentialSnapshot::Claude(credential) => {
+                    isyncyou_agent::SubscriptionProvider::new(
+                        credential.access_token,
+                        &settings.model,
+                        system,
+                        self.subscription_config(),
+                    )
                     .map(|provider| {
                         Box::new(provider) as Box<dyn isyncyou_agent::LlmProvider + Send>
                     })
-                    .map_err(|_| AgentStartTurnError::ProductNotReady)
+                    .map_err(|_| AgentStartTurnError::ProductNotReady)?
+                }
+                CredentialSnapshot::Codex(credential) => {
+                    let config = isyncyou_agent::CodexConfig {
+                        account_id: credential.account_id,
+                        model: settings.model,
+                        ..Default::default()
+                    };
+                    isyncyou_agent::CodexProvider::new(credential.access_token, system, config)
+                        .map(|provider| {
+                            Box::new(provider) as Box<dyn isyncyou_agent::LlmProvider + Send>
+                        })
+                        .map_err(|_| AgentStartTurnError::ProductNotReady)?
+                }
             }
-        }
+        };
+        Ok(PreparedTurnProvider {
+            provider,
+            provider_id: Some(selected),
+            operation_lease: Some(shared),
+        })
     }
 
     /// #639 T8: commit a successful official Claude OAuth atomically under the product-runtime gate:
@@ -1431,6 +1884,7 @@ const PRODUCT_CREDENTIAL_SCHEMA_VERSION: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CredentialLifecycle {
     Active,
+    Disconnecting { operation_id: String },
     ReconnectRequired { closed_code: String },
 }
 
@@ -1450,6 +1904,38 @@ struct ProductBundleMeta {
     policy_fingerprint: String,
     lifecycle: CredentialLifecycle,
     identity: account_identity::ProductCredentialIdentityV3,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+enum ProductCredentialMaterial {
+    Claude(StoredCredential),
+    Codex(CodexStoredCredential),
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl ProductCredentialMaterial {
+    fn revoke_credential(&self) -> isyncyou_agent::oauth::RevokeCredential {
+        match self {
+            Self::Claude(value) => isyncyou_agent::oauth::RevokeCredential {
+                access_token: (!value.access_token.is_empty())
+                    .then(|| isyncyou_agent::Secret::new(value.access_token.as_bytes().to_vec())),
+                refresh_token: (!value.refresh_token.is_empty())
+                    .then(|| isyncyou_agent::Secret::new(value.refresh_token.as_bytes().to_vec())),
+            },
+            Self::Codex(value) => isyncyou_agent::oauth::RevokeCredential {
+                access_token: (!value.access_token.is_empty())
+                    .then(|| isyncyou_agent::Secret::new(value.access_token.as_bytes().to_vec())),
+                refresh_token: (!value.refresh_token.is_empty())
+                    .then(|| isyncyou_agent::Secret::new(value.refresh_token.as_bytes().to_vec())),
+            },
+        }
+    }
 }
 
 #[cfg(any(
@@ -1497,15 +1983,22 @@ impl ProductBundleMeta {
                 "oauth_policy_fingerprint".into(),
                 serde_json::json!(self.policy_fingerprint),
             );
-            let (lifecycle, code) = match &self.lifecycle {
-                CredentialLifecycle::Active => ("active", String::new()),
+            let (lifecycle, code, operation_id) = match &self.lifecycle {
+                CredentialLifecycle::Active => ("active", String::new(), None),
+                CredentialLifecycle::Disconnecting { operation_id } => {
+                    ("disconnecting", String::new(), Some(operation_id.clone()))
+                }
                 CredentialLifecycle::ReconnectRequired { closed_code } => {
-                    ("reconnect_required", closed_code.clone())
+                    ("reconnect_required", closed_code.clone(), None)
                 }
             };
             obj.insert("lifecycle".into(), serde_json::json!(lifecycle));
             obj.insert("reconnect_code".into(), serde_json::json!(code));
             if self.schema_version == PRODUCT_CREDENTIAL_SCHEMA_VERSION {
+                obj.insert(
+                    "lifecycle_operation_id".into(),
+                    operation_id.map_or(serde_json::Value::Null, serde_json::Value::String),
+                );
                 self.identity.merge_into(obj);
             }
         }
@@ -1554,7 +2047,11 @@ impl ProductBundleMeta {
             .collect(),
         };
         if schema_version == PRODUCT_CREDENTIAL_SCHEMA_VERSION {
-            expected_keys.extend(["session_id_digest", "subject_digest"]);
+            expected_keys.extend([
+                "lifecycle_operation_id",
+                "session_id_digest",
+                "subject_digest",
+            ]);
         }
         if v.as_object()?
             .keys()
@@ -1573,10 +2070,26 @@ impl ProductBundleMeta {
             return None;
         }
         let reconnect_code = v.get("reconnect_code")?.as_str()?;
+        let lifecycle_operation_id = v.get("lifecycle_operation_id");
         let lifecycle = match v.get("lifecycle")?.as_str()? {
-            "active" if reconnect_code.is_empty() => CredentialLifecycle::Active,
+            "active"
+                if reconnect_code.is_empty()
+                    && lifecycle_operation_id.is_none_or(serde_json::Value::is_null) =>
+            {
+                CredentialLifecycle::Active
+            }
+            "disconnecting" if schema_version == PRODUCT_CREDENTIAL_SCHEMA_VERSION => {
+                let operation_id = lifecycle_operation_id?.as_str()?.to_string();
+                account_lifecycle::validate_operation_id(&operation_id).ok()?;
+                if !reconnect_code.is_empty() {
+                    return None;
+                }
+                CredentialLifecycle::Disconnecting { operation_id }
+            }
             "reconnect_required" => {
-                if reconnect_code.is_empty() {
+                if reconnect_code.is_empty()
+                    || lifecycle_operation_id.is_some_and(|value| !value.is_null())
+                {
                     return None;
                 }
                 CredentialLifecycle::ReconnectRequired {
@@ -2445,6 +2958,33 @@ fn store_onboarding_journal_index(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+fn delete_provider_onboarding_journals_durable(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+) -> Result<(), String> {
+    let index = load_onboarding_journal_index(oauth_dir, provider)
+        .map_err(|_| "onboarding journal index is invalid".to_string())?;
+    let store = agent_credential_store(oauth_dir)?;
+    for entry in index.entries {
+        store
+            .delete_durable(
+                isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+                &entry.store_id,
+            )
+            .map_err(credential_store_error)?;
+    }
+    store
+        .delete_durable(
+            isyncyou_agent::SecretClass::OnboardingAttemptJournal,
+            &OnboardingJournalIndexV1::store_id(provider),
+        )
+        .map_err(credential_store_error)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn store_indexed_onboarding_journal(
     oauth_dir: &Path,
     provider: ProductProviderId,
@@ -3141,6 +3681,36 @@ fn agent_credential_store(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+fn account_lifecycle_repository(
+    oauth_dir: &Path,
+) -> Result<account_lifecycle::LifecycleRepository, String> {
+    let config = agent_credential_config(oauth_dir);
+    Ok(account_lifecycle::LifecycleRepository::new(
+        agent_credential_store(oauth_dir)?,
+        config.store_dir(),
+        oauth_dir.join(".account-lifecycle-initialize.lock"),
+    ))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn initialize_account_lifecycle(oauth_dir: &Path) -> bool {
+    account_lifecycle_repository(oauth_dir)
+        .and_then(|repository| {
+            repository
+                .initialize()
+                .map(|_| ())
+                .map_err(|_| "lifecycle_unavailable".to_string())
+        })
+        .is_ok()
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn agent_credential_store_exists(oauth_dir: &Path) -> bool {
     agent_credential_config(oauth_dir).store_dir().exists()
 }
@@ -3190,6 +3760,42 @@ fn load_agent_credential_blob(
             MAX_PRODUCT_CREDENTIAL_PLAINTEXT_BYTES,
         )
         .map_err(credential_store_error)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn delete_provider_product_state_durable(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+) -> Result<(), String> {
+    let store = agent_credential_store(oauth_dir)?;
+    let credential_id = match provider {
+        ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+        ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+    };
+    store
+        .delete_durable(
+            isyncyou_agent::SecretClass::ProductActivation,
+            &ProductActivationV1::activation_store_id(provider),
+        )
+        .map_err(credential_store_error)?;
+    store
+        .delete_durable(
+            isyncyou_agent::SecretClass::ProviderOAuthRefresh,
+            credential_id,
+        )
+        .map_err(credential_store_error)?;
+    if load_agent_provider_selection(oauth_dir).is_some_and(|value| value.provider == provider) {
+        store
+            .delete_durable(
+                isyncyou_agent::SecretClass::ProductSettings,
+                PRODUCT_SETTINGS_ID,
+            )
+            .map_err(credential_store_error)?;
+    }
+    delete_provider_onboarding_journals_durable(oauth_dir, provider)
 }
 
 /// Persist a Codex credential to the encrypted store under `oauth_dir` (id `codex`).
@@ -3880,6 +4486,57 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         )
     }
 
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn lifecycle_credential(
+        &self,
+        provider: ProductProviderId,
+    ) -> Result<Option<(ProductCredentialMaterial, ProductBundleMeta)>, String> {
+        let credential_id = match provider {
+            ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+            ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+        };
+        let Some(secret) = load_agent_credential_blob(&self.oauth_dir, credential_id)? else {
+            return Ok(None);
+        };
+        let meta = ProductBundleMeta::from_blob(secret.expose(), provider)
+            .ok_or_else(|| "credential_invalid".to_string())?;
+        let material = match provider {
+            ProductProviderId::Claude => ProductCredentialMaterial::Claude(
+                StoredCredential::from_json(secret.expose())
+                    .ok_or_else(|| "credential_invalid".to_string())?,
+            ),
+            ProductProviderId::Codex => ProductCredentialMaterial::Codex(
+                CodexStoredCredential::from_json(secret.expose())
+                    .ok_or_else(|| "credential_invalid".to_string())?,
+            ),
+        };
+        Ok(Some((material, meta)))
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn persist_lifecycle_bundle(
+        &self,
+        provider: ProductProviderId,
+        material: &ProductCredentialMaterial,
+        meta: &ProductBundleMeta,
+    ) -> Result<(), String> {
+        match (provider, material) {
+            (ProductProviderId::Claude, ProductCredentialMaterial::Claude(value)) => {
+                self.store_claude_bundle(value, meta)
+            }
+            (ProductProviderId::Codex, ProductCredentialMaterial::Codex(value)) => {
+                store_codex_bundle(&self.oauth_dir, value, meta)
+            }
+            _ => Err("credential_invalid".into()),
+        }
+    }
+
     /// Persist the FULL token set from the OAuth code exchange (access + refresh + expiry) so
     /// `fresh_access_token` can self-refresh before the ~8h subscription token expires
     /// (LIVE-verified 2026-07-01 — without the refresh token the client "connection-lost"s
@@ -3911,6 +4568,181 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// Persist the switcher selection after validating it against the offered models.
     fn set_agent_settings(&self, provider: &str, model: &str) -> Result<(), String> {
         store_agent_provider_selection(&self.oauth_dir, provider, model)
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn disconnect_product_provider_with_transport(
+        &self,
+        provider: ProductProviderId,
+        request_id: &str,
+        transport: &dyn isyncyou_agent::oauth::ProductRevokeTransport,
+    ) -> Result<AccountLifecycleResult, String> {
+        let lease_id =
+            account_lifecycle::mint_operation_id().map_err(|error| error.wire().to_string())?;
+        let _provider_lease = self
+            .provider_leases
+            .acquire_exclusive(
+                &self.oauth_dir,
+                provider,
+                lease_id,
+                account_lifecycle::ProviderOperationKind::Lifecycle,
+            )
+            .map_err(|error| error.wire().to_string())?;
+
+        let repository = account_lifecycle_repository(&self.oauth_dir)?;
+        let (material, mut meta, operation) = {
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| "provider_busy".to_string())?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
+            let Some((material, meta)) = self.lifecycle_credential(provider)? else {
+                return Ok(AccountLifecycleResult {
+                    state: "disconnected",
+                    code: "already_disconnected",
+                    retryable: false,
+                    operation_id: None,
+                    operation_etag: None,
+                });
+            };
+            let refresh_present = match &material {
+                ProductCredentialMaterial::Claude(value) => !value.refresh_token.is_empty(),
+                ProductCredentialMaterial::Codex(value) => !value.refresh_token.is_empty(),
+            };
+            let target = if refresh_present {
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken
+            } else {
+                isyncyou_agent::oauth::RevokeRequestTarget::AccessToken
+            };
+            let operation = repository
+                .begin_disconnect(
+                    provider,
+                    request_id,
+                    &meta.generation,
+                    meta.identity.subject_digest.as_deref(),
+                    target,
+                    isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                    (self.credential_now_ms)(),
+                )
+                .map_err(|error| error.wire().to_string())?;
+            (material, meta, operation)
+        };
+
+        let Some(mut journal) = repository
+            .load_journal(&operation.journal_record_id)
+            .map_err(|error| error.wire().to_string())?
+        else {
+            return Ok(AccountLifecycleResult {
+                state: "disconnected",
+                code: "already_disconnected",
+                retryable: false,
+                operation_id: Some(operation.operation_id),
+                operation_etag: Some(operation.operation_etag),
+            });
+        };
+
+        if journal.phase == account_lifecycle::AccountLifecyclePhase::RevokedPendingCleanup {
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| "provider_busy".to_string())?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
+            delete_provider_product_state_durable(&self.oauth_dir, provider)?;
+            self.last_usage.lock().unwrap().remove(&provider);
+            repository
+                .complete_disconnect(&operation.journal_record_id, (self.credential_now_ms)())
+                .map_err(|error| error.wire().to_string())?;
+            return Ok(AccountLifecycleResult {
+                state: "disconnected",
+                code: "disconnected",
+                retryable: false,
+                operation_id: Some(operation.operation_id),
+                operation_etag: Some(operation.operation_etag),
+            });
+        }
+
+        if !matches!(meta.lifecycle, CredentialLifecycle::Disconnecting { .. }) {
+            meta.lifecycle = CredentialLifecycle::Disconnecting {
+                operation_id: operation.operation_id.clone(),
+            };
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| "provider_busy".to_string())?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
+            self.persist_lifecycle_bundle(provider, &material, &meta)?;
+        }
+
+        journal = repository
+            .start_active_revoke(&operation.journal_record_id, (self.credential_now_ms)())
+            .map_err(|error| error.wire().to_string())?;
+        let revoke_credential = material.revoke_credential();
+        let outcome = isyncyou_agent::oauth::revoke_product_credential(
+            transport,
+            provider,
+            &revoke_credential,
+        );
+
+        let _runtime = self
+            .product_runtime_gate
+            .lock()
+            .map_err(|_| "provider_busy".to_string())?;
+        let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
+        let current = repository
+            .load_journal(&operation.journal_record_id)
+            .map_err(|error| error.wire().to_string())?
+            .ok_or_else(|| "stale_lifecycle_fence".to_string())?;
+        if current.operation_etag != journal.operation_etag
+            || current.prepared.fence_epoch != journal.prepared.fence_epoch
+        {
+            return Err("stale_lifecycle_fence".into());
+        }
+        match outcome {
+            isyncyou_agent::oauth::RevokeOutcome::Confirmed { .. } => {
+                repository
+                    .publish_revoke_outcome(
+                        &operation.journal_record_id,
+                        true,
+                        "revoke_confirmed",
+                        (self.credential_now_ms)(),
+                    )
+                    .map_err(|error| error.wire().to_string())?;
+                delete_provider_product_state_durable(&self.oauth_dir, provider)?;
+                self.last_usage.lock().unwrap().remove(&provider);
+                repository
+                    .complete_disconnect(&operation.journal_record_id, (self.credential_now_ms)())
+                    .map_err(|error| error.wire().to_string())?;
+                Ok(AccountLifecycleResult {
+                    state: "disconnected",
+                    code: "disconnected",
+                    retryable: false,
+                    operation_id: Some(operation.operation_id),
+                    operation_etag: Some(operation.operation_etag),
+                })
+            }
+            isyncyou_agent::oauth::RevokeOutcome::Retryable { code }
+            | isyncyou_agent::oauth::RevokeOutcome::Terminal { code } => {
+                let code = revoke_failure_wire(code);
+                repository
+                    .publish_revoke_outcome(
+                        &operation.journal_record_id,
+                        false,
+                        code,
+                        (self.credential_now_ms)(),
+                    )
+                    .map_err(|error| error.wire().to_string())?;
+                Ok(AccountLifecycleResult {
+                    state: "revoke_unknown",
+                    code,
+                    retryable: true,
+                    operation_id: Some(operation.operation_id),
+                    operation_etag: Some(operation.operation_etag),
+                })
+            }
+        }
     }
 
     fn claude_product_bundle_state(
@@ -4318,10 +5150,22 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// local CLI source, and the encrypted store is updated only by the existing atomic writer
     /// after a complete finite credential response has been validated.
     fn refresh_product_credential(&self, provider: &str) -> Result<&'static str, String> {
-        // #639 (F2): the explicit refresh route shares the product-runtime gate (lock order: gate
-        // BEFORE credential_refresh_gate, matching the turn-build path) so a refresh cannot race a
-        // status snapshot / set_model / completion into a mixed revision. (The turn-build path already
-        // holds the gate and refreshes via the *_unlocked helpers, so it does not re-enter here.)
+        let selected =
+            ProductProviderId::parse(provider).ok_or_else(|| "reconnect_required".to_string())?;
+        let operation_id =
+            account_lifecycle::mint_operation_id().map_err(|_| "reconnect_required".to_string())?;
+        let _lifecycle = self
+            .provider_leases
+            .acquire_exclusive(
+                &self.oauth_dir,
+                selected,
+                operation_id,
+                account_lifecycle::ProviderOperationKind::Refresh,
+            )
+            .map_err(|_| "provider_busy".to_string())?;
+        // The provider lifecycle lease serializes this refresh against turns and account lifecycle
+        // operations. The short runtime/file locks protect only snapshots and are released before
+        // provider I/O; the refresh mutex coalesces concurrent refresh attempts.
         let _gate = self
             .product_runtime_gate
             .lock()
@@ -4332,13 +5176,16 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .credential_refresh_gate
             .lock()
             .map_err(|_| "reconnect_required".to_string())?;
-        match ProductProviderId::parse(provider) {
+        match Some(selected) {
             Some(ProductProviderId::Claude) => match self.claude_product_bundle_state() {
                 ProductCredentialState::PresentValid(_) => Ok("connected"),
-                ProductCredentialState::PresentNeedsRefresh((credential, meta)) => self
-                    .refresh_claude_product_credential_unlocked(credential, meta)
-                    .map(|_| "connected")
-                    .map_err(|_| "reconnect_required".into()),
+                ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                    drop(_file_gate);
+                    drop(_gate);
+                    self.refresh_claude_product_credential_unlocked(credential, meta)
+                        .map(|_| "connected")
+                        .map_err(|_| "reconnect_required".into())
+                }
                 ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
                     Err("reconnect_required".into())
                 }
@@ -4350,15 +5197,20 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 let force_refresh = false;
                 match self.codex_product_bundle_state() {
                     ProductCredentialState::PresentValid((credential, meta)) if force_refresh => {
+                        drop(_file_gate);
+                        drop(_gate);
                         self.refresh_codex_product_credential_unlocked(credential, meta)
                             .map(|_| "connected")
                             .map_err(|_| "reconnect_required".into())
                     }
                     ProductCredentialState::PresentValid(_) => Ok("connected"),
-                    ProductCredentialState::PresentNeedsRefresh((credential, meta)) => self
-                        .refresh_codex_product_credential_unlocked(credential, meta)
-                        .map(|_| "connected")
-                        .map_err(|_| "reconnect_required".into()),
+                    ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                        drop(_file_gate);
+                        drop(_gate);
+                        self.refresh_codex_product_credential_unlocked(credential, meta)
+                            .map(|_| "connected")
+                            .map_err(|_| "reconnect_required".into())
+                    }
                     ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
                         Err("reconnect_required".into())
                     }
@@ -4578,7 +5430,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         // resolution. A not-ready product turn returns the closed error here and creates no turn
         // state, no stream, no archive, and makes no provider call.
         let system = format!("{AGENT_SYSTEM_PROMPT}\n\nActive account: {account}.");
-        let mut provider = self.resolve_turn_provider(&system)?;
+        let prepared = self.resolve_turn_provider(&system)?;
+        let mut provider = prepared.provider;
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        let provider_id = prepared.provider_id;
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        let operation_lease = prepared.operation_lease;
 
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let turn_id = format!("turn-{n}-{}", unix_now());
@@ -4601,6 +5464,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 AgentStreamSlot {
                     rx: rx_str,
                     created_at_ms: now_ms,
+                    #[cfg(any(
+                        feature = "agent-oauth-providers",
+                        feature = "agent-subscription-experimental"
+                    ))]
+                    provider: provider_id,
                 },
             );
         }
@@ -4614,100 +5482,118 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let archive_root = self.archive_root_for(&account_id);
         let pending = self.pending.clone();
         let last_usage = Arc::clone(&self.last_usage);
-        std::thread::spawn(move || {
-            let exec = make_executor(&account_id, archive_root);
-            let mut history = vec![isyncyou_agent::Message::user(prompt)];
-            let outcome = isyncyou_agent::run_turn(
-                provider.as_mut(),
-                exec.as_ref(),
-                &mut history,
-                &mut |ev| {
-                    hub.emit(&tid, ev);
-                },
-            );
-            if let Some(usage) = provider.last_usage() {
-                *last_usage.lock().unwrap() = Some(usage);
-            }
-            match outcome {
-                Ok(isyncyou_agent::TurnOutcome::Final { .. }) => {}
-                Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
-                    let action = *action;
-                    let preview = match agent_ops::preview_for_pending_action(&action) {
-                        Ok(preview) => preview,
-                        Err(e) => {
-                            let _ = hub.emit(
-                                &tid,
-                                isyncyou_agent::StreamEvent::Error(
-                                    agent_ops::redact_agent_operation_text(&e),
-                                ),
-                            );
-                            let _ = hub.emit(
-                                &tid,
-                                isyncyou_agent::StreamEvent::done(
-                                    isyncyou_agent::DoneReason::Error,
-                                ),
-                            );
-                            hub.close(&tid);
-                            return;
-                        }
-                    };
-                    let _risk = preview.risk.as_str();
-                    match pending.register(
-                        action,
-                        preview.text,
-                        unix_now_ms(),
-                        AGENT_CONFIRM_TTL_MS,
-                    ) {
-                        Ok((pending_action, token)) => {
-                            let _ = hub.emit(
-                                &tid,
-                                isyncyou_agent::StreamEvent::ConfirmationRequired {
-                                    id: pending_action.id,
-                                    action: Box::new(pending_action.action),
-                                    preview: pending_action.preview,
-                                    action_hash: pending_action.action_hash,
-                                    risk: pending_action.risk,
-                                    expires_at_ms: pending_action.expires_at_ms,
-                                    token,
-                                },
-                            );
-                            let _ = hub.emit(
-                                &tid,
-                                isyncyou_agent::StreamEvent::done(
-                                    isyncyou_agent::DoneReason::PendingConfirmation,
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            let _ = e;
-                            let _ = hub.emit(
-                                &tid,
-                                isyncyou_agent::StreamEvent::Error(
-                                    "confirmation_unavailable".into(),
-                                ),
-                            );
-                            let _ = hub.emit(
-                                &tid,
-                                isyncyou_agent::StreamEvent::done(
-                                    isyncyou_agent::DoneReason::Error,
-                                ),
-                            );
-                        }
+        let turn_thread = std::thread::Builder::new()
+            .name(format!("agent-turn-{n}"))
+            .spawn(move || {
+                #[cfg(any(
+                    feature = "agent-oauth-providers",
+                    feature = "agent-subscription-experimental"
+                ))]
+                let _operation_lease = operation_lease;
+                let exec = make_executor(&account_id, archive_root);
+                let mut history = vec![isyncyou_agent::Message::user(prompt)];
+                let outcome = isyncyou_agent::run_turn(
+                    provider.as_mut(),
+                    exec.as_ref(),
+                    &mut history,
+                    &mut |ev| {
+                        hub.emit(&tid, ev);
+                    },
+                );
+                if let Some(usage) = provider.last_usage() {
+                    #[cfg(any(
+                        feature = "agent-oauth-providers",
+                        feature = "agent-subscription-experimental"
+                    ))]
+                    if let Some(provider_id) = provider_id {
+                        last_usage.lock().unwrap().insert(provider_id, usage);
                     }
                 }
-                Err(e) => {
-                    let _ = hub.emit(
-                        &tid,
-                        isyncyou_agent::StreamEvent::Error(agent_safe_turn_error(&e).into()),
-                    );
-                    let _ = hub.emit(
-                        &tid,
-                        isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
-                    );
+                match outcome {
+                    Ok(isyncyou_agent::TurnOutcome::Final { .. }) => {}
+                    Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
+                        let action = *action;
+                        let preview = match agent_ops::preview_for_pending_action(&action) {
+                            Ok(preview) => preview,
+                            Err(e) => {
+                                let _ = hub.emit(
+                                    &tid,
+                                    isyncyou_agent::StreamEvent::Error(
+                                        agent_ops::redact_agent_operation_text(&e),
+                                    ),
+                                );
+                                let _ = hub.emit(
+                                    &tid,
+                                    isyncyou_agent::StreamEvent::done(
+                                        isyncyou_agent::DoneReason::Error,
+                                    ),
+                                );
+                                hub.close(&tid);
+                                return;
+                            }
+                        };
+                        let _risk = preview.risk.as_str();
+                        match pending.register(
+                            action,
+                            preview.text,
+                            unix_now_ms(),
+                            AGENT_CONFIRM_TTL_MS,
+                        ) {
+                            Ok((pending_action, token)) => {
+                                let _ = hub.emit(
+                                    &tid,
+                                    isyncyou_agent::StreamEvent::ConfirmationRequired {
+                                        id: pending_action.id,
+                                        action: Box::new(pending_action.action),
+                                        preview: pending_action.preview,
+                                        action_hash: pending_action.action_hash,
+                                        risk: pending_action.risk,
+                                        expires_at_ms: pending_action.expires_at_ms,
+                                        token,
+                                    },
+                                );
+                                let _ = hub.emit(
+                                    &tid,
+                                    isyncyou_agent::StreamEvent::done(
+                                        isyncyou_agent::DoneReason::PendingConfirmation,
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                let _ = e;
+                                let _ = hub.emit(
+                                    &tid,
+                                    isyncyou_agent::StreamEvent::Error(
+                                        "confirmation_unavailable".into(),
+                                    ),
+                                );
+                                let _ = hub.emit(
+                                    &tid,
+                                    isyncyou_agent::StreamEvent::done(
+                                        isyncyou_agent::DoneReason::Error,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = hub.emit(
+                            &tid,
+                            isyncyou_agent::StreamEvent::Error(agent_safe_turn_error(&e).into()),
+                        );
+                        let _ = hub.emit(
+                            &tid,
+                            isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
+                        );
+                    }
                 }
-            }
-            hub.close(&tid);
-        });
+                hub.close(&tid);
+            });
+        if turn_thread.is_err() {
+            self.streams.lock().unwrap().remove(&turn_id);
+            self.hub.close(&turn_id);
+            return Err("turn_spawn_failed".into());
+        }
         Ok(turn_id)
     }
 
@@ -5045,11 +5931,6 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn status_json(&self) -> String {
-        let _ = self.oauth.reap_expired();
-        if let Ok(mut attempts) = self.oauth_attempts.lock() {
-            reap_oauth_attempts(&mut attempts, &self.oauth_dir);
-        }
-        reap_onboarding_journals_at(&self.oauth_dir, now_ms());
         // #639 (F2): take the ENTIRE status snapshot — credential_state, per-provider readiness,
         // the selected provider, and the onboarding projection — under ONE product-runtime-gate hold,
         // so a concurrent set_model / OAuth completion / turn build can never make status report a
@@ -5151,7 +6032,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "reconnect_required": reconnect_required,
             "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
         });
-        if let Some(usage) = self.last_usage.lock().unwrap().as_ref() {
+        if let Some(usage) = selected_id.and_then(|provider| {
+            self.last_usage
+                .lock()
+                .ok()
+                .and_then(|usage| usage.get(&provider).cloned())
+        }) {
             status["usage"] = usage.to_public_json();
         }
         // #639 T9: the per-provider onboarding projection drives the first-run wizard. It survives
@@ -6849,6 +7735,91 @@ mod tests {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
+    struct LifecycleRevokeMock {
+        status: u16,
+        calls: std::sync::atomic::AtomicUsize,
+        before_send: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    impl LifecycleRevokeMock {
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                before_send: None,
+            }
+        }
+
+        fn inspecting(status: u16, before_send: impl Fn() + Send + Sync + 'static) -> Self {
+            Self {
+                status,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                before_send: Some(Arc::new(before_send)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    impl isyncyou_agent::oauth::ProductRevokeTransport for LifecycleRevokeMock {
+        fn send(
+            &self,
+            _request: &isyncyou_agent::oauth::ProductRevokeRequest,
+        ) -> Result<u16, isyncyou_agent::http::SecretJsonTransportError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(before_send) = &self.before_send {
+                before_send();
+            }
+            Ok(self.status)
+        }
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn seed_claude_lifecycle_fixture(agent: &DaemonAgent) {
+        agent
+            .store_credential(&StoredCredential {
+                access_token: "synthetic-claude-access".into(),
+                refresh_token: "synthetic-claude-refresh".into(),
+                expires_at_ms: u64::MAX,
+            })
+            .unwrap();
+        agent.set_agent_settings("claude", DEFAULT_MODEL).unwrap();
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn seed_codex_lifecycle_fixture(agent: &DaemonAgent) {
+        store_codex_blob(
+            &agent.oauth_dir,
+            &CodexStoredCredential {
+                access_token: "synthetic-codex-access".into(),
+                refresh_token: "synthetic-codex-refresh".into(),
+                account_id: "synthetic-codex-account".into(),
+                expires_at_ms: u64::MAX,
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn assert_product_credential_turn_fails_closed(agent: &DaemonAgent) {
         // #639 T7: a not-ready product credential fails closed AT THE GATE — start_turn returns the
         // closed `product_not_ready` code and creates NO turn state (no stream slot, no provider
@@ -8306,6 +9277,11 @@ mod tests {
             AgentStreamSlot {
                 rx: rx_str,
                 created_at_ms: unix_now_ms(),
+                #[cfg(any(
+                    feature = "agent-oauth-providers",
+                    feature = "agent-subscription-experimental"
+                ))]
+                provider: None,
             },
         );
 
@@ -12194,17 +13170,20 @@ mod tests {
         let root = apphost_credential_test_root("usage-status");
         let _ = std::fs::remove_dir_all(&root);
         let agent = DaemonAgent::new(Config::default(), root.clone());
-        *agent.last_usage.lock().unwrap() = Some(isyncyou_agent::Usage {
-            input_tokens: 42,
-            output_tokens: 9,
-            provider: "claude".into(),
-            model: "claude-sonnet-5".into(),
-            request_id: Some("req-123".into()),
-            rate_limit: std::collections::BTreeMap::from([(
-                "anthropic-ratelimit-tokens-remaining".into(),
-                "99".into(),
-            )]),
-        });
+        agent.last_usage.lock().unwrap().insert(
+            ProductProviderId::Claude,
+            isyncyou_agent::Usage {
+                input_tokens: 42,
+                output_tokens: 9,
+                provider: "claude".into(),
+                model: "claude-sonnet-5".into(),
+                request_id: Some("req-123".into()),
+                rate_limit: std::collections::BTreeMap::from([(
+                    "anthropic-ratelimit-tokens-remaining".into(),
+                    "99".into(),
+                )]),
+            },
+        );
 
         let status: serde_json::Value =
             serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
@@ -13308,5 +14287,882 @@ mod tests {
             meta.preserve_refresh_identity(Some(&"x".repeat(43))),
             Err("credential_subject_mismatch".into())
         );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_marks_provider_not_ready_before_revoke_request() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("disconnect-not-ready-before-revoke");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let inspect_root = root.clone();
+        let transport = LifecycleRevokeMock::inspecting(200, move || {
+            let meta = load_product_bundle_meta(&inspect_root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+            assert!(matches!(
+                meta.lifecycle,
+                CredentialLifecycle::Disconnecting { .. }
+            ));
+            assert!(account_lifecycle_repository(&inspect_root)
+                .unwrap()
+                .provider_blocked(ProductProviderId::Claude)
+                .unwrap());
+        });
+        let result = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174100",
+                &transport,
+            )
+            .unwrap();
+        assert_eq!(result.code, "disconnected");
+        assert_eq!(transport.calls(), 1);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn provider_operation_lease_lives_until_actual_turn_thread_terminal_after_stream_open() {
+        let root = apphost_credential_test_root("turn-lease-thread");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = Arc::new(account_lifecycle::ProviderLeaseRegistry::default());
+        let lease = registry
+            .acquire_shared(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _turn_owned_lease = lease;
+            release_rx.recv().unwrap();
+        });
+        assert_eq!(registry.counts(ProductProviderId::Claude).shared, 1);
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(registry.counts(ProductProviderId::Claude).shared, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn provider_operation_lease_releases_on_error_cancel_completion_panic_and_spawn_failure() {
+        let root = apphost_credential_test_root("turn-lease-drop-paths");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = Arc::new(account_lifecycle::ProviderLeaseRegistry::default());
+        for _path in ["error", "cancel", "completion", "spawn_failure"] {
+            let lease = registry
+                .acquire_shared(
+                    &root,
+                    ProductProviderId::Claude,
+                    account_lifecycle::mint_operation_id().unwrap(),
+                    account_lifecycle::ProviderOperationKind::Turn,
+                )
+                .unwrap();
+            drop(lease);
+            assert_eq!(registry.counts(ProductProviderId::Claude).shared, 0);
+        }
+        let lease = registry
+            .acquire_shared(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .unwrap();
+        assert!(std::thread::spawn(move || {
+            let _lease = lease;
+            panic!("synthetic turn panic");
+        })
+        .join()
+        .is_err());
+        assert_eq!(registry.counts(ProductProviderId::Claude).shared, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn turn_setup_never_upgrades_shared_provider_lease_to_exclusive() {
+        let source = include_str!("lib.rs");
+        let gate = source
+            .split("fn product_runtime_gate(")
+            .nth(1)
+            .unwrap()
+            .split("fn commit_claude_oauth_success")
+            .next()
+            .unwrap();
+        let exclusive = gate.find("acquire_exclusive").unwrap();
+        let shared = gate.find("acquire_shared").unwrap();
+        assert!(exclusive < shared);
+        assert_eq!(gate[shared..].matches("acquire_exclusive").count(), 0);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn turn_refreshes_under_exclusive_lifecycle_lease_before_acquiring_shared_turn_lease() {
+        let source = include_str!("lib.rs");
+        let gate = source
+            .split("fn product_runtime_gate(")
+            .nth(1)
+            .unwrap()
+            .split("fn commit_claude_oauth_success")
+            .next()
+            .unwrap();
+        assert!(gate.find("acquire_exclusive").unwrap() < gate.find("refresh_claude").unwrap());
+        assert!(gate.find("refresh_claude").unwrap() < gate.rfind("acquire_shared").unwrap());
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn turn_revalidates_generation_and_journal_then_builds_without_refresh_under_shared_lease() {
+        let source = include_str!("lib.rs");
+        let gate = source
+            .split("fn product_runtime_gate(")
+            .nth(1)
+            .unwrap()
+            .split("fn commit_claude_oauth_success")
+            .next()
+            .unwrap();
+        let shared = gate.rfind("acquire_shared").unwrap();
+        let after = &gate[shared..];
+        assert!(after.contains("lifecycle_provider_blocked"));
+        assert!(after.contains("meta.generation != generation"));
+        assert!(!after.contains("refresh_claude_product_credential_unlocked"));
+        assert!(!after.contains("refresh_codex_product_credential_unlocked"));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_exclusive_lease_blocks_same_provider_but_not_other_provider() {
+        let root = apphost_credential_test_root("provider-scoped-leases");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = Arc::new(account_lifecycle::ProviderLeaseRegistry::default());
+        let _claude = registry
+            .acquire_exclusive(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Lifecycle,
+            )
+            .unwrap();
+        assert!(registry
+            .acquire_shared(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .is_err());
+        assert!(registry
+            .acquire_shared(
+                &root,
+                ProductProviderId::Codex,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_rejects_active_provider_turn_before_mutating_state() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("disconnect-active-turn");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let _turn = agent
+            .provider_leases
+            .acquire_shared(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .unwrap();
+        let transport = LifecycleRevokeMock::status(200);
+        assert_eq!(
+            agent.disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174101",
+                &transport,
+            ),
+            Err("provider_busy".into())
+        );
+        assert!(matches!(
+            load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .lifecycle,
+            CredentialLifecycle::Active
+        ));
+        assert_eq!(transport.calls(), 0);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_revokes_server_token_before_local_credential_delete() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("revoke-before-delete");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let inspect = root.clone();
+        let transport = LifecycleRevokeMock::inspecting(200, move || {
+            assert!(
+                load_agent_credential_blob(&inspect, SUBSCRIPTION_CREDENTIAL_ID)
+                    .unwrap()
+                    .is_some()
+            );
+        });
+        agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174102",
+                &transport,
+            )
+            .unwrap();
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_revoke_failure_keeps_encrypted_credential_and_never_reports_disconnected() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("revoke-failure-retains");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let transport = LifecycleRevokeMock::status(503);
+        let result = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174103",
+                &transport,
+            )
+            .unwrap();
+        assert_eq!(result.state, "revoke_unknown");
+        assert_ne!(result.code, "disconnected");
+        assert!(result.retryable);
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_some()
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_ambiguous_response_enters_revoke_unknown_and_retries_same_operation() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("revoke-unknown-retry");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let request = "123e4567-e89b-42d3-a456-426614174104";
+        let failed = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                request,
+                &LifecycleRevokeMock::status(503),
+            )
+            .unwrap();
+        let succeeded = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                request,
+                &LifecycleRevokeMock::status(200),
+            )
+            .unwrap();
+        assert_eq!(failed.operation_id, succeeded.operation_id);
+        assert_eq!(failed.operation_etag, succeeded.operation_etag);
+        assert_eq!(succeeded.state, "disconnected");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_missing_credential_returns_already_disconnected_without_network() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("already-disconnected");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let transport = LifecycleRevokeMock::status(200);
+        let result = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174105",
+                &transport,
+            )
+            .unwrap();
+        assert_eq!(result.code, "already_disconnected");
+        assert_eq!(transport.calls(), 0);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn provider_usage_is_keyed_and_cleanup_removes_only_matching_provider() {
+        let root = apphost_credential_test_root("provider-usage-keyed");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let usage = isyncyou_agent::Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            ..Default::default()
+        };
+        agent
+            .last_usage
+            .lock()
+            .unwrap()
+            .insert(ProductProviderId::Claude, usage.clone());
+        agent
+            .last_usage
+            .lock()
+            .unwrap()
+            .insert(ProductProviderId::Codex, usage);
+        agent
+            .last_usage
+            .lock()
+            .unwrap()
+            .remove(&ProductProviderId::Claude);
+        let usages = agent.last_usage.lock().unwrap();
+        assert!(!usages.contains_key(&ProductProviderId::Claude));
+        assert!(usages.contains_key(&ProductProviderId::Codex));
+        drop(usages);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_serializes_against_refresh_login_and_provider_construction() {
+        let source = include_str!("lib.rs");
+        let disconnect = source
+            .split("fn disconnect_product_provider_with_transport(")
+            .nth(1)
+            .unwrap()
+            .split("fn claude_product_bundle_state")
+            .next()
+            .unwrap();
+        assert!(
+            disconnect.find("acquire_exclusive").unwrap()
+                < disconnect.find("product_runtime_gate").unwrap()
+        );
+        assert!(
+            disconnect.find("acquire_exclusive").unwrap()
+                < disconnect.find("revoke_product_credential").unwrap()
+        );
+        assert!(
+            disconnect.find("revoke_product_credential").unwrap()
+                < disconnect
+                    .rfind("delete_provider_product_state_durable")
+                    .unwrap()
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_confirmed_revoke_with_delete_failure_recovers_cleanup_after_restart() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("cleanup-restart");
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.lifecycle_maintenance.take();
+        seed_claude_lifecycle_fixture(&agent);
+        let meta = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let operation = repository
+            .begin_disconnect(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174110",
+                &meta.generation,
+                None,
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken,
+                isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            )
+            .unwrap();
+        repository
+            .start_active_revoke(&operation.journal_record_id, 2_000)
+            .unwrap();
+        repository
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                true,
+                "revoke_confirmed",
+                3_000,
+            )
+            .unwrap();
+        drop(agent);
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_some()
+        );
+        assert!(repository
+            .load_journal(&operation.journal_record_id)
+            .unwrap()
+            .is_some());
+
+        let restarted = DaemonAgent::new(Config::default(), root.clone());
+        run_lifecycle_maintenance_once_at(
+            &root,
+            &restarted.provider_leases,
+            &restarted.last_usage,
+            4_000,
+        );
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!account_lifecycle_repository(&root)
+            .unwrap()
+            .provider_blocked(ProductProviderId::Claude)
+            .unwrap());
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn crash_after_partial_delete_finishes_exact_cleanup() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("partial-delete-recovery");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let meta = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let operation = repository
+            .begin_disconnect(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174111",
+                &meta.generation,
+                None,
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken,
+                isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            )
+            .unwrap();
+        repository
+            .start_active_revoke(&operation.journal_record_id, 2_000)
+            .unwrap();
+        repository
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                true,
+                "revoke_confirmed",
+                3_000,
+            )
+            .unwrap();
+        agent_credential_store(&root)
+            .unwrap()
+            .delete_durable(
+                isyncyou_agent::SecretClass::ProductActivation,
+                &ProductActivationV1::activation_store_id(ProductProviderId::Claude),
+            )
+            .unwrap();
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_some()
+        );
+        run_lifecycle_maintenance_once_at(&root, &agent.provider_leases, &agent.last_usage, 4_000);
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_agent_provider_selection(&root).is_none());
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_cleanup_removes_only_matching_credential_activation_settings_and_journals() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("exact-provider-cleanup");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let store_id = OnboardingAttemptJournalV1::journal_store_id("claude-cleanup-attempt");
+        store_indexed_onboarding_journal(
+            &root,
+            ProductProviderId::Claude,
+            &store_id,
+            OnboardingJournalKind::Attempt,
+            &OnboardingAttemptJournalV1 {
+                transitions: vec![OnboardingTransition {
+                    state: ProductOnboardingState::OfficialSignInStarted,
+                    generation: String::new(),
+                    error_code: None,
+                    recorded_at_ms: 1_000,
+                }],
+            },
+            1_000,
+        )
+        .unwrap();
+        agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174112",
+                &LifecycleRevokeMock::status(200),
+            )
+            .unwrap();
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
+        assert!(load_agent_provider_selection(&root).is_none());
+        assert!(load_onboarding_journal_at(&root, &store_id).is_none());
+        assert!(
+            load_onboarding_journal_index(&root, ProductProviderId::Claude)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_does_not_delete_other_provider_m365_session_or_storearchive_state() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("preserve-other-state");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        seed_codex_lifecycle_fixture(&agent);
+        agent.set_agent_settings("claude", DEFAULT_MODEL).unwrap();
+        let m365_marker = root.join("m365-session-sentinel");
+        let archive_marker = root.join("storearchive-sentinel");
+        std::fs::write(&m365_marker, b"m365").unwrap();
+        std::fs::write(&archive_marker, b"archive").unwrap();
+        agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174113",
+                &LifecycleRevokeMock::status(200),
+            )
+            .unwrap();
+        assert!(load_agent_credential_blob(&root, CODEX_CREDENTIAL_ID)
+            .unwrap()
+            .is_some());
+        assert!(load_product_activation(&root, ProductProviderId::Codex).is_some());
+        assert_eq!(std::fs::read(m365_marker).unwrap(), b"m365");
+        assert_eq!(std::fs::read(archive_marker).unwrap(), b"archive");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_resume_operation_adopts_existing_generation_without_second_revoke() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("resume-existing-operation");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let request = "123e4567-e89b-42d3-a456-426614174114";
+        let first_transport = LifecycleRevokeMock::status(503);
+        let first = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                request,
+                &first_transport,
+            )
+            .unwrap();
+        let second_transport = LifecycleRevokeMock::status(200);
+        let second = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                request,
+                &second_transport,
+            )
+            .unwrap();
+        assert_eq!(first.operation_id, second.operation_id);
+        assert_eq!(first.operation_etag, second.operation_etag);
+        assert_eq!(first_transport.calls(), 1);
+        assert_eq!(second_transport.calls(), 1);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn resume_cleanup_uses_operation_etag_after_credential_etag_is_deleted() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("resume-operation-etag");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let meta = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let operation = repository
+            .begin_disconnect(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174115",
+                &meta.generation,
+                None,
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken,
+                isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            )
+            .unwrap();
+        repository
+            .start_active_revoke(&operation.journal_record_id, 2_000)
+            .unwrap();
+        repository
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                true,
+                "revoke_confirmed",
+                3_000,
+            )
+            .unwrap();
+        delete_provider_product_state_durable(&root, ProductProviderId::Claude).unwrap();
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository
+                .load_journal(&operation.journal_record_id)
+                .unwrap()
+                .unwrap()
+                .operation_etag,
+            operation.operation_etag
+        );
+        repository
+            .complete_disconnect(&operation.journal_record_id, 4_000)
+            .unwrap();
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn disconnect_status_and_audit_are_closed_and_redacted() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("closed-status-audit");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let result = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174116",
+                &LifecycleRevokeMock::status(503),
+            )
+            .unwrap();
+        let diagnostic = format!("{result:?}");
+        let status = isyncyou_webui::AgentHandler::status_json(&agent);
+        for forbidden in [
+            "synthetic-claude-access",
+            "synthetic-claude-refresh",
+            "123e4567-e89b-42d3-a456-426614174116",
+        ] {
+            assert!(!diagnostic.contains(forbidden));
+            assert!(!status.contains(forbidden));
+        }
+        assert_eq!(result.state, "revoke_unknown");
+        assert!(result.code.starts_with("revoke_"));
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn account_lifecycle_maintenance_runs_at_startup_interval_and_joined_shutdown() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("maintenance-runtime");
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.lifecycle_maintenance.take();
+        seed_claude_lifecycle_fixture(&agent);
+        let meta = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let operation = repository
+            .begin_disconnect(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174117",
+                &meta.generation,
+                None,
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken,
+                isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            )
+            .unwrap();
+        repository
+            .start_active_revoke(&operation.journal_record_id, 2_000)
+            .unwrap();
+        repository
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                true,
+                "revoke_confirmed",
+                3_000,
+            )
+            .unwrap();
+        let runtime = LifecycleMaintenanceRuntime::spawn_with_interval(
+            root.clone(),
+            Arc::clone(&agent.provider_leases),
+            Arc::clone(&agent.last_usage),
+            Arc::clone(&agent.oauth),
+            Arc::clone(&agent.oauth_attempts),
+            std::time::Duration::from_millis(5),
+        );
+        for _ in 0..100 {
+            if load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+        drop(runtime);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn account_lifecycle_maintenance_acquires_exclusive_provider_lease_and_revalidates_fence_before_mutation(
+    ) {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("maintenance-exclusive-fence");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let meta = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let operation = repository
+            .begin_disconnect(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174118",
+                &meta.generation,
+                None,
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken,
+                isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            )
+            .unwrap();
+        repository
+            .start_active_revoke(&operation.journal_record_id, 2_000)
+            .unwrap();
+        repository
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                true,
+                "revoke_confirmed",
+                3_000,
+            )
+            .unwrap();
+        let turn_lease = agent
+            .provider_leases
+            .acquire_shared(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .unwrap();
+        run_lifecycle_maintenance_once_at(&root, &agent.provider_leases, &agent.last_usage, 4_000);
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_some()
+        );
+        drop(turn_lease);
+        run_lifecycle_maintenance_once_at(&root, &agent.provider_leases, &agent.last_usage, 5_000);
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

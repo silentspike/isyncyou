@@ -506,7 +506,10 @@ pub enum RevokeRequestTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevokeScopeGuarantee {
+    GuaranteedTokenSession,
     ObservedTokenSession,
+    Unknown,
+    FullGrant,
 }
 
 /// Closed public failure codes for one provider revoke attempt.

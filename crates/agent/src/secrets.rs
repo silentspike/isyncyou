@@ -363,6 +363,28 @@ impl AgentCredentialStore {
             AgentCredentialStore::Local(store) => store.delete(class, id),
         }
     }
+
+    /// Delete a secret without following final-component symlinks and durably publish the
+    /// directory entry removal before returning.
+    pub fn delete_durable(&self, class: SecretClass, id: &str) -> Result<(), AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => store.delete_durable(class, id),
+            AgentCredentialStore::Local(store) => store.delete_durable(class, id),
+        }
+    }
+
+    /// Derive a domain-separated HMAC from the at-rest master key without exporting either the
+    /// master key or the derived key. Intended for stable local authority identifiers and etags.
+    pub fn domain_hmac(
+        &self,
+        domain: &'static [u8],
+        message: &[u8],
+    ) -> Result<[u8; 32], AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => store.domain_hmac(domain, message),
+            AgentCredentialStore::Local(store) => store.domain_hmac(domain, message),
+        }
+    }
 }
 
 const DEFAULT_PROVIDER_ACCOUNT_ID: &str = "default";
@@ -833,6 +855,62 @@ impl<K: AtRestKey> CredentialStore<K> {
         }
         Ok(())
     }
+
+    /// Delete current and legacy records without following symlinks and fsync each affected
+    /// parent directory. A symlink or non-regular entry fails closed and is never unlinked.
+    pub fn delete_durable(&self, class: SecretClass, id: &str) -> Result<(), AgentError> {
+        for path in [self.path(&class, id), self.legacy_path(&class, id)] {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(AgentError::Provider(error.to_string())),
+            };
+            if !metadata.file_type().is_file() {
+                return Err(credential_err(
+                    "credential delete target is not a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != unsafe { libc::geteuid() } {
+                    return Err(credential_err(
+                        "credential delete target is not owner controlled",
+                    ));
+                }
+            }
+            std::fs::remove_file(&path).map_err(|error| AgentError::Provider(error.to_string()))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| credential_err("credential delete parent is unavailable"))?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| AgentError::Provider(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn domain_hmac(&self, domain: &'static [u8], message: &[u8]) -> Result<[u8; 32], AgentError> {
+        if domain.is_empty() || domain.len() > 128 || message.len() > 64 * 1024 {
+            return Err(credential_err("credential hmac input is invalid"));
+        }
+        let master = self.key.key()?;
+        let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, domain);
+        let prk = salt.extract(&master);
+        let info = [b"isyncyou/credential-store-domain-hmac/v1".as_slice()];
+        let okm = prk
+            .expand(&info, ring::hkdf::HKDF_SHA256)
+            .map_err(|_| credential_err("credential hmac derivation failed"))?;
+        let mut derived = [0u8; 32];
+        okm.fill(&mut derived)
+            .map_err(|_| credential_err("credential hmac derivation failed"))?;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &derived);
+        let tag = ring::hmac::sign(&key, message);
+        let mut output = [0u8; 32];
+        output.copy_from_slice(tag.as_ref());
+        derived.fill(0);
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
@@ -1057,6 +1135,35 @@ mod tests {
         assert!(s
             .get_bounded(SecretClass::ProductActivation, "x", 98_304, 65_536)
             .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_delete_is_no_follow_and_fsyncs_parent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.put(
+            SecretClass::ProviderOAuthRefresh,
+            "durable-delete",
+            &Secret::new(b"secret".to_vec()),
+        )
+        .unwrap();
+        let path = s.path(&SecretClass::ProviderOAuthRefresh, "durable-delete");
+        s.delete_durable(SecretClass::ProviderOAuthRefresh, "durable-delete")
+            .unwrap();
+        assert!(!path.exists());
+
+        let target = tmp.path().join("must-remain");
+        std::fs::write(&target, b"not a credential").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(s
+            .delete_durable(SecretClass::ProviderOAuthRefresh, "durable-delete")
+            .is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"not a credential");
+        assert!(std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
