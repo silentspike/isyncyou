@@ -209,7 +209,7 @@ function makeFixtureServer(evidence) {
         res.writeHead(204);
         res.end();
       } else if (req.method === "GET" && url.pathname === "/api/v1/accounts") {
-        json(res, 200, { accounts: [{ id: ACCOUNT, username: "fixture@example.test" }] });
+        json(res, 200, { accounts: [{ id: ACCOUNT, username: "Fixture account" }] });
       } else if (req.method === "GET" && url.pathname === "/api/v1/status") {
         json(res, 200, {
           services: [
@@ -332,6 +332,106 @@ async function screenshot(page, name) {
 
 async function pageText(page) {
   return page.locator("body").innerText({ timeout: 5000 });
+}
+
+function redactedRequest(rawUrl, extra = {}) {
+  try {
+    const url = new URL(String(rawUrl));
+    return {
+      ...extra,
+      path: url.pathname,
+      query_keys: [...new Set(url.searchParams.keys())].sort(),
+    };
+  } catch (_) {
+    return { ...extra, path: "invalid_url", query_keys: [] };
+  }
+}
+
+function evidenceForWrite(evidence, state) {
+  const closedProviders = state.oauthStarts
+    .map((row) => row.provider)
+    .filter((provider) => provider === "claude" || provider === "codex");
+  const closedModels = state.modelPosts
+    .map((row) => row.model)
+    .filter((model) => typeof model === "string" && /^[a-z0-9-]{1,64}$/.test(model));
+
+  return {
+    evidence_version: 2,
+    ok: evidence.ok,
+    generated_at: evidence.generated_at,
+    fixture_origin: "loopback-fixture",
+    assertions: evidence.assertions.map(({ name, status }) => ({ name, status })),
+    console_errors: evidence.console_errors.map(() => "redacted"),
+    page_errors: evidence.page_errors.map(() => "redacted"),
+    browser_requests: evidence.browser_requests.map((request) => redactedRequest(request.url, {
+      method: request.method,
+      resource_type: request.resource_type,
+    })),
+    runtime_transports: evidence.runtime_transports.map((request) => redactedRequest(request.url, {
+      kind: request.kind,
+    })),
+    external_launches: evidence.external_launches.map((launch) => redactedRequest(launch.url, {
+      target: launch.target,
+    })),
+    non_fixture_origin_requests: evidence.non_fixture_origin_requests.map((request) => ({
+      method: request.method,
+      resource_type: request.resource_type,
+      destination: "non_fixture_origin",
+    })),
+    fixture404: evidence.fixture404.map((request) => ({
+      method: request.method,
+      path: request.path,
+      query_present: Boolean(request.query),
+    })),
+    fixtureErrors: evidence.fixtureErrors.map(() => "redacted"),
+    fixture_state: {
+      oauth_start_count: state.oauthStarts.length,
+      oauth_providers: closedProviders,
+      model_post_count: state.modelPosts.length,
+      models: closedModels,
+      confirm_post_count: state.confirmPosts.length,
+      cancel_post_count: state.cancelPosts.length,
+      view_hit_count: state.viewHits.length,
+      stream_scenarios: state.streamScenarios.map(({ scenario }) => scenario),
+    },
+    screenshots: evidence.screenshots,
+    ...(evidence.ok ? {} : { error: "smoke_failed" }),
+  };
+}
+
+function assertRedactedEvidenceReport(report) {
+  const forbiddenKeys = new Set([
+    "url", "details", "token", "action_hash", "pending", "prompt", "code", "state",
+    "account_id", "email", "redirect",
+  ]);
+  const forbiddenStrings = [
+    /https?:\/\//i,
+    /(?:^|\D)127\.0\.0\.1(?:\D|$)/,
+    /\blocalhost\b/i,
+    /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
+    /fixture-(?:token|hash)-/i,
+    /pending-turn-/i,
+    /raw-fixture-provider-error/i,
+  ];
+
+  const visit = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (value && typeof value === "object") {
+      for (const [key, child] of Object.entries(value)) {
+        if (forbiddenKeys.has(key)) throw new Error("smoke evidence contains a forbidden field");
+        visit(child);
+      }
+      return;
+    }
+    if (typeof value === "string" && forbiddenStrings.some((pattern) => pattern.test(value))) {
+      throw new Error("smoke evidence contains a forbidden value");
+    }
+  };
+
+  visit(report);
 }
 
 async function main() {
@@ -631,7 +731,9 @@ async function main() {
     if (browser) await browser.close().catch(() => {});
     await new Promise((resolve) => fixture.server.close(resolve));
     evidence.fixture_state = evidence.fixture_state || fixture.state;
-    fs.writeFileSync(path.join(OUT_DIR, "agent-ui-smoke.json"), JSON.stringify(evidence, null, 2) + "\n");
+    const report = evidenceForWrite(evidence, evidence.fixture_state);
+    assertRedactedEvidenceReport(report);
+    fs.writeFileSync(path.join(OUT_DIR, "agent-ui-smoke.json"), JSON.stringify(report, null, 2) + "\n");
   }
   process.exit(evidence.ok ? 0 : 1);
 }
