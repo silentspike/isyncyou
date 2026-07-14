@@ -662,6 +662,29 @@ impl LifecycleRepository {
             .and_then(|context| context.authority.active_operations.get(&provider).cloned()))
     }
 
+    pub(crate) fn projected_credential_etag(
+        &self,
+        provider: ProductProviderId,
+        generation: &str,
+    ) -> Result<String, LifecycleRecordError> {
+        if !is_uuid_v4(generation) {
+            return Err(LifecycleRecordError::Invalid);
+        }
+        let context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::MissingInstallationPrincipal)?;
+        let lifecycle_epoch = next_epoch(context.authority.lifecycle_epoch)?;
+        self.derive_tag(
+            b"isyncyou/account-lifecycle-credential-etag/v1",
+            &[
+                context.principal.as_bytes(),
+                provider.wire().as_bytes(),
+                generation.as_bytes(),
+                &lifecycle_epoch.to_be_bytes(),
+            ],
+        )
+    }
+
     pub(crate) fn put_authority(
         &self,
         principal: &str,
@@ -3082,5 +3105,32 @@ mod tests {
         ] {
             assert!(!debug.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn agent_oauth_logout_uses_separate_idempotency_key_and_payload_digest() {
+        lifecycle_authority_persists_idempotency_fence_key_and_etag_authority_before_operation();
+        disconnect_same_request_id_with_different_payload_conflicts();
+    }
+
+    #[test]
+    fn agent_oauth_logout_idempotency_key_excludes_transient_session_principal() {
+        disconnect_idempotency_survives_webview_session_restart();
+    }
+
+    #[test]
+    fn agent_oauth_logout_same_request_id_changed_acknowledgement_conflicts() {
+        disconnect_same_request_id_with_different_payload_conflicts();
+    }
+
+    #[test]
+    fn agent_oauth_logout_resume_requires_matching_provider_mode_generation_and_installation() {
+        stale_process_fence_cannot_publish_readiness_or_cleanup();
+        missing_or_corrupt_installation_principal_fails_closed_without_new_operation_identity();
+    }
+
+    #[test]
+    fn agent_oauth_lifecycle_resume_retries_same_revoked_grant_reference_only() {
+        reconnect_and_switch_track_active_and_candidate_revoke_as_distinct_legs();
     }
 }

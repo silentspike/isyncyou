@@ -249,6 +249,60 @@ fn no_store_json_error(status: u16, message: &str) -> ApiResponse {
     with_no_store(ApiResponse::error(status, message))
 }
 
+fn parse_agent_strict_json<T: serde::de::DeserializeOwned>(
+    req: &ApiRequest,
+    operation: &str,
+) -> Result<T, ApiResponse> {
+    if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
+        return Err(no_store_json_error(
+            400,
+            &format!("{operation} accepts JSON only"),
+        ));
+    }
+    if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+        return Err(no_store_json_error(413, "request body too large"));
+    }
+    let body = std::str::from_utf8(&req.body)
+        .map_err(|_| no_store_json_error(400, "invalid JSON request body"))?;
+    serde_json::from_str(body)
+        .map_err(|_| no_store_json_error(400, &format!("invalid {operation} request")))
+}
+
+fn valid_client_request_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+        })
+}
+
+fn closed_lifecycle_error(code: &str) -> String {
+    match code {
+        "acknowledgement_required"
+        | "already_disconnected"
+        | "candidate_revoke_unknown"
+        | "cleanup_pending"
+        | "credential_etag_mismatch"
+        | "idempotency_conflict"
+        | "lifecycle_operation_mismatch"
+        | "lifecycle_phase_mismatch"
+        | "lifecycle_required"
+        | "operation_in_progress"
+        | "revoke_unknown"
+        | "scope_changed"
+        | "stale_lifecycle_fence"
+        | "switch_identity_unavailable" => code.to_string(),
+        _ => "account_lifecycle_unavailable".into(),
+    }
+}
+
 /// A response ready to be written by any server adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiResponse {
@@ -445,6 +499,62 @@ pub struct AgentCredentialRefreshRequest {
 pub struct AgentOAuthStartResponse {
     pub authorize_url: String,
     pub attempt_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOAuthStartRequest {
+    pub provider: String,
+    pub request_id: String,
+    #[serde(default)]
+    pub lifecycle_operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLifecycleResumeRef {
+    pub operation_id: String,
+    pub operation_etag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOAuthLogoutRequest {
+    pub provider: String,
+    pub mode: String,
+    pub request_id: String,
+    #[serde(default)]
+    pub credential_etag: Option<String>,
+    #[serde(default)]
+    pub resume: Option<AgentLifecycleResumeRef>,
+    pub acknowledge_full_grant: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOAuthLifecycleResumeRequest {
+    pub provider: String,
+    pub request_id: String,
+    pub operation_id: String,
+    pub operation_etag: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgentAccountLifecycleResponse {
+    pub provider: String,
+    pub mode: String,
+    pub operation_id: Option<String>,
+    pub operation_etag: Option<String>,
+    pub state: String,
+    pub revoke_leg: u32,
+    pub revoked_grant: Option<String>,
+    pub revoke_request_target: Option<String>,
+    pub revoke_scope_guarantee: Option<String>,
+    pub retryable: bool,
+    pub code: String,
 }
 
 /// Closed cancellation request for one provider OAuth attempt.
@@ -535,7 +645,26 @@ pub trait AgentHandler: Send + Sync {
         Ok(AgentOAuthStartResponse {
             authorize_url,
             attempt_id: String::new(),
+            lifecycle_operation_id: None,
         })
+    }
+    fn oauth_start_request(
+        &self,
+        request: AgentOAuthStartRequest,
+    ) -> Result<AgentOAuthStartResponse, String> {
+        self.oauth_start_with_attempt(&request.provider, "")
+    }
+    fn oauth_logout(
+        &self,
+        _request: AgentOAuthLogoutRequest,
+    ) -> Result<AgentAccountLifecycleResponse, String> {
+        Err("account lifecycle is not enabled on this server".into())
+    }
+    fn oauth_lifecycle_resume(
+        &self,
+        _request: AgentOAuthLifecycleResumeRequest,
+    ) -> Result<AgentAccountLifecycleResponse, String> {
+        Err("account lifecycle is not enabled on this server".into())
     }
     /// Cancel an OAuth attempt. Implementations must only cancel the matching opaque id.
     fn oauth_cancel(&self, _provider: &str, _attempt_id: &str) -> Result<(), String> {
@@ -1938,6 +2067,8 @@ impl Router {
                 "/api/v1/agent/connectivity/preflight" => self.agent_connectivity_preflight(req),
                 "/api/v1/agent/credential/refresh" => self.agent_credential_refresh(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
+                "/api/v1/agent/oauth/logout" => self.agent_oauth_logout(req),
+                "/api/v1/agent/oauth/lifecycle/resume" => self.agent_oauth_lifecycle_resume(req),
                 "/api/v1/agent/oauth/cancel" => self.agent_oauth_cancel(req),
                 "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
                 "/api/v1/agent/model" => self.agent_set_model(req),
@@ -4611,16 +4742,82 @@ impl Router {
             Ok(h) => h,
             Err(e) => return with_no_store(e),
         };
-        // redirect is optional: the manual (copy-paste) flow uses the provider's manual
-        // redirect, so the client need not supply a loopback origin.
-        let redirect = req.q("redirect").unwrap_or("");
-        let provider = match agent_oauth_provider_param(req.q("provider").unwrap_or("")) {
-            Ok(p) => p,
-            Err(e) => return no_store_json_error(400, e),
+        let request = match parse_agent_strict_json::<AgentOAuthStartRequest>(req, "oauth start") {
+            Ok(request) => request,
+            Err(response) => return response,
         };
-        with_no_store(match handler.oauth_start_with_attempt(provider, redirect) {
+        if agent_oauth_provider_param(&request.provider).is_err()
+            || !valid_client_request_id(&request.request_id)
+            || request
+                .lifecycle_operation_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 128)
+        {
+            return no_store_json_error(400, "invalid oauth start request");
+        }
+        with_no_store(match handler.oauth_start_request(request) {
             Ok(result) => ApiResponse::ok_json(&serde_json::to_value(result).unwrap_or_default()),
             Err(_) => ApiResponse::error(409, "oauth_start_failed"),
+        })
+    }
+
+    fn agent_oauth_logout(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(response) => return with_no_store(response),
+        };
+        let request = match parse_agent_strict_json::<AgentOAuthLogoutRequest>(req, "oauth logout")
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        let new_form = request.credential_etag.is_some() && request.resume.is_none();
+        let resume_form = request.credential_etag.is_none() && request.resume.is_some();
+        if agent_oauth_provider_param(&request.provider).is_err()
+            || !matches!(request.mode.as_str(), "disconnect" | "reconnect" | "switch")
+            || !valid_client_request_id(&request.request_id)
+            || !(new_form || resume_form)
+        {
+            return no_store_json_error(400, "invalid oauth logout request");
+        }
+        with_no_store(match handler.oauth_logout(request) {
+            Ok(response) => ApiResponse::ok_json(
+                &serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            Err(code) => no_store_json_error(409, &closed_lifecycle_error(&code)),
+        })
+    }
+
+    fn agent_oauth_lifecycle_resume(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(response) => return with_no_store(response),
+        };
+        let request = match parse_agent_strict_json::<AgentOAuthLifecycleResumeRequest>(
+            req,
+            "oauth lifecycle resume",
+        ) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        if agent_oauth_provider_param(&request.provider).is_err()
+            || !valid_client_request_id(&request.request_id)
+            || request.operation_id.is_empty()
+            || request.operation_id.len() > 128
+            || request.operation_etag.is_empty()
+            || request.operation_etag.len() > 128
+            || !matches!(
+                request.action.as_str(),
+                "retry_revoke" | "resume_cleanup" | "retry_exchange" | "continue_oauth"
+            )
+        {
+            return no_store_json_error(400, "invalid lifecycle resume request");
+        }
+        with_no_store(match handler.oauth_lifecycle_resume(request) {
+            Ok(response) => ApiResponse::ok_json(
+                &serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            Err(code) => no_store_json_error(409, &closed_lifecycle_error(&code)),
         })
     }
 
@@ -7174,6 +7371,55 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "https://auth.example/authorize?redirect_uri={redirect_uri}&state=st-1"
             ))
         }
+        fn oauth_start_request(
+            &self,
+            request: AgentOAuthStartRequest,
+        ) -> Result<AgentOAuthStartResponse, String> {
+            Ok(AgentOAuthStartResponse {
+                authorize_url: format!(
+                    "https://auth.example/authorize?provider={}",
+                    request.provider
+                ),
+                attempt_id: "attempt-1".into(),
+                lifecycle_operation_id: request.lifecycle_operation_id,
+            })
+        }
+        fn oauth_logout(
+            &self,
+            request: AgentOAuthLogoutRequest,
+        ) -> Result<AgentAccountLifecycleResponse, String> {
+            Ok(AgentAccountLifecycleResponse {
+                provider: request.provider,
+                mode: request.mode,
+                operation_id: Some("operation-1".into()),
+                operation_etag: Some("operation-etag-1".into()),
+                state: "disconnected".into(),
+                revoke_leg: 1,
+                revoked_grant: Some("active_credential".into()),
+                revoke_request_target: Some("refresh_token".into()),
+                revoke_scope_guarantee: Some("observed_token_session".into()),
+                retryable: false,
+                code: "disconnected".into(),
+            })
+        }
+        fn oauth_lifecycle_resume(
+            &self,
+            request: AgentOAuthLifecycleResumeRequest,
+        ) -> Result<AgentAccountLifecycleResponse, String> {
+            Ok(AgentAccountLifecycleResponse {
+                provider: request.provider,
+                mode: "connect".into(),
+                operation_id: Some(request.operation_id),
+                operation_etag: Some(request.operation_etag),
+                state: "candidate_cleanup".into(),
+                revoke_leg: 1,
+                revoked_grant: Some("oauth_candidate".into()),
+                revoke_request_target: Some("refresh_token".into()),
+                revoke_scope_guarantee: Some("observed_token_session".into()),
+                retryable: true,
+                code: request.action,
+            })
+        }
         fn oauth_cancel(&self, provider: &str, attempt_id: &str) -> Result<(), String> {
             if provider == "claude" && attempt_id == "attempt-1" {
                 Ok(())
@@ -7550,7 +7796,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
         for bad in ["anthropic", "openai", "gpt", "", "Claude"] {
-            let req = ApiRequest::new("POST", &format!("/api/v1/agent/oauth/start?provider={bad}"))
+            let req = ApiRequest::new("POST", "/api/v1/agent/oauth/start")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "provider": bad,
+                        "request_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "lifecycle_operation_id": null,
+                    }))
+                    .unwrap(),
+                )
                 .with_cap_token(Some("agentsecret".into()));
             assert_eq!(
                 router.route(&req).status,
@@ -7566,11 +7821,17 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
         for good in ["claude", "codex"] {
-            let req = ApiRequest::new(
-                "POST",
-                &format!("/api/v1/agent/oauth/start?provider={good}"),
-            )
-            .with_cap_token(Some("agentsecret".into()));
+            let req = ApiRequest::new("POST", "/api/v1/agent/oauth/start")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "provider": good,
+                        "request_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "lifecycle_operation_id": null,
+                    }))
+                    .unwrap(),
+                )
+                .with_cap_token(Some("agentsecret".into()));
             assert_eq!(
                 router.route(&req).status,
                 200,
@@ -7714,35 +7975,259 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn agent_oauth_start_is_cap_gated_and_returns_authorize_url() {
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
-        let redir = "http%3A%2F%2F127.0.0.1%3A5000%2Fagent%2Foauth%2Fcallback";
-        let q = format!("/api/v1/agent/oauth/start?provider=claude&redirect={redir}");
+        let request = |provider: &str| {
+            ApiRequest::new("POST", "/api/v1/agent/oauth/start")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "provider": provider,
+                        "request_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "lifecycle_operation_id": null,
+                    }))
+                    .unwrap(),
+                )
+        };
         // no cap token -> 401
-        assert_eq!(router.route(&ApiRequest::new("POST", &q)).status, 401);
+        assert_eq!(router.route(&request("claude")).status, 401);
         // with cap token -> 200 + an authorize URL the UI opens in the system browser
-        let ok =
-            router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
+        let ok = router.route(&request("claude").with_cap_token(Some("agentsecret".into())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
         assert!(ok.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("cache-control") && value == "no-store"
         }));
-        // redirect is optional now (manual flow) -> still 200 without it
-        let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=codex")
-            .with_cap_token(Some("agentsecret".into()));
+        let noredir = request("codex").with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&noredir).status, 200);
-        let unknown = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=openai")
-            .with_cap_token(Some("agentsecret".into()));
+        let unknown = request("openai").with_cap_token(Some("agentsecret".into()));
         let unknown = router.route(&unknown);
         assert_eq!(unknown.status, 400);
-        assert!(String::from_utf8_lossy(&unknown.body).contains("unknown provider"));
+        assert!(String::from_utf8_lossy(&unknown.body).contains("invalid oauth start request"));
         assert!(unknown.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("cache-control") && value == "no-store"
         }));
         let missing = ApiRequest::new("POST", "/api/v1/agent/oauth/start")
+            .with_content_type(Some("application/json".into()))
+            .with_body(br#"{}"#.to_vec())
             .with_cap_token(Some("agentsecret".into()));
         let missing = router.route(&missing);
         assert_eq!(missing.status, 400);
-        assert!(String::from_utf8_lossy(&missing.body).contains("provider is required"));
+        assert!(String::from_utf8_lossy(&missing.body).contains("invalid oauth start request"));
+    }
+
+    fn lifecycle_logout_request(body: serde_json::Value) -> ApiRequest {
+        ApiRequest::new("POST", "/api/v1/agent/oauth/logout")
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
+    fn lifecycle_resume_request(body: serde_json::Value) -> ApiRequest {
+        ApiRequest::new("POST", "/api/v1/agent/oauth/lifecycle/resume")
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
+    fn valid_logout_body() -> serde_json::Value {
+        serde_json::json!({
+            "provider": "claude",
+            "mode": "disconnect",
+            "request_id": "123e4567-e89b-42d3-a456-426614174100",
+            "credential_etag": "credential-etag-1",
+            "resume": null,
+            "acknowledge_full_grant": false
+        })
+    }
+
+    #[test]
+    fn agent_oauth_logout_requires_session_and_agent_cap_before_lookup() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("sess".into());
+        let request = || lifecycle_logout_request(valid_logout_body());
+        assert_eq!(router.route(&request()).status, 401);
+        assert_eq!(
+            router
+                .route(&request().with_cap_token(Some("agentsecret".into())))
+                .status,
+            401
+        );
+        assert_eq!(
+            router
+                .route(
+                    &request()
+                        .with_session_token(Some("sess".into()))
+                        .with_cap_token(Some("agentsecret".into()))
+                )
+                .status,
+            200
+        );
+    }
+
+    #[test]
+    fn agent_oauth_logout_requires_strict_json_and_rejects_body_over_8k() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let auth = |request: ApiRequest| request.with_cap_token(Some("agentsecret".into()));
+        assert_eq!(
+            router
+                .route(&auth(ApiRequest::new(
+                    "POST",
+                    "/api/v1/agent/oauth/logout?provider=claude"
+                )))
+                .status,
+            400
+        );
+        let oversized = ApiRequest::new("POST", "/api/v1/agent/oauth/logout")
+            .with_content_type(Some("application/json".into()))
+            .with_body(vec![b' '; AGENT_STRICT_JSON_MAX_BYTES + 1]);
+        assert_eq!(router.route(&auth(oversized)).status, 413);
+    }
+
+    #[test]
+    fn agent_oauth_logout_rejects_unknown_provider_mode_fields_and_duplicate_keys() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let send = |body: &[u8]| {
+            router.route(
+                &ApiRequest::new("POST", "/api/v1/agent/oauth/logout")
+                    .with_content_type(Some("application/json".into()))
+                    .with_body(body.to_vec())
+                    .with_cap_token(Some("agentsecret".into())),
+            )
+        };
+        for body in [
+            br#"{"provider":"openai","mode":"disconnect","request_id":"123e4567-e89b-42d3-a456-426614174101","credential_etag":"e","acknowledge_full_grant":false}"#.as_slice(),
+            br#"{"provider":"claude","mode":"delete","request_id":"123e4567-e89b-42d3-a456-426614174101","credential_etag":"e","acknowledge_full_grant":false}"#.as_slice(),
+            br#"{"provider":"claude","mode":"disconnect","request_id":"123e4567-e89b-42d3-a456-426614174101","credential_etag":"e","acknowledge_full_grant":false,"token":"forbidden"}"#.as_slice(),
+            br#"{"provider":"claude","provider":"codex","mode":"disconnect","request_id":"123e4567-e89b-42d3-a456-426614174101","credential_etag":"e","acknowledge_full_grant":false}"#.as_slice(),
+        ] {
+            assert_eq!(send(body).status, 400);
+        }
+    }
+
+    #[test]
+    fn agent_oauth_logout_requires_exactly_one_credential_or_operation_etag_form() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let send = |body: serde_json::Value| {
+            router.route(&lifecycle_logout_request(body).with_cap_token(Some("agentsecret".into())))
+        };
+        let mut neither = valid_logout_body();
+        neither["credential_etag"] = serde_json::Value::Null;
+        assert_eq!(send(neither).status, 400);
+        let mut both = valid_logout_body();
+        both["resume"] = serde_json::json!({
+            "operation_id": "operation-1", "operation_etag": "operation-etag-1"
+        });
+        assert_eq!(send(both).status, 400);
+        assert_eq!(send(valid_logout_body()).status, 200);
+    }
+
+    #[test]
+    fn agent_oauth_logout_response_is_no_store_and_closed_schema_only() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let response = router.route(
+            &lifecycle_logout_request(valid_logout_body())
+                .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(response.status, 200);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
+        let body = body_json(&response);
+        let object = body.as_object().unwrap();
+        assert_eq!(object.len(), 11);
+        for forbidden in [
+            "access_token",
+            "refresh_token_value",
+            "subject",
+            "account_id",
+            "raw_error",
+            "endpoint",
+        ] {
+            assert!(!object.contains_key(forbidden));
+            assert!(!String::from_utf8_lossy(&response.body).contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn agent_oauth_lifecycle_resume_supports_connect_candidate_cleanup_without_connect_logout_mode()
+    {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let response = router.route(
+            &lifecycle_resume_request(serde_json::json!({
+                "provider": "codex",
+                "request_id": "123e4567-e89b-42d3-a456-426614174102",
+                "operation_id": "operation-1",
+                "operation_etag": "operation-etag-1",
+                "action": "retry_revoke"
+            }))
+            .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["mode"], "connect");
+    }
+
+    #[test]
+    fn agent_oauth_start_rejects_legacy_query_provider_and_redirect() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let response = router.route(
+            &ApiRequest::new(
+                "POST",
+                "/api/v1/agent/oauth/start?provider=claude&redirect=https%3A%2F%2Fevil.invalid",
+            )
+            .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn agent_oauth_start_json_preserves_oauth_guard_preflight_paths() {
+        let start = APP_JS
+            .split("async function startAiLogin(provider)")
+            .nth(1)
+            .unwrap()
+            .split("async function finishClaudeGuard")
+            .next()
+            .unwrap();
+        let guard = start.find("beginNetworkGuard(\"oauth\")").unwrap();
+        let preflight = start
+            .find("runConnectivityPreflight(provider, \"oauth_start\", guardId)")
+            .unwrap();
+        let json_start = start
+            .find("postJson(\"/api/v1/agent/oauth/start\", CAP.agent")
+            .unwrap();
+        let browser = start.find("openExternalAuth(d.authorize_url").unwrap();
+        assert!(guard < preflight && preflight < json_start && json_start < browser);
+
+        let connect = APP_JS
+            .split("async function connectAgentProvider(provider)")
+            .nth(1)
+            .unwrap()
+            .split("async function pickModel")
+            .next()
+            .unwrap();
+        assert!(connect.contains("await startAiLogin(provider)"));
+        assert!(APP_JS.contains("connectAgentProvider(\"claude\")"));
+        assert!(APP_JS.contains("await connectAgentProvider(\"codex\")"));
+    }
+
+    #[test]
+    fn product_router_has_no_local_only_credential_delete_route() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        for path in [
+            "/api/v1/agent/credential/delete",
+            "/api/v1/agent/provider/key/delete",
+            "/api/v1/agent/subscription/delete",
+        ] {
+            let response = router
+                .route(&ApiRequest::new("POST", path).with_cap_token(Some("agentsecret".into())));
+            assert_eq!(response.status, 405, "{path}");
+        }
     }
 
     #[test]
@@ -10245,9 +10730,17 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "app.js missing #622 model/usage invariant: {needle}"
             );
         }
+        let usage_renderer = APP_JS
+            .split("function renderAssistantUsageChip(st)")
+            .nth(1)
+            .unwrap()
+            .split("function renderAssistantModelPicker")
+            .next()
+            .unwrap();
         assert!(
-            !APP_JS.contains("request_id:") && !APP_JS.contains("rate_limit: \"ok\""),
-            "production UI must not fabricate usage fields"
+            !usage_renderer.contains("request_id:")
+                && !usage_renderer.contains("rate_limit: \"ok\""),
+            "production usage renderer must not fabricate usage fields"
         );
         assert!(
             !APP_JS.contains("String(usage.rate_limit)"),

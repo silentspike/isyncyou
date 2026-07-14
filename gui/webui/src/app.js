@@ -4677,11 +4677,14 @@ async function startAiLogin(provider) {
     if (provider === "codex") CODEX_GUARD_ID = guardId;
     else AGENT_GUARD_ID = guardId;
     await runConnectivityPreflight(provider, "oauth_start", guardId);
-    const params = { provider };
     const redirect = localCallbackRedirect("localhost");
-    if (redirect) params.redirect = redirect;
     const manualCodeFlow = provider === "claude" && !redirect;
-    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
+    const requestId = crypto.randomUUID();
+    const d = await postJson("/api/v1/agent/oauth/start", CAP.agent, {
+      provider,
+      request_id: requestId,
+      lifecycle_operation_id: null,
+    });
     // Remember a server-created attempt before validating the rest of the response so the
     // common failure path can cancel it. Never return from here with the FGS lease live.
     if (d && d.attempt_id) OAUTH_ATTEMPTS.set(provider, d.attempt_id);

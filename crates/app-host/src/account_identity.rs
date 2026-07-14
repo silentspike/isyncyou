@@ -140,11 +140,11 @@ pub(crate) struct ValidatedCodexSubject {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct JwksResponse<'a> {
-    pub body: &'a [u8],
-    pub content_type: &'a str,
+pub(crate) struct JwksResponse {
+    pub body: Vec<u8>,
+    pub content_type: String,
     pub redirected: bool,
-    pub source_origin: &'a str,
+    pub source_origin: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,11 +219,11 @@ pub(crate) fn validate_codex_subject<F>(
     access_token: &str,
     client_id: &str,
     attempt: &OidcAttemptBinding<'_>,
-    initial_jwks: JwksResponse<'_>,
+    initial_jwks: JwksResponse,
     refresh_jwks: F,
 ) -> Result<ValidatedCodexSubject, IdentityError>
 where
-    F: FnMut() -> Result<JwksResponse<'static>, IdentityError>,
+    F: FnMut() -> Result<JwksResponse, IdentityError>,
 {
     validate_codex_subject_with_verifier(
         token,
@@ -252,12 +252,12 @@ fn validate_codex_subject_with_verifier<F, V>(
     access_token: &str,
     client_id: &str,
     attempt: &OidcAttemptBinding<'_>,
-    initial_jwks: JwksResponse<'_>,
+    initial_jwks: JwksResponse,
     mut refresh_jwks: F,
     verify_signature: V,
 ) -> Result<ValidatedCodexSubject, IdentityError>
 where
-    F: FnMut() -> Result<JwksResponse<'static>, IdentityError>,
+    F: FnMut() -> Result<JwksResponse, IdentityError>,
     V: Fn(&ParsedJwk, &[u8], &[u8]) -> Result<(), IdentityError>,
 {
     if attempt.expected_state.is_empty()
@@ -358,15 +358,15 @@ fn validate_claims(
     Ok(())
 }
 
-fn parse_jwks(response: JwksResponse<'_>) -> Result<BTreeMap<String, ParsedJwk>, IdentityError> {
+fn parse_jwks(response: JwksResponse) -> Result<BTreeMap<String, ParsedJwk>, IdentityError> {
     if response.redirected
         || response.source_origin != CODEX_OIDC_ISSUER
-        || !is_json_content_type(response.content_type)
+        || !is_json_content_type(&response.content_type)
         || response.body.len() > JWKS_MAX_BYTES
     {
         return Err(IdentityError::InvalidJwks);
     }
-    let document: JwksDocument = parse_strict_json(response.body)?;
+    let document: JwksDocument = parse_strict_json(&response.body)?;
     if document.keys.is_empty() || document.keys.len() > JWKS_MAX_KEYS {
         return Err(IdentityError::InvalidJwks);
     }
@@ -591,12 +591,12 @@ mod tests {
         .into_bytes()
     }
 
-    fn response(body: &[u8]) -> JwksResponse<'_> {
+    fn response(body: &[u8]) -> JwksResponse {
         JwksResponse {
-            body,
-            content_type: "application/json",
+            body: body.to_vec(),
+            content_type: "application/json".into(),
             redirected: false,
-            source_origin: CODEX_OIDC_ISSUER,
+            source_origin: CODEX_OIDC_ISSUER.into(),
         }
     }
 
@@ -744,7 +744,7 @@ mod tests {
             Err(IdentityError::UnknownKey)
         );
         let mut wrong_origin = response(&keys);
-        wrong_origin.source_origin = "https://other.invalid";
+        wrong_origin.source_origin = "https://other.invalid".into();
         assert_eq!(parse_jwks(wrong_origin), Err(IdentityError::InvalidJwks));
         assert_eq!(
             validate_codex_discovery(
@@ -816,7 +816,7 @@ mod tests {
         redirected.redirected = true;
         assert_eq!(parse_jwks(redirected), Err(IdentityError::InvalidJwks));
         let mut wrong_type = response(&keys);
-        wrong_type.content_type = "text/plain";
+        wrong_type.content_type = "text/plain".into();
         assert_eq!(parse_jwks(wrong_type), Err(IdentityError::InvalidJwks));
         let huge = vec![b' '; JWKS_MAX_BYTES + 1];
         assert_eq!(parse_jwks(response(&huge)), Err(IdentityError::InvalidJwks));
