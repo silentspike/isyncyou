@@ -385,7 +385,7 @@ requirements:
       projection, and `/oauth/complete` is a strict-JSON, attempt-bound, Claude-only manual step.
       FakeProvider is a test/fixture provider only and never a not-ready product turn. #627 experimental
       stays compiled-opt-in only and never confers product readiness. (S-AG.14/#639)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Readiness derives from the durable ProductActivationV1 (generation + policy fingerprint + harness contract) plus a valid Active bundle and a passing static harness attestation, decoupled from provider selection.
@@ -411,3 +411,8 @@ requirements:
       - test: official_oauth_precedes_credential_encryption_and_harness_transformation
       - test: activation_matches_requires_policy_and_contract_version
       - test: product_oauth_override_cannot_satisfy_official_handoff
+      - test: codex_callback_accepts_official_scope_parameter
+      - test: codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters
+      - test: codex_authorization_error_callback_terminates_without_exchange
+      - test: assistant_setup_consent_is_required_and_non_secret
+      - file: docs/evidence/issue-639-manifest.json

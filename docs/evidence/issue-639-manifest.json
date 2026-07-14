@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-13T21:14:45Z",
-  "commit": "a84b286569be88a672f9c6a67eb7ad55b6360a61",
+  "generated_at": "2026-07-14T08:02:50Z",
+  "commit": "1ad3d28e6d3b907f6d1017a8ed8281db3e93e3f0",
   "entries": [
     {
       "id": "EV-001",
@@ -286,29 +286,76 @@
       "requirement": "REQ-AGENT-014",
       "claim": "Digest-pinned Semgrep completed the changed JavaScript path with no findings.",
       "method": "command",
-      "command": "docker run semgrep/semgrep@sha256:a265d09a... semgrep scan --timeout 60 --jobs 1 gui/webui/src/app.js",
+      "command": "docker run semgrep/semgrep@sha256:a265d09a... semgrep scan --timeout 60 --config p/javascript --config p/secrets --config p/security-audit gui/webui/src/app.js",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
     },
     {
       "id": "EV-030",
       "requirement": "REQ-AGENT-014",
-      "claim": "Default-feature Android unit tests, lint, and APK assembly pass for the current tree.",
+      "claim": "The evidence-tested tree has the same product inputs as the clean built and installed default APK; the previously tested Android/mobile paths are unchanged.",
       "method": "command",
-      "command": "cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug",
+      "command": "at 6febc23: cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug; at 1ad3d28: git diff --name-only 6febc23..1ad3d28 -- android crates/mobile gui/webui crates",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
     },
     {
       "id": "EV-031",
       "requirement": "REQ-AGENT-014",
-      "claim": "Current-tree device instrumentation and official OAuth handoffs are not yet verified.",
+      "claim": "Both official provider activations and both independent consents are valid on the final default APK with no open OAuth attempt.",
       "method": "command",
-      "command": "cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=AgentCredentialKeyStoreInstrumentedTest,NetworkCriticalGuardInstrumentedTest",
-      "result": "fail",
-      "evidence": "Gradle: No connected devices; current-tree OAuth handoffs not run",
+      "command": "install final default APK; complete official handoffs; read back closed host/UI state",
+      "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt",
-      "notes": "Historical live device evidence in device/device-handoff.txt belongs to d5bee49d8daaa653bad3cb6941e7bf61d30d304c and is not current-tree proof."
+      "notes": "No OAuth material, account identity, IP address, or device serial was recorded."
+    },
+    {
+      "id": "EV-032",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The official Codex callback shape with an optional scope parameter is accepted.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_callback_accepts_official_scope_parameter -- --nocapture",
+      "test": "codex_callback_accepts_official_scope_parameter",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-033",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Duplicate, unknown, and ambiguous Codex callback parameters fail closed.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters -- --nocapture",
+      "test": "codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-034",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A provider authorization-error callback terminates without token exchange and records only a closed redacted code.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_authorization_error_callback_terminates_without_exchange -- --nocapture",
+      "test": "codex_authorization_error_callback_terminates_without_exchange",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-035",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Claude and ChatGPT privacy consents migrate from V1 and persist independently with visible allowed states without launching OAuth.",
+      "method": "command",
+      "command": "node tools/agent-ui-smoke.mjs --out docs/evidence/artifacts/issue-639/wizard-smoke",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/wizard-smoke/agent-ui-smoke.json"
+    },
+    {
+      "id": "EV-036",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The deterministic UI evidence self-check rejects complete request locations, addresses, raw assertion details, and fixture authority values before serialization.",
+      "method": "command",
+      "command": "node tools/agent-ui-smoke.mjs --out docs/evidence/artifacts/issue-639/wizard-smoke",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/wizard-smoke/agent-ui-smoke.json"
     }
   ]
 }

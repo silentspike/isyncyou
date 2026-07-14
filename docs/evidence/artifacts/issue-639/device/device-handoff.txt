@@ -2,10 +2,10 @@
 token, refresh, account id, IP, or device serial). Device: Pixel 8 Pro (husky), USB,
 device-lock ag-639. Default DEBUG product APK com.silentspike.isyncyou.debug.
 
-PROVENANCE: this live evidence was captured against implementation commit
-d5bee49d8daaa653bad3cb6941e7bf61d30d304c. It is retained as historical flow evidence; it does
-not attest implementation commit a84b286569be88a672f9c6a67eb7ad55b6360a61 or its APK. See
-../current-tree-recheck.txt for the current blocked device status.
+PROVENANCE: the screenshots and original full-flow narrative below were captured against
+implementation commit d5bee49d8daaa653bad3cb6941e7bf61d30d304c. They are retained as historical
+flow evidence. See ../current-tree-recheck.txt for the final 1ad3d28 evidence-tested tree, 6febc23
+product implementation, live repair-session readback, final APK hash, and exact delta provenance.
 
 DEFAULT PRODUCT APK
 -------------------
@@ -21,12 +21,12 @@ LIVE HANDOFF (user performed the real official login; NO raw-token seeding)
    ("Reconnect your AI account" + "Reconnect ChatGPT") for a pre-existing credential — proving
    #639 fail-closed: a credential without a matching ProductActivationV1 is treated as
    reconnect_required, never silently trusted. [01-wizard-reconnect-720.png]
-2. ChatGPT/Codex: tapped Reconnect ChatGPT → the device browser opened the OFFICIAL OpenAI login
-   (auth.openai.com/choose-an-account); after the real login the loopback callback completed,
+2. ChatGPT/Codex: tapped Reconnect ChatGPT → the device browser opened the OFFICIAL OpenAI login;
+   after the real login the loopback callback completed,
    the credential was encrypted + activated, and the wizard was replaced by the chat surface
    showing "Connected · ChatGPT · GPT-5.5". [02-codex-connected-720.png]
 3. Claude: model switcher → "Connect Claude…" → Allow Claude consent → the device browser opened
-   the OFFICIAL Claude authorize page (claude.ai/oauth/authorize); after the real authorization the
+   the OFFICIAL Claude authorization page; after the real authorization the
    shown code was pasted into the app's type=password field (strict-JSON /oauth/complete,
    attempt-state-bound), completing to "Connected · Claude · Sonnet 5". [03-claude-connected-720.png]
 
@@ -37,6 +37,24 @@ valid Active V2 bundle + a matching ProductActivationV1 + a passing static harne
 via a REAL official OAuth handoff on-device. Screens are the mobile (~720px-equivalent) evidence.
 Screenshots: docs/evidence/artifacts/issue-639/device/*.png (secret-free; keyboard/clipboard
 chips were dismissed/cleared before capture).
+
+FINAL CURRENT-TREE DELTA READBACK (2026-07-14)
+------------------------------------------------
+- Callback implementation commit 9092739 accepted the official Codex callback shape and added
+  fail-closed callback regressions; the user completed both provider interactions in the live repair
+  session without raw-token seeding.
+- Final product implementation commit 6febc2332bb38602c19046a327783cb7244f8194 adds only the independent
+  provider-consent V2 migration and its WebUI tests after 9092739.
+- Evidence-tested commit 1ad3d28e6d3b907f6d1017a8ed8281db3e93e3f0 changes only the deterministic
+  smoke reporter after 6febc23; no Android, mobile, WebUI, or Rust product path differs.
+- The clean final default APK SHA-256 is
+  d4d0f322cc649fb61a759a2fa91b910d83699bd85ec4e8aa3fb81ee2d8bd8c15; the diagnostic-hook marker is
+  absent.
+- On that final installed APK, the redacted host/UI readback was: Claude ready; Codex ready; both
+  provider consents true; connected chat active; no poller; no open OAuth attempt.
+- No final-state screenshot was committed because the closed status/consent readback was sufficient
+  and avoided capturing account or browser identity. The exact commands and gates are in
+  ../current-tree-recheck.txt.
 
 ON-DEVICE INSTRUMENTATION (device-lock ag-639, Pixel 8 Pro)
 -----------------------------------------------------------

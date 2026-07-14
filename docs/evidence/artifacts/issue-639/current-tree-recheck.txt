@@ -1,50 +1,77 @@
-#639 S-AG.14 current-tree recheck
-=================================
+#639 S-AG.14 final current-tree recheck
+=======================================
 
-Implementation commit: a84b286569be88a672f9c6a67eb7ad55b6360a61
-Collected: 2026-07-13T21:14:45Z
+Implementation commit: 1ad3d28e6d3b907f6d1017a8ed8281db3e93e3f0
+Product implementation commit: 6febc2332bb38602c19046a327783cb7244f8194
+Collected: 2026-07-14T08:02:50Z
+
+This artifact contains only redacted result codes, commit identities, commands, and artifact hashes.
+It contains no OAuth URL/state/code, provider token, account identity, device serial, or raw log.
 
 CURRENT IMPLEMENTATION GATES
 ----------------------------
-- cargo remote -c -- test --workspace --no-fail-fast: PASS
-- isyncyou-agent with http,agent-oauth-providers: PASS (201 tests)
-- isyncyou-app-host with agent-oauth-providers: PASS
-- isyncyou-app-host with agent-subscription-experimental: PASS
-- isyncyou-webui: PASS (212 tests)
-- workspace, product-feature, experimental-feature, and mobile-no-default Clippy: PASS
-- cargo-remote-fmt --check: PASS
-- npm ci and node syntax checks: PASS
-- agent UI smoke: PASS (33 assertions)
-- onboarding wizard smoke: PASS (15 assertions)
-- feature-matrix, public-surface, and release-exclusion boundary modes: PASS
-- cargo deny check: PASS (advisories, bans, licenses, and sources)
-- staged Gitleaks scan: PASS
-- Semgrep: 0 findings. The broad scan timed out one JavaScript rule on app.js; an immediate
-  single-file rerun with a 60-second rule timeout completed 83 applicable rules with 0 findings.
-- Default-feature Android unit tests, lint, and assembleDebug: BUILD SUCCESSFUL
-- Default product APK sha256:
-  9d8f4d1fc8bcb14a8c86999c77dcf9cbd99dfa94fe9deb9005fac514335ca6d6
-- Release-exclusion product build: PASS; experimental markers absent.
+- cargo remote -c -- test --workspace --no-fail-fast: PASS (0 failures).
+- isyncyou-app-host default/product suite: PASS (179 tests; live seed test remains explicitly ignored).
+- New callback regressions PASS:
+  codex_callback_accepts_official_scope_parameter;
+  codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters;
+  codex_authorization_error_callback_terminates_without_exchange.
+- cargo remote -c -- clippy --workspace --all-targets -- -D warnings: PASS.
+- cargo-remote-fmt --check: CLEAN.
+- node syntax checks: PASS.
+- tools/agent-ui-smoke.mjs: PASS (40/40 assertions), including V1 consent migration,
+  independent Claude/ChatGPT consent persistence, two visible allowed states, and both Connect
+  buttons remaining enabled.
+- The smoke report's built-in redaction gate rejects complete URLs, loopback addresses, email
+  addresses, raw assertion details, and fixture token/hash/pending values before serialization.
+- tools/agent-wizard-smoke.mjs: PASS (15/15 assertions).
+- Digest-pinned Semgrep rerun on the changed JavaScript with a 60-second rule timeout: 119 rules,
+  0 findings. The initial broad run reported one timeout; the bounded single-file rerun completed.
+- python3 tools/verify-agent-network-boundary.py against the final default APK: PASS, including
+  default_apk_excludes_hook_marker.
 
-CURRENT DEVICE/LIVE STATUS
---------------------------
-- The current-tree connectedDebugAndroidTest attempt did not run because Gradle reported
-  "No connected devices". This is a blocked observation, not a passing device gate.
-- Official Claude and Codex OAuth were not repeated against a84b286569be88a672f9c6a67eb7ad55b6360a61.
-- The retained screenshots and device-handoff.txt are historical evidence for implementation
-  commit d5bee49d8daaa653bad3cb6941e7bf61d30d304c only. They demonstrate the prior live flow but do
-  not attest the current implementation commit or current APK hash.
-- REQ-AGENT-014 therefore remains planned until a default APK from the current implementation
-  commit completes the required on-device instrumentation and both official OAuth handoffs.
+FINAL DEFAULT APK
+-----------------
+- Built from product implementation commit 6febc2332bb38602c19046a327783cb7244f8194 with:
+  cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug
+- git diff --name-only 6febc23..1ad3d28 -- android crates/mobile gui/webui crates returned no
+  paths. The later commit changes only tools/agent-ui-smoke.mjs, outside all product/APK inputs.
+- Result: BUILD SUCCESSFUL.
+- SHA-256: d4d0f322cc649fb61a759a2fa91b910d83699bd85ec4e8aa3fb81ee2d8bd8c15.
+- Installed successfully on the connected default debug application.
+- Diagnostic network-test hook marker: absent.
 
-RECHECKED FIXES
----------------
-- Product readiness and provider construction share one in-process gate and an owner-controlled,
-  no-follow cross-process file lock; competing transactions fail closed.
-- Product credential and activation reads are bounded and use one snapshot through turn build.
-- Startup closes unresumable OAuth attempts as error_redacted(interrupted).
-- Onboarding-journal index updates are cross-process serialized and reap dangling crash entries.
-- /oauth/complete rejects oversized framing, duplicate Content-Length, and Transfer-Encoding before
-  route allocation; the native bridge applies the same strict body cap.
-- Invalid OAuth-start responses cancel any server attempt and release the exact Android foreground
-  guard instead of leaking ownership.
+FINAL DEVICE READBACK
+---------------------
+- The user completed both official provider handoffs without raw-token seeding during this live
+  repair session. The callback fix was exercised before the final consent-only commit.
+- The final APK read back Claude state=ready and Codex state=ready from host status.
+- The final APK persisted Claude consent=true and Codex consent=true independently under consent
+  schema V2; the consent panel disappeared from the ready chat surface as designed.
+- selected-provider connected=true; chat surface active; OAuth poller inactive; open attempt count=0.
+- The final product delta from callback commit 9092739 to product commit 6febc23 is limited to the
+  provider-consent WebUI and its deterministic tests. The final APK readback therefore validates
+  both the retained host activation and the repaired consent behavior. Evidence-tested commit
+  1ad3d28 only adds the redacted smoke reporter and does not change a product input.
+
+ANDROID TEST PROVENANCE
+-----------------------
+- The representative default-APK instrumentation recorded in device/device-handoff.txt passed on
+  ancestor c0e5a2a (3 Keystore tests and 1 foreground-guard test).
+- git diff --name-only c0e5a2a..1ad3d28 -- android crates/mobile returned no paths. The tested
+  Android/mobile implementation is unchanged; instrumentation was not rerun after live OAuth because
+  that runner clears configured debug-app data.
+- The identical product inputs of the evidence-tested tree were rebuilt from clean native inputs,
+  scanned, installed, and exercised through the live host/UI readback above.
+
+FIXES VERIFIED IN THIS RECHECK
+------------------------------
+- The Codex callback accepts the official optional scope parameter while duplicate/unknown fields
+  remain fail-closed and an unbound state cannot consume the real attempt.
+- Provider authorization errors and malformed bound callbacks terminate with closed redacted codes;
+  no provider error text reaches public status.
+- Privacy consent is not a login action. Each provider persists independently, old V1 state migrates
+  safely, accepted buttons become disabled allowed states, and accepting one provider cannot erase
+  the other provider's consent.
+- Deterministic UI evidence stores no complete request URL, address, account label, prompt, token,
+  action hash, or pending identifier; screenshots use only the opaque label "Fixture account".
