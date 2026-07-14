@@ -1,0 +1,14 @@
+Issue #645 host gates for implementation commit b470ccedfdf799db89e89243a80db2a33f2bc5d2
+
+PASS cargo remote -c -- test --workspace --no-fail-fast
+  isyncyou-agent: 229 passed
+  isyncyou-app-host: 290 passed, 6 explicit live-seed tests ignored
+  isyncyou-webui: 227 passed
+  isyncyou-mobile: 32 passed
+  remaining workspace crates: no failures
+PASS python3 tools/verify-agent-account-lifecycle-boundary.py: 11 checks
+PASS python3 -m unittest tools.test_agent_account_lifecycle_device_probe tools.test_verify_agent_account_lifecycle_boundary: 7 tests
+PASS node tools/agent-account-lifecycle-ui-smoke.mjs: 22 assertions
+
+The remote test process exited only after all tests and doc-tests completed. Its optional
+multi-gigabyte artifact download was interrupted because the test results were already final.

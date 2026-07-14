@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "b470ccedfdf799db89e89243a80db2a33f2bc5d2",
+  "apk_sha256": "f6c59516aa4519059527e6c9b881163c6a9250417a9bd5cf93029b31be2141b7",
+  "hook_marker_present": true,
+  "instrumentation_test": "lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot",
+  "instrumentation_result": "pass",
+  "orchestrator_cleanup_result": "usb_device_lost_after_test",
+  "result": "pass_with_infrastructure_note"
+}

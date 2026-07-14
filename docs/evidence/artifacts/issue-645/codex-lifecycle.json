@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "scope": "physical_default_apk_product_oauth",
+  "provider": "codex",
+  "connect": "pass",
+  "post_connect_storearchive_turn": "pass",
+  "reconnect_existing_credential": "pass",
+  "generation_changed_after_reconnect": true,
+  "post_reconnect_storearchive_turn": "pass",
+  "disconnect_server_revoke_and_local_cleanup": "pass",
+  "connect_after_disconnect": "pass",
+  "post_second_connect_storearchive_turn": "pass",
+  "secrets_included": false,
+  "identity_included": false
+}

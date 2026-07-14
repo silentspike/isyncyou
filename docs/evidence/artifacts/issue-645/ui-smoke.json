@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "command": "node tools/agent-account-lifecycle-ui-smoke.mjs",
+  "assertions": 22,
+  "result": "pass",
+  "checks": [
+    "disconnect_available_for_non_ready_stored_credentials",
+    "switch_only_for_verified_subject",
+    "candidate_cleanup_retries_after_transient_busy",
+    "closed_codes_only",
+    "no_raw_provider_error"
+  ]
+}

@@ -1,0 +1,132 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-14T15:10:55Z",
+  "commit": "b470ccedfdf799db89e89243a80db2a33f2bc5d2",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Disconnect persists the provider revoke outcome before deleting the matching local credential.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers disconnect_revokes_server_token_before_local_credential_delete -- --nocapture",
+      "test": "disconnect_revokes_server_token_before_local_credential_delete",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Ambiguous revocation remains non-ready and resumes the same durable operation.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers disconnect_ambiguous_response_enters_revoke_unknown_and_retries_same_operation -- --nocapture",
+      "test": "disconnect_ambiguous_response_enters_revoke_unknown_and_retries_same_operation",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/recovery.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-015",
+      "claim": "A provider operation lease remains held until the real turn thread reaches a terminal outcome.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers provider_operation_lease_lives_until_actual_turn_thread_terminal_after_stream_open -- --nocapture",
+      "test": "provider_operation_lease_lives_until_actual_turn_thread_terminal_after_stream_open",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Reconnect revokes and cleans the prior generation before replacement.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers reconnect_existing_credential_revokes_before_replacement -- --nocapture",
+      "test": "reconnect_existing_credential_revokes_before_replacement",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-015",
+      "claim": "A different verified Codex subject activates through the normal product path in deterministic host coverage.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_switch_different_verified_subject_commits_through_normal_activation_and_completes -- --nocapture",
+      "test": "codex_switch_different_verified_subject_commits_through_normal_activation_and_completes",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/account-switch.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-015",
+      "claim": "A real two-account Codex Switch was not repeated after the owner ended further interactive sign-ins; AC-3 remains open.",
+      "method": "probe",
+      "command": "Physical Pixel two-controlled-account Codex Switch through the app and system browser",
+      "result": "fail",
+      "artifact": "docs/evidence/artifacts/issue-645/account-switch.json"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-015",
+      "claim": "A real same-account Codex Switch is rejected, the candidate is revoked under a fresh revoke guard, and no candidate remains ready.",
+      "method": "probe",
+      "command": "Physical Pixel default-APK same-account Codex Switch with closed lifecycle status readback",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/candidate-cleanup.json"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Claude and Codex each completed real disconnect, fresh connect, reconnect, and post-connect StoreArchive turns on the default APK.",
+      "method": "probe",
+      "command": "Physical Pixel default-APK provider lifecycle walk-through with closed status and terminal turn observations",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/claude-lifecycle.json"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Lifecycle UI controls are capability-aware and expose only closed retry/resume states.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui assistant_account_lifecycle_controls_are_capability_and_state_driven -- --nocapture",
+      "test": "assistant_account_lifecycle_controls_are_capability_and_state_driven",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/ui-smoke.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Credential-revoke snapshots are one-shot and bound to the engine session and guard reason.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers credential_revoke_snapshot_is_single_use_and_session_bound -- --nocapture",
+      "test": "credential_revoke_snapshot_is_single_use_and_session_bound",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-015",
+      "claim": "The separate hook APK contains the deliberate marker and its JNI control accepts only closed one-shot checkpoints.",
+      "method": "test",
+      "command": "(cd android && ISY_CARGO_FEATURES=agent-account-lifecycle-device-test-hooks ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentAccountLifecycleHookInstrumentedTest)",
+      "test": "lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/hook-apk-scan.json"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-015",
+      "claim": "The independently rebuilt default APK excludes the deliberate #645 lifecycle hook marker.",
+      "method": "command",
+      "command": "(cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug) && unzip -p android/app/build/outputs/apk/debug/app-debug.apk lib/arm64-v8a/libisyncyou_mobile.so | strings | rg ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_V1",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/default-apk-scan.json"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Production routes, defaults, workflows, status, cleanup, and UI preserve the account-lifecycle security boundary.",
+      "method": "command",
+      "command": "python3 tools/verify-agent-account-lifecycle-boundary.py",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/public-surface-scan.txt"
+    }
+  ]
+}

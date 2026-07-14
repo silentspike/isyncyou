@@ -451,3 +451,4 @@ requirements:
       - test: credential_revoke_snapshot_is_single_use_and_session_bound
       - test: account_lifecycle_hook_apk_contains_deliberate_marker_and_closed_jni_only_controls
       - file: tools/agent-account-lifecycle-ui-smoke.mjs
+      - file: docs/evidence/issue-645-manifest.json

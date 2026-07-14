@@ -1,0 +1,13 @@
+Issue #645 public-surface and product-boundary scan
+
+PASS 11/11 checks from tools/verify-agent-account-lifecycle-boundary.py
+PASS product router has no local-only credential deletion route
+PASS revoke endpoints are compiled provider policy, not caller input
+PASS status is observational
+PASS lifecycle does not use experimental local CLI credentials
+PASS provider cleanup excludes Graph and Microsoft 365 credentials
+PASS app-host/mobile defaults and release workflows exclude the lifecycle hook
+PASS Assistant renders closed lifecycle codes only
+PASS README contains no manual provider-token cleanup recipe
+
+No provider endpoint, token, callback, account identity, device serial, or raw error is included.

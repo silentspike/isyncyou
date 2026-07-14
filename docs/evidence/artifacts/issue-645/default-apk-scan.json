@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "b470ccedfdf799db89e89243a80db2a33f2bc5d2",
+  "apk_sha256": "e308f8725b810f4f015e7d19a3b46ac84c8c3134b273367ccba13ac08d0c0f5c",
+  "hook_marker_present": false,
+  "build": "clean_default_debug",
+  "result": "pass"
+}

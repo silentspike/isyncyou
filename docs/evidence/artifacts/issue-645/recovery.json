@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "scope": "deterministic_crash_and_ambiguity_recovery",
+  "result": "pass",
+  "covered": [
+    "prepared_before_bundle_write",
+    "revoke_inflight_before_response",
+    "provider_2xx_before_outcome_commit",
+    "revoked_pending_cleanup",
+    "receipt_before_compaction",
+    "candidate_write_before_activation",
+    "candidate_revoke_failure",
+    "cross_process_provider_lease",
+    "idempotency_after_webview_restart"
+  ],
+  "hook_instrumentation": "pass",
+  "real_provider_failure_injection_claimed": false
+}

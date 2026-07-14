@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "provider": "codex",
+  "deterministic_host_different_subject": "pass",
+  "deterministic_ui_capability_contract": "pass",
+  "physical_same_account_rejection": "pass",
+  "physical_different_account_switch": "not_run_policy",
+  "reason": "owner_ended_further_interactive_signins_after_repeated_product_oauth_runs",
+  "acceptance_criterion": "AC-3",
+  "acceptance_status": "open",
+  "requirement_status": "planned",
+  "identity_included": false,
+  "token_included": false
+}
