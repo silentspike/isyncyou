@@ -382,6 +382,8 @@ pub struct CodexTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub account_id: String,
+    /// Used only for immediate OIDC validation. Callers must not persist or log it.
+    pub id_token: String,
     pub expires_in: u64,
 }
 
@@ -422,13 +424,18 @@ fn codex_parse_tokens(text: &str, fallback_refresh: &str) -> Result<CodexTokens,
         .and_then(|t| t.as_str())
         .unwrap_or(fallback_refresh)
         .to_string();
-    let account_id =
-        codex_account_id_from_id_token(v.get("id_token").and_then(|t| t.as_str()).unwrap_or(""));
+    let id_token = v
+        .get("id_token")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let account_id = codex_account_id_from_id_token(&id_token);
     let expires_in = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(0);
     Ok(CodexTokens {
         access_token,
         refresh_token,
         account_id,
+        id_token,
         expires_in,
     })
 }

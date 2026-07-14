@@ -653,6 +653,15 @@ impl LifecycleRepository {
             .is_some_and(|context| context.authority.active_operations.contains_key(&provider)))
     }
 
+    pub(crate) fn active_operation(
+        &self,
+        provider: ProductProviderId,
+    ) -> Result<Option<ActiveOperationRefV1>, LifecycleRecordError> {
+        Ok(self
+            .load_existing()?
+            .and_then(|context| context.authority.active_operations.get(&provider).cloned()))
+    }
+
     pub(crate) fn put_authority(
         &self,
         principal: &str,
@@ -697,6 +706,54 @@ impl LifecycleRepository {
             candidate,
             CANDIDATE_PLAINTEXT_MAX,
             CANDIDATE_ENVELOPE_MAX,
+        )
+    }
+
+    pub(crate) fn load_candidate(
+        &self,
+        id: &str,
+    ) -> Result<Option<OAuthCandidateV1>, LifecycleRecordError> {
+        validate_b64url(id, DIGEST_LEN)?;
+        let Some(secret) = self
+            .store
+            .get_bounded(
+                isyncyou_agent::SecretClass::OAuthCandidate,
+                id,
+                CANDIDATE_ENVELOPE_MAX,
+                CANDIDATE_PLAINTEXT_MAX,
+            )
+            .map_err(|_| LifecycleRecordError::Store)?
+        else {
+            return Ok(None);
+        };
+        let candidate = parse_bounded(secret.expose(), CANDIDATE_PLAINTEXT_MAX)?;
+        validate_candidate(&candidate, id)?;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) fn delete_candidate(&self, id: &str) -> Result<(), LifecycleRecordError> {
+        validate_b64url(id, DIGEST_LEN)?;
+        self.store
+            .delete_durable(isyncyou_agent::SecretClass::OAuthCandidate, id)
+            .map_err(|_| LifecycleRecordError::Store)
+    }
+
+    pub(crate) fn candidate_record_id(
+        &self,
+        provider: ProductProviderId,
+        operation_id: &str,
+    ) -> Result<String, LifecycleRecordError> {
+        validate_b64url(operation_id, OPERATION_ID_LEN)?;
+        let context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::MissingInstallationPrincipal)?;
+        self.derive_tag(
+            b"isyncyou/account-lifecycle-candidate-id/v1",
+            &[
+                context.principal.as_bytes(),
+                provider.wire().as_bytes(),
+                operation_id.as_bytes(),
+            ],
         )
     }
 
@@ -798,6 +855,7 @@ impl LifecycleRepository {
         Ok(Some(journal))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_disconnect(
         &self,
         provider: ProductProviderId,
@@ -808,9 +866,44 @@ impl LifecycleRepository {
         scope: RevokeScopeGuarantee,
         now_ms: u64,
     ) -> Result<BeginLifecycleOperation, LifecycleRecordError> {
+        self.begin_operation(
+            provider,
+            AccountLifecycleRoute::Logout,
+            AccountLifecycleMode::Disconnect,
+            request_id,
+            Some(generation),
+            subject_digest,
+            Some(target),
+            Some(scope),
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_operation(
+        &self,
+        provider: ProductProviderId,
+        route: AccountLifecycleRoute,
+        mode: AccountLifecycleMode,
+        request_id: &str,
+        generation: Option<&str>,
+        subject_digest: Option<&str>,
+        target: Option<RevokeRequestTarget>,
+        scope: Option<RevokeScopeGuarantee>,
+        now_ms: u64,
+    ) -> Result<BeginLifecycleOperation, LifecycleRecordError> {
         validate_request_id(request_id)?;
-        if !is_uuid_v4(generation)
+        if generation.is_some_and(|value| !is_uuid_v4(value))
             || subject_digest.is_some_and(|value| validate_b64url(value, DIGEST_LEN).is_err())
+            || target.is_some() != scope.is_some()
+            || matches!(
+                mode,
+                AccountLifecycleMode::Disconnect
+                    | AccountLifecycleMode::Reconnect
+                    | AccountLifecycleMode::Switch
+            ) && (generation.is_none() || target.is_none())
+            || mode == AccountLifecycleMode::Connect
+                && (generation.is_some() || subject_digest.is_some() || target.is_some())
         {
             return Err(LifecycleRecordError::Invalid);
         }
@@ -819,7 +912,7 @@ impl LifecycleRepository {
             b"isyncyou/account-lifecycle-idempotency/v1",
             &[
                 context.principal.as_bytes(),
-                AccountLifecycleRoute::Logout.wire().as_bytes(),
+                route.wire().as_bytes(),
                 request_id.as_bytes(),
             ],
         )?;
@@ -827,10 +920,10 @@ impl LifecycleRepository {
             b"isyncyou/account-lifecycle-payload/v1",
             &[
                 provider.wire().as_bytes(),
-                AccountLifecycleMode::Disconnect.wire().as_bytes(),
-                generation.as_bytes(),
-                revoke_target_wire(target).as_bytes(),
-                revoke_scope_wire(scope).as_bytes(),
+                mode.wire().as_bytes(),
+                generation.unwrap_or("").as_bytes(),
+                target.map(revoke_target_wire).unwrap_or("").as_bytes(),
+                scope.map(revoke_scope_wire).unwrap_or("").as_bytes(),
             ],
         )?;
         if let Some(existing) = context.authority.active_operations.get(&provider) {
@@ -894,36 +987,40 @@ impl LifecycleRepository {
                 operation_id.as_bytes(),
             ],
         )?;
-        let credential_etag = self.derive_tag(
-            b"isyncyou/account-lifecycle-credential-etag/v1",
-            &[
-                context.principal.as_bytes(),
-                provider.wire().as_bytes(),
-                generation.as_bytes(),
-                &lifecycle_epoch.to_be_bytes(),
-            ],
-        )?;
+        let credential_etag = generation
+            .map(|generation| {
+                self.derive_tag(
+                    b"isyncyou/account-lifecycle-credential-etag/v1",
+                    &[
+                        context.principal.as_bytes(),
+                        provider.wire().as_bytes(),
+                        generation.as_bytes(),
+                        &lifecycle_epoch.to_be_bytes(),
+                    ],
+                )
+            })
+            .transpose()?;
         let prepared = PreparedOperationV1 {
             version: SCHEMA_VERSION,
             provider,
             operation_id: operation_id.clone(),
-            route: AccountLifecycleRoute::Logout,
+            route,
             request_id_hash: self.derive_tag(
                 b"isyncyou/account-lifecycle-request-id/v1",
                 &[request_id.as_bytes()],
             )?,
             idempotency_key,
             payload_digest,
-            mode: AccountLifecycleMode::Disconnect,
+            mode,
             lifecycle_epoch,
             fence_epoch,
             lifecycle_key_version: context.authority.lifecycle_key_version,
-            credential_etag: Some(credential_etag.clone()),
-            prior_generation: Some(generation.to_string()),
+            credential_etag: credential_etag.clone(),
+            prior_generation: generation.map(str::to_string),
             prior_subject_digest: subject_digest.map(str::to_string),
             revoke_spec_version: 1,
-            initial_revoke_request_target: Some(target),
-            initial_revoke_scope_guarantee: Some(scope),
+            initial_revoke_request_target: target,
+            initial_revoke_scope_guarantee: scope,
             prepared_at_ms: now_ms,
         };
         let active = ActiveOperationRefV1 {
@@ -933,10 +1030,12 @@ impl LifecycleRepository {
         };
         context.authority.lifecycle_epoch = lifecycle_epoch;
         context.authority.fence_epoch = fence_epoch;
-        context
-            .authority
-            .current_credential_etags
-            .insert(provider, credential_etag);
+        if let Some(credential_etag) = credential_etag {
+            context
+                .authority
+                .current_credential_etags
+                .insert(provider, credential_etag);
+        }
         context.authority.active_operations.insert(provider, active);
         self.put_authority(&context.principal, &context.authority)?;
 
@@ -987,6 +1086,117 @@ impl LifecycleRepository {
             return Err(LifecycleRecordError::StaleFence);
         }
         self.put_journal(id, journal)
+    }
+
+    pub(crate) fn transition_journal(
+        &self,
+        id: &str,
+        expected: AccountLifecyclePhase,
+        next: AccountLifecyclePhase,
+        code: Option<&str>,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let mut journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if journal.phase != expected
+            || !transition_allowed(journal.prepared.mode, expected, next)
+            || code.is_some_and(|value| !valid_closed_code(value))
+        {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        journal.phase = next;
+        journal.updated_at_ms = now_ms.max(journal.updated_at_ms);
+        journal.in_flight_until_ms = 0;
+        journal.closed_code = code.map(str::to_string);
+        self.write_journal_fenced(id, &journal)?;
+        Ok(journal)
+    }
+
+    pub(crate) fn mark_exchange_in_flight(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let mut journal = self.transition_journal(
+            id,
+            AccountLifecyclePhase::AwaitingOAuthLogin,
+            AccountLifecyclePhase::ExchangeInFlight,
+            None,
+            now_ms,
+        )?;
+        journal.attempt_count = journal
+            .attempt_count
+            .checked_add(1)
+            .filter(|value| *value <= MAX_ATTEMPTS)
+            .ok_or(LifecycleRecordError::CountLimit)?;
+        journal.in_flight_until_ms = now_ms.saturating_add(8 * 60 * 1_000);
+        self.write_journal_fenced(id, &journal)?;
+        Ok(journal)
+    }
+
+    pub(crate) fn publish_candidate(
+        &self,
+        id: &str,
+        candidate: &OAuthCandidateV1,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if journal.phase != AccountLifecyclePhase::ExchangeInFlight
+            || journal.prepared.operation_id != candidate.operation_id
+            || journal.prepared.provider != candidate.provider
+            || candidate.state != OAuthCandidateState::GrantBearing
+        {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        self.put_candidate(&candidate.record_id, candidate)?;
+        self.transition_journal(
+            id,
+            AccountLifecyclePhase::ExchangeInFlight,
+            AccountLifecyclePhase::OAuthCandidateStored,
+            None,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn start_candidate_revoke(
+        &self,
+        id: &str,
+        candidate_id: &str,
+        target: RevokeRequestTarget,
+        scope: RevokeScopeGuarantee,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let mut journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if journal.phase != AccountLifecyclePhase::OAuthCandidateCleanup
+            || self.load_candidate(candidate_id)?.is_none()
+        {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        journal.revoke_leg = journal
+            .revoke_leg
+            .checked_add(1)
+            .ok_or(LifecycleRecordError::EpochExhausted)?;
+        journal.revoked_grant = Some(RevokedGrantRef::OAuthCandidate {
+            record_id: candidate_id.to_string(),
+        });
+        journal.revoke_request_target = Some(target);
+        journal.revoke_scope_guarantee = Some(scope);
+        journal.phase = AccountLifecyclePhase::RevokeInFlight;
+        journal.attempt_count = journal
+            .attempt_count
+            .checked_add(1)
+            .filter(|value| *value <= MAX_ATTEMPTS)
+            .ok_or(LifecycleRecordError::CountLimit)?;
+        journal.in_flight_until_ms = now_ms.saturating_add(2 * 60 * 1_000);
+        journal.updated_at_ms = now_ms;
+        journal.closed_code = None;
+        self.write_journal_fenced(id, &journal)?;
+        Ok(journal)
     }
 
     pub(crate) fn start_active_revoke(
@@ -1067,13 +1277,32 @@ impl LifecycleRepository {
         ) {
             return Err(LifecycleRecordError::InvalidTransition);
         }
-        if journal.phase == AccountLifecyclePhase::RevokedPendingCleanup {
-            journal.phase = AccountLifecyclePhase::Disconnected;
-            journal.in_flight_until_ms = 0;
-            journal.updated_at_ms = now_ms;
-            journal.closed_code = Some("disconnected".into());
-            self.write_journal_fenced(id, &journal)?;
+        if journal.prepared.mode != AccountLifecycleMode::Disconnect {
+            return Err(LifecycleRecordError::InvalidTransition);
         }
+        let existing_context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        if !existing_context
+            .authority
+            .active_operations
+            .contains_key(&journal.prepared.provider)
+        {
+            let receipt_id =
+                self.receipt_index_id(&existing_context.principal, journal.prepared.provider)?;
+            let receipt = self
+                .load_receipt_index(&receipt_id)?
+                .and_then(|index| {
+                    index
+                        .receipts
+                        .into_iter()
+                        .find(|receipt| receipt.operation_id == journal.prepared.operation_id)
+                })
+                .ok_or(LifecycleRecordError::StaleFence)?;
+            self.delete_journal(id)?;
+            return Ok(receipt);
+        }
+        journal = self.checkpoint_disconnected(id, now_ms)?;
 
         let mut context = self
             .load_existing()?
@@ -1125,6 +1354,51 @@ impl LifecycleRepository {
             return Ok(receipt);
         }
 
+        context
+            .authority
+            .active_operations
+            .remove(&journal.prepared.provider);
+        self.put_authority(&context.principal, &context.authority)?;
+        self.delete_journal(id)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn checkpoint_disconnected(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let mut journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if !matches!(
+            journal.phase,
+            AccountLifecyclePhase::RevokedPendingCleanup | AccountLifecyclePhase::Disconnected
+        ) {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        if journal.phase == AccountLifecyclePhase::RevokedPendingCleanup {
+            journal.phase = AccountLifecyclePhase::Disconnected;
+            journal.in_flight_until_ms = 0;
+            journal.updated_at_ms = now_ms.max(journal.updated_at_ms);
+            journal.closed_code = Some("disconnected".into());
+            self.write_journal_fenced(id, &journal)?;
+        }
+        let mut context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        let active = context
+            .authority
+            .active_operations
+            .get(&journal.prepared.provider)
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        if active.prepared.operation_id != journal.prepared.operation_id
+            || active.operation_etag != journal.operation_etag
+            || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
+            || context.authority.fence_epoch != journal.prepared.fence_epoch
+        {
+            return Err(LifecycleRecordError::StaleFence);
+        }
         if let Some(etag) = context
             .authority
             .current_credential_etags
@@ -1141,13 +1415,243 @@ impl LifecycleRepository {
                 }
                 retired.push(etag);
             }
+            self.put_authority(&context.principal, &context.authority)?;
+        }
+        Ok(journal)
+    }
+
+    pub(crate) fn begin_candidate_validation(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        self.transition_journal(
+            id,
+            AccountLifecyclePhase::OAuthCandidateStored,
+            AccountLifecyclePhase::CandidateValidation,
+            None,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn await_oauth_login(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        match (journal.prepared.mode, journal.phase) {
+            (AccountLifecycleMode::Connect, AccountLifecyclePhase::Prepared) => self
+                .transition_journal(
+                    id,
+                    AccountLifecyclePhase::Prepared,
+                    AccountLifecyclePhase::AwaitingOAuthLogin,
+                    None,
+                    now_ms,
+                ),
+            (
+                AccountLifecycleMode::Reconnect | AccountLifecycleMode::Switch,
+                AccountLifecyclePhase::RevokedPendingCleanup,
+            ) => {
+                self.checkpoint_disconnected(id, now_ms)?;
+                self.transition_journal(
+                    id,
+                    AccountLifecyclePhase::Disconnected,
+                    AccountLifecyclePhase::AwaitingOAuthLogin,
+                    None,
+                    now_ms,
+                )
+            }
+            (
+                AccountLifecycleMode::Reconnect | AccountLifecycleMode::Switch,
+                AccountLifecyclePhase::Disconnected,
+            ) => self.transition_journal(
+                id,
+                AccountLifecyclePhase::Disconnected,
+                AccountLifecyclePhase::AwaitingOAuthLogin,
+                None,
+                now_ms,
+            ),
+            (_, AccountLifecyclePhase::AwaitingOAuthLogin) => Ok(journal),
+            _ => Err(LifecycleRecordError::InvalidTransition),
+        }
+    }
+
+    pub(crate) fn require_candidate_cleanup(
+        &self,
+        id: &str,
+        code: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        self.transition_journal(
+            id,
+            AccountLifecyclePhase::CandidateValidation,
+            AccountLifecyclePhase::OAuthCandidateCleanup,
+            Some(code),
+            now_ms,
+        )
+    }
+
+    pub(crate) fn mark_candidate_revoke_outcome(
+        &self,
+        id: &str,
+        candidate_id: &str,
+        confirmed: bool,
+        code: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let mut candidate = self
+            .load_candidate(candidate_id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        let journal = self.publish_revoke_outcome(id, confirmed, code, now_ms)?;
+        if confirmed {
+            candidate.state = OAuthCandidateState::RevokedCleaned;
+            candidate.terminal_at_ms = Some(now_ms);
+        } else {
+            candidate.state = OAuthCandidateState::RevokeUnknown;
+            candidate.terminal_at_ms = None;
+        }
+        self.put_candidate(candidate_id, &candidate)?;
+        Ok(journal)
+    }
+
+    pub(crate) fn promote_candidate(
+        &self,
+        id: &str,
+        candidate_id: &str,
+        result_generation: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleReceiptV1, LifecycleRecordError> {
+        if !is_uuid_v4(result_generation) {
+            return Err(LifecycleRecordError::Invalid);
+        }
+        let mut journal = self
+            .load_journal(id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if journal.phase != AccountLifecyclePhase::CandidateValidation {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        let mut candidate = self
+            .load_candidate(candidate_id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if candidate.operation_id != journal.prepared.operation_id
+            || candidate.provider != journal.prepared.provider
+            || candidate.state != OAuthCandidateState::GrantBearing
+        {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        journal.phase = AccountLifecyclePhase::Completed;
+        journal.updated_at_ms = now_ms.max(journal.updated_at_ms);
+        journal.closed_code = Some("connected".into());
+        self.write_journal_fenced(id, &journal)?;
+        candidate.state = OAuthCandidateState::Promoted;
+        candidate.terminal_at_ms = Some(now_ms);
+        self.put_candidate(candidate_id, &candidate)?;
+        let receipt =
+            self.finish_oauth_operation(&journal, Some(result_generation), "connected", now_ms)?;
+        self.delete_candidate(candidate_id)?;
+        self.delete_journal(id)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn finish_candidate_cleanup(
+        &self,
+        id: &str,
+        candidate_id: &str,
+        terminal_code: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleReceiptV1, LifecycleRecordError> {
+        if !valid_closed_code(terminal_code) {
+            return Err(LifecycleRecordError::Invalid);
+        }
+        let mut journal = self.checkpoint_disconnected(id, now_ms)?;
+        let candidate = self
+            .load_candidate(candidate_id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if candidate.state != OAuthCandidateState::RevokedCleaned {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        journal.phase = AccountLifecyclePhase::FailedTerminal;
+        journal.updated_at_ms = now_ms.max(journal.updated_at_ms);
+        journal.closed_code = Some(terminal_code.to_string());
+        self.write_journal_fenced(id, &journal)?;
+        let receipt = self.finish_oauth_operation(&journal, None, terminal_code, now_ms)?;
+        self.delete_candidate(candidate_id)?;
+        self.delete_journal(id)?;
+        Ok(receipt)
+    }
+
+    fn finish_oauth_operation(
+        &self,
+        journal: &AccountLifecycleJournalV1,
+        result_generation: Option<&str>,
+        terminal_code: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleReceiptV1, LifecycleRecordError> {
+        let mut context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        let active = context
+            .authority
+            .active_operations
+            .get(&journal.prepared.provider)
+            .ok_or(LifecycleRecordError::StaleFence)?;
+        if active.prepared.operation_id != journal.prepared.operation_id
+            || active.operation_etag != journal.operation_etag
+            || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
+            || context.authority.fence_epoch != journal.prepared.fence_epoch
+        {
+            return Err(LifecycleRecordError::StaleFence);
+        }
+        let receipt = AccountLifecycleReceiptV1 {
+            version: SCHEMA_VERSION,
+            operation_id: journal.prepared.operation_id.clone(),
+            operation_etag: journal.operation_etag.clone(),
+            route: journal.prepared.route,
+            mode: journal.prepared.mode,
+            idempotency_key: journal.prepared.idempotency_key.clone(),
+            payload_digest: journal.prepared.payload_digest.clone(),
+            prior_generation: journal.prepared.prior_generation.clone(),
+            result_generation: result_generation.map(str::to_string),
+            completed_revoke_legs: journal.revoke_leg,
+            lifecycle_epoch: journal.prepared.lifecycle_epoch,
+            fence_epoch: journal.prepared.fence_epoch,
+            lifecycle_key_version: journal.prepared.lifecycle_key_version,
+            terminal_code: terminal_code.to_string(),
+            completed_at_ms: now_ms,
+        };
+        let receipt_id = self.receipt_index_id(&context.principal, journal.prepared.provider)?;
+        let mut index =
+            self.load_receipt_index(&receipt_id)?
+                .unwrap_or(AccountLifecycleReceiptIndexV1 {
+                    version: SCHEMA_VERSION,
+                    provider: journal.prepared.provider,
+                    lifecycle_epoch: journal.prepared.lifecycle_epoch,
+                    receipts: Vec::new(),
+                });
+        if let Some(existing) = index
+            .receipts
+            .iter()
+            .find(|value| value.operation_id == receipt.operation_id)
+        {
+            if existing != &receipt {
+                return Err(LifecycleRecordError::StaleFence);
+            }
+        } else {
+            if index.receipts.len() >= MAX_RECEIPTS {
+                return Err(LifecycleRecordError::ReceiptCapacityExhausted);
+            }
+            index.lifecycle_epoch = journal.prepared.lifecycle_epoch;
+            index.receipts.push(receipt.clone());
+            self.put_receipt_index(&receipt_id, &index)?;
         }
         context
             .authority
             .active_operations
             .remove(&journal.prepared.provider);
         self.put_authority(&context.principal, &context.authority)?;
-        self.delete_journal(id)?;
         Ok(receipt)
     }
 
