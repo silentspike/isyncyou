@@ -351,22 +351,27 @@ impl Default for CodexOAuthConfig {
     }
 }
 
-/// Build the Codex authorize URL (PKCE S256) the system browser opens. NOTE: we deliberately
-/// do **not** send `codex_cli_simplified_flow` — that makes the consent hand the code to the
-/// loopback server over a JS `fetch` (CORS) handshake the CLI's own server implements; we use
-/// the plain redirect flow instead, so the browser just navigates to `redirect_uri?code=…`.
-/// `id_token_add_organizations` is kept so the id_token carries the ChatGPT account id.
+/// Required public-client identity used by the official Codex OAuth flow.
+pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
+pub const CODEX_OAUTH_SIMPLIFIED_FLOW: &str = "true";
+
+/// Build the Codex authorize URL (PKCE S256) the system browser opens. The simplified-flow and
+/// originator fields are part of the current official Codex public-client request. The official
+/// client still receives the authorization code through the ordinary loopback redirect, so our
+/// callback server can consume the same `redirect_uri?code=...&state=...` request.
 pub fn codex_build_authorize_url(cfg: &CodexOAuthConfig, challenge: &str, state: &str) -> String {
     format!(
         "{base}?response_type=code&client_id={cid}&redirect_uri={ru}&scope={sc}\
-         &code_challenge={ch}&code_challenge_method=S256&state={st}\
-         &id_token_add_organizations=true",
+         &code_challenge={ch}&code_challenge_method=S256&id_token_add_organizations=true\
+         &codex_cli_simplified_flow={simplified}&state={st}&originator={originator}",
         base = cfg.authorize_url,
         cid = pct(&cfg.client_id),
         ru = pct(&cfg.redirect_uri),
         sc = pct(&cfg.scope),
         ch = pct(challenge),
         st = pct(state),
+        simplified = CODEX_OAUTH_SIMPLIFIED_FLOW,
+        originator = CODEX_OAUTH_ORIGINATOR,
     )
 }
 
@@ -543,5 +548,49 @@ mod tests {
         let (c2, s2) = parse_pasted_code("onlycode");
         assert_eq!(c2, "onlycode");
         assert_eq!(s2, None);
+    }
+
+    #[test]
+    fn codex_authorize_url_retains_official_simplified_flow_and_originator() {
+        let cfg = CodexOAuthConfig::default();
+        let url = codex_build_authorize_url(&cfg, "challenge", "state");
+        let (_, query) = url.split_once('?').expect("authorize URL has query");
+        let ordered_keys: Vec<&str> = query
+            .split('&')
+            .map(|field| field.split_once('=').expect("query field has value").0)
+            .collect();
+        let fields: std::collections::BTreeMap<&str, &str> = query
+            .split('&')
+            .map(|field| field.split_once('=').expect("query field has value"))
+            .collect();
+
+        assert_eq!(
+            fields.len(),
+            10,
+            "no default-client query field may drift in"
+        );
+        assert_eq!(
+            ordered_keys,
+            [
+                "response_type",
+                "client_id",
+                "redirect_uri",
+                "scope",
+                "code_challenge",
+                "code_challenge_method",
+                "id_token_add_organizations",
+                "codex_cli_simplified_flow",
+                "state",
+                "originator",
+            ]
+        );
+        assert_eq!(
+            fields.get("codex_cli_simplified_flow"),
+            Some(&CODEX_OAUTH_SIMPLIFIED_FLOW)
+        );
+        assert_eq!(fields.get("originator"), Some(&CODEX_OAUTH_ORIGINATOR));
+        assert_eq!(fields.get("code_challenge_method"), Some(&"S256"));
+        assert_eq!(fields.get("id_token_add_organizations"), Some(&"true"));
+        assert_eq!(fields.get("state"), Some(&"state"));
     }
 }

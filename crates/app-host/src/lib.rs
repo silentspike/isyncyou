@@ -1621,8 +1621,9 @@ fn uuid_v4() -> Result<String, String> {
 }
 
 /// #639: a stable fingerprint of the compiled official OAuth policy tuple for `provider`
-/// (authorize/token endpoints, client id, redirect, scopes). Binding it into the activation record
-/// means a credential minted under a different (e.g. overridden) policy can never read as ready.
+/// (authorize/token endpoints, client id, redirect, scopes, and required public-client fields).
+/// Binding it into the activation record means a credential minted under a different (e.g.
+/// overridden) policy can never read as ready.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -1643,8 +1644,14 @@ fn oauth_policy_fingerprint(provider: ProductProviderId) -> String {
         ProductProviderId::Codex => {
             let c = isyncyou_agent::oauth::CodexOAuthConfig::default();
             format!(
-                "codex|{}|{}|{}|{}|{}",
-                c.authorize_url, c.token_url, c.client_id, c.redirect_uri, c.scope
+                "codex|{}|{}|{}|{}|{}|{}|{}",
+                c.authorize_url,
+                c.token_url,
+                c.client_id,
+                c.redirect_uri,
+                c.scope,
+                isyncyou_agent::oauth::CODEX_OAUTH_SIMPLIFIED_FLOW,
+                isyncyou_agent::oauth::CODEX_OAUTH_ORIGINATOR,
             )
         }
     };
