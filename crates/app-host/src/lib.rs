@@ -2212,6 +2212,8 @@ fn public_onboarding_error_code(code: Option<&str>) -> &'static str {
         Some("transport_unavailable") => "transport_unavailable",
         Some("exchange_failed") => "exchange_failed",
         Some("commit_failed") => "commit_failed",
+        Some("authorization_failed") => "authorization_failed",
+        Some("callback_invalid") => "callback_invalid",
         Some("journal_invalid") => "journal_invalid",
         _ => "onboarding_failed",
     }
@@ -2231,6 +2233,8 @@ fn is_onboarding_error_code(code: &str) -> bool {
             | "transport_unavailable"
             | "exchange_failed"
             | "commit_failed"
+            | "authorization_failed"
+            | "callback_invalid"
             | "journal_invalid"
     )
 }
@@ -3359,6 +3363,74 @@ fn pct_decode(s: &str) -> String {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedCodexCallback {
+    AuthorizationCode(String),
+    AuthorizationError,
+    InvalidBoundCallback,
+    UnboundCallback,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn parse_codex_callback_query(query: &str, want_state: &str) -> ParsedCodexCallback {
+    let mut code = None;
+    let mut state = None;
+    let mut state_count = 0u8;
+    let mut scope_seen = false;
+    let mut error_seen = false;
+    let mut error_nonempty = false;
+    let mut error_description_seen = false;
+    let mut error_uri_seen = false;
+    let mut malformed = false;
+
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            malformed = true;
+            continue;
+        };
+        match key {
+            "code" if code.is_none() => code = Some(pct_decode(value)),
+            "state" => {
+                state_count = state_count.saturating_add(1);
+                if state_count == 1 {
+                    state = Some(pct_decode(value));
+                }
+            }
+            "scope" if !scope_seen => scope_seen = true,
+            "error" if !error_seen => {
+                error_seen = true;
+                error_nonempty = !value.is_empty();
+            }
+            "error_description" if !error_description_seen => {
+                error_description_seen = true;
+            }
+            "error_uri" if !error_uri_seen => error_uri_seen = true,
+            _ => malformed = true,
+        }
+    }
+
+    // Only a single matching state grants this callback authority over the attempt. A random or
+    // ambiguous loopback request must not consume the real browser flow.
+    if state_count != 1 || state.as_deref() != Some(want_state) {
+        return ParsedCodexCallback::UnboundCallback;
+    }
+    if malformed || (!error_seen && (error_description_seen || error_uri_seen)) {
+        return ParsedCodexCallback::InvalidBoundCallback;
+    }
+    match (code, error_seen, error_nonempty) {
+        (Some(code), false, _) if !code.is_empty() => ParsedCodexCallback::AuthorizationCode(code),
+        (None, true, true) => ParsedCodexCallback::AuthorizationError,
+        _ => ParsedCodexCallback::InvalidBoundCallback,
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 const CODEX_OK_HTML: &str = "<!doctype html><meta charset=utf-8><title>ChatGPT connected</title>\
 <body style=\"font-family:system-ui;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;\
 align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Connected</h1>\
@@ -3413,7 +3485,7 @@ fn remove_legacy_codex_callback_diagnostics(oauth_dir: &Path) {
     feature = "agent-subscription-experimental"
 ))]
 /// One-shot loopback callback server for the Codex OAuth (OpenAI registers the fixed
-/// `:1455` redirect). Waits for the browser to hit `/auth/callback?code=&state=`, verifies
+/// `:1455` redirect). Waits for the browser to hit `/auth/callback?code=&state=&scope=`, verifies
 /// the CSRF `state`, exchanges the code, and persists the credential. The background
 /// thread uses the same bounded lifetime as its owning OAuth attempt. It never persists
 /// callback diagnostics or target data.
@@ -3543,31 +3615,39 @@ fn codex_callback_serve_until(
                 continue;
             }
             let query = target.split_once('?').map(|(_, query)| query).unwrap_or("");
-            let (mut code, mut state) = (None, None);
-            let mut duplicate_or_unknown = false;
-            for pair in query.split('&') {
-                match pair.split_once('=') {
-                    Some(("code", value)) if code.is_none() => code = Some(pct_decode(value)),
-                    Some(("state", value)) if state.is_none() => state = Some(pct_decode(value)),
-                    _ => duplicate_or_unknown = true,
+            let code = match parse_codex_callback_query(query, &want_state) {
+                ParsedCodexCallback::AuthorizationCode(code) => code,
+                ParsedCodexCallback::UnboundCallback => {
+                    let body = CODEX_ERR_HTML;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    continue;
                 }
-            }
-            let valid_callback = !duplicate_or_unknown
-                && code.as_deref().is_some_and(|value| !value.is_empty())
-                && state.as_deref() == Some(want_state.as_str());
-            if !valid_callback {
-                let body = CODEX_ERR_HTML;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes());
-                continue;
-            }
+                callback @ (ParsedCodexCallback::AuthorizationError
+                | ParsedCodexCallback::InvalidBoundCallback) => {
+                    if claim_codex_callback_attempt(&attempts, &attempt_id, &cancelled) {
+                        claimed = true;
+                        terminal_code = Some(
+                            if matches!(callback, ParsedCodexCallback::AuthorizationError) {
+                                "authorization_failed"
+                            } else {
+                                "callback_invalid"
+                            },
+                        );
+                    }
+                    let body = CODEX_ERR_HTML;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    break;
+                }
+            };
 
-            // The callback and cancel/reap paths race only here. Whoever removes this exact
-            // pointer-bound attempt first owns the terminal result; a late callback has no authority
-            // to exchange or persist credentials.
             if !claim_codex_callback_attempt(&attempts, &attempt_id, &cancelled) {
                 let body = CODEX_ERR_HTML;
                 let response = format!(
@@ -3577,17 +3657,15 @@ fn codex_callback_serve_until(
                 let _ = stream.write_all(response.as_bytes());
                 break;
             }
+            // The callback and cancel/reap paths race only here. Whoever removes this exact
+            // pointer-bound attempt first owns the terminal result; a late callback has no authority
+            // to exchange or persist credentials.
             claimed = true;
             let exchange = isyncyou_agent::http::HttpTransport::shared()
                 .map_err(|_| ())
                 .and_then(|http| {
-                    isyncyou_agent::oauth::codex_exchange(
-                        &http,
-                        &cfg,
-                        code.as_deref().unwrap_or_default(),
-                        &verifier,
-                    )
-                    .map_err(|_| ())
+                    isyncyou_agent::oauth::codex_exchange(&http, &cfg, &code, &verifier)
+                        .map_err(|_| ())
                 });
             let ok = match exchange {
                 Ok(token) => {
@@ -10611,6 +10689,128 @@ mod tests {
             "cancelled",
             &stale_owner
         ));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_callback_accepts_official_scope_parameter() {
+        assert_eq!(
+            parse_codex_callback_query(
+                "code=authorization-code&scope=openid%20profile%20email&state=expected",
+                "expected"
+            ),
+            ParsedCodexCallback::AuthorizationCode("authorization-code".into())
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters() {
+        assert_eq!(
+            parse_codex_callback_query(
+                "code=authorization-code&scope=openid&scope=profile&state=expected",
+                "expected"
+            ),
+            ParsedCodexCallback::InvalidBoundCallback
+        );
+        assert_eq!(
+            parse_codex_callback_query(
+                "code=authorization-code&unexpected=value&state=expected",
+                "expected"
+            ),
+            ParsedCodexCallback::InvalidBoundCallback
+        );
+        assert_eq!(
+            parse_codex_callback_query(
+                "code=authorization-code&state=expected&state=expected",
+                "expected"
+            ),
+            ParsedCodexCallback::UnboundCallback
+        );
+        assert_eq!(
+            parse_codex_callback_query("code=authorization-code&state=wrong", "expected"),
+            ParsedCodexCallback::UnboundCallback
+        );
+        assert_eq!(
+            public_onboarding_error_code(Some("authorization_failed")),
+            "authorization_failed"
+        );
+        assert_eq!(
+            public_onboarding_error_code(Some("callback_invalid")),
+            "callback_invalid"
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_authorization_error_callback_terminates_without_exchange() {
+        use std::io::{Read, Write};
+
+        let _env = AppHostCredentialEnvGuard::new();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_id = "authorization-error".to_string();
+        attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            OAuthAttempt::Codex {
+                cancelled: Arc::clone(&cancelled),
+                expires_at: std::time::Instant::now() + OAUTH_ATTEMPT_TTL,
+            },
+        );
+        let root = apphost_credential_test_root("codex-authorization-error");
+        let _ = std::fs::remove_dir_all(&root);
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Codex,
+            &attempt_id,
+            ProductOnboardingState::OfficialSignInStarted,
+            None,
+        );
+        let context = CodexCallbackContext {
+            oauth_dir: root.clone(),
+            cfg: isyncyou_agent::oauth::CodexOAuthConfig::default(),
+            verifier: "verifier".into(),
+            want_state: "expected".into(),
+            attempt_id: attempt_id.clone(),
+            cancelled,
+            attempts: Arc::clone(&attempts),
+            product_runtime_gate: Arc::new(Mutex::new(())),
+        };
+        let server = std::thread::spawn(move || {
+            codex_callback_serve_until(
+                listener,
+                context,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            );
+        });
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .write_all(
+                b"GET /auth/callback?error=access_denied&error_description=cancelled&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+
+        assert!(response.contains("Sign-in failed"));
+        assert!(!attempts.lock().unwrap().contains_key(&attempt_id));
+        let journal = load_onboarding_journal(&root, &attempt_id).expect("attempt journal");
+        let terminal = journal.transitions.last().expect("terminal transition");
+        assert_eq!(terminal.state, ProductOnboardingState::ErrorRedacted);
+        assert_eq!(terminal.error_code.as_deref(), Some("authorization_failed"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(any(
