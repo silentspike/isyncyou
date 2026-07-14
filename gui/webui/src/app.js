@@ -4637,6 +4637,278 @@ function agentCredentialState(st, provider) {
   return states && typeof states === "object" ? states[provider] : "";
 }
 
+function accountLifecycleNode(st, provider) {
+  const lifecycle = st && st.account_lifecycle;
+  const node = lifecycle && lifecycle[provider];
+  return node && typeof node === "object" ? node : null;
+}
+
+function lifecycleRequestId(key) {
+  const existing = AssistantState.lifecycleRequestIds.get(key);
+  if (existing) return existing;
+  const requestId = crypto.randomUUID();
+  AssistantState.lifecycleRequestIds.set(key, requestId);
+  return requestId;
+}
+
+function clearLifecycleRequestId(key) {
+  AssistantState.lifecycleRequestIds.delete(key);
+}
+
+function lifecycleProviderName(provider) {
+  return provider === "codex" ? "ChatGPT" : "Claude";
+}
+
+function lifecycleStateLabel(node) {
+  const labels = {
+    connected: "Connected",
+    reconnect_required: "Reconnect required",
+    revoke_unknown: "Revocation needs retry",
+    cleanup_pending: "Cleanup needs resume",
+    candidate_cleanup: "New sign-in needs cleanup",
+    exchange_outcome_unknown: "Sign-in outcome unknown",
+    awaiting_oauth_login: "Ready for sign-in",
+    disconnected: "Disconnected",
+    busy: "Account change in progress",
+    unavailable: "Lifecycle unavailable",
+  };
+  return labels[(node && node.state) || ""] || "Account status unavailable";
+}
+
+function confirmAccountLifecycle(provider, mode, scope, ackRequired) {
+  return new Promise((resolve) => {
+    const providerName = lifecycleProviderName(provider);
+    const action = mode === "disconnect" ? "Disconnect" : mode === "switch" ? "Switch" : "Reconnect";
+    const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+    const scrim = el("div", { class: "scrim" });
+    const ack = ackRequired ? el("input", { type: "checkbox", "data-agent-lifecycle-full-grant-ack": "1" }) : null;
+    const confirmButton = el("button", {
+      class: "btn primary",
+      type: "button",
+      disabled: ackRequired ? "disabled" : null,
+      "data-agent-lifecycle-confirm": mode,
+    }, action);
+    const close = (value) => { overlay.remove(); resolve(value); };
+    if (ack) ack.onchange = () => { confirmButton.disabled = !ack.checked; };
+    confirmButton.onclick = () => close({ acknowledgeFullGrant: !!(ack && ack.checked) });
+    scrim.onclick = () => close(null);
+    const scopeCopy = scope === "full_grant"
+      ? "This provider reports a shared grant. Revoking it may sign out other clients that use the same grant."
+      : scope === "guaranteed_token_session"
+        ? "The provider guarantees that revocation is limited to this app token session."
+        : scope === "observed_token_session"
+          ? "iSyncYou sends this app's token for revocation. The provider does not guarantee that the effect is limited to only this session."
+          : "The provider has not guaranteed the exact revocation scope.";
+    const panel = el("section", {
+      class: "assistant-lifecycle-dialog",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": `${action} ${providerName}`,
+      "data-agent-lifecycle-dialog": mode,
+    },
+    el("h2", { text: `${action} ${providerName}?` }),
+    el("p", { text: mode === "disconnect"
+      ? "iSyncYou will revoke its provider token before removing the local account state."
+      : mode === "switch"
+        ? "iSyncYou will revoke and remove the current account before opening a fresh sign-in."
+        : "iSyncYou will revoke and remove the current credential before reconnecting." }),
+    el("p", { class: "dim", text: scopeCopy }),
+    ack ? el("label", { class: "assistant-lifecycle-ack" }, ack, el("span", { text: "I understand that other clients may be signed out." })) : null,
+    el("div", { class: "assistant-lifecycle-dialog-actions" },
+      el("button", { class: "btn ghost", type: "button", onclick: () => close(null) }, "Cancel"),
+      confirmButton));
+    overlay.append(scrim, panel);
+    document.body.append(overlay);
+    confirmButton.focus();
+  });
+}
+
+async function withCredentialRevokeGuard(provider, operation) {
+  let guardId = null;
+  try {
+    guardId = await beginNetworkGuard("credential_revoke");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "credential_revoke", guardId);
+    return await operation();
+  } finally {
+    await endNetworkGuard(guardId);
+  }
+}
+
+function lifecycleResumeAction(node) {
+  if (!node) return null;
+  if (node.state === "revoke_unknown" || node.state === "candidate_cleanup") return "retry_revoke";
+  if (node.state === "cleanup_pending") return "resume_cleanup";
+  if (node.state === "exchange_outcome_unknown") return "retry_exchange";
+  return null;
+}
+
+async function runLifecycleResume(provider, node, explicitAction) {
+  const action = explicitAction || lifecycleResumeAction(node);
+  const operationId = node && node.resume_operation_id;
+  const operationEtag = node && node.operation_etag;
+  if (!action || !operationId || !operationEtag) {
+    toast("Account recovery is unavailable", "err");
+    return null;
+  }
+  const key = `lifecycle-resume:${provider}:${operationId}:${action}`;
+  try {
+    const result = await withCredentialRevokeGuard(provider, () => postJson(
+      "/api/v1/agent/oauth/lifecycle/resume",
+      CAP.agent,
+      {
+        provider,
+        request_id: lifecycleRequestId(key),
+        operation_id: operationId,
+        operation_etag: operationEtag,
+        action,
+      },
+    ));
+    clearLifecycleRequestId(key);
+    return result;
+  } catch (error) {
+    if (error && error.connectivity) rememberConnectivityIssue(error, () => runLifecycleResume(provider, node, action));
+    else toast("Account recovery could not continue", "err");
+    return null;
+  }
+}
+
+async function startAccountLifecycle(provider, mode, node) {
+  if (!node || !node.credential_etag || node.busy) return;
+  const confirmation = await confirmAccountLifecycle(
+    provider,
+    mode,
+    node.revoke_scope_guarantee || "unknown",
+    node.ack_required === true,
+  );
+  if (!confirmation) return;
+  const key = `lifecycle-start:${provider}:${mode}:${node.credential_etag}`;
+  try {
+    const result = await withCredentialRevokeGuard(provider, () => postJson(
+      "/api/v1/agent/oauth/logout",
+      CAP.agent,
+      {
+        provider,
+        mode,
+        request_id: lifecycleRequestId(key),
+        credential_etag: node.credential_etag,
+        resume: null,
+        acknowledge_full_grant: confirmation.acknowledgeFullGrant,
+      },
+    ));
+    clearLifecycleRequestId(key);
+    if (result && result.state === "awaiting_oauth_login" && (mode === "reconnect" || mode === "switch")) {
+      await startAiLogin(provider, result.operation_id);
+      return;
+    }
+    if (mode === "disconnect" && result && result.state === "completed") {
+      AssistantState.lastUsage = null;
+      toast(`${lifecycleProviderName(provider)} disconnected`);
+    }
+    await renderAssistantView($("#view"));
+  } catch (error) {
+    if (error && error.connectivity) rememberConnectivityIssue(error, () => startAccountLifecycle(provider, mode, node));
+    else toast("Account change could not be completed", "err");
+    await renderAssistantView($("#view"));
+  }
+}
+
+async function continueLifecycleOAuth(provider, node) {
+  if (!node || node.state !== "awaiting_oauth_login" || !node.resume_operation_id) return;
+  await startAiLogin(provider, node.resume_operation_id);
+}
+
+async function resumeAccountLifecycle(provider, node, action) {
+  const result = await runLifecycleResume(provider, node, action);
+  if (!result) {
+    await renderAssistantView($("#view"));
+    return;
+  }
+  if (result.state === "awaiting_oauth_login" && (result.mode === "reconnect" || result.mode === "switch")) {
+    await startAiLogin(provider, result.operation_id);
+    return;
+  }
+  if (result.code === "same_account_selected") toast("The same account was selected; the account was not switched.", "err");
+  await renderAssistantView($("#view"));
+}
+
+async function handleCandidateCleanupStatus(status, provider) {
+  const node = accountLifecycleNode(status, provider);
+  if (!node || node.state !== "candidate_cleanup") return false;
+  const operationId = node.resume_operation_id;
+  if (!operationId || AssistantState.lifecycleAutoResume.has(operationId)) return true;
+  AssistantState.lifecycleAutoResume.add(operationId);
+  OAUTH_ATTEMPTS.delete(provider);
+  await finishOAuthGuard(provider);
+  toast(node.mode === "switch" ? "The selected account could not be activated. Cleaning up the new sign-in." : "The new sign-in could not be activated. Cleaning it up.", "err");
+  try {
+    await resumeAccountLifecycle(provider, node, "retry_revoke");
+  } finally {
+    AssistantState.lifecycleAutoResume.delete(operationId);
+  }
+  return true;
+}
+
+function lifecycleActionButton(label, iconName, attrs, handler, disabled) {
+  return el("button", {
+    class: "btn ghost sm",
+    type: "button",
+    disabled: disabled ? "disabled" : null,
+    onclick: disabled ? null : handler,
+    ...attrs,
+  }, icon(iconName, "icon-sm"), label);
+}
+
+function renderAssistantLifecycleControls(st) {
+  const rows = ["claude", "codex"].map((provider) => {
+    const node = accountLifecycleNode(st, provider);
+    if (!node || node.state === "disconnected") return null;
+    const actions = [];
+    const resumeAction = lifecycleResumeAction(node);
+    if (resumeAction) {
+      const label = resumeAction === "retry_revoke" ? "Retry revoke"
+        : resumeAction === "resume_cleanup" ? "Resume cleanup" : "Retry exchange";
+      actions.push(lifecycleActionButton(label, "refresh-cw", {
+        "data-agent-lifecycle-resume": resumeAction,
+        "data-agent-lifecycle-provider": provider,
+      }, () => resumeAccountLifecycle(provider, node, resumeAction), false));
+    } else if (node.state === "awaiting_oauth_login") {
+      actions.push(lifecycleActionButton("Continue sign-in", "log-in", {
+        "data-agent-lifecycle-continue-oauth": provider,
+      }, () => continueLifecycleOAuth(provider, node), false));
+    } else if (node.credential_etag) {
+      actions.push(lifecycleActionButton(`Disconnect ${lifecycleProviderName(provider)}`, "log-out", {
+        "data-agent-lifecycle-action": "disconnect",
+        "data-agent-lifecycle-provider": provider,
+      }, () => startAccountLifecycle(provider, "disconnect", node), node.busy));
+      actions.push(lifecycleActionButton(`Reconnect ${lifecycleProviderName(provider)}`, "refresh-cw", {
+        "data-agent-lifecycle-action": "reconnect",
+        "data-agent-lifecycle-provider": provider,
+      }, () => startAccountLifecycle(provider, "reconnect", node), node.busy));
+      if (node.switch_capability === "verified_subject") {
+        actions.push(lifecycleActionButton(`Switch ${lifecycleProviderName(provider)} account`, "users", {
+          "data-agent-lifecycle-action": "switch",
+          "data-agent-lifecycle-provider": provider,
+        }, () => startAccountLifecycle(provider, "switch", node), node.busy));
+      }
+    }
+    return el("div", {
+      class: "assistant-lifecycle-row",
+      "data-agent-lifecycle-provider": provider,
+      "data-agent-lifecycle-state": node.state,
+      "data-agent-switch-capability": node.switch_capability || "unavailable",
+    },
+    el("div", { class: "assistant-lifecycle-summary" },
+      el("b", { text: lifecycleProviderName(provider) }),
+      el("span", { class: "dim", text: lifecycleStateLabel(node) }),
+      node.switch_capability === "unavailable" && node.state !== "disconnected"
+        ? el("span", { class: "dim assistant-lifecycle-capability", text: "Account switching unavailable" }) : null),
+    el("div", { class: "assistant-lifecycle-actions" }, ...actions));
+  }).filter(Boolean);
+  if (!rows.length) return null;
+  return el("section", { class: "assistant-lifecycle", "data-agent-lifecycle-controls": "1" }, ...rows);
+}
+
 async function refreshAssistantCredentialIfRequired(st) {
   const provider = agentActiveProvider(st);
   if (!provider) return st;
@@ -4663,7 +4935,7 @@ function localCallbackRedirect(host) {
   return location.port ? `http://${host}:${location.port}/callback` : "";
 }
 
-async function startAiLogin(provider) {
+async function startAiLogin(provider, lifecycleOperationId) {
   const consentProvider = agentProviderConsentId(provider);
   if (!agentPrivacyConsentAccepted(consentProvider)) {
     toast("Review privacy consent for " + agentProviderLabel(consentProvider), "err");
@@ -4679,11 +4951,12 @@ async function startAiLogin(provider) {
     await runConnectivityPreflight(provider, "oauth_start", guardId);
     const redirect = localCallbackRedirect("localhost");
     const manualCodeFlow = provider === "claude" && !redirect;
-    const requestId = crypto.randomUUID();
+    const requestKey = `oauth-start:${provider}:${lifecycleOperationId || "connect"}`;
+    const requestId = lifecycleRequestId(requestKey);
     const d = await postJson("/api/v1/agent/oauth/start", CAP.agent, {
       provider,
       request_id: requestId,
-      lifecycle_operation_id: null,
+      lifecycle_operation_id: lifecycleOperationId || null,
     });
     // Remember a server-created attempt before validating the rest of the response so the
     // common failure path can cancel it. Never return from here with the FGS lease live.
@@ -4691,6 +4964,7 @@ async function startAiLogin(provider) {
     if (!d || !d.authorize_url || !d.attempt_id) {
       throw new Error("oauth_start_invalid_response");
     }
+    clearLifecycleRequestId(requestKey);
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
@@ -4733,6 +5007,10 @@ async function pollAgentStatus(n, provider) {
   }
   try {
     const s = await api("/api/v1/agent/status");
+    if (await handleCandidateCleanupStatus(s, provider)) {
+      AGENT_POLL_ON = false;
+      return;
+    }
     const connected = assistantProviderReady(s, provider);
     if (connected) {
       AGENT_POLL_ON = false;
@@ -4793,8 +5071,12 @@ async function completeAiLogin() {
     });
     OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
-    toast("Connected!");
-    renderAssistantView($("#view"));   // re-fetch status -> switches to chat
+    const status = await api("/api/v1/agent/status");
+    if (!(await handleCandidateCleanupStatus(status, "claude"))) {
+      if (assistantProviderReady(status, "claude")) toast("Connected!");
+      else toast("Sign-in needs attention", "err");
+      renderAssistantView($("#view"));
+    }
   } catch (e) {
     await cancelOAuthAttempt("claude");
     await finishAgentGuard();
@@ -4817,6 +5099,8 @@ const AssistantState = {
   connectivityIssue: null,
   pendingConnectProvider: null,
   pendingModelSelection: null,
+  lifecycleRequestIds: new Map(),
+  lifecycleAutoResume: new Set(),
 };
 
 function closeAssistantStream(_reason) {
@@ -5031,9 +5315,13 @@ function renderAssistantWizard(body, st) {
     : reconnect
       ? "Your subscription needs to be reconnected. iSyncYou opens your device browser for the official login again."
       : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login, then hands off to the iSyncYou assistant.";
-  const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => startAiLogin("claude"), "data-testid": "agent-connect-claude" },
+  const claudeLifecycle = accountLifecycleNode(st, "claude");
+  const codexLifecycle = accountLifecycleNode(st, "codex");
+  const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => claudeLifecycle && claudeLifecycle.credential_etag
+    ? startAccountLifecycle("claude", "reconnect", claudeLifecycle) : startAiLogin("claude"), "data-testid": "agent-connect-claude" },
     icon("sparkles", "icon-sm"), reconnect && wizardProvider === "claude" ? "Reconnect Claude" : "Connect Claude");
-  const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => startAiLogin("codex"), "data-testid": "agent-connect-codex" },
+  const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => codexLifecycle && codexLifecycle.credential_etag
+    ? startAccountLifecycle("codex", "reconnect", codexLifecycle) : startAiLogin("codex"), "data-testid": "agent-connect-codex" },
     icon("sparkles", "icon-sm"), reconnect && wizardProvider === "codex" ? "Reconnect ChatGPT" : "Connect ChatGPT");
   if (unavailable || !claudeAllowed) {
     claude.setAttribute("disabled", "disabled");
@@ -5044,6 +5332,8 @@ function renderAssistantWizard(body, st) {
   body.append(el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }));
   const diagnostic = renderConnectivityDiagnostic();
   if (diagnostic) body.append(diagnostic);
+  const lifecycleControls = renderAssistantLifecycleControls(st);
+  if (lifecycleControls) body.append(lifecycleControls);
   // A reconnect is a shorter flow (same host invariants): condense the ordered steps to the
   // official sign-in + ready endpoints rather than repeating the full first-run sequence.
   const stepsPanel = reconnect ? null : renderAssistantWizardSteps(node);
@@ -5088,6 +5378,8 @@ function renderAssistantChat(body, st) {
   }
   const diagnostic = renderConnectivityDiagnostic();
   if (diagnostic) body.append(diagnostic);
+  const lifecycleControls = renderAssistantLifecycleControls(st);
+  if (lifecycleControls) body.append(lifecycleControls);
   body.append(...chatNodes);
   const log = $("#asst-log");
   if (!AssistantState.transcript.length) {
@@ -5236,6 +5528,11 @@ async function connectAgentProvider(provider) {
     await renderAssistantView($("#view"));
     return;
   }
+  const lifecycle = accountLifecycleNode(AssistantState.status, provider);
+  if (lifecycle && lifecycle.credential_etag) {
+    await startAccountLifecycle(provider, "reconnect", lifecycle);
+    return;
+  }
   await startAiLogin(provider);
 }
 async function pickModel(provider, model) {
@@ -5261,6 +5558,7 @@ async function connectCodex() {
 async function pollCodexStatus(n) {
   try {
     const s = await api("/api/v1/agent/status");
+    if (await handleCandidateCleanupStatus(s, "codex")) return;
     if (assistantProviderReady(s, "codex")) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
   if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);

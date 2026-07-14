@@ -8187,10 +8187,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn agent_oauth_start_json_preserves_oauth_guard_preflight_paths() {
         let start = APP_JS
-            .split("async function startAiLogin(provider)")
+            .split("async function startAiLogin(provider, lifecycleOperationId)")
             .nth(1)
             .unwrap()
-            .split("async function finishClaudeGuard")
+            .split("async function pollAgentStatus")
             .next()
             .unwrap();
         let guard = start.find("beginNetworkGuard(\"oauth\")").unwrap();
@@ -8213,6 +8213,130 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(connect.contains("await startAiLogin(provider)"));
         assert!(APP_JS.contains("connectAgentProvider(\"claude\")"));
         assert!(APP_JS.contains("await connectAgentProvider(\"codex\")"));
+    }
+
+    #[test]
+    fn assistant_account_lifecycle_controls_are_capability_and_state_driven() {
+        let controls = APP_JS
+            .split("function renderAssistantLifecycleControls(st)")
+            .nth(1)
+            .unwrap()
+            .split("async function refreshAssistantCredentialIfRequired")
+            .next()
+            .unwrap();
+        assert!(controls.contains("node.switch_capability === \"verified_subject\""));
+        assert!(controls.contains("Retry revoke"));
+        assert!(controls.contains("Resume cleanup"));
+        assert!(controls.contains("Retry exchange"));
+        assert!(controls.contains("node.credential_etag"));
+        assert!(controls.contains("node.busy"));
+    }
+
+    #[test]
+    fn account_lifecycle_revoke_guard_precedes_logout_request() {
+        let guard = APP_JS
+            .split("async function withCredentialRevokeGuard(provider, operation)")
+            .nth(1)
+            .unwrap()
+            .split("function lifecycleResumeAction")
+            .next()
+            .unwrap();
+        let begin = guard
+            .find("beginNetworkGuard(\"credential_revoke\")")
+            .unwrap();
+        let preflight = guard
+            .find("runConnectivityPreflight(provider, \"credential_revoke\", guardId)")
+            .unwrap();
+        let operation = guard.find("return await operation()").unwrap();
+        assert!(begin < preflight && preflight < operation);
+
+        let start = APP_JS
+            .split("async function startAccountLifecycle(provider, mode, node)")
+            .nth(1)
+            .unwrap()
+            .split("async function continueLifecycleOAuth")
+            .next()
+            .unwrap();
+        assert!(start.contains("confirmAccountLifecycle"));
+        assert!(start.contains("withCredentialRevokeGuard(provider"));
+        assert!(start.contains("/api/v1/agent/oauth/logout"));
+    }
+
+    #[test]
+    fn candidate_cleanup_ends_oauth_guard_before_starting_revoke_guard() {
+        let cleanup = APP_JS
+            .split("async function handleCandidateCleanupStatus(status, provider)")
+            .nth(1)
+            .unwrap()
+            .split("function lifecycleActionButton")
+            .next()
+            .unwrap();
+        let oauth_end = cleanup.find("await finishOAuthGuard(provider)").unwrap();
+        let revoke_resume = cleanup
+            .find("await resumeAccountLifecycle(provider, node, \"retry_revoke\")")
+            .unwrap();
+        assert!(oauth_end < revoke_resume);
+    }
+
+    #[test]
+    fn connect_reconnect_and_switch_candidate_revoke_require_fresh_revoke_snapshot() {
+        let cleanup = APP_JS
+            .split("async function handleCandidateCleanupStatus(status, provider)")
+            .nth(1)
+            .unwrap()
+            .split("function lifecycleActionButton")
+            .next()
+            .unwrap();
+        assert!(cleanup.contains("node.state !== \"candidate_cleanup\""));
+        assert!(cleanup.contains("finishOAuthGuard(provider)"));
+        assert!(APP_JS.contains("captureNetworkSnapshot(guardId)"));
+        assert!(
+            APP_JS.contains("runConnectivityPreflight(provider, \"credential_revoke\", guardId)")
+        );
+    }
+
+    #[test]
+    fn candidate_revoke_rejects_oauth_guard_snapshot() {
+        let source = include_str!("../../../crates/app-host/src/lib.rs");
+        let consume = source
+            .split("fn consume_mobile_connectivity_snapshot(")
+            .nth(1)
+            .unwrap()
+            .split("fn register_mobile_connectivity_snapshot")
+            .next()
+            .unwrap_or(source);
+        assert!(consume.contains("entry.snapshot.purpose != purpose"));
+        assert!(
+            source.contains("credential_revoke_preflight_rejects_oauth_refresh_or_turn_snapshot")
+        );
+    }
+
+    #[test]
+    fn assistant_account_lifecycle_requires_full_grant_ack_and_never_renders_raw_errors() {
+        let confirm = APP_JS
+            .split("function confirmAccountLifecycle(provider, mode, scope, ackRequired)")
+            .nth(1)
+            .unwrap()
+            .split("async function withCredentialRevokeGuard")
+            .next()
+            .unwrap();
+        assert!(confirm.contains("data-agent-lifecycle-full-grant-ack"));
+        assert!(confirm.contains("confirmButton.disabled = !ack.checked"));
+        let lifecycle = APP_JS
+            .split("function accountLifecycleNode")
+            .nth(1)
+            .unwrap()
+            .split("async function refreshAssistantCredentialIfRequired")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "subject_digest",
+            "callback_url",
+        ] {
+            assert!(!lifecycle.contains(forbidden));
+        }
     }
 
     #[test]
@@ -10832,10 +10956,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
         for needle in [
             "id: \"asst-connect-claude\"",
-            "onclick: () => startAiLogin(\"claude\")",
+            "startAccountLifecycle(\"claude\", \"reconnect\", claudeLifecycle) : startAiLogin(\"claude\")",
             "\"data-testid\": \"agent-connect-claude\"",
             "id: \"asst-connect-codex\"",
-            "onclick: () => startAiLogin(\"codex\")",
+            "startAccountLifecycle(\"codex\", \"reconnect\", codexLifecycle) : startAiLogin(\"codex\")",
             "\"data-testid\": \"agent-connect-codex\"",
         ] {
             assert!(
@@ -11055,9 +11179,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "manual Claude OAuth must show the paste-code UI instead of a polling-only wait screen"
         );
         assert!(
-            APP_JS.contains(
-                "OAUTH_ATTEMPTS.delete(\"claude\");\n    await finishAgentGuard();\n    toast(\"Connected!\");"
-            ),
+            APP_JS.contains("OAUTH_ATTEMPTS.delete(\"claude\");\n    await finishAgentGuard();")
+                && APP_JS.contains(
+                    "if (assistantProviderReady(status, \"claude\")) toast(\"Connected!\");"
+                ),
             "manual OAuth completion must clean up the network guard after a successful code exchange"
         );
         assert!(
