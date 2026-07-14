@@ -109,6 +109,35 @@ The constraints that force the shape of this decision:
    invalid product credential fails closed without local-client or FakeProvider fallback.
    Default product artifacts exclude the separate diagnostic hook (REQ-AGENT-013, #640).
 
+13. **First-run official OAuth → visible, host-enforced custom-harness handoff (REQ-AGENT-014,
+    S-AG.14/#639).** Product readiness is a durable, authenticated *activation authority*, not
+    credential presence. `provider_ready(p)` holds only when a valid **Active** V2 credential bundle
+    exists, a durable `ProductActivationV1` matches its credential generation + the official-OAuth
+    policy fingerprint + the harness contract version, and a static harness attestation passes; it is
+    **decoupled from provider selection** (an activated non-selected provider still reads ready) and
+    an experimental local-CLI credential can never satisfy it. Attestation is two-level: a static
+    per-provider allowlist over the shipped harness, plus a **per-round `AttestedProviderRequest`**
+    that the transport is the only value it will send — every `provider.next(history)` re-attests the
+    actually-sent request, so a mutated header/body cannot reach the wire. A single **product-runtime
+    gate** (one in-process mutex) spans selection + readiness (activation + attestation) + provider
+    construction and runs **before** any turn-id / stream-slot / archive resolution; a not-ready
+    product turn returns a typed `AgentStartTurnError::ProductNotReady` mapped to a closed **409** and
+    creates no turn state, with **no cross-provider fallback**. The official OAuth flow records an
+    **authenticated onboarding journal** of ordered transitions (official sign-in → credential
+    encrypted → retained envelope verified → default harness removed → M365 profile activated →
+    iSyncYou tool connected → subscription identity set → ready), keyed by the opaque attempt id
+    in-flight and by the credential generation once durable, so startup **crash-window recovery** can
+    resume: an activation missing after a credential write is re-attested and activated **without a
+    re-exchange**, and an interrupted attempt becomes `error_redacted` and is never resumed. A refresh
+    is a **V2 lifecycle event only** and never a journal event. The status onboarding projection
+    survives journal TTL (a ready provider reports every step from the activation, never the TTL'd
+    journal) and carries `Cache-Control: no-store` with no secret material; `/oauth/complete` is a
+    strict-JSON, attempt-state-bound, Claude-only manual step (Codex ends via its loopback callback).
+    The first-run wizard renders the ordered handoff from the host projection and keys all gating off
+    host readiness, never credential-presence flags. **#627 experimental** stays compiled-opt-in only
+    and never sets `connected`/activation/readiness; **FakeProvider** is a test/fixture provider only,
+    never an unconfigured product turn.
+
 ## Consequences
 
 - **Cost:** a new crate, a second HTTP client (small, blocking, rustls), and a genuinely

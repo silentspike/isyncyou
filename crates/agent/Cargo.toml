@@ -34,7 +34,13 @@ isyncyou-connectors = { path = "../connectors", default-features = false, option
 # model + crypto (tested over an in-memory transport) stay light. The caller passes a
 # pre-resolved Files.ReadWrite token, so no engine dependency is needed here.
 isyncyou-graph = { path = "../graph", default-features = false, optional = true }
-libc = { version = "0.2", optional = true }
+# non-optional: the encrypted-store bounded reader (`get_bounded`, #639) needs `O_NOFOLLOW`
+# in the default product build, not only under the experimental feature. libc is already in
+# the workspace graph transitively; making it direct here is minimal.
+libc = { version = "0.2" }
+# Cross-platform advisory product-runtime lock. Unlike a create-new sentinel, the OS releases this
+# automatically after a process crash.
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
@@ -60,4 +66,4 @@ byo-api-providers = ["http"]
 # EXPERIMENTAL, UNSUPPORTED, personal-build only (#627). Off by default; not part of
 # #623 product acceptance. This keeps local CLI credential fallback/capture separated
 # from the product app-OAuth provider runtime above.
-agent-subscription-experimental = ["http", "dep:libc"]
+agent-subscription-experimental = ["http"]

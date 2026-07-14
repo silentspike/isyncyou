@@ -1567,6 +1567,7 @@ version = "1.0.0"
 dependencies = [
  "argon2",
  "base64",
+ "fs2",
  "futures-util",
  "isyncyou-connectors",
  "isyncyou-core",
