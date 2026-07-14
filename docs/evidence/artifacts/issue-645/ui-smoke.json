@@ -1,13 +1,144 @@
 {
   "schema_version": 1,
-  "command": "node tools/agent-account-lifecycle-ui-smoke.mjs",
-  "assertions": 22,
-  "result": "pass",
-  "checks": [
-    "disconnect_available_for_non_ready_stored_credentials",
-    "switch_only_for_verified_subject",
-    "candidate_cleanup_retries_after_transient_busy",
-    "closed_codes_only",
-    "no_raw_provider_error"
+  "issue": 645,
+  "ok": true,
+  "assertions": [
+    {
+      "name": "connected Claude exposes Disconnect",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "connected Claude exposes Reconnect",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "Claude without verified subject has no Switch command",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "validated Codex exposes Switch",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "confirmation appears before lifecycle route",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "revoke guard and preflight precede logout POST",
+      "passed": true,
+      "detail": [
+        "guard:credential_revoke",
+        "preflight:credential_revoke",
+        "post:/api/v1/agent/oauth/logout:disconnect",
+        "end:revoke-guard"
+      ]
+    },
+    {
+      "name": "ambiguous revoke transport leaves guard to native deadline",
+      "passed": true,
+      "detail": [
+        "guard:credential_revoke",
+        "preflight:credential_revoke"
+      ]
+    },
+    {
+      "name": "definite revoke HTTP failure releases guard",
+      "passed": true,
+      "detail": [
+        "guard:credential_revoke",
+        "preflight:credential_revoke",
+        "end:revoke-guard"
+      ]
+    },
+    {
+      "name": "revoke unknown exposes only Retry revoke",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "revoke unknown does not expose fresh Disconnect",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "cleanup pending exposes Resume cleanup",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "unknown exchange exposes only Retry exchange",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "unknown exchange does not start another OAuth command",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "reconnect-required wizard renders Reconnect",
+      "passed": true,
+      "detail": "Reconnect Claude"
+    },
+    {
+      "name": "busy lifecycle keeps Disconnect visible but disabled",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "busy lifecycle keeps Reconnect visible but disabled",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "full-grant confirmation starts disabled",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "full-grant acknowledgement enables mutation",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "full-grant warning names other-client impact",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "Reconnect starts OAuth only with the server lifecycle operation",
+      "passed": true,
+      "detail": [
+        {
+          "provider": "claude",
+          "operationId": "server-operation-fixture"
+        }
+      ]
+    },
+    {
+      "name": "candidate cleanup ends OAuth guard before fresh revoke resume",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "candidate cleanup keeps polling after a transient callback lease race",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "lifecycle UI contains no token-delete affordance",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "both providers use the same candidate cleanup controller",
+      "passed": true,
+      "detail": null
+    }
   ]
 }

@@ -9,9 +9,14 @@
     "revoked_pending_cleanup",
     "receipt_before_compaction",
     "candidate_write_before_activation",
+    "exchange_intent_before_provider_exchange",
+    "activation_before_lifecycle_completion_restart",
     "candidate_revoke_failure",
     "cross_process_provider_lease",
-    "idempotency_after_webview_restart"
+    "idempotency_after_webview_restart",
+    "receipt_capacity_preflight",
+    "terminal_receipt_compaction",
+    "missing_authority_with_lifecycle_residue"
   ],
   "hook_instrumentation": "pass",
   "real_provider_failure_injection_claimed": false

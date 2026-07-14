@@ -1,14 +1,20 @@
-Issue #645 host gates for implementation commit b470ccedfdf799db89e89243a80db2a33f2bc5d2
+Issue #645 host gates for implementation commit 969f0c4bddbdca88644529139cad2b8317266bb5
 
 PASS cargo remote -c -- test --workspace --no-fail-fast
   isyncyou-agent: 229 passed
-  isyncyou-app-host: 290 passed, 6 explicit live-seed tests ignored
+  isyncyou-app-host: 295 passed, 6 explicit live-seed tests ignored
   isyncyou-webui: 227 passed
   isyncyou-mobile: 32 passed
   remaining workspace crates: no failures
+PASS cargo remote -c -- clippy --workspace --all-targets -- -D warnings
+PASS cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings
+PASS cargo remote -c -- clippy -p isyncyou-webui --all-targets -- -D warnings
+PASS cargo-remote-fmt --check
 PASS python3 tools/verify-agent-account-lifecycle-boundary.py: 11 checks
-PASS python3 -m unittest tools.test_agent_account_lifecycle_device_probe tools.test_verify_agent_account_lifecycle_boundary: 7 tests
-PASS node tools/agent-account-lifecycle-ui-smoke.mjs: 22 assertions
+PASS python3 -m unittest tools.test_agent_account_lifecycle_device_probe: 4 tests
+PASS python3 tools/check_traceability.py: 71 requirements, 70 implemented, 1 planned
+PASS node tools/agent-account-lifecycle-ui-smoke.mjs: 24 assertions
+PASS node --check gui/webui/src/app.js
 
-The remote test process exited only after all tests and doc-tests completed. Its optional
-multi-gigabyte artifact download was interrupted because the test results were already final.
+The remote workspace test and Clippy processes exited successfully after all tests,
+doc-tests, and target checks completed.

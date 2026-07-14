@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-14T15:10:55Z",
-  "commit": "b470ccedfdf799db89e89243a80db2a33f2bc5d2",
+  "generated_at": "2026-07-14T17:28:40Z",
+  "commit": "969f0c4bddbdca88644529139cad2b8317266bb5",
   "entries": [
     {
       "id": "EV-001",
@@ -127,6 +127,85 @@
       "command": "python3 tools/verify-agent-account-lifecycle-boundary.py",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-645/public-surface-scan.txt"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-015",
+      "claim": "The production OAuth callback persists an exchange intent before provider exchange and preserves an unknown outcome across restart.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers exchange_response_before_candidate_write_records_unknown_and_never_claims_cleanup -- --nocapture",
+      "test": "exchange_response_before_candidate_write_records_unknown_and_never_claims_cleanup",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/recovery.json"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Startup completes candidate promotion after a crash between product activation and lifecycle finalization.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers crash_after_activation_before_lifecycle_completion_recovers_after_restart -- --nocapture",
+      "test": "crash_after_activation_before_lifecycle_completion_recovers_after_restart",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/recovery.json"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Receipt capacity is rejected before lifecycle reservation or destructive provider work begins.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers receipt_capacity_is_rejected_before_a_new_operation_is_reserved -- --nocapture",
+      "test": "receipt_capacity_is_rejected_before_a_new_operation_is_reserved",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/recovery.json"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Missing authority fails closed when lifecycle journals, candidates, receipts, or exchange intents remain.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers missing_authority_with_lifecycle_residue_fails_closed -- --nocapture",
+      "test": "missing_authority_with_lifecycle_residue_fails_closed",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/recovery.json"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Lifecycle status reports the selected provider busy while its turn lease is active.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers account_lifecycle_status_is_busy_while_matching_provider_turn_lease_is_active -- --nocapture",
+      "test": "account_lifecycle_status_is_busy_while_matching_provider_turn_lease_is_active",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Lifecycle transitions write a closed redacted audit entry without operation or credential material.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers account_lifecycle_audit_records_closed_transition_without_secret_values -- --nocapture",
+      "test": "account_lifecycle_audit_records_closed_transition_without_secret_values",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-015",
+      "claim": "All strict lifecycle JSON routes receive the 8 KiB preallocation limit before router dispatch.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui strict_agent_json_routes_have_small_preallocation_limits -- --nocapture",
+      "test": "strict_agent_json_routes_have_small_preallocation_limits",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-AGENT-015",
+      "claim": "The UI retains an ambiguous revoke guard until native expiry, releases it after a definite response, and accepts the disconnected terminal state.",
+      "method": "command",
+      "command": "node tools/agent-account-lifecycle-ui-smoke.mjs docs/evidence/artifacts/issue-645/ui-smoke.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/ui-smoke.json"
     }
   ]
 }
