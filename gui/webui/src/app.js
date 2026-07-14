@@ -4842,11 +4842,11 @@ function assistantCanUse(st) {
 }
 
 const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
-const AGENT_PRIVACY_CONSENT_VERSION = 1;
+const AGENT_PRIVACY_CONSENT_VERSION = 2;
 function agentProviderConsentId(provider) {
   if (provider === "claude") return "claude";
   if (provider === "codex") return "codex";
-  return provider || "claude";
+  return null;
 }
 function agentSelectedProvider(st) {
   const onboardingProvider = st && st.onboarding && st.onboarding.selected_provider;
@@ -4865,22 +4865,42 @@ function assistantSelectedReady(st) {
   return !!provider && assistantProviderReady(st, provider);
 }
 function readAgentPrivacyConsent() {
-  try { return JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {}; }
-  catch (_) { return {}; }
+  const empty = { version: AGENT_PRIVACY_CONSENT_VERSION, providers: {} };
+  try {
+    const stored = JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {};
+    const providers = {};
+    if (stored.version === AGENT_PRIVACY_CONSENT_VERSION && stored.providers && typeof stored.providers === "object") {
+      ["claude", "codex"].forEach((provider) => {
+        const entry = stored.providers[provider];
+        if (entry && entry.accepted === true) {
+          providers[provider] = { accepted: true, timestamp: String(entry.timestamp || "") };
+        }
+      });
+      return { version: AGENT_PRIVACY_CONSENT_VERSION, providers };
+    }
+    // Preserve the previously accepted provider when upgrading the original single-provider record.
+    if (stored.version === 1 && stored.accepted === true && ["claude", "codex"].includes(stored.provider)) {
+      providers[stored.provider] = { accepted: true, timestamp: String(stored.timestamp || "") };
+      return { version: AGENT_PRIVACY_CONSENT_VERSION, providers };
+    }
+    return empty;
+  } catch (_) { return empty; }
 }
 function agentPrivacyConsentAccepted(provider) {
   const c = readAgentPrivacyConsent();
-  return c.version === AGENT_PRIVACY_CONSENT_VERSION
-    && c.accepted === true
-    && c.provider === agentProviderConsentId(provider);
+  const entry = c.providers && c.providers[agentProviderConsentId(provider)];
+  return c.version === AGENT_PRIVACY_CONSENT_VERSION && !!entry && entry.accepted === true;
 }
 async function acceptAgentPrivacyConsent(provider) {
   const consentProvider = agentProviderConsentId(provider);
+  if (!consentProvider) return;
+  const current = readAgentPrivacyConsent();
   const record = {
     version: AGENT_PRIVACY_CONSENT_VERSION,
-    accepted: true,
-    provider: consentProvider,
-    timestamp: new Date().toISOString(),
+    providers: {
+      ...current.providers,
+      [consentProvider]: { accepted: true, timestamp: new Date().toISOString() },
+    },
   };
   try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
   const pendingModel = AssistantState.pendingModelSelection;

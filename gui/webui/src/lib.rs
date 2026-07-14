@@ -10289,13 +10289,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn assistant_setup_consent_is_required_and_non_secret() {
         for needle in [
             "const AGENT_PRIVACY_CONSENT_KEY = \"isy_agent_privacy_consent_v1\";",
-            "const AGENT_PRIVACY_CONSENT_VERSION = 1;",
+            "const AGENT_PRIVACY_CONSENT_VERSION = 2;",
             "function agentPrivacyConsentAccepted(provider)",
             "async function acceptAgentPrivacyConsent(provider)",
             "version: AGENT_PRIVACY_CONSENT_VERSION",
-            "accepted: true",
-            "provider: consentProvider",
-            "timestamp: new Date().toISOString()",
+            "[\"claude\", \"codex\"].forEach((provider)",
+            "stored.version === 1 && stored.accepted === true",
+            "[consentProvider]: { accepted: true, timestamp: new Date().toISOString() }",
             "localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record))",
             "function renderAssistantConsentPanel(providers)",
             "\"data-agent-consent\": \"1\"",

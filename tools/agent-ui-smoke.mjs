@@ -456,16 +456,46 @@ async function main() {
     await page.goto(`${origin}/?first-run-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
 
+    await page.evaluate(() => localStorage.setItem("isy_agent_privacy_consent_v1", JSON.stringify({
+      version: 1,
+      accepted: true,
+      provider: "claude",
+      timestamp: "2026-01-01T00:00:00.000Z",
+    })));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
+    assert(evidence, "legacy single-provider consent remains accepted after schema upgrade",
+      await page.locator('[data-agent-consent-accept="claude"]').getAttribute("data-agent-consent-state") === "accepted"
+      && await page.locator('[data-agent-consent-accept="codex"]').getAttribute("data-agent-consent-state") === "required");
+    await page.evaluate(() => localStorage.removeItem("isy_agent_privacy_consent_v1"));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
+
     await page.locator('[data-agent-consent-accept="claude"]').click();
-    const consent = await page.evaluate(() => JSON.parse(localStorage.getItem("isy_agent_privacy_consent_v1") || "{}"));
-    assert(evidence, "consent localStorage is versioned", consent.version === 1 && consent.accepted === true && consent.provider === "claude", consent);
-    assert(evidence, "consent localStorage contains no secrets", !JSON.stringify(consent).match(/token|secret|key|code|content|refresh|access/i), consent);
+    let consent = await page.evaluate(() => JSON.parse(localStorage.getItem("isy_agent_privacy_consent_v1") || "{}"));
+    assert(evidence, "consent localStorage is versioned", consent.version === 2 && consent.providers?.claude?.accepted === true, consent);
+    assert(evidence, "consent localStorage contains no secrets",
+      !JSON.stringify(consent).match(/"(?:access_token|refresh_token|token|secret|key|code|content)"\s*:/i), consent);
     const acceptedConsent = page.locator('[data-agent-consent-accept="claude"]');
     assert(evidence, "accepted consent is visibly confirmed", await acceptedConsent.getAttribute("data-agent-consent-state") === "accepted"
       && await acceptedConsent.getAttribute("aria-pressed") === "true"
       && (await acceptedConsent.innerText()).includes("Claude allowed"));
     assert(evidence, "accepted consent cannot be submitted repeatedly", await acceptedConsent.isDisabled());
     assert(evidence, "connect is enabled only after consent", !(await page.locator('[data-testid="agent-connect-claude"]').isDisabled()));
+
+    await page.locator('[data-agent-consent-accept="codex"]').click();
+    consent = await page.evaluate(() => JSON.parse(localStorage.getItem("isy_agent_privacy_consent_v1") || "{}"));
+    assert(evidence, "provider consents persist independently", consent.version === 2
+      && consent.providers?.claude?.accepted === true
+      && consent.providers?.codex?.accepted === true, consent);
+    const acceptedCodexConsent = page.locator('[data-agent-consent-accept="codex"]');
+    assert(evidence, "both provider consents remain visibly confirmed",
+      await acceptedConsent.getAttribute("data-agent-consent-state") === "accepted"
+      && await acceptedCodexConsent.getAttribute("data-agent-consent-state") === "accepted"
+      && (await acceptedCodexConsent.innerText()).includes("ChatGPT allowed"));
+    assert(evidence, "both provider connect buttons stay enabled after consent",
+      !(await page.locator('[data-testid="agent-connect-claude"]').isDisabled())
+      && !(await page.locator('[data-testid="agent-connect-codex"]').isDisabled()));
 
     const authPopupPromise = page.waitForEvent("popup", { timeout: 2000 }).catch(() => null);
     await page.locator('#asst-connect-claude').click();
