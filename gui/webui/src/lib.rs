@@ -8249,6 +8249,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .unwrap();
         let operation = guard.find("return await operation()").unwrap();
         assert!(begin < preflight && preflight < operation);
+        assert!(guard.contains("error.responseReceived !== true"));
+        assert!(guard.contains("if (releaseGuard) await endNetworkGuard(guardId)"));
 
         let start = APP_JS
             .split("async function startAccountLifecycle(provider, mode, node)")
@@ -8260,6 +8262,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(start.contains("confirmAccountLifecycle"));
         assert!(start.contains("withCredentialRevokeGuard(provider"));
         assert!(start.contains("/api/v1/agent/oauth/logout"));
+        assert!(start.contains("result.state === \"disconnected\""));
     }
 
     #[test]

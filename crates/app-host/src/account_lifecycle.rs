@@ -33,6 +33,7 @@ const NONCE_LEN: usize = 22;
 const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const MAX_PROVIDER_ACCOUNT_ID_BYTES: usize = 512;
 const MAX_CLOSED_CODE_BYTES: usize = 64;
+const TERMINAL_RECEIPT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,6 +234,8 @@ pub(crate) struct OAuthCandidateV1 {
     pub provider_account_id: Option<String>,
     pub subject_digest: Option<String>,
     pub session_id_digest: Option<String>,
+    #[serde(default)]
+    pub result_generation: Option<String>,
     pub state: OAuthCandidateState,
     pub created_at_ms: u64,
     pub terminal_at_ms: Option<u64>,
@@ -527,6 +530,7 @@ impl LifecycleRepository {
                 INSTALLATION_PLAINTEXT_MAX,
             )
             .map_err(|_| LifecycleRecordError::Store)?;
+        let installation_existed = installation.is_some();
         let installation = match installation {
             Some(secret) => {
                 let record: AccountLifecycleInstallationV1 =
@@ -540,7 +544,7 @@ impl LifecycleRepository {
                 record
             }
             None => {
-                if directory_contains_class(&self.store_dir, "account-lifecycle-authority__")? {
+                if directory_contains_lifecycle_residue(&self.store_dir)? {
                     return Err(LifecycleRecordError::MissingInstallationPrincipal);
                 }
                 let record = AccountLifecycleInstallationV1 {
@@ -577,6 +581,9 @@ impl LifecycleRepository {
                 authority
             }
             None => {
+                if installation_existed && directory_contains_lifecycle_residue(&self.store_dir)? {
+                    return Err(LifecycleRecordError::MissingInstallationPrincipal);
+                }
                 let authority = AccountLifecycleAuthorityV1 {
                     version: SCHEMA_VERSION,
                     installation_principal_initialized: true,
@@ -796,6 +803,86 @@ impl LifecycleRepository {
         )
     }
 
+    pub(crate) fn prepare_exchange(
+        &self,
+        journal_id: &str,
+        attempt_id: &str,
+        now_ms: u64,
+    ) -> Result<AccountLifecycleJournalV1, LifecycleRecordError> {
+        let journal = self
+            .load_journal(journal_id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if journal.phase != AccountLifecyclePhase::AwaitingOAuthLogin {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        let intent_id =
+            self.exchange_intent_id(journal.prepared.provider, &journal.prepared.operation_id)?;
+        self.put_exchange_intent(
+            &intent_id,
+            &OAuthExchangeIntentV1 {
+                version: SCHEMA_VERSION,
+                provider: journal.prepared.provider,
+                operation_id: journal.prepared.operation_id.clone(),
+                attempt_id: attempt_id.to_string(),
+                created_at_ms: now_ms,
+                expires_at_ms: now_ms.saturating_add(8 * 60 * 1_000),
+            },
+        )?;
+        self.mark_exchange_in_flight(journal_id, now_ms)
+    }
+
+    fn exchange_intent_id(
+        &self,
+        provider: ProductProviderId,
+        operation_id: &str,
+    ) -> Result<String, LifecycleRecordError> {
+        let context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::MissingInstallationPrincipal)?;
+        self.derive_tag(
+            b"isyncyou/account-lifecycle-exchange-intent-id/v1",
+            &[
+                context.principal.as_bytes(),
+                provider.wire().as_bytes(),
+                operation_id.as_bytes(),
+            ],
+        )
+    }
+
+    pub(crate) fn load_exchange_intent(
+        &self,
+        provider: ProductProviderId,
+        operation_id: &str,
+    ) -> Result<Option<OAuthExchangeIntentV1>, LifecycleRecordError> {
+        let id = self.exchange_intent_id(provider, operation_id)?;
+        let Some(secret) = self
+            .store
+            .get_bounded(
+                isyncyou_agent::SecretClass::OAuthExchangeIntent,
+                &id,
+                EXCHANGE_ENVELOPE_MAX,
+                EXCHANGE_PLAINTEXT_MAX,
+            )
+            .map_err(|_| LifecycleRecordError::Store)?
+        else {
+            return Ok(None);
+        };
+        let intent = parse_bounded(secret.expose(), EXCHANGE_PLAINTEXT_MAX)?;
+        validate_exchange_intent(&intent)?;
+        Ok(Some(intent))
+    }
+
+    pub(crate) fn delete_exchange_intent(
+        &self,
+        provider: ProductProviderId,
+        operation_id: &str,
+    ) -> Result<(), LifecycleRecordError> {
+        let id = self.exchange_intent_id(provider, operation_id)?;
+        self.store
+            .delete_durable(isyncyou_agent::SecretClass::OAuthExchangeIntent, &id)
+            .map_err(|_| LifecycleRecordError::Store)
+    }
+
     pub(crate) fn put_receipt_index(
         &self,
         id: &str,
@@ -968,14 +1055,14 @@ impl LifecycleRepository {
         }
         let receipt_id = self.receipt_index_id(&context.principal, provider)?;
         if let Some(index) = self.load_receipt_index(&receipt_id)? {
-            for receipt in index.receipts {
+            for receipt in &index.receipts {
                 if receipt.idempotency_key == idempotency_key {
                     if receipt.payload_digest != payload_digest {
                         return Err(LifecycleRecordError::IdempotencyConflict);
                     }
                     return Ok(BeginLifecycleOperation {
-                        operation_id: receipt.operation_id,
-                        operation_etag: receipt.operation_etag,
+                        operation_id: receipt.operation_id.clone(),
+                        operation_etag: receipt.operation_etag.clone(),
                         journal_record_id: self.derive_tag(
                             b"isyncyou/account-lifecycle-journal-id/v1",
                             &[
@@ -987,6 +1074,9 @@ impl LifecycleRepository {
                         idempotent_replay: true,
                     });
                 }
+            }
+            if index.receipts.len() >= MAX_RECEIPTS {
+                return Err(LifecycleRecordError::ReceiptCapacityExhausted);
             }
         }
         let lifecycle_epoch = next_epoch(context.authority.lifecycle_epoch)?;
@@ -1457,6 +1547,36 @@ impl LifecycleRepository {
         )
     }
 
+    pub(crate) fn bind_candidate_generation(
+        &self,
+        journal_id: &str,
+        candidate_id: &str,
+        generation: &str,
+    ) -> Result<(), LifecycleRecordError> {
+        if !is_uuid_v4(generation) {
+            return Err(LifecycleRecordError::Invalid);
+        }
+        let journal = self
+            .load_journal(journal_id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        let mut candidate = self
+            .load_candidate(candidate_id)?
+            .ok_or(LifecycleRecordError::Invalid)?;
+        if journal.phase != AccountLifecyclePhase::CandidateValidation
+            || candidate.operation_id != journal.prepared.operation_id
+            || candidate.provider != journal.prepared.provider
+            || candidate.state != OAuthCandidateState::GrantBearing
+            || candidate
+                .result_generation
+                .as_ref()
+                .is_some_and(|existing| existing != generation)
+        {
+            return Err(LifecycleRecordError::InvalidTransition);
+        }
+        candidate.result_generation = Some(generation.to_string());
+        self.put_candidate(candidate_id, &candidate)
+    }
+
     pub(crate) fn await_oauth_login(
         &self,
         id: &str,
@@ -1553,7 +1673,10 @@ impl LifecycleRepository {
         let mut journal = self
             .load_journal(id)?
             .ok_or(LifecycleRecordError::Invalid)?;
-        if journal.phase != AccountLifecyclePhase::CandidateValidation {
+        if !matches!(
+            journal.phase,
+            AccountLifecyclePhase::CandidateValidation | AccountLifecyclePhase::Completed
+        ) {
             return Err(LifecycleRecordError::InvalidTransition);
         }
         let mut candidate = self
@@ -1561,17 +1684,31 @@ impl LifecycleRepository {
             .ok_or(LifecycleRecordError::Invalid)?;
         if candidate.operation_id != journal.prepared.operation_id
             || candidate.provider != journal.prepared.provider
-            || candidate.state != OAuthCandidateState::GrantBearing
+            || candidate.result_generation.as_deref() != Some(result_generation)
+            || !matches!(
+                (journal.phase, candidate.state),
+                (
+                    AccountLifecyclePhase::CandidateValidation,
+                    OAuthCandidateState::GrantBearing
+                ) | (
+                    AccountLifecyclePhase::Completed,
+                    OAuthCandidateState::GrantBearing | OAuthCandidateState::Promoted
+                )
+            )
         {
             return Err(LifecycleRecordError::InvalidTransition);
         }
-        journal.phase = AccountLifecyclePhase::Completed;
-        journal.updated_at_ms = now_ms.max(journal.updated_at_ms);
-        journal.closed_code = Some("connected".into());
-        self.write_journal_fenced(id, &journal)?;
-        candidate.state = OAuthCandidateState::Promoted;
-        candidate.terminal_at_ms = Some(now_ms);
-        self.put_candidate(candidate_id, &candidate)?;
+        if journal.phase == AccountLifecyclePhase::CandidateValidation {
+            journal.phase = AccountLifecyclePhase::Completed;
+            journal.updated_at_ms = now_ms.max(journal.updated_at_ms);
+            journal.closed_code = Some("connected".into());
+            self.write_journal_fenced(id, &journal)?;
+        }
+        if candidate.state == OAuthCandidateState::GrantBearing {
+            candidate.state = OAuthCandidateState::Promoted;
+            candidate.terminal_at_ms = Some(now_ms);
+            self.put_candidate(candidate_id, &candidate)?;
+        }
         let receipt =
             self.finish_oauth_operation(&journal, Some(result_generation), "connected", now_ms)?;
         self.delete_candidate(candidate_id)?;
@@ -1710,6 +1847,70 @@ impl LifecycleRepository {
         )
     }
 
+    pub(crate) fn compact_terminal_receipts(
+        &self,
+        provider: ProductProviderId,
+        protected_generation: Option<&str>,
+        now_ms: u64,
+    ) -> Result<usize, LifecycleRecordError> {
+        if protected_generation.is_some_and(|generation| !is_uuid_v4(generation)) {
+            return Err(LifecycleRecordError::Invalid);
+        }
+        let mut context = match self.load_existing()? {
+            Some(context) => context,
+            None => return Ok(0),
+        };
+        let receipt_id = self.receipt_index_id(&context.principal, provider)?;
+        let Some(mut index) = self.load_receipt_index(&receipt_id)? else {
+            return Ok(0);
+        };
+        let before = index.receipts.len();
+        let mut removed_etags = Vec::new();
+        index.receipts.retain(|receipt| {
+            let protects_current_generation = protected_generation.is_some_and(|generation| {
+                receipt.prior_generation.as_deref() == Some(generation)
+                    || receipt.result_generation.as_deref() == Some(generation)
+            });
+            let expired =
+                now_ms.saturating_sub(receipt.completed_at_ms) >= TERMINAL_RECEIPT_RETENTION_MS;
+            if expired && !protects_current_generation {
+                if let Some(generation) = receipt.prior_generation.as_deref() {
+                    if let Ok(etag) = self.derive_tag(
+                        b"isyncyou/account-lifecycle-credential-etag/v1",
+                        &[
+                            context.principal.as_bytes(),
+                            provider.wire().as_bytes(),
+                            generation.as_bytes(),
+                            &receipt.lifecycle_epoch.to_be_bytes(),
+                        ],
+                    ) {
+                        removed_etags.push(etag);
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
+        let removed = before.saturating_sub(index.receipts.len());
+        if removed == 0 {
+            return Ok(0);
+        }
+        if let Some(retired) = context
+            .authority
+            .retired_credential_etags
+            .get_mut(&provider)
+        {
+            retired.retain(|etag| !removed_etags.contains(etag));
+            if retired.is_empty() {
+                context.authority.retired_credential_etags.remove(&provider);
+            }
+        }
+        self.put_receipt_index(&receipt_id, &index)?;
+        self.put_authority(&context.principal, &context.authority)?;
+        Ok(removed)
+    }
+
     fn derive_tag(
         &self,
         domain: &'static [u8],
@@ -1784,6 +1985,24 @@ fn directory_contains_class(dir: &Path, prefix: &str) -> Result<bool, LifecycleR
         }
     }
     Ok(false)
+}
+
+fn directory_contains_lifecycle_residue(dir: &Path) -> Result<bool, LifecycleRecordError> {
+    [
+        "account-lifecycle-authority__",
+        "account-lifecycle-journal__",
+        "account-lifecycle-receipts__",
+        "oauth-exchange-intent__",
+        "oauth-candidate__",
+    ]
+    .into_iter()
+    .try_fold(false, |found, prefix| {
+        if found {
+            Ok(true)
+        } else {
+            directory_contains_class(dir, prefix)
+        }
+    })
 }
 
 fn random_b64url(bytes: usize) -> Result<String, LifecycleRecordError> {
@@ -1953,7 +2172,11 @@ pub(crate) fn validate_exchange_intent(
 ) -> Result<(), LifecycleRecordError> {
     if intent.version != SCHEMA_VERSION
         || validate_b64url(&intent.operation_id, OPERATION_ID_LEN).is_err()
-        || validate_b64url(&intent.attempt_id, DIGEST_LEN).is_err()
+        || intent.attempt_id.len() != 32
+        || !intent
+            .attempt_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         || intent.created_at_ms >= intent.expires_at_ms
     {
         return Err(LifecycleRecordError::Invalid);
@@ -1985,6 +2208,10 @@ pub(crate) fn validate_candidate(
             .session_id_digest
             .as_ref()
             .is_some_and(|value| validate_b64url(value, DIGEST_LEN).is_err())
+        || candidate
+            .result_generation
+            .as_ref()
+            .is_some_and(|value| !is_uuid_v4(value))
         || candidate.created_at_ms > candidate.expires_at_ms
         || matches!(
             candidate.state,
@@ -2220,6 +2447,7 @@ mod tests {
             provider_account_id: Some("private-account-sentinel".into()),
             subject_digest: Some("s".repeat(43)),
             session_id_digest: None,
+            result_generation: None,
             state,
             created_at_ms: 1,
             terminal_at_ms: matches!(
@@ -2577,7 +2805,7 @@ mod tests {
             version: 1,
             provider: ProductProviderId::Codex,
             operation_id: "O".repeat(OPERATION_ID_LEN),
-            attempt_id: "A".repeat(DIGEST_LEN),
+            attempt_id: "a".repeat(32),
             created_at_ms: 1,
             expires_at_ms: 2,
         };
@@ -2597,6 +2825,131 @@ mod tests {
         assert!(candidate_reapable(&value, 31 * 24 * 60 * 60 * 1_000));
         value.state = OAuthCandidateState::Promoted;
         assert!(candidate_reapable(&value, 31 * 24 * 60 * 60 * 1_000));
+
+        let root = temp_root("receipt-reaper");
+        let repo = repository(&root);
+        let context = repo.initialize().unwrap();
+        let receipt_id = repo
+            .receipt_index_id(context.principal(), ProductProviderId::Codex)
+            .unwrap();
+        let mut terminal = disconnect_receipt(&journal(AccountLifecycleMode::Disconnect), 1);
+        terminal.operation_id = "R".repeat(OPERATION_ID_LEN);
+        terminal.operation_etag = "E".repeat(DIGEST_LEN);
+        terminal.idempotency_key = "I".repeat(DIGEST_LEN);
+        terminal.payload_digest = "P".repeat(DIGEST_LEN);
+        repo.put_receipt_index(
+            &receipt_id,
+            &AccountLifecycleReceiptIndexV1 {
+                version: SCHEMA_VERSION,
+                provider: ProductProviderId::Codex,
+                lifecycle_epoch: terminal.lifecycle_epoch,
+                receipts: vec![terminal],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo.compact_terminal_receipts(
+                ProductProviderId::Codex,
+                None,
+                TERMINAL_RECEIPT_RETENTION_MS + 2,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(repo
+            .load_receipt_index(&receipt_id)
+            .unwrap()
+            .unwrap()
+            .receipts
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_capacity_is_rejected_before_a_new_operation_is_reserved() {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let root = temp_root("receipt-capacity-preflight");
+        let repo = repository(&root);
+        let context = repo.initialize().unwrap();
+        let receipt_id = repo
+            .receipt_index_id(context.principal(), ProductProviderId::Codex)
+            .unwrap();
+        let receipts = ALPHABET
+            .iter()
+            .map(|byte| AccountLifecycleReceiptV1 {
+                version: SCHEMA_VERSION,
+                operation_id: char::from(*byte).to_string().repeat(OPERATION_ID_LEN),
+                operation_etag: char::from(*byte).to_string().repeat(DIGEST_LEN),
+                route: AccountLifecycleRoute::Logout,
+                mode: AccountLifecycleMode::Disconnect,
+                idempotency_key: char::from(*byte).to_string().repeat(DIGEST_LEN),
+                payload_digest: char::from(*byte).to_string().repeat(DIGEST_LEN),
+                prior_generation: Some("123e4567-e89b-42d3-a456-426614174001".into()),
+                result_generation: None,
+                completed_revoke_legs: 1,
+                lifecycle_epoch: 1,
+                fence_epoch: 1,
+                lifecycle_key_version: 1,
+                terminal_code: "disconnected".into(),
+                completed_at_ms: 1,
+            })
+            .collect();
+        repo.put_receipt_index(
+            &receipt_id,
+            &AccountLifecycleReceiptIndexV1 {
+                version: SCHEMA_VERSION,
+                provider: ProductProviderId::Codex,
+                lifecycle_epoch: 1,
+                receipts,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo.begin_operation(
+                ProductProviderId::Codex,
+                AccountLifecycleRoute::Logout,
+                AccountLifecycleMode::Disconnect,
+                "123e4567-e89b-42d3-a456-426614174099",
+                Some("123e4567-e89b-42d3-a456-426614174001"),
+                None,
+                Some(RevokeRequestTarget::RefreshToken),
+                Some(RevokeScopeGuarantee::ObservedTokenSession),
+                2,
+            ),
+            Err(LifecycleRecordError::ReceiptCapacityExhausted)
+        );
+        assert!(repo
+            .active_operation(ProductProviderId::Codex)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_authority_with_lifecycle_residue_fails_closed() {
+        let root = temp_root("missing-authority-residue");
+        let repo = repository(&root);
+        let context = repo.initialize().unwrap();
+        repo.store
+            .delete_durable(
+                isyncyou_agent::SecretClass::AccountLifecycleAuthority,
+                context.principal(),
+            )
+            .unwrap();
+        repo.store
+            .put_bounded(
+                isyncyou_agent::SecretClass::OAuthCandidate,
+                &"r".repeat(DIGEST_LEN),
+                &isyncyou_agent::Secret::new(b"residue".to_vec()),
+                CANDIDATE_ENVELOPE_MAX,
+            )
+            .unwrap();
+        assert!(matches!(
+            repository(&root).initialize(),
+            Err(LifecycleRecordError::MissingInstallationPrincipal)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -103,6 +103,9 @@ fn strict_json_body_limit(method: &str, target: &str) -> Option<usize> {
             | "/api/v1/agent/credential/refresh"
             | "/api/v1/agent/oauth/cancel"
             | "/api/v1/agent/oauth/complete"
+            | "/api/v1/agent/oauth/start"
+            | "/api/v1/agent/oauth/logout"
+            | "/api/v1/agent/oauth/lifecycle/resume"
     )
     .then_some(AGENT_STRICT_JSON_MAX_BYTES)
 }
@@ -796,6 +799,17 @@ mod tests {
             strict_json_body_limit("POST", "/api/v1/agent/oauth/complete"),
             Some(AGENT_STRICT_JSON_MAX_BYTES)
         );
+        for path in [
+            "/api/v1/agent/oauth/start",
+            "/api/v1/agent/oauth/logout",
+            "/api/v1/agent/oauth/lifecycle/resume",
+        ] {
+            assert_eq!(
+                strict_json_body_limit("POST", path),
+                Some(AGENT_STRICT_JSON_MAX_BYTES),
+                "{path} must be bounded before body allocation"
+            );
+        }
         assert_eq!(strict_json_body_limit("POST", "/api/v1/agent/turn"), None);
         assert_eq!(
             strict_json_body_limit("GET", "/api/v1/agent/connectivity/preflight"),

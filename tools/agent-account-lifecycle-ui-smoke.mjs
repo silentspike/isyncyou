@@ -160,7 +160,7 @@ async function main() {
         window.__lifecycleOrder = [];
         beginNetworkGuard = async (reason) => { window.__lifecycleOrder.push(`guard:${reason}`); return "revoke-guard"; };
         runConnectivityPreflight = async (_provider, purpose) => { window.__lifecycleOrder.push(`preflight:${purpose}`); return { status: "ready" }; };
-        postJson = async (route, _cap, body) => { window.__lifecycleOrder.push(`post:${route}:${body.mode}`); return { state: "completed", mode: body.mode, code: "ok" }; };
+        postJson = async (route, _cap, body) => { window.__lifecycleOrder.push(`post:${route}:${body.mode}`); return { state: "disconnected", mode: body.mode, code: "disconnected" }; };
         endNetworkGuard = async (guardId) => { window.__lifecycleOrder.push(`end:${guardId}`); };
         renderAssistantView = async () => {};
       });
@@ -170,6 +170,28 @@ async function main() {
       await page.waitForFunction(() => window.__lifecycleOrder.length === 4);
       const order = await page.evaluate(() => window.__lifecycleOrder);
       check(report, "revoke guard and preflight precede logout POST", order.join("|") === "guard:credential_revoke|preflight:credential_revoke|post:/api/v1/agent/oauth/logout:disconnect|end:revoke-guard", order);
+
+      const ambiguous = await page.evaluate(async () => {
+        window.__lifecycleOrder = [];
+        try {
+          await withCredentialRevokeGuard("claude", async () => { throw new Error("lost response"); });
+        } catch (_) {}
+        return window.__lifecycleOrder;
+      });
+      check(report, "ambiguous revoke transport leaves guard to native deadline", ambiguous.join("|") === "guard:credential_revoke|preflight:credential_revoke", ambiguous);
+
+      const rejected = await page.evaluate(async () => {
+        window.__lifecycleOrder = [];
+        try {
+          await withCredentialRevokeGuard("claude", async () => {
+            const error = new Error("closed HTTP error");
+            error.responseReceived = true;
+            throw error;
+          });
+        } catch (_) {}
+        return window.__lifecycleOrder;
+      });
+      check(report, "definite revoke HTTP failure releases guard", rejected.join("|") === "guard:credential_revoke|preflight:credential_revoke|end:revoke-guard", rejected);
     });
 
     await withScenario(browser, "revoke_unknown", async (page) => {

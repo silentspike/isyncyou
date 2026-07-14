@@ -536,7 +536,11 @@ async function request(method, path, opts) {
     const sep = path.includes("?") ? "&" : "?";
     return request(method, `${path}${sep}_pat=${encodeURIComponent(d.pending_action_id)}`, opts);
   }
-  if (!Number.isFinite(status) || status < 200 || status >= 300) throw new Error(d.error || status || "Request failed");
+  if (!Number.isFinite(status) || status < 200 || status >= 300) {
+    const error = new Error(d.error || status || "Request failed");
+    error.responseReceived = true;
+    throw error;
+  }
   return d;
 }
 async function api(path) { return request("GET", path); }
@@ -4725,13 +4729,21 @@ function confirmAccountLifecycle(provider, mode, scope, ackRequired) {
 
 async function withCredentialRevokeGuard(provider, operation) {
   let guardId = null;
+  let operationStarted = false;
+  let releaseGuard = true;
   try {
     guardId = await beginNetworkGuard("credential_revoke");
     if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
     await runConnectivityPreflight(provider, "credential_revoke", guardId);
+    operationStarted = true;
     return await operation();
+  } catch (error) {
+    if (operationStarted && error && error.responseReceived !== true) {
+      releaseGuard = false;
+    }
+    throw error;
   } finally {
-    await endNetworkGuard(guardId);
+    if (releaseGuard) await endNetworkGuard(guardId);
   }
 }
 
@@ -4801,7 +4813,7 @@ async function startAccountLifecycle(provider, mode, node) {
       await startAiLogin(provider, result.operation_id);
       return;
     }
-    if (mode === "disconnect" && result && result.state === "completed") {
+    if (mode === "disconnect" && result && result.state === "disconnected") {
       AssistantState.lastUsage = null;
       toast(`${lifecycleProviderName(provider)} disconnected`);
     }
