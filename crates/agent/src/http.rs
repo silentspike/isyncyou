@@ -62,6 +62,18 @@ pub struct ProviderHttpResponse {
     pub body_preview: Option<String>,
 }
 
+/// Closed failure categories for secret-bearing, non-streaming provider requests.
+/// Raw transport errors and response bodies never cross this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "http", test))]
+pub enum SecretJsonTransportError {
+    ConnectTimedOut,
+    NameResolutionFailed,
+    TlsFailed,
+    ConnectFailed,
+    InitializationFailed,
+}
+
 /// One parsed Server-Sent Event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(any(feature = "http", test))]
@@ -285,6 +297,7 @@ mod live {
     };
     use crate::connectivity::{ProbeObservation, ProbeTarget};
     use crate::AgentError;
+    use crate::Secret;
     use futures_util::StreamExt;
     use std::sync::{Arc, OnceLock};
     use std::time::Duration;
@@ -500,6 +513,31 @@ mod live {
                 .map_err(|_| AgentError::Transport("provider_response_read_failed".into()))?;
             Ok((status, text))
         }
+
+        /// Send a secret JSON body without redirects and return only the HTTP status.
+        /// This intentionally does not read or retain the provider response body.
+        pub(crate) fn post_secret_json_no_redirect(
+            &self,
+            url: &str,
+            body: &Secret,
+            timeout: Duration,
+        ) -> Result<u16, super::SecretJsonTransportError> {
+            Self::ensure_test_network_allowed()
+                .map_err(|_| super::SecretJsonTransportError::ConnectFailed)?;
+            let client = reqwest::blocking::Client::builder()
+                .connect_timeout(timeout)
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| super::SecretJsonTransportError::InitializationFailed)?;
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.expose().to_vec())
+                .send()
+                .map(|response| response.status().as_u16())
+                .map_err(secret_json_transport_error)
+        }
     }
 
     /// The transport capability held by product providers. Unlike [`HttpTransport`], this type has
@@ -606,6 +644,17 @@ mod live {
             _ => "provider_connect_failed",
         };
         AgentError::Transport(code.into())
+    }
+
+    fn secret_json_transport_error(error: reqwest::Error) -> super::SecretJsonTransportError {
+        match probe_observation_for_reqwest_error(&error) {
+            ProbeObservation::ConnectTimedOut => super::SecretJsonTransportError::ConnectTimedOut,
+            ProbeObservation::TlsFailed => super::SecretJsonTransportError::TlsFailed,
+            ProbeObservation::NameResolutionFailed => {
+                super::SecretJsonTransportError::NameResolutionFailed
+            }
+            _ => super::SecretJsonTransportError::ConnectFailed,
+        }
     }
 
     pub(super) async fn within_deadline<T>(
