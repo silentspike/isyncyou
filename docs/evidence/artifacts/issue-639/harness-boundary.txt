@@ -1,0 +1,51 @@
+#639 S-AG.14 — retained-envelope / custom-harness boundary proof (redacted: field names,
+order, and comparison booleans only — never token/account/credential VALUES).
+
+Source of truth: the positive harness allowlist in crates/agent/src/provider.rs
+(attest_product_harness / build_attested_provider_request) and its tests.
+
+RETAINED PROVIDER-IDENTITY ENVELOPE (present + unchanged)
+--------------------------------------------------------
+Claude request top-level keys (exact set, no more, no less):
+  {max_tokens, messages, metadata, model, stream, system, tools}
+  - system: exactly 2 blocks; block[0].text STARTS WITH "x-anthropic-billing-header" (billing
+    block first + unchanged); block[1] is the single iSyncYou system prompt.
+  - stream == true (boolean).
+Claude mandatory headers (order asserted): authorization, anthropic-version, anthropic-beta,
+  anthropic-dangerous-direct-browser-access, user-agent, x-app, x-claude-code-session-id,
+  content-type, accept.
+
+Codex request top-level keys (exact set):
+  {input, instructions, model, parallel_tool_calls, store, stream, tool_choice, tools}
+  - store == false (boolean).
+  - stream == true (boolean).
+Codex mandatory headers (order asserted): authorization, chatgpt-account-id, originator,
+  openai-beta, user-agent, accept.
+
+CUSTOM HARNESS INSTALLED (exactly one tool)
+-------------------------------------------
+tools array length == 1; tools[0].name == crate::tool::TOOL_NAME ("isyncyou").
+
+DEFAULT-CLIENT HARNESS ABSENT (negative scan)
+---------------------------------------------
+No key from the forbidden set appears anywhere (recursive) in either request body:
+  client_context, commands, cwd, default_system_prompt, filesystem, history, mcp, mcp_servers,
+  memories, plugins, rules, shell, skills, system_prompt, workspace.
+
+VERIFYING TESTS (all PASS; agent suite 198 passed)
+--------------------------------------------------
+  product_harness_retains_only_required_provider_identity_fields
+  product_harness_contains_no_default_client_agent_components
+  custom_harness_installs_only_isyncyou_prompt_and_tool
+  custom_harness_removes_default_prompt_tools_skills_mcp_rules_and_history
+  custom_harness_replaces_only_non_auth_non_billing_sections
+  claude_billing_block_remains_first_and_unchanged            (subscription.rs)
+  codex_subscription_identity_envelope_remains_unchanged      (codex.rs)
+  every_provider_round_attests_its_current_history
+  transport_accepts_only_attested_provider_request
+  attestation_cannot_be_reused_after_header_or_body_mutation
+  attestation_rejects_each_claude_field_mutation
+  attestation_rejects_each_codex_field_mutation
+
+Command: cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers provider
+Result:  test result: ok. 60 passed (provider module) / 198 passed (crate).

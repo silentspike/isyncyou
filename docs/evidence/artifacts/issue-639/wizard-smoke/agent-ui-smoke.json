@@ -1,0 +1,941 @@
+{
+  "evidence_version": 2,
+  "ok": true,
+  "generated_at": "2026-07-14T08:02:50.313Z",
+  "fixture_origin": "loopback-fixture",
+  "assertions": [
+    {
+      "name": "desktop Assistant nav visible",
+      "status": "pass"
+    },
+    {
+      "name": "setup consent panel visible",
+      "status": "pass"
+    },
+    {
+      "name": "connect disabled before consent",
+      "status": "pass"
+    },
+    {
+      "name": "BYO key row absent",
+      "status": "pass"
+    },
+    {
+      "name": "no editable secret input in setup",
+      "status": "pass"
+    },
+    {
+      "name": "handoff wizard renders 8 ordered steps",
+      "status": "pass"
+    },
+    {
+      "name": "wizard steps are the ordered handoff sequence",
+      "status": "pass"
+    },
+    {
+      "name": "720px wizard has no horizontal overflow",
+      "status": "pass"
+    },
+    {
+      "name": "reconnect uses the short host-driven flow",
+      "status": "pass"
+    },
+    {
+      "name": "legacy single-provider consent remains accepted after schema upgrade",
+      "status": "pass"
+    },
+    {
+      "name": "consent localStorage is versioned",
+      "status": "pass"
+    },
+    {
+      "name": "consent localStorage contains no secrets",
+      "status": "pass"
+    },
+    {
+      "name": "accepted consent is visibly confirmed",
+      "status": "pass"
+    },
+    {
+      "name": "accepted consent cannot be submitted repeatedly",
+      "status": "pass"
+    },
+    {
+      "name": "connect is enabled only after consent",
+      "status": "pass"
+    },
+    {
+      "name": "provider consents persist independently",
+      "status": "pass"
+    },
+    {
+      "name": "both provider consents remain visibly confirmed",
+      "status": "pass"
+    },
+    {
+      "name": "both provider connect buttons stay enabled after consent",
+      "status": "pass"
+    },
+    {
+      "name": "oauth start posted once",
+      "status": "pass"
+    },
+    {
+      "name": "oauth start used same-origin fixture route",
+      "status": "pass"
+    },
+    {
+      "name": "auth launch stayed on fixture origin",
+      "status": "pass"
+    },
+    {
+      "name": "handoff DOM console and storage exclude capability and attempt secrets",
+      "status": "pass"
+    },
+    {
+      "name": "first token appears incrementally",
+      "status": "pass"
+    },
+    {
+      "name": "citation href same-origin path",
+      "status": "pass"
+    },
+    {
+      "name": "citation click opens fixture view",
+      "status": "pass"
+    },
+    {
+      "name": "model picker posts model change",
+      "status": "pass"
+    },
+    {
+      "name": "usage chip shows unavailable state",
+      "status": "pass"
+    },
+    {
+      "name": "pending card appears",
+      "status": "pass"
+    },
+    {
+      "name": "no confirm before click",
+      "status": "pass"
+    },
+    {
+      "name": "pending DOM excludes token hash and pending handle",
+      "status": "pass"
+    },
+    {
+      "name": "confirm posts once with pending token action_hash",
+      "status": "pass"
+    },
+    {
+      "name": "cancel posts once for separate turn",
+      "status": "pass"
+    },
+    {
+      "name": "error stream renders only redacted safe copy",
+      "status": "pass"
+    },
+    {
+      "name": "mobile Assistant nav visible",
+      "status": "pass"
+    },
+    {
+      "name": "mobile Assistant has no horizontal overflow",
+      "status": "pass"
+    },
+    {
+      "name": "no console errors",
+      "status": "pass"
+    },
+    {
+      "name": "no page errors",
+      "status": "pass"
+    },
+    {
+      "name": "no non-fixture-origin WebView requests",
+      "status": "pass"
+    },
+    {
+      "name": "fixture routes complete",
+      "status": "pass"
+    },
+    {
+      "name": "normal pending error streams exercised",
+      "status": "pass"
+    }
+  ],
+  "console_errors": [],
+  "page_errors": [],
+  "browser_requests": [
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "stylesheet",
+      "path": "/app.css",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "script",
+      "path": "/app.js",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/settings",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "font",
+      "path": "/app.woff2",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/",
+      "query_keys": [
+        "reconnect-smoke"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "stylesheet",
+      "path": "/app.css",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "script",
+      "path": "/app.js",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "font",
+      "path": "/app.woff2",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/",
+      "query_keys": [
+        "first-run-smoke"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "stylesheet",
+      "path": "/app.css",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "script",
+      "path": "/app.js",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "font",
+      "path": "/app.woff2",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/",
+      "query_keys": [
+        "first-run-smoke"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "stylesheet",
+      "path": "/app.css",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "script",
+      "path": "/app.js",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "font",
+      "path": "/app.woff2",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/",
+      "query_keys": [
+        "first-run-smoke"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "stylesheet",
+      "path": "/app.css",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "script",
+      "path": "/app.js",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "font",
+      "path": "/app.woff2",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/connectivity/preflight",
+      "query_keys": []
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/oauth/start",
+      "query_keys": [
+        "provider",
+        "redirect"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/fixture-auth-complete",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "stylesheet",
+      "path": "/app.css",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "script",
+      "path": "/app.js",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "font",
+      "path": "/app.woff2",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/connectivity/preflight",
+      "query_keys": []
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/turn",
+      "query_keys": [
+        "account",
+        "prompt"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/agent/stream",
+      "query_keys": [
+        "turn"
+      ]
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/model",
+      "query_keys": [
+        "model",
+        "provider"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/connectivity/preflight",
+      "query_keys": []
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/turn",
+      "query_keys": [
+        "account",
+        "prompt"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/agent/stream",
+      "query_keys": [
+        "turn"
+      ]
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/confirm",
+      "query_keys": [
+        "action_hash",
+        "pending",
+        "token"
+      ]
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/connectivity/preflight",
+      "query_keys": []
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/turn",
+      "query_keys": [
+        "account",
+        "prompt"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/agent/stream",
+      "query_keys": [
+        "turn"
+      ]
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/cancel",
+      "query_keys": [
+        "turn"
+      ]
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/connectivity/preflight",
+      "query_keys": []
+    },
+    {
+      "method": "POST",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/turn",
+      "query_keys": [
+        "account",
+        "prompt"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/agent/stream",
+      "query_keys": [
+        "turn"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "document",
+      "path": "/",
+      "query_keys": [
+        "mobile-smoke"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "stylesheet",
+      "path": "/app.css",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "script",
+      "path": "/app.js",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "eventsource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "method": "GET",
+      "resource_type": "font",
+      "path": "/app.woff2",
+      "query_keys": []
+    },
+    {
+      "method": "GET",
+      "resource_type": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    }
+  ],
+  "runtime_transports": [
+    {
+      "kind": "fetch",
+      "path": "/api/v1/accounts",
+      "query_keys": []
+    },
+    {
+      "kind": "fetch",
+      "path": "/api/v1/sync/state",
+      "query_keys": []
+    },
+    {
+      "kind": "fetch",
+      "path": "/api/v1/agent/status",
+      "query_keys": []
+    },
+    {
+      "kind": "EventSource",
+      "path": "/api/v1/events",
+      "query_keys": []
+    },
+    {
+      "kind": "fetch",
+      "path": "/api/v1/activity",
+      "query_keys": [
+        "account",
+        "limit"
+      ]
+    },
+    {
+      "kind": "fetch",
+      "path": "/api/v1/status",
+      "query_keys": [
+        "account"
+      ]
+    }
+  ],
+  "external_launches": [
+    {
+      "target": "same-tab",
+      "path": "/fixture-auth-complete",
+      "query_keys": []
+    }
+  ],
+  "non_fixture_origin_requests": [],
+  "fixture404": [],
+  "fixtureErrors": [],
+  "fixture_state": {
+    "oauth_start_count": 1,
+    "oauth_providers": [
+      "claude"
+    ],
+    "model_post_count": 1,
+    "models": [
+      "claude-opus-4"
+    ],
+    "confirm_post_count": 1,
+    "cancel_post_count": 1,
+    "view_hit_count": 1,
+    "stream_scenarios": [
+      "normal",
+      "pending-confirm",
+      "pending-cancel",
+      "error"
+    ]
+  },
+  "screenshots": {
+    "setup_consent": "docs/evidence/artifacts/issue-639/wizard-smoke/setup-consent.png",
+    "desktop_assistant": "docs/evidence/artifacts/issue-639/wizard-smoke/desktop-assistant.png",
+    "wizard_720": "docs/evidence/artifacts/issue-639/wizard-smoke/wizard-720.png",
+    "reconnect_720": "docs/evidence/artifacts/issue-639/wizard-smoke/reconnect-720.png",
+    "stream_citations": "docs/evidence/artifacts/issue-639/wizard-smoke/stream-citations.png",
+    "pending_confirm": "docs/evidence/artifacts/issue-639/wizard-smoke/pending-confirm.png",
+    "pending_cancel": "docs/evidence/artifacts/issue-639/wizard-smoke/pending-cancel.png",
+    "mobile_assistant": "docs/evidence/artifacts/issue-639/wizard-smoke/mobile-assistant.png"
+  }
+}

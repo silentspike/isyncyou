@@ -4639,6 +4639,7 @@ function agentCredentialState(st, provider) {
 
 async function refreshAssistantCredentialIfRequired(st) {
   const provider = agentActiveProvider(st);
+  if (!provider) return st;
   if (agentCredentialState(st, provider) !== "refresh_required") return st;
   let guardId = null;
   try {
@@ -4681,8 +4682,12 @@ async function startAiLogin(provider) {
     if (redirect) params.redirect = redirect;
     const manualCodeFlow = provider === "claude" && !redirect;
     const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url || !d.attempt_id) { toast("Could not start sign-in"); return; }
-    OAUTH_ATTEMPTS.set(provider, d.attempt_id);
+    // Remember a server-created attempt before validating the rest of the response so the
+    // common failure path can cancel it. Never return from here with the FGS lease live.
+    if (d && d.attempt_id) OAUTH_ATTEMPTS.set(provider, d.attempt_id);
+    if (!d || !d.authorize_url || !d.attempt_id) {
+      throw new Error("oauth_start_invalid_response");
+    }
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
@@ -4725,7 +4730,7 @@ async function pollAgentStatus(n, provider) {
   }
   try {
     const s = await api("/api/v1/agent/status");
-    const connected = provider === "codex" ? !!(s && s.codex) : !!(s && s.claude);
+    const connected = assistantProviderReady(s, provider);
     if (connected) {
       AGENT_POLL_ON = false;
       OAUTH_ATTEMPTS.delete(provider);
@@ -4760,7 +4765,7 @@ function showCodeStep() {
     el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
     el("h2", { style: "margin:.3rem 0 .5rem", text: "Paste your code" }),
     el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.3rem;max-width:27rem", text: "After you approve in the browser, copy the code it shows and paste it here to finish connecting." }),
-    el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
+    el("input", { id: "asst-code", type: "password", autocomplete: "off", spellcheck: "false", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
     el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
       el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
       el("button", { class: "btn", onclick: async () => { await cancelOAuthAttempt("claude"); await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
@@ -4772,8 +4777,17 @@ async function completeAiLogin() {
   const inp = document.getElementById("asst-code");
   const code = inp && inp.value.trim();
   if (!code) { toast("Paste the code first"); return; }
+  const attemptId = OAUTH_ATTEMPTS.get("claude");
+  if (!attemptId) { toast("Start sign-in again.", "err"); return; }
+  // #639 T10: the pasted code crosses the boundary only in this strict-JSON body — never a URL/query
+  // param, never persisted. Clear the input immediately so it does not linger in the DOM.
+  if (inp) inp.value = "";
   try {
-    await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
+    await postJson("/api/v1/agent/oauth/complete", CAP.agent, {
+      provider: "claude",
+      attempt_id: attemptId,
+      pasted_code: code,
+    });
     OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
     toast("Connected!");
@@ -4791,6 +4805,7 @@ const AssistantState = {
   activeTurnId: null,
   activeStream: null,
   pendingCardsById: new Map(),
+  pendingCardNodesById: new Map(),
   lastUsage: null,
   model: null,
   draft: "",
@@ -4803,6 +4818,7 @@ const AssistantState = {
 
 function closeAssistantStream(_reason) {
   const stream = AssistantState.activeStream;
+  const turn = AssistantState.activeTurnId;
   AssistantState.activeStream = null;
   AssistantState.activeTurnId = null;
   AssistantState.activeMessage = null;
@@ -4810,6 +4826,7 @@ function closeAssistantStream(_reason) {
   if (stream) {
     try { stream.close(); } catch (_) {}
   }
+  if (turn) void finishTurnGuard(turn);
 }
 
 function rememberAssistantStatus(st) {
@@ -4820,41 +4837,70 @@ function rememberAssistantStatus(st) {
     : null;
 }
 
-function assistantCanUse() {
-  return !!CAP.agent && !!App.account;
+function assistantCanUse(st) {
+  return !!CAP.agent && !!App.account && assistantSelectedReady(st);
 }
 
 const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
-const AGENT_PRIVACY_CONSENT_VERSION = 1;
+const AGENT_PRIVACY_CONSENT_VERSION = 2;
 function agentProviderConsentId(provider) {
   if (provider === "claude") return "claude";
   if (provider === "codex") return "codex";
-  return provider || "claude";
+  return null;
+}
+function agentSelectedProvider(st) {
+  const onboardingProvider = st && st.onboarding && st.onboarding.selected_provider;
+  const candidate = onboardingProvider || (st && st.selected_provider);
+  return candidate === "claude" || candidate === "codex" ? candidate : null;
 }
 function agentActiveProvider(st) {
-  if (st && st.provider) return agentProviderConsentId(st.provider);
-  if (st && st.selected_provider) return agentProviderConsentId(st.selected_provider);
-  if (st && st.claude) return "claude";
-  if (st && st.codex) return "codex";
-  return "claude";
+  return agentSelectedProvider(st);
+}
+function assistantProviderReady(st, provider) {
+  const node = assistantOnboardingFor(st, provider);
+  return !!node && node.state === "ready";
+}
+function assistantSelectedReady(st) {
+  const provider = agentSelectedProvider(st);
+  return !!provider && assistantProviderReady(st, provider);
 }
 function readAgentPrivacyConsent() {
-  try { return JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {}; }
-  catch (_) { return {}; }
+  const empty = { version: AGENT_PRIVACY_CONSENT_VERSION, providers: {} };
+  try {
+    const stored = JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {};
+    const providers = {};
+    if (stored.version === AGENT_PRIVACY_CONSENT_VERSION && stored.providers && typeof stored.providers === "object") {
+      ["claude", "codex"].forEach((provider) => {
+        const entry = stored.providers[provider];
+        if (entry && entry.accepted === true) {
+          providers[provider] = { accepted: true, timestamp: String(entry.timestamp || "") };
+        }
+      });
+      return { version: AGENT_PRIVACY_CONSENT_VERSION, providers };
+    }
+    // Preserve the previously accepted provider when upgrading the original single-provider record.
+    if (stored.version === 1 && stored.accepted === true && ["claude", "codex"].includes(stored.provider)) {
+      providers[stored.provider] = { accepted: true, timestamp: String(stored.timestamp || "") };
+      return { version: AGENT_PRIVACY_CONSENT_VERSION, providers };
+    }
+    return empty;
+  } catch (_) { return empty; }
 }
 function agentPrivacyConsentAccepted(provider) {
   const c = readAgentPrivacyConsent();
-  return c.version === AGENT_PRIVACY_CONSENT_VERSION
-    && c.accepted === true
-    && c.provider === agentProviderConsentId(provider);
+  const entry = c.providers && c.providers[agentProviderConsentId(provider)];
+  return c.version === AGENT_PRIVACY_CONSENT_VERSION && !!entry && entry.accepted === true;
 }
 async function acceptAgentPrivacyConsent(provider) {
   const consentProvider = agentProviderConsentId(provider);
+  if (!consentProvider) return;
+  const current = readAgentPrivacyConsent();
   const record = {
     version: AGENT_PRIVACY_CONSENT_VERSION,
-    accepted: true,
-    provider: consentProvider,
-    timestamp: new Date().toISOString(),
+    providers: {
+      ...current.providers,
+      [consentProvider]: { accepted: true, timestamp: new Date().toISOString() },
+    },
   };
   try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
   const pendingModel = AssistantState.pendingModelSelection;
@@ -4880,8 +4926,19 @@ function renderAssistantConsentPanel(providers) {
       el("b", { text: "Privacy consent" }),
       el("p", { class: "dim", text: "The assistant sends selected Microsoft 365 content to the selected provider to answer your question. Continue only if you want that provider to process the selected content." })),
     el("div", { class: "assistant-consent-actions" },
-      ids.map(provider => el("button", { class: "btn sm", type: "button", onclick: () => acceptAgentPrivacyConsent(provider), "data-agent-consent-accept": provider },
-        icon("shield-check", "icon-sm"), "Allow " + agentProviderLabel(provider))),
+      ids.map(provider => {
+        const accepted = agentPrivacyConsentAccepted(provider);
+        return el("button", {
+          class: "btn sm assistant-consent-choice" + (accepted ? " is-accepted" : ""),
+          type: "button",
+          disabled: accepted ? "disabled" : null,
+          onclick: accepted ? null : () => acceptAgentPrivacyConsent(provider),
+          "aria-pressed": accepted ? "true" : "false",
+          "data-agent-consent-accept": provider,
+          "data-agent-consent-state": accepted ? "accepted" : "required",
+        }, icon(accepted ? "check" : "shield-check", "icon-sm"),
+        accepted ? agentProviderLabel(provider) + " allowed" : "Allow " + agentProviderLabel(provider));
+      }),
       el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
         icon("x", "icon-sm"), "Reset")));
 }
@@ -4903,23 +4960,78 @@ async function renderAssistantView(view) {
   } catch (_) { st = {}; }
   rememberAssistantStatus(st);
   clear(body);
-  if (st && st.connected) renderAssistantChat(body, st);
-  else renderAssistantSetup(body, st);
-  if (OAUTH_ATTEMPTS.has("claude") && !(st && st.claude)) showCodeStep();
+  // #639 T7/T10: `connected` is now host-verified per-provider readiness (provider_ready of the
+  // selected provider), so the chat vs. wizard split is driven by host readiness, not credential
+  // presence. The manual code step keys off the in-flight attempt + the per-provider onboarding state.
+  if (assistantSelectedReady(st)) renderAssistantChat(body, st);
+  else renderAssistantWizard(body, st);
+  const claudeReady = assistantProviderReady(st, "claude");
+  if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
 }
 
-// The connect card (shown until an AI account is connected).
-function renderAssistantSetup(body, st) {
+// #639 T10: the ordered official-sign-in -> custom-harness handoff steps the wizard proves. Keys
+// mirror the host onboarding wire states (status_json.onboarding.providers[p].steps).
+const AGENT_ONBOARDING_STEPS = [
+  ["official_oauth_completed", "Official sign-in"],
+  ["credential_encrypted", "Credential encrypted"],
+  ["retained_envelope_verified", "Provider identity retained"],
+  ["default_harness_removed", "Default assistant removed"],
+  ["m365_profile_activated", "iSyncYou M365 profile activated"],
+  ["isyncyou_tool_connected", "iSyncYou tool connected"],
+  ["subscription_identity_set", "Subscription identity set"],
+  ["ready", "Ready"],
+];
+
+// The per-provider onboarding projection from the host status (never trusts the client).
+function assistantOnboardingFor(st, provider) {
+  const ob = st && st.onboarding;
+  if (!ob || !ob.providers) return null;
+  return ob.providers[provider] || null;
+}
+
+// The provider whose handoff the wizard should surface: the host-selected one, else Claude.
+function assistantWizardProvider(st) {
+  const sel = st && st.onboarding && st.onboarding.selected_provider;
+  return sel === "codex" ? "codex" : "claude";
+}
+
+// The ordered step list, marking each complete from the host projection (condense-not-reorder).
+function renderAssistantWizardSteps(node) {
+  const steps = (node && Array.isArray(node.steps)) ? node.steps : [];
+  const completeByKey = {};
+  steps.forEach((s) => { if (s && s.key) completeByKey[s.key] = s.complete === true; });
+  return el("ol", { class: "assistant-wizard-steps", "data-testid": "agent-wizard-steps", "data-agent-wizard-steps": "1" },
+    AGENT_ONBOARDING_STEPS.map(([key, label], i) => {
+      const done = completeByKey[key] === true;
+      return el("li", {
+        class: "assistant-wizard-step" + (done ? " is-complete" : ""),
+        "data-agent-wizard-step": key,
+        "data-complete": done ? "1" : "0",
+      },
+        el("span", { class: "assistant-wizard-step-num", text: done ? "✓" : String(i + 1) }),
+        el("span", { class: "assistant-wizard-step-label", text: label }));
+    }));
+}
+
+// #639 T10: the state-driven first-run handoff wizard (replaces the old direct-connect card). It
+// reads only the host onboarding projection (per-provider readiness), never st.claude/st.codex.
+function renderAssistantWizard(body, st) {
   const unavailable = !CAP.agent;
   const claudeAllowed = agentPrivacyConsentAccepted("claude");
   const codexAllowed = agentPrivacyConsentAccepted("codex");
+  const wizardProvider = assistantWizardProvider(st);
+  const node = assistantOnboardingFor(st, wizardProvider);
+  const state = node && node.state ? node.state : "not_started";
+  const reconnect = state === "reconnect_required";
   const hint = unavailable
     ? "Assistant is not available in this build."
-    : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login.";
+    : reconnect
+      ? "Your subscription needs to be reconnected. iSyncYou opens your device browser for the official login again."
+      : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login, then hands off to the iSyncYou assistant.";
   const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => startAiLogin("claude"), "data-testid": "agent-connect-claude" },
-    icon("sparkles", "icon-sm"), "Connect Claude");
+    icon("sparkles", "icon-sm"), reconnect && wizardProvider === "claude" ? "Reconnect Claude" : "Connect Claude");
   const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => startAiLogin("codex"), "data-testid": "agent-connect-codex" },
-    icon("sparkles", "icon-sm"), "Connect ChatGPT");
+    icon("sparkles", "icon-sm"), reconnect && wizardProvider === "codex" ? "Reconnect ChatGPT" : "Connect ChatGPT");
   if (unavailable || !claudeAllowed) {
     claude.setAttribute("disabled", "disabled");
   }
@@ -4929,11 +5041,15 @@ function renderAssistantSetup(body, st) {
   body.append(el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }));
   const diagnostic = renderConnectivityDiagnostic();
   if (diagnostic) body.append(diagnostic);
+  // A reconnect is a shorter flow (same host invariants): condense the ordered steps to the
+  // official sign-in + ready endpoints rather than repeating the full first-run sequence.
+  const stepsPanel = reconnect ? null : renderAssistantWizardSteps(node);
   body.append(
-    el("div", { id: "asst-connect-card", class: "assistant-setup", "data-agent-setup": "1", "data-testid": "agent-setup" },
+    el("div", { id: "asst-connect-card", class: "assistant-setup assistant-wizard", "data-agent-setup": "1", "data-agent-wizard": state, "data-testid": "agent-setup" },
       el("div", { class: "assistant-setup-icon" }, icon("sparkles")),
-      el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
+      el("h2", { style: "margin:.3rem 0 .5rem", text: reconnect ? "Reconnect your AI account" : "Connect your AI account" }),
       el("p", { class: "dim assistant-setup-copy", text: hint }),
+      stepsPanel,
       renderAssistantConsentPanel(["claude", "codex"]),
       el("div", { class: "assistant-setup-actions" }, claude, codex),
       st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,
@@ -4983,7 +5099,9 @@ function renderAssistantComposer(_st) {
   const provider = agentActiveProvider(_st || AssistantState.status);
   const disabledReason = !CAP.agent ? "Assistant unavailable"
     : (!App.account ? "Select an account first"
-      : (!agentPrivacyConsentAccepted(provider) ? "Review privacy consent first" : ""));
+      : (!assistantSelectedReady(_st || AssistantState.status) ? "Reconnect your AI account"
+        : (!agentPrivacyConsentAccepted(provider) ? "Review privacy consent first"
+          : (AssistantState.busy ? "Wait for the active turn" : ""))));
   const input = el("textarea", {
     id: "asst-input",
     class: "input assistant-input",
@@ -5071,14 +5189,16 @@ function agentModelSwitcher(st) {
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
   };
-  addGroup("claude", st.claude);
-  addGroup("codex", st.codex);
-  if (!st.claude) {
+  const claudeReady = assistantProviderReady(st, "claude");
+  const codexReady = assistantProviderReady(st, "codex");
+  addGroup("claude", claudeReady);
+  addGroup("codex", codexReady);
+  if (!claudeReady) {
     rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "claude", onclick: () => connectAgentProvider("claude") },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect Claude…" })));
   }
-  if (!st.codex) {
+  if (!codexReady) {
     rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectAgentProvider("codex") },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
@@ -5138,7 +5258,7 @@ async function connectCodex() {
 async function pollCodexStatus(n) {
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.codex) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
+    if (assistantProviderReady(s, "codex")) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
   if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
   else await finishCodexGuard();
@@ -5327,11 +5447,18 @@ function pendingRecord(pendingId) {
 }
 
 function rerenderPendingCards(pendingId) {
-  document.querySelectorAll("[data-agent-pending-card]").forEach((node) => {
-    if (node.getAttribute("data-agent-pending-card") !== pendingId) return;
-    const record = pendingRecord(pendingId);
-    if (record) node.replaceWith(renderAgentPendingCard(record));
+  const record = pendingRecord(pendingId);
+  const nodes = AssistantState.pendingCardNodesById.get(pendingId);
+  if (!record || !nodes) return;
+  const replacements = new Set();
+  nodes.forEach((node) => {
+    if (!node.isConnected) return;
+    const replacement = renderAgentPendingCard(record, false);
+    node.replaceWith(replacement);
+    replacements.add(replacement);
   });
+  if (replacements.size) AssistantState.pendingCardNodesById.set(pendingId, replacements);
+  else AssistantState.pendingCardNodesById.delete(pendingId);
 }
 
 function pendingStatus(pending) {
@@ -5388,22 +5515,22 @@ async function cancelAgentPending(pendingId) {
   rerenderPendingCards(pendingId);
 }
 
-function renderAgentPendingCard(pending) {
+function renderAgentPendingCard(pending, trackNode = true) {
   const status = pendingStatus(pending);
   const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
   const done = status === "confirmed" || status === "cancelled";
   const waiting = status === "confirming" || status === "cancelling";
   const confirmDisabled = waiting || done || status === "expired";
   const cancelDisabled = waiting || done;
-  const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": pending.pending_id || "" },
+  const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": "1" },
     icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
-  const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": pending.pending_id || "" },
+  const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": "1" },
     icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
   if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
   if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
-  return el("div", {
+  const card = el("div", {
     class: "asst-pending-card " + status,
-    "data-agent-pending-card": pending.pending_id || "",
+    "data-agent-pending-card": "1",
   },
     el("div", { class: "asst-pending-head" },
       icon("shield-check", "icon-sm"),
@@ -5413,6 +5540,12 @@ function renderAgentPendingCard(pending) {
     pending.result ? el("div", { class: "asst-pending-result", text: pending.result }) : null,
     pending.error ? el("div", { class: "asst-pending-error", text: pending.error }) : null,
     el("div", { class: "asst-pending-actions" }, confirm, cancel));
+  if (trackNode && pending.pending_id) {
+    const nodes = AssistantState.pendingCardNodesById.get(pending.pending_id) || new Set();
+    nodes.add(card);
+    AssistantState.pendingCardNodesById.set(pending.pending_id, nodes);
+  }
+  return card;
 }
 
 function renderAssistantMessage(m) {
@@ -5527,7 +5660,12 @@ function agentSendFromInput() {
 // Start a turn and stream its tokens into a fresh assistant bubble.
 async function agentSend(text) {
   const log = $("#asst-log"); if (!log) return;
-  if (!assistantCanUse()) { toast("Assistant is unavailable for this account", "err"); return; }
+  if (!assistantCanUse(AssistantState.status)) {
+    toast("Reconnect the selected AI account before sending", "err");
+    renderAssistantView($("#view"));
+    return;
+  }
+  if (AssistantState.busy) { toast("Wait for the active turn", "err"); return; }
   const provider = agentActiveProvider(AssistantState.status);
   if (!agentPrivacyConsentAccepted(provider)) {
     toast("Review privacy consent for " + agentProviderLabel(provider), "err");
@@ -5658,11 +5796,13 @@ async function agentSend(text) {
   }
   AssistantState.activeTurnId = turn;
   if (BRIDGE && startingGuardId) {
+    // Own the starting lease immediately. Even an ambiguous native bind response must be released
+    // on terminal/error/route teardown rather than lingering until its deadline.
+    TURN_GUARDS.set(turn, startingGuardId);
     try {
-      const bound = await nativeCall("bindNetworkGuard", { guard_id: startingGuardId, turn }, NATIVE_TIMEOUT_MS);
-      if (bound && bound.ok) TURN_GUARDS.set(turn, startingGuardId);
+      await nativeCall("bindNetworkGuard", { guard_id: startingGuardId, turn }, NATIVE_TIMEOUT_MS);
     } catch (_) {
-      // A lost bind response is ambiguous. Keep the short starting lease for native expiry.
+      // A lost bind response is ambiguous; local ownership still guarantees terminal cleanup.
     }
   }
 
@@ -5674,8 +5814,11 @@ async function agentSend(text) {
   const finish = (msg, terminalReason) => {
     clearThinking();
     if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
-    else { try { stream.close(); } catch (_) {} }
-    if (terminalReason) void finishTurnGuard(turn);
+    else {
+      try { stream.close(); } catch (_) {}
+      void finishTurnGuard(turn);
+    }
+    void terminalReason;
     if (!asst.text && msg) setText(msg);
   };
   const turnState = {

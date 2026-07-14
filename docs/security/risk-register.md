@@ -93,6 +93,17 @@ README's [Known limitations](../../README.md#known-limitations).
 
 ---
 
+## R10 — First-run OAuth handoff / product-readiness spoofing
+
+| | |
+|---|---|
+| **Risk** | A turn runs on a credential that never completed the official OAuth → custom-harness handoff (mere credential presence, a stale/forged onboarding journal, an experimental local-CLI credential, a policy/contract-mismatched or half-written credential), or a default-client harness component reaches the wire, or the pasted manual code leaks via URL/DOM/log. |
+| **Impact** | High — an unverified or spoofed provider identity could act on the user's Microsoft 365 domain, or full-power default-client capabilities could be exercised under the product path, or a subscription credential could leak. |
+| **Mitigation** | #639 makes readiness a durable, authenticated `ProductActivationV1` (generation + official policy fingerprint + harness contract) plus a valid Active V2 bundle plus a passing static harness attestation; the TTL'd onboarding journal is evidence/recovery only and never the authority. Every provider round re-attests the actually-sent request against a positive allowlist; the transport accepts only an attested request. One product-runtime gate spans selection + readiness + build before any turn-id/stream/archive and returns a closed 409 with no cross-provider fallback; an experimental local-CLI credential never confers readiness and FakeProvider is never an unconfigured product turn. Crash windows are defined and recovered without re-exchange; interrupted attempts are `error_redacted` and never resumed; refresh is a V2-lifecycle event only. Status carries `no-store` and no secrets; `/oauth/complete` is strict-JSON, attempt-state-bound, Claude-only; the pasted code is transient (type=password, cleared, never URL/DOM-attr/log/storage). |
+| **Status** | **Mitigated / monitored (host)** — host, UI, and boundary evidence is recorded in [the #639 manifest](../evidence/issue-639-manifest.json); the `planned → implemented` transition of REQ-AGENT-014 awaits live official Claude + Codex OAuth handoff evidence on-device (S-AG.14 device task). Residual provider wire drift and platform scheduling remain monitored. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
 ## How this register is maintained
 
 A risk is added the moment it is understood, with an honest status — not after it is

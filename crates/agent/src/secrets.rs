@@ -32,6 +32,12 @@ pub enum SecretClass {
     ProviderApiKey,
     ProviderOAuthRefresh,
     SessionPairingKey,
+    /// #639: the durable, authenticated product-activation record (the readiness authority).
+    ProductActivation,
+    /// #639: the authenticated per-attempt onboarding transition journal.
+    OnboardingAttemptJournal,
+    /// #639: the closed product provider/model selection consumed by the runtime gate.
+    ProductSettings,
 }
 
 impl SecretClass {
@@ -40,6 +46,9 @@ impl SecretClass {
             SecretClass::ProviderApiKey => "provider-api-key",
             SecretClass::ProviderOAuthRefresh => "provider-oauth-refresh",
             SecretClass::SessionPairingKey => "session-pairing-key",
+            SecretClass::ProductActivation => "product-activation",
+            SecretClass::OnboardingAttemptJournal => "onboarding-attempt-journal",
+            SecretClass::ProductSettings => "product-settings",
         }
     }
 }
@@ -278,6 +287,24 @@ impl AgentCredentialStore {
         match self {
             AgentCredentialStore::Provided(store) => store.get(class, id),
             AgentCredentialStore::Local(store) => store.get(class, id),
+        }
+    }
+
+    /// Bounded, no-follow load (#639) — see [`CredentialStore::get_bounded`].
+    pub fn get_bounded(
+        &self,
+        class: SecretClass,
+        id: &str,
+        max_envelope_bytes: usize,
+        max_plaintext_bytes: usize,
+    ) -> Result<Option<Secret>, AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => {
+                store.get_bounded(class, id, max_envelope_bytes, max_plaintext_bytes)
+            }
+            AgentCredentialStore::Local(store) => {
+                store.get_bounded(class, id, max_envelope_bytes, max_plaintext_bytes)
+            }
         }
     }
 
@@ -547,6 +574,23 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// Open a file for reading, refusing to follow a final-component symlink (#639). On unix this
+/// is `O_NOFOLLOW | O_CLOEXEC`; the returned handle is the single object `get_bounded` both
+/// size-checks and reads, so a swap between a stat and a read cannot redirect it.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 /// Typed, encrypted-at-rest credential store over a directory.
 pub struct CredentialStore<K: AtRestKey> {
     dir: PathBuf,
@@ -649,6 +693,60 @@ impl<K: AtRestKey> CredentialStore<K> {
         Ok(Some(Secret(plaintext.to_vec())))
     }
 
+    /// Load a secret for `(class, id)` with hard size bounds (#639). Unlike [`get`], this reads
+    /// from a **single `O_NOFOLLOW` handle** and reads at most `max_envelope_bytes` from **that
+    /// same handle** — never `stat` then `read`, which would re-introduce a symlink/swap TOCTOU.
+    /// Errors if the on-disk envelope exceeds `max_envelope_bytes` or the decrypted plaintext
+    /// exceeds `max_plaintext_bytes`. `None` if not present.
+    pub fn get_bounded(
+        &self,
+        class: SecretClass,
+        id: &str,
+        max_envelope_bytes: usize,
+        max_plaintext_bytes: usize,
+    ) -> Result<Option<Secret>, AgentError> {
+        use std::io::Read;
+        let path = self.existing_path(&class, id);
+        let f = match open_no_follow(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(AgentError::Provider(e.to_string())),
+        };
+        // Read at most one byte past the bound from the SAME handle; the extra byte proves oversize.
+        let mut raw = Vec::new();
+        f.take((max_envelope_bytes as u64).saturating_add(1))
+            .read_to_end(&mut raw)
+            .map_err(|e| AgentError::Provider(e.to_string()))?;
+        if raw.len() > max_envelope_bytes {
+            return Err(credential_err("credential envelope exceeds size bound"));
+        }
+        let env: Envelope =
+            serde_json::from_slice(&raw).map_err(|e| AgentError::Provider(e.to_string()))?;
+        validate_envelope(&env, class, id)?;
+        let nonce = decode_nonce(&env.nonce)?;
+        let mut ct = decode_ciphertext(&env.ct)?;
+        let master = self.key.key()?;
+        let key = class_key(&master, class)?;
+        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &key)
+            .map_err(|_| credential_err("credential aead key setup failed"))?;
+        let opening = aead::LessSafeKey::new(unbound);
+        let aad = aad(class, id);
+        let plaintext = opening
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(aad.as_slice()),
+                &mut ct,
+            )
+            .map_err(|_| credential_err("credential decryption failed"))?;
+        if plaintext.is_empty() {
+            return Err(credential_err("credential plaintext is invalid"));
+        }
+        if plaintext.len() > max_plaintext_bytes {
+            return Err(credential_err("credential plaintext exceeds size bound"));
+        }
+        Ok(Some(Secret(plaintext.to_vec())))
+    }
+
     /// Delete a secret if present.
     pub fn delete(&self, class: SecretClass, id: &str) -> Result<(), AgentError> {
         let path = self.path(&class, id);
@@ -737,6 +835,114 @@ mod tests {
         let custom = CredentialStoreConfig::with_paths(tmp.path().join("s"), tmp.path().join("k"));
         assert_eq!(custom.store_dir(), tmp.path().join("s"));
         assert_eq!(custom.local_key_file(), tmp.path().join("k"));
+    }
+
+    #[test]
+    fn get_bounded_reads_within_bounds_and_missing_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.put(
+            SecretClass::ProductActivation,
+            "activation:claude",
+            &Secret::new(b"hello".to_vec()),
+        )
+        .unwrap();
+        let got = s
+            .get_bounded(
+                SecretClass::ProductActivation,
+                "activation:claude",
+                98_304,
+                65_536,
+            )
+            .unwrap();
+        assert_eq!(got.unwrap().expose(), b"hello");
+        assert!(s
+            .get_bounded(
+                SecretClass::ProductActivation,
+                "activation:codex",
+                98_304,
+                65_536
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn get_bounded_rejects_oversize_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.put(
+            SecretClass::OnboardingAttemptJournal,
+            "j",
+            &Secret::new(vec![7u8; 4096]),
+        )
+        .unwrap();
+        // a 64-byte envelope cap must reject the (far larger) envelope without a full read.
+        let e = err_text(s.get_bounded(SecretClass::OnboardingAttemptJournal, "j", 64, 65_536));
+        assert!(e.contains("envelope exceeds size bound"), "got: {e}");
+    }
+
+    #[test]
+    fn get_bounded_rejects_oversize_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.put(
+            SecretClass::OnboardingAttemptJournal,
+            "j",
+            &Secret::new(vec![7u8; 4096]),
+        )
+        .unwrap();
+        // envelope fits the cap, but the 4096-byte plaintext exceeds a 100-byte plaintext cap.
+        let e = err_text(s.get_bounded(SecretClass::OnboardingAttemptJournal, "j", 98_304, 100));
+        assert!(e.contains("plaintext exceeds size bound"), "got: {e}");
+    }
+
+    #[test]
+    fn get_bounded_cross_class_aad_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.put(
+            SecretClass::ProductActivation,
+            "x",
+            &Secret::new(b"v".to_vec()),
+        )
+        .unwrap();
+        // Forge the envelope's class tag to the journal class and move it to the journal path, so
+        // the metadata check "matches". The ciphertext was sealed under ProductActivation's
+        // per-class subkey + AAD, so reading it as the journal class must fail to DECRYPT.
+        let src = s.path(&SecretClass::ProductActivation, "x");
+        let mut env = read_env(&src);
+        env.class = SecretClass::OnboardingAttemptJournal.tag().to_string();
+        std::fs::remove_file(&src).unwrap();
+        write_env(&s.path(&SecretClass::OnboardingAttemptJournal, "x"), &env);
+        let e = err_text(s.get_bounded(SecretClass::OnboardingAttemptJournal, "x", 98_304, 65_536));
+        assert!(
+            e.contains("decryption failed"),
+            "cross-class crypto must reject: {e}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_bounded_refuses_to_follow_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        // a real secret under a separate store dir
+        let real = CredentialStore::new(tmp.path().join("real"), ProvidedKey([42u8; KEY_LEN]));
+        real.put(
+            SecretClass::ProductActivation,
+            "x",
+            &Secret::new(b"v".to_vec()),
+        )
+        .unwrap();
+        // point the expected cred path at the real file via a symlink
+        let link = s.path(&SecretClass::ProductActivation, "x");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(real.path(&SecretClass::ProductActivation, "x"), &link).unwrap();
+        // O_NOFOLLOW must refuse the final-component symlink instead of reading through it.
+        assert!(s
+            .get_bounded(SecretClass::ProductActivation, "x", 98_304, 65_536)
+            .is_err());
     }
 
     #[test]

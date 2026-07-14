@@ -232,12 +232,21 @@ fn is_json_content_type(content_type: Option<&str>) -> bool {
     })
 }
 
-fn no_store_json_error(status: u16, message: &str) -> ApiResponse {
-    let mut response = ApiResponse::error(status, message);
-    response
+fn with_no_store(mut response: ApiResponse) -> ApiResponse {
+    if !response
         .headers
-        .push(("Cache-Control".into(), "no-store".into()));
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+    {
+        response
+            .headers
+            .push(("Cache-Control".into(), "no-store".into()));
+    }
     response
+}
+
+fn no_store_json_error(status: u16, message: &str) -> ApiResponse {
+    with_no_store(ApiResponse::error(status, message))
 }
 
 /// A response ready to be written by any server adapter.
@@ -446,6 +455,17 @@ pub struct AgentOAuthCancelRequest {
     pub attempt_id: String,
 }
 
+/// #639 T9: closed manual-completion request for the Claude copy-paste OAuth flow. The pasted code
+/// crosses the boundary only transiently in this body (never a URL/query/log). `deny_unknown_fields`
+/// plus serde's derived struct deserializer reject unknown AND duplicate keys.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOAuthCompleteRequest {
+    pub provider: String,
+    pub attempt_id: String,
+    pub pasted_code: String,
+}
+
 /// The in-app agent (S-AG.6/#621). Injected by the daemon/mobile engine (app-host owns
 /// the LLM/engine stack) so the router stays a thin surface. The handler deals only in
 /// strings — it serializes its own stream events to JSON SSE-data lines (returned as a
@@ -528,9 +548,10 @@ pub trait AgentHandler: Send + Sync {
         Err("subscription login is not enabled on this server".into())
     }
 
-    /// Manual-login completion: the operator pastes the `code#state`
-    /// that the provider showed; the handler exchanges it and stores the token.
-    fn oauth_complete(&self, _pasted: &str) -> Result<String, String> {
+    /// Manual-login completion (Claude only): the operator pastes the `code#state` the provider
+    /// showed; `attempt_id` binds it to the server-side attempt whose state must match the embedded
+    /// `#state`. The handler exchanges it and stores the token.
+    fn oauth_complete(&self, _attempt_id: &str, _pasted: &str) -> Result<String, String> {
         Err("subscription login is not enabled on this server".into())
     }
 
@@ -4424,6 +4445,8 @@ impl Router {
         };
         match handler.start_turn(account, prompt) {
             Ok(turn_id) => ApiResponse::ok_json(&json!({ "turn": turn_id })),
+            // #639: a host-verified not-ready product turn is a closed 409, not a blanket 500.
+            Err(e) if e == "product_not_ready" => ApiResponse::error(409, &e),
             Err(e) => ApiResponse::error(500, &e),
         }
     }
@@ -4574,8 +4597,9 @@ impl Router {
         ApiResponse {
             status: 200,
             content_type: "application/json".into(),
+            // #639 T9: status carries onboarding/credential state — never let a WebView cache it.
+            headers: vec![("Cache-Control".into(), "no-store".into())],
             body: body.into_bytes(),
-            headers: Vec::new(),
         }
     }
 
@@ -4585,19 +4609,19 @@ impl Router {
     fn agent_oauth_start(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
         // redirect is optional: the manual (copy-paste) flow uses the provider's manual
         // redirect, so the client need not supply a loopback origin.
         let redirect = req.q("redirect").unwrap_or("");
         let provider = match agent_oauth_provider_param(req.q("provider").unwrap_or("")) {
             Ok(p) => p,
-            Err(e) => return ApiResponse::error(400, e),
+            Err(e) => return no_store_json_error(400, e),
         };
-        match handler.oauth_start_with_attempt(provider, redirect) {
+        with_no_store(match handler.oauth_start_with_attempt(provider, redirect) {
             Ok(result) => ApiResponse::ok_json(&serde_json::to_value(result).unwrap_or_default()),
-            Err(e) => ApiResponse::error(500, &e),
-        }
+            Err(_) => ApiResponse::error(409, "oauth_start_failed"),
+        })
     }
 
     /// Cancel one active provider OAuth attempt. The body is deliberately strict so
@@ -4605,7 +4629,7 @@ impl Router {
     fn agent_oauth_cancel(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
         if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
             return no_store_json_error(400, "oauth cancel accepts JSON only");
@@ -4645,15 +4669,44 @@ impl Router {
     fn agent_oauth_complete(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
-        let code = match req.q("code") {
-            Some(c) if !c.is_empty() => c,
-            _ => return ApiResponse::error(400, "code is required"),
+        // #639 T9: strict JSON only — the pasted code must never arrive as a URL/query param.
+        if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
+            return no_store_json_error(400, "oauth complete accepts JSON only");
+        }
+        if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+            return no_store_json_error(413, "request body too large");
+        }
+        let body = match std::str::from_utf8(&req.body) {
+            Ok(body) => body,
+            Err(_) => return no_store_json_error(400, "invalid oauth complete request"),
         };
-        match handler.oauth_complete(code) {
-            Ok(_) => ApiResponse::ok_json(&json!({ "connected": true })),
-            Err(e) => ApiResponse::error(400, &e),
+        // deny_unknown_fields + serde's derived struct deserializer reject unknown/duplicate keys.
+        let request = match serde_json::from_str::<AgentOAuthCompleteRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return no_store_json_error(400, "invalid oauth complete request"),
+        };
+        // Manual completion is the Claude copy-paste flow ONLY; Codex ends via its loopback callback.
+        if request.provider != "claude" {
+            return no_store_json_error(400, "oauth complete is claude-only");
+        }
+        if request.attempt_id.is_empty()
+            || request.attempt_id.len() > 128
+            || request.pasted_code.is_empty()
+            || request.pasted_code.len() > AGENT_STRICT_JSON_MAX_BYTES
+        {
+            return no_store_json_error(400, "invalid oauth complete request");
+        }
+        match handler.oauth_complete(&request.attempt_id, &request.pasted_code) {
+            Ok(_) => {
+                let mut response = ApiResponse::ok_json(&json!({ "connected": true }));
+                response
+                    .headers
+                    .push(("Cache-Control".into(), "no-store".into()));
+                response
+            }
+            Err(_) => no_store_json_error(400, "oauth complete failed"),
         }
     }
 
@@ -4681,16 +4734,16 @@ impl Router {
     fn agent_oauth_callback(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent.as_ref() {
             Some(h) => h,
-            None => return ApiResponse::error(404, "the agent is not enabled on this server"),
+            None => return no_store_json_error(404, "the agent is not enabled on this server"),
         };
         let (code, state) = match (req.q("code"), req.q("state")) {
             (Some(c), Some(s)) if !c.is_empty() && !s.is_empty() => (c, s),
-            _ => return ApiResponse::error(400, "code and state are required"),
+            _ => return no_store_json_error(400, "code and state are required"),
         };
-        match handler.oauth_callback(code, state) {
+        with_no_store(match handler.oauth_callback(code, state) {
             Ok(html) => ApiResponse::html(&html),
-            Err(e) => ApiResponse::error(400, &e),
-        }
+            Err(_) => ApiResponse::error(400, "oauth_callback_failed"),
+        })
     }
 
     /// The effective configuration the UI's settings view reads: engine-wide sync
@@ -6884,6 +6937,196 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
     }
 
+    /// #639 T7: a handler whose product turn is refused with the closed `product_not_ready` code.
+    struct ProductNotReadyAgent;
+    impl AgentHandler for ProductNotReadyAgent {
+        fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
+            Err("product_not_ready".into())
+        }
+        fn confirm(&self, _p: &str, _t: &str, _h: &str) -> Result<String, String> {
+            Err("n/a".into())
+        }
+        fn cancel(&self, _t: &str) {}
+        fn open_stream(&self, _t: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+    }
+
+    #[test]
+    fn product_not_ready_turn_maps_to_409_not_500() {
+        let (_d, router) = setup();
+        let router = router.with_agent(
+            std::sync::Arc::new(ProductNotReadyAgent),
+            "agentsecret".into(),
+        );
+        let resp = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
+                .with_cap_token(Some("agentsecret".into())),
+        );
+        assert_eq!(resp.status, 409);
+        assert!(String::from_utf8_lossy(&resp.body).contains("product_not_ready"));
+    }
+
+    // #639 T9 AC1: /oauth/complete is strict JSON and Claude-only. A query-param code, a codex
+    // provider, an unknown field, and a non-JSON content type are all rejected at the edge (400).
+    #[test]
+    fn oauth_complete_route_is_strict_json_claude_only() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let json_post = |body: &str| {
+            ApiRequest::new("POST", "/api/v1/agent/oauth/complete")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(body.as_bytes().to_vec())
+        };
+        // A pasted code as a URL/query param is rejected (must be a JSON body).
+        let query = ApiRequest::new("POST", "/api/v1/agent/oauth/complete?code=abc%23state")
+            .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&query).status, 400);
+        // Codex may not use this route.
+        assert_eq!(
+            router
+                .route(&json_post(
+                    r#"{"provider":"codex","attempt_id":"a","pasted_code":"c#s"}"#
+                ))
+                .status,
+            400
+        );
+        // Unknown field is rejected (deny_unknown_fields).
+        assert_eq!(
+            router
+                .route(&json_post(
+                    r#"{"provider":"claude","attempt_id":"a","pasted_code":"c#s","x":1}"#
+                ))
+                .status,
+            400
+        );
+        // Serde's struct visitor rejects duplicate fields rather than accepting the last value.
+        assert_eq!(
+            router
+                .route(&json_post(
+                    r#"{"provider":"claude","attempt_id":"a","attempt_id":"b","pasted_code":"c#s"}"#
+                ))
+                .status,
+            400
+        );
+        // A well-formed claude request reaches the handler and the response carries no-store.
+        let resp = router.route(&json_post(
+            r#"{"provider":"claude","attempt_id":"a","pasted_code":"c#s"}"#,
+        ));
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+    }
+
+    #[test]
+    fn assistant_first_run_renders_handoff_wizard_from_host_readiness() {
+        let view_start = APP_JS
+            .find("async function renderAssistantView(view)")
+            .expect("assistant view");
+        let view_end = APP_JS[view_start..]
+            .find("const AGENT_ONBOARDING_STEPS")
+            .map(|offset| view_start + offset)
+            .expect("onboarding steps");
+        let view = &APP_JS[view_start..view_end];
+        assert!(view.contains("if (assistantSelectedReady(st)) renderAssistantChat(body, st);"));
+        assert!(!view.contains("if (st && st.connected)"));
+
+        let expected = [
+            "official_oauth_completed",
+            "credential_encrypted",
+            "retained_envelope_verified",
+            "default_harness_removed",
+            "m365_profile_activated",
+            "isyncyou_tool_connected",
+            "subscription_identity_set",
+            "ready",
+        ];
+        let mut previous = 0;
+        for key in expected {
+            let position = APP_JS
+                .find(&format!("[\"{key}\""))
+                .unwrap_or_else(|| panic!("missing wizard step {key}"));
+            assert!(position >= previous, "wizard step order drifted at {key}");
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn assistant_reconnect_uses_short_flow_after_onboarding() {
+        assert!(APP_JS.contains("const reconnect = state === \"reconnect_required\";"));
+        assert!(APP_JS
+            .contains("const stepsPanel = reconnect ? null : renderAssistantWizardSteps(node);"));
+        assert!(APP_JS
+            .contains("reconnect ? \"Reconnect your AI account\" : \"Connect your AI account\""));
+    }
+
+    #[test]
+    fn assistant_handoff_dom_logs_and_storage_do_not_contain_secrets() {
+        let start = APP_JS
+            .find("async function completeAiLogin()")
+            .expect("manual completion function");
+        let end = APP_JS[start..]
+            .find("const AssistantState")
+            .map(|offset| start + offset)
+            .expect("manual completion end");
+        let completion = &APP_JS[start..end];
+        assert!(completion.contains("if (inp) inp.value = \"\";"));
+        assert!(completion.contains("postJson(\"/api/v1/agent/oauth/complete\""));
+        for forbidden in [
+            "console.",
+            "localStorage",
+            "sessionStorage",
+            "qs({",
+            "innerHTML",
+        ] {
+            assert!(
+                !completion.contains(forbidden),
+                "manual OAuth completion must not use secret sink {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_turn_guard_releases_on_stream_error_and_route_teardown() {
+        let close_start = APP_JS
+            .find("function closeAssistantStream(_reason)")
+            .expect("stream close helper");
+        let close_end = APP_JS[close_start..]
+            .find("function rememberAssistantStatus")
+            .map(|offset| close_start + offset)
+            .expect("stream close helper end");
+        let close = &APP_JS[close_start..close_end];
+        assert!(close.contains("const turn = AssistantState.activeTurnId;"));
+        assert!(close.contains("if (turn) void finishTurnGuard(turn);"));
+        assert!(APP_JS.contains("TURN_GUARDS.set(turn, startingGuardId);"));
+    }
+
+    // #639 T9 AC3: the status response carries Cache-Control: no-store and never leaks a secret.
+    #[test]
+    fn status_carries_no_store_and_no_secrets() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let resp = router.route(&ApiRequest::new("GET", "/api/v1/agent/status"));
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+        let body = String::from_utf8_lossy(&resp.body);
+        for secret in [
+            "access_token",
+            "refresh_token",
+            "account_id",
+            "authorization",
+            "Bearer",
+            "verifier",
+            "pkce",
+        ] {
+            assert!(!body.contains(secret), "status leaked {secret}");
+        }
+    }
+
     struct FakeAgent;
     impl AgentHandler for FakeAgent {
         fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
@@ -7301,6 +7544,42 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn unknown_agent_provider_identifier_returns_400() {
+        // #639: the closed product provider id is the allowlist. Aliases (anthropic/openai) and
+        // any unknown value are rejected at the API edge with 400 — no normalization to a product id.
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        for bad in ["anthropic", "openai", "gpt", "", "Claude"] {
+            let req = ApiRequest::new("POST", &format!("/api/v1/agent/oauth/start?provider={bad}"))
+                .with_cap_token(Some("agentsecret".into()));
+            assert_eq!(
+                router.route(&req).status,
+                400,
+                "provider {bad:?} must be rejected with 400"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_connect_posts_claude_and_codex_provider_ids() {
+        // #639: the two accepted connect provider ids are exactly `claude` and `codex`.
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        for good in ["claude", "codex"] {
+            let req = ApiRequest::new(
+                "POST",
+                &format!("/api/v1/agent/oauth/start?provider={good}"),
+            )
+            .with_cap_token(Some("agentsecret".into()));
+            assert_eq!(
+                router.route(&req).status,
+                200,
+                "provider {good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn mobile_agent_confirm_requires_biometric_before_agent_token_consumption() {
         let (_d, router) = setup();
         let agent = std::sync::Arc::new(RecordingAgent::backup());
@@ -7444,6 +7723,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             router.route(&ApiRequest::new("POST", &q).with_cap_token(Some("agentsecret".into())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("auth.example/authorize"));
+        assert!(ok.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
         // redirect is optional now (manual flow) -> still 200 without it
         let noredir = ApiRequest::new("POST", "/api/v1/agent/oauth/start?provider=codex")
             .with_cap_token(Some("agentsecret".into()));
@@ -7453,6 +7735,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let unknown = router.route(&unknown);
         assert_eq!(unknown.status, 400);
         assert!(String::from_utf8_lossy(&unknown.body).contains("unknown provider"));
+        assert!(unknown.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
         let missing = ApiRequest::new("POST", "/api/v1/agent/oauth/start")
             .with_cap_token(Some("agentsecret".into()));
         let missing = router.route(&missing);
@@ -7530,6 +7815,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let r = router.route(&cb);
         assert_eq!(r.status, 200);
         assert!(String::from_utf8_lossy(&r.body).contains("connected code=abc"));
+        assert!(r.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
         // missing code/state -> 400
         let bad = ApiRequest::new("GET", "/callback?code=abc");
         assert_eq!(router.route(&bad).status, 400);
@@ -9871,7 +10159,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for needle in [
             "function confirmAgentPending(pendingId)",
             "function cancelAgentPending(pendingId)",
-            "function renderAgentPendingCard(pending)",
+            "function renderAgentPendingCard(pending, trackNode = true)",
             "AssistantState.pendingCardsById.set(pending.pending_id",
             "token: d.token || \"\"",
             "action_hash: d.action_hash || \"\"",
@@ -9885,8 +10173,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "record.status = \"error\"",
             "confirm.setAttribute(\"disabled\", \"disabled\")",
             "cancel.setAttribute(\"disabled\", \"disabled\")",
-            "\"data-agent-pending-confirm\": pending.pending_id || \"\"",
-            "\"data-agent-pending-cancel\": pending.pending_id || \"\"",
+            "\"data-agent-pending-confirm\": \"1\"",
+            "\"data-agent-pending-cancel\": \"1\"",
+            "\"data-agent-pending-card\": \"1\"",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -9912,6 +10201,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 && !pending_renderer.contains("sessionStorage"),
             "PendingAction renderer must not expose or persist secrets"
         );
+        for forbidden in [
+            "\"data-agent-pending-card\": pending.pending_id",
+            "\"data-agent-pending-confirm\": pending.pending_id",
+            "\"data-agent-pending-cancel\": pending.pending_id",
+        ] {
+            assert!(
+                !pending_renderer.contains(forbidden),
+                "PendingAction handles must not be serialized into DOM attributes: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -9935,7 +10234,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "\"data-agent-model-connect\": \"codex\"",
             "async function connectAgentProvider(provider)",
             "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
-            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
             "await post(\"/api/v1/agent/model?\" + qs({ provider, model }), CAP.agent);",
             "const st = await api(\"/api/v1/agent/status\");",
             "rememberAssistantStatus(st);",
@@ -9976,7 +10275,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for needle in [
             "data-agent-oauth-code-step\": \"claude\"",
             "body.prepend(card);",
-            "if (OAUTH_ATTEMPTS.has(\"claude\") && !(st && st.claude)) showCodeStep();",
+            "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
             "await cancelOAuthAttempt(\"claude\");",
         ] {
             assert!(
@@ -9990,17 +10289,20 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn assistant_setup_consent_is_required_and_non_secret() {
         for needle in [
             "const AGENT_PRIVACY_CONSENT_KEY = \"isy_agent_privacy_consent_v1\";",
-            "const AGENT_PRIVACY_CONSENT_VERSION = 1;",
+            "const AGENT_PRIVACY_CONSENT_VERSION = 2;",
             "function agentPrivacyConsentAccepted(provider)",
             "async function acceptAgentPrivacyConsent(provider)",
             "version: AGENT_PRIVACY_CONSENT_VERSION",
-            "accepted: true",
-            "provider: consentProvider",
-            "timestamp: new Date().toISOString()",
+            "[\"claude\", \"codex\"].forEach((provider)",
+            "stored.version === 1 && stored.accepted === true",
+            "[consentProvider]: { accepted: true, timestamp: new Date().toISOString() }",
             "localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record))",
             "function renderAssistantConsentPanel(providers)",
             "\"data-agent-consent\": \"1\"",
             "\"data-agent-consent-accept\": provider",
+            "\"data-agent-consent-state\": accepted ? \"accepted\" : \"required\"",
+            "accepted ? agentProviderLabel(provider) + \" allowed\"",
+            "icon(accepted ? \"check\" : \"shield-check\"",
             "\"data-agent-consent-reset\": \"1\"",
             "if (!agentPrivacyConsentAccepted(consentProvider))",
             "if (!agentPrivacyConsentAccepted(provider))",
@@ -10083,7 +10385,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "data-agent-connectivity-settings",
             "nativeCall(\"openNetworkSettings\", { hint }",
             "const BRIDGE_STREAM_TIMEOUT_MS = 125000",
-            "if (st && st.selected_provider)",
+            "const onboardingProvider = st && st.onboarding && st.onboarding.selected_provider",
+            "const candidate = onboardingProvider || (st && st.selected_provider)",
             "if (error && error.connectivity)",
             "await cancelOAuthAttempt(\"claude\"); await finishAgentGuard()",
         ] {
@@ -10096,15 +10399,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             !APP_JS.contains("[provider]: \"reconnect_required\""),
             "a connectivity failure must not rewrite credential state"
         );
-        let effective = APP_JS
-            .find("if (st && st.provider)")
-            .expect("effective provider branch");
-        let selected = APP_JS
-            .find("if (st && st.selected_provider)")
-            .expect("selected provider branch");
         assert!(
-            effective < selected,
-            "the currently effective connected provider must win over a stale selection"
+            !APP_JS.contains("st.provider || st.selected_provider"),
+            "connectivity preflight must follow the host-selected onboarding provider without a runtime-provider fallback"
         );
     }
 

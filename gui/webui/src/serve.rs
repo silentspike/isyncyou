@@ -102,6 +102,7 @@ fn strict_json_body_limit(method: &str, target: &str) -> Option<usize> {
         "/api/v1/agent/connectivity/preflight"
             | "/api/v1/agent/credential/refresh"
             | "/api/v1/agent/oauth/cancel"
+            | "/api/v1/agent/oauth/complete"
     )
     .then_some(AGENT_STRICT_JSON_MAX_BYTES)
 }
@@ -189,6 +190,11 @@ pub struct BridgeDispatchRequest<'a> {
 }
 
 pub fn dispatch_message(router: &Router, request: BridgeDispatchRequest<'_>) -> ApiResponse {
+    if strict_json_body_limit(request.method, request.target)
+        .is_some_and(|limit| request.body.len() > limit)
+    {
+        return ApiResponse::error(413, "request body too large");
+    }
     router.route(&build_request(
         request.method,
         request.target,
@@ -467,7 +473,7 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
                             }
                         }
                     } else {
-                        // Preserve legacy framing behavior outside the three strict JSON
+                        // Preserve legacy framing behavior outside the strict JSON
                         // endpoints. Their later hardening belongs to #628.
                         content_length = Some(v.parse::<usize>().unwrap_or(0));
                     }
@@ -786,6 +792,10 @@ mod tests {
             strict_json_body_limit("POST", "/api/v1/agent/oauth/cancel"),
             Some(AGENT_STRICT_JSON_MAX_BYTES)
         );
+        assert_eq!(
+            strict_json_body_limit("POST", "/api/v1/agent/oauth/complete"),
+            Some(AGENT_STRICT_JSON_MAX_BYTES)
+        );
         assert_eq!(strict_json_body_limit("POST", "/api/v1/agent/turn"), None);
         assert_eq!(
             strict_json_body_limit("GET", "/api/v1/agent/connectivity/preflight"),
@@ -950,6 +960,34 @@ mod tests {
         let buf = one_tcp_response(b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "got: {buf}");
         assert!(buf.contains("\"accounts\""), "body: {buf}");
+    }
+
+    #[test]
+    fn oauth_complete_strict_limit_and_framing_apply_before_routing() {
+        let oversized = one_tcp_response(
+            format!(
+                "POST /api/v1/agent/oauth/complete HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                AGENT_STRICT_JSON_MAX_BYTES + 1
+            )
+            .as_bytes(),
+        );
+        assert!(oversized.starts_with("HTTP/1.1 413"), "got: {oversized}");
+
+        let duplicate_length = one_tcp_response(
+            b"POST /api/v1/agent/oauth/complete HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(
+            duplicate_length.starts_with("HTTP/1.1 400"),
+            "got: {duplicate_length}"
+        );
+
+        let transfer_encoding = one_tcp_response(
+            b"POST /api/v1/agent/oauth/complete HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(
+            transfer_encoding.starts_with("HTTP/1.1 400"),
+            "got: {transfer_encoding}"
+        );
     }
 
     #[test]
@@ -1370,6 +1408,23 @@ mod tests {
             },
         );
         assert_ne!(allowed.status, 401, "bridge with token must pass the gate");
+
+        let oversized = dispatch_message(
+            &open,
+            BridgeDispatchRequest {
+                method: "POST",
+                target: "/api/v1/agent/oauth/complete",
+                cap_token: None,
+                session_token: None,
+                cookie: None,
+                content_type: Some("application/json".into()),
+                body: vec![b'x'; AGENT_STRICT_JSON_MAX_BYTES + 1],
+            },
+        );
+        assert_eq!(
+            oversized.status, 413,
+            "bridge must enforce the same route limit"
+        );
     }
 
     #[test]
