@@ -2947,6 +2947,9 @@ fn public_onboarding_error_code(code: Option<&str>) -> &'static str {
         Some("transport_unavailable") => "transport_unavailable",
         Some("exchange_failed") => "exchange_failed",
         Some("commit_failed") => "commit_failed",
+        Some("same_account_selected") => "same_account_selected",
+        Some("candidate_identity_invalid") => "candidate_identity_invalid",
+        Some("candidate_revoke_unknown") => "candidate_revoke_unknown",
         Some("authorization_failed") => "authorization_failed",
         Some("callback_invalid") => "callback_invalid",
         Some("journal_invalid") => "journal_invalid",
@@ -2968,6 +2971,9 @@ fn is_onboarding_error_code(code: &str) -> bool {
             | "transport_unavailable"
             | "exchange_failed"
             | "commit_failed"
+            | "same_account_selected"
+            | "candidate_identity_invalid"
+            | "candidate_revoke_unknown"
             | "authorization_failed"
             | "callback_invalid"
             | "journal_invalid"
@@ -4593,54 +4599,10 @@ fn commit_codex_oauth_candidate(
         repository
             .require_candidate_cleanup(&journal_id, code, (runtime.now_ms)())
             .map_err(|error| error.wire().to_string())?;
-        let target = if material.refresh_token.is_empty() {
-            isyncyou_agent::oauth::RevokeRequestTarget::AccessToken
-        } else {
-            isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken
-        };
-        repository
-            .start_candidate_revoke(
-                &journal_id,
-                &candidate_id,
-                target,
-                isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
-                (runtime.now_ms)(),
-            )
-            .map_err(|error| error.wire().to_string())?;
-        return match isyncyou_agent::oauth::revoke_product_credential(
-            http,
-            ProductProviderId::Codex,
-            &material.revoke_credential(),
-        ) {
-            isyncyou_agent::oauth::RevokeOutcome::Confirmed { .. } => {
-                repository
-                    .mark_candidate_revoke_outcome(
-                        &journal_id,
-                        &candidate_id,
-                        true,
-                        "revoke_confirmed",
-                        (runtime.now_ms)(),
-                    )
-                    .map_err(|error| error.wire().to_string())?;
-                repository
-                    .finish_candidate_cleanup(&journal_id, &candidate_id, code, (runtime.now_ms)())
-                    .map_err(|error| error.wire().to_string())?;
-                Err(code.into())
-            }
-            isyncyou_agent::oauth::RevokeOutcome::Retryable { code }
-            | isyncyou_agent::oauth::RevokeOutcome::Terminal { code } => {
-                repository
-                    .mark_candidate_revoke_outcome(
-                        &journal_id,
-                        &candidate_id,
-                        false,
-                        revoke_failure_wire(code),
-                        (runtime.now_ms)(),
-                    )
-                    .map_err(|error| error.wire().to_string())?;
-                Err("candidate_revoke_unknown".into())
-            }
-        };
+        // Candidate revocation is a separate authenticated lifecycle operation. The browser
+        // callback owns only exchange, encrypted candidate persistence, and identity validation;
+        // Android must end the OAuth guard before acquiring a fresh credential-revoke guard.
+        return Err(code.into());
     };
 
     let mut meta = ProductBundleMeta::fresh(ProductProviderId::Codex)?;
@@ -4882,7 +4844,7 @@ fn codex_callback_serve_until(
                 });
             let ok = match exchange {
                 Ok(token) => {
-                    let committed = isyncyou_agent::http::HttpTransport::shared()
+                    let commit = isyncyou_agent::http::HttpTransport::shared()
                         .map_err(|_| "transport_unavailable".to_string())
                         .and_then(|http| {
                             commit_codex_oauth_candidate(
@@ -4893,14 +4855,22 @@ fn codex_callback_serve_until(
                                 started_at_seconds,
                                 http.as_ref(),
                             )
-                        })
-                        .is_ok();
-                    if committed {
-                        completed = true;
-                    } else {
-                        terminal_code = Some("commit_failed");
+                        });
+                    match commit {
+                        Ok(()) => {
+                            completed = true;
+                            true
+                        }
+                        Err(error) => {
+                            terminal_code = Some(match error.as_str() {
+                                "same_account_selected" => "same_account_selected",
+                                "candidate_identity_invalid" => "candidate_identity_invalid",
+                                "candidate_revoke_unknown" => "candidate_revoke_unknown",
+                                _ => "commit_failed",
+                            });
+                            false
+                        }
                     }
-                    committed
                 }
                 Err(()) => {
                     terminal_code = Some("exchange_failed");
@@ -5342,7 +5312,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         operation_id: &str,
         material: OAuthCandidateMaterial,
         identity: CandidateIdentityDecision,
-        transport: &dyn isyncyou_agent::oauth::ProductRevokeTransport,
+        _transport: &dyn isyncyou_agent::oauth::ProductRevokeTransport,
     ) -> Result<AccountLifecycleResult, String> {
         if material.provider != provider {
             return Err("candidate_provider_mismatch".into());
@@ -5458,76 +5428,13 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             repository
                 .require_candidate_cleanup(&journal_id, code, (self.credential_now_ms)())
                 .map_err(|error| error.wire().to_string())?;
-            let target = if material.refresh_token.is_empty() {
-                isyncyou_agent::oauth::RevokeRequestTarget::AccessToken
-            } else {
-                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken
-            };
-            repository
-                .start_candidate_revoke(
-                    &journal_id,
-                    &candidate_id,
-                    target,
-                    isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
-                    (self.credential_now_ms)(),
-                )
-                .map_err(|error| error.wire().to_string())?;
-            let outcome = account_lifecycle_revoke_outcome_for_device_test().unwrap_or_else(|| {
-                isyncyou_agent::oauth::revoke_product_credential(
-                    transport,
-                    provider,
-                    &material.revoke_credential(),
-                )
+            return Ok(AccountLifecycleResult {
+                state: "candidate_cleanup",
+                code,
+                retryable: true,
+                operation_id: Some(operation_id.to_string()),
+                operation_etag: Some(active.operation_etag),
             });
-            return match outcome {
-                isyncyou_agent::oauth::RevokeOutcome::Confirmed { .. } => {
-                    repository
-                        .mark_candidate_revoke_outcome(
-                            &journal_id,
-                            &candidate_id,
-                            true,
-                            "revoke_confirmed",
-                            (self.credential_now_ms)(),
-                        )
-                        .map_err(|error| error.wire().to_string())?;
-                    account_lifecycle_revoke_checkpoint_for_device_test();
-                    repository
-                        .finish_candidate_cleanup(
-                            &journal_id,
-                            &candidate_id,
-                            code,
-                            (self.credential_now_ms)(),
-                        )
-                        .map_err(|error| error.wire().to_string())?;
-                    Ok(AccountLifecycleResult {
-                        state: "disconnected",
-                        code,
-                        retryable: false,
-                        operation_id: Some(operation_id.to_string()),
-                        operation_etag: Some(active.operation_etag),
-                    })
-                }
-                isyncyou_agent::oauth::RevokeOutcome::Retryable { code: failure }
-                | isyncyou_agent::oauth::RevokeOutcome::Terminal { code: failure } => {
-                    let failure = revoke_failure_wire(failure);
-                    repository
-                        .mark_candidate_revoke_outcome(
-                            &journal_id,
-                            &candidate_id,
-                            false,
-                            failure,
-                            (self.credential_now_ms)(),
-                        )
-                        .map_err(|error| error.wire().to_string())?;
-                    Ok(AccountLifecycleResult {
-                        state: "candidate_revoke_unknown",
-                        code: failure,
-                        retryable: true,
-                        operation_id: Some(operation_id.to_string()),
-                        operation_etag: Some(active.operation_etag),
-                    })
-                }
-            };
         };
 
         let mut meta = ProductBundleMeta::fresh(provider)?;
@@ -5692,6 +5599,127 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .map_err(|error| error.wire().to_string())?
             .ok_or_else(|| "lifecycle_journal_missing".to_string())?;
         let mode = journal.prepared.mode;
+
+        let candidate_retry = match journal.phase {
+            account_lifecycle::AccountLifecyclePhase::OAuthCandidateCleanup
+                if action == "retry_revoke" =>
+            {
+                Some((
+                    repository
+                        .candidate_record_id(provider, operation_id)
+                        .map_err(|error| error.wire().to_string())?,
+                    match journal.closed_code.as_deref() {
+                        Some("same_account_selected") => "same_account_selected",
+                        Some("switch_identity_unavailable") => "switch_identity_unavailable",
+                        _ => "candidate_identity_invalid",
+                    },
+                    true,
+                ))
+            }
+            account_lifecycle::AccountLifecyclePhase::RevokeOutcomeUnknown
+                if action == "retry_revoke" =>
+            {
+                journal
+                    .revoked_grant
+                    .as_ref()
+                    .and_then(|grant| match grant {
+                        account_lifecycle::RevokedGrantRef::OAuthCandidate { record_id } => {
+                            Some((record_id.clone(), "candidate_identity_invalid", false))
+                        }
+                        account_lifecycle::RevokedGrantRef::ActiveCredential { .. } => None,
+                    })
+            }
+            _ => None,
+        };
+        if let Some((candidate_id, terminal_code, first_attempt)) = candidate_retry {
+            let candidate = repository
+                .load_candidate(&candidate_id)
+                .map_err(|error| error.wire().to_string())?
+                .ok_or_else(|| "candidate_missing".to_string())?;
+            let target = if candidate.refresh_token.is_empty() {
+                isyncyou_agent::oauth::RevokeRequestTarget::AccessToken
+            } else {
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken
+            };
+            if first_attempt {
+                repository
+                    .start_candidate_revoke(
+                        &journal_id,
+                        &candidate_id,
+                        target,
+                        isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                        (self.credential_now_ms)(),
+                    )
+                    .map_err(|error| error.wire().to_string())?;
+            } else {
+                repository
+                    .start_active_revoke(&journal_id, (self.credential_now_ms)())
+                    .map_err(|error| error.wire().to_string())?;
+            }
+            let material = OAuthCandidateMaterial {
+                provider,
+                access_token: candidate.access_token,
+                refresh_token: candidate.refresh_token,
+                expires_at_ms: candidate.expires_at_ms,
+                provider_account_id: candidate.provider_account_id,
+            };
+            let outcome = account_lifecycle_revoke_outcome_for_device_test().unwrap_or_else(|| {
+                isyncyou_agent::oauth::revoke_product_credential(
+                    transport,
+                    provider,
+                    &material.revoke_credential(),
+                )
+            });
+            return match outcome {
+                isyncyou_agent::oauth::RevokeOutcome::Confirmed { .. } => {
+                    repository
+                        .mark_candidate_revoke_outcome(
+                            &journal_id,
+                            &candidate_id,
+                            true,
+                            "revoke_confirmed",
+                            (self.credential_now_ms)(),
+                        )
+                        .map_err(|error| error.wire().to_string())?;
+                    account_lifecycle_revoke_checkpoint_for_device_test();
+                    repository
+                        .finish_candidate_cleanup(
+                            &journal_id,
+                            &candidate_id,
+                            terminal_code,
+                            (self.credential_now_ms)(),
+                        )
+                        .map_err(|error| error.wire().to_string())?;
+                    Ok(AccountLifecycleResult {
+                        state: "disconnected",
+                        code: terminal_code,
+                        retryable: false,
+                        operation_id: Some(operation_id.into()),
+                        operation_etag: Some(operation_etag.into()),
+                    })
+                }
+                isyncyou_agent::oauth::RevokeOutcome::Retryable { code }
+                | isyncyou_agent::oauth::RevokeOutcome::Terminal { code } => {
+                    let code = revoke_failure_wire(code);
+                    repository
+                        .mark_candidate_revoke_outcome(
+                            &journal_id,
+                            &candidate_id,
+                            false,
+                            code,
+                            (self.credential_now_ms)(),
+                        )
+                        .map_err(|error| error.wire().to_string())?;
+                    Ok(AccountLifecycleResult {
+                        state: "candidate_revoke_unknown",
+                        code,
+                        retryable: true,
+                        operation_id: Some(operation_id.into()),
+                        operation_etag: Some(operation_etag.into()),
+                    })
+                }
+            };
+        }
         match (journal.phase, action) {
             (account_lifecycle::AccountLifecyclePhase::RevokedPendingCleanup, "resume_cleanup") => {
                 let _runtime = self
@@ -7112,6 +7140,42 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             return Err("lifecycle_operation_mismatch".into());
         }
         let mode = active.prepared.mode;
+        let journal = repository
+            .load_journal(&active.journal_record_id)
+            .map_err(|error| error.wire().to_string())?
+            .ok_or_else(|| "lifecycle_journal_missing".to_string())?;
+        let candidate_revoke = matches!(
+            journal.phase,
+            account_lifecycle::AccountLifecyclePhase::OAuthCandidateCleanup
+        ) || matches!(
+            journal.revoked_grant.as_ref(),
+            Some(account_lifecycle::RevokedGrantRef::OAuthCandidate { .. })
+        );
+        let candidate_revoke_target = if candidate_revoke {
+            let candidate_id = repository
+                .candidate_record_id(provider, &request.operation_id)
+                .map_err(|error| error.wire().to_string())?;
+            repository
+                .load_candidate(&candidate_id)
+                .map_err(|error| error.wire().to_string())?
+                .map(|candidate| {
+                    if candidate.refresh_token.is_empty() {
+                        "access_token"
+                    } else {
+                        "refresh_token"
+                    }
+                })
+        } else {
+            None
+        };
+        let candidate_revoke_leg = if candidate_revoke {
+            Some(journal.revoke_leg.saturating_add(u32::from(matches!(
+                journal.phase,
+                account_lifecycle::AccountLifecyclePhase::OAuthCandidateCleanup
+            ))))
+        } else {
+            None
+        };
         let transport = isyncyou_agent::http::HttpTransport::shared()
             .map_err(|_| "provider_unavailable".to_string())?;
         let result = self.resume_lifecycle_operation_with_transport(
@@ -7121,7 +7185,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             &request.action,
             transport.as_ref(),
         )?;
-        Ok(lifecycle_api_response(provider, mode, result))
+        let mut response = lifecycle_api_response(provider, mode, result);
+        if let Some(revoke_leg) = candidate_revoke_leg {
+            response.revoke_leg = revoke_leg;
+            response.revoked_grant = Some("oauth_candidate".into());
+            response.revoke_request_target = candidate_revoke_target.map(str::to_string);
+            response.revoke_scope_guarantee = Some("observed_token_session".into());
+        }
+        Ok(response)
     }
 
     fn oauth_start(&self, provider: &str, redirect_uri: &str) -> Result<String, String> {
@@ -7274,14 +7345,20 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             expires_at_ms: (self.credential_now_ms)().saturating_add(token.expires_in * 1_000),
             provider_account_id: None,
         };
-        if let Err(e) = self.process_oauth_candidate_with_transport(
+        let committed = self.process_oauth_candidate_with_transport(
             ProductProviderId::Claude,
             &binding.operation_id,
             candidate,
             CandidateIdentityDecision::Unavailable,
             http.as_ref(),
-        ) {
-            return fail("commit_failed", &e);
+        );
+        match committed {
+            Ok(result) if result.state == "connected" => {}
+            Ok(result) if result.state == "candidate_cleanup" => {
+                return fail(result.code, "oauth_candidate_cleanup_required");
+            }
+            Ok(_) => return fail("commit_failed", "oauth_commit_failed"),
+            Err(error) => return fail("commit_failed", &error),
         }
         Ok("connected".to_string())
     }
@@ -7361,17 +7438,19 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             expires_at_ms: (self.credential_now_ms)().saturating_add(token.expires_in * 1_000),
             provider_account_id: None,
         };
-        if self
-            .process_oauth_candidate_with_transport(
-                ProductProviderId::Claude,
-                &binding.operation_id,
-                candidate,
-                CandidateIdentityDecision::Unavailable,
-                http.as_ref(),
-            )
-            .is_err()
-        {
-            return fail("commit_failed", "oauth_commit_failed");
+        let committed = self.process_oauth_candidate_with_transport(
+            ProductProviderId::Claude,
+            &binding.operation_id,
+            candidate,
+            CandidateIdentityDecision::Unavailable,
+            http.as_ref(),
+        );
+        match committed {
+            Ok(result) if result.state == "connected" => {}
+            Ok(result) if result.state == "candidate_cleanup" => {
+                return fail(result.code, "oauth_candidate_cleanup_required");
+            }
+            Ok(_) | Err(_) => return fail("commit_failed", "oauth_commit_failed"),
         }
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
@@ -17071,7 +17150,8 @@ mod tests {
                 &LifecycleRevokeMock::status(503),
             )
             .unwrap();
-        assert_eq!(result.state, "candidate_revoke_unknown");
+        assert_eq!(result.state, "candidate_cleanup");
+        assert_eq!(result.code, "candidate_identity_invalid");
         assert!(!agent.provider_ready(ProductProviderId::Codex));
         drop(agent);
         let _ = std::fs::remove_dir_all(root);
@@ -17104,8 +17184,20 @@ mod tests {
                 &transport,
             )
             .unwrap();
+        assert_eq!(result.state, "candidate_cleanup");
+        assert_eq!(transport.calls(), 0);
+        let resumed = agent
+            .resume_lifecycle_operation_with_transport(
+                ProductProviderId::Codex,
+                &operation,
+                result.operation_etag.as_deref().unwrap(),
+                "retry_revoke",
+                &transport,
+            )
+            .unwrap();
         assert_eq!(transport.calls(), 1);
-        assert_eq!(result.code, "candidate_identity_invalid");
+        assert_eq!(resumed.state, "disconnected");
+        assert_eq!(resumed.code, "candidate_identity_invalid");
         assert!(account_lifecycle_repository(&root)
             .unwrap()
             .active_operation(ProductProviderId::Codex)
@@ -17132,7 +17224,7 @@ mod tests {
             .unwrap()
             .operation_id
             .unwrap();
-        agent
+        let pending = agent
             .process_oauth_candidate_with_transport(
                 ProductProviderId::Codex,
                 &operation,
@@ -17141,6 +17233,17 @@ mod tests {
                 &LifecycleRevokeMock::status(503),
             )
             .unwrap();
+        assert_eq!(pending.state, "candidate_cleanup");
+        let failed = agent
+            .resume_lifecycle_operation_with_transport(
+                ProductProviderId::Codex,
+                &operation,
+                pending.operation_etag.as_deref().unwrap(),
+                "retry_revoke",
+                &LifecycleRevokeMock::status(503),
+            )
+            .unwrap();
+        assert_eq!(failed.state, "candidate_revoke_unknown");
         let repo = account_lifecycle_repository(&root).unwrap();
         let id = repo
             .candidate_record_id(ProductProviderId::Codex, &operation)
@@ -17383,6 +17486,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.code, "same_account_selected");
+        assert_eq!(result.state, "candidate_cleanup");
+        assert_eq!(transport.calls(), 0);
+        let resumed = agent
+            .resume_lifecycle_operation_with_transport(
+                ProductProviderId::Codex,
+                &operation,
+                result.operation_etag.as_deref().unwrap(),
+                "retry_revoke",
+                &transport,
+            )
+            .unwrap();
+        assert_eq!(resumed.state, "disconnected");
+        assert_eq!(resumed.code, "same_account_selected");
         assert_eq!(transport.calls(), 1);
         assert!(!agent.provider_ready(ProductProviderId::Codex));
         drop(agent);
@@ -17453,7 +17569,17 @@ mod tests {
                 &LifecycleRevokeMock::status(503),
             )
             .unwrap();
-        assert_eq!(result.state, "candidate_revoke_unknown");
+        assert_eq!(result.state, "candidate_cleanup");
+        let failed = agent
+            .resume_lifecycle_operation_with_transport(
+                ProductProviderId::Codex,
+                &operation,
+                result.operation_etag.as_deref().unwrap(),
+                "retry_revoke",
+                &LifecycleRevokeMock::status(503),
+            )
+            .unwrap();
+        assert_eq!(failed.state, "candidate_revoke_unknown");
         let repo = account_lifecycle_repository(&root).unwrap();
         let id = repo
             .candidate_record_id(ProductProviderId::Codex, &operation)
