@@ -389,6 +389,7 @@ fn snapshot_purpose_for_guard(reason: &str) -> Option<isyncyou_agent::Connectivi
     match reason {
         "oauth" => Some(isyncyou_agent::ConnectivityPurpose::OAuthStart),
         "credential_refresh" => Some(isyncyou_agent::ConnectivityPurpose::Refresh),
+        "credential_revoke" => Some(isyncyou_agent::ConnectivityPurpose::CredentialRevoke),
         "agent_turn" => Some(isyncyou_agent::ConnectivityPurpose::TurnStart),
         _ => None,
     }
@@ -3633,6 +3634,103 @@ fn take_codex_refresh_for_device_test() -> bool {
     FORCE_CODEX_REFRESH_FOR_DEVICE_TEST.swap(false, Ordering::SeqCst)
 }
 
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountLifecycleDeviceTestHook {
+    HoldAfterRevokeBeforeCleanup,
+    CrashAfterRevokeConfirmed,
+    ForceRevokeTimeout,
+    ForceCandidateValidationFailure,
+}
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+static ACCOUNT_LIFECYCLE_DEVICE_TEST_HOOK: OnceLock<Mutex<Option<AccountLifecycleDeviceTestHook>>> =
+    OnceLock::new();
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+fn account_lifecycle_device_test_hook() -> &'static Mutex<Option<AccountLifecycleDeviceTestHook>> {
+    ACCOUNT_LIFECYCLE_DEVICE_TEST_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+pub fn arm_account_lifecycle_device_test_hook(value: &str) -> bool {
+    let hook = match value {
+        "hold_after_revoke_before_cleanup" => {
+            AccountLifecycleDeviceTestHook::HoldAfterRevokeBeforeCleanup
+        }
+        "crash_after_revoke_confirmed" => AccountLifecycleDeviceTestHook::CrashAfterRevokeConfirmed,
+        "force_revoke_timeout" => AccountLifecycleDeviceTestHook::ForceRevokeTimeout,
+        "force_candidate_validation_failure" => {
+            AccountLifecycleDeviceTestHook::ForceCandidateValidationFailure
+        }
+        _ => return false,
+    };
+    let Ok(mut armed) = account_lifecycle_device_test_hook().lock() else {
+        return false;
+    };
+    if armed.is_some() {
+        return false;
+    }
+    *armed = Some(hook);
+    true
+}
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+fn take_account_lifecycle_device_test_hook(expected: AccountLifecycleDeviceTestHook) -> bool {
+    let Ok(mut armed) = account_lifecycle_device_test_hook().lock() else {
+        return false;
+    };
+    if *armed != Some(expected) {
+        return false;
+    }
+    *armed = None;
+    true
+}
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+fn account_lifecycle_revoke_outcome_for_device_test() -> Option<isyncyou_agent::oauth::RevokeOutcome>
+{
+    take_account_lifecycle_device_test_hook(AccountLifecycleDeviceTestHook::ForceRevokeTimeout)
+        .then_some(isyncyou_agent::oauth::RevokeOutcome::Retryable {
+            code: isyncyou_agent::oauth::RevokeFailureCode::ConnectTimedOut,
+        })
+}
+
+#[cfg(not(feature = "agent-account-lifecycle-device-test-hooks"))]
+fn account_lifecycle_revoke_outcome_for_device_test() -> Option<isyncyou_agent::oauth::RevokeOutcome>
+{
+    None
+}
+
+fn account_lifecycle_revoke_checkpoint_for_device_test() {
+    #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+    {
+        if take_account_lifecycle_device_test_hook(
+            AccountLifecycleDeviceTestHook::CrashAfterRevokeConfirmed,
+        ) {
+            std::process::abort();
+        }
+        if take_account_lifecycle_device_test_hook(
+            AccountLifecycleDeviceTestHook::HoldAfterRevokeBeforeCleanup,
+        ) {
+            std::thread::sleep(Duration::from_secs(120));
+        }
+    }
+}
+
+fn force_candidate_validation_failure_for_device_test() -> bool {
+    #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+    {
+        take_account_lifecycle_device_test_hook(
+            AccountLifecycleDeviceTestHook::ForceCandidateValidationFailure,
+        )
+    }
+    #[cfg(not(feature = "agent-account-lifecycle-device-test-hooks"))]
+    {
+        false
+    }
+}
+
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -5129,11 +5227,13 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .start_active_revoke(&operation.journal_record_id, (self.credential_now_ms)())
             .map_err(|error| error.wire().to_string())?;
         let revoke_credential = material.revoke_credential();
-        let outcome = isyncyou_agent::oauth::revoke_product_credential(
-            transport,
-            provider,
-            &revoke_credential,
-        );
+        let outcome = account_lifecycle_revoke_outcome_for_device_test().unwrap_or_else(|| {
+            isyncyou_agent::oauth::revoke_product_credential(
+                transport,
+                provider,
+                &revoke_credential,
+            )
+        });
 
         let _runtime = self
             .product_runtime_gate
@@ -5159,6 +5259,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                         (self.credential_now_ms)(),
                     )
                     .map_err(|error| error.wire().to_string())?;
+                account_lifecycle_revoke_checkpoint_for_device_test();
                 delete_provider_product_state_durable(&self.oauth_dir, provider)?;
                 self.last_usage.lock().unwrap().remove(&provider);
                 if mode == account_lifecycle::AccountLifecycleMode::Disconnect {
@@ -5283,6 +5384,11 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             .begin_candidate_validation(&journal_id, (self.credential_now_ms)())
             .map_err(|error| error.wire().to_string())?;
 
+        let identity = if force_candidate_validation_failure_for_device_test() {
+            CandidateIdentityDecision::Invalid
+        } else {
+            identity
+        };
         let prior_subject = active.prepared.prior_subject_digest.as_deref();
         let accepted_subject = match (journal.prepared.mode, provider, identity) {
             (
@@ -5344,11 +5450,13 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     (self.credential_now_ms)(),
                 )
                 .map_err(|error| error.wire().to_string())?;
-            let outcome = isyncyou_agent::oauth::revoke_product_credential(
-                transport,
-                provider,
-                &material.revoke_credential(),
-            );
+            let outcome = account_lifecycle_revoke_outcome_for_device_test().unwrap_or_else(|| {
+                isyncyou_agent::oauth::revoke_product_credential(
+                    transport,
+                    provider,
+                    &material.revoke_credential(),
+                )
+            });
             return match outcome {
                 isyncyou_agent::oauth::RevokeOutcome::Confirmed { .. } => {
                     repository
@@ -5360,6 +5468,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                             (self.credential_now_ms)(),
                         )
                         .map_err(|error| error.wire().to_string())?;
+                    account_lifecycle_revoke_checkpoint_for_device_test();
                     repository
                         .finish_candidate_cleanup(
                             &journal_id,
@@ -14262,6 +14371,25 @@ mod tests {
         assert!(!codex_refresh_for_device_test_is_armed());
     }
 
+    #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+    #[test]
+    fn account_lifecycle_device_hook_is_closed_single_armed_and_one_shot() {
+        assert!(arm_account_lifecycle_device_test_hook(
+            "force_revoke_timeout"
+        ));
+        assert!(!arm_account_lifecycle_device_test_hook(
+            "force_candidate_validation_failure"
+        ));
+        assert_eq!(
+            account_lifecycle_revoke_outcome_for_device_test(),
+            Some(isyncyou_agent::oauth::RevokeOutcome::Retryable {
+                code: isyncyou_agent::oauth::RevokeFailureCode::ConnectTimedOut,
+            })
+        );
+        assert_eq!(account_lifecycle_revoke_outcome_for_device_test(), None);
+        assert!(!arm_account_lifecycle_device_test_hook("arbitrary_hook"));
+    }
+
     #[cfg(any(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
@@ -15451,6 +15579,7 @@ mod tests {
             isyncyou_agent::ConnectivityPurpose::OAuthStart,
         )
         .is_err());
+        invalidate_mobile_connectivity_guard("guard-a");
     }
 
     #[test]
@@ -15481,6 +15610,85 @@ mod tests {
             isyncyou_agent::ConnectivityPurpose::OAuthStart,
         )
         .is_err());
+    }
+
+    #[test]
+    fn credential_revoke_snapshot_is_single_use_and_session_bound() {
+        let snapshot = isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: isyncyou_agent::RestrictBackgroundStatus::Disabled,
+            notifications_visible: true,
+            guard_ready: true,
+        };
+        let register = || {
+            register_mobile_connectivity_snapshot(
+                "revoke-session",
+                "revoke-guard",
+                "credential_revoke",
+                snapshot,
+                None,
+            )
+            .expect("revoke snapshot is registered")
+        };
+
+        let wrong_session = register();
+        assert!(consume_mobile_connectivity_snapshot(
+            &wrong_session,
+            Some("other-session"),
+            isyncyou_agent::ConnectivityPurpose::CredentialRevoke,
+        )
+        .is_err());
+
+        let id = register();
+        assert!(consume_mobile_connectivity_snapshot(
+            &id,
+            Some("revoke-session"),
+            isyncyou_agent::ConnectivityPurpose::CredentialRevoke,
+        )
+        .is_ok());
+        assert!(consume_mobile_connectivity_snapshot(
+            &id,
+            Some("revoke-session"),
+            isyncyou_agent::ConnectivityPurpose::CredentialRevoke,
+        )
+        .is_err());
+        invalidate_mobile_connectivity_guard("revoke-guard");
+    }
+
+    #[test]
+    fn credential_revoke_preflight_rejects_oauth_refresh_or_turn_snapshot() {
+        let snapshot = isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: isyncyou_agent::RestrictBackgroundStatus::Disabled,
+            notifications_visible: true,
+            guard_ready: true,
+        };
+        for (ordinal, reason) in ["oauth", "credential_refresh", "agent_turn"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = register_mobile_connectivity_snapshot(
+                "revoke-purpose-session",
+                &format!("wrong-revoke-guard-{ordinal}"),
+                reason,
+                snapshot,
+                None,
+            )
+            .expect("closed non-revoke snapshot is registered");
+            assert!(consume_mobile_connectivity_snapshot(
+                &id,
+                Some("revoke-purpose-session"),
+                isyncyou_agent::ConnectivityPurpose::CredentialRevoke,
+            )
+            .is_err());
+            invalidate_mobile_connectivity_guard(&format!("wrong-revoke-guard-{ordinal}"));
+        }
     }
 
     #[test]

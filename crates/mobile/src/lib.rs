@@ -1583,9 +1583,20 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
 #[no_mangle]
 pub static ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER: &[u8] = b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
 
+/// #645 evidence marker. The feature-enabled APK exposes only JNI-internal closed
+/// checkpoints; product WebView/HTTP/bridge code has no path to this marker or control.
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_MARKER: &[u8] =
+    b"ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_V1";
+
 /// Consume one app-private #640 diagnostic hook. This is deliberately JNI-only: WebView,
 /// HTTP, bridge payloads, and capability tokens cannot select a diagnostic branch.
-#[cfg(feature = "agent-network-device-test-hooks")]
+#[cfg(any(
+    feature = "agent-network-device-test-hooks",
+    feature = "agent-account-lifecycle-device-test-hooks"
+))]
 fn take_private_device_test_hook(
     files_dir: &str,
     hook_file: &str,
@@ -1689,6 +1700,21 @@ fn arm_codex_refresh_device_test_hook(files_dir: &str) -> bool {
     true
 }
 
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+fn arm_account_lifecycle_device_test_hook(files_dir: &str) -> bool {
+    let value = take_private_device_test_hook(
+        files_dir,
+        "account-lifecycle-test-hook",
+        &[
+            "hold_after_revoke_before_cleanup",
+            "crash_after_revoke_confirmed",
+            "force_revoke_timeout",
+            "force_candidate_validation_failure",
+        ],
+    );
+    !value.is_empty() && isyncyou_app_host::arm_account_lifecycle_device_test_hook(&value)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkDeviceHooksEnabled<
     'local,
@@ -1703,6 +1729,23 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkD
         !ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER.is_empty()
     }
     #[cfg(not(feature = "agent-network-device-test-hooks"))]
+    {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAccountLifecycleDeviceHooksEnabled<
+    'local,
+>(
+    _env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+) -> jni::sys::jboolean {
+    #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+    {
+        !ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_MARKER.is_empty()
+    }
+    #[cfg(not(feature = "agent-account-lifecycle-device-test-hooks"))]
     {
         false
     }
@@ -1734,6 +1777,20 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmCodex
 ) -> jni::sys::jboolean {
     jni_get_string(&mut env, &files_dir)
         .map(|path| arm_codex_refresh_device_test_hook(&path))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmAccountLifecycleDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jboolean {
+    jni_get_string(&mut env, &files_dir)
+        .map(|path| arm_account_lifecycle_device_test_hook(&path))
         .unwrap_or(false)
 }
 
@@ -1805,6 +1862,60 @@ mod tests {
         .is_empty());
     }
 
+    #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+    #[test]
+    fn account_lifecycle_hook_apk_contains_deliberate_marker_and_closed_jni_only_controls() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_MARKER,
+            b"ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_V1"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("account-lifecycle-test-hook");
+        let allowed = [
+            "hold_after_revoke_before_cleanup",
+            "crash_after_revoke_confirmed",
+            "force_revoke_timeout",
+            "force_candidate_validation_failure",
+        ];
+        std::fs::write(&hook, "force_revoke_timeout\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_private_device_test_hook(
+                dir.path().to_str().unwrap(),
+                "account-lifecycle-test-hook",
+                &allowed,
+            ),
+            "force_revoke_timeout"
+        );
+        assert!(!hook.exists());
+
+        std::fs::write(&hook, "arbitrary_checkpoint\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(take_private_device_test_hook(
+            dir.path().to_str().unwrap(),
+            "account-lifecycle-test-hook",
+            &allowed,
+        )
+        .is_empty());
+    }
+
+    #[cfg(not(feature = "agent-account-lifecycle-device-test-hooks"))]
+    #[test]
+    fn default_apk_excludes_account_lifecycle_test_hooks() {
+        let manifest = include_str!("../Cargo.toml");
+        let defaults = manifest
+            .split_once("default = [")
+            .expect("mobile defaults exist")
+            .1
+            .split_once(']')
+            .expect("mobile defaults close")
+            .0;
+        assert!(!defaults.contains("agent-account-lifecycle-device-test-hooks"));
+        assert!(!cfg!(feature = "agent-account-lifecycle-device-test-hooks"));
+    }
+
     #[test]
     fn mobile_product_has_no_local_cli_experimental_feature() {
         let manifest = include_str!("../Cargo.toml");
@@ -1826,6 +1937,7 @@ mod tests {
             "agent-credential-store-self-test",
             "mobile-job-device-test-hooks",
             "agent-network-device-test-hooks",
+            "agent-account-lifecycle-device-test-hooks",
         ];
         let allowlist = gradle
             .split_once("val allowedCargoTestFeatures = setOf(")

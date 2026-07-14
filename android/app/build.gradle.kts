@@ -66,6 +66,7 @@ val allowedCargoTestFeatures = setOf(
     "agent-credential-store-self-test",
     "mobile-job-device-test-hooks",
     "agent-network-device-test-hooks",
+    "agent-account-lifecycle-device-test-hooks",
 )
 val requestedCargoTestFeatures = System.getenv("ISY_CARGO_FEATURES")
     ?.takeUnless { it.isBlank() }

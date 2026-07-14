@@ -632,8 +632,10 @@ mod live {
         match target {
             ProbeTarget::ClaudeOAuth => "https://claude.com/cai/oauth/authorize",
             ProbeTarget::ClaudeInference => "https://api.anthropic.com/v1/messages",
+            ProbeTarget::ClaudeRevoke => "https://platform.claude.com/v1/oauth/token/revoke",
             ProbeTarget::CodexOAuth => "https://auth.openai.com/",
             ProbeTarget::CodexInference => "https://chatgpt.com/backend-api/codex/responses",
+            ProbeTarget::CodexRevoke => "https://auth.openai.com/oauth/revoke",
         }
     }
 

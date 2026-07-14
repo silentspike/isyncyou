@@ -60,6 +60,11 @@ agent-network-device-test-hooks = [
     "agent-oauth-providers",
     "isyncyou-app-host/agent-network-device-test-hooks",
 ]
+# TEST/EVIDENCE ONLY, default-OFF (#645): JNI-only account-lifecycle checkpoints.
+agent-account-lifecycle-device-test-hooks = [
+    "agent-oauth-providers",
+    "isyncyou-app-host/agent-account-lifecycle-device-test-hooks",
+]
 
 [dev-dependencies]
 tempfile = "3"
