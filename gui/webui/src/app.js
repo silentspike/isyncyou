@@ -4906,8 +4906,19 @@ function renderAssistantConsentPanel(providers) {
       el("b", { text: "Privacy consent" }),
       el("p", { class: "dim", text: "The assistant sends selected Microsoft 365 content to the selected provider to answer your question. Continue only if you want that provider to process the selected content." })),
     el("div", { class: "assistant-consent-actions" },
-      ids.map(provider => el("button", { class: "btn sm", type: "button", onclick: () => acceptAgentPrivacyConsent(provider), "data-agent-consent-accept": provider },
-        icon("shield-check", "icon-sm"), "Allow " + agentProviderLabel(provider))),
+      ids.map(provider => {
+        const accepted = agentPrivacyConsentAccepted(provider);
+        return el("button", {
+          class: "btn sm assistant-consent-choice" + (accepted ? " is-accepted" : ""),
+          type: "button",
+          disabled: accepted ? "disabled" : null,
+          onclick: accepted ? null : () => acceptAgentPrivacyConsent(provider),
+          "aria-pressed": accepted ? "true" : "false",
+          "data-agent-consent-accept": provider,
+          "data-agent-consent-state": accepted ? "accepted" : "required",
+        }, icon(accepted ? "check" : "shield-check", "icon-sm"),
+        accepted ? agentProviderLabel(provider) + " allowed" : "Allow " + agentProviderLabel(provider));
+      }),
       el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
         icon("x", "icon-sm"), "Reset")));
 }

@@ -460,6 +460,12 @@ async function main() {
     const consent = await page.evaluate(() => JSON.parse(localStorage.getItem("isy_agent_privacy_consent_v1") || "{}"));
     assert(evidence, "consent localStorage is versioned", consent.version === 1 && consent.accepted === true && consent.provider === "claude", consent);
     assert(evidence, "consent localStorage contains no secrets", !JSON.stringify(consent).match(/token|secret|key|code|content|refresh|access/i), consent);
+    const acceptedConsent = page.locator('[data-agent-consent-accept="claude"]');
+    assert(evidence, "accepted consent is visibly confirmed", await acceptedConsent.getAttribute("data-agent-consent-state") === "accepted"
+      && await acceptedConsent.getAttribute("aria-pressed") === "true"
+      && (await acceptedConsent.innerText()).includes("Claude allowed"));
+    assert(evidence, "accepted consent cannot be submitted repeatedly", await acceptedConsent.isDisabled());
+    assert(evidence, "connect is enabled only after consent", !(await page.locator('[data-testid="agent-connect-claude"]').isDisabled()));
 
     const authPopupPromise = page.waitForEvent("popup", { timeout: 2000 }).catch(() => null);
     await page.locator('#asst-connect-claude').click();

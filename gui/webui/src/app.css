@@ -1405,6 +1405,14 @@ a.note-meta-chip:hover { color: var(--accent); }
   flex-wrap: wrap;
   gap: var(--sp-2);
 }
+.assistant-consent-choice.is-accepted,
+.assistant-consent-choice.is-accepted:disabled {
+  border-color: color-mix(in oklab, var(--ok) 38%, transparent);
+  background: var(--ok-soft);
+  color: var(--ok);
+  cursor: default;
+  opacity: 1;
+}
 .assistant-setup-locked {
   display: flex;
   align-items: center;
