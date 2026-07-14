@@ -18,6 +18,8 @@ isyncyou-webui = { path = "../../gui/webui", default-features = false }
 # compile the product OAuth provider/retrieval path or the #627 local fallback surface.
 isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
+serde = { workspace = true }
+base64 = "0.22"
 ring = "0.17"
 
 [dev-dependencies]

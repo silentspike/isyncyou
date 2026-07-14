@@ -38,6 +38,18 @@ pub enum SecretClass {
     OnboardingAttemptJournal,
     /// #639: the closed product provider/model selection consumed by the runtime gate.
     ProductSettings,
+    /// #645: stable installation principal and initialization marker.
+    AccountLifecycleInstallation,
+    /// #645: installation-wide epoch, key-version, etag, and active-operation authority.
+    AccountLifecycleAuthority,
+    /// #645: one active, provider-bound lifecycle operation journal.
+    AccountLifecycleJournal,
+    /// #645: bounded terminal lifecycle receipt index for one provider.
+    AccountLifecycleReceiptIndex,
+    /// #645: one-time OAuth exchange authority bound to a lifecycle operation.
+    OAuthExchangeIntent,
+    /// #645: encrypted, non-ready token-exchange result pending validation/activation.
+    OAuthCandidate,
 }
 
 impl SecretClass {
@@ -49,6 +61,26 @@ impl SecretClass {
             SecretClass::ProductActivation => "product-activation",
             SecretClass::OnboardingAttemptJournal => "onboarding-attempt-journal",
             SecretClass::ProductSettings => "product-settings",
+            SecretClass::AccountLifecycleInstallation => "account-lifecycle-installation",
+            SecretClass::AccountLifecycleAuthority => "account-lifecycle-authority",
+            SecretClass::AccountLifecycleJournal => "account-lifecycle-journal",
+            SecretClass::AccountLifecycleReceiptIndex => "account-lifecycle-receipts",
+            SecretClass::OAuthExchangeIntent => "oauth-exchange-intent",
+            SecretClass::OAuthCandidate => "oauth-candidate",
+        }
+    }
+
+    fn aad_tag(&self) -> &'static str {
+        match self {
+            SecretClass::AccountLifecycleInstallation => {
+                "isyncyou/account-lifecycle-installation/v1"
+            }
+            SecretClass::AccountLifecycleAuthority => "isyncyou/account-lifecycle-authority/v1",
+            SecretClass::AccountLifecycleJournal => "isyncyou/account-lifecycle-journal/v1",
+            SecretClass::AccountLifecycleReceiptIndex => "isyncyou/account-lifecycle-receipts/v1",
+            SecretClass::OAuthExchangeIntent => "isyncyou/oauth-exchange-intent/v1",
+            SecretClass::OAuthCandidate => "isyncyou/oauth-candidate/v1",
+            _ => self.tag(),
         }
     }
 }
@@ -283,6 +315,23 @@ impl AgentCredentialStore {
         }
     }
 
+    pub fn put_bounded(
+        &self,
+        class: SecretClass,
+        id: &str,
+        secret: &Secret,
+        max_envelope_bytes: usize,
+    ) -> Result<(), AgentError> {
+        match self {
+            AgentCredentialStore::Provided(store) => {
+                store.put_bounded(class, id, secret, max_envelope_bytes)
+            }
+            AgentCredentialStore::Local(store) => {
+                store.put_bounded(class, id, secret, max_envelope_bytes)
+            }
+        }
+    }
+
     pub fn get(&self, class: SecretClass, id: &str) -> Result<Option<Secret>, AgentError> {
         match self {
             AgentCredentialStore::Provided(store) => store.get(class, id),
@@ -448,7 +497,7 @@ fn aad(class: SecretClass, id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     push_len_prefixed(&mut out, AAD_DOMAIN);
     push_len_prefixed(&mut out, &ENVELOPE_VERSION.to_be_bytes());
-    push_len_prefixed(&mut out, class.tag().as_bytes());
+    push_len_prefixed(&mut out, class.aad_tag().as_bytes());
     push_len_prefixed(&mut out, id.as_bytes());
     out
 }
@@ -456,7 +505,7 @@ fn aad(class: SecretClass, id: &str) -> Vec<u8> {
 fn class_key(master: &[u8; KEY_LEN], class: SecretClass) -> Result<[u8; KEY_LEN], AgentError> {
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, HKDF_SALT);
     let prk = salt.extract(master);
-    let info = [b"class:".as_slice(), class.tag().as_bytes()];
+    let info = [b"class:".as_slice(), class.aad_tag().as_bytes()];
     let okm = prk
         .expand(&info, KeyLen(KEY_LEN))
         .map_err(|_| credential_err("credential key derivation failed"))?;
@@ -628,6 +677,28 @@ impl<K: AtRestKey> CredentialStore<K> {
 
     /// Store a secret (overwriting any existing one for `(class, id)`), owner-only.
     pub fn put(&self, class: SecretClass, id: &str, secret: &Secret) -> Result<(), AgentError> {
+        self.put_internal(class, id, secret, None)
+    }
+
+    /// Store a secret only when the final serialized envelope fits `max_envelope_bytes`.
+    /// The bound is checked before the temporary file is created or the prior record is replaced.
+    pub fn put_bounded(
+        &self,
+        class: SecretClass,
+        id: &str,
+        secret: &Secret,
+        max_envelope_bytes: usize,
+    ) -> Result<(), AgentError> {
+        self.put_internal(class, id, secret, Some(max_envelope_bytes))
+    }
+
+    fn put_internal(
+        &self,
+        class: SecretClass,
+        id: &str,
+        secret: &Secret,
+        max_envelope_bytes: Option<usize>,
+    ) -> Result<(), AgentError> {
         if secret.expose().is_empty() {
             return Err(credential_err("credential secret must not be empty"));
         }
@@ -658,6 +729,9 @@ impl<K: AtRestKey> CredentialStore<K> {
         };
         std::fs::create_dir_all(&self.dir).map_err(|e| AgentError::Provider(e.to_string()))?;
         let bytes = serde_json::to_vec(&env).map_err(|e| AgentError::Provider(e.to_string()))?;
+        if max_envelope_bytes.is_some_and(|bound| bytes.len() > bound) {
+            return Err(credential_err("credential envelope exceeds size bound"));
+        }
         write_owner_only(&self.path(&class, id), &bytes)
     }
 
@@ -791,6 +865,46 @@ mod tests {
             !haystack.windows(needle.len()).any(|w| w == needle),
             "plaintext sentinel must not be present"
         );
+    }
+
+    #[test]
+    fn lifecycle_envelope_on_disk_caps_match_production_base64_serializer_at_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let plaintext = Secret::new(vec![b'x'; 4 * 1024]);
+        store
+            .put_bounded(
+                SecretClass::AccountLifecycleInstallation,
+                "installation",
+                &plaintext,
+                usize::MAX,
+            )
+            .unwrap();
+        let path = store.path(&SecretClass::AccountLifecycleInstallation, "installation");
+        let serialized_len = std::fs::metadata(&path).unwrap().len() as usize;
+        let ciphertext_base64 = 4 * ((plaintext.expose().len() + 16).div_ceil(3));
+        assert!(serialized_len >= ciphertext_base64);
+        assert!(serialized_len <= ciphertext_base64 + 2_048);
+
+        store
+            .put_bounded(
+                SecretClass::AccountLifecycleInstallation,
+                "installation",
+                &plaintext,
+                serialized_len,
+            )
+            .unwrap();
+        assert!(store
+            .put_bounded(
+                SecretClass::AccountLifecycleInstallation,
+                "cap-plus-one",
+                &plaintext,
+                serialized_len - 1,
+            )
+            .is_err());
+        assert!(!store
+            .path(&SecretClass::AccountLifecycleInstallation, "cap-plus-one")
+            .exists());
     }
 
     struct CredEnvGuard {

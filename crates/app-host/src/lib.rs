@@ -3,6 +3,16 @@
 //! calls [`build_live_router`] for the shared base; the mobile client adds its
 //! full-node job handlers with [`with_mobile_full_node_jobs`].
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+mod account_identity;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+mod account_lifecycle;
 mod agent_ops;
 #[cfg(feature = "agent-subscription-experimental")]
 mod local_cli_fallback;
@@ -1409,7 +1419,7 @@ fn now_ms() -> u64 {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-const PRODUCT_CREDENTIAL_SCHEMA_VERSION: u32 = 2;
+const PRODUCT_CREDENTIAL_SCHEMA_VERSION: u32 = 3;
 
 /// #639: whether a persisted product credential is usable, or has been marked (fail-closed) as
 /// requiring a fresh official OAuth. A failed refresh persists `ReconnectRequired` so the next
@@ -1434,10 +1444,12 @@ enum CredentialLifecycle {
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProductBundleMeta {
+    schema_version: u32,
     provider: ProductProviderId,
     generation: String,
     policy_fingerprint: String,
     lifecycle: CredentialLifecycle,
+    identity: account_identity::ProductCredentialIdentityV3,
 }
 
 #[cfg(any(
@@ -1449,10 +1461,15 @@ impl ProductBundleMeta {
     /// fingerprint for `provider`, and an `Active` lifecycle.
     fn fresh(provider: ProductProviderId) -> Result<Self, String> {
         Ok(Self {
+            schema_version: PRODUCT_CREDENTIAL_SCHEMA_VERSION,
             provider,
             generation: uuid_v4()?,
             policy_fingerprint: oauth_policy_fingerprint(provider),
             lifecycle: CredentialLifecycle::Active,
+            identity: account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            },
         })
     }
 
@@ -1466,7 +1483,7 @@ impl ProductBundleMeta {
         if let Some(obj) = v.as_object_mut() {
             obj.insert(
                 "schema_version".into(),
-                serde_json::json!(PRODUCT_CREDENTIAL_SCHEMA_VERSION),
+                serde_json::json!(self.schema_version),
             );
             obj.insert(
                 "provider_id".into(),
@@ -1488,6 +1505,9 @@ impl ProductBundleMeta {
             };
             obj.insert("lifecycle".into(), serde_json::json!(lifecycle));
             obj.insert("reconnect_code".into(), serde_json::json!(code));
+            if self.schema_version == PRODUCT_CREDENTIAL_SCHEMA_VERSION {
+                self.identity.merge_into(obj);
+            }
         }
         serde_json::to_vec(&v).unwrap_or(token_json)
     }
@@ -1496,16 +1516,15 @@ impl ProductBundleMeta {
     /// schema version or the generation) — the caller treats that as un-migratable → reconnect.
     fn from_blob(raw: &[u8], expected_provider: ProductProviderId) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
-        if v.get("schema_version").and_then(|x| x.as_u64())
-            != Some(PRODUCT_CREDENTIAL_SCHEMA_VERSION as u64)
-        {
+        let schema_version = u32::try_from(v.get("schema_version")?.as_u64()?).ok()?;
+        if !matches!(schema_version, 2 | PRODUCT_CREDENTIAL_SCHEMA_VERSION) {
             return None;
         }
         let provider = ProductProviderId::parse(v.get("provider_id")?.as_str()?)?;
         if provider != expected_provider {
             return None;
         }
-        let expected_keys: BTreeSet<&str> = match provider {
+        let mut expected_keys: BTreeSet<&str> = match provider {
             ProductProviderId::Claude => [
                 "access_token",
                 "credential_generation",
@@ -1534,6 +1553,9 @@ impl ProductBundleMeta {
             .into_iter()
             .collect(),
         };
+        if schema_version == PRODUCT_CREDENTIAL_SCHEMA_VERSION {
+            expected_keys.extend(["session_id_digest", "subject_digest"]);
+        }
         if v.as_object()?
             .keys()
             .map(String::as_str)
@@ -1563,12 +1585,54 @@ impl ProductBundleMeta {
             }
             _ => return None,
         };
+        let identity = if schema_version == PRODUCT_CREDENTIAL_SCHEMA_VERSION {
+            let identity = account_identity::ProductCredentialIdentityV3 {
+                subject_digest: v
+                    .get("subject_digest")
+                    .and_then(|value| value.as_str().map(str::to_string)),
+                session_id_digest: v
+                    .get("session_id_digest")
+                    .and_then(|value| value.as_str().map(str::to_string)),
+            };
+            identity.validate().ok()?;
+            identity
+        } else {
+            account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            }
+        };
         Some(Self {
+            schema_version,
             provider,
             generation,
             policy_fingerprint,
             lifecycle,
+            identity,
         })
+    }
+
+    #[allow(dead_code)]
+    fn switch_capability(&self) -> account_identity::SwitchCapability {
+        if self.schema_version != PRODUCT_CREDENTIAL_SCHEMA_VERSION {
+            return account_identity::SwitchCapability::Unavailable;
+        }
+        account_identity::switch_capability(self.provider, self.identity.subject_digest.as_deref())
+    }
+
+    #[allow(dead_code)]
+    fn preserve_refresh_identity(
+        &self,
+        refreshed_subject: Option<&str>,
+    ) -> Result<account_identity::ProductCredentialIdentityV3, String> {
+        if let (Some(current), Some(refreshed)) =
+            (self.identity.subject_digest.as_deref(), refreshed_subject)
+        {
+            if current != refreshed {
+                return Err("credential_subject_mismatch".into());
+            }
+        }
+        Ok(self.identity.clone())
     }
 }
 
@@ -1644,7 +1708,7 @@ fn oauth_policy_fingerprint(provider: ProductProviderId) -> String {
         ProductProviderId::Codex => {
             let c = isyncyou_agent::oauth::CodexOAuthConfig::default();
             format!(
-                "codex|{}|{}|{}|{}|{}|{}|{}",
+                "codex|{}|{}|{}|{}|{}|{}|{}|{}",
                 c.authorize_url,
                 c.token_url,
                 c.client_id,
@@ -1652,6 +1716,7 @@ fn oauth_policy_fingerprint(provider: ProductProviderId) -> String {
                 c.scope,
                 isyncyou_agent::oauth::CODEX_OAUTH_SIMPLIFIED_FLOW,
                 isyncyou_agent::oauth::CODEX_OAUTH_ORIGINATOR,
+                "codex-oidc-subject-rs256-v1",
             )
         }
     };
@@ -9796,10 +9861,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         // An Active V2 bundle minted under a DIFFERENT OAuth policy (valid, far-future token).
         let meta = ProductBundleMeta {
+            schema_version: 2,
             provider: ProductProviderId::Claude,
             generation: uuid_v4().unwrap(),
             policy_fingerprint: "0".repeat(64),
             lifecycle: CredentialLifecycle::Active,
+            identity: account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            },
         };
         store_agent_credential_blob(
             &root,
@@ -9840,10 +9910,15 @@ mod tests {
         };
         let old_policy = "1".repeat(64);
         let meta = ProductBundleMeta {
+            schema_version: 2,
             provider: ProductProviderId::Claude,
             generation: uuid_v4().unwrap(),
             policy_fingerprint: old_policy.clone(),
             lifecycle: CredentialLifecycle::Active,
+            identity: account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            },
         };
         store_agent_credential_blob(
             &root,
@@ -10244,10 +10319,15 @@ mod tests {
         // policy-valid; progress must not rely on a credential the product runtime would reject.
         let agent = DaemonAgent::new(Config::default(), root.clone());
         let meta = ProductBundleMeta {
+            schema_version: PRODUCT_CREDENTIAL_SCHEMA_VERSION,
             provider: ProductProviderId::Claude,
             generation: uuid_v4().unwrap(),
             policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
             lifecycle: CredentialLifecycle::Active,
+            identity: account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            },
         };
         store_agent_credential_blob(
             &root,
@@ -10445,10 +10525,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let agent = DaemonAgent::new(Config::default(), root.clone());
         let meta = ProductBundleMeta {
+            schema_version: PRODUCT_CREDENTIAL_SCHEMA_VERSION,
             provider: ProductProviderId::Claude,
             generation: uuid_v4().unwrap(),
             policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
             lifecycle: CredentialLifecycle::Active,
+            identity: account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            },
         };
         store_agent_credential_blob(
             &root,
@@ -11591,10 +11676,15 @@ mod tests {
             .generation;
         assert_ne!(g1, g2, "each login mints a new generation");
         let meta = ProductBundleMeta {
+            schema_version: PRODUCT_CREDENTIAL_SCHEMA_VERSION,
             provider: ProductProviderId::Claude,
             generation: g1.clone(),
             policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
             lifecycle: CredentialLifecycle::Active,
+            identity: account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            },
         };
         let blob = meta.to_blob(
             StoredCredential {
@@ -11628,11 +11718,16 @@ mod tests {
                     expires_at_ms: u64::MAX,
                 },
                 &ProductBundleMeta {
+                    schema_version: PRODUCT_CREDENTIAL_SCHEMA_VERSION,
                     provider: ProductProviderId::Claude,
                     generation: uuid_v4().unwrap(),
                     policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
                     lifecycle: CredentialLifecycle::ReconnectRequired {
                         closed_code: "refresh_failed".into(),
+                    },
+                    identity: account_identity::ProductCredentialIdentityV3 {
+                        subject_digest: None,
+                        session_id_digest: None,
                     },
                 },
             )
@@ -13108,5 +13203,110 @@ mod tests {
         assert_eq!(response.code, "tls_failed");
         assert!(!response.retryable);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn subject_contract_change_rotates_oauth_policy_fingerprint_and_invalidates_old_activation() {
+        let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
+        let old_tuple = format!(
+            "codex|{}|{}|{}|{}|{}|{}|{}",
+            config.authorize_url,
+            config.token_url,
+            config.client_id,
+            config.redirect_uri,
+            config.scope,
+            isyncyou_agent::oauth::CODEX_OAUTH_SIMPLIFIED_FLOW,
+            isyncyou_agent::oauth::CODEX_OAUTH_ORIGINATOR,
+        );
+        let old_digest = ring::digest::digest(&ring::digest::SHA256, old_tuple.as_bytes());
+        let old_policy: String = old_digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let current = oauth_policy_fingerprint(ProductProviderId::Codex);
+        assert_ne!(old_policy, current);
+        let generation = uuid_v4().unwrap();
+        let old_activation = ProductActivationV1 {
+            provider_id: "codex".into(),
+            credential_generation: generation.clone(),
+            oauth_policy_fingerprint: old_policy,
+            harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
+        };
+        assert!(!old_activation.matches(
+            ProductProviderId::Codex,
+            &generation,
+            &current,
+            isyncyou_agent::HARNESS_CONTRACT_VERSION
+        ));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn credential_v2_remains_disconnectable_but_cannot_claim_account_switch() {
+        let meta = ProductBundleMeta {
+            schema_version: 2,
+            provider: ProductProviderId::Codex,
+            generation: uuid_v4().unwrap(),
+            policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Codex),
+            lifecycle: CredentialLifecycle::Active,
+            identity: account_identity::ProductCredentialIdentityV3 {
+                subject_digest: None,
+                session_id_digest: None,
+            },
+        };
+        let blob = meta.to_blob(
+            CodexStoredCredential {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                account_id: "account".into(),
+                expires_at_ms: 2_000,
+            }
+            .to_json(),
+        );
+        let parsed = ProductBundleMeta::from_blob(&blob, ProductProviderId::Codex).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(
+            parsed.switch_capability(),
+            account_identity::SwitchCapability::Unavailable
+        );
+        assert_eq!(parsed.lifecycle, CredentialLifecycle::Active);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn refresh_preserves_subject_and_rejects_account_mismatch() {
+        let digest = account_identity::subject_digest(
+            ProductProviderId::Codex,
+            account_identity::CODEX_OIDC_ISSUER,
+            "subject",
+        )
+        .unwrap();
+        let mut meta = ProductBundleMeta::fresh(ProductProviderId::Codex).unwrap();
+        meta.identity.subject_digest = Some(digest.clone());
+        assert_eq!(
+            meta.preserve_refresh_identity(None).unwrap().subject_digest,
+            Some(digest.clone())
+        );
+        assert_eq!(
+            meta.preserve_refresh_identity(Some(&digest))
+                .unwrap()
+                .subject_digest,
+            Some(digest)
+        );
+        assert_eq!(
+            meta.preserve_refresh_identity(Some(&"x".repeat(43))),
+            Err("credential_subject_mismatch".into())
+        );
     }
 }

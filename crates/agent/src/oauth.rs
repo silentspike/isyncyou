@@ -14,7 +14,7 @@ use crate::AgentError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
@@ -495,14 +495,16 @@ const CODEX_REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
 
 /// Which credential authority was sent to the provider revoke endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RevokeRequestTarget {
     RefreshToken,
     AccessToken,
 }
 
 /// What the reviewed provider contract allows the product to claim about revocation scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RevokeScopeGuarantee {
     ObservedTokenSession,
 }
