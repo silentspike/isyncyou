@@ -1,9 +1,9 @@
-Issue #645 host gates for implementation commit 6b11f884a4ee2e695aa856394869c17cde2e96dc
+Issue #645 host gates for implementation commit 65c2126db3402d361e4bfe6e04f901759619b523
 
 PASS cargo remote -c -- test --workspace --no-fail-fast
   isyncyou-agent: 229 passed
-  isyncyou-app-host: 300 passed, 6 explicit live-seed tests ignored
-  isyncyou-webui: 227 passed
+  isyncyou-app-host: 301 passed, 6 explicit live-seed tests ignored
+  isyncyou-webui: 229 passed
   isyncyou-mobile: 32 passed
   remaining workspace crates: no failures
 PASS cargo remote -c -- clippy --workspace --all-targets -- -D warnings
@@ -15,9 +15,12 @@ PASS cargo remote -c -- clippy -p isyncyou-mobile --all-targets --no-default-fea
 PASS cargo-remote-fmt --check
 PASS python3 tools/verify-agent-account-lifecycle-boundary.py with final default and hook APKs: 13 checks
 PASS python3 -m unittest tools.test_agent_account_lifecycle_device_probe: 4 tests
-PASS python3 tools/check_traceability.py: 71 requirements, 70 implemented, 1 planned
+PASS python3 tools/check_traceability.py: 71 requirements, 71 implemented, 0 planned
 PASS node tools/agent-account-lifecycle-ui-smoke.mjs: 24 assertions
 PASS node --check gui/webui/src/app.js
+PASS agent_oauth_start_first_connect_resumes_bound_operation_after_restart
+PASS agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window
+PASS agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding
 PASS cargo deny check
 PASS actionlint v1.7.12
 

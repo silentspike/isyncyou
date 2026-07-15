@@ -1,14 +1,18 @@
 {
   "schema_version": 1,
+  "implementation_commit": "65c2126db3402d361e4bfe6e04f901759619b523",
   "provider": "codex",
   "deterministic_host_different_subject": "pass",
   "deterministic_ui_capability_contract": "pass",
   "physical_same_account_rejection": "pass",
-  "physical_different_account_switch": "not_run_policy",
-  "reason": "owner_ended_further_interactive_signins_after_repeated_product_oauth_runs",
+  "physical_different_account_switch": "pass",
+  "physical_switch_apk_sha256": "f878a7a6c253d8929050313cf75904615412f0974959de70c06292942f8dfbb2",
+  "closed_audit_account_changed": true,
+  "post_switch_storearchive_turn": "pass",
+  "two_controlled_accounts_used": true,
   "acceptance_criterion": "AC-3",
-  "acceptance_status": "open",
-  "requirement_status": "planned",
+  "acceptance_status": "closed",
+  "requirement_status": "implemented",
   "identity_included": false,
   "token_included": false
 }

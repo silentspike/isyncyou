@@ -428,7 +428,7 @@ requirements:
       non-ready candidate and cannot replace an existing credential before validation and
       required cleanup complete. Android revoke work uses a bounded credential-revoke
       foreground guard and one-shot native connectivity snapshot. (S-AG.16, #645)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Product operation leases prevent disconnect, reconnect, or switch from racing a turn or refresh for the same provider while leaving the other provider usable.
@@ -450,5 +450,8 @@ requirements:
       - test: assistant_account_lifecycle_controls_are_capability_and_state_driven
       - test: credential_revoke_snapshot_is_single_use_and_session_bound
       - test: account_lifecycle_hook_apk_contains_deliberate_marker_and_closed_jni_only_controls
+      - test: agent_oauth_start_first_connect_resumes_bound_operation_after_restart
+      - test: agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window
+      - test: agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding
       - file: tools/agent-account-lifecycle-ui-smoke.mjs
       - file: docs/evidence/issue-645-manifest.json

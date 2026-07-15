@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-15T05:13:12Z",
-  "commit": "6b11f884a4ee2e695aa856394869c17cde2e96dc",
+  "generated_at": "2026-07-15T14:12:12Z",
+  "commit": "65c2126db3402d361e4bfe6e04f901759619b523",
   "entries": [
     {
       "id": "EV-001",
@@ -56,10 +56,10 @@
     {
       "id": "EV-006",
       "requirement": "REQ-AGENT-015",
-      "claim": "A real two-account Codex Switch was not repeated after the owner ended further interactive sign-ins; AC-3 remains open.",
+      "claim": "A real two-account Codex Switch activated a different verified subject and completed a post-Switch StoreArchive turn.",
       "method": "probe",
-      "command": "Physical Pixel two-controlled-account Codex Switch through the app and system browser",
-      "result": "fail",
+      "command": "jq -e '.physical_different_account_switch == \"pass\" and .closed_audit_account_changed == true and .post_switch_storearchive_turn == \"pass\" and .identity_included == false and .token_included == false' docs/evidence/artifacts/issue-645/account-switch.json",
+      "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-645/account-switch.json"
     },
     {
@@ -67,16 +67,16 @@
       "requirement": "REQ-AGENT-015",
       "claim": "A real same-account Codex Switch is rejected, the candidate is revoked under a fresh revoke guard, and no candidate remains ready.",
       "method": "probe",
-      "command": "Physical Pixel default-APK same-account Codex Switch with closed lifecycle status readback",
+      "command": "jq -e '.result == \"pass\" and .closed_code == \"same_account_selected\" and .candidate_ready == false and .secret_or_identity_included == false' docs/evidence/artifacts/issue-645/candidate-cleanup.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-645/candidate-cleanup.json"
     },
     {
       "id": "EV-008",
       "requirement": "REQ-AGENT-015",
-      "claim": "Claude and Codex each completed real disconnect, fresh connect, reconnect, and post-connect StoreArchive turns on the default APK.",
+      "claim": "Claude completed real disconnect, fresh connect, reconnect, and post-connect StoreArchive turns on the default APK.",
       "method": "probe",
-      "command": "Physical Pixel default-APK provider lifecycle walk-through with closed status and terminal turn observations",
+      "command": "jq -e '.connect == \"pass\" and .reconnect_existing_credential == \"pass\" and .post_reconnect_storearchive_turn == \"pass\" and .disconnect_server_revoke_and_local_cleanup == \"pass\" and .secrets_included == false and .identity_included == false' docs/evidence/artifacts/issue-645/claude-lifecycle.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-645/claude-lifecycle.json"
     },
@@ -236,6 +236,45 @@
       "test": "partial_candidate_activation_windows_recover_to_explicit_revoke_cleanup",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-645/recovery.json"
+    },
+    {
+      "id": "EV-025",
+      "requirement": "REQ-AGENT-015",
+      "claim": "A bound first-Connect OAuth operation resumes after the Android app/WebView restarts.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-app-host --features agent-oauth-providers --filter agent_oauth_start_first_connect_resumes_bound_operation_after_restart",
+      "test": "agent_oauth_start_first_connect_resumes_bound_operation_after_restart",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-026",
+      "requirement": "REQ-AGENT-015",
+      "claim": "The WebUI keeps Codex loopback polling alive for the full host OAuth-attempt window.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-webui --filter agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window",
+      "test": "agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-027",
+      "requirement": "REQ-AGENT-015",
+      "claim": "Connectivity retry preserves the durable lifecycle-operation binding instead of starting an unbound OAuth attempt.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-webui --filter agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding",
+      "test": "agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/host-gates.txt"
+    },
+    {
+      "id": "EV-028",
+      "requirement": "REQ-AGENT-015",
+      "claim": "The freshly rebuilt default APK completed a real Codex Connect, read-only turn, Reconnect, and post-Reconnect turn after hook testing.",
+      "method": "probe",
+      "command": "python3 tools/agent-account-lifecycle-device-probe.py --apk android/app/build/outputs/apk/debug/app-debug.apk --scope default --observation /tmp/issue-645-codex-reconnect-observation.json --output /tmp/issue-645-final-device-report.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-645/final-default-reconnect.json"
     }
   ]
 }

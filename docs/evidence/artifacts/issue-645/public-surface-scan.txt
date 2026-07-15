@@ -1,15 +1,71 @@
-Issue #645 public-surface and product-boundary scan
-
-PASS 13/13 checks from tools/verify-agent-account-lifecycle-boundary.py with final default and hook APKs
-PASS product router has no local-only credential deletion route
-PASS revoke endpoints are compiled provider policy, not caller input
-PASS status is observational
-PASS lifecycle does not use experimental local CLI credentials
-PASS provider cleanup excludes Graph and Microsoft 365 credentials
-PASS app-host/mobile defaults and release workflows exclude the lifecycle hook
-PASS Assistant renders closed lifecycle codes only
-PASS README contains no manual provider-token cleanup recipe
-PASS final default APK excludes the lifecycle hook marker
-PASS separate hook APK contains the deliberate lifecycle hook marker
-
-No provider endpoint, token, callback, account identity, device serial, or raw error is included.
+{
+  "checks": [
+    {
+      "detail": "product router exposes lifecycle logout, not local credential deletion",
+      "name": "product_router_has_no_local_only_delete_route",
+      "passed": true
+    },
+    {
+      "detail": "provider revoke endpoints remain compiled provider policy",
+      "name": "product_lifecycle_has_no_endpoint_override",
+      "passed": true
+    },
+    {
+      "detail": "Assistant lifecycle UI consumes closed codes only",
+      "name": "assistant_does_not_render_raw_provider_response",
+      "passed": true
+    },
+    {
+      "detail": "status performs no network, recovery, reaping, cleanup, or persistence mutation",
+      "name": "status_is_observational",
+      "passed": true
+    },
+    {
+      "detail": "product lifecycle does not consult experimental local CLI auth",
+      "name": "lifecycle_does_not_use_local_cli_credentials",
+      "passed": true
+    },
+    {
+      "detail": "provider cleanup is bounded to AI provider state",
+      "name": "cleanup_excludes_graph_and_m365_credentials",
+      "passed": true
+    },
+    {
+      "detail": "app-host defaults exclude the #645 hook",
+      "name": "app_host_default_excludes_hook",
+      "passed": true
+    },
+    {
+      "detail": "mobile defaults exclude the #645 hook",
+      "name": "mobile_default_excludes_hook",
+      "passed": true
+    },
+    {
+      "detail": "Gradle forwards only explicitly allowlisted test features",
+      "name": "android_hook_is_allowlisted_test_only",
+      "passed": true
+    },
+    {
+      "detail": "release workflows do not enable the hook or all features",
+      "name": "release_workflows_exclude_hook",
+      "passed": true
+    },
+    {
+      "detail": "README does not teach token export or manual provider-token deletion",
+      "name": "readme_has_no_manual_provider_token_cleanup",
+      "passed": true
+    },
+    {
+      "detail": "default APK excludes the deliberate #645 marker",
+      "name": "default_apk_excludes_hook_marker",
+      "passed": true
+    },
+    {
+      "detail": "hook APK contains the deliberate #645 marker",
+      "name": "hook_apk_contains_hook_marker",
+      "passed": true
+    }
+  ],
+  "ok": true,
+  "schema_version": 1
+}

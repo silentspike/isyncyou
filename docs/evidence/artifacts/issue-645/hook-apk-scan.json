@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "implementation_commit": "6b11f884a4ee2e695aa856394869c17cde2e96dc",
-  "apk_sha256": "f0f17bb4c664fe7f7a7d6247d5f4f83a4c05e4d4319d0d8ef4c8f9242de1bd18",
+  "implementation_commit": "65c2126db3402d361e4bfe6e04f901759619b523",
+  "apk_sha256": "9a5561c934864cf0cd1a9f0e177c31f1ca8fc02293c1f9afafbb4b41acdae869",
   "hook_marker_present": true,
   "instrumentation_test": "lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot",
   "instrumentation_result": "pass",

@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "implementation_commit": "65c2126db3402d361e4bfe6e04f901759619b523",
   "scope": "physical_default_apk_product_oauth",
   "provider": "codex",
   "connect": "pass",
@@ -10,6 +11,12 @@
   "disconnect_server_revoke_and_local_cleanup": "pass",
   "connect_after_disconnect": "pass",
   "post_second_connect_storearchive_turn": "pass",
+  "post_hook_final_default_apk_sha256": "3de9f65fe44700f67a3571b3a290630c2170aee3bbde7e9048d1092953ee5006",
+  "post_hook_final_default_connect": "pass",
+  "post_hook_final_default_pre_reconnect_turn": "pass",
+  "post_hook_final_default_reconnect": "pass",
+  "post_hook_final_default_post_reconnect_turn": "pass",
+  "post_hook_final_default_marker_absent": true,
   "secrets_included": false,
   "identity_included": false
 }
