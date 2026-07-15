@@ -416,3 +416,42 @@ requirements:
       - test: codex_authorization_error_callback_terminates_without_exchange
       - test: assistant_setup_consent_is_required_and_non_secret
       - file: docs/evidence/issue-639-manifest.json
+
+  - id: REQ-AGENT-015
+    title: Product AI accounts have a reversible, server-revoked lifecycle
+    statement: >
+      Product Claude and Codex credentials can be disconnected or reconnected only through
+      a durable, idempotent lifecycle operation that blocks new provider work, revokes the
+      provider grant before matching local authority is removed, and recovers fail closed
+      after a crash. Account switching is available only when the provider identity is
+      cryptographically verified; every OAuth result is first retained as an encrypted,
+      non-ready candidate and cannot replace an existing credential before validation and
+      required cleanup complete. Android revoke work uses a bounded credential-revoke
+      foreground guard and one-shot native connectivity snapshot. (S-AG.16, #645)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Product operation leases prevent disconnect, reconnect, or switch from racing a turn or refresh for the same provider while leaving the other provider usable.
+      - Revoke success is persisted before provider-scoped credential, activation, usage, settings, and onboarding state are durably removed; ambiguous revoke outcomes remain encrypted and non-ready for explicit retry.
+      - Stable installation-bound idempotency, lifecycle fencing, and encrypted journals make every documented crash window resumable without duplicating revocation or silently losing grant authority.
+      - Reconnect revokes and cleans the old generation before OAuth; every exchanged credential is a non-ready encrypted candidate until identity and product activation succeed.
+      - Codex Switch requires a strictly validated signed subject; Claude reports switching unavailable unless an equivalent verified subject contract exists.
+      - Strict JSON lifecycle routes and the Assistant expose only closed states, capabilities, retry actions, and scope warnings, never tokens, identities, callback data, or raw provider errors.
+      - Android uses a distinct credential-revoke guard and one-shot snapshot; default artifacts exclude lifecycle device hooks and hook evidence never substitutes for real provider evidence.
+    verified_by:
+      - test: disconnect_revokes_server_token_before_local_credential_delete
+      - test: disconnect_ambiguous_response_enters_revoke_unknown_and_retries_same_operation
+      - test: provider_operation_lease_lives_until_actual_turn_thread_terminal_after_stream_open
+      - test: reconnect_existing_credential_revokes_before_replacement
+      - test: codex_switch_different_verified_subject_commits_through_normal_activation_and_completes
+      - test: switch_same_subject_revokes_candidate_and_remains_disconnected
+      - test: candidate_revoke_failure_never_loses_grant_authority
+      - test: agent_status_projects_account_lifecycle_without_identity_or_secret
+      - test: assistant_account_lifecycle_controls_are_capability_and_state_driven
+      - test: credential_revoke_snapshot_is_single_use_and_session_bound
+      - test: account_lifecycle_hook_apk_contains_deliberate_marker_and_closed_jni_only_controls
+      - test: agent_oauth_start_first_connect_resumes_bound_operation_after_restart
+      - test: agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window
+      - test: agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding
+      - file: tools/agent-account-lifecycle-ui-smoke.mjs
+      - file: docs/evidence/issue-645-manifest.json

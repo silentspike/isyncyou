@@ -1588,6 +1588,7 @@ dependencies = [
 name = "isyncyou-app-host"
 version = "1.0.0"
 dependencies = [
+ "base64",
  "filetime",
  "isyncyou-agent",
  "isyncyou-connectors",
@@ -1597,6 +1598,7 @@ dependencies = [
  "isyncyou-store",
  "isyncyou-webui",
  "ring",
+ "serde",
  "serde_json",
 ]
 

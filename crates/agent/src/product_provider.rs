@@ -4,7 +4,10 @@
 
 /// One of the two supported product providers. There is deliberately no `Other`/alias variant:
 /// the type itself is the allowlist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ProductProviderId {
     Claude,
     Codex,
