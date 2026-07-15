@@ -16,7 +16,12 @@
     "idempotency_after_webview_restart",
     "receipt_capacity_preflight",
     "terminal_receipt_compaction",
-    "missing_authority_with_lifecycle_residue"
+    "missing_authority_with_lifecycle_residue",
+    "exchange_inflight_restart_to_unknown",
+    "partial_candidate_activation_windows",
+    "terminal_receipt_after_authority_release",
+    "terminal_artifact_cleanup_idempotence",
+    "generation_lifetime_receipt_retention"
   ],
   "hook_instrumentation": "pass",
   "real_provider_failure_injection_claimed": false

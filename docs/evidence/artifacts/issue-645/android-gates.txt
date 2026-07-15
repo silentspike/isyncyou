@@ -1,9 +1,10 @@
-Issue #645 Android gates for implementation commit b470ccedfdf799db89e89243a80db2a33f2bc5d2
+Issue #645 Android gates for implementation commit 6b11f884a4ee2e695aa856394869c17cde2e96dc
 
-PASS default APK clean assembleDebug
+PASS Android unit tests and lintDebug
+PASS default APK clean assembleDebug and final reinstall after hook testing
 PASS AgentAccountLifecycleInstrumentedTest: 1 test
 PASS AgentAccountLifecycleHookInstrumentedTest.lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot: OK (1 test)
-INFRA Android Test Orchestrator lost USB ADB only during afterAll APK uninstall; the test itself had already returned PASSED.
-PASS Android unit tests and lintDebug in the preceding final gate sweep
+PASS default APK marker absent: sha256 127bfc5f21a942c0eeb64afc2ade9e2142a9db898fd23f7a2e2c444987167513
+PASS hook APK marker present: sha256 f0f17bb4c664fe7f7a7d6247d5f4f83a4c05e4d4319d0d8ef4c8f9242de1bd18
 
 No OAuth, PIN, account identity, device serial, callback, or raw platform log is included.

@@ -1,6 +1,6 @@
 Issue #645 public-surface and product-boundary scan
 
-PASS 11/11 checks from tools/verify-agent-account-lifecycle-boundary.py
+PASS 13/13 checks from tools/verify-agent-account-lifecycle-boundary.py with final default and hook APKs
 PASS product router has no local-only credential deletion route
 PASS revoke endpoints are compiled provider policy, not caller input
 PASS status is observational
@@ -9,5 +9,7 @@ PASS provider cleanup excludes Graph and Microsoft 365 credentials
 PASS app-host/mobile defaults and release workflows exclude the lifecycle hook
 PASS Assistant renders closed lifecycle codes only
 PASS README contains no manual provider-token cleanup recipe
+PASS final default APK excludes the lifecycle hook marker
+PASS separate hook APK contains the deliberate lifecycle hook marker
 
 No provider endpoint, token, callback, account identity, device serial, or raw error is included.
