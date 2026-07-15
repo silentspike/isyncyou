@@ -296,39 +296,26 @@ fn lifecycle_diagnostics() -> &'static account_lifecycle::LifecycleDiagnostics {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn record_account_lifecycle_audit(
+fn record_account_lifecycle_transition_audit(
     cfg: &Config,
-    provider: ProductProviderId,
-    mode: account_lifecycle::AccountLifecycleMode,
-    result: &AccountLifecycleResult,
+    event: &account_lifecycle::LifecycleAuditEvent,
 ) {
     let Some(account) = cfg.accounts.first() else {
         lifecycle_diagnostics().record_audit_failure();
         return;
     };
-    let digest = result.operation_id.as_deref().map(|operation_id| {
-        let value = ring::digest::digest(&ring::digest::SHA256, operation_id.as_bytes());
-        value
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    });
     let summary = format!(
-        "provider={} mode={} transition={} retryable={} local_cleanup_completed={} account_changed={} code={} operation_id_hash={}",
-        provider.wire(),
-        match mode {
-            account_lifecycle::AccountLifecycleMode::Connect => "connect",
-            account_lifecycle::AccountLifecycleMode::Disconnect => "disconnect",
-            account_lifecycle::AccountLifecycleMode::Reconnect => "reconnect",
-            account_lifecycle::AccountLifecycleMode::Switch => "switch",
-        },
-        result.state,
-        result.retryable,
-        result.state == "disconnected",
-        mode == account_lifecycle::AccountLifecycleMode::Switch && result.state == "connected",
-        result.code,
-        digest.as_deref().unwrap_or("none"),
+        "provider={} mode={} transition={} revoke_scope_guarantee={} retryable={} local_cleanup_completed={} account_changed={} code={} timestamp_ms={} operation_id_hash={}",
+        event.provider.wire(),
+        event.mode.wire(),
+        event.phase.wire(),
+        event.revoke_scope_guarantee.unwrap_or("none"),
+        event.retryable,
+        event.local_cleanup_completed,
+        event.account_changed,
+        event.code,
+        event.timestamp_ms,
+        event.operation_id_hash,
     );
     let now = unix_now();
     let recorded = Store::open(account.archive_root.join(".isyncyou-store.db")).and_then(|store| {
@@ -338,7 +325,7 @@ fn record_account_lifecycle_audit(
                 "audit:agent-account-lifecycle",
                 &now,
                 &now,
-                result.state,
+                event.phase.wire(),
                 &summary,
             )
             .map(|_| ())
@@ -616,70 +603,45 @@ struct LifecycleMaintenanceRuntime {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[derive(Clone)]
+struct LifecycleMaintenanceContext {
+    cfg: Config,
+    oauth_dir: PathBuf,
+    provider_leases: Arc<account_lifecycle::ProviderLeaseRegistry>,
+    product_runtime_gate: Arc<Mutex<()>>,
+    last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+    oauth: Arc<isyncyou_agent::AgentOAuth>,
+    oauth_attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
+    oauth_lifecycle_bindings: Arc<Mutex<HashMap<String, OAuthLifecycleAttemptBinding>>>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 impl LifecycleMaintenanceRuntime {
-    fn spawn(
-        oauth_dir: PathBuf,
-        provider_leases: Arc<account_lifecycle::ProviderLeaseRegistry>,
-        last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
-        oauth: Arc<isyncyou_agent::AgentOAuth>,
-        oauth_attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
-        oauth_lifecycle_bindings: Arc<Mutex<HashMap<String, OAuthLifecycleAttemptBinding>>>,
-    ) -> Self {
-        Self::spawn_with_interval(
-            oauth_dir,
-            provider_leases,
-            last_usage,
-            oauth,
-            oauth_attempts,
-            oauth_lifecycle_bindings,
-            std::time::Duration::from_secs(60),
-        )
+    fn spawn(context: LifecycleMaintenanceContext) -> Self {
+        Self::spawn_with_interval(context, std::time::Duration::from_secs(60))
     }
 
     fn spawn_with_interval(
-        oauth_dir: PathBuf,
-        provider_leases: Arc<account_lifecycle::ProviderLeaseRegistry>,
-        last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
-        oauth: Arc<isyncyou_agent::AgentOAuth>,
-        oauth_attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
-        oauth_lifecycle_bindings: Arc<Mutex<HashMap<String, OAuthLifecycleAttemptBinding>>>,
+        context: LifecycleMaintenanceContext,
         interval: std::time::Duration,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let join = std::thread::Builder::new()
             .name("agent-account-lifecycle-maintenance".into())
             .spawn(move || {
-                run_account_maintenance_once(
-                    &oauth_dir,
-                    &provider_leases,
-                    &last_usage,
-                    &oauth,
-                    &oauth_attempts,
-                    &oauth_lifecycle_bindings,
-                );
+                run_account_maintenance_once(&context, false);
                 loop {
                     match rx.recv_timeout(interval) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            run_account_maintenance_once(
-                                &oauth_dir,
-                                &provider_leases,
-                                &last_usage,
-                                &oauth,
-                                &oauth_attempts,
-                                &oauth_lifecycle_bindings,
-                            );
+                            run_account_maintenance_once(&context, false);
                         }
                     }
                 }
-                run_account_maintenance_once(
-                    &oauth_dir,
-                    &provider_leases,
-                    &last_usage,
-                    &oauth,
-                    &oauth_attempts,
-                    &oauth_lifecycle_bindings,
-                );
+                run_account_maintenance_once(&context, false);
             })
             .ok();
         Self {
@@ -694,24 +656,28 @@ impl LifecycleMaintenanceRuntime {
     feature = "agent-subscription-experimental"
 ))]
 fn run_account_maintenance_once(
-    oauth_dir: &Path,
-    provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
-    last_usage: &Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
-    oauth: &isyncyou_agent::AgentOAuth,
-    oauth_attempts: &Arc<Mutex<HashMap<String, OAuthAttempt>>>,
-    oauth_lifecycle_bindings: &Arc<Mutex<HashMap<String, OAuthLifecycleAttemptBinding>>>,
+    context: &LifecycleMaintenanceContext,
+    recover_interrupted_exchange: bool,
 ) {
-    let _ = oauth.reap_expired();
-    if let Ok(mut attempts) = oauth_attempts.lock() {
-        let expired = reap_oauth_attempts(&mut attempts, oauth_dir);
-        if let Ok(mut bindings) = oauth_lifecycle_bindings.lock() {
+    let _ = context.oauth.reap_expired();
+    if let Ok(mut attempts) = context.oauth_attempts.lock() {
+        let expired = reap_oauth_attempts(&mut attempts, &context.oauth_dir);
+        if let Ok(mut bindings) = context.oauth_lifecycle_bindings.lock() {
             for attempt_id in expired {
                 bindings.remove(&attempt_id);
             }
         }
     }
-    reap_onboarding_journals_at(oauth_dir, now_ms());
-    run_lifecycle_maintenance_once(oauth_dir, provider_leases, last_usage);
+    reap_onboarding_journals_at(&context.oauth_dir, now_ms());
+    run_lifecycle_maintenance_once_at_with_recovery(
+        &context.cfg,
+        &context.oauth_dir,
+        &context.provider_leases,
+        &context.product_runtime_gate,
+        &context.last_usage,
+        now_ms(),
+        recover_interrupted_exchange,
+    );
 }
 
 #[cfg(any(
@@ -729,29 +695,46 @@ impl Drop for LifecycleMaintenanceRuntime {
     }
 }
 
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
+#[cfg(all(
+    test,
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
 ))]
-fn run_lifecycle_maintenance_once(
+fn run_lifecycle_maintenance_once_at(
+    cfg: &Config,
     oauth_dir: &Path,
     provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
+    product_runtime_gate: &Arc<Mutex<()>>,
     last_usage: &Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
+    maintenance_now_ms: u64,
 ) {
-    run_lifecycle_maintenance_once_at(oauth_dir, provider_leases, last_usage, now_ms());
+    run_lifecycle_maintenance_once_at_with_recovery(
+        cfg,
+        oauth_dir,
+        provider_leases,
+        product_runtime_gate,
+        last_usage,
+        maintenance_now_ms,
+        false,
+    );
 }
 
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn run_lifecycle_maintenance_once_at(
+fn run_lifecycle_maintenance_once_at_with_recovery(
+    cfg: &Config,
     oauth_dir: &Path,
     provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
+    product_runtime_gate: &Arc<Mutex<()>>,
     last_usage: &Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
     maintenance_now_ms: u64,
+    recover_interrupted_exchange: bool,
 ) {
-    let Ok(repository) = account_lifecycle_repository(oauth_dir) else {
+    let Ok(repository) = audited_account_lifecycle_repository(oauth_dir, cfg) else {
         return;
     };
     let Ok(Some(context)) = repository.load_existing() else {
@@ -767,6 +750,12 @@ fn run_lifecycle_maintenance_once_at(
             maintenance_id,
             account_lifecycle::ProviderOperationKind::Maintenance,
         ) else {
+            continue;
+        };
+        let Ok(_runtime) = product_runtime_gate.lock() else {
+            continue;
+        };
+        let Ok(_snapshot) = acquire_product_runtime_file_lock(oauth_dir) else {
             continue;
         };
         let Ok(Some(current)) = repository.load_existing() else {
@@ -800,19 +789,23 @@ fn run_lifecycle_maintenance_once_at(
                 let committed_generation = candidate
                     .as_ref()
                     .and_then(|candidate| candidate.result_generation.as_deref());
+                let bundle = load_product_bundle_meta(oauth_dir, credential_id);
+                let activation = load_product_activation(oauth_dir, provider);
+                let selection = load_agent_provider_selection(oauth_dir);
                 let product_commit_matches = committed_generation.is_some_and(|generation| {
-                    load_product_bundle_meta(oauth_dir, credential_id).is_some_and(|meta| {
+                    bundle.as_ref().is_some_and(|meta| {
                         meta.lifecycle == CredentialLifecycle::Active
                             && meta.generation == generation
                             && meta.policy_fingerprint == oauth_policy_fingerprint(provider)
-                    }) && load_product_activation(oauth_dir, provider).is_some_and(|activation| {
+                    }) && activation.as_ref().is_some_and(|activation| {
                         activation.matches(
                             provider,
                             generation,
                             &oauth_policy_fingerprint(provider),
                             isyncyou_agent::HARNESS_CONTRACT_VERSION,
                         )
-                    }) && load_agent_provider_selection(oauth_dir)
+                    }) && selection
+                        .as_ref()
                         .is_some_and(|settings| settings.provider == provider)
                 });
                 if product_commit_matches {
@@ -823,6 +816,50 @@ fn run_lifecycle_maintenance_once_at(
                             &active.journal_record_id,
                             candidate_id,
                             generation,
+                            maintenance_now_ms,
+                        );
+                    }
+                } else if journal.phase
+                    == account_lifecycle::AccountLifecyclePhase::CandidateValidation
+                {
+                    let partial_commit_is_owned = candidate.as_ref().is_some_and(|candidate| {
+                        if candidate.state != account_lifecycle::OAuthCandidateState::GrantBearing {
+                            return false;
+                        }
+                        match candidate.result_generation.as_deref() {
+                            Some(generation) => {
+                                bundle.as_ref().is_none_or(|meta| {
+                                    meta.lifecycle == CredentialLifecycle::Active
+                                        && meta.generation == generation
+                                        && meta.policy_fingerprint
+                                            == oauth_policy_fingerprint(provider)
+                                }) && activation.as_ref().is_none_or(|activation| {
+                                    activation.matches(
+                                        provider,
+                                        generation,
+                                        &oauth_policy_fingerprint(provider),
+                                        isyncyou_agent::HARNESS_CONTRACT_VERSION,
+                                    )
+                                })
+                            }
+                            None => {
+                                bundle.is_none()
+                                    && activation.is_none()
+                                    && !selection
+                                        .as_ref()
+                                        .is_some_and(|settings| settings.provider == provider)
+                            }
+                        }
+                    });
+                    if partial_commit_is_owned
+                        && delete_provider_product_state_durable(oauth_dir, provider).is_ok()
+                    {
+                        if let Ok(mut usage) = last_usage.lock() {
+                            usage.remove(&provider);
+                        }
+                        let _ = repository.require_candidate_cleanup(
+                            &active.journal_record_id,
+                            "candidate_activation_interrupted",
                             maintenance_now_ms,
                         );
                     }
@@ -851,6 +888,26 @@ fn run_lifecycle_maintenance_once_at(
                     maintenance_now_ms,
                 );
             }
+            account_lifecycle::AccountLifecyclePhase::ExchangeInFlight
+                if recover_interrupted_exchange
+                    || journal.in_flight_until_ms != 0
+                        && journal.in_flight_until_ms <= maintenance_now_ms =>
+            {
+                let has_intent = repository
+                    .load_exchange_intent(provider, &journal.prepared.operation_id)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if has_intent {
+                    let _ = repository.transition_journal(
+                        &active.journal_record_id,
+                        account_lifecycle::AccountLifecyclePhase::ExchangeInFlight,
+                        account_lifecycle::AccountLifecyclePhase::ExchangeOutcomeUnknown,
+                        Some("exchange_outcome_unknown"),
+                        maintenance_now_ms,
+                    );
+                }
+            }
             account_lifecycle::AccountLifecyclePhase::RevokeOutcomeUnknown
             | account_lifecycle::AccountLifecyclePhase::ExchangeOutcomeUnknown => {}
             _ => {}
@@ -868,12 +925,24 @@ fn run_lifecycle_maintenance_once_at(
         ) else {
             continue;
         };
+        let Ok(_runtime) = product_runtime_gate.lock() else {
+            continue;
+        };
+        let Ok(_snapshot) = acquire_product_runtime_file_lock(oauth_dir) else {
+            continue;
+        };
         let credential_id = match provider {
             ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
             ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
         };
         let protected_generation =
             load_product_bundle_meta(oauth_dir, credential_id).map(|meta| meta.generation);
+        if repository
+            .cleanup_terminal_operation_artifacts(provider)
+            .is_err()
+        {
+            continue;
+        }
         let _ = repository.compact_terminal_receipts(
             provider,
             protected_generation.as_deref(),
@@ -1251,16 +1320,29 @@ impl DaemonAgent {
             reap_onboarding_journals_at(&agent.oauth_dir, now_ms());
             recover_interrupted_onboarding_attempts(&agent.oauth_dir);
             agent.recover_product_onboarding();
-            agent.lifecycle_maintenance = Some(LifecycleMaintenanceRuntime::spawn(
-                agent.oauth_dir.clone(),
-                Arc::clone(&agent.provider_leases),
-                Arc::clone(&agent.last_usage),
-                Arc::clone(&agent.oauth),
-                Arc::clone(&agent.oauth_attempts),
-                Arc::clone(&agent.oauth_lifecycle_bindings),
-            ));
+            let maintenance_context = agent.lifecycle_maintenance_context();
+            run_account_maintenance_once(&maintenance_context, true);
+            agent.lifecycle_maintenance =
+                Some(LifecycleMaintenanceRuntime::spawn(maintenance_context));
         }
         agent
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn lifecycle_maintenance_context(&self) -> LifecycleMaintenanceContext {
+        LifecycleMaintenanceContext {
+            cfg: self.cfg.clone(),
+            oauth_dir: self.oauth_dir.clone(),
+            provider_leases: Arc::clone(&self.provider_leases),
+            product_runtime_gate: Arc::clone(&self.product_runtime_gate),
+            last_usage: Arc::clone(&self.last_usage),
+            oauth: Arc::clone(&self.oauth),
+            oauth_attempts: Arc::clone(&self.oauth_attempts),
+            oauth_lifecycle_bindings: Arc::clone(&self.oauth_lifecycle_bindings),
+        }
     }
 
     #[cfg(test)]
@@ -4103,6 +4185,22 @@ fn account_lifecycle_repository(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+fn audited_account_lifecycle_repository(
+    oauth_dir: &Path,
+    cfg: &Config,
+) -> Result<account_lifecycle::LifecycleRepository, String> {
+    let cfg = cfg.clone();
+    Ok(
+        account_lifecycle_repository(oauth_dir)?.with_audit_hook(Arc::new(move |event| {
+            record_account_lifecycle_transition_audit(&cfg, event);
+        })),
+    )
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn initialize_account_lifecycle(oauth_dir: &Path) -> bool {
     account_lifecycle_repository(oauth_dir)
         .and_then(|repository| {
@@ -4577,6 +4675,7 @@ struct CodexCandidateRuntime {
     feature = "agent-subscription-experimental"
 ))]
 fn prepare_product_oauth_exchange(
+    cfg: &Config,
     oauth_dir: &Path,
     provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
     provider: ProductProviderId,
@@ -4594,7 +4693,7 @@ fn prepare_product_oauth_exchange(
             account_lifecycle::ProviderOperationKind::OAuthActivation,
         )
         .map_err(|error| error.wire().to_string())?;
-    let repository = account_lifecycle_repository(oauth_dir)?;
+    let repository = audited_account_lifecycle_repository(oauth_dir, cfg)?;
     let active = repository
         .active_operation(provider)
         .map_err(|error| error.wire().to_string())?
@@ -4606,6 +4705,59 @@ fn prepare_product_oauth_exchange(
         .prepare_exchange(&active.journal_record_id, attempt_id, now_ms)
         .map_err(|error| error.wire().to_string())?;
     Ok(())
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn mark_product_oauth_exchange_unknown(
+    cfg: &Config,
+    oauth_dir: &Path,
+    provider_leases: &Arc<account_lifecycle::ProviderLeaseRegistry>,
+    provider: ProductProviderId,
+    operation_id: &str,
+    code: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    let lease_id =
+        account_lifecycle::mint_operation_id().map_err(|error| error.wire().to_string())?;
+    let _lease = provider_leases
+        .acquire_exclusive(
+            oauth_dir,
+            provider,
+            lease_id,
+            account_lifecycle::ProviderOperationKind::OAuthActivation,
+        )
+        .map_err(|error| error.wire().to_string())?;
+    let repository = audited_account_lifecycle_repository(oauth_dir, cfg)?;
+    let active = repository
+        .active_operation(provider)
+        .map_err(|error| error.wire().to_string())?
+        .ok_or_else(|| "lifecycle_operation_missing".to_string())?;
+    if active.prepared.operation_id != operation_id {
+        return Err("lifecycle_operation_mismatch".into());
+    }
+    let journal = repository
+        .load_journal(&active.journal_record_id)
+        .map_err(|error| error.wire().to_string())?
+        .ok_or_else(|| "lifecycle_journal_missing".to_string())?;
+    match journal.phase {
+        account_lifecycle::AccountLifecyclePhase::ExchangeInFlight => {
+            repository
+                .transition_journal(
+                    &active.journal_record_id,
+                    account_lifecycle::AccountLifecyclePhase::ExchangeInFlight,
+                    account_lifecycle::AccountLifecyclePhase::ExchangeOutcomeUnknown,
+                    Some(code),
+                    now_ms,
+                )
+                .map_err(|error| error.wire().to_string())?;
+            Ok(())
+        }
+        account_lifecycle::AccountLifecyclePhase::ExchangeOutcomeUnknown => Ok(()),
+        _ => Err("lifecycle_phase_mismatch".into()),
+    }
 }
 
 #[cfg(any(
@@ -4687,7 +4839,7 @@ fn commit_codex_oauth_candidate(
             account_lifecycle::ProviderOperationKind::OAuthActivation,
         )
         .map_err(|error| error.wire().to_string())?;
-    let repository = account_lifecycle_repository(&runtime.oauth_dir)?;
+    let repository = audited_account_lifecycle_repository(&runtime.oauth_dir, &runtime.cfg)?;
     let active = repository
         .active_operation(ProductProviderId::Codex)
         .map_err(|error| error.wire().to_string())?
@@ -4768,18 +4920,6 @@ fn commit_codex_oauth_candidate(
         repository
             .require_candidate_cleanup(&journal_id, code, (runtime.now_ms)())
             .map_err(|error| error.wire().to_string())?;
-        record_account_lifecycle_audit(
-            &runtime.cfg,
-            ProductProviderId::Codex,
-            journal.prepared.mode,
-            &AccountLifecycleResult {
-                state: "candidate_cleanup",
-                code,
-                retryable: true,
-                operation_id: Some(operation_id.to_string()),
-                operation_etag: Some(active.operation_etag.clone()),
-            },
-        );
         // Candidate revocation is a separate authenticated lifecycle operation. The browser
         // callback owns only exchange, encrypted candidate persistence, and identity validation;
         // Android must end the OAuth guard before acquiring a fresh credential-revoke guard.
@@ -4833,18 +4973,6 @@ fn commit_codex_oauth_candidate(
             (runtime.now_ms)(),
         )
         .map_err(|error| error.wire().to_string())?;
-    record_account_lifecycle_audit(
-        &runtime.cfg,
-        ProductProviderId::Codex,
-        journal.prepared.mode,
-        &AccountLifecycleResult {
-            state: "connected",
-            code: "connected",
-            retryable: false,
-            operation_id: Some(operation_id.to_string()),
-            operation_etag: Some(active.operation_etag),
-        },
-    );
     Ok(())
 }
 
@@ -5033,6 +5161,7 @@ fn codex_callback_serve_until(
             // to exchange or persist credentials.
             claimed = true;
             let prepared = prepare_product_oauth_exchange(
+                &candidate_runtime.cfg,
                 &candidate_runtime.oauth_dir,
                 &candidate_runtime.provider_leases,
                 ProductProviderId::Codex,
@@ -5040,6 +5169,7 @@ fn codex_callback_serve_until(
                 &attempt_id,
                 (candidate_runtime.now_ms)(),
             );
+            let exchange_prepared = prepared.is_ok();
             let exchange = prepared.map_err(|_| ()).and_then(|()| {
                 isyncyou_agent::http::HttpTransport::shared()
                     .map_err(|_| ())
@@ -5068,6 +5198,15 @@ fn codex_callback_serve_until(
                             true
                         }
                         Err(error) => {
+                            let _ = mark_product_oauth_exchange_unknown(
+                                &candidate_runtime.cfg,
+                                &candidate_runtime.oauth_dir,
+                                &candidate_runtime.provider_leases,
+                                ProductProviderId::Codex,
+                                &operation_id,
+                                "exchange_outcome_unknown",
+                                (candidate_runtime.now_ms)(),
+                            );
                             terminal_code = Some(match error.as_str() {
                                 "same_account_selected" => "same_account_selected",
                                 "candidate_identity_invalid" => "candidate_identity_invalid",
@@ -5079,6 +5218,17 @@ fn codex_callback_serve_until(
                     }
                 }
                 Err(()) => {
+                    if exchange_prepared {
+                        let _ = mark_product_oauth_exchange_unknown(
+                            &candidate_runtime.cfg,
+                            &candidate_runtime.oauth_dir,
+                            &candidate_runtime.provider_leases,
+                            ProductProviderId::Codex,
+                            &operation_id,
+                            "exchange_outcome_unknown",
+                            (candidate_runtime.now_ms)(),
+                        );
+                    }
                     terminal_code = Some("exchange_failed");
                     false
                 }
@@ -5321,7 +5471,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             )
             .map_err(|error| error.wire().to_string())?;
 
-        let repository = account_lifecycle_repository(&self.oauth_dir)?;
+        let repository = audited_account_lifecycle_repository(&self.oauth_dir, &self.cfg)?;
         let (material, mut meta, operation) = {
             let _runtime = self
                 .product_runtime_gate
@@ -5534,7 +5684,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 account_lifecycle::ProviderOperationKind::OAuthActivation,
             )
             .map_err(|error| error.wire().to_string())?;
-        let repository = account_lifecycle_repository(&self.oauth_dir)?;
+        let repository = audited_account_lifecycle_repository(&self.oauth_dir, &self.cfg)?;
         let active = repository
             .active_operation(provider)
             .map_err(|error| error.wire().to_string())?
@@ -5652,7 +5802,6 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 operation_id: Some(operation_id.to_string()),
                 operation_etag: Some(active.operation_etag),
             };
-            record_account_lifecycle_audit(&self.cfg, provider, journal.prepared.mode, &result);
             return Ok(result);
         };
 
@@ -5716,7 +5865,6 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             operation_id: Some(operation_id.to_string()),
             operation_etag: Some(active.operation_etag),
         };
-        record_account_lifecycle_audit(&self.cfg, provider, journal.prepared.mode, &result);
         Ok(result)
     }
 
@@ -5745,7 +5893,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         if self.lifecycle_credential(provider)?.is_some() {
             return Err("lifecycle_required".into());
         }
-        let repository = account_lifecycle_repository(&self.oauth_dir)?;
+        let repository = audited_account_lifecycle_repository(&self.oauth_dir, &self.cfg)?;
         let operation = repository
             .begin_operation(
                 provider,
@@ -5809,7 +5957,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 account_lifecycle::ProviderOperationKind::Lifecycle,
             )
             .map_err(|error| error.wire().to_string())?;
-        let repository = account_lifecycle_repository(&self.oauth_dir)?;
+        let repository = audited_account_lifecycle_repository(&self.oauth_dir, &self.cfg)?;
         let active = repository
             .active_operation(provider)
             .map_err(|error| error.wire().to_string())?
@@ -5835,6 +5983,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     match journal.closed_code.as_deref() {
                         Some("same_account_selected") => "same_account_selected",
                         Some("switch_identity_unavailable") => "switch_identity_unavailable",
+                        Some("candidate_activation_interrupted") => {
+                            "candidate_activation_interrupted"
+                        }
                         _ => "candidate_identity_invalid",
                     },
                     true,
@@ -7341,7 +7492,6 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 }
             }
         };
-        record_account_lifecycle_audit(&self.cfg, provider, mode, &result);
         Ok(lifecycle_api_response(provider, mode, result))
     }
 
@@ -7411,7 +7561,6 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             &request.action,
             transport.as_ref(),
         )?;
-        record_account_lifecycle_audit(&self.cfg, provider, mode, &result);
         let mut response = lifecycle_api_response(provider, mode, result);
         if let Some(revoke_leg) = candidate_revoke_leg {
             response.revoke_leg = revoke_leg;
@@ -7544,6 +7693,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             return fail("lifecycle_binding_missing", "oauth_commit_failed");
         };
         if prepare_product_oauth_exchange(
+            &self.cfg,
             &self.oauth_dir,
             &self.provider_leases,
             ProductProviderId::Claude,
@@ -7555,16 +7705,30 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         {
             return fail("exchange_intent_failed", "oauth_commit_failed");
         }
+        let fail_exchange = |closed_code: &str, wire_error: &str| {
+            let _ = mark_product_oauth_exchange_unknown(
+                &self.cfg,
+                &self.oauth_dir,
+                &self.provider_leases,
+                ProductProviderId::Claude,
+                &binding.operation_id,
+                "exchange_outcome_unknown",
+                (self.credential_now_ms)(),
+            );
+            fail(closed_code, wire_error)
+        };
         // #639 (F5): once the attempt is consumed, ANY failure of the exchange/commit is a terminal,
         // redacted transition for this attempt (the manual Claude flow has no callback thread to do
         // it), so a failed sign-in is durably recorded as error_redacted and is never resumed.
         let cfg = match self.load_oauth_config() {
             Ok(cfg) => cfg,
-            Err(_) => return fail("policy_unavailable", "provider_connect_failed"),
+            Err(_) => return fail_exchange("policy_unavailable", "provider_connect_failed"),
         };
         let http = match isyncyou_agent::http::HttpTransport::shared() {
             Ok(http) => http,
-            Err(_) => return fail("transport_unavailable", "provider_connect_failed"),
+            Err(_) => {
+                return fail_exchange("transport_unavailable", "provider_connect_failed");
+            }
         };
         let token = match isyncyou_agent::oauth::exchange(
             &http,
@@ -7575,7 +7739,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             &state,
         ) {
             Ok(token) => token,
-            Err(_) => return fail("exchange_failed", "oauth_exchange_failed"),
+            Err(_) => return fail_exchange("exchange_failed", "oauth_exchange_failed"),
         };
         let candidate = OAuthCandidateMaterial {
             provider: ProductProviderId::Claude,
@@ -7597,7 +7761,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 return fail(result.code, "oauth_candidate_cleanup_required");
             }
             Ok(_) => return fail("commit_failed", "oauth_commit_failed"),
-            Err(error) => return fail("commit_failed", &error),
+            Err(error) => return fail_exchange("commit_failed", &error),
         }
         Ok("connected".to_string())
     }
@@ -7652,6 +7816,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             return fail("lifecycle_binding_missing", "oauth_commit_failed");
         };
         if prepare_product_oauth_exchange(
+            &self.cfg,
             &self.oauth_dir,
             &self.provider_leases,
             ProductProviderId::Claude,
@@ -7663,13 +7828,27 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         {
             return fail("exchange_intent_failed", "oauth_commit_failed");
         }
+        let fail_exchange = |closed_code: &str, wire_error: &str| {
+            let _ = mark_product_oauth_exchange_unknown(
+                &self.cfg,
+                &self.oauth_dir,
+                &self.provider_leases,
+                ProductProviderId::Claude,
+                &binding.operation_id,
+                "exchange_outcome_unknown",
+                (self.credential_now_ms)(),
+            );
+            fail(closed_code, wire_error)
+        };
         let cfg = match self.load_oauth_config() {
             Ok(cfg) => cfg,
-            Err(_) => return fail("policy_unavailable", "provider_connect_failed"),
+            Err(_) => return fail_exchange("policy_unavailable", "provider_connect_failed"),
         };
         let http = match isyncyou_agent::http::HttpTransport::shared() {
             Ok(http) => http,
-            Err(_) => return fail("transport_unavailable", "provider_connect_failed"),
+            Err(_) => {
+                return fail_exchange("transport_unavailable", "provider_connect_failed");
+            }
         };
         let token = match isyncyou_agent::oauth::exchange(
             &http,
@@ -7680,7 +7859,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             state,
         ) {
             Ok(token) => token,
-            Err(_) => return fail("exchange_failed", "oauth_exchange_failed"),
+            Err(_) => return fail_exchange("exchange_failed", "oauth_exchange_failed"),
         };
         let candidate = OAuthCandidateMaterial {
             provider: ProductProviderId::Claude,
@@ -7701,7 +7880,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             Ok(result) if result.state == "candidate_cleanup" => {
                 return fail(result.code, "oauth_candidate_cleanup_required");
             }
-            Ok(_) | Err(_) => return fail("commit_failed", "oauth_commit_failed"),
+            Ok(_) | Err(_) => return fail_exchange("commit_failed", "oauth_commit_failed"),
         }
         Ok(Self::OAUTH_SUCCESS_HTML.to_string())
     }
@@ -16744,8 +16923,10 @@ mod tests {
 
         let restarted = DaemonAgent::new(Config::default(), root.clone());
         run_lifecycle_maintenance_once_at(
+            &restarted.cfg,
             &root,
             &restarted.provider_leases,
+            &restarted.product_runtime_gate,
             &restarted.last_usage,
             4_000,
         );
@@ -16808,7 +16989,14 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        run_lifecycle_maintenance_once_at(&root, &agent.provider_leases, &agent.last_usage, 4_000);
+        run_lifecycle_maintenance_once_at(
+            &agent.cfg,
+            &root,
+            &agent.provider_leases,
+            &agent.product_runtime_gate,
+            &agent.last_usage,
+            4_000,
+        );
         assert!(
             load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
                 .unwrap()
@@ -17033,6 +17221,7 @@ mod tests {
     ))]
     #[test]
     fn account_lifecycle_audit_records_closed_transition_without_secret_values() {
+        let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("lifecycle-audit-store");
         let archive = root.join("archive");
         std::fs::create_dir_all(&archive).unwrap();
@@ -17047,31 +17236,39 @@ mod tests {
             }],
             ..Default::default()
         };
-        let operation_id = "123e4567-e89b-42d3-a456-426614174241";
-        let result = AccountLifecycleResult {
-            state: "revoke_unknown",
-            code: "revoke_timeout",
-            retryable: true,
-            operation_id: Some(operation_id.into()),
-            operation_etag: Some("secret-operation-etag".into()),
-        };
-
-        record_account_lifecycle_audit(
-            &cfg,
-            ProductProviderId::Claude,
-            account_lifecycle::AccountLifecycleMode::Disconnect,
-            &result,
-        );
+        let mut agent = DaemonAgent::new(cfg, root.clone());
+        agent.lifecycle_maintenance.take();
+        seed_claude_lifecycle_fixture(&agent);
+        let request_id = "123e4567-e89b-42d3-a456-426614174241";
+        let result = agent
+            .disconnect_product_provider_with_transport(
+                ProductProviderId::Claude,
+                request_id,
+                &LifecycleRevokeMock::status(503),
+            )
+            .unwrap();
+        let operation_id = result.operation_id.unwrap();
+        drop(agent);
 
         let store = Store::open(archive.join(".isyncyou-store.db")).unwrap();
-        let runs = store.recent_runs("me", 1).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].kind, "audit:agent-account-lifecycle");
-        assert_eq!(runs[0].status, "revoke_unknown");
-        assert!(runs[0].summary.contains("provider=claude"));
-        assert!(runs[0].summary.contains("code=revoke_timeout"));
-        assert!(!runs[0].summary.contains(operation_id));
-        assert!(!runs[0].summary.contains("secret-operation-etag"));
+        let runs = store.recent_runs("me", 10).unwrap();
+        let statuses = runs
+            .iter()
+            .map(|run| run.status.as_str())
+            .collect::<Vec<_>>();
+        assert!(statuses.contains(&"prepared"));
+        assert!(statuses.contains(&"revoke_in_flight"));
+        assert!(statuses.contains(&"revoke_outcome_unknown"));
+        for run in runs {
+            assert_eq!(run.kind, "audit:agent-account-lifecycle");
+            assert!(run.summary.contains("provider=claude"));
+            assert!(run
+                .summary
+                .contains("revoke_scope_guarantee=observed_token_session"));
+            assert!(!run.summary.contains(request_id));
+            assert!(!run.summary.contains(&operation_id));
+            assert!(!run.summary.contains("synthetic-claude-refresh"));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -17111,12 +17308,7 @@ mod tests {
             )
             .unwrap();
         let runtime = LifecycleMaintenanceRuntime::spawn_with_interval(
-            root.clone(),
-            Arc::clone(&agent.provider_leases),
-            Arc::clone(&agent.last_usage),
-            Arc::clone(&agent.oauth),
-            Arc::clone(&agent.oauth_attempts),
-            Arc::clone(&agent.oauth_lifecycle_bindings),
+            agent.lifecycle_maintenance_context(),
             std::time::Duration::from_millis(5),
         );
         for _ in 0..100 {
@@ -17182,14 +17374,28 @@ mod tests {
                 account_lifecycle::ProviderOperationKind::Turn,
             )
             .unwrap();
-        run_lifecycle_maintenance_once_at(&root, &agent.provider_leases, &agent.last_usage, 4_000);
+        run_lifecycle_maintenance_once_at(
+            &agent.cfg,
+            &root,
+            &agent.provider_leases,
+            &agent.product_runtime_gate,
+            &agent.last_usage,
+            4_000,
+        );
         assert!(
             load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
                 .unwrap()
                 .is_some()
         );
         drop(turn_lease);
-        run_lifecycle_maintenance_once_at(&root, &agent.provider_leases, &agent.last_usage, 5_000);
+        run_lifecycle_maintenance_once_at(
+            &agent.cfg,
+            &root,
+            &agent.provider_leases,
+            &agent.product_runtime_gate,
+            &agent.last_usage,
+            5_000,
+        );
         assert!(
             load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
                 .unwrap()
@@ -17583,6 +17789,7 @@ mod tests {
             .unwrap();
         let repo = account_lifecycle_repository(&root).unwrap();
         prepare_product_oauth_exchange(
+            &agent.cfg,
             &root,
             &agent.provider_leases,
             ProductProviderId::Codex,
@@ -17599,18 +17806,22 @@ mod tests {
             .unwrap()
             .expect("exchange intent must be durable before provider output");
         assert_eq!(intent.attempt_id, "a".repeat(32));
+        run_lifecycle_maintenance_once_at_with_recovery(
+            &agent.cfg,
+            &root,
+            &agent.provider_leases,
+            &agent.product_runtime_gate,
+            &agent.last_usage,
+            3_000,
+            true,
+        );
         let active = repo
             .active_operation(ProductProviderId::Codex)
             .unwrap()
             .unwrap();
         let journal = repo
-            .transition_journal(
-                &active.journal_record_id,
-                account_lifecycle::AccountLifecyclePhase::ExchangeInFlight,
-                account_lifecycle::AccountLifecyclePhase::ExchangeOutcomeUnknown,
-                Some("exchange_outcome_unknown"),
-                3_000,
-            )
+            .load_journal(&active.journal_record_id)
+            .unwrap()
             .unwrap();
         assert_eq!(
             journal.phase,
@@ -17622,6 +17833,60 @@ mod tests {
             .unwrap()
             .is_none());
         drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn startup_recovery_marks_durable_exchange_intent_outcome_unknown() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("exchange-startup-recovery");
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.lifecycle_maintenance.take();
+        let operation = agent
+            .begin_connect_lifecycle(
+                ProductProviderId::Codex,
+                "123e4567-e89b-42d3-a456-426614174212",
+            )
+            .unwrap();
+        prepare_product_oauth_exchange(
+            &agent.cfg,
+            &root,
+            &agent.provider_leases,
+            ProductProviderId::Codex,
+            operation.operation_id.as_deref().unwrap(),
+            &"b".repeat(32),
+            2_000,
+        )
+        .unwrap();
+        drop(agent);
+
+        let recovered = DaemonAgent::new(Config::default(), root.clone());
+        let repo = account_lifecycle_repository(&root).unwrap();
+        let active = repo
+            .active_operation(ProductProviderId::Codex)
+            .unwrap()
+            .unwrap();
+        let journal = repo
+            .load_journal(&active.journal_record_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            journal.phase,
+            account_lifecycle::AccountLifecyclePhase::ExchangeOutcomeUnknown
+        );
+        assert_eq!(
+            journal.closed_code.as_deref(),
+            Some("exchange_outcome_unknown")
+        );
+        assert!(repo
+            .load_exchange_intent(ProductProviderId::Codex, &active.prepared.operation_id)
+            .unwrap()
+            .is_some());
+        drop(recovered);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -17975,7 +18240,8 @@ mod tests {
     fn switch_crash_after_active_commit_finishes_candidate_cleanup_idempotently() {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("switch-active-commit");
-        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.lifecycle_maintenance.take();
         seed_codex_v3_lifecycle_fixture(&agent, "old-subject");
         let operation = agent
             .begin_reconnect_or_switch_with_transport(
@@ -17987,41 +18253,133 @@ mod tests {
             .unwrap()
             .operation_id
             .unwrap();
-        let subject = account_identity::subject_digest(
+        prepare_product_oauth_exchange(
+            &agent.cfg,
+            &root,
+            &agent.provider_leases,
+            ProductProviderId::Codex,
+            &operation,
+            &"c".repeat(32),
+            2_000,
+        )
+        .unwrap();
+        let subject_digest = account_identity::subject_digest(
             ProductProviderId::Codex,
             account_identity::CODEX_OIDC_ISSUER,
             "new-subject",
         )
         .unwrap();
-        agent
-            .process_oauth_candidate_with_transport(
-                ProductProviderId::Codex,
-                &operation,
-                synthetic_candidate(ProductProviderId::Codex),
-                CandidateIdentityDecision::VerifiedSubject(subject),
-                &LifecycleRevokeMock::status(200),
-            )
+        let repo = account_lifecycle_repository(&root).unwrap();
+        let active = repo
+            .active_operation(ProductProviderId::Codex)
+            .unwrap()
             .unwrap();
+        let candidate_id = repo
+            .candidate_record_id(ProductProviderId::Codex, &operation)
+            .unwrap();
+        repo.publish_candidate(
+            &active.journal_record_id,
+            &account_lifecycle::OAuthCandidateV1 {
+                version: 1,
+                provider: ProductProviderId::Codex,
+                operation_id: operation.clone(),
+                record_id: candidate_id.clone(),
+                access_token: "candidate-access".into(),
+                refresh_token: "candidate-refresh".into(),
+                expires_at_ms: u64::MAX,
+                provider_account_id: Some("candidate-account".into()),
+                subject_digest: Some(subject_digest.clone()),
+                session_id_digest: None,
+                result_generation: None,
+                state: account_lifecycle::OAuthCandidateState::GrantBearing,
+                created_at_ms: 2_000,
+                terminal_at_ms: None,
+            },
+            2_000,
+        )
+        .unwrap();
+        repo.begin_candidate_validation(&active.journal_record_id, 2_001)
+            .unwrap();
+        let mut meta = ProductBundleMeta::fresh(ProductProviderId::Codex).unwrap();
+        meta.identity.subject_digest = Some(subject_digest);
+        repo.bind_candidate_generation(&active.journal_record_id, &candidate_id, &meta.generation)
+            .unwrap();
+        store_codex_bundle(
+            &root,
+            &CodexStoredCredential {
+                access_token: "candidate-access".into(),
+                refresh_token: "candidate-refresh".into(),
+                account_id: "candidate-account".into(),
+                expires_at_ms: u64::MAX,
+            },
+            &meta,
+        )
+        .unwrap();
+        activate_product(&root, ProductProviderId::Codex, &meta.generation).unwrap();
+        store_agent_provider_selection(
+            &root,
+            "codex",
+            &isyncyou_agent::CodexConfig::default().model,
+        )
+        .unwrap();
+        repo.checkpoint_candidate_promoted_before_artifact_cleanup(
+            &active.journal_record_id,
+            &candidate_id,
+            &meta.generation,
+            3_000,
+        )
+        .unwrap();
+        assert!(repo
+            .active_operation(ProductProviderId::Codex)
+            .unwrap()
+            .is_none());
+        assert!(repo.load_candidate(&candidate_id).unwrap().is_some());
+        assert!(repo
+            .load_journal(&active.journal_record_id)
+            .unwrap()
+            .is_some());
+        assert!(repo
+            .load_exchange_intent(ProductProviderId::Codex, &operation)
+            .unwrap()
+            .is_some());
+        drop(agent);
+
+        let mut restarted = DaemonAgent::new(Config::default(), root.clone());
+        restarted.lifecycle_maintenance.take();
+        assert!(account_lifecycle_repository(&root)
+            .unwrap()
+            .load_candidate(&candidate_id)
+            .unwrap()
+            .is_none());
+        assert!(account_lifecycle_repository(&root)
+            .unwrap()
+            .load_journal(&active.journal_record_id)
+            .unwrap()
+            .is_none());
+        assert!(account_lifecycle_repository(&root)
+            .unwrap()
+            .load_exchange_intent(ProductProviderId::Codex, &operation)
+            .unwrap()
+            .is_none());
         let generation = load_product_bundle_meta(&root, CODEX_CREDENTIAL_ID)
             .unwrap()
             .generation;
-        assert!(agent
-            .process_oauth_candidate_with_transport(
-                ProductProviderId::Codex,
-                &operation,
-                synthetic_candidate(ProductProviderId::Codex),
-                CandidateIdentityDecision::Invalid,
-                &LifecycleRevokeMock::status(200)
-            )
-            .is_err());
+        run_lifecycle_maintenance_once_at(
+            &restarted.cfg,
+            &root,
+            &restarted.provider_leases,
+            &restarted.product_runtime_gate,
+            &restarted.last_usage,
+            4_000,
+        );
         assert_eq!(
             load_product_bundle_meta(&root, CODEX_CREDENTIAL_ID)
                 .unwrap()
                 .generation,
             generation
         );
-        assert!(agent.provider_ready(ProductProviderId::Codex));
-        drop(agent);
+        assert!(restarted.provider_ready(ProductProviderId::Codex));
+        drop(restarted);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -18044,6 +18402,7 @@ mod tests {
             .operation_id
             .unwrap();
         prepare_product_oauth_exchange(
+            &agent.cfg,
             &root,
             &agent.provider_leases,
             ProductProviderId::Claude,
@@ -18100,14 +18459,6 @@ mod tests {
             .unwrap();
         activate_product(&root, ProductProviderId::Claude, &meta.generation).unwrap();
         store_agent_provider_selection(&root, "claude", DEFAULT_MODEL).unwrap();
-        repo.transition_journal(
-            &active.journal_record_id,
-            account_lifecycle::AccountLifecyclePhase::CandidateValidation,
-            account_lifecycle::AccountLifecyclePhase::Completed,
-            Some("connected"),
-            2_002,
-        )
-        .unwrap();
         assert_eq!(
             repo.load_candidate(&candidate_id).unwrap().unwrap().state,
             account_lifecycle::OAuthCandidateState::GrantBearing,
@@ -18118,8 +18469,10 @@ mod tests {
         let mut restarted = DaemonAgent::new(Config::default(), root.clone());
         restarted.lifecycle_maintenance.take();
         run_lifecycle_maintenance_once_at(
+            &restarted.cfg,
             &root,
             &restarted.provider_leases,
+            &restarted.product_runtime_gate,
             &restarted.last_usage,
             3_000,
         );
@@ -18131,6 +18484,165 @@ mod tests {
         assert!(restarted.provider_ready(ProductProviderId::Claude));
         drop(restarted);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn partial_candidate_activation_windows_recover_to_explicit_revoke_cleanup() {
+        let _env = AppHostCredentialEnvGuard::new();
+        for (label, request_id, publication_count) in [
+            (
+                "candidate-generation-only",
+                "123e4567-e89b-42d3-a456-426614174231",
+                0,
+            ),
+            (
+                "candidate-credential-written",
+                "123e4567-e89b-42d3-a456-426614174232",
+                1,
+            ),
+            (
+                "candidate-activation-written",
+                "123e4567-e89b-42d3-a456-426614174233",
+                2,
+            ),
+        ] {
+            let root = apphost_credential_test_root(label);
+            let mut agent = DaemonAgent::new(Config::default(), root.clone());
+            agent.lifecycle_maintenance.take();
+            let operation = agent
+                .begin_connect_lifecycle(ProductProviderId::Claude, request_id)
+                .unwrap()
+                .operation_id
+                .unwrap();
+            prepare_product_oauth_exchange(
+                &agent.cfg,
+                &root,
+                &agent.provider_leases,
+                ProductProviderId::Claude,
+                &operation,
+                &"b".repeat(32),
+                2_000,
+            )
+            .unwrap();
+            let repo = account_lifecycle_repository(&root).unwrap();
+            let active = repo
+                .active_operation(ProductProviderId::Claude)
+                .unwrap()
+                .unwrap();
+            let candidate_id = repo
+                .candidate_record_id(ProductProviderId::Claude, &operation)
+                .unwrap();
+            let meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
+            repo.publish_candidate(
+                &active.journal_record_id,
+                &account_lifecycle::OAuthCandidateV1 {
+                    version: 1,
+                    provider: ProductProviderId::Claude,
+                    operation_id: operation.clone(),
+                    record_id: candidate_id.clone(),
+                    access_token: "candidate-access".into(),
+                    refresh_token: "candidate-refresh".into(),
+                    expires_at_ms: u64::MAX,
+                    provider_account_id: None,
+                    subject_digest: None,
+                    session_id_digest: None,
+                    result_generation: None,
+                    state: account_lifecycle::OAuthCandidateState::GrantBearing,
+                    created_at_ms: 2_000,
+                    terminal_at_ms: None,
+                },
+                2_000,
+            )
+            .unwrap();
+            repo.delete_exchange_intent(ProductProviderId::Claude, &operation)
+                .unwrap();
+            repo.begin_candidate_validation(&active.journal_record_id, 2_001)
+                .unwrap();
+            repo.bind_candidate_generation(
+                &active.journal_record_id,
+                &candidate_id,
+                &meta.generation,
+            )
+            .unwrap();
+            if publication_count >= 1 {
+                agent
+                    .store_claude_bundle(
+                        &StoredCredential {
+                            access_token: "candidate-access".into(),
+                            refresh_token: "candidate-refresh".into(),
+                            expires_at_ms: u64::MAX,
+                        },
+                        &meta,
+                    )
+                    .unwrap();
+            }
+            if publication_count >= 2 {
+                activate_product(&root, ProductProviderId::Claude, &meta.generation).unwrap();
+            }
+            drop(agent);
+
+            let mut restarted = DaemonAgent::new(Config::default(), root.clone());
+            restarted.lifecycle_maintenance.take();
+            run_lifecycle_maintenance_once_at(
+                &restarted.cfg,
+                &root,
+                &restarted.provider_leases,
+                &restarted.product_runtime_gate,
+                &restarted.last_usage,
+                3_000,
+            );
+            let repo = account_lifecycle_repository(&root).unwrap();
+            let active = repo
+                .active_operation(ProductProviderId::Claude)
+                .unwrap()
+                .unwrap();
+            let journal = repo
+                .load_journal(&active.journal_record_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                journal.phase,
+                account_lifecycle::AccountLifecyclePhase::OAuthCandidateCleanup,
+                "{label}"
+            );
+            assert_eq!(
+                journal.closed_code.as_deref(),
+                Some("candidate_activation_interrupted"),
+                "{label}"
+            );
+            assert_eq!(
+                repo.load_candidate(&candidate_id).unwrap().unwrap().state,
+                account_lifecycle::OAuthCandidateState::GrantBearing,
+                "{label}"
+            );
+            assert!(load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).is_none());
+            assert!(load_product_activation(&root, ProductProviderId::Claude).is_none());
+            assert!(load_agent_provider_selection(&root).is_none());
+            assert!(!restarted.provider_ready(ProductProviderId::Claude));
+
+            let result = restarted
+                .resume_lifecycle_operation_with_transport(
+                    ProductProviderId::Claude,
+                    &operation,
+                    &active.operation_etag,
+                    "retry_revoke",
+                    &LifecycleRevokeMock::status(200),
+                )
+                .unwrap();
+            assert_eq!(result.state, "disconnected", "{label}");
+            assert_eq!(result.code, "candidate_activation_interrupted", "{label}");
+            assert!(account_lifecycle_repository(&root)
+                .unwrap()
+                .active_operation(ProductProviderId::Claude)
+                .unwrap()
+                .is_none());
+            drop(restarted);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[cfg(any(
