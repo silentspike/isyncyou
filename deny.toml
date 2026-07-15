@@ -12,16 +12,16 @@ ignore = [
     # quick-xml quadratic-time / unbounded-namespace-allocation DoS. Reached ONLY via
     # `wayland-scanner` — a BUILD-TIME proc-macro that parses the trusted, crate-shipped
     # Wayland protocol XML (never attacker-controlled, runs at compile time, not in the
-    # product). Pinned to ^0.39 by winit 0.30's Wayland stack; the fix (quick-xml 0.41)
-    # requires winit 0.31, which is still a beta. Not exploitable in our usage.
-    # REVIEW-BY: 2026-07-10 (revisit when winit 0.31 is stable)
-    { id = "RUSTSEC-2026-0194", reason = "build-time wayland-scanner, trusted protocol XML; fix needs winit 0.31 (beta) — REVIEW-BY 2026-07-10" },
-    { id = "RUSTSEC-2026-0195", reason = "build-time wayland-scanner, trusted protocol XML; fix needs winit 0.31 (beta) — REVIEW-BY 2026-07-10" },
+    # product). Rechecked 2026-07-15: latest wayland-scanner 0.31.10 still requires
+    # quick-xml 0.39, while winit 0.31 remains beta. Not exploitable in our usage.
+    # REVIEW-BY: 2026-08-15 (revisit wayland-scanner and stable winit 0.31)
+    { id = "RUSTSEC-2026-0194", reason = "build-time wayland-scanner 0.31.10 parses trusted crate XML; quick-xml fix still needs beta winit 0.31 — REVIEW-BY 2026-08-15" },
+    { id = "RUSTSEC-2026-0195", reason = "build-time wayland-scanner 0.31.10 parses trusted crate XML; quick-xml fix still needs beta winit 0.31 — REVIEW-BY 2026-08-15" },
     # ttf-parser is UNMAINTAINED (a supply-chain hygiene advisory, not a vulnerability).
-    # Transitive in the desktop font/GUI stack; no patched version exists. Revisit when
-    # the upstream font libraries migrate off it.
-    # REVIEW-BY: 2026-07-10
-    { id = "RUSTSEC-2026-0192", reason = "unmaintained (not a vuln), transitive font dep, no fix exists — REVIEW-BY 2026-07-10" },
+    # Rechecked 2026-07-15: latest ttf-parser 0.25.1 remains transitive in the desktop
+    # statusbar font/GUI stack and the advisory still has no patched version.
+    # REVIEW-BY: 2026-08-15 (revisit upstream font-stack migration)
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained (not a vulnerability), ttf-parser 0.25.1 is transitive in the desktop statusbar and has no patched release — REVIEW-BY 2026-08-15" },
 ]
 
 [licenses]
