@@ -4989,7 +4989,7 @@ async function startAiLogin(provider, lifecycleOperationId) {
     if (AGENT_GUARD_ID === guardId) AGENT_GUARD_ID = null;
     if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
     if (e && e.connectivity) {
-      rememberConnectivityIssue(e, () => startAiLogin(provider));
+      rememberConnectivityIssue(e, () => startAiLogin(provider, lifecycleOperationId));
       renderAssistantView($("#view"));
     } else {
       toast("Sign-in unavailable", "err");
@@ -4999,6 +4999,8 @@ async function startAiLogin(provider, lifecycleOperationId) {
 
 // After the browser login the engine's /callback stores the token; poll status until
 // connected, then switch to the chat.
+const AGENT_OAUTH_POLL_INTERVAL_MS = 2_000;
+const AGENT_OAUTH_POLL_LIMIT = 240; // Match the host's eight-minute OAuth attempt window.
 let AGENT_POLL_ON = false;
 function showWaitingStep(provider) {
   const card = document.getElementById("asst-connect-card");
@@ -5035,7 +5037,9 @@ async function pollAgentStatus(n, provider) {
       return;
     }
   } catch (_) {}
-  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1, provider), 2000); }
+  if (n < AGENT_OAUTH_POLL_LIMIT) {
+    setTimeout(() => pollAgentStatus(n + 1, provider), AGENT_OAUTH_POLL_INTERVAL_MS);
+  }
   else {
     AGENT_POLL_ON = false;
     await cancelOAuthAttempt(provider);
@@ -5575,7 +5579,9 @@ async function pollCodexStatus(n) {
     if (await handleCandidateCleanupStatus(s, "codex")) return;
     if (assistantProviderReady(s, "codex")) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
-  if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
+  if (n < AGENT_OAUTH_POLL_LIMIT) {
+    setTimeout(() => pollCodexStatus(n + 1), AGENT_OAUTH_POLL_INTERVAL_MS);
+  }
   else await finishCodexGuard();
 }
 

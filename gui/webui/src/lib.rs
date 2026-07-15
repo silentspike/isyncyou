@@ -8216,6 +8216,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window() {
+        assert!(APP_JS.contains("const AGENT_OAUTH_POLL_INTERVAL_MS = 2_000"));
+        assert!(APP_JS.contains("const AGENT_OAUTH_POLL_LIMIT = 240"));
+        assert!(APP_JS.contains(
+            "setTimeout(() => pollAgentStatus(n + 1, provider), AGENT_OAUTH_POLL_INTERVAL_MS)"
+        ));
+        assert!(APP_JS
+            .contains("setTimeout(() => pollCodexStatus(n + 1), AGENT_OAUTH_POLL_INTERVAL_MS)"));
+        assert!(!APP_JS.contains("n < 90"));
+    }
+
+    #[test]
+    fn agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding() {
+        assert!(APP_JS.contains(
+            "rememberConnectivityIssue(e, () => startAiLogin(provider, lifecycleOperationId))"
+        ));
+        assert!(!APP_JS.contains("rememberConnectivityIssue(e, () => startAiLogin(provider));"));
+    }
+
+    #[test]
     fn assistant_account_lifecycle_controls_are_capability_and_state_driven() {
         let controls = APP_JS
             .split("function renderAssistantLifecycleControls(st)")

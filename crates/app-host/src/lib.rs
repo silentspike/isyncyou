@@ -7354,7 +7354,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if active.prepared.operation_id != operation_id
                 || !matches!(
                     active.prepared.mode,
-                    account_lifecycle::AccountLifecycleMode::Reconnect
+                    account_lifecycle::AccountLifecycleMode::Connect
+                        | account_lifecycle::AccountLifecycleMode::Reconnect
                         | account_lifecycle::AccountLifecycleMode::Switch
                 )
                 || journal.phase != account_lifecycle::AccountLifecyclePhase::AwaitingOAuthLogin
@@ -18839,6 +18840,41 @@ mod tests {
         let replay = agent.oauth_start_request(request()).unwrap();
         assert_eq!(first, replay);
         drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_oauth_start_first_connect_resumes_bound_operation_after_restart() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("oauth-start-connect-restart");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let first = agent
+            .oauth_start_request(isyncyou_webui::AgentOAuthStartRequest {
+                provider: "claude".into(),
+                request_id: "123e4567-e89b-42d3-a456-426614174227".into(),
+                lifecycle_operation_id: None,
+            })
+            .unwrap();
+        let operation_id = first.lifecycle_operation_id.unwrap();
+        drop(agent);
+
+        let restarted = DaemonAgent::new(Config::default(), root.clone());
+        let resumed = restarted
+            .oauth_start_request(isyncyou_webui::AgentOAuthStartRequest {
+                provider: "claude".into(),
+                request_id: "123e4567-e89b-42d3-a456-426614174228".into(),
+                lifecycle_operation_id: Some(operation_id.clone()),
+            })
+            .unwrap();
+        assert_eq!(
+            resumed.lifecycle_operation_id.as_deref(),
+            Some(operation_id.as_str())
+        );
+        drop(restarted);
         let _ = std::fs::remove_dir_all(root);
     }
 
