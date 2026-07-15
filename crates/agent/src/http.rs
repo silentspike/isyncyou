@@ -62,6 +62,29 @@ pub struct ProviderHttpResponse {
     pub body_preview: Option<String>,
 }
 
+/// Bounded response for public provider metadata such as OIDC discovery and JWKS.
+/// Redirect targets and transport errors remain private to the transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(feature = "http", test))]
+pub struct PublicJsonResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub redirected: bool,
+}
+
+/// Closed failure categories for secret-bearing, non-streaming provider requests.
+/// Raw transport errors and response bodies never cross this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "http", test))]
+pub enum SecretJsonTransportError {
+    ConnectTimedOut,
+    NameResolutionFailed,
+    TlsFailed,
+    ConnectFailed,
+    InitializationFailed,
+}
+
 /// One parsed Server-Sent Event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(any(feature = "http", test))]
@@ -280,11 +303,12 @@ fn read_body_preview(mut reader: impl Read) -> Result<Option<String>, AgentError
 #[cfg(feature = "http")]
 mod live {
     use super::{
-        filter_provider_header_pairs, ProviderHttpResponse, SseDecoder, SseEvent,
-        MAX_PROVIDER_BODY_PREVIEW_BYTES,
+        filter_provider_header_pairs, ProviderHttpResponse, PublicJsonResponse, SseDecoder,
+        SseEvent, MAX_PROVIDER_BODY_PREVIEW_BYTES,
     };
     use crate::connectivity::{ProbeObservation, ProbeTarget};
     use crate::AgentError;
+    use crate::Secret;
     use futures_util::StreamExt;
     use std::sync::{Arc, OnceLock};
     use std::time::Duration;
@@ -374,6 +398,50 @@ mod live {
                 Ok(response) => Ok(ProbeObservation::HttpStatus(response.status().as_u16())),
                 Err(error) => Ok(probe_observation_for_reqwest_error(&error)),
             }
+        }
+
+        /// Fetch bounded, unauthenticated JSON metadata without following redirects.
+        pub fn get_public_json(
+            &self,
+            url: &str,
+            max_body_bytes: usize,
+        ) -> Result<PublicJsonResponse, AgentError> {
+            use std::io::Read as _;
+
+            Self::ensure_test_network_allowed()?;
+            let response = self
+                .probe_client
+                .get(url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .map_err(safe_reqwest_transport_error)?;
+            if response
+                .content_length()
+                .is_some_and(|length| length > max_body_bytes as u64)
+            {
+                return Err(AgentError::Transport("provider_metadata_size_limit".into()));
+            }
+            let status = response.status().as_u16();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let mut body = Vec::with_capacity(max_body_bytes.min(16 * 1024));
+            response
+                .take(max_body_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut body)
+                .map_err(|_| AgentError::Transport("provider_metadata_read_failed".into()))?;
+            if body.len() > max_body_bytes {
+                return Err(AgentError::Transport("provider_metadata_size_limit".into()));
+            }
+            Ok(PublicJsonResponse {
+                status,
+                content_type,
+                body,
+                redirected: (300..400).contains(&status),
+            })
         }
 
         /// POST a JSON body with the given headers; returns `(status, body_text)`.
@@ -500,6 +568,31 @@ mod live {
                 .map_err(|_| AgentError::Transport("provider_response_read_failed".into()))?;
             Ok((status, text))
         }
+
+        /// Send a secret JSON body without redirects and return only the HTTP status.
+        /// This intentionally does not read or retain the provider response body.
+        pub(crate) fn post_secret_json_no_redirect(
+            &self,
+            url: &str,
+            body: &Secret,
+            timeout: Duration,
+        ) -> Result<u16, super::SecretJsonTransportError> {
+            Self::ensure_test_network_allowed()
+                .map_err(|_| super::SecretJsonTransportError::ConnectFailed)?;
+            let client = reqwest::blocking::Client::builder()
+                .connect_timeout(timeout)
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| super::SecretJsonTransportError::InitializationFailed)?;
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.expose().to_vec())
+                .send()
+                .map(|response| response.status().as_u16())
+                .map_err(secret_json_transport_error)
+        }
     }
 
     /// The transport capability held by product providers. Unlike [`HttpTransport`], this type has
@@ -539,8 +632,10 @@ mod live {
         match target {
             ProbeTarget::ClaudeOAuth => "https://claude.com/cai/oauth/authorize",
             ProbeTarget::ClaudeInference => "https://api.anthropic.com/v1/messages",
+            ProbeTarget::ClaudeRevoke => "https://platform.claude.com/v1/oauth/token/revoke",
             ProbeTarget::CodexOAuth => "https://auth.openai.com/",
             ProbeTarget::CodexInference => "https://chatgpt.com/backend-api/codex/responses",
+            ProbeTarget::CodexRevoke => "https://auth.openai.com/oauth/revoke",
         }
     }
 
@@ -606,6 +701,17 @@ mod live {
             _ => "provider_connect_failed",
         };
         AgentError::Transport(code.into())
+    }
+
+    fn secret_json_transport_error(error: reqwest::Error) -> super::SecretJsonTransportError {
+        match probe_observation_for_reqwest_error(&error) {
+            ProbeObservation::ConnectTimedOut => super::SecretJsonTransportError::ConnectTimedOut,
+            ProbeObservation::TlsFailed => super::SecretJsonTransportError::TlsFailed,
+            ProbeObservation::NameResolutionFailed => {
+                super::SecretJsonTransportError::NameResolutionFailed
+            }
+            _ => super::SecretJsonTransportError::ConnectFailed,
+        }
     }
 
     pub(super) async fn within_deadline<T>(

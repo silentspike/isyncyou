@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "scope": "physical_default_apk_product_oauth",
+  "provider": "claude",
+  "connect": "pass",
+  "post_connect_storearchive_turn": "pass",
+  "reconnect_existing_credential": "pass",
+  "post_reconnect_storearchive_turn": "pass",
+  "disconnect_server_revoke_and_local_cleanup": "pass",
+  "connect_after_disconnect": "pass",
+  "post_second_connect_storearchive_turn": "pass",
+  "switch_capability": "identity_unavailable",
+  "secrets_included": false,
+  "identity_included": false
+}

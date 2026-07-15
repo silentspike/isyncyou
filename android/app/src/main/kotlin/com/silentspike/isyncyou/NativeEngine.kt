@@ -111,6 +111,12 @@ object NativeEngine {
      */
     external fun nativeArmCodexRefreshDeviceTestHook(filesDir: String): Boolean
 
+    /** #645 feature-enabled JNI-only lifecycle checkpoint controls. */
+    external fun nativeAccountLifecycleDeviceHooksEnabled(): Boolean
+
+    /** Consume and arm one closed app-private #645 checkpoint. */
+    external fun nativeArmAccountLifecycleDeviceTestHook(filesDir: String): Boolean
+
     /**
      * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
      * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,

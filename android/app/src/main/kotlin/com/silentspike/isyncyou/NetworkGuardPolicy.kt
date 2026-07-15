@@ -14,6 +14,7 @@ enum class NetworkGuardReason(
 ) {
     OAUTH("oauth", 10 * 60_000L),
     CREDENTIAL_REFRESH("credential_refresh", 2 * 60_000L),
+    CREDENTIAL_REVOKE("credential_revoke", 2 * 60_000L),
     AGENT_TURN("agent_turn", 2 * 60_000L, 20 * 60_000L),
     ;
 

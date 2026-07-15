@@ -16,8 +16,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
- * Process foreground protection for an active provider OAuth, credential refresh, or
- * streamed Agent turn. It improves Android execution priority but does not promise that
+ * Process foreground protection for active provider OAuth, credential refresh/revoke, or
+ * a streamed Agent turn. It improves Android execution priority but does not promise that
  * a provider or network path is reachable.
  */
 class NetworkCriticalGuardService : Service() {

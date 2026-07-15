@@ -36,6 +36,7 @@ pub enum ConnectivityPurpose {
     OAuthStart,
     TurnStart,
     Refresh,
+    CredentialRevoke,
 }
 
 impl ConnectivityPurpose {
@@ -44,6 +45,7 @@ impl ConnectivityPurpose {
             "oauth_start" => Some(Self::OAuthStart),
             "turn_start" => Some(Self::TurnStart),
             "refresh" => Some(Self::Refresh),
+            "credential_revoke" => Some(Self::CredentialRevoke),
             _ => None,
         }
     }
@@ -53,6 +55,7 @@ impl ConnectivityPurpose {
             Self::OAuthStart => "oauth_start",
             Self::TurnStart => "turn_start",
             Self::Refresh => "refresh",
+            Self::CredentialRevoke => "credential_revoke",
         }
     }
 }
@@ -64,6 +67,8 @@ pub enum ProbeTarget {
     ClaudeInference,
     CodexOAuth,
     CodexInference,
+    ClaudeRevoke,
+    CodexRevoke,
 }
 
 pub fn target_for(provider: ConnectivityProvider, purpose: ConnectivityPurpose) -> ProbeTarget {
@@ -73,10 +78,16 @@ pub fn target_for(provider: ConnectivityProvider, purpose: ConnectivityPurpose) 
         (ConnectivityProvider::Claude, ConnectivityPurpose::TurnStart) => {
             ProbeTarget::ClaudeInference
         }
+        (ConnectivityProvider::Claude, ConnectivityPurpose::CredentialRevoke) => {
+            ProbeTarget::ClaudeRevoke
+        }
         (ConnectivityProvider::Codex, ConnectivityPurpose::OAuthStart)
         | (ConnectivityProvider::Codex, ConnectivityPurpose::Refresh) => ProbeTarget::CodexOAuth,
         (ConnectivityProvider::Codex, ConnectivityPurpose::TurnStart) => {
             ProbeTarget::CodexInference
+        }
+        (ConnectivityProvider::Codex, ConnectivityPurpose::CredentialRevoke) => {
+            ProbeTarget::CodexRevoke
         }
     }
 }
@@ -288,6 +299,31 @@ mod tests {
         assert_eq!(
             target_for(ConnectivityProvider::Codex, ConnectivityPurpose::TurnStart),
             ProbeTarget::CodexInference
+        );
+    }
+
+    #[test]
+    fn credential_revoke_preflight_selects_reviewed_provider_target() {
+        assert_eq!(
+            target_for(
+                ConnectivityProvider::Claude,
+                ConnectivityPurpose::CredentialRevoke
+            ),
+            ProbeTarget::ClaudeRevoke
+        );
+        assert_eq!(
+            target_for(
+                ConnectivityProvider::Codex,
+                ConnectivityPurpose::CredentialRevoke
+            ),
+            ProbeTarget::CodexRevoke
+        );
+        assert_ne!(
+            target_for(
+                ConnectivityProvider::Codex,
+                ConnectivityPurpose::CredentialRevoke
+            ),
+            target_for(ConnectivityProvider::Codex, ConnectivityPurpose::OAuthStart)
         );
     }
 

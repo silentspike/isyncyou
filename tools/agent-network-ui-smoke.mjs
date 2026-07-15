@@ -84,7 +84,15 @@ async function main() {
             else if (url.pathname === "/api/v1/sync/state") value = { enabled: false, paused: false };
             else if (url.pathname === "/api/v1/agent/status") value = {
               enabled: true, connected: true, provider: "claude", selected_provider: "claude",
-              model: "claude-sonnet-4", claude: true, codex: false, credential_state: "connected",
+              model: "claude-sonnet-4", claude: true, codex: false,
+              credential_state: { claude: "connected", codex: "unconfigured" },
+              onboarding: {
+                selected_provider: "claude",
+                providers: {
+                  claude: { state: "ready", steps: [] },
+                  codex: { state: "not_started", steps: [] },
+                },
+              },
               models: { claude: [{ id: "claude-sonnet-4", label: "Claude" }], codex: [] },
             };
             else if (url.pathname === "/api/v1/agent/connectivity/preflight") {

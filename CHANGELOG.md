@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Reversible Agent account lifecycle (#645)**
+- `agent`+`app-host`+`webui`+`android`: added provider-revoked Disconnect and
+  Reconnect, verified-identity Codex account switching, encrypted crash-recovery
+  journals and candidates, provider-scoped operation leases, strict lifecycle
+  routes and recovery controls, and a separate default-off Android lifecycle hook.
+
 **Network-critical Agent flow boundary (#640)**
 - `android`+`agent`+`app-host`+`webui`: added acknowledged, service-owned foreground
   guards for provider OAuth and streamed turns, strict redacted connectivity preflight,

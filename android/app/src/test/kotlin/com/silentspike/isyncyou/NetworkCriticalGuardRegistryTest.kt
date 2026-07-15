@@ -9,6 +9,64 @@ import org.junit.Test
 
 class NetworkCriticalGuardRegistryTest {
     @Test
+    fun credentialRevokeGuardUsesTwoMinuteBoundedLease() {
+        var now = 50L
+        val registry = NetworkCriticalGuardRegistry(
+            onStart = {},
+            onStop = {},
+            nowElapsedMs = { now },
+            newId = { "revoke" },
+        )
+
+        assertTrue(registry.begin(NetworkGuardReason.CREDENTIAL_REVOKE).ok)
+        assertEquals(now + 2 * 60_000L, registry.activeLease("revoke")?.deadlineElapsedMs)
+        now += 2 * 60_000L
+        assertNull(registry.activeLease("revoke"))
+    }
+
+    @Test
+    fun credentialRevokeGuardSharesServiceWithoutEndingOtherReasons() {
+        var starts = 0
+        var stops = 0
+        val ids = mutableListOf("oauth", "revoke")
+        val registry = NetworkCriticalGuardRegistry(
+            onStart = { starts += 1 },
+            onStop = { stops += 1 },
+            nowElapsedMs = { 100L },
+            newId = { ids.removeAt(0) },
+        )
+
+        assertTrue(registry.begin(NetworkGuardReason.OAUTH).ok)
+        assertTrue(registry.begin(NetworkGuardReason.CREDENTIAL_REVOKE).ok)
+        assertEquals(1, starts)
+        assertTrue(registry.end("revoke"))
+        assertEquals(0, stops)
+        assertEquals(NetworkGuardReason.OAUTH, registry.activeLease("oauth")?.reason)
+        assertTrue(registry.end("oauth"))
+        assertEquals(1, stops)
+    }
+
+    @Test
+    fun credentialRevokeSnapshotRequiresExactLiveReadyGuard() {
+        val registry = NetworkCriticalGuardRegistry(
+            onStart = {},
+            onStop = {},
+            nowElapsedMs = { 1L },
+            newId = { "revoke" },
+        )
+
+        assertNull(registry.activeLease("revoke"))
+        assertTrue(registry.begin(NetworkGuardReason.CREDENTIAL_REVOKE).ok)
+        assertEquals(
+            NetworkGuardReason.CREDENTIAL_REVOKE,
+            registry.activeLease("revoke")?.reason,
+        )
+        assertNull(registry.activeLease("other"))
+        assertTrue(registry.end("revoke"))
+        assertNull(registry.activeLease("revoke"))
+    }
+
+    @Test
     fun reasonsShareOneForegroundServiceUntilLastLeaseEnds() {
         var now = 1_000L
         var starts = 0

@@ -1,4 +1,4 @@
-//! An exclusive advisory file lock (#639).
+//! Advisory file locks used by product runtime and lifecycle transactions (#639/#645).
 //!
 //! Held for the lifetime of the returned guard (dropping it, including on process exit/crash,
 //! releases the lock via the closed fd). Used to serialize product credential transactions and
@@ -39,7 +39,7 @@ impl FileLock {
             ));
         }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Self::try_lock_file(file)
+        Self::try_lock_file(file, true)
     }
 
     #[cfg(not(unix))]
@@ -53,11 +53,56 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .open(path)?;
-        Self::try_lock_file(file)
+        Self::try_lock_file(file, true)
     }
 
-    fn try_lock_file(file: std::fs::File) -> std::io::Result<Option<FileLock>> {
-        match fs2::FileExt::try_lock_exclusive(&file) {
+    /// Acquire a shared, non-blocking advisory lock on an owner-controlled lock file.
+    #[cfg(unix)]
+    pub fn try_acquire_shared(path: &Path) -> std::io::Result<Option<FileLock>> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "runtime lock is not an owner-controlled regular file",
+            ));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Self::try_lock_file(file, false)
+    }
+
+    #[cfg(not(unix))]
+    pub fn try_acquire_shared(path: &Path) -> std::io::Result<Option<FileLock>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        Self::try_lock_file(file, false)
+    }
+
+    fn try_lock_file(file: std::fs::File, exclusive: bool) -> std::io::Result<Option<FileLock>> {
+        let result = if exclusive {
+            fs2::FileExt::try_lock_exclusive(&file)
+        } else {
+            fs2::FileExt::try_lock_shared(&file)
+        };
+        match result {
             Ok(()) => Ok(Some(FileLock { _file: file })),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(error),
@@ -82,6 +127,19 @@ mod tests {
         );
         drop(first);
         // after release, it can be re-acquired
+        assert!(FileLock::try_acquire_exclusive(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn shared_holders_coexist_and_block_exclusive_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".provider-lifecycle.lock");
+        let first = FileLock::try_acquire_shared(&path).unwrap().unwrap();
+        let second = FileLock::try_acquire_shared(&path).unwrap().unwrap();
+        assert!(FileLock::try_acquire_exclusive(&path).unwrap().is_none());
+        drop(first);
+        assert!(FileLock::try_acquire_exclusive(&path).unwrap().is_none());
+        drop(second);
         assert!(FileLock::try_acquire_exclusive(&path).unwrap().is_some());
     }
 
