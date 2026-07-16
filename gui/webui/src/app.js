@@ -4560,11 +4560,11 @@ async function renderSettingsView(view) {
     const acctCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Account" }),
       kvList([["User", acc.username || App.account], ["Sync root", acc.sync_root], ["Archive root", acc.archive_root], ["Mount point", acc.mount_point || "—"]]));
     // The sidebar account chip (which opens sign-in / reconnect) is hidden in the phone
-    // bottom-nav layout, so surface the same device-code account menu here too —
+    // bottom-nav layout, so surface the same Microsoft account menu here too —
     // Settings is reachable on mobile. Without this a standalone phone (#89) would have
     // no way to sign in. Shown whenever account-auth is wired (mobile live + daemon).
     if (CAP.account) acctCard.append(el("button", { class: "btn", style: "margin-top:12px", onclick: openAccountSwitcher },
-      icon("rotate-ccw", "icon-sm"), "Sign in / reconnect account"));
+      icon("rotate-ccw", "icon-sm"), "Choose Microsoft account"));
     body.append(acctCard);
     // Diagnostics: a live perf overlay flag (CPU/RAM/disk-IO of the whole app process).
     const perfLbl = el("span", { text: localStorage.getItem("isy_perf") === "1" ? "Hide performance overlay" : "Show performance overlay" });
@@ -4632,10 +4632,26 @@ async function doShare(it, btn) {
 
 /* ---------------------------------------------------------------- account switcher */
 // Account menu (#68): switch between configured accounts, sign out (clear the
-// cached token), and sign in / reconnect via the device-code flow (cap-gated).
-let accountMenu = null, accountMenuPoll = null;
+// cached token), and sign in / reconnect through Microsoft's account picker (cap-gated).
+let accountMenu = null, accountMenuPoll = null, accountMenuLogin = null;
+async function cancelAccountLogin() {
+  const loginId = accountMenuLogin;
+  if (!loginId || !CAP.account) return true;
+  try {
+    const result = await postJson("/api/v1/account/login/cancel", CAP.account, {
+      request_id: crypto.randomUUID(),
+      id: loginId,
+    });
+    if (result && result.cancelled === true) {
+      accountMenuLogin = null;
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
 function closeAccountMenu() {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
+  void cancelAccountLogin();
   if (accountMenu) { accountMenu.remove(); accountMenu = null; }
 }
 function openAccountSwitcher() {
@@ -4652,9 +4668,16 @@ function openAccountSwitcher() {
 // to the system browser. Mobile uses typed native bridge ops; desktop keeps browser
 // navigation. The engine completes the callback/token exchange and the UI polls status.
 function openDesktopExternal(url, newTab) {
-  if (newTab && typeof window !== "undefined" && window.open) {
-    const w = window.open(url, "_blank", "noopener");
-    if (w) return;
+  if (newTab && typeof document !== "undefined") {
+    const link = document.createElement("a");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.style.display = "none";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    return;
   }
   location.href = url;
 }
@@ -6607,6 +6630,7 @@ async function agentSend(text) {
 
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
+  void cancelAccountLogin();
   clear(body);
   App.accounts.forEach(a => {
     const active = a.id === App.account;
@@ -6618,14 +6642,14 @@ function renderAccountMenu(body) {
       active ? icon("check", "icon-sm") : null);
     if (CAP.account) {
       const acts = el("div", { class: "acct-acts" });
-      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Sign in / reconnect (device code)", onclick: () => startDeviceLogin(a, body) }, icon("rotate-ccw", "icon-sm")));
+      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Choose Microsoft account", onclick: () => startAccountLogin(a, body) }, icon("rotate-ccw", "icon-sm")));
       acts.append(el("button", { class: "btn ghost sm icon-only", style: "color:var(--danger,#f87171)", title: "Sign out — clear cached token", onclick: () => accountSignOut(a, body) }, icon("trash-2", "icon-sm")));
       row.append(acts);
     }
     body.append(row);
   });
   body.append(el("div", { class: "acct-note dim" }, CAP.account
-    ? "Reconnect re-runs device-code sign-in. Adding a brand-new account still needs `isyncyou setup` (live add is the remaining backend work)."
+    ? "Microsoft will ask which identity to use for this configured account slot."
     : "Read-only server — account switching only."));
 }
 async function accountSignOut(a, body) {
@@ -6633,32 +6657,40 @@ async function accountSignOut(a, body) {
   catch (e) { toast("Sign-out failed: " + e.message, "err"); }
   renderAccountMenu(body);
 }
-async function startDeviceLogin(a, body) {
+async function startAccountLogin(a, body) {
   clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: "Starting sign-in…" })));
-  let dc;
-  try { dc = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); }
-  catch (e) { toast("Sign-in failed: " + e.message, "err"); renderAccountMenu(body); return; }
-  const openDeviceLogin = async () => {
+  let login;
+  try { login = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); }
+  catch (_) { toast("Sign-in could not be started. Try again.", "err"); renderAccountMenu(body); return; }
+  if (login.flow !== "authorization_code_pkce" || !login.authorization_uri || !login.login_id) {
+    toast("Sign-in could not be started. Try again.", "err");
+    renderAccountMenu(body);
+    return;
+  }
+  const openAccountPicker = async () => {
     try {
-      await openExternalAuth(dc.verification_uri, "account_device_code", { newTab: true });
-    } catch (e) {
-      toast("Could not open sign-in page: " + (e.message || e), "err");
+      await openExternalAuth(login.authorization_uri, "account_authorize", { newTab: true });
+    } catch (_) {
+      toast("Could not open the Microsoft sign-in page.", "err");
     }
   };
-  const status = el("div", { class: "acct-dc-status dim", text: "Waiting for you to sign in…" });
+  const status = el("div", { class: "acct-dc-status dim", text: "Waiting for Microsoft sign-in…" });
   clear(body).append(el("div", { class: "acct-dc" },
-    el("div", { class: "acct-dc-title", text: "Sign in to " + (a.username || a.id) }),
-    el("p", { class: "dim", text: "Open the page and enter this code:" }),
-    el("div", { class: "acct-dc-code", text: dc.user_code || "—" }),
-    el("button", { class: "btn sm primary", type: "button", onclick: openDeviceLogin }, icon("external-link", "icon-sm"), "Open sign-in page"),
+    el("div", { class: "acct-dc-title", text: "Choose a Microsoft account" }),
+    el("p", { class: "dim", text: "Microsoft will show the available accounts and an option to use another one." }),
+    el("button", { class: "btn sm primary", type: "button", onclick: openAccountPicker }, icon("external-link", "icon-sm"), "Open Microsoft account picker"),
     status,
-    el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: () => renderAccountMenu(body) }, "Cancel")));
+    el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: async () => {
+      if (await cancelAccountLogin()) renderAccountMenu(body);
+      else status.textContent = "Completing Microsoft sign-in…";
+    } }, "Cancel")));
+  accountMenuLogin = login.login_id;
   accountMenuPoll = setInterval(async () => {
     let r;
-    try { r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: dc.login_id }); }
-    catch (e) { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Poll error: " + e.message; return; }
-    if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
-    else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Sign-in failed: " + (r.error || "unknown"); }
+    try { r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: login.login_id }); }
+    catch (_) { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Connection to the sign-in status was lost. Start again."; return; }
+    if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; accountMenuLogin = null; toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
+    else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; accountMenuLogin = null; status.textContent = r.code === "account_login_expired" ? "Sign-in expired. Start again." : "Sign-in failed. Start again."; }
   }, 3000);
 }
 

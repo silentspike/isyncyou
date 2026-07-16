@@ -196,6 +196,7 @@ fn route_body_policy(method: &str, target: &str) -> RouteBodyPolicy {
             | "/api/v1/onenote/delete"
             | "/api/v1/account/login/start"
             | "/api/v1/account/login/poll"
+            | "/api/v1/account/login/cancel"
             | "/api/v1/account/signout"
             | "/api/v1/onedrive/transfers/cancel"
             | "/api/v1/onedrive/transfers/pause"
@@ -1226,6 +1227,7 @@ mod tests {
             "/api/v1/onedrive/cleanup",
             "/api/v1/account/login/start",
             "/api/v1/account/login/poll",
+            "/api/v1/account/login/cancel",
             "/api/v1/account/signout",
             "/api/v1/push/register",
             "/api/v1/push/test",

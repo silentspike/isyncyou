@@ -1883,14 +1883,17 @@ pub fn onedrive_mode_online_cleanup_pat_item(folder: &str) -> String {
         .expect("static OneDrive online-cleanup action array serializes")
 }
 
-/// Live account-auth handler (#68): the daemon's device-code sign-in + sign-out.
+/// Live account-auth handler (#68): the daemon's Microsoft sign-in + sign-out.
 /// `None` => the account menu offers only switching (the read-only CLI `serve`).
 pub trait AccountAuthHandler: Send + Sync {
-    /// Begin a device-code login for a configured `account`. Returns
-    /// `{ login_id, user_code, verification_uri, message }` to present to the user.
+    /// Begin Authorization Code + PKCE for a configured account. Returns only an opaque login ID
+    /// and a reviewed authorization URI. The expected state, verifier, callback code, and tokens
+    /// stay in Rust; the authorization URI necessarily contains the public state challenge.
     fn start_login(&self, account: &str) -> Result<serde_json::Value, String>;
-    /// Poll a started login by its `login_id` → `{ state: "pending"|"done"|"error", error? }`.
+    /// Poll a started login by its `login_id` -> `{ state: "pending"|"done"|"error", code? }`.
     fn poll_login(&self, login_id: &str) -> serde_json::Value;
+    /// Cancel one active login attempt. Returns true only when this call cancelled it.
+    fn cancel_login(&self, login_id: &str) -> bool;
     /// Remove an account's cached tokens (sign out). Returns a short status note.
     fn sign_out(&self, account: &str) -> Result<serde_json::Value, String>;
 }
@@ -2046,7 +2049,7 @@ pub struct Router {
     /// Optional OneDrive risk classifier for Android-only biometric prompts (#723).
     /// Desktop routes must not call it when `biometric_gate` is false.
     onedrive_risk: Option<std::sync::Arc<dyn OneDriveRiskHandler>>,
-    /// Optional account-auth handler (#68): device-code sign-in + sign-out. `None`
+    /// Optional account-auth handler (#68): Microsoft sign-in + sign-out. `None`
     /// => the account menu only switches between already-configured accounts.
     account_auth: Option<std::sync::Arc<dyn AccountAuthHandler>>,
     /// Separate capability token for account login/sign-out POSTs.
@@ -2557,7 +2560,7 @@ impl Router {
         self
     }
 
-    /// Wire the account-auth handler (device-code sign-in + sign-out, #68).
+    /// Wire the account-auth handler (Microsoft sign-in + sign-out, #68).
     pub fn with_account_auth(
         mut self,
         handler: std::sync::Arc<dyn AccountAuthHandler>,
@@ -2837,6 +2840,7 @@ impl Router {
                 "/api/v1/onedrive/cleanup" => self.onedrive_cleanup(req),
                 "/api/v1/account/login/start" => self.account_login_start(req),
                 "/api/v1/account/login/poll" => self.account_login_poll(req),
+                "/api/v1/account/login/cancel" => self.account_login_cancel(req),
                 "/api/v1/account/signout" => self.account_signout(req),
                 "/api/v1/push/register" => self.push_register(req),
                 "/api/v1/push/test" => self.push_test(req),
@@ -5783,6 +5787,21 @@ impl Router {
             None => return ApiResponse::error(400, "missing 'id'"),
         };
         ApiResponse::ok_json(&h.poll_login(id))
+    }
+
+    fn account_login_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let parsed = match parse_strict_scalar_mutation(req, "account login cancel", &["id"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let Some(id) = parsed.q("id") else {
+            return ApiResponse::error(400, "missing 'id'");
+        };
+        ApiResponse::ok_json(&json!({ "cancelled": h.cancel_login(id) }))
     }
 
     fn account_signout(&self, req: &ApiRequest) -> ApiResponse {
@@ -13318,7 +13337,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "nativeCall(\"beginNetworkGuard\"",
             "nativeCall(\"endNetworkGuard\"",
             "\"agent_authorize\"",
-            "\"account_device_code\"",
+            "\"account_authorize\"",
             "__isyBridgeTransportStats",
             "BRIDGE_TIMEOUT_MS",
             "NATIVE_TIMEOUT_MS",
@@ -13475,10 +13494,68 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for p in [
             "/api/v1/account/login/start?account=a",
             "/api/v1/account/login/poll?id=1",
+            "/api/v1/account/login/cancel?id=1",
             "/api/v1/account/signout?account=a",
         ] {
             assert_eq!(r.route(&ApiRequest::new("POST", p)).status, 404, "{p}");
         }
+    }
+
+    #[derive(Default)]
+    struct RecAccountAuth {
+        cancelled: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AccountAuthHandler for RecAccountAuth {
+        fn start_login(&self, _account: &str) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "flow": "authorization_code_pkce",
+                "login_id": "1",
+                "authorization_uri": "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
+            }))
+        }
+
+        fn poll_login(&self, _login_id: &str) -> serde_json::Value {
+            json!({ "state": "pending" })
+        }
+
+        fn cancel_login(&self, login_id: &str) -> bool {
+            self.cancelled.lock().unwrap().push(login_id.to_string());
+            true
+        }
+
+        fn sign_out(&self, _account: &str) -> Result<serde_json::Value, String> {
+            Ok(json!({ "removed": 1 }))
+        }
+    }
+
+    #[test]
+    fn account_login_cancel_is_strict_cap_gated_and_calls_exact_attempt() {
+        let auth = std::sync::Arc::new(RecAccountAuth::default());
+        let router = Router::new(Config::default()).with_account_auth(auth.clone(), "cap".into());
+        let body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174099",
+            "id": "42"
+        });
+        assert_eq!(
+            router
+                .route(&strict_json_post(
+                    "/api/v1/account/login/cancel",
+                    body.clone(),
+                    None,
+                ))
+                .status,
+            401
+        );
+        assert!(auth.cancelled.lock().unwrap().is_empty());
+        let response = router.route(&strict_json_post(
+            "/api/v1/account/login/cancel",
+            body,
+            Some("cap"),
+        ));
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["cancelled"], true);
+        assert_eq!(*auth.cancelled.lock().unwrap(), vec!["42"]);
     }
 
     #[derive(Default)]

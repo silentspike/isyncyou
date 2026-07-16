@@ -4879,10 +4879,6 @@ fn store_agent_provider_selection(
 }
 
 /// Minimal percent-decode for the loopback callback query (`+`→space, `%XX`→byte).
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -9863,21 +9859,26 @@ impl isyncyou_webui::OneNoteWriteHandler for DaemonOneNoteWrite {
     }
 }
 
-/// Per-login progress, shared between the HTTP poll handler and the background
-/// device-code thread (#68).
-#[derive(Default)]
+const MICROSOFT_CALLBACK_PATH: &str = "/";
+const MICROSOFT_LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
+const MICROSOFT_CALLBACK_HEAD_LIMIT: usize = 8 * 1024;
+const MICROSOFT_LOGIN_LIMIT: usize = 8;
+const MICROSOFT_SUCCESS_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>iSyncYou</title><p>Sign-in complete. Return to iSyncYou.</p>";
+const MICROSOFT_ERROR_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>iSyncYou</title><p>Sign-in could not be completed. Return to iSyncYou and try again.</p>";
+
+/// Per-login progress shared between the loopback callback and UI polling.
 pub struct LoginState {
-    device: Option<isyncyou_graph::auth::flow::DeviceCode>,
+    account: String,
+    started_at: std::time::Instant,
+    exchange_in_flight: bool,
     done: bool,
-    error: Option<String>,
+    error_code: Option<&'static str>,
 }
 
 static LOGIN_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Account-auth handler (#68): a device-code sign-in runs to completion in a
-/// background thread (so the HTTP handler returns the code at once and the UI
-/// polls), writing the account's write-token cache on success. Sign-out clears the
-/// cached tokens. Re-authenticates an account already present in the config.
+/// Account-auth handler (#68): Authorization Code + PKCE uses a short-lived loopback callback and
+/// forces Microsoft's account picker. The verifier, state, code, and tokens never enter JavaScript.
 pub struct DaemonAccountAuth {
     cfg: Config,
     logins: Mutex<std::collections::HashMap<u64, Arc<Mutex<LoginState>>>>,
@@ -9885,76 +9886,415 @@ pub struct DaemonAccountAuth {
 impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
     fn start_login(&self, account: &str) -> Result<serde_json::Value, String> {
         let cache = isyncyou_engine::auth::write_token_cache_path(&self.cfg, account)
-            .ok_or_else(|| format!("no account '{account}' in config"))?;
+            .ok_or_else(|| "unknown_account".to_string())?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|_| "account_callback_unavailable".to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|_| "account_callback_unavailable".to_string())?
+            .port();
+        let redirect_uri = format!("http://localhost:{port}");
+        let start = isyncyou_graph::auth::flow::start_authorization_code(
+            isyncyou_engine::auth::WRITE_CLIENT,
+            isyncyou_engine::auth::RESTORE_SCOPES,
+            &redirect_uri,
+        )?;
         let id = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
-        let state = Arc::new(Mutex::new(LoginState::default()));
-        self.logins.lock().unwrap().insert(id, state.clone());
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let st = state.clone();
-        std::thread::spawn(move || {
-            let present = |dc: &isyncyou_graph::auth::flow::DeviceCode| {
-                st.lock().unwrap().device = Some(dc.clone());
-            };
-            match isyncyou_graph::auth::flow::device_code_login(
-                isyncyou_engine::auth::WRITE_CLIENT,
-                isyncyou_engine::auth::RESTORE_SCOPES,
-                now,
-                present,
-            ) {
-                Ok(tokens) => match tokens.save(&cache) {
-                    Ok(()) => st.lock().unwrap().done = true,
-                    Err(e) => st.lock().unwrap().error = Some(format!("save token: {e}")),
-                },
-                Err(e) => st.lock().unwrap().error = Some(e),
+        let state = Arc::new(Mutex::new(LoginState {
+            account: account.to_string(),
+            started_at: std::time::Instant::now(),
+            exchange_in_flight: false,
+            done: false,
+            error_code: None,
+        }));
+        {
+            let mut logins = self
+                .logins
+                .lock()
+                .map_err(|_| "account_login_unavailable".to_string())?;
+            logins.retain(|_, login| {
+                login.lock().is_ok_and(|state| {
+                    !state.done
+                        && state.error_code.is_none()
+                        && state.started_at.elapsed() < MICROSOFT_LOGIN_TTL
+                })
+            });
+            if logins.len() >= MICROSOFT_LOGIN_LIMIT {
+                return Err("account_login_busy".into());
             }
-        });
-        // Wait briefly for the device code — start_device_code is the first network
-        // call inside device_code_login, so it lands within a second or two.
-        for _ in 0..100 {
-            {
-                let s = state.lock().unwrap();
-                if let Some(dc) = &s.device {
-                    return Ok(serde_json::json!({
-                        "login_id": id.to_string(),
-                        "user_code": dc.user_code,
-                        "verification_uri": dc.verification_uri,
-                        "message": dc.message,
-                    }));
-                }
-                if let Some(e) = &s.error {
-                    return Err(e.clone());
-                }
+            if logins.values().any(|login| {
+                login.lock().is_ok_and(|state| {
+                    state.account == account && !state.done && state.error_code.is_none()
+                })
+            }) {
+                return Err("account_login_in_progress".into());
             }
-            std::thread::sleep(Duration::from_millis(100));
+            logins.insert(id, Arc::clone(&state));
         }
-        Err("device-code did not start in time".into())
+        let authorization_uri = start.authorization_uri.clone();
+        let callback_state = Arc::clone(&state);
+        if std::thread::Builder::new()
+            .name("microsoft-account-callback".into())
+            .spawn(move || {
+                microsoft_callback_serve(
+                    listener,
+                    callback_state,
+                    start.state,
+                    start.verifier,
+                    redirect_uri,
+                    cache,
+                );
+            })
+            .is_err()
+        {
+            if let Ok(mut logins) = self.logins.lock() {
+                logins.remove(&id);
+            }
+            return Err("account_callback_unavailable".into());
+        }
+        Ok(serde_json::json!({
+            "flow": "authorization_code_pkce",
+            "login_id": id.to_string(),
+            "authorization_uri": authorization_uri,
+        }))
     }
 
     fn poll_login(&self, login_id: &str) -> serde_json::Value {
         let Ok(id) = login_id.parse::<u64>() else {
-            return serde_json::json!({ "state": "error", "error": "bad login id" });
+            return serde_json::json!({ "state": "error", "code": "account_login_not_found" });
         };
-        let state = self.logins.lock().unwrap().get(&id).cloned();
+        let state = self
+            .logins
+            .lock()
+            .ok()
+            .and_then(|logins| logins.get(&id).cloned());
         let Some(state) = state else {
-            return serde_json::json!({ "state": "error", "error": "unknown login id" });
+            return serde_json::json!({ "state": "error", "code": "account_login_not_found" });
         };
-        let s = state.lock().unwrap();
-        if let Some(e) = &s.error {
-            serde_json::json!({ "state": "error", "error": e })
+        let Ok(s) = state.lock() else {
+            return serde_json::json!({ "state": "error", "code": "account_login_unavailable" });
+        };
+        if let Some(code) = s.error_code {
+            serde_json::json!({ "state": "error", "code": code })
         } else if s.done {
             serde_json::json!({ "state": "done" })
+        } else if s.started_at.elapsed() >= MICROSOFT_LOGIN_TTL {
+            serde_json::json!({ "state": "error", "code": "account_login_expired" })
         } else {
             serde_json::json!({ "state": "pending" })
         }
+    }
+
+    fn cancel_login(&self, login_id: &str) -> bool {
+        let Ok(id) = login_id.parse::<u64>() else {
+            return false;
+        };
+        let state = self
+            .logins
+            .lock()
+            .ok()
+            .and_then(|logins| logins.get(&id).cloned());
+        let Some(state) = state else {
+            return false;
+        };
+        let Ok(mut state) = state.lock() else {
+            return false;
+        };
+        if state.exchange_in_flight || state.done || state.error_code.is_some() {
+            return false;
+        }
+        state.error_code = Some("account_login_cancelled");
+        true
     }
 
     fn sign_out(&self, account: &str) -> Result<serde_json::Value, String> {
         let n = isyncyou_engine::auth::sign_out(&self.cfg, account)?;
         Ok(serde_json::json!({ "removed": n, "message": format!("Signed out of {account}") }))
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedMicrosoftCallback {
+    AuthorizationCode(String),
+    AuthorizationError,
+    InvalidBoundCallback,
+    UnboundCallback,
+}
+
+fn parse_microsoft_callback(query: &str, expected_state: &str) -> ParsedMicrosoftCallback {
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut invalid = query.len() > 4096;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let Some((key, value)) = pair.split_once('=') else {
+            invalid = true;
+            continue;
+        };
+        let Some(key) = pct_decode_strict(key) else {
+            invalid = true;
+            continue;
+        };
+        let Some(value) = pct_decode_strict(value) else {
+            invalid = true;
+            continue;
+        };
+        if !seen.insert(key.clone()) {
+            invalid = true;
+            continue;
+        }
+        match key.as_str() {
+            "code" => code = Some(value),
+            "state" => state = Some(value),
+            "error" => error = Some(value),
+            "error_description" | "error_uri" | "session_state" => {}
+            _ => invalid = true,
+        }
+    }
+    let state_matches = state
+        .as_deref()
+        .is_some_and(|state| oauth_state_matches(state, expected_state));
+    if !state_matches {
+        return ParsedMicrosoftCallback::UnboundCallback;
+    }
+    if invalid {
+        return ParsedMicrosoftCallback::InvalidBoundCallback;
+    }
+    match (code, error) {
+        (Some(code), None) if !code.is_empty() && code.len() <= 4096 => {
+            ParsedMicrosoftCallback::AuthorizationCode(code)
+        }
+        (None, Some(error)) if !error.is_empty() && error.len() <= 128 => {
+            ParsedMicrosoftCallback::AuthorizationError
+        }
+        _ => ParsedMicrosoftCallback::InvalidBoundCallback,
+    }
+}
+
+fn oauth_state_matches(candidate: &str, expected: &str) -> bool {
+    const DOMAIN: &[u8] = b"isyncyou-microsoft-oauth-state-v1";
+    let expected_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, expected.as_bytes());
+    let candidate_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, candidate.as_bytes());
+    let candidate_tag = ring::hmac::sign(&candidate_key, DOMAIN);
+    ring::hmac::verify(&expected_key, DOMAIN, candidate_tag.as_ref()).is_ok()
+}
+
+fn pct_decode_strict(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let high = (bytes[index + 1] as char).to_digit(16)?;
+                let low = (bytes[index + 2] as char).to_digit(16)?;
+                decoded.push(((high << 4) | low) as u8);
+                index += 3;
+            }
+            b'%' => return None,
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn microsoft_callback_headers_valid<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    expected_host: &str,
+) -> bool {
+    let mut host = None;
+    let mut content_length = None;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
+        {
+            return false;
+        }
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("host") {
+            if host.replace(value).is_some() {
+                return false;
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length.replace(value).is_some() || value != "0" {
+                return false;
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            return false;
+        }
+    }
+    host.is_some_and(|host| host.eq_ignore_ascii_case(expected_host))
+}
+
+fn microsoft_callback_serve(
+    listener: std::net::TcpListener,
+    state: Arc<Mutex<LoginState>>,
+    expected_state: String,
+    verifier: String,
+    redirect_uri: String,
+    cache: PathBuf,
+) {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + MICROSOFT_LOGIN_TTL;
+    let expected_host = redirect_uri
+        .strip_prefix("http://")
+        .unwrap_or("")
+        .to_string();
+    if listener.set_nonblocking(true).is_err() {
+        if let Ok(mut state) = state.lock() {
+            state.error_code = Some("account_callback_unavailable");
+        }
+        return;
+    }
+    while std::time::Instant::now() < deadline {
+        if state
+            .lock()
+            .map_or(true, |state| state.done || state.error_code.is_some())
+        {
+            return;
+        }
+        let mut stream = match listener.accept() {
+            Ok((stream, peer)) if peer.ip().is_loopback() => stream,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(_) => break,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut head = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        while head.len() <= MICROSOFT_CALLBACK_HEAD_LIMIT && !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+        let request = if head.len() <= MICROSOFT_CALLBACK_HEAD_LIMIT && head.ends_with(b"\r\n\r\n")
+        {
+            std::str::from_utf8(&head).ok()
+        } else {
+            None
+        };
+        let Some(request) = request else {
+            write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+            continue;
+        };
+        let mut lines = request.split("\r\n");
+        let mut request_line = lines.next().unwrap_or("").split_whitespace();
+        let method = request_line.next().unwrap_or("");
+        let target = request_line.next().unwrap_or("");
+        let version = request_line.next().unwrap_or("");
+        let request_line_valid = request_line.next().is_none();
+        let headers_valid = microsoft_callback_headers_valid(lines, &expected_host);
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if method != "GET"
+            || version != "HTTP/1.1"
+            || !request_line_valid
+            || path != MICROSOFT_CALLBACK_PATH
+            || !headers_valid
+        {
+            write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+            continue;
+        }
+        match parse_microsoft_callback(query, &expected_state) {
+            ParsedMicrosoftCallback::UnboundCallback => {
+                write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+                continue;
+            }
+            ParsedMicrosoftCallback::AuthorizationError
+            | ParsedMicrosoftCallback::InvalidBoundCallback => {
+                if let Ok(mut state) = state.lock() {
+                    state.error_code = Some("account_authorization_failed");
+                }
+                write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+                return;
+            }
+            ParsedMicrosoftCallback::AuthorizationCode(code) => {
+                let exchange_allowed = state.lock().is_ok_and(|mut state| {
+                    if state.done || state.error_code.is_some() || state.exchange_in_flight {
+                        false
+                    } else {
+                        state.exchange_in_flight = true;
+                        true
+                    }
+                });
+                if !exchange_allowed {
+                    write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+                    return;
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let token_result = isyncyou_graph::auth::flow::exchange_authorization_code(
+                    isyncyou_engine::auth::WRITE_CLIENT,
+                    isyncyou_engine::auth::RESTORE_SCOPES,
+                    &redirect_uri,
+                    &code,
+                    &verifier,
+                    now,
+                );
+                let succeeded = if let Ok(mut state) = state.lock() {
+                    match token_result.and_then(|tokens| {
+                        tokens
+                            .save(&cache)
+                            .map_err(|_| "account_credential_store_failed".into())
+                    }) {
+                        Ok(()) => {
+                            state.exchange_in_flight = false;
+                            state.done = true;
+                            true
+                        }
+                        Err(_) => {
+                            state.exchange_in_flight = false;
+                            state.error_code = Some("account_authorization_failed");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                write_microsoft_callback_page(
+                    &mut stream,
+                    if succeeded {
+                        MICROSOFT_SUCCESS_HTML
+                    } else {
+                        MICROSOFT_ERROR_HTML
+                    },
+                );
+                return;
+            }
+        }
+    }
+    if let Ok(mut state) = state.lock() {
+        if !state.done && state.error_code.is_none() {
+            state.error_code = Some("account_login_expired");
+        }
+    }
+}
+
+fn write_microsoft_callback_page(stream: &mut std::net::TcpStream, body: &str) {
+    use std::io::Write;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    let _ = stream.write_all(response.as_bytes());
 }
 
 /// Push notifications (#576): stores registered device FCM tokens and sends FCM v1
@@ -21122,4 +21462,143 @@ fn turn_cancel_after_provider_return_blocks_pending_registration() {
         Ok(PendingTransition::Cancelled)
     ));
     assert!(!called);
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_callback_parser_requires_bound_state_and_unique_strict_fields() {
+    let state = "s".repeat(43);
+    assert_eq!(
+        parse_microsoft_callback(&format!("code=authorization-code&state={state}"), &state),
+        ParsedMicrosoftCallback::AuthorizationCode("authorization-code".into())
+    );
+    assert_eq!(
+        parse_microsoft_callback(&format!("error=access_denied&state={state}"), &state),
+        ParsedMicrosoftCallback::AuthorizationError
+    );
+    for query in [
+        "code=authorization-code&state=wrong".to_string(),
+        format!("code=authorization-code&state={state}&state={state}"),
+        format!("code=authorization-code&st%61te={state}&state={state}"),
+        format!("code=%ZZ&state={state}"),
+        format!("code=authorization-code&extra=value&state={state}"),
+    ] {
+        assert!(!matches!(
+            parse_microsoft_callback(&query, &state),
+            ParsedMicrosoftCallback::AuthorizationCode(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_callback_headers_require_one_exact_host_and_no_body_framing() {
+    assert!(microsoft_callback_headers_valid(
+        ["Host: localhost:43123", "User-Agent: browser"].into_iter(),
+        "localhost:43123"
+    ));
+    for headers in [
+        vec!["User-Agent: browser"],
+        vec!["Host: localhost:43123", "Host: localhost:43123"],
+        vec![
+            "Host: localhost:43123",
+            "Content-Length: 0",
+            "Content-Length: 0",
+        ],
+        vec!["Host: localhost:43123", "Content-Length: 1"],
+        vec!["Host: localhost:43123", "Transfer-Encoding: chunked"],
+        vec!["Host: localhost:9999"],
+    ] {
+        assert!(!microsoft_callback_headers_valid(
+            headers.into_iter(),
+            "localhost:43123"
+        ));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
+    let root = std::env::temp_dir().join(format!(
+        "isyncyou-account-pkce-{}-{}",
+        std::process::id(),
+        LOGIN_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let archive = root.join("archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    let auth = DaemonAccountAuth {
+        cfg: Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "account-slot".into(),
+                username: "account-slot".into(),
+                sync_root: root.join("sync"),
+                archive_root: archive,
+                cache_root: root.join("cache"),
+                mount_point: None,
+            }],
+            ..Default::default()
+        },
+        logins: Mutex::new(std::collections::HashMap::new()),
+    };
+    let started = isyncyou_webui::AccountAuthHandler::start_login(&auth, "account-slot").unwrap();
+    assert_eq!(started["flow"], "authorization_code_pkce");
+    assert!(started.get("user_code").is_none());
+    assert!(started.get("verification_uri").is_none());
+    let login_id = started["login_id"].as_str().unwrap();
+    let authorization_uri = started["authorization_uri"].as_str().unwrap();
+    assert!(authorization_uri
+        .starts_with("https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?"));
+    let query: std::collections::HashMap<_, _> = authorization_uri
+        .split_once('?')
+        .unwrap()
+        .1
+        .split('&')
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap();
+            (
+                pct_decode_strict(key).unwrap(),
+                pct_decode_strict(value).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        query.get("prompt").map(String::as_str),
+        Some("select_account")
+    );
+    assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+    assert!(query
+        .get("redirect_uri")
+        .is_some_and(|value| value.starts_with("http://localhost:")));
+    assert!(query
+        .get("redirect_uri")
+        .is_some_and(|value| !value["http://localhost:".len()..].contains('/')));
+    assert!(!query.contains_key("code_verifier"));
+    assert!(isyncyou_webui::AccountAuthHandler::cancel_login(
+        &auth, login_id
+    ));
+    assert!(!isyncyou_webui::AccountAuthHandler::cancel_login(
+        &auth, login_id
+    ));
+    assert_eq!(
+        isyncyou_webui::AccountAuthHandler::poll_login(&auth, login_id)["code"],
+        "account_login_cancelled"
+    );
+
+    let exchange_id = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
+    auth.logins.lock().unwrap().insert(
+        exchange_id,
+        Arc::new(Mutex::new(LoginState {
+            account: "account-slot".into(),
+            started_at: std::time::Instant::now(),
+            exchange_in_flight: true,
+            done: false,
+            error_code: None,
+        })),
+    );
+    assert!(!isyncyou_webui::AccountAuthHandler::cancel_login(
+        &auth,
+        &exchange_id.to_string()
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = std::fs::remove_dir_all(root);
 }

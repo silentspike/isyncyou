@@ -19,6 +19,7 @@ const OUT_DIR = outFlag >= 0
   ? path.resolve(REPO, process.argv[outFlag + 1])
   : path.join(REPO, "docs/evidence/artifacts/issue-622");
 const AGENT_CAP = "fixture-agent-cap";
+const ACCOUNT_CAP = "fixture-account-cap";
 const ACCOUNT = "fixture";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,7 +28,8 @@ const readText = (p) => fs.readFileSync(path.join(REPO, p), "utf8");
 function fixtureAppJs() {
   return readText("gui/webui/src/app.js").replace(
     /__([A-Z0-9_]+_CAP_TOKEN)__/g,
-    (_m, token) => (token === "AGENT_CAP_TOKEN" ? AGENT_CAP : ""),
+    (_m, token) => token === "AGENT_CAP_TOKEN" ? AGENT_CAP
+      : token === "ACCOUNT_CAP_TOKEN" ? ACCOUNT_CAP : "",
   );
 }
 
@@ -53,6 +55,10 @@ function text(res, status, body, contentType) {
 
 function checkAgentCap(req) {
   return req.headers["x-capability-token"] === AGENT_CAP;
+}
+
+function checkAccountCap(req) {
+  return req.headers["x-capability-token"] === ACCOUNT_CAP;
 }
 
 async function readJson(req) {
@@ -152,6 +158,8 @@ function makeFixtureServer(evidence) {
   const sessions = new Map();
   const turns = new Map();
   const state = {
+    accountLoginStarts: [],
+    accountLoginCancels: [],
     oauthStarts: [],
     modelPosts: [],
     confirmPosts: [],
@@ -248,6 +256,26 @@ function makeFixtureServer(evidence) {
         res.write(": fixture-ready\n\n");
       } else if (req.method === "GET" && url.pathname === "/api/v1/agent/status") {
         json(res, 200, statusBody());
+      } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/start") {
+        if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        state.accountLoginStarts.push({ account: body.account });
+        json(res, 200, {
+          flow: "authorization_code_pkce",
+          login_id: "fixture-login-1",
+          authorization_uri: `http://${req.headers.host}/fixture-account-auth?prompt=select_account&state=${"s".repeat(43)}`,
+        });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/poll") {
+        if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
+        await readJson(req);
+        json(res, 200, { state: "pending" });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/cancel") {
+        if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        state.accountLoginCancels.push({ matched: body.id === "fixture-login-1" });
+        json(res, 200, { cancelled: true });
+      } else if (req.method === "GET" && url.pathname === "/fixture-account-auth") {
+        text(res, 200, "<!doctype html><title>Account picker fixture</title>", "text/html; charset=utf-8");
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/connectivity/preflight") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
@@ -438,6 +466,8 @@ function evidenceForWrite(evidence, state) {
       models: closedModels,
       confirm_post_count: state.confirmPosts.length,
       cancel_post_count: state.cancelPosts.length,
+      account_login_start_count: state.accountLoginStarts.length,
+      account_login_cancel_count: state.accountLoginCancels.length,
       view_hit_count: state.viewHits.length,
       stream_scenarios: state.streamScenarios.map(({ scenario }) => scenario),
     },
@@ -563,6 +593,36 @@ async function main() {
       }
     });
 
+    await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
+    await page.goto(`${origin}/#/settings`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Choose Microsoft account" }).click();
+    await page.getByTitle("Choose Microsoft account").click();
+    await page.locator(".acct-menu .acct-dc-title").waitFor();
+    const accountMenuText = await page.locator(".acct-menu").innerText();
+    assert(evidence, "account reconnect renders picker flow without device code",
+      accountMenuText.includes("Choose a Microsoft account")
+      && accountMenuText.includes("Open Microsoft account picker")
+      && !accountMenuText.includes("enter this code"));
+    const accountPickerPopupPromise = page.waitForEvent("popup", { timeout: 2000 }).catch(() => null);
+    await page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" }).click();
+    const accountPickerPopup = await accountPickerPopupPromise;
+    if (accountPickerPopup) {
+      await accountPickerPopup.waitForLoadState("domcontentloaded");
+      const pickerUrl = new URL(accountPickerPopup.url());
+      assert(evidence, "account picker launch uses select_account without verifier",
+        pickerUrl.searchParams.get("prompt") === "select_account"
+        && pickerUrl.searchParams.has("state")
+        && !pickerUrl.searchParams.has("code_verifier"));
+      await accountPickerPopup.close();
+    } else {
+      assert(evidence, "account picker launch uses select_account without verifier", false);
+    }
+    await page.locator(".acct-menu").getByRole("button", { name: "Cancel" }).click();
+    await page.waitForFunction(() => !document.querySelector(".acct-menu .acct-dc"));
+    assert(evidence, "account picker cancel closes exact backend attempt",
+      fixture.state.accountLoginStarts.length === 1
+      && fixture.state.accountLoginCancels.length === 1
+      && fixture.state.accountLoginCancels[0].matched === true);
     await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('.nav-item[data-service="assistant"]', { timeout: 10000 });
     const assistantNavVisible = await page.locator('.nav-item[data-service="assistant"]').first().isVisible();

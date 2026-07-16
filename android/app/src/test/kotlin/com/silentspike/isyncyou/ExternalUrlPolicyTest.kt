@@ -1,5 +1,7 @@
 package com.silentspike.isyncyou
 
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -7,6 +9,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ExternalUrlPolicyTest {
+    private val accountScopes = listOf(
+        "Files.ReadWrite",
+        "Mail.ReadWrite",
+        "Mail.Send",
+        "MailboxSettings.ReadWrite",
+        "Calendars.ReadWrite",
+        "Contacts.ReadWrite",
+        "Tasks.ReadWrite",
+        "Notes.ReadWrite",
+        "offline_access",
+    )
+
     @Test
     fun externalUrlRequiresKnownKind() {
         val missing = ExternalUrlPolicy.classifyExternalUrl(
@@ -96,6 +110,35 @@ class ExternalUrlPolicyTest {
     }
 
     @Test
+    fun accountAuthorizeRequiresExactPkceAccountPickerContract() {
+        assertAllowed(
+            ExternalUrlPolicy.classifyExternalUrl(
+                accountAuthorizeUrl(),
+                AuthUrlKind.AccountAuthorize,
+            ),
+            "login.microsoftonline.com",
+        )
+
+        val invalidUrls = listOf(
+            accountAuthorizeUrl(mapOf("prompt" to "login")),
+            accountAuthorizeUrl(mapOf("client_id" to "other-client")),
+            accountAuthorizeUrl(mapOf("redirect_uri" to "http://127.0.0.1:45678")),
+            accountAuthorizeUrl(mapOf("redirect_uri" to "http://localhost:45678/")),
+            accountAuthorizeUrl(mapOf("redirect_uri" to "http://localhost:45678/oauth/microsoft/callback")),
+            accountAuthorizeUrl(mapOf("scope" to "Files.Read offline_access")),
+            accountAuthorizeUrl(mapOf("state" to "short")),
+            accountAuthorizeUrl().replace("login.microsoftonline.com/", "login.microsoftonline.com:444/"),
+            accountAuthorizeUrl() + "&state=${"b".repeat(43)}",
+        )
+        for (url in invalidUrls) {
+            assertBlocked(
+                ExternalUrlPolicy.classifyExternalUrl(url, AuthUrlKind.AccountAuthorize),
+                "not_allowlisted",
+            )
+        }
+    }
+
+    @Test
     fun unsafeUrlShapesAreRejectedBeforeAllowlist() {
         val cases = listOf(
             "http://auth.openai.com/oauth/authorize",
@@ -150,6 +193,28 @@ class ExternalUrlPolicyTest {
         assertEquals("allowed", decision.reason)
         assertEquals(host, decision.normalizedHost)
     }
+
+    private fun accountAuthorizeUrl(overrides: Map<String, String> = emptyMap()): String {
+        val values = linkedMapOf(
+            "client_id" to "a90d9140-3a62-46d0-907b-f2b7b61a573a",
+            "response_type" to "code",
+            "response_mode" to "query",
+            "redirect_uri" to "http://localhost:45678",
+            "scope" to accountScopes.joinToString(" "),
+            "code_challenge" to "a".repeat(43),
+            "code_challenge_method" to "S256",
+            "state" to "b".repeat(43),
+            "prompt" to "select_account",
+        )
+        values.putAll(overrides)
+        val query = values.entries.joinToString("&") { (key, value) ->
+            "${encode(key)}=${encode(value)}"
+        }
+        return "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?$query"
+    }
+
+    private fun encode(value: String): String =
+        URLEncoder.encode(value, StandardCharsets.UTF_8.name())
 
     private fun assertBlocked(decision: ExternalUrlDecision, reason: String) {
         assertFalse(decision.allowed)
