@@ -20,6 +20,9 @@ pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/re
 pub(super) const ORIGINATOR: &str = crate::oauth::CODEX_OAUTH_ORIGINATOR;
 pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.4";
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+const MAX_REASONING_CONTEXT_BYTES: usize = 1024 * 1024;
+const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
+const MAX_REASONING_ITEMS_PER_ROUND: usize = 4;
 
 /// Closed reasoning levels offered by the product UI and accepted by the Codex backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -94,7 +97,32 @@ pub(super) fn responses_tools() -> Value {
 /// Map the agent history to the Responses `input` array (message / function_call /
 /// function_call_output items), pairing tool_use ↔ tool_result by `call_id`.
 pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
+    build_input_with_reasoning(history, &[], 0)
+}
+
+#[derive(Clone)]
+struct CodexReasoningContext {
+    summary: Value,
+    encrypted_content: String,
+}
+
+impl CodexReasoningContext {
+    fn replay_value(&self) -> Value {
+        json!({
+            "type": "reasoning",
+            "summary": self.summary,
+            "encrypted_content": self.encrypted_content,
+        })
+    }
+}
+
+fn build_input_with_reasoning(
+    history: &[Message],
+    reasoning_rounds: &[Vec<CodexReasoningContext>],
+    assistant_base: usize,
+) -> Vec<Value> {
     let mut out = Vec::new();
+    let mut assistant_index = 0usize;
     for m in history {
         match m.role {
             Role::User => out.push(json!({
@@ -102,6 +130,13 @@ pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
                 "content": [{ "type": "input_text", "text": m.content }],
             })),
             Role::Assistant => {
+                if let Some(round) = assistant_index
+                    .checked_sub(assistant_base)
+                    .and_then(|round| reasoning_rounds.get(round))
+                {
+                    out.extend(round.iter().map(CodexReasoningContext::replay_value));
+                }
+                assistant_index = assistant_index.saturating_add(1);
                 if !m.content.is_empty() {
                     out.push(json!({
                         "type": "message", "role": "assistant",
@@ -125,6 +160,36 @@ pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
         }
     }
     out
+}
+
+fn replayable_reasoning_context(item: &Value) -> Result<CodexReasoningContext, AgentError> {
+    let object = item
+        .as_object()
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .ok_or_else(|| AgentError::Provider("codex: invalid reasoning item".into()))?;
+    let encrypted_content = object
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_REASONING_CONTEXT_BYTES)
+        .ok_or_else(|| AgentError::Provider("codex: invalid reasoning context".into()))?;
+    let summary = object
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    if !summary.is_array()
+        || serde_json::to_vec(&summary)
+            .map_err(|_| AgentError::Provider("codex: invalid reasoning summary".into()))?
+            .len()
+            > MAX_REASONING_SUMMARY_BYTES
+    {
+        return Err(AgentError::Provider(
+            "codex: invalid reasoning summary".into(),
+        ));
+    }
+    Ok(CodexReasoningContext {
+        summary,
+        encrypted_content: encrypted_content.to_owned(),
+    })
 }
 
 /// Build the Responses request body. `instructions` carries the system prompt (the
@@ -155,6 +220,7 @@ fn apply_sse_event(
     data: &str,
     text: &mut String,
     tools: &mut Vec<CodexToolArgs>,
+    reasoning: &mut Vec<CodexReasoningContext>,
     usage: &mut Usage,
     failure: &mut Option<String>,
 ) -> Result<Option<String>, AgentError> {
@@ -173,18 +239,29 @@ fn apply_sse_event(
         }
         Some("response.output_item.done") => {
             if let Some(item) = v.get("item") {
-                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                    let id = item
-                        .get("call_id")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let args = item
-                        .get("arguments")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("{}")
-                        .to_string();
-                    tools.push((id, args));
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        let id = item
+                            .get("call_id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let args = item
+                            .get("arguments")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        tools.push((id, args));
+                    }
+                    Some("reasoning") => {
+                        if reasoning.len() >= MAX_REASONING_ITEMS_PER_ROUND {
+                            return Err(AgentError::Provider(
+                                "codex: too many reasoning items".into(),
+                            ));
+                        }
+                        reasoning.push(replayable_reasoning_context(item)?);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -234,6 +311,31 @@ fn sse_event_advances_turn(data: &str) -> bool {
         })
 }
 
+#[cfg(feature = "http")]
+fn closed_backend_failure_code(status: u16, detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("reasoning") {
+        "reasoning_context"
+    } else if detail.contains("function_call") {
+        "function_call_pairing"
+    } else if detail.contains("context_length") || detail.contains("input token") {
+        "context_limit"
+    } else if status == 400 {
+        "http_bad_request"
+    } else if status == 429 {
+        "http_rate_limited"
+    } else if status >= 500 {
+        "http_server_failure"
+    } else {
+        "http_request_rejected"
+    }
+}
+
+#[cfg(feature = "http")]
+fn closed_provider_failure(code: &str) -> AgentError {
+    AgentError::Provider(format!("codex_safe:{code}"))
+}
+
 fn finish_sse_blocks(
     text: String,
     tools: Vec<CodexToolArgs>,
@@ -260,6 +362,7 @@ fn finish_sse_blocks(
 pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
     let mut text = String::new();
     let mut tools: Vec<CodexToolArgs> = Vec::new();
+    let mut reasoning = Vec::new();
     let mut usage = Usage::default();
     let mut failure: Option<String> = None;
 
@@ -268,7 +371,14 @@ pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), Agen
             Some(d) => d,
             None => continue,
         };
-        apply_sse_event(data, &mut text, &mut tools, &mut usage, &mut failure)?;
+        apply_sse_event(
+            data,
+            &mut text,
+            &mut tools,
+            &mut reasoning,
+            &mut usage,
+            &mut failure,
+        )?;
     }
 
     finish_sse_blocks(text, tools, usage, failure)
@@ -285,6 +395,8 @@ mod live {
         access_token: String,
         instructions: String,
         cfg: CodexConfig,
+        reasoning_rounds: Vec<Vec<CodexReasoningContext>>,
+        history_assistant_base: Option<usize>,
         pub last_usage: Usage,
     }
 
@@ -299,6 +411,8 @@ mod live {
                 access_token: access_token.into(),
                 instructions: instructions.into(),
                 cfg,
+                reasoning_rounds: Vec::new(),
+                history_assistant_base: None,
                 last_usage: Usage::default(),
             })
         }
@@ -345,6 +459,12 @@ mod live {
             emit: &mut dyn FnMut(StreamEvent),
             cancellation: Option<&crate::CancellationToken>,
         ) -> Result<Vec<AssistantBlock>, AgentError> {
+            let assistant_base = *self.history_assistant_base.get_or_insert_with(|| {
+                history
+                    .iter()
+                    .filter(|message| message.role == Role::Assistant)
+                    .count()
+            });
             // #639: attest THIS round's request, then send only the attested object.
             let attested = crate::provider::build_attested_provider_request(
                 crate::provider::ProviderRequestBinding::Codex {
@@ -356,15 +476,24 @@ mod live {
                 },
                 self.cfg.responses_url.clone(),
                 self.request_headers(),
-                build_request(
-                    &self.cfg.model,
-                    self.cfg.reasoning_effort,
-                    &self.instructions,
-                    history,
-                ),
+                {
+                    let mut body = build_request(
+                        &self.cfg.model,
+                        self.cfg.reasoning_effort,
+                        &self.instructions,
+                        history,
+                    );
+                    body["input"] = Value::Array(build_input_with_reasoning(
+                        history,
+                        &self.reasoning_rounds,
+                        assistant_base,
+                    ));
+                    body
+                },
             )?;
             let mut text = String::new();
             let mut tools: Vec<CodexToolArgs> = Vec::new();
+            let mut reasoning = Vec::new();
             let mut usage = Usage::default();
             let mut failure: Option<String> = None;
             let mut parse_error: Option<AgentError> = None;
@@ -379,6 +508,7 @@ mod live {
                         &event.data,
                         &mut text,
                         &mut tools,
+                        &mut reasoning,
                         &mut usage,
                         &mut failure,
                     ) {
@@ -391,26 +521,21 @@ mod live {
                 cancellation,
             )?;
             if response.status == 401 || response.status == 403 {
-                return Err(AgentError::Provider(
-                    "codex: unauthorized — connect ChatGPT again".into(),
-                ));
+                return Err(closed_provider_failure("authorization_rejected"));
             }
             if response.status >= 400 {
                 let detail = response.body_preview.unwrap_or_default();
-                return Err(AgentError::Provider(format!(
-                    "codex: backend status {}{}",
+                return Err(closed_provider_failure(closed_backend_failure_code(
                     response.status,
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
+                    &detail,
                 )));
             }
-            if let Some(e) = parse_error {
-                return Err(e);
+            if parse_error.is_some() {
+                return Err(closed_provider_failure("parse_failure"));
             }
-            let (blocks, usage) = finish_sse_blocks(text, tools, usage, failure)?;
+            let (blocks, usage) = finish_sse_blocks(text, tools, usage, failure)
+                .map_err(|_| closed_provider_failure("stream_failure"))?;
+            self.reasoning_rounds.push(reasoning);
             let usage = usage.with_provider_response("codex", &self.cfg.model, &response.headers);
             self.last_usage = usage;
             Ok(blocks)
@@ -516,6 +641,88 @@ mod tests {
     }
 
     #[test]
+    fn build_input_replays_reasoning_before_matching_tool_round() {
+        let h = vec![
+            Message::assistant("older visible context", Vec::new()),
+            Message::user("q"),
+            Message::assistant(
+                "",
+                vec![ToolUseRef {
+                    id: "call_1".into(),
+                    input: json!({"op":"search","account":"me","query":"x"}),
+                }],
+            ),
+            Message::tool("call_1", "hit: item-42"),
+        ];
+        let reasoning = replayable_reasoning_context(&json!({
+            "type": "reasoning",
+            "id": "provider-item-id",
+            "summary": [{"type":"summary_text","text":"private summary"}],
+            "content": [{"type":"reasoning_text","text":"private plaintext"}],
+            "encrypted_content": "opaque-context",
+        }))
+        .unwrap();
+
+        let input = build_input_with_reasoning(&h, &[vec![reasoning]], 1);
+        let reasoning_index = input
+            .iter()
+            .position(|item| item["type"] == "reasoning")
+            .unwrap();
+        let call_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call")
+            .unwrap();
+        let output_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .unwrap();
+
+        assert!(reasoning_index < call_index && call_index < output_index);
+        assert_eq!(
+            input[reasoning_index]["encrypted_content"],
+            "opaque-context"
+        );
+        assert!(input[reasoning_index].get("id").is_none());
+        assert!(input[reasoning_index].get("content").is_none());
+        assert!(!serde_json::to_string(&input)
+            .unwrap()
+            .contains("private plaintext"));
+    }
+
+    #[test]
+    fn codex_reasoning_context_is_bounded_and_requires_encrypted_content() {
+        assert!(replayable_reasoning_context(&json!({
+            "type": "reasoning",
+            "summary": [],
+        }))
+        .is_err());
+        assert!(replayable_reasoning_context(&json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "x".repeat(MAX_REASONING_CONTEXT_BYTES + 1),
+        }))
+        .is_err());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn codex_backend_failures_reduce_to_closed_diagnostics() {
+        assert_eq!(
+            closed_backend_failure_code(400, "reasoning item is required"),
+            "reasoning_context"
+        );
+        assert_eq!(
+            closed_backend_failure_code(400, "function_call pairing failed"),
+            "function_call_pairing"
+        );
+        assert_eq!(
+            closed_backend_failure_code(400, "unrecognized private provider detail"),
+            "http_bad_request"
+        );
+        assert!(!closed_backend_failure_code(400, "secret-value").contains("secret-value"));
+    }
+
+    #[test]
     fn parse_sse_collects_text_and_usage() {
         let sse = "\
 event: response.output_text.delta\n\
@@ -537,6 +744,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
     fn apply_sse_event_returns_text_delta_immediately() {
         let mut text = String::new();
         let mut tools = Vec::new();
+        let mut reasoning = Vec::new();
         let mut usage = Usage::default();
         let mut failure = None;
 
@@ -544,6 +752,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
             "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
             &mut text,
             &mut tools,
+            &mut reasoning,
             &mut usage,
             &mut failure,
         )
@@ -552,8 +761,34 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         assert_eq!(delta.as_deref(), Some("hello"));
         assert_eq!(text, "hello");
         assert!(tools.is_empty());
+        assert!(reasoning.is_empty());
         assert_eq!(usage, Usage::default());
         assert!(failure.is_none());
+    }
+
+    #[test]
+    fn apply_sse_event_captures_replayable_reasoning_without_plaintext() {
+        let mut text = String::new();
+        let mut tools = Vec::new();
+        let mut reasoning = Vec::new();
+        let mut usage = Usage::default();
+        let mut failure = None;
+
+        apply_sse_event(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"do not retain"}],"encrypted_content":"opaque"}}"#,
+            &mut text,
+            &mut tools,
+            &mut reasoning,
+            &mut usage,
+            &mut failure,
+        )
+        .unwrap();
+
+        assert_eq!(reasoning.len(), 1);
+        let replay = reasoning[0].replay_value();
+        assert_eq!(replay["encrypted_content"], "opaque");
+        assert!(replay.get("id").is_none());
+        assert!(replay.get("content").is_none());
     }
 
     #[test]

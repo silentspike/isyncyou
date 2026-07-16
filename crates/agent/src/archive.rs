@@ -111,7 +111,7 @@ mod store_backed {
             // Repo-specific WAL read-query handle: no .lock, no create/migration.
             // It is intentionally not a raw SQLite READ_ONLY connection.
             Store::open_readonly(self.archive_root.join(".isyncyou-store.db"))
-                .map_err(|e| AgentError::Provider(format!("store open: {e}")))
+                .map_err(|_| AgentError::Provider("archive_store_unavailable".into()))
         }
 
         fn body_path(&self, rel: &str) -> Result<PathBuf, AgentError> {
@@ -119,10 +119,10 @@ mod store_backed {
             let root = self
                 .archive_root
                 .canonicalize()
-                .map_err(|e| AgentError::Provider(format!("archive root: {e}")))?;
+                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))?;
             let path = joined
                 .canonicalize()
-                .map_err(|e| AgentError::Provider(format!("body path: {e}")))?;
+                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))?;
             if !path.starts_with(&root) {
                 return Err(AgentError::ToolArgs(format!("path escape rejected: {rel}")));
             }
@@ -139,7 +139,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             Ok(store
                 .search_names(&self.account, query)
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .into_iter()
                 .map(to_ref)
                 .collect())
@@ -149,14 +149,14 @@ mod store_backed {
             let store = self.open_readonly()?;
             store
                 .search_bodies(&self.account, query)
-                .map_err(|e| AgentError::Provider(e.to_string()))
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))
         }
 
         fn get(&self, service: &str, id: &str) -> Result<Option<ItemRef>, AgentError> {
             let store = self.open_readonly()?;
             Ok(store
                 .get_item(&self.account, service, id)
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .map(to_ref))
         }
 
@@ -169,7 +169,7 @@ mod store_backed {
             })?;
             let path = self.body_path(&rel)?;
             isyncyou_core::envelope::read_body(&path)
-                .map_err(|e| AgentError::Provider(format!("read body: {e}")))
+                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))
         }
 
         fn list_page(
@@ -181,7 +181,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             let items = store
                 .items_by_service_page(&self.account, service, limit, offset)
-                .map_err(|e| AgentError::Provider(e.to_string()))?;
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
             Ok(items.into_iter().map(to_ref).collect())
         }
 
@@ -189,7 +189,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             Ok(store
                 .roots(&self.account, service)
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .into_iter()
                 .map(to_ref)
                 .collect())
@@ -199,7 +199,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             Ok(store
                 .children(&self.account, service, Some(parent))
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .into_iter()
                 .map(to_ref)
                 .collect())
@@ -209,7 +209,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             store
                 .count_by_service(&self.account, service)
-                .map_err(|e| AgentError::Provider(e.to_string()))
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))
         }
     }
 }

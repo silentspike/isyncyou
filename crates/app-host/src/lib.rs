@@ -401,7 +401,37 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
     match error {
         isyncyou_agent::AgentError::Cancelled => "turn_cancelled",
         isyncyou_agent::AgentError::ToolArgs(_) => "assistant_tool_arguments_invalid",
-        isyncyou_agent::AgentError::Provider(_) => "provider_request_failed",
+        isyncyou_agent::AgentError::Provider(code) => match code.as_str() {
+            "archive_store_unavailable" => "assistant_archive_unavailable",
+            "archive_query_failed" => "assistant_archive_query_failed",
+            "archive_body_unavailable" => "assistant_archive_body_unavailable",
+            "session_store_unavailable" => "session_store_unavailable",
+            "session_transport_unavailable" => "session_transport_unavailable",
+            "manifest_conflict" | "lease_lost" => "lease_lost",
+            "turn_outcome_unknown" => "turn_outcome_unknown",
+            "request_id_conflict" => "request_id_conflict",
+            "session_limit_reached" => "session_limit_reached",
+            "duplicate_tool_use_id" => "assistant_tool_response_invalid",
+            "provider_generation_changed" => "provider_generation_changed",
+            "invalid_session_record" | "invalid_request_journal" => "session_state_invalid",
+            "turn_step_invalid" => "turn_state_invalid",
+            "turn exceeded max steps" => "provider_step_limit_reached",
+            "outcome_unknown" => "turn_outcome_unknown",
+            "codex_safe:authorization_rejected" => "provider_authorization_rejected",
+            "codex_safe:reasoning_context" => "provider_reasoning_context_rejected",
+            "codex_safe:function_call_pairing" => "provider_function_call_pairing_rejected",
+            "codex_safe:context_limit" => "provider_context_limit_reached",
+            "codex_safe:http_rate_limited" => "provider_rate_limited",
+            "codex_safe:http_server_failure" => "provider_service_unavailable",
+            "codex_safe:parse_failure" => "provider_response_invalid",
+            "codex_safe:stream_failure" => "provider_stream_failed",
+            "codex_safe:http_bad_request" | "codex_safe:http_request_rejected" => {
+                "provider_request_rejected"
+            }
+            code if code.starts_with("harness attestation failed:") => "provider_harness_rejected",
+            code if code.starts_with("codex:") => "provider_response_invalid",
+            _ => "provider_request_failed",
+        },
         isyncyou_agent::AgentError::Transport(code) => match code.as_str() {
             "provider_connect_timed_out" => "provider_connect_timed_out",
             "provider_response_timed_out" => "provider_response_timed_out",
@@ -12048,6 +12078,90 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     static APP_HOST_CREDENTIAL_ENV_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    #[test]
+    fn codex_provider_failures_serialize_only_closed_diagnostic_codes() {
+        let cases = [
+            ("authorization_rejected", "provider_authorization_rejected"),
+            ("reasoning_context", "provider_reasoning_context_rejected"),
+            (
+                "function_call_pairing",
+                "provider_function_call_pairing_rejected",
+            ),
+            ("context_limit", "provider_context_limit_reached"),
+            ("http_rate_limited", "provider_rate_limited"),
+            ("http_server_failure", "provider_service_unavailable"),
+            ("http_bad_request", "provider_request_rejected"),
+            ("parse_failure", "provider_response_invalid"),
+            ("stream_failure", "provider_stream_failed"),
+        ];
+        for (internal, public) in cases {
+            let error = isyncyou_agent::AgentError::Provider(format!("codex_safe:{internal}"));
+            assert_eq!(agent_safe_turn_error(&error), public);
+        }
+        let raw = isyncyou_agent::AgentError::Provider("private provider detail".into());
+        assert_eq!(agent_safe_turn_error(&raw), "provider_request_failed");
+    }
+
+    #[test]
+    fn product_session_failures_serialize_only_closed_diagnostic_codes() {
+        let cases = [
+            ("session_store_unavailable", "session_store_unavailable"),
+            (
+                "session_transport_unavailable",
+                "session_transport_unavailable",
+            ),
+            ("manifest_conflict", "lease_lost"),
+            ("lease_lost", "lease_lost"),
+            ("turn_outcome_unknown", "turn_outcome_unknown"),
+            ("request_id_conflict", "request_id_conflict"),
+            ("session_limit_reached", "session_limit_reached"),
+            ("duplicate_tool_use_id", "assistant_tool_response_invalid"),
+            ("provider_generation_changed", "provider_generation_changed"),
+            ("invalid_session_record", "session_state_invalid"),
+            ("invalid_request_journal", "session_state_invalid"),
+        ];
+        for (internal, public) in cases {
+            let error = isyncyou_agent::AgentError::Provider(internal.into());
+            assert_eq!(agent_safe_turn_error(&error), public);
+        }
+
+        let raw = isyncyou_agent::AgentError::Provider("private session detail".into());
+        assert_eq!(agent_safe_turn_error(&raw), "provider_request_failed");
+    }
+
+    #[test]
+    fn archive_failures_serialize_only_closed_diagnostic_codes() {
+        let cases = [
+            ("archive_store_unavailable", "assistant_archive_unavailable"),
+            ("archive_query_failed", "assistant_archive_query_failed"),
+            (
+                "archive_body_unavailable",
+                "assistant_archive_body_unavailable",
+            ),
+        ];
+        for (internal, public) in cases {
+            let error = isyncyou_agent::AgentError::Provider(internal.into());
+            assert_eq!(agent_safe_turn_error(&error), public);
+        }
+    }
+
+    #[test]
+    fn turn_runtime_failures_serialize_only_closed_diagnostic_codes() {
+        let cases = [
+            ("turn_step_invalid", "turn_state_invalid"),
+            ("turn exceeded max steps", "provider_step_limit_reached"),
+            (
+                "harness attestation failed: private detail",
+                "provider_harness_rejected",
+            ),
+            ("codex: private parser detail", "provider_response_invalid"),
+        ];
+        for (internal, public) in cases {
+            let error = isyncyou_agent::AgentError::Provider(internal.into());
+            assert_eq!(agent_safe_turn_error(&error), public);
+        }
+    }
 
     struct EnvelopeRequirementGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
