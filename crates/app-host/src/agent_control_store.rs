@@ -260,7 +260,7 @@ impl AgentControlStore {
         let lock_path = root.join(".lock");
         reject_symlink_or_insecure_file(&lock_path)?;
         let lock = FileLock::try_acquire_exclusive(&lock_path)
-            .map_err(|_| "control_store_unavailable")?
+            .map_err(|_| "control_store_lock_unavailable")?
             .ok_or_else(|| "control_store_busy".to_string())?;
         let db_path = root.join(".isyncyou-agent-control.db");
         reject_symlink_or_insecure_file(&db_path)?;
@@ -289,30 +289,33 @@ impl AgentControlStore {
                 .map_err(|_| "control_store_key_unavailable")?,
         );
 
-        let connection = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(|_| "control_store_unavailable")?;
+        let open_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        // Android's bundled SQLCipher rejects SQLITE_OPEN_NOFOLLOW at open time. The database is
+        // still confined to the app-private 0700 directory and is checked as a regular owner-only
+        // file before and immediately after open. Other supported targets retain the kernel-backed
+        // final-component no-follow flag.
+        #[cfg(not(target_os = "android"))]
+        let open_flags = open_flags | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = Connection::open_with_flags(&db_path, open_flags)
+            .map_err(|_| "control_store_database_open_failed")?;
         #[cfg(feature = "encrypted-store")]
         apply_sqlcipher_key(&connection, &sqlcipher_key)?;
         sqlcipher_key.fill(0);
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| "control_store_unavailable")?;
+            .map_err(|_| "control_store_database_config_failed")?;
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON;
                  PRAGMA journal_mode=WAL;
                  PRAGMA secure_delete=ON;",
             )
-            .map_err(|_| "control_store_unavailable")?;
+            .map_err(|_| "control_store_database_config_failed")?;
         let migration = connection
             .unchecked_transaction()
-            .map_err(|_| "control_store_unavailable")?;
+            .map_err(|_| "control_store_migration_failed")?;
         migration
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS control_metadata (
@@ -413,11 +416,11 @@ impl AgentControlStore {
                    FOREIGN KEY(intent_id) REFERENCES mutation_intents(intent_id) ON DELETE CASCADE
                  );",
             )
-            .map_err(|_| "control_store_unavailable")?;
+            .map_err(|_| "control_store_migration_failed")?;
         initialize_metadata(&migration, &installation_binding, lifecycle_key_version)?;
         migration
             .commit()
-            .map_err(|_| "control_store_unavailable")?;
+            .map_err(|_| "control_store_migration_failed")?;
         secure_file_mode(&db_path)?;
         for suffix in ["-wal", "-shm"] {
             let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
@@ -2800,7 +2803,7 @@ mod tests {
         drop(AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap());
         assert_eq!(
             AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 2).unwrap_err(),
-            "control_store_unavailable"
+            "control_store_database_config_failed"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2861,7 +2864,7 @@ mod tests {
             AgentControlStore::open(&root, &store, "BBBBBBBBBBBBBBBBBBBBBB", 1).unwrap_err();
         assert!(matches!(
             error.as_str(),
-            "control_store_unavailable" | "control_store_identity_mismatch"
+            "control_store_database_config_failed" | "control_store_identity_mismatch"
         ));
         std::fs::remove_dir_all(root).unwrap();
     }

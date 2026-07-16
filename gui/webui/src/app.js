@@ -6071,6 +6071,7 @@ function agentSafeErrorCopy(code) {
     provider_response_read_failed: "The provider response could not be read.",
     provider_transport_failed: "The provider connection failed.",
     confirmation_unavailable: "Confirmation is temporarily unavailable.",
+    session_transport_unavailable: "Shared session storage is unavailable. Check your Microsoft 365 connection and try again.",
   };
   return known[code] || "The assistant could not complete this request.";
 }
@@ -6540,7 +6541,7 @@ async function agentSend(text) {
       setText(CONNECTIVITY_COPY[AssistantState.connectivityIssue.code]);
       renderAssistantView($("#view"));
     } else {
-      setText("The assistant could not start this turn.");
+      setText(agentSafeErrorCopy(e && e.message));
     }
     return;
   }

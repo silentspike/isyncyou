@@ -148,6 +148,7 @@ function makeFixtureServer(evidence) {
   let oauthAttemptSeq = 0;
   let turnSeq = 0;
   let selectedSessionId = null;
+  let failNextSessionCreate = false;
   const sessions = new Map();
   const turns = new Map();
   const state = {
@@ -288,6 +289,10 @@ function makeFixtureServer(evidence) {
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/session/create") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         await readJson(req);
+        if (failNextSessionCreate) {
+          failNextSessionCreate = false;
+          return json(res, 200, { session: null });
+        }
         const sessionId = `session-${sessions.size + 1}`;
         const session = { session_id: sessionId, display_name: "Assistant", archived: false };
         sessions.set(sessionId, { ...session, records: [] });
@@ -353,6 +358,9 @@ function makeFixtureServer(evidence) {
     setOnboardingMode(mode) {
       onboardingMode = mode;
       agentConnected = mode === "ready";
+    },
+    failNextSessionCreate() {
+      failNextSessionCreate = true;
     },
   };
 }
@@ -664,6 +672,16 @@ async function main() {
     });
     assert(evidence, "handoff DOM console and storage exclude capability and attempt secrets",
       !secretSurfaceText.includes(AGENT_CAP) && !secretSurfaceText.includes("fixture-attempt-"));
+
+    fixture.failNextSessionCreate();
+    await page.locator('[data-testid="agent-input"]').fill("Check shared session storage");
+    await page.locator('[data-testid="agent-send"]').click();
+    await page.waitForFunction(() => document.body.innerText.includes("Shared session storage is unavailable."), null, { timeout: 10000 });
+    const sessionTransportText = await pageText(page);
+    assert(evidence, "session transport failure renders safe actionable copy",
+      sessionTransportText.includes("Check your Microsoft 365 connection and try again.")
+      && !sessionTransportText.includes("SQLITE")
+      && !sessionTransportText.includes("database_open_failed"));
 
     await page.locator('[data-testid="agent-input"]').fill("Find the quarterly brief");
     await page.locator('[data-testid="agent-send"]').click();

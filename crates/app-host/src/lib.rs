@@ -335,7 +335,7 @@ fn record_account_lifecycle_transition_audit(
                 "audit:agent-account-lifecycle",
                 &now,
                 &now,
-                event.phase.wire(),
+                "ok",
                 &summary,
             )
             .map(|_| ())
@@ -1343,6 +1343,11 @@ pub struct DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     control_store: Option<Arc<agent_control_store::AgentControlStore>>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    control_store_state: &'static str,
     confirmed_executor: Arc<dyn AgentConfirmedActionExecutor>,
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
@@ -1466,11 +1471,14 @@ impl DaemonAgent {
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
-        let control_store = lifecycle_initialized
-            .then(|| open_agent_control_store(&oauth_dir))
-            .transpose()
-            .ok()
-            .flatten();
+        let (control_store, control_store_state) = if lifecycle_initialized {
+            match open_agent_control_store(&oauth_dir) {
+                Ok(store) => (Some(store), "ready"),
+                Err(error) => (None, public_control_store_init_code(&error)),
+            }
+        } else {
+            (None, "lifecycle_unavailable")
+        };
         #[cfg(any(
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
@@ -1511,6 +1519,11 @@ impl DaemonAgent {
                 feature = "agent-subscription-experimental"
             ))]
             control_store,
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
+            control_store_state,
             confirmed_executor,
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
@@ -4504,6 +4517,45 @@ fn open_agent_control_store(
         installation.principal(),
         installation.authority.lifecycle_key_version,
     )?))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn public_control_store_init_code(error: &str) -> &'static str {
+    match error {
+        "control_store_identity_unavailable" => "identity_unavailable",
+        "control_store_busy" => "busy",
+        "control_store_lock_unavailable" => "lock_unavailable",
+        "control_store_key_unavailable" => "key_unavailable",
+        "control_store_database_open_failed" => "database_open_failed",
+        "control_store_database_config_failed" => "database_config_failed",
+        "control_store_migration_failed" => "migration_failed",
+        "control_store_identity_mismatch" => "identity_mismatch",
+        _ => "unavailable",
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
+))]
+#[test]
+fn agent_status_control_store_state_is_closed_and_redacted() {
+    assert_eq!(
+        public_control_store_init_code("control_store_database_open_failed"),
+        "database_open_failed"
+    );
+    assert_eq!(
+        public_control_store_init_code(
+            "SQLITE_CANTOPEN: /data/user/0/private/.isyncyou-agent-control.db"
+        ),
+        "unavailable"
+    );
 }
 
 #[cfg(any(
@@ -9416,6 +9468,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "claude": claude,
             "codex": codex,
             "credential_state": { "claude": claude_state, "codex": codex_state },
+            "control_store_state": self.control_store_state,
             "reconnect_required": reconnect_required,
             "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
         });
@@ -18995,13 +19048,20 @@ mod tests {
 
         let store = Store::open(archive.join(".isyncyou-store.db")).unwrap();
         let runs = store.recent_runs("me", 10).unwrap();
-        let statuses = runs
+        assert!(runs.iter().all(|run| run.status == "ok"));
+        let summaries = runs
             .iter()
-            .map(|run| run.status.as_str())
+            .map(|run| run.summary.as_str())
             .collect::<Vec<_>>();
-        assert!(statuses.contains(&"prepared"));
-        assert!(statuses.contains(&"revoke_in_flight"));
-        assert!(statuses.contains(&"revoke_outcome_unknown"));
+        assert!(summaries
+            .iter()
+            .any(|summary| summary.contains("transition=prepared")));
+        assert!(summaries
+            .iter()
+            .any(|summary| summary.contains("transition=revoke_in_flight")));
+        assert!(summaries
+            .iter()
+            .any(|summary| summary.contains("transition=revoke_outcome_unknown")));
         for run in runs {
             assert_eq!(run.kind, "audit:agent-account-lifecycle");
             assert!(run.summary.contains("provider=claude"));
