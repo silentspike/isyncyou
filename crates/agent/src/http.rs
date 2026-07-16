@@ -315,8 +315,9 @@ mod live {
 
     /// Compiled policy for product provider traffic. Callers cannot override these values.
     pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    pub const PROVIDER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-    pub const PROVIDER_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    pub const PROVIDER_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const PROVIDER_STREAM_START_TIMEOUT: Duration = Duration::from_secs(180);
+    pub const PROVIDER_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(240);
     pub const PROVIDER_TURN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
     pub const PREFLIGHT_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -455,7 +456,7 @@ mod live {
             let mut req = self
                 .client
                 .post(url)
-                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .timeout(PROVIDER_CONTROL_RESPONSE_TIMEOUT)
                 .json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
@@ -495,10 +496,10 @@ mod live {
             self.sse_runtime.block_on(async {
                 let started_at = tokio::time::Instant::now();
                 let deadline = started_at + PROVIDER_TURN_TIMEOUT;
-                let first_event_deadline = started_at + PROVIDER_RESPONSE_TIMEOUT;
+                let first_event_deadline = started_at + PROVIDER_STREAM_START_TIMEOUT;
                 let response = within_deadline_cancellable(
                     first_event_deadline,
-                    PROVIDER_RESPONSE_TIMEOUT,
+                    PROVIDER_STREAM_START_TIMEOUT,
                     cancellation,
                     req.send(),
                 )
@@ -580,7 +581,7 @@ mod live {
             let resp = self
                 .client
                 .post(url)
-                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .timeout(PROVIDER_CONTROL_RESPONSE_TIMEOUT)
                 .form(form)
                 .send()
                 .map_err(safe_reqwest_transport_error)?;
@@ -805,7 +806,7 @@ mod live {
         if saw_event {
             (PROVIDER_SSE_IDLE_TIMEOUT, "provider_stream_idle_timed_out")
         } else {
-            (PROVIDER_RESPONSE_TIMEOUT, "provider_response_timed_out")
+            (PROVIDER_STREAM_START_TIMEOUT, "provider_response_timed_out")
         }
     }
 
@@ -1028,10 +1029,12 @@ mod tests {
     #[test]
     fn provider_transport_timeout_policy_has_distinct_response_idle_and_turn_bounds() {
         assert_eq!(live::PROVIDER_CONNECT_TIMEOUT.as_secs(), 10);
-        assert_eq!(live::PROVIDER_RESPONSE_TIMEOUT.as_secs(), 60);
-        assert_eq!(live::PROVIDER_SSE_IDLE_TIMEOUT.as_secs(), 120);
+        assert_eq!(live::PROVIDER_CONTROL_RESPONSE_TIMEOUT.as_secs(), 60);
+        assert_eq!(live::PROVIDER_STREAM_START_TIMEOUT.as_secs(), 180);
+        assert_eq!(live::PROVIDER_SSE_IDLE_TIMEOUT.as_secs(), 240);
         assert_eq!(live::PROVIDER_TURN_TIMEOUT.as_secs(), 20 * 60);
-        assert!(live::PROVIDER_RESPONSE_TIMEOUT < live::PROVIDER_SSE_IDLE_TIMEOUT);
+        assert!(live::PROVIDER_CONTROL_RESPONSE_TIMEOUT < live::PROVIDER_STREAM_START_TIMEOUT);
+        assert!(live::PROVIDER_STREAM_START_TIMEOUT < live::PROVIDER_SSE_IDLE_TIMEOUT);
         assert!(live::PROVIDER_SSE_IDLE_TIMEOUT < live::PROVIDER_TURN_TIMEOUT);
     }
 
@@ -1089,7 +1092,7 @@ mod tests {
         assert_eq!(
             live::provider_stream_wait_policy(false),
             (
-                live::PROVIDER_RESPONSE_TIMEOUT,
+                live::PROVIDER_STREAM_START_TIMEOUT,
                 "provider_response_timed_out"
             )
         );
