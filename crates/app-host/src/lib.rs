@@ -9921,7 +9921,6 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
                         "login_id": id.to_string(),
                         "user_code": dc.user_code,
                         "verification_uri": dc.verification_uri,
-                        "browser_logout_uri": "https://login.microsoftonline.com/consumers/oauth2/v2.0/logout",
                         "message": dc.message,
                     }));
                 }

@@ -83,8 +83,6 @@ const ICONS = {
   "corner-up-left": "M9 14L4 9l5-5M4 9h11a4 4 0 0 1 4 4v7",
   "corner-up-right": "M15 14l5-5-5-5M20 9H9a4 4 0 0 0-4 4v7",
   "trash-2": "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6",
-  "user-plus": "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M19 8v6M22 11h-6",
-  "log-out": "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9",
   tag: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82zM7 7h.01",
   "mail-open": "M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8M3 8l9-6 9 6M3 8l9 6 9-6",
   sparkles: "M12 3l2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2z",
@@ -6620,15 +6618,14 @@ function renderAccountMenu(body) {
       active ? icon("check", "icon-sm") : null);
     if (CAP.account) {
       const acts = el("div", { class: "acct-acts" });
-      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Reconnect this Microsoft account", onclick: () => startDeviceLogin(a, body, false) }, icon("rotate-ccw", "icon-sm")));
-      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Use a different Microsoft account", onclick: () => startDeviceLogin(a, body, true) }, icon("user-plus", "icon-sm")));
+      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Sign in / reconnect (device code)", onclick: () => startDeviceLogin(a, body) }, icon("rotate-ccw", "icon-sm")));
       acts.append(el("button", { class: "btn ghost sm icon-only", style: "color:var(--danger,#f87171)", title: "Sign out — clear cached token", onclick: () => accountSignOut(a, body) }, icon("trash-2", "icon-sm")));
       row.append(acts);
     }
     body.append(row);
   });
   body.append(el("div", { class: "acct-note dim" }, CAP.account
-    ? "Reconnect keeps the current browser account. Use the different-account action to choose another Microsoft account."
+    ? "Reconnect re-runs device-code sign-in. Adding a brand-new account still needs `isyncyou setup` (live add is the remaining backend work)."
     : "Read-only server — account switching only."));
 }
 async function accountSignOut(a, body) {
@@ -6636,7 +6633,7 @@ async function accountSignOut(a, body) {
   catch (e) { toast("Sign-out failed: " + e.message, "err"); }
   renderAccountMenu(body);
 }
-async function startDeviceLogin(a, body, differentAccount) {
+async function startDeviceLogin(a, body) {
   clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: "Starting sign-in…" })));
   let dc;
   try { dc = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); }
@@ -6648,26 +6645,12 @@ async function startDeviceLogin(a, body, differentAccount) {
       toast("Could not open sign-in page: " + (e.message || e), "err");
     }
   };
-  let continueButton = null;
-  const openBrowserLogout = async () => {
-    try {
-      await openExternalAuth(dc.browser_logout_uri, "account_browser_logout", { newTab: true });
-      status.textContent = "After Microsoft signs out, return here and open the sign-in page.";
-      if (continueButton) continueButton.disabled = false;
-    } catch (e) {
-      toast("Could not open Microsoft sign-out: " + (e.message || e), "err");
-    }
-  };
   const status = el("div", { class: "acct-dc-status dim", text: "Waiting for you to sign in…" });
-  continueButton = el("button", { class: "btn sm primary", type: "button", disabled: differentAccount ? "" : null, onclick: openDeviceLogin }, icon("external-link", "icon-sm"), differentAccount ? "Continue with another account" : "Open sign-in page");
   clear(body).append(el("div", { class: "acct-dc" },
     el("div", { class: "acct-dc-title", text: "Sign in to " + (a.username || a.id) }),
     el("p", { class: "dim", text: "Open the page and enter this code:" }),
     el("div", { class: "acct-dc-code", text: dc.user_code || "—" }),
-    differentAccount
-      ? el("button", { class: "btn sm", type: "button", onclick: openBrowserLogout }, icon("log-out", "icon-sm"), "Sign out browser account")
-      : null,
-    continueButton,
+    el("button", { class: "btn sm primary", type: "button", onclick: openDeviceLogin }, icon("external-link", "icon-sm"), "Open sign-in page"),
     status,
     el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: () => renderAccountMenu(body) }, "Cancel")));
   accountMenuPoll = setInterval(async () => {

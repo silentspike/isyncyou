@@ -8,32 +8,6 @@ import org.junit.Test
 
 class ExternalUrlPolicyTest {
     @Test
-    fun accountBrowserLogoutAllowsOnlyReviewedMicrosoftLogoutEndpoints() {
-        val allowed = listOf(
-            "https://login.microsoftonline.com/consumers/oauth2/v2.0/logout",
-            "https://login.microsoftonline.com/common/oauth2/v2.0/logout",
-            "https://login.live.com/oauth20_logout.srf",
-        )
-        allowed.forEach { url ->
-            assertTrue(
-                url,
-                ExternalUrlPolicy.classifyExternalUrl(url, AuthUrlKind.AccountBrowserLogout).allowed,
-            )
-        }
-        val blocked = listOf(
-            "https://login.microsoftonline.com/organizations/oauth2/v2.0/logout",
-            "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
-            "https://example.com/logout",
-        )
-        blocked.forEach { url ->
-            assertFalse(
-                url,
-                ExternalUrlPolicy.classifyExternalUrl(url, AuthUrlKind.AccountBrowserLogout).allowed,
-            )
-        }
-    }
-
-    @Test
     fun externalUrlRequiresKnownKind() {
         val missing = ExternalUrlPolicy.classifyExternalUrl(
             "https://auth.openai.com/oauth/authorize",
