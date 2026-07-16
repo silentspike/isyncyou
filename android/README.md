@@ -28,8 +28,11 @@ gets the loopback port + session token, and loads the local UI:
 adb shell am start -n com.silentspike.isyncyou/.MainActivity
 ```
 
-Sign in once via the in-app account menu (device-code); the engine fills a local cache
-store and serves the live view. The loopback API is fully session-token gated (#89 P1).
+Connect **iSyncYou Reader** and **iSyncYou Writer** independently for each configured
+Microsoft account through the in-app account menu. Authorization Code + PKCE opens
+Microsoft's account picker in the system browser; the callback, verifier, and tokens stay
+in Rust. Reader fills the local cache, while Writer supplies scoped sync/mutation and
+backup/restore authority. The loopback API is fully session-token gated (#89 P1).
 
 ### Release build
 

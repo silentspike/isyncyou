@@ -6635,38 +6635,78 @@ async function agentSend(text) {
   AssistantState.activeStream = stream;
 }
 
+const ACCOUNT_ROLE_META = Object.freeze({
+  reader: { label: "iSyncYou Reader", icon: "notebook" },
+  writer: { label: "iSyncYou Writer", icon: "pencil" },
+});
+function accountRoleStatus(a, role) {
+  const value = a && a.auth && a.auth[role];
+  return value && ["connected", "disconnected", "reconnect_required"].includes(value.state)
+    ? value : { state: "disconnected", identity_verified: false };
+}
+function accountRoleStateLabel(status) {
+  if (status.state === "connected") return status.identity_verified ? "Connected" : "Connected · verification pending";
+  if (status.state === "reconnect_required") return "Reconnect required";
+  return "Not connected";
+}
+async function reloadAccounts() {
+  const current = App.account;
+  const data = await api("/api/v1/accounts");
+  App.accounts = data.accounts || [];
+  App.account = App.accounts.some((account) => account.id === current)
+    ? current : (App.accounts[0] && App.accounts[0].id) || null;
+}
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
   void cancelAccountLogin();
   clear(body);
   App.accounts.forEach(a => {
     const active = a.id === App.account;
-    const row = el("div", { class: "acct-row" + (active ? " active" : "") },
+    const row = el("div", { class: "acct-row" + (active ? " active" : "") });
+    row.append(el("div", { class: "acct-main" },
       el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(a.username || a.id) }),
       el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + (a.username || a.id)); closeAccountMenu(); onRoute(); } } },
         el("div", { class: "truncate", text: a.username || a.id }),
         el("div", { class: "dim", style: "font-size:11px", text: active ? "Active" : a.id })),
-      active ? icon("check", "icon-sm") : null);
+      active ? icon("check", "icon-sm") : null));
     if (CAP.account) {
-      const acts = el("div", { class: "acct-acts" });
-      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Choose Microsoft account", onclick: () => startAccountLogin(a, body) }, icon("rotate-ccw", "icon-sm")));
-      acts.append(el("button", { class: "btn ghost sm icon-only", style: "color:var(--danger,#f87171)", title: "Sign out — clear cached token", onclick: () => accountSignOut(a, body) }, icon("trash-2", "icon-sm")));
-      row.append(acts);
+      const roles = el("div", { class: "acct-roles" });
+      for (const role of ["reader", "writer"]) {
+        const meta = ACCOUNT_ROLE_META[role], status = accountRoleStatus(a, role);
+        const acts = el("div", { class: "acct-acts" });
+        if (status.state === "connected") {
+          acts.append(el("button", { class: "btn ghost sm icon-only", title: `Reconnect ${meta.label}`, onclick: () => startAccountLogin(a, role, body) }, icon("refresh-cw", "icon-sm")));
+          acts.append(el("button", { class: "btn ghost sm icon-only", style: "color:var(--danger,#f87171)", title: `Disconnect ${meta.label}`, onclick: () => accountSignOut(a, role, body) }, icon("x", "icon-sm")));
+        } else {
+          acts.append(el("button", { class: "btn sm", onclick: () => startAccountLogin(a, role, body) }, icon(status.state === "reconnect_required" ? "refresh-cw" : "external-link", "icon-sm"), status.state === "reconnect_required" ? "Reconnect" : "Connect"));
+        }
+        roles.append(el("div", { class: "acct-role" },
+          el("span", { class: "acct-role-icon" }, icon(meta.icon, "icon-sm")),
+          el("span", { class: "acct-role-copy" }, el("b", { text: meta.label }), el("span", { class: "dim", text: accountRoleStateLabel(status) })),
+          acts));
+      }
+      row.append(roles);
     }
     body.append(row);
   });
   body.append(el("div", { class: "acct-note dim" }, CAP.account
-    ? "Microsoft will ask which identity to use for this configured account slot."
+    ? "Reader and Writer are connected separately for each Microsoft account."
     : "Read-only server — account switching only."));
 }
-async function accountSignOut(a, body) {
-  try { const d = await postJson("/api/v1/account/signout", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); toast(d.message || "Signed out"); }
-  catch (e) { toast("Sign-out failed: " + e.message, "err"); }
+async function accountSignOut(a, role, body) {
+  try {
+    const d = await postJson("/api/v1/account/signout", CAP.account, { request_id: crypto.randomUUID(), account: a.id, role });
+    await reloadAccounts();
+    toast(d.message || `${ACCOUNT_ROLE_META[role].label} disconnected`);
+  }
+  catch (_) { toast("Disconnect failed. Try again.", "err"); }
   renderAccountMenu(body);
 }
-async function startAccountLogin(a, body) {
+async function startAccountLogin(a, role, body) {
+  const roleMeta = ACCOUNT_ROLE_META[role];
+  if (!roleMeta) return;
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
-  clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: "Starting sign-in…" })));
+  clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: `Starting ${roleMeta.label} sign-in…` })));
   let guardId = null;
   try {
     guardId = await beginNetworkGuard("oauth");
@@ -6677,9 +6717,9 @@ async function startAccountLogin(a, body) {
     return;
   }
   let login;
-  try { login = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); }
+  try { login = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id, role }); }
   catch (_) { await endNetworkGuard(guardId); toast("Sign-in could not be started. Try again.", "err"); renderAccountMenu(body); return; }
-  if (login.flow !== "authorization_code_pkce" || !login.authorization_uri || !login.login_id) {
+  if (login.flow !== "authorization_code_pkce" || login.role !== role || !login.authorization_uri || !login.login_id) {
     await endNetworkGuard(guardId);
     toast("Sign-in could not be started. Try again.", "err");
     renderAccountMenu(body);
@@ -6698,7 +6738,7 @@ async function startAccountLogin(a, body) {
     if (releaseGuard) await finishAccountLoginGuard(login.login_id);
     status.textContent = message;
     if (!retryButton) {
-      retryButton = el("button", { class: "btn sm primary", type: "button", onclick: () => startAccountLogin(a, body) }, "Start sign-in again");
+      retryButton = el("button", { class: "btn sm primary", type: "button", onclick: () => startAccountLogin(a, role, body) }, "Start sign-in again");
       status.after(retryButton);
     }
   };
@@ -6716,7 +6756,7 @@ async function startAccountLogin(a, body) {
   const status = el("div", { class: "acct-dc-status dim", text: "Waiting for Microsoft sign-in…" });
   pickerButton = el("button", { class: "btn sm primary", type: "button", onclick: openAccountPicker }, icon("external-link", "icon-sm"), "Open Microsoft account picker");
   clear(body).append(el("div", { class: "acct-dc" },
-    el("div", { class: "acct-dc-title", text: "Choose a Microsoft account" }),
+    el("div", { class: "acct-dc-title", text: `Connect ${roleMeta.label}` }),
     el("p", { class: "dim", text: "Microsoft will show the available accounts and an option to use another one." }),
     pickerButton,
     status,
@@ -6728,8 +6768,22 @@ async function startAccountLogin(a, body) {
     let r;
     try { r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: login.login_id }); }
     catch (_) { clearInterval(accountMenuPoll); accountMenuPoll = null; await endAttempt("Connection to the sign-in status was lost.", false); return; }
-    if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; attemptEnded = true; if (accountMenuLogin === login.login_id) accountMenuLogin = null; pickerButton.disabled = true; await finishAccountLoginGuard(login.login_id); toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
-    else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; await endAttempt(r.code === "account_login_expired" ? "Sign-in expired." : "Sign-in failed.", true); }
+    if (r.state === "done" && r.role === role) {
+      clearInterval(accountMenuPoll); accountMenuPoll = null; attemptEnded = true;
+      if (accountMenuLogin === login.login_id) accountMenuLogin = null;
+      pickerButton.disabled = true;
+      await finishAccountLoginGuard(login.login_id);
+      await reloadAccounts();
+      toast(`${roleMeta.label} connected`);
+      renderAccountMenu(body);
+    } else if (r.state === "error") {
+      clearInterval(accountMenuPoll); accountMenuPoll = null;
+      const message = r.code === "account_login_expired" ? "Sign-in expired."
+        : r.code === "account_identity_mismatch" ? "Reader and Writer must use the same Microsoft account."
+          : r.code === "account_identity_unverified" ? "The Microsoft account could not be verified. Reconnect the other role first."
+            : "Sign-in failed.";
+      await endAttempt(message, true);
+    }
   }, 3000);
 }
 
@@ -6923,9 +6977,7 @@ async function init() {
     else if (e.key === "Escape" && sheetEl) closeSheet();
   });
   try {
-    const d = await api("/api/v1/accounts");
-    App.accounts = d.accounts || [];
-    if (App.accounts.length) App.account = App.accounts[0].id;
+    await reloadAccounts();
   } catch {}
   onRoute();
   subscribeEvents();

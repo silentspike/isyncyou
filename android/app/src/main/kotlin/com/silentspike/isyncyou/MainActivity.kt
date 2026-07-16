@@ -110,7 +110,7 @@ class MainActivity : FragmentActivity() {
         web.clearCache(true)
         expireLegacySessionCookie()
         web.webViewClient = object : WebViewClient() {
-            // The app-origin UI stays in the WebView. Typed, exact auth/device-code
+            // The app-origin UI stays in the WebView. Typed, exact authorization
             // destinations are handed to the system browser. Everything else is consumed
             // fail-closed rather than loaded in-app.
             override fun shouldOverrideUrlLoading(

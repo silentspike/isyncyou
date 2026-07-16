@@ -126,12 +126,16 @@ object ExternalUrlPolicy {
         }
         val query = decodeUniqueQuery(uri.rawQuery ?: return false) ?: return false
         if (query.keys != ACCOUNT_AUTHORIZE_QUERY_KEYS) return false
-        if (query["client_id"] != ACCOUNT_WRITE_CLIENT_ID ||
-            query["response_type"] != "code" ||
+        val expectedScopes = when (query["client_id"]) {
+            ACCOUNT_READ_CLIENT_ID -> ACCOUNT_READ_SCOPES
+            ACCOUNT_WRITE_CLIENT_ID -> ACCOUNT_WRITE_SCOPES
+            else -> return false
+        }
+        if (query["response_type"] != "code" ||
             query["response_mode"] != "query" ||
             query["code_challenge_method"] != "S256" ||
             query["prompt"] != "select_account" ||
-            query["scope"]?.split(' ')?.toSet() != ACCOUNT_WRITE_SCOPES
+            query["scope"]?.split(' ')?.toSet() != expectedScopes
         ) {
             return false
         }
@@ -179,7 +183,20 @@ object ExternalUrlPolicy {
             redirect.rawFragment == null
     }
 
+    private const val ACCOUNT_READ_CLIENT_ID = "cee80dd9-c13e-4dbb-9d4c-73eb4987d447"
     private const val ACCOUNT_WRITE_CLIENT_ID = "a90d9140-3a62-46d0-907b-f2b7b61a573a"
+    private val ACCOUNT_READ_SCOPES = setOf(
+        "Files.Read",
+        "Mail.Read",
+        "MailboxSettings.Read",
+        "Calendars.Read",
+        "Contacts.Read",
+        "Tasks.Read",
+        "Notes.Read",
+        "People.Read",
+        "User.Read",
+        "offline_access",
+    )
     private val ACCOUNT_WRITE_SCOPES = setOf(
         "Files.ReadWrite",
         "Mail.ReadWrite",
@@ -189,6 +206,7 @@ object ExternalUrlPolicy {
         "Contacts.ReadWrite",
         "Tasks.ReadWrite",
         "Notes.ReadWrite",
+        "User.Read",
         "offline_access",
     )
     private val ACCOUNT_AUTHORIZE_QUERY_KEYS = setOf(

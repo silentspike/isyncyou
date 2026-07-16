@@ -4879,6 +4879,10 @@ fn store_agent_provider_selection(
 }
 
 /// Minimal percent-decode for the loopback callback query (`+`→space, `%XX`→byte).
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -9869,6 +9873,7 @@ const MICROSOFT_ERROR_HTML: &str = "<!doctype html><meta charset=utf-8><meta nam
 /// Per-login progress shared between the loopback callback and UI polling.
 pub struct LoginState {
     account: String,
+    role: isyncyou_webui::AccountAuthRole,
     started_at: std::time::Instant,
     exchange_in_flight: bool,
     done: bool,
@@ -9883,10 +9888,146 @@ pub struct DaemonAccountAuth {
     cfg: Config,
     logins: Mutex<std::collections::HashMap<u64, Arc<Mutex<LoginState>>>>,
 }
+
+struct MicrosoftRoleConfig {
+    client_id: &'static str,
+    scopes: &'static [&'static str],
+    cache: PathBuf,
+    peer_client_id: &'static str,
+    peer_scopes: &'static [&'static str],
+    peer_cache: PathBuf,
+}
+
+fn microsoft_role_label(role: isyncyou_webui::AccountAuthRole) -> &'static str {
+    match role {
+        isyncyou_webui::AccountAuthRole::Reader => "Reader",
+        isyncyou_webui::AccountAuthRole::Writer => "Writer",
+    }
+}
+
+fn microsoft_role_config(
+    cfg: &Config,
+    account: &str,
+    role: isyncyou_webui::AccountAuthRole,
+) -> Result<MicrosoftRoleConfig, String> {
+    let reader_cache = isyncyou_engine::auth::read_token_cache_path(cfg, account)
+        .ok_or_else(|| "unknown_account".to_string())?;
+    let writer_cache = isyncyou_engine::auth::write_token_cache_path(cfg, account)
+        .ok_or_else(|| "unknown_account".to_string())?;
+    Ok(match role {
+        isyncyou_webui::AccountAuthRole::Reader => MicrosoftRoleConfig {
+            client_id: isyncyou_engine::auth::READ_CLIENT,
+            scopes: isyncyou_engine::auth::READ_SCOPES,
+            cache: reader_cache,
+            peer_client_id: isyncyou_engine::auth::WRITE_CLIENT,
+            peer_scopes: isyncyou_engine::auth::RESTORE_SCOPES,
+            peer_cache: writer_cache,
+        },
+        isyncyou_webui::AccountAuthRole::Writer => MicrosoftRoleConfig {
+            client_id: isyncyou_engine::auth::WRITE_CLIENT,
+            scopes: isyncyou_engine::auth::RESTORE_SCOPES,
+            cache: writer_cache,
+            peer_client_id: isyncyou_engine::auth::READ_CLIENT,
+            peer_scopes: isyncyou_engine::auth::READ_SCOPES,
+            peer_cache: reader_cache,
+        },
+    })
+}
+
+fn microsoft_role_status(path: Option<PathBuf>) -> isyncyou_webui::AccountRoleStatus {
+    let Some(path) = path else {
+        return isyncyou_webui::AccountRoleStatus {
+            state: isyncyou_webui::AccountAuthState::Disconnected,
+            identity_verified: false,
+        };
+    };
+    if !path.exists() {
+        return isyncyou_webui::AccountRoleStatus {
+            state: isyncyou_webui::AccountAuthState::Disconnected,
+            identity_verified: false,
+        };
+    }
+    match isyncyou_graph::auth::TokenCache::load(&path) {
+        Ok(cache)
+            if !cache.access_token.is_empty()
+                && cache
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|token| !token.is_empty()) =>
+        {
+            isyncyou_webui::AccountRoleStatus {
+                state: isyncyou_webui::AccountAuthState::Connected,
+                identity_verified: cache.account_subject.is_some(),
+            }
+        }
+        _ => isyncyou_webui::AccountRoleStatus {
+            state: isyncyou_webui::AccountAuthState::ReconnectRequired,
+            identity_verified: false,
+        },
+    }
+}
+
+fn microsoft_profile_subject(profile: &serde_json::Value) -> Option<String> {
+    profile
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            profile
+                .pointer("/owner/user/id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .map(str::to_string)
+}
+
+fn microsoft_account_subject(access_token: &str) -> Result<String, &'static str> {
+    let graph = isyncyou_graph::GraphClient::new(access_token);
+    if let Ok(profile) = graph.get_json("/me?$select=id") {
+        if let Some(subject) = microsoft_profile_subject(&profile) {
+            return Ok(subject);
+        }
+    }
+
+    let drive = graph
+        .get_json("/me/drive?$select=owner")
+        .map_err(|_| "account_identity_unavailable")?;
+    microsoft_profile_subject(&drive).ok_or("account_identity_unavailable")
+}
+
+fn load_or_bind_microsoft_subject(
+    cache_path: &std::path::Path,
+    client_id: &str,
+    scopes: &[&str],
+    now: u64,
+) -> Result<Option<String>, &'static str> {
+    if !cache_path.exists() {
+        return Ok(None);
+    }
+    let mut cache = isyncyou_graph::auth::TokenCache::load(cache_path)
+        .map_err(|_| "account_identity_unverified")?;
+    if let Some(subject) = cache.account_subject.clone() {
+        return Ok(Some(subject));
+    }
+    let access_token =
+        isyncyou_graph::auth::flow::ensure_access_token(cache_path, client_id, scopes, now)
+            .map_err(|_| "account_identity_unverified")?;
+    let subject = microsoft_account_subject(&access_token)?;
+    cache = isyncyou_graph::auth::TokenCache::load(cache_path)
+        .map_err(|_| "account_identity_unverified")?;
+    cache.account_subject = Some(subject.clone());
+    cache
+        .save(cache_path)
+        .map_err(|_| "account_identity_unverified")?;
+    Ok(Some(subject))
+}
+
 impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
-    fn start_login(&self, account: &str) -> Result<serde_json::Value, String> {
-        let cache = isyncyou_engine::auth::write_token_cache_path(&self.cfg, account)
-            .ok_or_else(|| "unknown_account".to_string())?;
+    fn start_login(
+        &self,
+        account: &str,
+        role: isyncyou_webui::AccountAuthRole,
+    ) -> Result<serde_json::Value, String> {
+        let role_config = microsoft_role_config(&self.cfg, account, role)?;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|_| "account_callback_unavailable".to_string())?;
         let port = listener
@@ -9895,13 +10036,14 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
             .port();
         let redirect_uri = format!("http://localhost:{port}");
         let start = isyncyou_graph::auth::flow::start_authorization_code(
-            isyncyou_engine::auth::WRITE_CLIENT,
-            isyncyou_engine::auth::RESTORE_SCOPES,
+            role_config.client_id,
+            role_config.scopes,
             &redirect_uri,
         )?;
         let id = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(Mutex::new(LoginState {
             account: account.to_string(),
+            role,
             started_at: std::time::Instant::now(),
             exchange_in_flight: false,
             done: false,
@@ -9924,7 +10066,10 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
             }
             if logins.values().any(|login| {
                 login.lock().is_ok_and(|state| {
-                    state.account == account && !state.done && state.error_code.is_none()
+                    state.account == account
+                        && state.role == role
+                        && !state.done
+                        && state.error_code.is_none()
                 })
             }) {
                 return Err("account_login_in_progress".into());
@@ -9942,7 +10087,7 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
                     start.state,
                     start.verifier,
                     redirect_uri,
-                    cache,
+                    role_config,
                 );
             })
             .is_err()
@@ -9954,6 +10099,7 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         }
         Ok(serde_json::json!({
             "flow": "authorization_code_pkce",
+            "role": role.as_str(),
             "login_id": id.to_string(),
             "authorization_uri": authorization_uri,
         }))
@@ -9975,13 +10121,13 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
             return serde_json::json!({ "state": "error", "code": "account_login_unavailable" });
         };
         if let Some(code) = s.error_code {
-            serde_json::json!({ "state": "error", "code": code })
+            serde_json::json!({ "state": "error", "code": code, "role": s.role.as_str() })
         } else if s.done {
-            serde_json::json!({ "state": "done" })
+            serde_json::json!({ "state": "done", "role": s.role.as_str() })
         } else if s.started_at.elapsed() >= MICROSOFT_LOGIN_TTL {
-            serde_json::json!({ "state": "error", "code": "account_login_expired" })
+            serde_json::json!({ "state": "error", "code": "account_login_expired", "role": s.role.as_str() })
         } else {
-            serde_json::json!({ "state": "pending" })
+            serde_json::json!({ "state": "pending", "role": s.role.as_str() })
         }
     }
 
@@ -10007,9 +10153,35 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         true
     }
 
-    fn sign_out(&self, account: &str) -> Result<serde_json::Value, String> {
-        let n = isyncyou_engine::auth::sign_out(&self.cfg, account)?;
-        Ok(serde_json::json!({ "removed": n, "message": format!("Signed out of {account}") }))
+    fn sign_out(
+        &self,
+        account: &str,
+        role: isyncyou_webui::AccountAuthRole,
+    ) -> Result<serde_json::Value, String> {
+        let removed = match role {
+            isyncyou_webui::AccountAuthRole::Reader => {
+                isyncyou_engine::auth::sign_out_reader(&self.cfg, account)?
+            }
+            isyncyou_webui::AccountAuthRole::Writer => {
+                isyncyou_engine::auth::sign_out_writer(&self.cfg, account)?
+            }
+        };
+        Ok(serde_json::json!({
+            "removed": removed,
+            "role": role.as_str(),
+            "message": format!("iSyncYou {} disconnected", microsoft_role_label(role)),
+        }))
+    }
+
+    fn status(&self, account: &str) -> isyncyou_webui::AccountAuthStatus {
+        isyncyou_webui::AccountAuthStatus {
+            reader: microsoft_role_status(isyncyou_engine::auth::read_token_cache_path(
+                &self.cfg, account,
+            )),
+            writer: microsoft_role_status(isyncyou_engine::auth::write_token_cache_path(
+                &self.cfg, account,
+            )),
+        }
     }
 }
 
@@ -10145,7 +10317,7 @@ fn microsoft_callback_serve(
     expected_state: String,
     verifier: String,
     redirect_uri: String,
-    cache: PathBuf,
+    role_config: MicrosoftRoleConfig,
 ) {
     use std::io::Read;
     let deadline = std::time::Instant::now() + MICROSOFT_LOGIN_TTL;
@@ -10242,27 +10414,49 @@ fn microsoft_callback_serve(
                     .map(|duration| duration.as_secs())
                     .unwrap_or(0);
                 let token_result = isyncyou_graph::auth::flow::exchange_authorization_code(
-                    isyncyou_engine::auth::WRITE_CLIENT,
-                    isyncyou_engine::auth::RESTORE_SCOPES,
+                    role_config.client_id,
+                    role_config.scopes,
                     &redirect_uri,
                     &code,
                     &verifier,
                     now,
                 );
                 let succeeded = if let Ok(mut state) = state.lock() {
-                    match token_result.and_then(|tokens| {
+                    match token_result.and_then(|mut tokens| {
+                        let subject = microsoft_account_subject(&tokens.access_token)
+                            .map_err(str::to_string)?;
+                        if load_or_bind_microsoft_subject(
+                            &role_config.peer_cache,
+                            role_config.peer_client_id,
+                            role_config.peer_scopes,
+                            now,
+                        )?
+                        .is_some_and(|peer_subject| peer_subject != subject)
+                        {
+                            return Err("account_identity_mismatch".into());
+                        }
+                        tokens.account_subject = Some(subject);
                         tokens
-                            .save(&cache)
-                            .map_err(|_| "account_credential_store_failed".into())
+                            .save(&role_config.cache)
+                            .map_err(|_| "account_credential_store_failed".to_string())
                     }) {
                         Ok(()) => {
                             state.exchange_in_flight = false;
                             state.done = true;
                             true
                         }
-                        Err(_) => {
+                        Err(code) => {
                             state.exchange_in_flight = false;
-                            state.error_code = Some("account_authorization_failed");
+                            state.error_code = Some(match code.as_str() {
+                                "account_identity_mismatch" => "account_identity_mismatch",
+                                "account_identity_unavailable" | "account_identity_unverified" => {
+                                    "account_identity_unverified"
+                                }
+                                "account_credential_store_failed" => {
+                                    "account_credential_store_failed"
+                                }
+                                _ => "account_authorization_failed",
+                            });
                             false
                         }
                     }
@@ -21540,8 +21734,14 @@ fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
         },
         logins: Mutex::new(std::collections::HashMap::new()),
     };
-    let started = isyncyou_webui::AccountAuthHandler::start_login(&auth, "account-slot").unwrap();
+    let started = isyncyou_webui::AccountAuthHandler::start_login(
+        &auth,
+        "account-slot",
+        isyncyou_webui::AccountAuthRole::Reader,
+    )
+    .unwrap();
     assert_eq!(started["flow"], "authorization_code_pkce");
+    assert_eq!(started["role"], "reader");
     assert!(started.get("user_code").is_none());
     assert!(started.get("verification_uri").is_none());
     let login_id = started["login_id"].as_str().unwrap();
@@ -21566,6 +21766,16 @@ fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
         Some("select_account")
     );
     assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+    assert_eq!(
+        query.get("client_id").map(String::as_str),
+        Some(isyncyou_engine::auth::READ_CLIENT)
+    );
+    assert!(query
+        .get("scope")
+        .is_some_and(|value| value.contains("People.Read")));
+    assert!(query
+        .get("scope")
+        .is_some_and(|value| !value.contains("Mail.ReadWrite")));
     assert!(query
         .get("redirect_uri")
         .is_some_and(|value| value.starts_with("http://localhost:")));
@@ -21573,8 +21783,44 @@ fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
         .get("redirect_uri")
         .is_some_and(|value| !value["http://localhost:".len()..].contains('/')));
     assert!(!query.contains_key("code_verifier"));
+
+    let writer_started = isyncyou_webui::AccountAuthHandler::start_login(
+        &auth,
+        "account-slot",
+        isyncyou_webui::AccountAuthRole::Writer,
+    )
+    .unwrap();
+    assert_eq!(writer_started["role"], "writer");
+    let writer_login_id = writer_started["login_id"].as_str().unwrap();
+    let writer_query: std::collections::HashMap<_, _> = writer_started["authorization_uri"]
+        .as_str()
+        .unwrap()
+        .split_once('?')
+        .unwrap()
+        .1
+        .split('&')
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap();
+            (
+                pct_decode_strict(key).unwrap(),
+                pct_decode_strict(value).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        writer_query.get("client_id").map(String::as_str),
+        Some(isyncyou_engine::auth::WRITE_CLIENT)
+    );
+    assert!(writer_query
+        .get("scope")
+        .is_some_and(|value| value.contains("Mail.ReadWrite")));
+
     assert!(isyncyou_webui::AccountAuthHandler::cancel_login(
         &auth, login_id
+    ));
+    assert!(isyncyou_webui::AccountAuthHandler::cancel_login(
+        &auth,
+        writer_login_id
     ));
     assert!(!isyncyou_webui::AccountAuthHandler::cancel_login(
         &auth, login_id
@@ -21589,6 +21835,7 @@ fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
         exchange_id,
         Arc::new(Mutex::new(LoginState {
             account: "account-slot".into(),
+            role: isyncyou_webui::AccountAuthRole::Writer,
             started_at: std::time::Instant::now(),
             exchange_in_flight: true,
             done: false,
@@ -21601,4 +21848,105 @@ fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
     ));
     std::thread::sleep(Duration::from_millis(100));
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_account_roles_use_separate_clients_caches_and_safe_status() {
+    let root = std::env::temp_dir().join(format!(
+        "isyncyou-account-roles-{}-{}",
+        std::process::id(),
+        LOGIN_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let archive = root.join("archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    let cfg = Config {
+        accounts: vec![isyncyou_core::AccountConfig {
+            id: "account-slot".into(),
+            username: "account-slot".into(),
+            sync_root: root.join("sync"),
+            archive_root: archive.clone(),
+            cache_root: root.join("cache"),
+            mount_point: None,
+        }],
+        ..Default::default()
+    };
+
+    let reader = microsoft_role_config(
+        &cfg,
+        "account-slot",
+        isyncyou_webui::AccountAuthRole::Reader,
+    )
+    .unwrap();
+    let writer = microsoft_role_config(
+        &cfg,
+        "account-slot",
+        isyncyou_webui::AccountAuthRole::Writer,
+    )
+    .unwrap();
+    assert_eq!(reader.client_id, isyncyou_engine::auth::READ_CLIENT);
+    assert_eq!(writer.client_id, isyncyou_engine::auth::WRITE_CLIENT);
+    assert_eq!(
+        reader.cache,
+        archive.join(isyncyou_engine::auth::READ_CACHE_FILE)
+    );
+    assert_eq!(
+        writer.cache,
+        archive.join(isyncyou_engine::auth::WRITE_CACHE_FILE)
+    );
+    assert_ne!(reader.cache, writer.cache);
+    assert!(reader.scopes.contains(&"People.Read"));
+    assert!(writer.scopes.contains(&"Mail.ReadWrite"));
+    assert!(writer.scopes.contains(&"User.Read"));
+
+    assert_eq!(
+        microsoft_role_status(Some(reader.cache.clone())).state,
+        isyncyou_webui::AccountAuthState::Disconnected
+    );
+    let cache = isyncyou_graph::auth::TokenCache {
+        access_token: "test-access".into(),
+        refresh_token: Some("test-refresh".into()),
+        expires_at: u64::MAX,
+        account_subject: Some("stable-subject".into()),
+    };
+    std::fs::write(&reader.cache, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let status = microsoft_role_status(Some(reader.cache));
+    assert_eq!(status.state, isyncyou_webui::AccountAuthState::Connected);
+    assert!(status.identity_verified);
+    assert_eq!(
+        microsoft_role_status(Some(writer.cache)).state,
+        isyncyou_webui::AccountAuthState::Disconnected
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_account_identity_accepts_profile_or_drive_owner_subject_only() {
+    assert_eq!(
+        microsoft_profile_subject(&serde_json::json!({ "id": "profile-subject" })),
+        Some("profile-subject".into())
+    );
+    assert_eq!(
+        microsoft_profile_subject(&serde_json::json!({
+            "owner": { "user": { "id": "drive-owner-subject", "displayName": "ignored" } }
+        })),
+        Some("drive-owner-subject".into())
+    );
+    assert_eq!(
+        microsoft_profile_subject(&serde_json::json!({
+            "mail": "not-an-identity@example.invalid",
+            "owner": { "user": { "displayName": "No stable ID" } }
+        })),
+        None
+    );
+    assert_eq!(
+        microsoft_profile_subject(&serde_json::json!({ "id": "" })),
+        None
+    );
+    assert_eq!(
+        microsoft_profile_subject(&serde_json::json!({ "id": "x".repeat(257) })),
+        None
+    );
 }

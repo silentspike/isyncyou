@@ -44,6 +44,9 @@ pub struct TokenCache {
     pub refresh_token: Option<String>,
     /// Unix seconds at which the access token should be considered expired.
     pub expires_at: u64,
+    /// Stable Microsoft Graph `/me` object id used only to bind Reader and Writer locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_subject: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +74,7 @@ impl TokenCache {
             access_token: r.access_token.clone(),
             refresh_token: r.refresh_token.clone(),
             expires_at: now_unix.saturating_add(r.expires_in.saturating_sub(60)),
+            account_subject: None,
         }
     }
 
@@ -898,11 +902,13 @@ pub mod flow {
             .clone()
             .ok_or("cached token expired and no refresh token; run the device-code login")?;
         let resp = refresh(client_id, &rt, scopes)?;
+        let account_subject = cache.account_subject.clone();
         cache = TokenCache::from_response(&resp, now_unix);
         // Graph does not always return a fresh refresh token; keep the old one.
         if cache.refresh_token.is_none() {
             cache.refresh_token = Some(rt);
         }
+        cache.account_subject = account_subject;
         cache.save(cache_path).map_err(|e| e.to_string())?;
         Ok(cache.access_token)
     }
@@ -1234,6 +1240,7 @@ mod tests {
             access_token: "ACCESS-TOKEN-SECRET".into(),
             refresh_token: Some("REFRESH-TOKEN-SECRET".into()),
             expires_at: 1234,
+            account_subject: Some("stable-subject".into()),
         };
 
         c.save_encrypted_with_secret(&p, b"correct horse battery staple")
@@ -1243,11 +1250,13 @@ mod tests {
         assert!(raw.contains(TOKEN_CACHE_MAGIC));
         assert!(!raw.contains("ACCESS-TOKEN-SECRET"), "raw cache: {raw}");
         assert!(!raw.contains("REFRESH-TOKEN-SECRET"), "raw cache: {raw}");
+        assert!(!raw.contains("stable-subject"), "raw cache: {raw}");
         let back =
             TokenCache::load_encrypted_with_secret(&p, b"correct horse battery staple").unwrap();
         assert_eq!(back.access_token, c.access_token);
         assert_eq!(back.refresh_token, c.refresh_token);
         assert_eq!(back.expires_at, c.expires_at);
+        assert_eq!(back.account_subject, c.account_subject);
 
         #[cfg(unix)]
         {
@@ -1310,6 +1319,7 @@ mod tests {
                 access_token: "ACCESS-TOKEN-IN-KEYRING".into(),
                 refresh_token: Some("REFRESH-TOKEN-IN-KEYRING".into()),
                 expires_at: 4242,
+                account_subject: Some("stable-subject".into()),
             };
 
             c.save_to_keyring(&p).unwrap();
@@ -1322,11 +1332,13 @@ mod tests {
                 !raw.contains("REFRESH-TOKEN-IN-KEYRING"),
                 "raw cache: {raw}"
             );
+            assert!(!raw.contains("stable-subject"), "raw cache: {raw}");
 
             let back = TokenCache::load(&p).unwrap();
             assert_eq!(back.access_token, c.access_token);
             assert_eq!(back.refresh_token, c.refresh_token);
             assert_eq!(back.expires_at, c.expires_at);
+            assert_eq!(back.account_subject, c.account_subject);
 
             #[cfg(unix)]
             {
@@ -1353,6 +1365,7 @@ mod tests {
                 access_token: "OLD".into(),
                 refresh_token: Some("OLD-RT".into()),
                 expires_at: 1,
+                account_subject: None,
             }
             .save_to_keyring(&p)
             .unwrap();
@@ -1361,6 +1374,7 @@ mod tests {
                 access_token: "NEW".into(),
                 refresh_token: Some("NEW-RT".into()),
                 expires_at: 999,
+                account_subject: None,
             };
             renewed.save(&p).unwrap();
 
@@ -1397,6 +1411,7 @@ mod tests {
             access_token: "GOOD".into(),
             refresh_token: Some("RT".into()),
             expires_at: 10_000,
+            account_subject: Some("stable-subject".into()),
         }
         .save(&p)
         .unwrap();
@@ -1407,6 +1422,7 @@ mod tests {
             access_token: String::new(),
             refresh_token: None,
             expires_at: 0,
+            account_subject: None,
         }
         .save(&p)
         .unwrap();
@@ -1439,6 +1455,7 @@ mod tests {
             access_token: String::new(),
             refresh_token: Some(rt),
             expires_at: 0,
+            account_subject: None,
         }
         .save(&p)
         .unwrap();

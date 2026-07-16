@@ -673,15 +673,21 @@ a:hover { text-decoration: underline; }
    z-index:auto and the positioned scrim paints on top of it, swallowing every tap on
    the menu's buttons (reconnect / sign-out were unclickable; only the curl-driven API
    path was ever exercised). Found on-device while wiring standalone sign-in (#89). */
-.acct-menu { z-index: 71; position: fixed; left: var(--sp-3); bottom: 72px; width: 320px; max-width: calc(100vw - 24px); max-height: 70vh; overflow: auto;
+.acct-menu { z-index: 71; position: fixed; left: var(--sp-3); bottom: 72px; width: 360px; max-width: calc(100vw - 24px); max-height: 70vh; overflow: auto;
   background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md, 12px); box-shadow: 0 12px 40px rgba(0,0,0,.5); }
 .acct-menu-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3); font-weight: 600; border-bottom: 1px solid var(--line); }
 .acct-menu-body { padding: var(--sp-2); display: flex; flex-direction: column; gap: 2px; }
-.acct-row { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2); border-radius: var(--r-sm); }
+.acct-row { display: flex; flex-direction: column; align-items: stretch; gap: var(--sp-2); padding: var(--sp-2); border-radius: var(--r-sm); }
 .acct-row.active { background: color-mix(in oklab, var(--accent) 12%, transparent); }
 .acct-row:hover { background: var(--bg-2); }
+.acct-main { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
 .acct-pick { display: flex; flex-direction: column; align-items: flex-start; text-align: left; background: transparent; border: 0; color: inherit; cursor: pointer; min-width: 0; }
 .acct-acts { display: flex; gap: 4px; flex: none; }
+.acct-roles { display: flex; flex-direction: column; gap: 1px; margin-left: 42px; }
+.acct-role { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: var(--sp-2); min-height: 38px; padding: 4px 0; }
+.acct-role-icon { display: grid; place-items: center; color: var(--text-mid); }
+.acct-role-copy { display: flex; flex-direction: column; min-width: 0; font-size: var(--fs-xs); }
+.acct-role-copy b, .acct-role-copy span { overflow-wrap: anywhere; }
 .acct-note { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); line-height: 1.5; border-top: 1px solid var(--line); margin-top: var(--sp-1); }
 .acct-dc { padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-start; }
 .acct-dc-title { font-weight: 600; }

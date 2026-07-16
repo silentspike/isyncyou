@@ -79,16 +79,25 @@ async function main() {
           if (msg.t !== "req") return;
           const url = new URL(msg.path, "https://appassets.androidplatform.net");
           let value = {};
-          if (url.pathname === "/api/v1/accounts") value = { accounts: [{ id: "fixture", username: "Fixture account" }] };
+          if (url.pathname === "/api/v1/accounts") value = { accounts: [{
+            id: "fixture",
+            username: "Fixture account",
+            auth: {
+              reader: { state: "disconnected", identity_verified: false },
+              writer: { state: "connected", identity_verified: true },
+            },
+          }] };
           else if (url.pathname === "/api/v1/settings") value = { accounts: [{ id: "fixture" }] };
           else if (url.pathname === "/api/v1/status") value = { services: [], totals: { items: 0, archived: 0 } };
           else if (url.pathname === "/api/v1/activity") value = { runs: [] };
           else if (url.pathname === "/api/v1/sync/state") value = { enabled: false, paused: false };
           else if (url.pathname === "/api/v1/account/login/start") {
+            const body = typeof msg.body === "string" ? JSON.parse(msg.body) : msg.body;
             state.loginSequence += 1;
-            state.events.push("request:start");
+            state.events.push(`request:start:${body.role}`);
             value = {
               flow: "authorization_code_pkce",
+              role: body.role,
               login_id: `fixture-login-${state.loginSequence}`,
               authorization_uri: "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?prompt=select_account",
             };
@@ -105,13 +114,15 @@ async function main() {
 
     await page.goto(`${origin}/#/settings`, { waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Choose Microsoft account" }).click();
-    await page.getByTitle("Choose Microsoft account").click();
+    const reader = page.locator(".acct-role").filter({ hasText: "iSyncYou Reader" });
+    const writer = page.locator(".acct-role").filter({ hasText: "iSyncYou Writer" });
+    await reader.getByRole("button", { name: "Connect" }).click();
     await page.getByRole("button", { name: "Open Microsoft account picker" }).click();
     await page.getByRole("button", { name: "Cancel" }).click();
     await page.waitForFunction(() => window.__microsoftAccountSmoke.events.includes("native:end"));
     const events = await page.evaluate(() => window.__microsoftAccountSmoke.events);
     const begin = events.indexOf("native:begin:oauth");
-    const start = events.indexOf("request:start");
+    const start = events.indexOf("request:start:reader");
     const open = events.indexOf("native:open:account_authorize");
     const cancel = events.indexOf("request:cancel");
     const end = events.indexOf("native:end");
@@ -119,13 +130,29 @@ async function main() {
       begin >= 0 && begin < start && start < open, events);
     assert(report, "host attempt is cancelled before guard release",
       cancel > open && end > cancel, events);
+    assert(report, "Reader and Writer expose independent connection state",
+      await reader.getByText("Not connected").isVisible()
+      && await writer.getByText("Connected").isVisible());
+    const menuBox = await page.locator(".acct-menu").boundingBox();
+    const viewport = page.viewportSize();
+    assert(report, "account role controls fit the mobile viewport",
+      Boolean(menuBox && viewport
+        && menuBox.x >= 0
+        && menuBox.y >= 0
+        && menuBox.x + menuBox.width <= viewport.width
+        && menuBox.y + menuBox.height <= viewport.height));
+    assert(report, "account menu has no horizontal overflow",
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    if (process.env.ISY_SMOKE_SCREENSHOT) {
+      await page.screenshot({ path: process.env.ISY_SMOKE_SCREENSHOT, fullPage: true });
+    }
 
     await page.evaluate(() => { window.__microsoftAccountSmoke.guardAvailable = false; });
-    await page.getByTitle("Choose Microsoft account").click();
+    await reader.getByRole("button", { name: "Connect" }).click();
     await page.getByText("Sign-in could not be kept active while the browser is open.").waitFor();
     const failedEvents = await page.evaluate(() => window.__microsoftAccountSmoke.events);
     assert(report, "guard failure prevents backend start and browser launch",
-      failedEvents.filter((event) => event === "request:start").length === 1
+      failedEvents.filter((event) => event === "request:start:reader").length === 1
       && failedEvents.filter((event) => event.startsWith("native:open:")).length === 1,
       failedEvents);
     report.ok = true;

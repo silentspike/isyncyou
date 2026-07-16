@@ -43,7 +43,7 @@ README's [Known limitations](../../README.md#known-limitations).
 |---|---|
 | **Risk** | The tool holds Microsoft 365 access/refresh tokens; an over-broad scope or a leaked token widens the blast radius. |
 | **Impact** | High. |
-| **Mitigation** | Separate read and write/restore app registrations with least-privilege scopes; the write/restore scope is only requested when a restore is actually performed; tokens are never logged; public-client OAuth (PKCE / device-code) with no client secret on the desktop/CLI. |
+| **Mitigation** | Separate Reader and Writer app registrations use least-privilege scopes and independent encrypted caches. Product UI connects them explicitly per account, verifies the same stable Graph object identity before pairing them, never substitutes Writer for Reader cache refresh, and never logs tokens. Public-client OAuth uses PKCE in the desktop/mobile product flow and retains device-code only for the explicit headless CLI workflow; neither path uses a client secret. |
 | **Status** | **Mitigated** for handling; at-rest protection tracked under R2. |
 
 ## R5 — Malicious mail content in the viewer

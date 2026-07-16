@@ -229,7 +229,14 @@ function makeFixtureServer(evidence) {
         res.writeHead(204);
         res.end();
       } else if (req.method === "GET" && url.pathname === "/api/v1/accounts") {
-        json(res, 200, { accounts: [{ id: ACCOUNT, username: "Fixture account" }] });
+        json(res, 200, { accounts: [{
+          id: ACCOUNT,
+          username: "Fixture account",
+          auth: {
+            reader: { state: "connected", identity_verified: true },
+            writer: { state: "connected", identity_verified: true },
+          },
+        }] });
       } else if (req.method === "GET" && url.pathname === "/api/v1/status") {
         json(res, 200, {
           services: [
@@ -263,18 +270,20 @@ function makeFixtureServer(evidence) {
         const sequence = state.accountLoginStarts.length + 1;
         const loginId = `fixture-login-${sequence}`;
         const authorizationUri = `http://${req.headers.host}/fixture-account-auth?prompt=select_account&state=${"s".repeat(42)}${sequence}&attempt=${sequence}`;
-        state.accountLoginStarts.push({ account: body.account, loginId, authorizationUri });
+        state.accountLoginStarts.push({ account: body.account, role: body.role, loginId, authorizationUri });
         json(res, 200, {
           flow: "authorization_code_pkce",
+          role: body.role,
           login_id: loginId,
           authorization_uri: authorizationUri,
         });
       } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/poll") {
         if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
         await readJson(req);
+        const role = state.accountLoginStarts.at(-1)?.role || "reader";
         json(res, 200, state.accountLoginPollState === "error"
-          ? { state: "error", code: "account_authorization_failed" }
-          : { state: state.accountLoginPollState });
+          ? { state: "error", code: "account_authorization_failed", role }
+          : { state: state.accountLoginPollState, role });
       } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/cancel") {
         if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
         const body = await readJson(req);
@@ -604,11 +613,16 @@ async function main() {
     await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
     await page.goto(`${origin}/#/settings`, { waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Choose Microsoft account" }).click();
-    await page.getByTitle("Choose Microsoft account").click();
+    const readerRole = page.locator(".acct-role").filter({ hasText: "iSyncYou Reader" });
+    const writerRole = page.locator(".acct-role").filter({ hasText: "iSyncYou Writer" });
+    assert(evidence, "account menu exposes independent Reader and Writer roles",
+      await readerRole.getByText("Connected").isVisible()
+      && await writerRole.getByText("Connected").isVisible());
+    await readerRole.getByTitle("Reconnect iSyncYou Reader").click();
     await page.locator(".acct-menu .acct-dc-title").waitFor();
     const accountMenuText = await page.locator(".acct-menu").innerText();
     assert(evidence, "account reconnect renders picker flow without device code",
-      accountMenuText.includes("Choose a Microsoft account")
+      accountMenuText.includes("Connect iSyncYou Reader")
       && accountMenuText.includes("Open Microsoft account picker")
       && !accountMenuText.includes("enter this code"));
     const accountPickerPopupPromise = page.waitForEvent("popup", { timeout: 2000 }).catch(() => null);
@@ -629,10 +643,11 @@ async function main() {
     await page.waitForFunction(() => !document.querySelector(".acct-menu .acct-dc"));
     assert(evidence, "account picker cancel closes exact backend attempt",
       fixture.state.accountLoginStarts.length === 1
+      && fixture.state.accountLoginStarts[0].role === "reader"
       && fixture.state.accountLoginCancels.length === 1
       && fixture.state.accountLoginCancels[0].matched === true);
     fixture.state.accountLoginPollState = "error";
-    await page.getByTitle("Choose Microsoft account").click();
+    await readerRole.getByTitle("Reconnect iSyncYou Reader").click();
     await page.locator(".acct-menu .acct-dc-title").waitFor();
     const stalePicker = page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" });
     await page.locator(".acct-menu").getByRole("button", { name: "Start sign-in again" }).waitFor({ timeout: 5000 });

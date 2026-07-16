@@ -238,6 +238,8 @@ pub mod auth {
         "Contacts.ReadWrite",
         "Tasks.ReadWrite",
         "Notes.ReadWrite",
+        // Identity-only: binds this Writer grant to the same account as Reader.
+        "User.Read",
         "offline_access",
     ];
 
@@ -255,18 +257,36 @@ pub mod auth {
         isyncyou_graph::auth::flow::ensure_access_token(&cache, WRITE_CLIENT, RESTORE_SCOPES, now)
     }
 
-    /// Resolve a token for the **mobile read-only cache refresh** (#89): prefer the
-    /// cached read token (desktop), else fall back to the write/restore token, whose
-    /// `*.ReadWrite` scopes are read-capable. A standalone phone that did only a
-    /// single device-code (write) login can therefore still fill its live cache.
-    /// Caveat: the restore scopes omit `People.Read`/`User.Read`, so people-relevance
-    /// features are unavailable on a write-token-only refresh (acceptable for the
-    /// live companion; the laptop with a read token remains the backup-of-record).
+    /// Resolve the dedicated Reader token for a mobile read-only cache refresh (#89).
+    /// Reader and Writer are separate product grants on every device; write authority
+    /// is never substituted for a missing Reader connection.
     pub fn resolve_cache_refresh_token(cfg: &Config, account: &str) -> Result<String, String> {
-        match resolve_cached_read_token(cfg, account) {
-            Ok(t) => Ok(t),
-            Err(_) => resolve_cached_restore_token(cfg, account),
+        resolve_cached_read_token(cfg, account)
+    }
+
+    fn remove_cached_token(path: Option<PathBuf>) -> Result<usize, String> {
+        let Some(path) = path else {
+            return Ok(0);
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(1),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(format!("remove {}: {e}", path.display())),
         }
+    }
+
+    pub fn sign_out_reader(cfg: &Config, account: &str) -> Result<usize, String> {
+        if !cfg.accounts.iter().any(|a| a.id == account) {
+            return Err(format!("no account '{account}' in config"));
+        }
+        remove_cached_token(read_token_cache_path(cfg, account))
+    }
+
+    pub fn sign_out_writer(cfg: &Config, account: &str) -> Result<usize, String> {
+        if !cfg.accounts.iter().any(|a| a.id == account) {
+            return Err(format!("no account '{account}' in config"));
+        }
+        remove_cached_token(write_token_cache_path(cfg, account))
     }
 
     /// Sign an account out by removing its cached read + write tokens (#68). The
@@ -277,21 +297,7 @@ pub mod auth {
         if !cfg.accounts.iter().any(|a| a.id == account) {
             return Err(format!("no account '{account}' in config"));
         }
-        let mut removed = 0;
-        for path in [
-            read_token_cache_path(cfg, account),
-            write_token_cache_path(cfg, account),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("remove {}: {e}", path.display())),
-            }
-        }
-        Ok(removed)
+        Ok(sign_out_reader(cfg, account)? + sign_out_writer(cfg, account)?)
     }
 }
 
@@ -460,8 +466,7 @@ impl RefreshServices {
 
 /// Refresh the local store for `account` from Microsoft Graph across mail, calendar,
 /// contacts, ToDo and OneNote — the read-only pass that both the daemon's scheduled
-/// backup and the standalone mobile client use. `read_access` is the primary token
-/// (read token on desktop, write/restore token on mobile — both read-capable);
+/// backup and the standalone mobile client use. `read_access` is the dedicated Reader token;
 /// `write_access`, when present, is used only for the ToDo `.../attachments` endpoint
 /// (which denies the read scope). Per-service failures are logged and skipped so one
 /// hiccup never blocks the others. **Never mutates the cloud.** The caller holds any
@@ -2142,6 +2147,10 @@ mod tests {
             auth::RESTORE_SCOPES.contains(&"MailboxSettings.ReadWrite"),
             "live write must cover mailbox settings"
         );
+        assert!(
+            auth::RESTORE_SCOPES.contains(&"User.Read"),
+            "Writer must identify its grant before it can be paired with Reader"
+        );
         // Personal/Family MSA cannot grant any admin-only `.All` scope.
         for s in auth::READ_SCOPES
             .iter()
@@ -2190,11 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_refresh_token_prefers_read_then_falls_back_to_write() {
-        // #89: the mobile cache-refresh resolves the read token first, else the
-        // write/restore token (read-capable). With NEITHER cached it surfaces the
-        // WRITE-token error — proof it fell through the read attempt to the write
-        // fallback (the standalone-phone path, which only did a write login).
+    fn cache_refresh_token_requires_the_dedicated_reader_connection() {
         let cfg = Config {
             accounts: vec![isyncyou_core::AccountConfig {
                 id: "a".into(),
@@ -2208,10 +2213,41 @@ mod tests {
         };
         let err = auth::resolve_cache_refresh_token(&cfg, "a").unwrap_err();
         assert!(
-            err.contains("write token"),
-            "must fall through the read attempt to the write fallback: {err}"
+            err.contains("no cached token") && !err.contains("write token"),
+            "mobile cache refresh must not substitute Writer for Reader: {err}"
         );
         // Unknown account → clean error, never a panic.
         assert!(auth::resolve_cache_refresh_token(&cfg, "ghost").is_err());
+    }
+
+    #[test]
+    fn account_role_sign_out_preserves_the_other_connection() {
+        let dir =
+            std::env::temp_dir().join(format!("isyncyou-role-signout-{}", std::process::id()));
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "a".into(),
+                username: "a@example.com".into(),
+                sync_root: dir.join("sync"),
+                archive_root: archive.clone(),
+                cache_root: Default::default(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let reader = archive.join(auth::READ_CACHE_FILE);
+        let writer = archive.join(auth::WRITE_CACHE_FILE);
+        std::fs::write(&reader, b"reader").unwrap();
+        std::fs::write(&writer, b"writer").unwrap();
+
+        assert_eq!(auth::sign_out_reader(&cfg, "a").unwrap(), 1);
+        assert!(!reader.exists());
+        assert!(writer.exists());
+        assert_eq!(auth::sign_out_writer(&cfg, "a").unwrap(), 1);
+        assert!(!writer.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

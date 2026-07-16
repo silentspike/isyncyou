@@ -1883,19 +1883,70 @@ pub fn onedrive_mode_online_cleanup_pat_item(folder: &str) -> String {
         .expect("static OneDrive online-cleanup action array serializes")
 }
 
+/// The two independently consented Microsoft authorities attached to one configured account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuthRole {
+    Reader,
+    Writer,
+}
+
+impl AccountAuthRole {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reader" => Some(Self::Reader),
+            "writer" => Some(Self::Writer),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuthState {
+    Connected,
+    Disconnected,
+    ReconnectRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AccountRoleStatus {
+    pub state: AccountAuthState,
+    pub identity_verified: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AccountAuthStatus {
+    pub reader: AccountRoleStatus,
+    pub writer: AccountRoleStatus,
+}
+
 /// Live account-auth handler (#68): the daemon's Microsoft sign-in + sign-out.
 /// `None` => the account menu offers only switching (the read-only CLI `serve`).
 pub trait AccountAuthHandler: Send + Sync {
     /// Begin Authorization Code + PKCE for a configured account. Returns only an opaque login ID
     /// and a reviewed authorization URI. The expected state, verifier, callback code, and tokens
     /// stay in Rust; the authorization URI necessarily contains the public state challenge.
-    fn start_login(&self, account: &str) -> Result<serde_json::Value, String>;
+    fn start_login(
+        &self,
+        account: &str,
+        role: AccountAuthRole,
+    ) -> Result<serde_json::Value, String>;
     /// Poll a started login by its `login_id` -> `{ state: "pending"|"done"|"error", code? }`.
     fn poll_login(&self, login_id: &str) -> serde_json::Value;
     /// Cancel one active login attempt. Returns true only when this call cancelled it.
     fn cancel_login(&self, login_id: &str) -> bool;
-    /// Remove an account's cached tokens (sign out). Returns a short status note.
-    fn sign_out(&self, account: &str) -> Result<serde_json::Value, String>;
+    /// Remove exactly one role's cached token. Reader and Writer remain independently usable.
+    fn sign_out(&self, account: &str, role: AccountAuthRole) -> Result<serde_json::Value, String>;
+    /// Return only closed connection state; token and account identity values never leave Rust.
+    fn status(&self, account: &str) -> AccountAuthStatus;
 }
 
 /// Push-registration handler (#576): the web UI hands the daemon this device's FCM
@@ -5729,7 +5780,13 @@ impl Router {
             .config
             .accounts
             .iter()
-            .map(|a| json!({ "id": a.id, "username": a.username }))
+            .map(|a| {
+                let auth = self
+                    .account_auth
+                    .as_ref()
+                    .map(|handler| handler.status(&a.id));
+                json!({ "id": a.id, "username": a.username, "auth": auth })
+            })
             .collect();
         ApiResponse::ok_json(&json!({ "accounts": accounts }))
     }
@@ -5757,16 +5814,21 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let parsed = match parse_strict_scalar_mutation(req, "account login start", &["account"]) {
-            Ok(req) => req,
-            Err(e) => return e,
-        };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "account login start", &["account", "role"]) {
+                Ok(req) => req,
+                Err(e) => return e,
+            };
         let req = &parsed;
         let account = match req.q("account") {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
         };
-        match h.start_login(account) {
+        let role = match req.q("role").and_then(AccountAuthRole::parse) {
+            Some(role) => role,
+            None => return ApiResponse::error(400, "invalid 'role'"),
+        };
+        match h.start_login(account, role) {
             Ok(v) => ApiResponse::ok_json(&v),
             Err(e) => ApiResponse::error(502, &e),
         }
@@ -5809,16 +5871,21 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let parsed = match parse_strict_scalar_mutation(req, "account signout", &["account"]) {
-            Ok(req) => req,
-            Err(e) => return e,
-        };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "account signout", &["account", "role"]) {
+                Ok(req) => req,
+                Err(e) => return e,
+            };
         let req = &parsed;
         let account = match req.q("account") {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
         };
-        match h.sign_out(account) {
+        let role = match parsed.q("role").and_then(AccountAuthRole::parse) {
+            Some(role) => role,
+            None => return ApiResponse::error(400, "invalid 'role'"),
+        };
+        match h.sign_out(account, role) {
             Ok(v) => ApiResponse::ok_json(&v),
             Err(e) => ApiResponse::error(500, &e),
         }
@@ -13504,12 +13571,23 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[derive(Default)]
     struct RecAccountAuth {
         cancelled: std::sync::Mutex<Vec<String>>,
+        started: std::sync::Mutex<Vec<(String, AccountAuthRole)>>,
+        signed_out: std::sync::Mutex<Vec<(String, AccountAuthRole)>>,
     }
 
     impl AccountAuthHandler for RecAccountAuth {
-        fn start_login(&self, _account: &str) -> Result<serde_json::Value, String> {
+        fn start_login(
+            &self,
+            account: &str,
+            role: AccountAuthRole,
+        ) -> Result<serde_json::Value, String> {
+            self.started
+                .lock()
+                .unwrap()
+                .push((account.to_string(), role));
             Ok(json!({
                 "flow": "authorization_code_pkce",
+                "role": role.as_str(),
                 "login_id": "1",
                 "authorization_uri": "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
             }))
@@ -13524,9 +13602,99 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             true
         }
 
-        fn sign_out(&self, _account: &str) -> Result<serde_json::Value, String> {
-            Ok(json!({ "removed": 1 }))
+        fn sign_out(
+            &self,
+            account: &str,
+            role: AccountAuthRole,
+        ) -> Result<serde_json::Value, String> {
+            self.signed_out
+                .lock()
+                .unwrap()
+                .push((account.to_string(), role));
+            Ok(json!({ "removed": 1, "role": role.as_str() }))
         }
+
+        fn status(&self, _account: &str) -> AccountAuthStatus {
+            AccountAuthStatus {
+                reader: AccountRoleStatus {
+                    state: AccountAuthState::Connected,
+                    identity_verified: true,
+                },
+                writer: AccountRoleStatus {
+                    state: AccountAuthState::Disconnected,
+                    identity_verified: false,
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn account_auth_routes_require_closed_reader_or_writer_role() {
+        let auth = std::sync::Arc::new(RecAccountAuth::default());
+        let router = Router::new(Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "account".into(),
+                sync_root: PathBuf::from("/tmp/sync"),
+                archive_root: PathBuf::from("/tmp/archive"),
+                cache_root: PathBuf::from("/tmp/cache"),
+                mount_point: None,
+            }],
+            ..Config::default()
+        })
+        .with_account_auth(auth.clone(), "cap".into());
+
+        let start = router.route(&strict_json_post(
+            "/api/v1/account/login/start",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174001",
+                "account": "a",
+                "role": "reader"
+            }),
+            Some("cap"),
+        ));
+        assert_eq!(start.status, 200);
+        assert_eq!(body_json(&start)["role"], "reader");
+        assert_eq!(
+            *auth.started.lock().unwrap(),
+            vec![("a".into(), AccountAuthRole::Reader)]
+        );
+
+        let invalid = router.route(&strict_json_post(
+            "/api/v1/account/login/start",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174002",
+                "account": "a",
+                "role": "restore"
+            }),
+            Some("cap"),
+        ));
+        assert_eq!(invalid.status, 400);
+
+        let signout = router.route(&strict_json_post(
+            "/api/v1/account/signout",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174003",
+                "account": "a",
+                "role": "writer"
+            }),
+            Some("cap"),
+        ));
+        assert_eq!(signout.status, 200);
+        assert_eq!(
+            *auth.signed_out.lock().unwrap(),
+            vec![("a".into(), AccountAuthRole::Writer)]
+        );
+
+        let accounts = body_json(&router.route(&ApiRequest::get("/api/v1/accounts")));
+        assert_eq!(
+            accounts["accounts"][0]["auth"]["reader"]["state"],
+            "connected"
+        );
+        assert_eq!(
+            accounts["accounts"][0]["auth"]["writer"]["state"],
+            "disconnected"
+        );
     }
 
     #[test]

@@ -45,8 +45,9 @@ fn android_info(message: &str) {
     eprintln!("{message}");
 }
 
-/// The single configured account id on the phone. The user signs in to it via the
-/// account menu's device-code flow; its token cache + store live under `filesDir`.
+/// The single configured account id on the phone. The account menu connects its
+/// independent Reader and Writer grants through Authorization Code + PKCE; encrypted
+/// token caches and the local store live under `filesDir`.
 const ACCOUNT: &str = "me";
 
 struct EngineState {
@@ -887,8 +888,8 @@ fn start_inner(
 /// One mobile scoped OneDrive pass under the store-access gate (#655/#718): Sync scopes ingest
 /// metadata; Offline scopes additionally materialize and mirror local edits back over the ledger.
 /// Returns whether UI-visible data changed. Skips quietly with no explicit Sync/Offline scopes
-/// configured or no cached sync/write token (not signed in). `progress` is the shared tracker the
-/// router surfaces. Token policy is unchanged: the scoped pass still uses `resolve_cached_sync_token`.
+/// configured or no cached Writer token (not signed in). `progress` is the shared tracker the
+/// router surfaces. Reader remains independently required by the cache-refresh pass.
 fn run_onedrive_scoped_pass(
     cfg: &Config,
     gate: &Arc<Mutex<()>>,

@@ -9,7 +9,21 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ExternalUrlPolicyTest {
-    private val accountScopes = listOf(
+    private val readerClientId = "cee80dd9-c13e-4dbb-9d4c-73eb4987d447"
+    private val writerClientId = "a90d9140-3a62-46d0-907b-f2b7b61a573a"
+    private val readerScopes = listOf(
+        "Files.Read",
+        "Mail.Read",
+        "MailboxSettings.Read",
+        "Calendars.Read",
+        "Contacts.Read",
+        "Tasks.Read",
+        "Notes.Read",
+        "People.Read",
+        "User.Read",
+        "offline_access",
+    )
+    private val writerScopes = listOf(
         "Files.ReadWrite",
         "Mail.ReadWrite",
         "Mail.Send",
@@ -18,6 +32,7 @@ class ExternalUrlPolicyTest {
         "Contacts.ReadWrite",
         "Tasks.ReadWrite",
         "Notes.ReadWrite",
+        "User.Read",
         "offline_access",
     )
 
@@ -118,10 +133,26 @@ class ExternalUrlPolicyTest {
             ),
             "login.microsoftonline.com",
         )
+        assertAllowed(
+            ExternalUrlPolicy.classifyExternalUrl(
+                accountAuthorizeUrl(clientId = readerClientId, scopes = readerScopes),
+                AuthUrlKind.AccountAuthorize,
+            ),
+            "login.microsoftonline.com",
+        )
 
         val invalidUrls = listOf(
             accountAuthorizeUrl(mapOf("prompt" to "login")),
             accountAuthorizeUrl(mapOf("client_id" to "other-client")),
+            accountAuthorizeUrl(
+                clientId = readerClientId,
+                scopes = writerScopes,
+            ),
+            accountAuthorizeUrl(
+                clientId = writerClientId,
+                scopes = readerScopes,
+            ),
+            accountAuthorizeUrl(scopes = writerScopes.filterNot { it == "User.Read" }),
             accountAuthorizeUrl(mapOf("redirect_uri" to "http://127.0.0.1:45678")),
             accountAuthorizeUrl(mapOf("redirect_uri" to "http://localhost:45678/")),
             accountAuthorizeUrl(mapOf("redirect_uri" to "http://localhost:45678/oauth/microsoft/callback")),
@@ -194,13 +225,17 @@ class ExternalUrlPolicyTest {
         assertEquals(host, decision.normalizedHost)
     }
 
-    private fun accountAuthorizeUrl(overrides: Map<String, String> = emptyMap()): String {
+    private fun accountAuthorizeUrl(
+        overrides: Map<String, String> = emptyMap(),
+        clientId: String = writerClientId,
+        scopes: List<String> = writerScopes,
+    ): String {
         val values = linkedMapOf(
-            "client_id" to "a90d9140-3a62-46d0-907b-f2b7b61a573a",
+            "client_id" to clientId,
             "response_type" to "code",
             "response_mode" to "query",
             "redirect_uri" to "http://localhost:45678",
-            "scope" to accountScopes.joinToString(" "),
+            "scope" to scopes.joinToString(" "),
             "code_challenge" to "a".repeat(43),
             "code_challenge_method" to "S256",
             "state" to "b".repeat(43),

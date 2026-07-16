@@ -3,7 +3,7 @@
 > Status: spike findings + **live-verified by the Rust connectors** (see the
 > "iSyncYou connector status" section at the bottom) · Phase -1 spike (#35) ·
 > Test account: `testuser@example.com` (dedicated throwaway)
-> Apps: `backup_read` (`cee80dd9…`, full read scopes) · **iSyncYou Writer** (`a90d9140…`, write/restore scopes incl. delegated `Notes.ReadWrite`)
+> Apps: **iSyncYou Reader** (`cee80dd9…`, full read scopes) · **iSyncYou Writer** (`a90d9140…`, write/restore scopes incl. delegated `Notes.ReadWrite`)
 > Authority: `https://login.microsoftonline.com/consumers` (PersonalMicrosoftAccount)
 
 Two evidence sources:
