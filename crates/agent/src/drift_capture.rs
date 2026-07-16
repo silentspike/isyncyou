@@ -39,7 +39,6 @@ const CODEX_REQUIRED_WIRE_HEADERS: &[&str] = &[
     "authorization",
     "chatgpt-account-id",
     "content-type",
-    "openai-beta",
     "originator",
     "user-agent",
 ];
@@ -905,7 +904,6 @@ fn inspect_header(provider: CaptureProvider, header: &str, state: &mut Reduction
         "anthropic-version"
         | "anthropic-beta"
         | "anthropic-dangerous-direct-browser-access"
-        | "openai-beta"
         | "content-type" => state.headers.protocol_version_present = true,
         "accept" => state.headers.stream_accept_present = true,
         _ => {}
@@ -1067,7 +1065,13 @@ mod tests {
     fn claude_options(dir: &Path, events: &str) -> DriftCaptureOptions {
         let version = dir.join("version.txt");
         let event_file = dir.join("events.jsonl");
-        write_private(&version, "2.1.207 (Claude Code)\n");
+        write_private(
+            &version,
+            &format!(
+                "{} (Claude Code)\n",
+                CaptureProvider::Claude.compatibility_version()
+            ),
+        );
         write_private(&event_file, events);
         DriftCaptureOptions {
             provider: CaptureProvider::Claude,
@@ -1127,15 +1131,21 @@ mod tests {
         let debug_file = dir.join(format!("{}-debug.json", provider.name()));
         let (version_text, event_text) = match provider {
             CaptureProvider::Claude => (
-                "2.1.207 (Claude Code)\n",
+                format!(
+                    "{} (Claude Code)\n",
+                    CaptureProvider::Claude.compatibility_version()
+                ),
                 r#"{"type":"assistant","message":{"text":"issue-627-controlled-sentinel"}}"#,
             ),
             CaptureProvider::Codex => (
-                "codex-cli 0.144.1\n",
+                format!(
+                    "codex-cli {}\n",
+                    CaptureProvider::Codex.compatibility_version()
+                ),
                 r#"{"type":"item.completed","item":{"text":"issue-627-controlled-sentinel"}}"#,
             ),
         };
-        write_private(&version, version_text);
+        write_private(&version, &version_text);
         write_private(&events, event_text);
         write_private(&debug_file, &serde_json::to_string(debug).unwrap());
         DriftCaptureOptions {
