@@ -4634,6 +4634,12 @@ async function doShare(it, btn) {
 // Account menu (#68): switch between configured accounts, sign out (clear the
 // cached token), and sign in / reconnect through Microsoft's account picker (cap-gated).
 let accountMenu = null, accountMenuPoll = null, accountMenuLogin = null;
+const ACCOUNT_LOGIN_GUARDS = new Map();
+async function finishAccountLoginGuard(loginId) {
+  const guardId = ACCOUNT_LOGIN_GUARDS.get(loginId);
+  ACCOUNT_LOGIN_GUARDS.delete(loginId);
+  await endNetworkGuard(guardId);
+}
 async function cancelAccountLogin() {
   const loginId = accountMenuLogin;
   if (!loginId || !CAP.account) return true;
@@ -4644,6 +4650,7 @@ async function cancelAccountLogin() {
     });
     if (result && result.cancelled === true) {
       accountMenuLogin = null;
+      await finishAccountLoginGuard(loginId);
       return true;
     }
   } catch (_) {}
@@ -6658,16 +6665,48 @@ async function accountSignOut(a, body) {
   renderAccountMenu(body);
 }
 async function startAccountLogin(a, body) {
+  if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
   clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: "Starting sign-in…" })));
+  let guardId = null;
+  try {
+    guardId = await beginNetworkGuard("oauth");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+  } catch (_) {
+    toast("Sign-in could not be kept active while the browser is open.", "err");
+    renderAccountMenu(body);
+    return;
+  }
   let login;
   try { login = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); }
-  catch (_) { toast("Sign-in could not be started. Try again.", "err"); renderAccountMenu(body); return; }
+  catch (_) { await endNetworkGuard(guardId); toast("Sign-in could not be started. Try again.", "err"); renderAccountMenu(body); return; }
   if (login.flow !== "authorization_code_pkce" || !login.authorization_uri || !login.login_id) {
+    await endNetworkGuard(guardId);
     toast("Sign-in could not be started. Try again.", "err");
     renderAccountMenu(body);
     return;
   }
+  accountMenuLogin = login.login_id;
+  ACCOUNT_LOGIN_GUARDS.set(login.login_id, guardId);
+  let attemptEnded = false;
+  let retryButton = null;
+  let pickerButton = null;
+  const attemptIsActive = () => !attemptEnded && accountMenuLogin === login.login_id;
+  const endAttempt = async (message, releaseGuard) => {
+    attemptEnded = true;
+    if (accountMenuLogin === login.login_id) accountMenuLogin = null;
+    if (pickerButton) pickerButton.disabled = true;
+    if (releaseGuard) await finishAccountLoginGuard(login.login_id);
+    status.textContent = message;
+    if (!retryButton) {
+      retryButton = el("button", { class: "btn sm primary", type: "button", onclick: () => startAccountLogin(a, body) }, "Start sign-in again");
+      status.after(retryButton);
+    }
+  };
   const openAccountPicker = async () => {
+    if (!attemptIsActive()) {
+      toast("This sign-in attempt has ended. Start sign-in again.", "err");
+      return;
+    }
     try {
       await openExternalAuth(login.authorization_uri, "account_authorize", { newTab: true });
     } catch (_) {
@@ -6675,22 +6714,22 @@ async function startAccountLogin(a, body) {
     }
   };
   const status = el("div", { class: "acct-dc-status dim", text: "Waiting for Microsoft sign-in…" });
+  pickerButton = el("button", { class: "btn sm primary", type: "button", onclick: openAccountPicker }, icon("external-link", "icon-sm"), "Open Microsoft account picker");
   clear(body).append(el("div", { class: "acct-dc" },
     el("div", { class: "acct-dc-title", text: "Choose a Microsoft account" }),
     el("p", { class: "dim", text: "Microsoft will show the available accounts and an option to use another one." }),
-    el("button", { class: "btn sm primary", type: "button", onclick: openAccountPicker }, icon("external-link", "icon-sm"), "Open Microsoft account picker"),
+    pickerButton,
     status,
     el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: async () => {
       if (await cancelAccountLogin()) renderAccountMenu(body);
       else status.textContent = "Completing Microsoft sign-in…";
     } }, "Cancel")));
-  accountMenuLogin = login.login_id;
   accountMenuPoll = setInterval(async () => {
     let r;
     try { r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: login.login_id }); }
-    catch (_) { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Connection to the sign-in status was lost. Start again."; return; }
-    if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; accountMenuLogin = null; toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
-    else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; accountMenuLogin = null; status.textContent = r.code === "account_login_expired" ? "Sign-in expired. Start again." : "Sign-in failed. Start again."; }
+    catch (_) { clearInterval(accountMenuPoll); accountMenuPoll = null; await endAttempt("Connection to the sign-in status was lost.", false); return; }
+    if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; attemptEnded = true; if (accountMenuLogin === login.login_id) accountMenuLogin = null; pickerButton.disabled = true; await finishAccountLoginGuard(login.login_id); toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
+    else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; await endAttempt(r.code === "account_login_expired" ? "Sign-in expired." : "Sign-in failed.", true); }
   }, 3000);
 }
 

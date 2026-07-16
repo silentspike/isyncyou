@@ -160,6 +160,7 @@ function makeFixtureServer(evidence) {
   const state = {
     accountLoginStarts: [],
     accountLoginCancels: [],
+    accountLoginPollState: "pending",
     oauthStarts: [],
     modelPosts: [],
     confirmPosts: [],
@@ -259,20 +260,27 @@ function makeFixtureServer(evidence) {
       } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/start") {
         if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
         const body = await readJson(req);
-        state.accountLoginStarts.push({ account: body.account });
+        const sequence = state.accountLoginStarts.length + 1;
+        const loginId = `fixture-login-${sequence}`;
+        const authorizationUri = `http://${req.headers.host}/fixture-account-auth?prompt=select_account&state=${"s".repeat(42)}${sequence}&attempt=${sequence}`;
+        state.accountLoginStarts.push({ account: body.account, loginId, authorizationUri });
         json(res, 200, {
           flow: "authorization_code_pkce",
-          login_id: "fixture-login-1",
-          authorization_uri: `http://${req.headers.host}/fixture-account-auth?prompt=select_account&state=${"s".repeat(43)}`,
+          login_id: loginId,
+          authorization_uri: authorizationUri,
         });
       } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/poll") {
         if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
         await readJson(req);
-        json(res, 200, { state: "pending" });
+        json(res, 200, state.accountLoginPollState === "error"
+          ? { state: "error", code: "account_authorization_failed" }
+          : { state: state.accountLoginPollState });
       } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/cancel") {
         if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
         const body = await readJson(req);
-        state.accountLoginCancels.push({ matched: body.id === "fixture-login-1" });
+        state.accountLoginCancels.push({
+          matched: state.accountLoginStarts.some((attempt) => attempt.loginId === body.id),
+        });
         json(res, 200, { cancelled: true });
       } else if (req.method === "GET" && url.pathname === "/fixture-account-auth") {
         text(res, 200, "<!doctype html><title>Account picker fixture</title>", "text/html; charset=utf-8");
@@ -623,6 +631,22 @@ async function main() {
       fixture.state.accountLoginStarts.length === 1
       && fixture.state.accountLoginCancels.length === 1
       && fixture.state.accountLoginCancels[0].matched === true);
+    fixture.state.accountLoginPollState = "error";
+    await page.getByTitle("Choose Microsoft account").click();
+    await page.locator(".acct-menu .acct-dc-title").waitFor();
+    const stalePicker = page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" });
+    await page.locator(".acct-menu").getByRole("button", { name: "Start sign-in again" }).waitFor({ timeout: 5000 });
+    assert(evidence, "terminal account attempt disables stale authorization url",
+      await stalePicker.isDisabled());
+    const endedAuthorizationUri = fixture.state.accountLoginStarts.at(-1).authorizationUri;
+    fixture.state.accountLoginPollState = "pending";
+    await page.locator(".acct-menu").getByRole("button", { name: "Start sign-in again" }).click();
+    await page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" }).waitFor();
+    assert(evidence, "account sign-in retry creates a fresh backend attempt before browser launch",
+      fixture.state.accountLoginStarts.length === 3
+      && fixture.state.accountLoginStarts.at(-1).authorizationUri !== endedAuthorizationUri);
+    await page.locator(".acct-menu").getByRole("button", { name: "Cancel" }).click();
+    await page.waitForFunction(() => !document.querySelector(".acct-menu .acct-dc"));
     await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('.nav-item[data-service="assistant"]', { timeout: 10000 });
     const assistantNavVisible = await page.locator('.nav-item[data-service="assistant"]').first().isVisible();
