@@ -1742,6 +1742,7 @@ a.note-meta-chip:hover { color: var(--accent); }
 
 /* ── Assistant model picker: in-UI dropdown with spring unfold ───────────── */
 .mdl { position: relative; display: inline-block; }
+.mdl.open { z-index: 61; }
 .mdl-trigger {
   display: inline-flex; align-items: center; gap: var(--sp-1);
   font-size: var(--fs-sm); font-weight: 500; color: var(--text-hi);
