@@ -10572,6 +10572,33 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_chat_render_does_not_wait_for_cloud_history_hydration() {
+        let render = APP_JS
+            .split("async function renderAssistantView(view)")
+            .nth(1)
+            .unwrap()
+            .split("function renderAssistantWizardSteps")
+            .next()
+            .unwrap();
+        let chat = render.find("renderAssistantChat(body, st)").unwrap();
+        let hydration = render
+            .find("void hydrateAgentSession(selectedSession.session_id)")
+            .unwrap();
+        assert!(chat < hydration);
+
+        let select = APP_JS
+            .split("async function loadSelectedAgentSession()")
+            .nth(1)
+            .unwrap()
+            .split("function closeAgentDialog")
+            .next()
+            .unwrap();
+        assert!(!select.contains("await hydrateAgentSession"));
+        assert!(APP_JS.contains("AssistantState.sessionHydrationPromise"));
+        assert!(APP_JS.contains("AssistantState.sessionHydrationSeq !== sequence"));
+    }
+
+    #[test]
     fn agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window() {
         assert!(APP_JS.contains("const AGENT_OAUTH_POLL_INTERVAL_MS = 2_000"));
         assert!(APP_JS.contains("const AGENT_OAUTH_POLL_LIMIT = 240"));

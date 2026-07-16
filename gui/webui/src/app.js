@@ -5294,6 +5294,9 @@ const AssistantState = {
   selectedSessionId: null,
   selectedSessionAccount: null,
   sessionHydratedId: null,
+  sessionHydrationId: null,
+  sessionHydrationPromise: null,
+  sessionHydrationSeq: 0,
 };
 
 function closeAssistantStream(_reason) {
@@ -5439,8 +5442,9 @@ async function renderAssistantView(view) {
     st = await refreshAssistantCredentialIfRequired(st);
   } catch (_) { st = {}; }
   rememberAssistantStatus(st);
+  let selectedSession = null;
   if (assistantSelectedReady(st)) {
-    try { await loadSelectedAgentSession(); } catch (_) {}
+    try { selectedSession = await loadSelectedAgentSession(); } catch (_) {}
   }
   clear(body);
   // #639 T7/T10: `connected` is now host-verified per-provider readiness (provider_ready of the
@@ -5448,6 +5452,15 @@ async function renderAssistantView(view) {
   // presence. The manual code step keys off the in-flight attempt + the per-provider onboarding state.
   if (assistantSelectedReady(st)) renderAssistantChat(body, st);
   else renderAssistantWizard(body, st);
+  if (selectedSession && AssistantState.sessionHydratedId !== selectedSession.session_id) {
+    void hydrateAgentSession(selectedSession.session_id).then(() => {
+      if (App.route === "assistant"
+          && !AssistantState.busy
+          && AssistantState.selectedSessionId === selectedSession.session_id) {
+        void renderAssistantView($("#view"));
+      }
+    }).catch(() => {});
+  }
   const claudeReady = assistantProviderReady(st, "claude");
   if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
 }
@@ -6247,20 +6260,39 @@ function sessionRecordsToTranscript(records) {
 
 async function hydrateAgentSession(sessionId) {
   if (!sessionId || AssistantState.busy || AssistantState.sessionHydratedId === sessionId) return;
-  let cursor = null;
-  const records = [];
-  do {
-    const path = "/api/v1/agent/session/history?" + qs({
-      session_id: sessionId,
-      limit: 100,
-      ...(cursor ? { cursor } : {}),
-    });
-    const page = await request("GET", path, { capToken: CAP.agent });
-    if (Array.isArray(page.records)) records.push(...page.records);
-    cursor = page.next_cursor || null;
-  } while (cursor && records.length < 10000);
-  AssistantState.transcript = sessionRecordsToTranscript(records);
-  AssistantState.sessionHydratedId = sessionId;
+  if (AssistantState.sessionHydrationId === sessionId && AssistantState.sessionHydrationPromise) {
+    return AssistantState.sessionHydrationPromise;
+  }
+  const sequence = ++AssistantState.sessionHydrationSeq;
+  const hydration = (async () => {
+    let cursor = null;
+    const records = [];
+    do {
+      const path = "/api/v1/agent/session/history?" + qs({
+        session_id: sessionId,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      const page = await request("GET", path, { capToken: CAP.agent });
+      if (Array.isArray(page.records)) records.push(...page.records);
+      cursor = page.next_cursor || null;
+    } while (cursor && records.length < 10000);
+    if (AssistantState.sessionHydrationSeq !== sequence
+        || AssistantState.selectedSessionId !== sessionId
+        || AssistantState.busy) return;
+    AssistantState.transcript = sessionRecordsToTranscript(records);
+    AssistantState.sessionHydratedId = sessionId;
+  })();
+  AssistantState.sessionHydrationId = sessionId;
+  AssistantState.sessionHydrationPromise = hydration;
+  try {
+    await hydration;
+  } finally {
+    if (AssistantState.sessionHydrationSeq === sequence) {
+      AssistantState.sessionHydrationId = null;
+      AssistantState.sessionHydrationPromise = null;
+    }
+  }
 }
 
 async function loadSelectedAgentSession() {
@@ -6273,7 +6305,6 @@ async function loadSelectedAgentSession() {
   if (!selected) return null;
   AssistantState.selectedSessionId = selected.session_id;
   AssistantState.selectedSessionAccount = App.account;
-  await hydrateAgentSession(selected.session_id);
   return selected;
 }
 
