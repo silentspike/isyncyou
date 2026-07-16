@@ -1446,8 +1446,7 @@ mod tests {
         assert!(buf.contains("\"accounts\""), "body: {buf}");
     }
 
-    #[test]
-    fn existing_agent_lifecycle_json_routes_keep_8k_framing_and_no_store() {
+    fn assert_oauth_complete_framing_is_bounded_before_routing() {
         let oversized = one_tcp_response(
             format!(
                 "POST /api/v1/agent/oauth/complete HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -1475,6 +1474,17 @@ mod tests {
             transfer_encoding.starts_with("HTTP/1.1 400"),
             "got: {transfer_encoding}"
         );
+    }
+
+    #[test]
+    fn existing_agent_lifecycle_json_routes_keep_8k_framing_and_no_store() {
+        assert_oauth_complete_framing_is_bounded_before_routing();
+    }
+
+    // Retain the evidence-stable #639 name after #628 consolidated route policy tests.
+    #[test]
+    fn oauth_complete_strict_limit_and_framing_apply_before_routing() {
+        assert_oauth_complete_framing_is_bounded_before_routing();
     }
 
     #[test]
