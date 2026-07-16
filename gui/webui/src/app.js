@@ -6242,14 +6242,16 @@ function sessionRecordsToTranscript(records) {
   const transcript = [];
   (records || []).forEach((record) => {
     if (!record || typeof record !== "object") return;
-    if (record.kind === "turn_intent" && typeof record.user_text === "string") {
-      transcript.push({ role: "user", text: record.user_text });
-    } else if (record.kind === "assistant_result" && typeof record.text === "string") {
+    const payload = record.kind && typeof record.kind === "object" ? record.kind : record;
+    const kind = typeof record.kind === "string" ? record.kind : payload.kind;
+    if (kind === "turn_intent" && typeof payload.user_text === "string") {
+      transcript.push({ role: "user", text: payload.user_text });
+    } else if (kind === "assistant_result" && typeof payload.text === "string") {
       transcript.push({
         role: "assistant",
-        text: record.text,
+        text: payload.text,
         chips: [], stages: [], results: [], tools: [], errors: [],
-        citations: Array.isArray(record.sources) ? record.sources : [],
+        citations: Array.isArray(payload.sources) ? payload.sources : [],
         pending: null,
         doneReason: "complete",
       });

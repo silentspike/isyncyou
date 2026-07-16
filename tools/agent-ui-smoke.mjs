@@ -425,6 +425,33 @@ function makeFixtureServer(evidence) {
     failNextSessionCreate() {
       failNextSessionCreate = true;
     },
+    seedSelectedSessionHistory() {
+      const session = sessions.get(selectedSessionId);
+      if (!session) throw new Error("fixture session is unavailable");
+      session.records = [
+        {
+          kind: {
+            kind: "turn_intent",
+            user_text: "Persisted fixture question",
+          },
+        },
+        {
+          kind: {
+            kind: "assistant_result",
+            text: "Persisted fixture answer",
+            sources: [{
+              service: "mail",
+              id: "mail-1",
+              item_id: "mail-1",
+              path: "/Inbox/quarterly-brief.eml",
+              name: "Quarterly brief",
+              item_type: "message",
+            }],
+            usage: null,
+          },
+        },
+      ];
+    },
   };
 }
 
@@ -820,6 +847,15 @@ async function main() {
     assert(evidence, "citation click opens fixture view", popup.url().startsWith(`${origin}/api/v1/view?`), { popup: popup.url() });
     await popup.close();
     evidence.screenshots.stream_citations = await screenshot(page, "stream-citations.png");
+
+    fixture.seedSelectedSessionHistory();
+    await page.goto(`${origin}/?session-hydration-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.body.innerText.includes("Persisted fixture answer"), null, { timeout: 10000 });
+    const hydratedTranscript = await page.locator('[data-testid="agent-transcript"]').innerText();
+    assert(evidence, "V2 tagged session history rehydrates question answer and source",
+      hydratedTranscript.includes("Persisted fixture question")
+      && hydratedTranscript.includes("Persisted fixture answer")
+      && await page.locator('[data-agent-citation="view"]').count() === 1);
 
     await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
     await page.locator('[data-agent-model-option="claude|claude-opus-4"]').click();
