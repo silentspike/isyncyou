@@ -981,6 +981,7 @@ pub struct AgentModelRequest {
     pub request_id: String,
     pub provider: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -1092,7 +1093,10 @@ pub struct AgentOAuthCompleteRequest {
 pub trait AgentHandler: Send + Sync {
     /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
-    fn start_turn_request(&self, request: AgentTurnRequest) -> Result<String, String> {
+    fn start_turn_request(
+        self: std::sync::Arc<Self>,
+        request: AgentTurnRequest,
+    ) -> Result<String, String> {
         self.start_turn(&request.account, &request.prompt)
     }
     /// Peek the non-secret binding for a pending destructive action without checking
@@ -1298,7 +1302,12 @@ pub trait AgentHandler: Send + Sync {
 
     /// Set the active provider + model (the in-app model switcher). The offered models are
     /// reported in `status_json`'s `models` field. Default: not available.
-    fn set_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
+    fn set_model(
+        &self,
+        _provider: &str,
+        _model: &str,
+        _reasoning_effort: Option<&str>,
+    ) -> Result<(), String> {
         Err("model selection is not enabled on this server".into())
     }
 }
@@ -6267,7 +6276,7 @@ impl Router {
         {
             return no_store_json_error(400, "invalid agent turn request");
         }
-        match handler.start_turn_request(request) {
+        match std::sync::Arc::clone(handler).start_turn_request(request) {
             Ok(turn_id) => with_no_store(ApiResponse::ok_json(&json!({ "turn": turn_id }))),
             // #639: a host-verified not-ready product turn is a closed 409, not a blanket 500.
             Err(e)
@@ -6675,10 +6684,15 @@ impl Router {
         {
             return no_store_json_error(400, "invalid agent model request");
         }
-        match handler.set_model(&request.provider, &request.model) {
+        match handler.set_model(
+            &request.provider,
+            &request.model,
+            request.reasoning_effort.as_deref(),
+        ) {
             Ok(_) => ApiResponse::ok_json(&json!({
                 "provider": request.provider,
                 "model": request.model,
+                "reasoning_effort": request.reasoning_effort,
             })),
             Err(e) => ApiResponse::error(400, &e),
         }
@@ -8981,6 +8995,84 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(String::from_utf8_lossy(&resp.body).contains("product_not_ready"));
     }
 
+    #[derive(Default)]
+    struct RecordingModelAgent {
+        selections: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    impl AgentHandler for RecordingModelAgent {
+        fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+            Err("not enabled".into())
+        }
+
+        fn confirm(
+            &self,
+            _pending_id: &str,
+            _token: &str,
+            _action_hash: &str,
+        ) -> Result<String, String> {
+            Err("not enabled".into())
+        }
+
+        fn cancel(&self, _turn_id: &str) {}
+
+        fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+
+        fn set_model(
+            &self,
+            provider: &str,
+            model: &str,
+            reasoning_effort: Option<&str>,
+        ) -> Result<(), String> {
+            self.selections.lock().unwrap().push((
+                provider.to_owned(),
+                model.to_owned(),
+                reasoning_effort.map(str::to_owned),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn agent_model_route_carries_closed_reasoning_effort_in_strict_json() {
+        let (_directory, router) = setup();
+        let agent = std::sync::Arc::new(RecordingModelAgent::default());
+        let router = router.with_agent(agent.clone(), "agentsecret".into());
+        let request_id = "550e8400-e29b-41d4-a716-446655440000";
+        let response = router.route(&strict_json_post(
+            "/api/v1/agent/model",
+            json!({
+                "request_id": request_id,
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "high",
+            }),
+            Some("agentsecret"),
+        ));
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["reasoning_effort"], "high");
+        assert_eq!(
+            agent.selections.lock().unwrap().as_slice(),
+            &[("codex".into(), "gpt-5.6-terra".into(), Some("high".into()))]
+        );
+
+        let unknown = router.route(&strict_json_post(
+            "/api/v1/agent/model",
+            json!({
+                "request_id": request_id,
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium",
+                "endpoint": "forbidden",
+            }),
+            Some("agentsecret"),
+        ));
+        assert_eq!(unknown.status, 400);
+        assert_eq!(agent.selections.lock().unwrap().len(), 1);
+    }
+
     // #639 T9 AC1: /oauth/complete is strict JSON and Claude-only. A query-param code, a codex
     // provider, an unknown field, and a non-JSON content type are all rejected at the edge (400).
     #[test]
@@ -9115,6 +9207,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(close.contains("const turn = AssistantState.activeTurnId;"));
         assert!(close.contains("if (turn) void finishTurnGuard(turn);"));
         assert!(APP_JS.contains("TURN_GUARDS.set(turn, startingGuardId);"));
+    }
+
+    #[test]
+    fn assistant_turn_start_preserves_ambiguous_guard() {
+        let start = APP_JS
+            .find("async function agentSend(text)")
+            .expect("agent send function");
+        let end = APP_JS[start..]
+            .find("function renderAssistantView")
+            .map(|offset| start + offset)
+            .unwrap_or(APP_JS.len());
+        let send = &APP_JS[start..end];
+        assert!(send.contains("let turnStartPosted = false;"));
+        assert!(send.contains("turnStartPosted = true;"));
+        assert!(send.contains("!turnStartPosted || (e && e.responseReceived === true)"));
     }
 
     // #639 T9 AC3: the status response carries Cache-Control: no-store and never leaks a secret.
@@ -13136,7 +13243,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "async function connectAgentProvider(provider)",
             "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
             "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
-            "await postJson(\"/api/v1/agent/model\", CAP.agent, {",
+            "const efforts = st.reasoning_efforts || [];",
+            "data-agent-effort-option",
+            "if (provider === \"codex\") body.reasoning_effort = reasoningEffort || \"medium\";",
+            "await postJson(\"/api/v1/agent/model\", CAP.agent, body);",
             "const st = await api(\"/api/v1/agent/status\");",
             "rememberAssistantStatus(st);",
             "renderAssistantView($(\"#view\"));",
@@ -13168,9 +13278,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn assistant_model_switch_resumes_after_provider_privacy_consent() {
         for needle in [
             "pendingModelSelection: null",
-            "AssistantState.pendingModelSelection = { provider: agentProviderConsentId(provider), model }",
+            "provider: agentProviderConsentId(provider), model, reasoning_effort: reasoningEffort,",
             "renderAssistantConsentPanel([pendingModel.provider])",
-            "if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model)",
+            "if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model, resumeModel.reasoning_effort)",
         ] {
             assert!(
                 APP_JS.contains(needle),

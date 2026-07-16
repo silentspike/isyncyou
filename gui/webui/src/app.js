@@ -5393,7 +5393,7 @@ async function acceptAgentPrivacyConsent(provider) {
   AssistantState.pendingConnectProvider = null;
   AssistantState.pendingModelSelection = null;
   await renderAssistantView($("#view"));
-  if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model);
+  if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model, resumeModel.reasoning_effort);
   else if (resumeConnect) await startAiLogin(consentProvider);
 }
 function resetAgentPrivacyConsent() {
@@ -5663,12 +5663,17 @@ function agentProviderLabel(provider) {
 }
 function agentModelSwitcher(st) {
   const models = st.models || {};
+  const efforts = st.reasoning_efforts || [];
+  const currentEffort = st.reasoning_effort || "medium";
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
     for (const prov of ["claude", "codex"]) {
       const tag = agentProviderLabel(prov);
       const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
-      if (m) return tag + " · " + m.label;
+      if (m) {
+        const effort = prov === "codex" ? efforts.find((x) => x.id === currentEffort) : null;
+        return tag + " · " + m.label + (effort ? " · " + effort.label : "");
+      }
     }
     return st.model ? agentProviderLabel(st.provider) + " · " + st.model : "Select model";
   };
@@ -5681,7 +5686,7 @@ function agentModelSwitcher(st) {
     list.forEach((m) => {
       const val = prov + "|" + m.id;
       rows.push(el("button",
-        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", "data-agent-model-option": val, onclick: () => pickModel(prov, m.id) },
+        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", "data-agent-model-option": val, onclick: () => pickModel(prov, m.id, prov === "codex" ? currentEffort : null) },
         el("span", { class: "mdl-dot" }),
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
@@ -5690,6 +5695,17 @@ function agentModelSwitcher(st) {
   const codexReady = assistantProviderReady(st, "codex");
   addGroup("claude", claudeReady);
   addGroup("codex", codexReady);
+  if (codexReady && st.provider === "codex" && st.model && efforts.length) {
+    rows.push(el("div", { class: "mdl-group" }, "Reasoning effort"));
+    rows.push(el("div", { class: "mdl-efforts", role: "group", "aria-label": "Reasoning effort" },
+      ...efforts.map((effort) => el("button", {
+        class: "mdl-effort" + (effort.id === currentEffort ? " active" : ""),
+        type: "button",
+        "data-agent-effort-option": effort.id,
+        onclick: () => pickModel("codex", st.model, effort.id),
+        text: effort.label,
+      }))));
+  }
   if (!claudeReady) {
     rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "claude", onclick: () => connectAgentProvider("claude") },
       el("span", { class: "mdl-plus" }, "＋"),
@@ -5737,20 +5753,25 @@ async function connectAgentProvider(provider) {
   }
   await startAiLogin(provider);
 }
-async function pickModel(provider, model) {
+async function pickModel(provider, model, reasoningEffort = null) {
   if (!agentPrivacyConsentAccepted(provider)) {
-    AssistantState.pendingModelSelection = { provider: agentProviderConsentId(provider), model };
+    AssistantState.pendingModelSelection = {
+      provider: agentProviderConsentId(provider), model, reasoning_effort: reasoningEffort,
+    };
     toast("Review privacy consent for " + agentProviderLabel(provider), "err");
     renderAssistantView($("#view"));
     return;
   }
   try {
-    await postJson("/api/v1/agent/model", CAP.agent, {
-      request_id: crypto.randomUUID(), provider, model,
-    });
+    const body = { request_id: crypto.randomUUID(), provider, model };
+    if (provider === "codex") body.reasoning_effort = reasoningEffort || "medium";
+    await postJson("/api/v1/agent/model", CAP.agent, body);
     const st = await api("/api/v1/agent/status");
     rememberAssistantStatus(st);
-    toast("Model: " + agentProviderLabel(provider) + " · " + model);
+    const effortLabel = provider === "codex"
+      ? (AssistantState.status?.reasoning_efforts || []).find((x) => x.id === (reasoningEffort || "medium"))?.label
+      : null;
+    toast("Model: " + agentProviderLabel(provider) + " · " + model + (effortLabel ? " · " + effortLabel : ""));
     renderAssistantView($("#view"));
   } catch (err) {
     toast("Could not switch model: " + (err.message || err));
@@ -6101,6 +6122,7 @@ function agentSafeErrorCopy(code) {
     provider_response_read_failed: "The provider response could not be read.",
     provider_transport_failed: "The provider connection failed.",
     confirmation_unavailable: "Confirmation is temporarily unavailable.",
+    session_store_unavailable: "Shared session state is temporarily unavailable. Try again.",
     session_transport_unavailable: "Shared session storage is unavailable. Check your Microsoft 365 connection and try again.",
   };
   return known[code] || "The assistant could not complete this request.";
@@ -6550,11 +6572,13 @@ async function agentSend(text) {
 
   let turn;
   let startingGuardId = null;
+  let turnStartPosted = false;
   try {
     startingGuardId = await beginNetworkGuard("agent_turn");
     if (BRIDGE && !startingGuardId) throw new Error("network_guard_unavailable");
     await runConnectivityPreflight(provider, "turn_start", startingGuardId);
     const sessionId = await ensureAgentSession();
+    turnStartPosted = true;
     const r = await postJson("/api/v1/agent/turn", CAP.agent, {
       request_id: crypto.randomUUID(),
       session_id: sessionId,
@@ -6563,7 +6587,12 @@ async function agentSend(text) {
     });
     turn = r && r.turn;
   } catch (e) {
-    await endNetworkGuard(startingGuardId);
+    // A bridge timeout after dispatch is ambiguous: the host may have committed a turn and merely
+    // lost the response. Abandon JS ownership and let the native starting deadline reap the lease.
+    // A preflight failure or an HTTP response is unambiguous and releases immediately.
+    if (!turnStartPosted || (e && e.responseReceived === true)) {
+      await endNetworkGuard(startingGuardId);
+    }
     AssistantState.busy = false;
     AssistantState.activeMessage = null;
     if (e && e.connectivity) {

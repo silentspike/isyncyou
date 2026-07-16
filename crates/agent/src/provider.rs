@@ -338,6 +338,7 @@ pub(crate) enum ProviderRequestBinding<'a> {
         access_token: &'a str,
         account_id: &'a str,
         model: &'a str,
+        reasoning_effort: codex::CodexReasoningEffort,
         instructions: &'a str,
     },
 }
@@ -634,6 +635,7 @@ fn attest_product_harness(
                 access_token,
                 account_id,
                 model,
+                reasoning_effort,
                 instructions,
             } = binding
             else {
@@ -657,8 +659,10 @@ fn attest_product_harness(
             let allowed: std::collections::BTreeSet<&str> = [
                 "input",
                 "instructions",
+                "include",
                 "model",
                 "parallel_tool_calls",
+                "reasoning",
                 "store",
                 "stream",
                 "tool_choice",
@@ -674,8 +678,16 @@ fn attest_product_harness(
             if obj.get("store") != Some(&serde_json::Value::Bool(false)) {
                 return Err(harness_violation("codex store must be false"));
             }
+            let reasoning = obj
+                .get("reasoning")
+                .and_then(|value| value.as_object())
+                .filter(|value| value.len() == 1)
+                .ok_or_else(|| harness_violation("codex reasoning shape is invalid"))?;
             if obj.get("model").and_then(|v| v.as_str()) != Some(*model)
                 || obj.get("instructions").and_then(|v| v.as_str()) != Some(*instructions)
+                || reasoning.get("effort").and_then(|v| v.as_str())
+                    != Some(reasoning_effort.as_str())
+                || obj.get("include") != Some(&serde_json::json!(["reasoning.encrypted_content"]))
                 || !obj.get("input").is_some_and(|v| v.is_array())
                 || obj.get("parallel_tool_calls") != Some(&serde_json::Value::Bool(false))
                 || obj.get("tool_choice").and_then(|v| v.as_str()) != Some("auto")
@@ -693,7 +705,6 @@ fn attest_product_harness(
                     ("authorization".into(), format!("Bearer {access_token}")),
                     ("chatgpt-account-id".into(), (*account_id).to_string()),
                     ("originator".into(), codex::ORIGINATOR.into()),
-                    ("openai-beta".into(), codex::OPENAI_BETA.into()),
                     (
                         "user-agent".into(),
                         format!("{}/{}", codex::ORIGINATOR, codex::DEFAULT_CLI_VERSION),
@@ -777,12 +788,14 @@ pub fn attest_static_product_harness(
                     access_token: "static-attestation-probe",
                     account_id: "static-account-binding",
                     model: &codex::CodexConfig::default().model,
+                    reasoning_effort: codex::CodexConfig::default().reasoning_effort,
                     instructions: expected_system,
                 },
                 codex::RESPONSES_URL,
                 &p.request_headers(),
                 &codex::build_request(
                     &codex::CodexConfig::default().model,
+                    codex::CodexConfig::default().reasoning_effort,
                     expected_system,
                     &history,
                 ),
@@ -860,8 +873,12 @@ mod tests {
         )
         .unwrap()
         .request_body(&history);
-        let codex =
-            codex::build_request("codex-test", "iSyncYou controlled system prompt", &history);
+        let codex = codex::build_request(
+            "codex-test",
+            codex::CodexReasoningEffort::Medium,
+            "iSyncYou controlled system prompt",
+            &history,
+        );
         (claude, codex)
     }
 
@@ -991,7 +1008,6 @@ mod tests {
                 "authorization",
                 "chatgpt-account-id",
                 "originator",
-                "openai-beta",
                 "user-agent",
                 "accept",
             ]
@@ -1036,9 +1052,11 @@ mod tests {
             codex_keys,
             BTreeSet::from([
                 "input".into(),
+                "include".into(),
                 "instructions".into(),
                 "model".into(),
                 "parallel_tool_calls".into(),
+                "reasoning".into(),
                 "store".into(),
                 "stream".into(),
                 "tool_choice".into(),
@@ -1092,7 +1110,12 @@ mod tests {
         (
             codex::RESPONSES_URL.to_string(),
             provider.request_headers(),
-            codex::build_request("codex-test", "iSyncYou controlled system prompt", &history),
+            codex::build_request(
+                "codex-test",
+                codex::CodexReasoningEffort::Medium,
+                "iSyncYou controlled system prompt",
+                &history,
+            ),
         )
     }
 
@@ -1119,6 +1142,7 @@ mod tests {
                 access_token: "codex-oauth-token",
                 account_id: "codex-account-identity",
                 model: "codex-test",
+                reasoning_effort: codex::CodexReasoningEffort::Medium,
                 instructions: "iSyncYou controlled system prompt",
             },
         };
@@ -1225,6 +1249,29 @@ mod tests {
         assert!(
             attest_test_request(HarnessProvider::Codex, url, mutated_headers, body).is_err(),
             "mutated headers must fail re-attestation"
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_reasoning_effort_is_bound_into_request_attestation() {
+        let (url, headers, body) = valid_codex_request("controlled user request");
+        attest_test_request(
+            HarnessProvider::Codex,
+            url.clone(),
+            headers.clone(),
+            body.clone(),
+        )
+        .expect("baseline reasoning effort attests");
+
+        let mut mutated = body;
+        mutated["reasoning"]["effort"] = json!("xhigh");
+        assert!(
+            attest_test_request(HarnessProvider::Codex, url, headers, mutated).is_err(),
+            "reasoning effort must match the prepared provider binding"
         );
     }
 

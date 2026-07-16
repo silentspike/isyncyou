@@ -118,7 +118,7 @@ pub use oauth::{AgentOAuth, OAuthConfig, StartedLogin};
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-pub use provider::codex::{CodexConfig, CodexProvider};
+pub use provider::codex::{CodexConfig, CodexProvider, CodexReasoningEffort};
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"

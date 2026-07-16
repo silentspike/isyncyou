@@ -150,6 +150,7 @@ function makeFixtureServer(evidence) {
   let agentConnected = false;
   let agentProvider = "claude";
   let agentModel = "claude-sonnet-4";
+  let agentReasoningEffort = "medium";
   let onboardingMode = "not_started";
   let oauthAttemptSeq = 0;
   let turnSeq = 0;
@@ -188,6 +189,13 @@ function makeFixtureServer(evidence) {
     connected: agentConnected,
     provider: agentProvider,
     model: agentModel,
+    reasoning_effort: agentProvider === "codex" ? agentReasoningEffort : "",
+    reasoning_efforts: [
+      { id: "low", label: "Light" },
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High" },
+      { id: "xhigh", label: "Extra High" },
+    ],
     claude: agentConnected && agentProvider === "claude",
     codex: agentConnected && agentProvider === "codex",
     onboarding: {
@@ -204,7 +212,9 @@ function makeFixtureServer(evidence) {
         { id: "claude-opus-4", label: "Claude Opus 4" },
       ],
       codex: [
-        { id: "gpt-5-codex", label: "GPT-5 Codex" },
+        { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+        { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
+        { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
       ],
     },
   });
@@ -323,6 +333,7 @@ function makeFixtureServer(evidence) {
         state.modelPosts.push(body);
         agentProvider = body.provider || agentProvider;
         agentModel = body.model || agentModel;
+        if (agentProvider === "codex") agentReasoningEffort = body.reasoning_effort || "medium";
         json(res, 200, { ok: true });
       } else if (req.method === "GET" && url.pathname === "/api/v1/agent/session/list") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
@@ -404,6 +415,13 @@ function makeFixtureServer(evidence) {
       onboardingMode = mode;
       agentConnected = mode === "ready";
     },
+    setAgent(provider, model, reasoningEffort = "medium") {
+      agentConnected = true;
+      onboardingMode = "ready";
+      agentProvider = provider;
+      agentModel = model;
+      agentReasoningEffort = reasoningEffort;
+    },
     failNextSessionCreate() {
       failNextSessionCreate = true;
     },
@@ -446,6 +464,9 @@ function evidenceForWrite(evidence, state) {
   const closedModels = state.modelPosts
     .map((row) => row.model)
     .filter((model) => typeof model === "string" && /^[a-z0-9-]{1,64}$/.test(model));
+  const closedEfforts = state.modelPosts
+    .map((row) => row.reasoning_effort)
+    .filter((effort) => ["low", "medium", "high", "xhigh"].includes(effort));
 
   return {
     evidence_version: 2,
@@ -481,6 +502,7 @@ function evidenceForWrite(evidence, state) {
       oauth_providers: closedProviders,
       model_post_count: state.modelPosts.length,
       models: closedModels,
+      reasoning_efforts: closedEfforts,
       confirm_post_count: state.confirmPosts.length,
       cancel_post_count: state.cancelPosts.length,
       account_login_start_count: state.accountLoginStarts.length,
@@ -804,6 +826,26 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"]')?.innerText.includes("Claude Opus 4"), null, { timeout: 10000 });
     assert(evidence, "model picker posts model change", fixture.state.modelPosts.length === 1 && fixture.state.modelPosts[0].model === "claude-opus-4", fixture.state.modelPosts);
     assert(evidence, "usage chip shows unavailable state", (await page.locator('[data-testid="agent-usage"]').innerText()).includes("Usage unavailable"));
+
+    fixture.setAgent("codex", "gpt-5.6-sol", "medium");
+    await page.goto(`${origin}/?codex-model-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="agent-transcript"]', { timeout: 10000 });
+    await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
+    assert(evidence, "ChatGPT picker exposes Sol Terra and Luna",
+      await page.locator('[data-agent-model-option="codex|gpt-5.6-sol"]').isVisible()
+      && await page.locator('[data-agent-model-option="codex|gpt-5.6-terra"]').isVisible()
+      && await page.locator('[data-agent-model-option="codex|gpt-5.6-luna"]').isVisible());
+    await page.locator('[data-agent-model-option="codex|gpt-5.6-terra"]').click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"]')?.innerText.includes("GPT-5.6 Terra"), null, { timeout: 10000 });
+    await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
+    await page.locator('[data-agent-effort-option="high"]').click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"]')?.innerText.includes("GPT-5.6 Terra · High"), null, { timeout: 10000 });
+    const codexSelection = fixture.state.modelPosts.at(-1);
+    assert(evidence, "ChatGPT effort posts with the selected GPT-5.6 model",
+      codexSelection?.provider === "codex"
+      && codexSelection?.model === "gpt-5.6-terra"
+      && codexSelection?.reasoning_effort === "high",
+      fixture.state.modelPosts);
 
     await page.locator('[data-testid="agent-input"]').fill("Please delete the stale fixture item");
     await page.locator('[data-testid="agent-send"]').click();

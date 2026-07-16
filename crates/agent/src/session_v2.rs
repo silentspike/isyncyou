@@ -2086,6 +2086,8 @@ pub use onedrive_transport::OneDriveSessionV2Transport;
 pub struct ProviderAttemptBindingV1 {
     pub provider: ProductProviderId,
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub credential_generation: String,
     pub oauth_policy_fingerprint: String,
     pub harness_contract_version: u32,
@@ -2690,6 +2692,7 @@ mod tests {
         ProviderAttemptBindingV1 {
             provider: ProductProviderId::Claude,
             model: "model".into(),
+            reasoning_effort: None,
             credential_generation: "generation".into(),
             oauth_policy_fingerprint: "policy".into(),
             harness_contract_version: 1,

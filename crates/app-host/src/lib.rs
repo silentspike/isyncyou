@@ -211,7 +211,23 @@ const CLAUDE_MODELS: &[(&str, &str)] = &[
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-const CODEX_MODELS: &[(&str, &str)] = &[("gpt-5.5", "GPT-5.5"), ("gpt-5.4", "GPT-5.4")];
+const CODEX_MODELS: &[(&str, &str)] = &[
+    ("gpt-5.6-sol", "GPT-5.6 Sol"),
+    ("gpt-5.6-terra", "GPT-5.6 Terra"),
+    ("gpt-5.6-luna", "GPT-5.6 Luna"),
+    ("gpt-5.5", "GPT-5.5"),
+    ("gpt-5.4", "GPT-5.4"),
+];
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const CODEX_REASONING_EFFORTS: &[(&str, &str)] = &[
+    ("low", "Light"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra High"),
+];
 
 #[cfg(test)]
 type TestProviderScript = Arc<Mutex<Option<Vec<Vec<isyncyou_agent::AssistantBlock>>>>>;
@@ -399,6 +415,115 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
             _ => "provider_transport_failed",
         },
     }
+}
+
+fn agent_safe_turn_start_error(error: &str) -> &'static str {
+    match error {
+        "product_not_ready" => "product_not_ready",
+        "provider_busy" => "provider_busy",
+        "provider_generation_changed" => "provider_generation_changed",
+        "request_id_conflict" => "request_id_conflict",
+        "session_account_mismatch" => "session_account_mismatch",
+        "session_busy" => "session_busy",
+        "session_not_found" => "session_not_found",
+        "session_store_unavailable" => "session_store_unavailable",
+        "session_transport_unavailable" => "session_transport_unavailable",
+        _ => "turn_start_failed",
+    }
+}
+
+fn turn_id_from_request_id(request_id: &str) -> Result<String, String> {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let compact = request_id.replace('-', "");
+    if compact.len() != 32 {
+        return Err("invalid_request_id".into());
+    }
+    let mut value = u128::from_str_radix(&compact, 16).map_err(|_| "invalid_request_id")?;
+    let mut encoded = [b'0'; 26];
+    for byte in encoded.iter_mut().rev() {
+        *byte = CROCKFORD[(value & 31) as usize];
+        value >>= 5;
+    }
+    String::from_utf8(encoded.to_vec()).map_err(|_| "invalid_request_id".into())
+}
+
+fn turn_admission_digest(request: &isyncyou_webui::AgentTurnRequest) -> [u8; 32] {
+    let mut input = Vec::with_capacity(
+        32 + request.session_id.len() + request.account.len() + request.prompt.len(),
+    );
+    input.extend_from_slice(b"isyncyou-turn-admission-v1");
+    for value in [
+        request.session_id.as_bytes(),
+        request.account.as_bytes(),
+        request.prompt.as_bytes(),
+    ] {
+        input.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        input.extend_from_slice(value);
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    let mut result = [0_u8; 32];
+    result.copy_from_slice(digest.as_ref());
+    result
+}
+
+const MAX_ACTIVE_TURN_ADMISSIONS: usize = 256;
+
+#[derive(Default)]
+struct TurnAdmissionRegistry {
+    bindings: Mutex<HashMap<String, [u8; 32]>>,
+}
+
+impl TurnAdmissionRegistry {
+    fn reserve(
+        self: &Arc<Self>,
+        turn_id: &str,
+        digest: [u8; 32],
+    ) -> Result<Option<TurnAdmissionLease>, String> {
+        let mut bindings = self
+            .bindings
+            .lock()
+            .map_err(|_| "turn_registry_unavailable".to_string())?;
+        if let Some(existing) = bindings.get(turn_id) {
+            return if existing == &digest {
+                Ok(None)
+            } else {
+                Err("request_id_conflict".into())
+            };
+        }
+        if bindings.len() >= MAX_ACTIVE_TURN_ADMISSIONS {
+            return Err("turn_registry_unavailable".into());
+        }
+        bindings.insert(turn_id.to_owned(), digest);
+        Ok(Some(TurnAdmissionLease {
+            registry: Arc::clone(self),
+            turn_id: turn_id.to_owned(),
+        }))
+    }
+
+    fn release(&self, turn_id: &str) {
+        if let Ok(mut bindings) = self.bindings.lock() {
+            bindings.remove(turn_id);
+        }
+    }
+}
+
+struct TurnAdmissionLease {
+    registry: Arc<TurnAdmissionRegistry>,
+    turn_id: String,
+}
+
+impl Drop for TurnAdmissionLease {
+    fn drop(&mut self) {
+        self.registry.release(&self.turn_id);
+    }
+}
+
+fn spawn_agent_turn_admission(task: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("agent-turn-admission".into())
+        .spawn(task)
+        .map(|_| ())
+        .map_err(|_| "turn_spawn_failed".to_string())
 }
 
 #[cfg_attr(
@@ -776,6 +901,18 @@ struct PreparedTurnProvider {
         feature = "agent-subscription-experimental"
     ))]
     session_binding: Option<isyncyou_agent::ProviderAttemptBindingV1>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+struct ReservedAgentTurn {
+    turn_id: String,
+    sequence: u64,
+    turn_state: Arc<Mutex<TurnAuthorityState>>,
+    cancellation: isyncyou_agent::CancellationToken,
+    admission: TurnAdmissionLease,
 }
 
 #[cfg(any(
@@ -1351,6 +1488,7 @@ pub struct DaemonAgent {
     confirmed_executor: Arc<dyn AgentConfirmedActionExecutor>,
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
+    turn_admissions: Arc<TurnAdmissionRegistry>,
     #[cfg_attr(
         not(any(
             feature = "agent-oauth-providers",
@@ -1527,6 +1665,7 @@ impl DaemonAgent {
             confirmed_executor,
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
+            turn_admissions: Arc::new(TurnAdmissionRegistry::default()),
             last_usage: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(any(
                 feature = "agent-oauth-providers",
@@ -1712,9 +1851,12 @@ impl DaemonAgent {
             // cross-provider fallback (an activated non-selected provider is never silently
             // substituted, fixing the old "falls back to the other" behavior).
             let built = match self.agent_settings() {
-                Some(settings) if settings.provider == ProductProviderId::Codex => {
-                    self.try_codex_provider(system, &settings.model)
-                }
+                Some(settings) if settings.provider == ProductProviderId::Codex => self
+                    .try_codex_provider(
+                        system,
+                        &settings.model,
+                        settings.reasoning_effort.unwrap_or_default(),
+                    ),
                 Some(settings) if settings.provider == ProductProviderId::Claude => {
                     self.try_subscription_provider(system, &settings.model)
                 }
@@ -2293,9 +2435,9 @@ impl DaemonAgent {
             let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
                 .map_err(|_| AgentStartTurnError::ProductNotReady)?;
             if self.lifecycle_provider_blocked(selected)
-                || self.agent_settings().is_none_or(|current| {
-                    current.provider != selected || current.model != settings.model
-                })
+                || self
+                    .agent_settings()
+                    .is_none_or(|current| current != settings)
             {
                 return Err(AgentStartTurnError::ProductNotReady);
             }
@@ -2325,6 +2467,7 @@ impl DaemonAgent {
                     let config = isyncyou_agent::CodexConfig {
                         account_id: credential.account_id,
                         model: settings.model.clone(),
+                        reasoning_effort: settings.reasoning_effort.unwrap_or_default(),
                         ..Default::default()
                     };
                     isyncyou_agent::CodexProvider::new(credential.access_token, system, config)
@@ -2335,8 +2478,12 @@ impl DaemonAgent {
                 }
             }
         };
-        let session_binding =
-            self.provider_attempt_binding(selected, &settings.model, &generation)?;
+        let session_binding = self.provider_attempt_binding(
+            selected,
+            &settings.model,
+            settings.reasoning_effort,
+            &generation,
+        )?;
         Ok(PreparedTurnProvider {
             provider,
             provider_id: Some(selected),
@@ -2353,6 +2500,7 @@ impl DaemonAgent {
         &self,
         provider: ProductProviderId,
         model: &str,
+        reasoning_effort: Option<isyncyou_agent::CodexReasoningEffort>,
         generation: &str,
     ) -> Result<isyncyou_agent::ProviderAttemptBindingV1, AgentStartTurnError> {
         use base64::Engine as _;
@@ -2369,6 +2517,7 @@ impl DaemonAgent {
         Ok(isyncyou_agent::ProviderAttemptBindingV1 {
             provider,
             model: model.to_owned(),
+            reasoning_effort: reasoning_effort.map(|value| value.as_str().to_owned()),
             credential_generation: generation.to_owned(),
             oauth_policy_fingerprint: oauth_policy_fingerprint(provider),
             harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
@@ -4807,6 +4956,7 @@ const MAX_PRODUCT_SETTINGS_ENVELOPE_BYTES: usize = 8_192;
 struct AgentSettingsSnapshot {
     provider: ProductProviderId,
     model: String,
+    reasoning_effort: Option<isyncyou_agent::CodexReasoningEffort>,
 }
 
 #[cfg(any(
@@ -4839,14 +4989,34 @@ fn load_agent_provider_selection(oauth_dir: &Path) -> Option<AgentSettingsSnapsh
         )
         .ok()??;
     let value: serde_json::Value = serde_json::from_slice(secret.expose()).ok()?;
-    if value.get("schema_version").and_then(|v| v.as_u64()) != Some(1)
-        || value.as_object().map(|v| v.len()) != Some(3)
-    {
+    let schema_version = value.get("schema_version").and_then(|v| v.as_u64())?;
+    let expected_fields = match schema_version {
+        1 => 3,
+        2 => 4,
+        _ => return None,
+    };
+    if value.as_object().map(|v| v.len()) != Some(expected_fields) {
         return None;
     }
     let provider = ProductProviderId::parse(value.get("provider")?.as_str()?)?;
     let model = value.get("model")?.as_str()?.to_string();
-    provider_has_model(provider, &model).then_some(AgentSettingsSnapshot { provider, model })
+    if !provider_has_model(provider, &model) {
+        return None;
+    }
+    let reasoning_effort = match (provider, schema_version) {
+        (ProductProviderId::Codex, 1) => Some(isyncyou_agent::CodexReasoningEffort::Medium),
+        (ProductProviderId::Codex, 2) => Some(isyncyou_agent::CodexReasoningEffort::parse(
+            value.get("reasoning_effort")?.as_str()?,
+        )?),
+        (ProductProviderId::Claude, 1) => None,
+        (ProductProviderId::Claude, 2) if value.get("reasoning_effort")?.is_null() => None,
+        _ => return None,
+    };
+    Some(AgentSettingsSnapshot {
+        provider,
+        model,
+        reasoning_effort,
+    })
 }
 
 #[cfg(any(
@@ -4858,15 +5028,41 @@ fn store_agent_provider_selection(
     provider: &str,
     model: &str,
 ) -> Result<(), String> {
+    store_agent_provider_selection_with_effort(oauth_dir, provider, model, None)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn store_agent_provider_selection_with_effort(
+    oauth_dir: &Path,
+    provider: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<(), String> {
     let provider =
         ProductProviderId::parse(provider).ok_or_else(|| "unknown provider".to_string())?;
     if !provider_has_model(provider, model) {
         return Err("unknown model for provider".into());
     }
+    let reasoning_effort = match provider {
+        ProductProviderId::Codex => {
+            isyncyou_agent::CodexReasoningEffort::parse(reasoning_effort.unwrap_or("medium"))
+                .ok_or_else(|| "unknown reasoning effort".to_string())?
+                .as_str()
+                .into()
+        }
+        ProductProviderId::Claude if reasoning_effort.is_none() => serde_json::Value::Null,
+        ProductProviderId::Claude => {
+            return Err("reasoning effort is available only for ChatGPT".into())
+        }
+    };
     let blob = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "provider": provider.wire(),
         "model": model,
+        "reasoning_effort": reasoning_effort,
     }))
     .map_err(|e| e.to_string())?;
     agent_credential_store(oauth_dir)?
@@ -5799,6 +5995,20 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// Persist the switcher selection after validating it against the offered models.
     fn set_agent_settings(&self, provider: &str, model: &str) -> Result<(), String> {
         store_agent_provider_selection(&self.oauth_dir, provider, model)
+    }
+
+    fn set_agent_settings_with_effort(
+        &self,
+        provider: &str,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<(), String> {
+        store_agent_provider_selection_with_effort(
+            &self.oauth_dir,
+            provider,
+            model,
+            reasoning_effort,
+        )
     }
 
     #[cfg(any(
@@ -7183,6 +7393,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         &self,
         instructions: &str,
         model: &str,
+        reasoning_effort: isyncyou_agent::CodexReasoningEffort,
     ) -> Result<
         Option<Box<dyn isyncyou_agent::LlmProvider + Send>>,
         ProviderCredentialResolutionError,
@@ -7198,6 +7409,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         let cfg = isyncyou_agent::CodexConfig {
             account_id: credential.account_id,
             model: model.to_string(),
+            reasoning_effort,
             ..Default::default()
         };
         let provider =
@@ -7298,29 +7510,13 @@ impl DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    fn launch_prepared_turn(
+    fn reserve_agent_turn(
         &self,
-        account: &str,
-        prompt: &str,
-        prepared: PreparedTurnProvider,
-        product_turn: Option<product_session::ProductTurnRuntime>,
-    ) -> Result<String, String> {
-        let mut provider = prepared.provider;
-        #[cfg(any(
-            feature = "agent-oauth-providers",
-            feature = "agent-subscription-experimental"
-        ))]
-        let provider_id = prepared.provider_id;
-        #[cfg(any(
-            feature = "agent-oauth-providers",
-            feature = "agent-subscription-experimental"
-        ))]
-        let operation_lease = prepared.operation_lease;
-        let n = self.seq.fetch_add(1, Ordering::SeqCst);
-        let turn_id = product_turn
-            .as_ref()
-            .map(|runtime| runtime.turn_id().to_owned())
-            .unwrap_or_else(|| format!("turn-{n}-{}", unix_now()));
+        turn_id: String,
+        provider: Option<ProductProviderId>,
+        admission: TurnAdmissionLease,
+    ) -> Result<ReservedAgentTurn, String> {
+        let sequence = self.seq.fetch_add(1, Ordering::SeqCst);
         let rx_events = self.hub.open(&turn_id, 256);
         let turn_state = match self.turns.register(&turn_id) {
             Ok(state) => state,
@@ -7338,6 +7534,25 @@ impl DaemonAgent {
             }
         };
         let (tx_str, rx_str) = std::sync::mpsc::channel::<String>();
+        let now_ms = unix_now_ms();
+        let mut streams = match self.streams.lock() {
+            Ok(streams) => streams,
+            Err(_) => {
+                self.turns.remove(&turn_id);
+                self.hub.close(&turn_id);
+                return Err("turn_registry_unavailable".into());
+            }
+        };
+        Self::sweep_unopened_streams_locked(&mut streams, now_ms);
+        streams.insert(
+            turn_id.clone(),
+            AgentStreamSlot {
+                rx: rx_str,
+                created_at_ms: now_ms,
+                provider,
+            },
+        );
+        drop(streams);
         std::thread::spawn(move || {
             while let Ok(event) = rx_events.recv() {
                 if tx_str.send(agent_event_json(&event)).is_err() {
@@ -7345,23 +7560,45 @@ impl DaemonAgent {
                 }
             }
         });
-        let now_ms = unix_now_ms();
-        {
-            let mut streams = self.streams.lock().unwrap();
-            Self::sweep_unopened_streams_locked(&mut streams, now_ms);
-            streams.insert(
-                turn_id.clone(),
-                AgentStreamSlot {
-                    rx: rx_str,
-                    created_at_ms: now_ms,
-                    #[cfg(any(
-                        feature = "agent-oauth-providers",
-                        feature = "agent-subscription-experimental"
-                    ))]
-                    provider: provider_id,
-                },
-            );
-        }
+        Ok(ReservedAgentTurn {
+            turn_id,
+            sequence,
+            turn_state,
+            cancellation,
+            admission,
+        })
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn launch_prepared_turn(
+        &self,
+        account: &str,
+        prompt: &str,
+        prepared: PreparedTurnProvider,
+        product_turn: Option<product_session::ProductTurnRuntime>,
+        reserved: ReservedAgentTurn,
+    ) -> Result<String, String> {
+        let mut provider = prepared.provider;
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        let provider_id = prepared.provider_id;
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        let operation_lease = prepared.operation_lease;
+        let ReservedAgentTurn {
+            turn_id,
+            sequence: n,
+            turn_state,
+            cancellation,
+            admission,
+        } = reserved;
         let hub = self.hub.clone();
         let tid = turn_id.clone();
         let prompt = prompt.to_owned();
@@ -7377,6 +7614,7 @@ impl DaemonAgent {
         let turn_thread = std::thread::Builder::new()
             .name(format!("agent-turn-{n}"))
             .spawn(move || {
+                let _admission = admission;
                 let mut keep_turn_authority = false;
                 #[cfg(any(
                     feature = "agent-oauth-providers",
@@ -7635,14 +7873,11 @@ impl DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    fn register_product_turn_replay(
+    fn emit_product_turn_replay(
         &self,
+        reserved_turn_id: &str,
         replay: product_session::ProductTurnReplay,
-        provider: Option<ProductProviderId>,
-    ) -> String {
-        if self.streams.lock().unwrap().contains_key(&replay.turn_id) {
-            return replay.turn_id;
-        }
+    ) {
         let mut events = Vec::new();
         match replay.phase {
             isyncyou_agent::RequestPhase::Committed => {
@@ -7691,20 +7926,35 @@ impl DaemonAgent {
                 ));
             }
         }
-        let (tx, rx) = std::sync::mpsc::channel();
         for event in events {
-            let _ = tx.send(agent_event_json(&event));
+            let _ = self.hub.emit(reserved_turn_id, event);
         }
-        drop(tx);
-        self.streams.lock().unwrap().insert(
-            replay.turn_id.clone(),
-            AgentStreamSlot {
-                rx,
-                created_at_ms: unix_now_ms(),
-                provider,
-            },
-        );
-        replay.turn_id
+        self.hub.close(reserved_turn_id);
+        self.turns.remove(reserved_turn_id);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn fail_reserved_turn(&self, reserved_turn_id: &str, error: &str) {
+        if error == "turn_cancelled" {
+            let _ = self.hub.emit(
+                reserved_turn_id,
+                isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Cancelled),
+            );
+        } else {
+            let _ = self.hub.emit(
+                reserved_turn_id,
+                isyncyou_agent::StreamEvent::Error(agent_safe_turn_start_error(error).into()),
+            );
+            let _ = self.hub.emit(
+                reserved_turn_id,
+                isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
+            );
+        }
+        self.hub.close(reserved_turn_id);
+        self.turns.remove(reserved_turn_id);
     }
 }
 
@@ -8591,7 +8841,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     }
 
     fn start_turn_request(
-        &self,
+        self: Arc<Self>,
         request: isyncyou_webui::AgentTurnRequest,
     ) -> Result<String, String> {
         #[cfg(any(
@@ -8606,47 +8856,96 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if bound_account != request.account {
                 return Err("session_account_mismatch".into());
             }
-            let system = format!(
-                "{AGENT_SYSTEM_PROMPT}\n\nActive account: {}.",
-                request.account
-            );
-            let prepared = self.resolve_turn_provider(&system)?;
-            let provider_binding = prepared
-                .session_binding
-                .clone()
-                .ok_or_else(|| "provider_generation_changed".to_string())?;
-            let installation = account_lifecycle_repository(&self.oauth_dir)
-                .and_then(|repository| {
-                    repository
-                        .load_existing()
-                        .map_err(|_| "lifecycle_unavailable".to_string())
-                })?
-                .ok_or_else(|| "lifecycle_unavailable".to_string())?;
-            let token =
-                isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &request.account)
-                    .map_err(|_| "session_transport_unavailable".to_string())?;
-            let product_turn = registry.begin_turn(product_session::ProductTurnRequest {
-                graph_token: &token,
-                session_id: &request.session_id,
-                request_id: &request.request_id,
-                local_account: &request.account,
-                prompt: &request.prompt,
-                provider_binding,
-                installation_principal: installation.principal(),
-                created_at_ms: unix_now_ms(),
-            })?;
-            match product_turn {
-                product_session::ProductTurnStart::Started(product_turn) => self
-                    .launch_prepared_turn(
+            let turn_id = turn_id_from_request_id(&request.request_id)?;
+            let admission = match self
+                .turn_admissions
+                .reserve(&turn_id, turn_admission_digest(&request))?
+            {
+                Some(admission) => admission,
+                None => return Ok(turn_id),
+            };
+            let selected_provider = self.agent_settings().map(|settings| settings.provider);
+            let reserved =
+                self.reserve_agent_turn(turn_id.clone(), selected_provider, admission)?;
+            let worker = Arc::clone(&self);
+            let worker_turn_id = turn_id.clone();
+            let admission_cancellation = reserved.cancellation.clone();
+            let preparation = spawn_agent_turn_admission(move || {
+                let result = (|| -> Result<(), String> {
+                    let ensure_active = || {
+                        if admission_cancellation.is_cancelled() {
+                            Err("turn_cancelled".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    ensure_active()?;
+                    let system = format!(
+                        "{AGENT_SYSTEM_PROMPT}\n\nActive account: {}.",
+                        request.account
+                    );
+                    let prepared = worker.resolve_turn_provider(&system)?;
+                    ensure_active()?;
+                    let provider_binding = prepared
+                        .session_binding
+                        .clone()
+                        .ok_or_else(|| "provider_generation_changed".to_string())?;
+                    let installation = account_lifecycle_repository(&worker.oauth_dir)
+                        .and_then(|repository| {
+                            repository
+                                .load_existing()
+                                .map_err(|_| "lifecycle_unavailable".to_string())
+                        })?
+                        .ok_or_else(|| "lifecycle_unavailable".to_string())?;
+                    let token = isyncyou_engine::auth::resolve_cached_sync_token(
+                        &worker.cfg,
                         &request.account,
-                        &request.prompt,
-                        prepared,
-                        Some(*product_turn),
-                    ),
-                product_session::ProductTurnStart::Replay(replay) => {
-                    Ok(self.register_product_turn_replay(replay, prepared.provider_id))
+                    )
+                    .map_err(|_| "session_transport_unavailable".to_string())?;
+                    ensure_active()?;
+                    let store = agent_credential_store(&worker.oauth_dir)
+                        .map_err(|_| "session_store_unavailable".to_string())?;
+                    let registry = product_session::ProductSessionRegistry::new(&store);
+                    ensure_active()?;
+                    let product_turn =
+                        registry.begin_turn(product_session::ProductTurnRequest {
+                            graph_token: &token,
+                            session_id: &request.session_id,
+                            request_id: &request.request_id,
+                            turn_id: &worker_turn_id,
+                            local_account: &request.account,
+                            prompt: &request.prompt,
+                            provider_binding,
+                            installation_principal: installation.principal(),
+                            created_at_ms: unix_now_ms(),
+                        })?;
+                    match product_turn {
+                        product_session::ProductTurnStart::Started(product_turn) => {
+                            worker.launch_prepared_turn(
+                                &request.account,
+                                &request.prompt,
+                                prepared,
+                                Some(*product_turn),
+                                reserved,
+                            )?;
+                        }
+                        product_session::ProductTurnStart::Replay(replay) => {
+                            worker.emit_product_turn_replay(&worker_turn_id, replay);
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    worker.fail_reserved_turn(&worker_turn_id, &error);
                 }
+            });
+            if preparation.is_err() {
+                self.streams.lock().unwrap().remove(&turn_id);
+                self.hub.close(&turn_id);
+                self.turns.remove(&turn_id);
+                return Err("turn_spawn_failed".into());
             }
+            Ok(turn_id)
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -9452,6 +9751,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .as_ref()
             .map(|settings| settings.model.clone())
             .unwrap_or_default();
+        let reasoning_effort = settings
+            .as_ref()
+            .and_then(|settings| settings.reasoning_effort)
+            .map(isyncyou_agent::CodexReasoningEffort::as_str)
+            .unwrap_or("");
         let selected_provider = selected_id.map(ProductProviderId::wire).unwrap_or("");
         let list = |models: &[(&str, &str)]| -> serde_json::Value {
             models
@@ -9465,12 +9769,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             "provider": provider,
             "selected_provider": selected_provider,
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "claude": claude,
             "codex": codex,
             "credential_state": { "claude": claude_state, "codex": codex_state },
             "control_store_state": self.control_store_state,
             "reconnect_required": reconnect_required,
             "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
+            "reasoning_efforts": list(CODEX_REASONING_EFFORTS),
         });
         if let Some(usage) = selected_id.and_then(|provider| {
             self.last_usage
@@ -9505,7 +9811,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    fn set_model(&self, provider: &str, model: &str) -> Result<(), String> {
+    fn set_model(
+        &self,
+        provider: &str,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<(), String> {
         // #639 (F2): the selection write shares the product-runtime gate, so a status snapshot or a
         // turn build never observes a selection that is inconsistent with the readiness it just read.
         let _gate = self
@@ -9513,7 +9824,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .lock()
             .map_err(|_| "product_busy".to_string())?;
         let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)?;
-        self.set_agent_settings(provider, model)
+        self.set_agent_settings_with_effort(provider, model, reasoning_effort)
     }
 }
 
@@ -13574,6 +13885,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_turn_admission_returns_reserved_turn_before_onedrive_manifest_work() {
+        let source = include_str!("lib.rs");
+        let function = source
+            .split("fn start_turn_request(")
+            .nth(1)
+            .expect("start_turn_request implementation")
+            .split("fn pending_binding(")
+            .next()
+            .expect("start_turn_request boundary");
+        let reserve = function
+            .find("reserve_agent_turn")
+            .expect("turn reservation");
+        let spawn = function
+            .find("spawn_agent_turn_admission")
+            .expect("admission worker");
+        let provider = function
+            .find("resolve_turn_provider")
+            .expect("provider preparation");
+        let manifest = function.find("begin_turn").expect("manifest admission");
+        let response = function.rfind("Ok(turn_id)").expect("immediate response");
+
+        assert!(reserve < spawn);
+        assert!(spawn < provider);
+        assert!(spawn < manifest);
+        assert!(manifest < response);
+        assert!(function[..spawn].find("begin_turn").is_none());
+    }
+
+    #[test]
+    fn agent_turn_admission_worker_returns_while_admission_work_is_blocked() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+        spawn_agent_turn_admission(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_tx.send(()).unwrap();
+        })
+        .unwrap();
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker started");
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker completed after release");
+    }
+
+    #[test]
+    fn agent_turn_admission_retry_reuses_exact_request_and_rejects_changed_payload() {
+        let registry = Arc::new(TurnAdmissionRegistry::default());
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+            session_id: "01J00000000000000000000000".into(),
+            account: "primary".into(),
+            prompt: "bounded prompt".into(),
+        };
+        let turn_id = turn_id_from_request_id(&request.request_id).unwrap();
+        let lease = registry
+            .reserve(&turn_id, turn_admission_digest(&request))
+            .unwrap()
+            .expect("first request owns admission");
+        assert!(registry
+            .reserve(&turn_id, turn_admission_digest(&request))
+            .unwrap()
+            .is_none());
+
+        let mut changed = request.clone();
+        changed.prompt = "changed prompt".into();
+        assert_eq!(
+            registry
+                .reserve(&turn_id, turn_admission_digest(&changed))
+                .err()
+                .unwrap(),
+            "request_id_conflict"
+        );
+
+        drop(lease);
+        assert!(registry
+            .reserve(&turn_id, turn_admission_digest(&changed))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn agent_turn_id_is_deterministic_valid_ulid_from_request_id() {
+        let request_id = "123e4567-e89b-42d3-a456-426614174000";
+        let turn_id = turn_id_from_request_id(request_id).unwrap();
+        assert_eq!(turn_id, turn_id_from_request_id(request_id).unwrap());
+        assert_eq!(turn_id.len(), 26);
+        assert!(turn_id
+            .bytes()
+            .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte)));
+        assert_ne!(
+            turn_id,
+            turn_id_from_request_id("123e4567-e89b-42d3-a456-426614174001").unwrap()
+        );
+        assert_eq!(
+            turn_id_from_request_id("not-a-request-id").unwrap_err(),
+            "invalid_request_id"
+        );
+    }
+
     #[test]
     fn agent_stream_token_events_contain_no_confirmation_token() {
         let script = vec![vec![
@@ -16601,7 +17026,8 @@ mod tests {
         let held = acquire_product_runtime_file_lock(&root).unwrap();
 
         assert_eq!(
-            isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL).unwrap_err(),
+            isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL, None)
+                .unwrap_err(),
             "product_busy"
         );
         let status: serde_json::Value =
@@ -16610,7 +17036,7 @@ mod tests {
         assert_eq!(status["onboarding"]["selected_state"], "error_redacted");
 
         drop(held);
-        isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL).unwrap();
+        isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL, None).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -16806,6 +17232,10 @@ mod tests {
 
         assert_eq!(settings.provider, ProductProviderId::Codex);
         assert_eq!(settings.model, isyncyou_agent::CodexConfig::default().model);
+        assert_eq!(
+            settings.reasoning_effort,
+            Some(isyncyou_agent::CodexReasoningEffort::Medium)
+        );
         assert!(!root.join("agent-settings.json").exists());
         let on_disk = std::fs::read_dir(agent_credential_config(&root).store_dir())
             .unwrap()
@@ -16814,6 +17244,113 @@ mod tests {
             .collect::<String>();
         assert!(!on_disk.contains(r#""provider":"codex""#));
         assert!(!on_disk.contains(&isyncyou_agent::CodexConfig::default().model));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_settings_v1_defaults_codex_reasoning_effort_to_medium() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("settings-v1-codex-effort");
+        let _ = std::fs::remove_dir_all(&root);
+        agent_credential_store(&root)
+            .unwrap()
+            .put(
+                isyncyou_agent::SecretClass::ProductSettings,
+                PRODUCT_SETTINGS_ID,
+                &isyncyou_agent::Secret::new(
+                    br#"{"schema_version":1,"provider":"codex","model":"gpt-5.5"}"#.to_vec(),
+                ),
+            )
+            .unwrap();
+
+        let settings = load_agent_provider_selection(&root).expect("v1 settings migrate on read");
+        assert_eq!(settings.provider, ProductProviderId::Codex);
+        assert_eq!(settings.model, "gpt-5.5");
+        assert_eq!(
+            settings.reasoning_effort,
+            Some(isyncyou_agent::CodexReasoningEffort::Medium)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_settings_v2_persists_closed_codex_reasoning_effort() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("settings-v2-codex-effort");
+        let _ = std::fs::remove_dir_all(&root);
+
+        store_agent_provider_selection_with_effort(&root, "codex", "gpt-5.6-terra", Some("high"))
+            .unwrap();
+        let settings = load_agent_provider_selection(&root).expect("valid v2 settings");
+        assert_eq!(settings.provider, ProductProviderId::Codex);
+        assert_eq!(settings.model, "gpt-5.6-terra");
+        assert_eq!(
+            settings.reasoning_effort,
+            Some(isyncyou_agent::CodexReasoningEffort::High)
+        );
+
+        assert_eq!(
+            store_agent_provider_selection_with_effort(&root, "codex", "gpt-5.6-sol", Some("max"),)
+                .unwrap_err(),
+            "unknown reasoning effort"
+        );
+        assert_eq!(
+            store_agent_provider_selection_with_effort(
+                &root,
+                "claude",
+                DEFAULT_MODEL,
+                Some("medium"),
+            )
+            .unwrap_err(),
+            "reasoning effort is available only for ChatGPT"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_status_exposes_gpt_5_6_models_and_closed_reasoning_efforts() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("status-codex-model-efforts");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        agent
+            .set_agent_settings_with_effort("codex", "gpt-5.6-luna", Some("xhigh"))
+            .unwrap();
+
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+        let model_ids = status["models"]["codex"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(model_ids.contains(&"gpt-5.6-sol"));
+        assert!(model_ids.contains(&"gpt-5.6-terra"));
+        assert!(model_ids.contains(&"gpt-5.6-luna"));
+        assert_eq!(status["model"], "gpt-5.6-luna");
+        assert_eq!(status["reasoning_effort"], "xhigh");
+        assert_eq!(
+            status["reasoning_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

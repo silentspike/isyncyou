@@ -163,6 +163,7 @@ pub struct ProductTurnRequest<'a> {
     pub graph_token: &'a str,
     pub session_id: &'a str,
     pub request_id: &'a str,
+    pub turn_id: &'a str,
     pub local_account: &'a str,
     pub prompt: &'a str,
     pub provider_binding: ProviderAttemptBindingV1,
@@ -171,7 +172,6 @@ pub struct ProductTurnRequest<'a> {
 }
 
 pub struct ProductTurnReplay {
-    pub turn_id: String,
     pub phase: RequestPhase,
     pub final_text: Option<String>,
     pub error_code: Option<String>,
@@ -185,10 +185,6 @@ fn validate_provider_recovery_binding(
 }
 
 impl ProductTurnRuntime {
-    pub fn turn_id(&self) -> &str {
-        &self.turn_id
-    }
-
     pub fn provider_history(
         &mut self,
         prompt: &str,
@@ -1155,6 +1151,7 @@ impl<'a> ProductSessionRegistry<'a> {
             graph_token,
             session_id,
             request_id,
+            turn_id,
             local_account,
             prompt,
             provider_binding,
@@ -1193,9 +1190,7 @@ impl<'a> ProductSessionRegistry<'a> {
             let mut final_text = None;
             let mut error_code = None;
             let mut intent_record_id = None;
-            let mut replay_turn_id = None;
             for record in replay.visible_records {
-                replay_turn_id = Some(record.turn_id.clone());
                 match record.kind {
                     SessionRecordKind::TurnIntent { .. } => {
                         intent_record_id = Some(record.record_id)
@@ -1216,8 +1211,6 @@ impl<'a> ProductSessionRegistry<'a> {
                     }
                 };
                 return Ok(ProductTurnStart::Replay(ProductTurnReplay {
-                    turn_id: replay_turn_id
-                        .ok_or_else(|| "session_store_unavailable".to_string())?,
                     phase,
                     final_text,
                     error_code,
@@ -1281,7 +1274,6 @@ impl<'a> ProductSessionRegistry<'a> {
                         .unwrap_or_default();
                     runtime.finish_final(text.clone(), None, created_at_ms)?;
                     return Ok(ProductTurnStart::Replay(ProductTurnReplay {
-                        turn_id: journal.turn_id,
                         phase: RequestPhase::Committed,
                         final_text: Some(text),
                         error_code: None,
@@ -1290,7 +1282,6 @@ impl<'a> ProductSessionRegistry<'a> {
                 return Ok(ProductTurnStart::Started(Box::new(runtime)));
             }
             return Ok(ProductTurnStart::Replay(ProductTurnReplay {
-                turn_id: journal.turn_id,
                 phase: journal.phase.recovery_phase(),
                 final_text,
                 error_code,
@@ -1308,7 +1299,10 @@ impl<'a> ProductSessionRegistry<'a> {
         let guard = store
             .acquire_lease(session_id, &lease_id, &holder_binding)
             .map_err(map_session_error)?;
-        let turn_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+        if turn_id.is_empty() || turn_id.len() > 128 {
+            return Err("session_store_unavailable".into());
+        }
+        let turn_id = turn_id.to_owned();
         let intent_record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let journal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let journal = RequestJournalV1 {
@@ -1559,6 +1553,7 @@ mod tests {
         ProviderAttemptBindingV1 {
             provider: isyncyou_agent::ProductProviderId::Codex,
             model: "model-a".into(),
+            reasoning_effort: Some("medium".into()),
             credential_generation: "generation-a".into(),
             oauth_policy_fingerprint: "policy-a".into(),
             harness_contract_version: 1,
@@ -1740,6 +1735,7 @@ mod tests {
         let recorded = ProviderAttemptBindingV1 {
             provider: isyncyou_agent::ProductProviderId::Codex,
             model: "model-a".into(),
+            reasoning_effort: Some("medium".into()),
             credential_generation: "generation-a".into(),
             oauth_policy_fingerprint: "policy-a".into(),
             harness_contract_version: 1,
@@ -1748,9 +1744,10 @@ mod tests {
         assert!(validate_provider_recovery_binding(&recorded, &recorded).is_ok());
 
         type BindingMutation = Box<dyn Fn(&mut ProviderAttemptBindingV1)>;
-        let mutations: [BindingMutation; 6] = [
+        let mutations: [BindingMutation; 7] = [
             Box::new(|binding| binding.provider = isyncyou_agent::ProductProviderId::Claude),
             Box::new(|binding| binding.model = "model-b".into()),
+            Box::new(|binding| binding.reasoning_effort = Some("high".into())),
             Box::new(|binding| binding.credential_generation = "generation-b".into()),
             Box::new(|binding| binding.oauth_policy_fingerprint = "policy-b".into()),
             Box::new(|binding| binding.harness_contract_version = 2),

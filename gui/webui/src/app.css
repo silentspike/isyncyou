@@ -1781,6 +1781,21 @@ a.note-meta-chip:hover { color: var(--accent); }
 .mdl-dot { width: 8px; height: 8px; border-radius: var(--r-full); background: var(--text-lo); opacity: .45; flex: none; transition: background .13s; }
 .mdl-item.active .mdl-dot { background: var(--grad-accent); opacity: 1; box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 70%, transparent); }
 .mdl-lbl { flex: 1; }
+.mdl-efforts {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px;
+  padding: 4px 6px 7px;
+}
+.mdl-effort {
+  min-width: 0; padding: 7px 8px; border: 1px solid var(--glass-border);
+  border-radius: var(--r-md); background: transparent; color: var(--text-mid);
+  font-size: var(--fs-sm); cursor: pointer;
+}
+.mdl-effort:hover { background: var(--accent-soft); color: var(--text-hi); }
+.mdl-effort.active {
+  border-color: var(--accent-line);
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+  color: var(--text-hi); font-weight: 600;
+}
 .mdl-connect { color: var(--accent-2); font-weight: 500; }
 .mdl-plus { width: 8px; text-align: center; font-weight: 700; flex: none; }
 /* staggered fade-in of each row when the panel opens */

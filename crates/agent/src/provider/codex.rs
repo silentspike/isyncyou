@@ -12,15 +12,46 @@ use super::{AssistantBlock, Usage};
 use crate::tool::{tool_schema, TOOL_NAME};
 use crate::turn::{Message, Role};
 use crate::AgentError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Verified Codex-CLI mimicry recipe.
 pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub(super) const ORIGINATOR: &str = crate::oauth::CODEX_OAUTH_ORIGINATOR;
-pub(super) const OPENAI_BETA: &str = "responses=experimental";
-pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.1";
-const DEFAULT_MODEL: &str = "gpt-5.5";
+pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.4";
+const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+
+/// Closed reasoning levels offered by the product UI and accepted by the Codex backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexReasoningEffort {
+    Low,
+    #[default]
+    Medium,
+    High,
+    XHigh,
+}
+
+impl CodexReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            _ => None,
+        }
+    }
+}
 
 /// The ChatGPT/Codex wire configuration. Defaults to the verified recipe; the product
 /// credential path supplies `account_id` from the encrypted store. #627 experimental
@@ -32,6 +63,7 @@ pub struct CodexConfig {
     pub account_id: String,
     pub cli_version: String,
     pub model: String,
+    pub reasoning_effort: CodexReasoningEffort,
 }
 
 impl Default for CodexConfig {
@@ -41,6 +73,7 @@ impl Default for CodexConfig {
             account_id: String::new(),
             cli_version: DEFAULT_CLI_VERSION.to_string(),
             model: DEFAULT_MODEL.to_string(),
+            reasoning_effort: CodexReasoningEffort::default(),
         }
     }
 }
@@ -96,9 +129,15 @@ pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
 
 /// Build the Responses request body. `instructions` carries the system prompt (the
 /// Responses API's top-level system field).
-pub(crate) fn build_request(model: &str, instructions: &str, history: &[Message]) -> Value {
+pub(crate) fn build_request(
+    model: &str,
+    reasoning_effort: CodexReasoningEffort,
+    instructions: &str,
+    history: &[Message],
+) -> Value {
     json!({
         "model": model,
+        "reasoning": { "effort": reasoning_effort.as_str() },
         "instructions": instructions,
         "input": build_input(history),
         "tools": responses_tools(),
@@ -106,6 +145,7 @@ pub(crate) fn build_request(model: &str, instructions: &str, history: &[Message]
         "parallel_tool_calls": false,
         "stream": true,
         "store": false,
+        "include": ["reasoning.encrypted_content"],
     })
 }
 
@@ -275,7 +315,6 @@ mod live {
                     self.cfg.account_id.clone(),
                 ),
                 ("originator".to_string(), ORIGINATOR.to_string()),
-                ("openai-beta".to_string(), OPENAI_BETA.to_string()),
                 (
                     "user-agent".to_string(),
                     format!("{ORIGINATOR}/{}", self.cfg.cli_version),
@@ -312,11 +351,17 @@ mod live {
                     access_token: &self.access_token,
                     account_id: &self.cfg.account_id,
                     model: &self.cfg.model,
+                    reasoning_effort: self.cfg.reasoning_effort,
                     instructions: &self.instructions,
                 },
                 self.cfg.responses_url.clone(),
                 self.request_headers(),
-                build_request(&self.cfg.model, &self.instructions, history),
+                build_request(
+                    &self.cfg.model,
+                    self.cfg.reasoning_effort,
+                    &self.instructions,
+                    history,
+                ),
             )?;
             let mut text = String::new();
             let mut tools: Vec<CodexToolArgs> = Vec::new();
@@ -392,20 +437,23 @@ mod tests {
             c.responses_url,
             "https://chatgpt.com/backend-api/codex/responses"
         );
-        assert_eq!(c.model, "gpt-5.5");
-        assert_eq!(c.cli_version, "0.144.1");
+        assert_eq!(c.model, "gpt-5.6-sol");
+        assert_eq!(c.reasoning_effort, CodexReasoningEffort::Medium);
+        assert_eq!(c.cli_version, "0.144.4");
     }
 
     #[test]
     fn build_request_uses_responses_shape_with_instructions_and_tool() {
         let h = vec![Message::user("find the spotify invoice")];
-        let body = build_request("gpt-5.5", "be terse", &h);
-        assert_eq!(body["model"], "gpt-5.5");
+        let body = build_request("gpt-5.6-terra", CodexReasoningEffort::High, "be terse", &h);
+        assert_eq!(body["model"], "gpt-5.6-terra");
+        assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["instructions"], "be terse");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "isyncyou");
         assert_eq!(body["input"][0]["role"], "user");
@@ -433,7 +481,6 @@ mod tests {
                 "authorization",
                 "chatgpt-account-id",
                 "originator",
-                "openai-beta",
                 "user-agent",
                 "accept",
             ]
@@ -442,8 +489,7 @@ mod tests {
         assert_eq!(get("authorization").unwrap(), "Bearer tok123");
         assert_eq!(get("chatgpt-account-id").unwrap(), "acct_123");
         assert_eq!(get("originator").unwrap(), "codex_cli_rs");
-        assert_eq!(get("openai-beta").unwrap(), "responses=experimental");
-        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.1");
+        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.4");
         assert_eq!(get("accept").unwrap(), "text/event-stream");
         assert!(get("content-type").is_none());
     }
