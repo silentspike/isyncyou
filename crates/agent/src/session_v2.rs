@@ -993,6 +993,82 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         }))
     }
 
+    /// Read only the durable lifecycle phase for a previously accepted request.
+    ///
+    /// Status lookup deliberately does not accept a payload digest: the original
+    /// semantic binding remains sealed in the UUID index and this path cannot
+    /// authorize a replay. The caller must still supply the exact closed route
+    /// domain, session scope, and canonical request UUID.
+    pub fn request_phase(
+        &self,
+        session_id: &str,
+        route: RequestRouteDomain,
+        request_id: &str,
+    ) -> Result<Option<RequestPhase>, SessionV2Error> {
+        if session_id.is_empty() || session_id.len() > 128 || !valid_uuid_v4(request_id) {
+            return Err(SessionV2Error::InvalidRequestId);
+        }
+        let current = self.transport.load_manifest(session_id)?;
+        let binding_entries = self.load_index_entries(
+            session_id,
+            SessionObjectClass::UuidBindingIndex,
+            current.manifest.uuid_binding_index_head.as_ref(),
+        )?;
+        let mut request_key = None;
+        for entry in binding_entries.iter().rev() {
+            let bytes =
+                self.load_indexed_object(session_id, SessionObjectClass::UuidBinding, entry)?;
+            let binding: RequestUuidBindingV1 =
+                serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
+            if binding.binding_version != 1
+                || binding.request_key != entry.object_id
+                || !valid_uuid_v4(&binding.request_id)
+            {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            if binding.request_id == request_id {
+                if binding.session_scope != session_id || binding.route_domain != route.canonical()
+                {
+                    return Err(SessionV2Error::InvalidRequestId);
+                }
+                request_key = Some(binding.request_key);
+                break;
+            }
+        }
+        let Some(request_key) = request_key else {
+            return Ok(None);
+        };
+
+        let request_entries = self.load_index_entries(
+            session_id,
+            SessionObjectClass::RequestIndex,
+            current.manifest.request_index_head.as_ref(),
+        )?;
+        for entry in request_entries.iter().rev() {
+            let bytes =
+                self.load_indexed_object(session_id, SessionObjectClass::RequestState, entry)?;
+            if let Ok(tombstone) = serde_json::from_slice::<IdempotencyTombstoneV1>(&bytes) {
+                if tombstone.request_key == request_key {
+                    return Ok(Some(match tombstone.terminal_status {
+                        TurnTerminalStatus::Complete => RequestPhase::Committed,
+                        TurnTerminalStatus::Cancelled => RequestPhase::Cancelled,
+                        TurnTerminalStatus::Error => RequestPhase::Failed,
+                        TurnTerminalStatus::OutcomeUnknown => RequestPhase::OutcomeUnknown,
+                    }));
+                }
+                continue;
+            }
+            let Ok(journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) else {
+                continue;
+            };
+            if journal.session_id == session_id && journal.request_id == request_id {
+                self.load_request_chain(&journal)?;
+                return Ok(Some(journal.phase.recovery_phase()));
+            }
+        }
+        Err(SessionV2Error::InvalidJournal)
+    }
+
     fn stage_index_page(
         &self,
         session_id: &str,
@@ -3272,6 +3348,62 @@ mod tests {
         assert_eq!(
             store.request_replay("s", &conflict),
             Err(SessionV2Error::RequestConflict)
+        );
+    }
+
+    #[test]
+    fn request_status_reports_started_provider_step_as_outcome_unknown() {
+        let transport = InMemorySessionV2Transport::default();
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport, &[6; 32], object_crypto());
+        let request_binding = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            "s",
+            RID,
+            payload_digest(&("account", "prompt")).unwrap(),
+        )
+        .unwrap();
+        let journal = RequestJournalV1 {
+            journal_version: REQUEST_JOURNAL_VERSION,
+            session_id: "s".into(),
+            request_id: RID.into(),
+            turn_id: ULID_A.into(),
+            provider_binding: binding(),
+            phase: RequestPhase::ProviderStepStarted,
+            next_step_seq: 0,
+            completed_steps: vec![],
+            read_checkpoints: vec![],
+        };
+        store
+            .publish(
+                &current,
+                SessionCommitV1 {
+                    visible_records: vec![record(ULID_A, ULID_A, RID, "prompt")],
+                    request_objects: vec![(ULID_B.into(), serde_json::to_vec(&journal).unwrap())],
+                    uuid_bindings: vec![request_binding],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .request_phase("s", RequestRouteDomain::AgentTurn, RID)
+                .unwrap(),
+            Some(RequestPhase::OutcomeUnknown)
+        );
+        assert_eq!(
+            store.request_phase("s", RequestRouteDomain::AgentConfirm, RID),
+            Err(SessionV2Error::InvalidRequestId)
+        );
+        assert_eq!(
+            store
+                .request_phase(
+                    "s",
+                    RequestRouteDomain::AgentTurn,
+                    "00000000-0000-4000-8000-000000000002",
+                )
+                .unwrap(),
+            None
         );
     }
 

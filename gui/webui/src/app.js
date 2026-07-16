@@ -6228,6 +6228,9 @@ function handleAgentEvent(message, turnState) {
         : "(no response)";
       turnState.message.doneReason = reason;
       turnState.finish(fallback, reason);
+      if (reason === "error" && typeof turnState.reconcileRequestStatus === "function") {
+        void turnState.reconcileRequestStatus();
+      }
       break;
     }
   }
@@ -6264,6 +6267,15 @@ async function ensureAgentSession() {
   AssistantState.selectedSessionId = session.session_id;
   AssistantState.selectedSessionAccount = App.account;
   return session.session_id;
+}
+
+async function loadAgentRequestStatus(sessionId, requestId) {
+  if (!sessionId || !requestId) throw new Error("request_status_unavailable");
+  return request("GET", "/api/v1/agent/request/status?" + qs({
+    session_id: sessionId,
+    route: "agent_turn",
+    request_id: requestId,
+  }), { capToken: CAP.agent });
 }
 
 function sessionRecordsToTranscript(records) {
@@ -6632,16 +6644,32 @@ async function agentSend(text) {
   };
 
   let turn;
+  let sessionId = null;
+  const requestId = crypto.randomUUID();
   let startingGuardId = null;
   let turnStartPosted = false;
+  const reconcileRequestStatus = async () => {
+    if (!sessionId) return null;
+    try {
+      const status = await loadAgentRequestStatus(sessionId, requestId);
+      asst.requestStatus = status;
+      if (status && status.terminal && status.code && status.code !== "ok") {
+        const copy = agentSafeErrorCopy(status.code);
+        if (!asst.errors.includes(copy)) addError(copy);
+      }
+      return status;
+    } catch (_) {
+      return null;
+    }
+  };
   try {
     startingGuardId = await beginNetworkGuard("agent_turn");
     if (BRIDGE && !startingGuardId) throw new Error("network_guard_unavailable");
     await runConnectivityPreflight(provider, "turn_start", startingGuardId);
-    const sessionId = await ensureAgentSession();
+    sessionId = await ensureAgentSession();
     turnStartPosted = true;
     const r = await postJson("/api/v1/agent/turn", CAP.agent, {
-      request_id: crypto.randomUUID(),
+      request_id: requestId,
       session_id: sessionId,
       account: App.account,
       prompt: text,
@@ -6662,6 +6690,9 @@ async function agentSend(text) {
       renderAssistantView($("#view"));
     } else {
       setText(agentSafeErrorCopy(e && e.message));
+    }
+    if (turnStartPosted && (!e || e.responseReceived !== true)) {
+      void reconcileRequestStatus();
     }
     return;
   }
@@ -6709,6 +6740,7 @@ async function agentSend(text) {
     onSearchStage,
     onPartialResult,
     finish,
+    reconcileRequestStatus,
   };
   stream = openEventStream(url, (name, data) => {
     if (name === "done") { handleAgentEvent({ event: "done", reason: "complete" }, turnState); return; }
@@ -6721,7 +6753,10 @@ async function agentSend(text) {
       return;
     }
     handleAgentEvent(d, turnState);
-  }, () => finish("⚠ connection lost"));
+  }, () => {
+    void reconcileRequestStatus();
+    finish("⚠ connection lost");
+  });
   AssistantState.activeStream = stream;
 }
 

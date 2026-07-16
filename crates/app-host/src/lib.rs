@@ -614,10 +614,13 @@ fn terminal_events_after_persistence(
 ) -> Vec<isyncyou_agent::StreamEvent> {
     match persisted {
         Ok(()) => vec![isyncyou_agent::StreamEvent::done(success)],
-        Err(_) => vec![
-            isyncyou_agent::StreamEvent::Error("lease_lost".into()),
-            isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
-        ],
+        Err(error) => {
+            let safe = agent_safe_turn_error(&isyncyou_agent::AgentError::Provider(error));
+            vec![
+                isyncyou_agent::StreamEvent::Error(safe.into()),
+                isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
+            ]
+        }
     }
 }
 
@@ -8186,6 +8189,89 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         )))]
         {
             let _ = (session_id, cursor, limit);
+            Err("product_sessions_unavailable".into())
+        }
+    }
+
+    fn request_status(
+        &self,
+        session_id: &str,
+        route: &str,
+        request_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if route != "agent_turn" {
+                return Err("invalid_request_route".into());
+            }
+            let store = agent_credential_store(&self.oauth_dir)
+                .map_err(|_| "session_store_unavailable".to_string())?;
+            let registry = product_session::ProductSessionRegistry::new(&store);
+            let account = registry.account_for(session_id)?;
+            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
+                .map_err(|_| "session_transport_unavailable".to_string())?;
+            let phase = registry
+                .open(&token, session_id)?
+                .request_phase(
+                    session_id,
+                    isyncyou_agent::RequestRouteDomain::AgentTurn,
+                    request_id,
+                )
+                .map_err(|error| match error {
+                    isyncyou_agent::SessionV2Error::InvalidRecord
+                    | isyncyou_agent::SessionV2Error::InvalidJournal => {
+                        "session_state_invalid".to_string()
+                    }
+                    isyncyou_agent::SessionV2Error::InvalidRequestId => {
+                        "invalid_request_id".to_string()
+                    }
+                    isyncyou_agent::SessionV2Error::ManifestConflict
+                    | isyncyou_agent::SessionV2Error::LeaseLost => "lease_lost".to_string(),
+                    isyncyou_agent::SessionV2Error::TransportUnavailable => {
+                        "session_transport_unavailable".to_string()
+                    }
+                    _ => "session_store_unavailable".to_string(),
+                })?
+                .ok_or_else(|| "request_not_found".to_string())?;
+            let (state, code, terminal, resume_allowed) = match phase {
+                isyncyou_agent::RequestPhase::Accepted => {
+                    ("accepted", "request_resume_required", false, true)
+                }
+                isyncyou_agent::RequestPhase::ProviderStepStarted
+                | isyncyou_agent::RequestPhase::OutcomeUnknown => {
+                    ("outcome_unknown", "turn_outcome_unknown", true, false)
+                }
+                isyncyou_agent::RequestPhase::ProviderStepCompleted => (
+                    "provider_step_completed",
+                    "request_resume_required",
+                    false,
+                    true,
+                ),
+                isyncyou_agent::RequestPhase::PendingConfirmation => {
+                    ("pending_confirmation", "pending_confirmation", true, false)
+                }
+                isyncyou_agent::RequestPhase::Committed => ("committed", "ok", true, false),
+                isyncyou_agent::RequestPhase::Failed => ("failed", "turn_failed", true, false),
+                isyncyou_agent::RequestPhase::Cancelled => {
+                    ("cancelled", "turn_cancelled", true, false)
+                }
+            };
+            Ok(serde_json::json!({
+                "state": state,
+                "code": code,
+                "terminal": terminal,
+                "resume_allowed": resume_allowed,
+            }))
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (session_id, route, request_id);
             Err("product_sessions_unavailable".into())
         }
     }
@@ -22332,6 +22418,28 @@ fn persist_failure_emits_error_and_done_error_not_complete() {
         isyncyou_agent::StreamEvent::Done {
             reason: isyncyou_agent::DoneReason::Error
         }
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn persist_failure_serializes_only_safe_session_code() {
+    let events = terminal_events_after_persistence(
+        Err("invalid_request_journal".into()),
+        isyncyou_agent::DoneReason::Complete,
+    );
+    assert!(matches!(
+        &events[0],
+        isyncyou_agent::StreamEvent::Error(code) if code == "session_state_invalid"
+    ));
+
+    let redacted = terminal_events_after_persistence(
+        Err("provider secret response text".into()),
+        isyncyou_agent::DoneReason::Complete,
+    );
+    assert!(matches!(
+        &redacted[0],
+        isyncyou_agent::StreamEvent::Error(code) if code == "provider_request_failed"
     ));
 }
 

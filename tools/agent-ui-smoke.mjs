@@ -158,6 +158,7 @@ function makeFixtureServer(evidence) {
   let failNextSessionCreate = false;
   const sessions = new Map();
   const turns = new Map();
+  const requestScenarios = new Map();
   const state = {
     accountLoginStarts: [],
     accountLoginCancels: [],
@@ -168,6 +169,7 @@ function makeFixtureServer(evidence) {
     cancelPosts: [],
     viewHits: [],
     streamScenarios: [],
+    requestStatusReads: [],
   };
 
   // #639 T10: the host onboarding projection the wizard renders (per-provider readiness + steps).
@@ -365,6 +367,15 @@ function makeFixtureServer(evidence) {
         const session = sessions.get(url.searchParams.get("session_id"));
         if (!session) return json(res, 404, { error: "session_not_found" });
         json(res, 200, { records: session.records, next_cursor: null });
+      } else if (req.method === "GET" && url.pathname === "/api/v1/agent/request/status") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const requestId = url.searchParams.get("request_id") || "";
+        const scenario = requestScenarios.get(requestId);
+        state.requestStatusReads.push({ matched: Boolean(scenario) });
+        if (!scenario) return json(res, 404, { error: "request_not_found" });
+        json(res, 200, scenario === "error"
+          ? { state: "outcome_unknown", code: "turn_outcome_unknown", terminal: true, resume_allowed: false }
+          : { state: "committed", code: "ok", terminal: true, resume_allowed: false });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/turn") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         const body = await readJson(req);
@@ -376,6 +387,7 @@ function makeFixtureServer(evidence) {
             : lower.includes("delete") || lower.includes("confirm") ? "pending-confirm"
               : "normal";
         turns.set(turn, scenario);
+        requestScenarios.set(body.request_id, scenario);
         json(res, 200, { turn });
       } else if (req.method === "GET" && url.pathname === "/api/v1/agent/stream") {
         const turn = url.searchParams.get("turn") || "";
@@ -535,6 +547,7 @@ function evidenceForWrite(evidence, state) {
       account_login_start_count: state.accountLoginStarts.length,
       account_login_cancel_count: state.accountLoginCancels.length,
       view_hit_count: state.viewHits.length,
+      request_status_count: state.requestStatusReads.length,
       stream_scenarios: state.streamScenarios.map(({ scenario }) => scenario),
     },
     screenshots: evidence.screenshots,
@@ -914,10 +927,12 @@ async function main() {
 
     await page.locator('[data-testid="agent-input"]').fill("trigger error");
     await page.locator('[data-testid="agent-send"]').click();
-    await page.waitForFunction(() => document.body.innerText.includes("The assistant could not complete this request."), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.body.innerText.includes("The turn may have reached the provider"), null, { timeout: 10000 });
     const errorText = await pageText(page);
-    assert(evidence, "error stream renders only redacted safe copy",
-      errorText.includes("The assistant could not complete this request.")
+    assert(evidence, "ambiguous provider outcome is reconciled without automatic replay",
+      errorText.includes("The turn may have reached the provider")
+      && fixture.state.requestStatusReads.length >= 1
+      && fixture.state.requestStatusReads.every((entry) => entry.matched === true)
       && !errorText.includes("raw-fixture-provider-error"));
 
     await page.setViewportSize({ width: 390, height: 844 });

@@ -665,8 +665,12 @@ fn parse_bounded_page_limit(value: Option<&str>) -> Result<Option<usize>, ApiRes
 
 fn agent_session_error_status(error: &str) -> u16 {
     match error {
-        "invalid_cursor" | "invalid_session_name" | "invalid_session_record" => 400,
-        "session_not_found" => 404,
+        "invalid_cursor"
+        | "invalid_request_id"
+        | "invalid_request_route"
+        | "invalid_session_name"
+        | "invalid_session_record" => 400,
+        "request_not_found" | "session_not_found" => 404,
         "manifest_conflict"
         | "provider_generation_changed"
         | "request_id_conflict"
@@ -1163,6 +1167,15 @@ pub trait AgentHandler: Send + Sync {
         _limit: Option<usize>,
     ) -> Result<serde_json::Value, String> {
         Err("product sessions are not enabled on this server".into())
+    }
+
+    fn request_status(
+        &self,
+        _session_id: &str,
+        _route: &str,
+        _request_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("product request status is not enabled on this server".into())
     }
 
     fn session_archive(
@@ -2972,6 +2985,7 @@ impl Router {
             "/api/v1/agent/status" => self.agent_status(req),
             "/api/v1/agent/session/list" => self.agent_session_list(req),
             "/api/v1/agent/session/history" => self.agent_session_history(req),
+            "/api/v1/agent/request/status" => self.agent_request_status(req),
             // app.js carries the (same-origin) capability tokens so the UI can POST
             // restore/share/sync; empty when an action is disabled, hiding its UI.
             "/app.js" => ApiResponse {
@@ -6057,6 +6071,38 @@ impl Router {
             Err(error) => return error,
         };
         match handler.session_history(session_id, cursor, limit) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_request_status(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        const FIELDS: [&str; 3] = ["session_id", "route", "request_id"];
+        if req.query.len() != FIELDS.len()
+            || FIELDS
+                .iter()
+                .any(|field| req.query.iter().filter(|(name, _)| name == field).count() != 1)
+            || req
+                .query
+                .iter()
+                .any(|(name, _)| !FIELDS.contains(&name.as_str()))
+        {
+            return no_store_json_error(400, "invalid agent request status query");
+        }
+        let Some(session_id) = req.q("session_id").filter(|id| valid_opaque_agent_id(id)) else {
+            return no_store_json_error(400, "invalid agent request status query");
+        };
+        let Some(request_id) = req.q("request_id").filter(|id| valid_client_request_id(id)) else {
+            return no_store_json_error(400, "invalid agent request status query");
+        };
+        let Some(route) = req.q("route").filter(|route| *route == "agent_turn") else {
+            return no_store_json_error(400, "invalid agent request status query");
+        };
+        match handler.request_status(session_id, route, request_id) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
             Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
         }
@@ -9339,6 +9385,22 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "next_cursor": null,
             }))
         }
+        fn request_status(
+            &self,
+            session_id: &str,
+            route: &str,
+            request_id: &str,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "session_scope_valid": session_id == "01JSESSION00000000000000000",
+                "route": route,
+                "request_id_valid": request_id == "123e4567-e89b-42d3-a456-426614174000",
+                "state": "outcome_unknown",
+                "code": "turn_outcome_unknown",
+                "terminal": true,
+                "resume_allowed": false,
+            }))
+        }
         fn session_archive(
             &self,
             request: AgentSessionArchiveRequest,
@@ -9683,6 +9745,27 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         assert_eq!(missing_cap.status, 401);
 
+        let status_path = format!(
+            "/api/v1/agent/request/status?session_id={SESSION_ID}&route=agent_turn&request_id={REQUEST_ID}"
+        );
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("GET", &status_path)
+                        .with_cap_token(Some("agentsecret".into())),
+                )
+                .status,
+            401
+        );
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("GET", &status_path).with_session_token(Some("sess".into())),
+                )
+                .status,
+            401
+        );
+
         let created = router.route(&create());
         assert_eq!(created.status, 200);
         assert_eq!(body_json(&created)["selected_session_id"], SESSION_ID);
@@ -9731,6 +9814,35 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         )));
         assert_eq!(history.status, 200);
         assert_eq!(body_json(&history)["session_id"], SESSION_ID);
+        let request_status = router.route(&authenticated(ApiRequest::new(
+            "GET",
+            &format!(
+                "/api/v1/agent/request/status?session_id={SESSION_ID}&route=agent_turn&request_id={REQUEST_ID}"
+            ),
+        )));
+        assert_eq!(request_status.status, 200);
+        assert_eq!(body_json(&request_status)["code"], "turn_outcome_unknown");
+        assert!(request_status.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
+        for query in [
+            format!(
+                "/api/v1/agent/request/status?session_id={SESSION_ID}&route=unknown&request_id={REQUEST_ID}"
+            ),
+            format!(
+                "/api/v1/agent/request/status?session_id={SESSION_ID}&route=agent_turn&request_id={REQUEST_ID}&extra=1"
+            ),
+            format!(
+                "/api/v1/agent/request/status?session_id={SESSION_ID}&route=agent_turn&route=agent_turn&request_id={REQUEST_ID}"
+            ),
+        ] {
+            assert_eq!(
+                router
+                    .route(&authenticated(ApiRequest::new("GET", &query)))
+                    .status,
+                400
+            );
+        }
 
         let presence = router.route(&authenticated(
             ApiRequest::new("POST", "/api/v1/agent/user-presence/start")
