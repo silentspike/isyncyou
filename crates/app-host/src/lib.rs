@@ -417,6 +417,11 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn agent_safe_turn_start_error(error: &str) -> &'static str {
     match error {
         "product_not_ready" => "product_not_ready",
@@ -432,6 +437,11 @@ fn agent_safe_turn_start_error(error: &str) -> &'static str {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn turn_id_from_request_id(request_id: &str) -> Result<String, String> {
     const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let compact = request_id.replace('-', "");
@@ -447,6 +457,11 @@ fn turn_id_from_request_id(request_id: &str) -> Result<String, String> {
     String::from_utf8(encoded.to_vec()).map_err(|_| "invalid_request_id".into())
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn turn_admission_digest(request: &isyncyou_webui::AgentTurnRequest) -> [u8; 32] {
     let mut input = Vec::with_capacity(
         32 + request.session_id.len() + request.account.len() + request.prompt.len(),
@@ -466,13 +481,28 @@ fn turn_admission_digest(request: &isyncyou_webui::AgentTurnRequest) -> [u8; 32]
     result
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 const MAX_ACTIVE_TURN_ADMISSIONS: usize = 256;
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 #[derive(Default)]
 struct TurnAdmissionRegistry {
     bindings: Mutex<HashMap<String, [u8; 32]>>,
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 impl TurnAdmissionRegistry {
     fn reserve(
         self: &Arc<Self>,
@@ -507,17 +537,32 @@ impl TurnAdmissionRegistry {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 struct TurnAdmissionLease {
     registry: Arc<TurnAdmissionRegistry>,
     turn_id: String,
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 impl Drop for TurnAdmissionLease {
     fn drop(&mut self) {
         self.registry.release(&self.turn_id);
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn spawn_agent_turn_admission(task: impl FnOnce() + Send + 'static) -> Result<(), String> {
     std::thread::Builder::new()
         .name("agent-turn-admission".into())
@@ -1488,6 +1533,11 @@ pub struct DaemonAgent {
     confirmed_executor: Arc<dyn AgentConfirmedActionExecutor>,
     audit_sink: Arc<dyn AgentAuditSink>,
     streams: Mutex<std::collections::HashMap<String, AgentStreamSlot>>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental",
+        test
+    ))]
     turn_admissions: Arc<TurnAdmissionRegistry>,
     #[cfg_attr(
         not(any(
@@ -1665,6 +1715,11 @@ impl DaemonAgent {
             confirmed_executor,
             audit_sink,
             streams: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental",
+                test
+            ))]
             turn_admissions: Arc::new(TurnAdmissionRegistry::default()),
             last_usage: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(any(
