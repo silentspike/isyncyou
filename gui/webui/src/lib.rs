@@ -10550,15 +10550,25 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(guard < preflight && preflight < json_start && json_start < browser);
 
         let connect = APP_JS
-            .split("async function connectAgentProvider(provider)")
+            .split("async function connectAgentProvider(provider, lifecycleNode = null)")
             .nth(1)
             .unwrap()
             .split("async function pickModel")
             .next()
             .unwrap();
+        assert!(connect.contains("lifecycle.state === \"awaiting_oauth_login\""));
+        assert!(connect.contains("await continueLifecycleOAuth(provider, lifecycle)"));
         assert!(connect.contains("await startAiLogin(provider)"));
-        assert!(APP_JS.contains("connectAgentProvider(\"claude\")"));
+        assert!(APP_JS.contains("connectAgentProvider(\"claude\", claudeLifecycle)"));
+        assert!(APP_JS.contains("connectAgentProvider(\"codex\", codexLifecycle)"));
         assert!(APP_JS.contains("await connectAgentProvider(\"codex\")"));
+    }
+
+    #[test]
+    fn assistant_connect_action_resumes_oauth_without_duplicate_lifecycle_button() {
+        assert!(APP_JS.contains("claudeContinuing ? \"Continue Claude sign-in\""));
+        assert!(APP_JS.contains("codexContinuing ? \"Continue ChatGPT sign-in\""));
+        assert!(!APP_JS.contains("lifecycleActionButton(\"Continue sign-in\""));
     }
 
     #[test]
@@ -13253,7 +13263,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "\"data-agent-model-option\": val",
             "\"data-agent-model-connect\": \"claude\"",
             "\"data-agent-model-connect\": \"codex\"",
-            "async function connectAgentProvider(provider)",
+            "async function connectAgentProvider(provider, lifecycleNode = null)",
             "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
             "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
             "const efforts = st.reasoning_efforts || [];",
@@ -13371,11 +13381,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
         for needle in [
             "id: \"asst-connect-claude\"",
-            "startAccountLifecycle(\"claude\", \"reconnect\", claudeLifecycle) : startAiLogin(\"claude\")",
+            "connectAgentProvider(\"claude\", claudeLifecycle)",
             "\"data-testid\": \"agent-connect-claude\"",
             "id: \"asst-connect-codex\"",
-            "startAccountLifecycle(\"codex\", \"reconnect\", codexLifecycle) : startAiLogin(\"codex\")",
+            "connectAgentProvider(\"codex\", codexLifecycle)",
             "\"data-testid\": \"agent-connect-codex\"",
+            "lifecycle.state === \"awaiting_oauth_login\" && lifecycle.resume_operation_id",
+            "await continueLifecycleOAuth(provider, lifecycle)",
         ] {
             assert!(
                 APP_JS.contains(needle),

@@ -5062,10 +5062,6 @@ function renderAssistantLifecycleControls(st) {
         "data-agent-lifecycle-resume": resumeAction,
         "data-agent-lifecycle-provider": provider,
       }, () => resumeAccountLifecycle(provider, node, resumeAction), false));
-    } else if (node.state === "awaiting_oauth_login") {
-      actions.push(lifecycleActionButton("Continue sign-in", "log-in", {
-        "data-agent-lifecycle-continue-oauth": provider,
-      }, () => continueLifecycleOAuth(provider, node), false));
     } else if (node.credential_etag) {
       actions.push(lifecycleActionButton(`Disconnect ${lifecycleProviderName(provider)}`, "log-out", {
         "data-agent-lifecycle-action": "disconnect",
@@ -5394,7 +5390,7 @@ async function acceptAgentPrivacyConsent(provider) {
   AssistantState.pendingModelSelection = null;
   await renderAssistantView($("#view"));
   if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model, resumeModel.reasoning_effort);
-  else if (resumeConnect) await startAiLogin(consentProvider);
+  else if (resumeConnect) await connectAgentProvider(consentProvider);
 }
 function resetAgentPrivacyConsent() {
   AssistantState.pendingConnectProvider = null;
@@ -5517,12 +5513,12 @@ function renderAssistantWizard(body, st) {
       : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login, then hands off to the iSyncYou assistant.";
   const claudeLifecycle = accountLifecycleNode(st, "claude");
   const codexLifecycle = accountLifecycleNode(st, "codex");
-  const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => claudeLifecycle && claudeLifecycle.credential_etag
-    ? startAccountLifecycle("claude", "reconnect", claudeLifecycle) : startAiLogin("claude"), "data-testid": "agent-connect-claude" },
-    icon("sparkles", "icon-sm"), reconnect && wizardProvider === "claude" ? "Reconnect Claude" : "Connect Claude");
-  const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => codexLifecycle && codexLifecycle.credential_etag
-    ? startAccountLifecycle("codex", "reconnect", codexLifecycle) : startAiLogin("codex"), "data-testid": "agent-connect-codex" },
-    icon("sparkles", "icon-sm"), reconnect && wizardProvider === "codex" ? "Reconnect ChatGPT" : "Connect ChatGPT");
+  const claudeContinuing = claudeLifecycle && claudeLifecycle.state === "awaiting_oauth_login";
+  const codexContinuing = codexLifecycle && codexLifecycle.state === "awaiting_oauth_login";
+  const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => connectAgentProvider("claude", claudeLifecycle), "data-testid": "agent-connect-claude" },
+    icon("sparkles", "icon-sm"), claudeContinuing ? "Continue Claude sign-in" : reconnect && wizardProvider === "claude" ? "Reconnect Claude" : "Connect Claude");
+  const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => connectAgentProvider("codex", codexLifecycle), "data-testid": "agent-connect-codex" },
+    icon("sparkles", "icon-sm"), codexContinuing ? "Continue ChatGPT sign-in" : reconnect && wizardProvider === "codex" ? "Reconnect ChatGPT" : "Connect ChatGPT");
   if (unavailable || !claudeAllowed) {
     claude.setAttribute("disabled", "disabled");
   }
@@ -5740,13 +5736,17 @@ function agentModelSwitcher(st) {
   wrap.append(trigger, el("div", { class: "mdl-panel", role: "listbox" }, ...rows));
   return wrap;
 }
-async function connectAgentProvider(provider) {
+async function connectAgentProvider(provider, lifecycleNode = null) {
   if (!agentPrivacyConsentAccepted(provider)) {
     AssistantState.pendingConnectProvider = agentProviderConsentId(provider);
     await renderAssistantView($("#view"));
     return;
   }
-  const lifecycle = accountLifecycleNode(AssistantState.status, provider);
+  const lifecycle = lifecycleNode || accountLifecycleNode(AssistantState.status, provider);
+  if (lifecycle && lifecycle.state === "awaiting_oauth_login" && lifecycle.resume_operation_id) {
+    await continueLifecycleOAuth(provider, lifecycle);
+    return;
+  }
   if (lifecycle && lifecycle.credential_etag) {
     await startAccountLifecycle(provider, "reconnect", lifecycle);
     return;
