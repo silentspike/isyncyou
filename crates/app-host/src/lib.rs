@@ -918,6 +918,27 @@ fn consume_mobile_connectivity_snapshot(
     })
 }
 
+fn connectivity_snapshot_for_transport<'a>(
+    request: &'a isyncyou_webui::AgentConnectivityPreflightRequest,
+    session_token: Option<&str>,
+    mobile_bridge: bool,
+) -> Result<Option<&'a str>, String> {
+    if mobile_bridge {
+        if session_token.is_none() {
+            return Err("mobile connectivity session is required".into());
+        }
+        return request
+            .snapshot_id
+            .as_deref()
+            .map(Some)
+            .ok_or_else(|| "mobile connectivity snapshot is required".into());
+    }
+    if request.snapshot_id.is_some() {
+        return Err("desktop connectivity snapshot is not allowed".into());
+    }
+    Ok(None)
+}
+
 struct AgentStreamSlot {
     rx: std::sync::mpsc::Receiver<String>,
     created_at_ms: u64,
@@ -8602,27 +8623,27 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         &self,
         request: isyncyou_webui::AgentConnectivityPreflightRequest,
     ) -> Result<isyncyou_webui::AgentConnectivityPreflightResponse, String> {
-        self.connectivity_preflight_with_session(request, None)
+        self.connectivity_preflight_with_session(request, None, false)
     }
 
     fn connectivity_preflight_with_session(
         &self,
         request: isyncyou_webui::AgentConnectivityPreflightRequest,
         session_token: Option<&str>,
+        mobile_bridge: bool,
     ) -> Result<isyncyou_webui::AgentConnectivityPreflightResponse, String> {
         let provider = isyncyou_agent::ConnectivityProvider::parse(&request.provider)
             .ok_or_else(|| "unknown provider".to_string())?;
         let purpose = isyncyou_agent::ConnectivityPurpose::parse(&request.purpose)
             .ok_or_else(|| "unknown connectivity purpose".to_string())?;
+        let snapshot_id =
+            connectivity_snapshot_for_transport(&request, session_token, mobile_bridge)?;
         let preflight = match CONNECTIVITY_PROBES.try_acquire() {
             None => isyncyou_agent::classify(None, None),
             Some(_permit) => {
                 // Do not consume the single-use mobile handle until the request has passed
                 // every local admission check and will actually run a probe.
-                if session_token.is_some() && request.snapshot_id.is_none() {
-                    return Err("mobile connectivity snapshot is required".into());
-                }
-                let consumed_snapshot = match request.snapshot_id.as_deref() {
+                let consumed_snapshot = match snapshot_id {
                     Some(snapshot_id) => Some(consume_mobile_connectivity_snapshot(
                         snapshot_id,
                         session_token,
@@ -19176,11 +19197,42 @@ mod tests {
                 snapshot_id: None,
             },
             Some("mobile-session"),
+            true,
         );
 
         assert_eq!(
             result.unwrap_err(),
             "mobile connectivity snapshot is required"
+        );
+    }
+
+    #[test]
+    fn connectivity_preflight_desktop_cookie_session_does_not_require_mobile_snapshot() {
+        let request = isyncyou_webui::AgentConnectivityPreflightRequest {
+            provider: "codex".into(),
+            purpose: "oauth_start".into(),
+            snapshot_id: None,
+        };
+
+        assert_eq!(
+            connectivity_snapshot_for_transport(&request, Some("desktop-cookie-session"), false)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn connectivity_preflight_desktop_rejects_android_snapshot_handle() {
+        let request = isyncyou_webui::AgentConnectivityPreflightRequest {
+            provider: "codex".into(),
+            purpose: "oauth_start".into(),
+            snapshot_id: Some("opaque-mobile-handle".into()),
+        };
+
+        assert_eq!(
+            connectivity_snapshot_for_transport(&request, Some("desktop-cookie-session"), false)
+                .unwrap_err(),
+            "desktop connectivity snapshot is not allowed"
         );
     }
 
@@ -19261,6 +19313,7 @@ mod tests {
                     snapshot_id: Some(id),
                 },
                 Some("hook-session-preflight"),
+                true,
             )
             .expect("forced diagnostic returns a closed response");
         assert_eq!(response.status, "unavailable");

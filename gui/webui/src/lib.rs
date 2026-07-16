@@ -102,6 +102,9 @@ pub struct ApiRequest {
     /// Trusted Android bridge observation. The WebView cannot set this value because
     /// Kotlin strips and replaces the corresponding header.
     pub storage_not_low: Option<bool>,
+    /// True only for requests dispatched by the in-process Android message bridge.
+    /// HTTP headers, cookies, and JavaScript cannot set this transport provenance.
+    pub mobile_bridge: bool,
     /// Normalized inbound `Content-Type`. Only newly introduced JSON routes depend on
     /// this; legacy query/body routes intentionally retain their existing contract.
     pub content_type: Option<String>,
@@ -123,6 +126,7 @@ impl std::fmt::Debug for ApiRequest {
             .field("has_capability", &self.cap_token.is_some())
             .field("has_session", &self.session_token.is_some())
             .field("has_per_action", &self.per_action_token.is_some())
+            .field("mobile_bridge", &self.mobile_bridge)
             .field("has_content_type", &self.content_type.is_some())
             .finish()
     }
@@ -151,6 +155,7 @@ impl ApiRequest {
             session_token: None,
             per_action_token: None,
             storage_not_low: None,
+            mobile_bridge: false,
             content_type: None,
             body: Vec::new(),
         }
@@ -175,6 +180,11 @@ impl ApiRequest {
 
     pub fn with_storage_not_low(mut self, value: Option<bool>) -> Self {
         self.storage_not_low = value;
+        self
+    }
+
+    pub fn with_mobile_bridge(mut self, mobile_bridge: bool) -> Self {
+        self.mobile_bridge = mobile_bridge;
         self
     }
 
@@ -1227,6 +1237,7 @@ pub trait AgentHandler: Send + Sync {
         &self,
         request: AgentConnectivityPreflightRequest,
         _session_token: Option<&str>,
+        _mobile_bridge: bool,
     ) -> Result<AgentConnectivityPreflightResponse, String> {
         self.connectivity_preflight(request)
     }
@@ -6421,9 +6432,11 @@ impl Router {
             Ok(request) => request,
             Err(_) => return no_store_json_error(400, "invalid connectivity preflight request"),
         };
-        let response = match handler
-            .connectivity_preflight_with_session(request, req.session_token.as_deref())
-        {
+        let response = match handler.connectivity_preflight_with_session(
+            request,
+            req.session_token.as_deref(),
+            req.mobile_bridge,
+        ) {
             Ok(response) => response,
             Err(_) => return no_store_json_error(503, "connectivity preflight unavailable"),
         };

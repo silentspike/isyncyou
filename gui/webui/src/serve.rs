@@ -270,7 +270,7 @@ pub fn parse_request_line(line: &str) -> Option<(String, String)> {
 /// effective session token (explicit `X-Session-Token`, else the `isy_session` loopback
 /// cookie) and attach the cap-token + body. Shared by the HTTP [`handle`] loop and the
 /// in-process [`dispatch_message`] bridge so both transports route **identically** (#0A).
-fn build_request(request: BridgeDispatchRequest<'_>) -> ApiRequest {
+fn build_request(request: BridgeDispatchRequest<'_>, mobile_bridge: bool) -> ApiRequest {
     let session_token = request.session_token.or_else(|| {
         request
             .cookie
@@ -282,6 +282,7 @@ fn build_request(request: BridgeDispatchRequest<'_>) -> ApiRequest {
         .with_session_token(session_token)
         .with_per_action_token(request.per_action_token)
         .with_storage_not_low(request.storage_not_low)
+        .with_mobile_bridge(mobile_bridge)
         .with_content_type(request.content_type)
         .with_body(request.body)
 }
@@ -318,7 +319,7 @@ pub fn dispatch_message(router: &Router, request: BridgeDispatchRequest<'_>) -> 
     {
         return ApiResponse::error(400, "application/json required");
     }
-    router.route(&build_request(request))
+    router.route(&build_request(request, true))
 }
 
 fn valid_json_content_type(value: &str) -> bool {
@@ -780,17 +781,20 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             .as_deref()
             .or(cookie_session.as_deref());
         if target.starts_with("/api/v1/") && !router.session_authorized(session) {
-            let request = build_request(BridgeDispatchRequest {
-                method: &method,
-                target: &target,
-                cap_token: headers.cap_token.clone(),
-                session_token: headers.session_token.clone(),
-                per_action_token: headers.per_action_token.clone(),
-                cookie: headers.cookie.clone(),
-                content_type: headers.content_type.clone(),
-                storage_not_low: headers.storage_not_low,
-                body: Vec::new(),
-            });
+            let request = build_request(
+                BridgeDispatchRequest {
+                    method: &method,
+                    target: &target,
+                    cap_token: headers.cap_token.clone(),
+                    session_token: headers.session_token.clone(),
+                    per_action_token: headers.per_action_token.clone(),
+                    cookie: headers.cookie.clone(),
+                    content_type: headers.content_type.clone(),
+                    storage_not_low: headers.storage_not_low,
+                    body: Vec::new(),
+                },
+                false,
+            );
             let response = router.route(&request);
             stream.write_all(&format_http(&response))?;
             stream.flush()?;
@@ -847,17 +851,20 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
         // Build the routed request from the same transport-agnostic path the in-process
         // bridge uses (#0A): explicit `X-Session-Token`, else the `isy_session` loopback
         // cookie that auto-rides iframe/img/EventSource subresource requests.
-        let req = build_request(BridgeDispatchRequest {
-            method: &method,
-            target: &target,
-            cap_token: headers.cap_token.clone(),
-            session_token: headers.session_token.clone(),
-            per_action_token: headers.per_action_token.clone(),
-            cookie: headers.cookie.clone(),
-            content_type: headers.content_type.clone(),
-            storage_not_low: headers.storage_not_low,
-            body,
-        });
+        let req = build_request(
+            BridgeDispatchRequest {
+                method: &method,
+                target: &target,
+                cap_token: headers.cap_token.clone(),
+                session_token: headers.session_token.clone(),
+                per_action_token: headers.per_action_token.clone(),
+                cookie: headers.cookie.clone(),
+                content_type: headers.content_type.clone(),
+                storage_not_low: headers.storage_not_low,
+                body,
+            },
+            false,
+        );
         // SSE change stream: a long-lived connection that bypasses the one-shot
         // response model. Reached only after header validation, so the same
         // loopback/origin rules apply; needs the injected EventBus (daemon only).
@@ -1995,38 +2002,61 @@ mod tests {
     fn build_request_resolves_cookie_session_and_carries_body() {
         // #0A: the shared request builder carries the body and resolves the session from
         // the loopback cookie when no explicit header is present.
-        let r = build_request(BridgeDispatchRequest {
-            method: "POST",
-            target: "/api/v1/x?a=1",
-            cap_token: Some("cap-1".into()),
-            session_token: None,
-            per_action_token: Some("pat-1".into()),
-            cookie: Some("other=z; isy_session=cook-tok".into()),
-            content_type: Some("application/json".into()),
-            storage_not_low: None,
-            body: b"hello-body".to_vec(),
-        });
+        let r = build_request(
+            BridgeDispatchRequest {
+                method: "POST",
+                target: "/api/v1/x?a=1",
+                cap_token: Some("cap-1".into()),
+                session_token: None,
+                per_action_token: Some("pat-1".into()),
+                cookie: Some("other=z; isy_session=cook-tok".into()),
+                content_type: Some("application/json".into()),
+                storage_not_low: None,
+                body: b"hello-body".to_vec(),
+            },
+            false,
+        );
         assert_eq!(r.method, "POST");
         assert_eq!(r.path, "/api/v1/x");
         assert_eq!(r.cap_token.as_deref(), Some("cap-1"));
         assert_eq!(r.session_token.as_deref(), Some("cook-tok"));
         assert_eq!(r.per_action_token.as_deref(), Some("pat-1"));
+        assert!(!r.mobile_bridge);
         assert_eq!(r.content_type.as_deref(), Some("application/json"));
         assert_eq!(r.body, b"hello-body");
         // An explicit X-Session-Token header wins over the cookie.
-        let r2 = build_request(BridgeDispatchRequest {
-            method: "GET",
-            target: "/api/v1/x",
-            cap_token: None,
-            session_token: Some("hdr-tok".into()),
-            per_action_token: None,
-            cookie: Some("isy_session=cook-tok".into()),
-            content_type: None,
-            storage_not_low: None,
-            body: Vec::new(),
-        });
+        let r2 = build_request(
+            BridgeDispatchRequest {
+                method: "GET",
+                target: "/api/v1/x",
+                cap_token: None,
+                session_token: Some("hdr-tok".into()),
+                per_action_token: None,
+                cookie: Some("isy_session=cook-tok".into()),
+                content_type: None,
+                storage_not_low: None,
+                body: Vec::new(),
+            },
+            false,
+        );
         assert_eq!(r2.session_token.as_deref(), Some("hdr-tok"));
         assert!(r2.body.is_empty());
+
+        let bridge = build_request(
+            BridgeDispatchRequest {
+                method: "GET",
+                target: "/api/v1/x",
+                cap_token: None,
+                session_token: Some("native-session".into()),
+                per_action_token: None,
+                cookie: None,
+                content_type: None,
+                storage_not_low: Some(true),
+                body: Vec::new(),
+            },
+            true,
+        );
+        assert!(bridge.mobile_bridge);
     }
 
     #[test]
