@@ -101,10 +101,21 @@ async function main() {
               login_id: `fixture-login-${state.loginSequence}`,
               authorization_uri: "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?prompt=select_account",
             };
-          } else if (url.pathname === "/api/v1/account/login/poll") value = { state: "pending" };
+          } else if (url.pathname === "/api/v1/account/login/poll") {
+            if (state.failNextPoll) {
+              state.failNextPoll = false;
+              reply({ t: "res", id: msg.id, status: 503, body: JSON.stringify({ error: "unavailable" }) });
+              return;
+            }
+            value = { state: "pending" };
+          }
           else if (url.pathname === "/api/v1/account/login/cancel") {
             state.events.push("request:cancel");
             value = { cancelled: true };
+            if (state.cancelDelayMs) {
+              setTimeout(() => reply({ t: "res", id: msg.id, status: 200, body: JSON.stringify(value) }), state.cancelDelayMs);
+              return;
+            }
           }
           reply({ t: "res", id: msg.id, status: 200, body: JSON.stringify(value) });
         },
@@ -118,6 +129,12 @@ async function main() {
     const writer = page.locator(".acct-role").filter({ hasText: "iSyncYou Writer" });
     await reader.getByRole("button", { name: "Connect" }).click();
     await page.getByRole("button", { name: "Open Microsoft account picker" }).click();
+    await page.evaluate(() => { window.__microsoftAccountSmoke.failNextPoll = true; });
+    await page.getByText("Reconnecting to the sign-in status…").waitFor({ timeout: 5000 });
+    await page.getByText("Waiting for Microsoft sign-in…").waitFor({ timeout: 5000 });
+    assert(report, "one transient bridge poll failure keeps the login attempt resumable",
+      await page.getByRole("button", { name: "Open Microsoft account picker" }).isEnabled()
+      && await page.getByRole("button", { name: "Start sign-in again" }).count() === 0);
     await page.getByRole("button", { name: "Cancel" }).click();
     await page.waitForFunction(() => window.__microsoftAccountSmoke.events.includes("native:end"));
     const events = await page.evaluate(() => window.__microsoftAccountSmoke.events);
@@ -133,6 +150,20 @@ async function main() {
     assert(report, "Reader and Writer expose independent connection state",
       await reader.getByText("Not connected").isVisible()
       && await writer.getByText("Connected").isVisible());
+    await page.evaluate(() => { window.__microsoftAccountSmoke.cancelDelayMs = 150; });
+    await reader.getByRole("button", { name: "Connect" }).click();
+    await page.getByRole("button", { name: "Open Microsoft account picker" }).waitFor();
+    await page.locator(".acct-menu-wrap > .scrim").click({ position: { x: 5, y: 5 } });
+    await page.getByRole("button", { name: "Choose Microsoft account" }).click();
+    await reader.getByRole("button", { name: "Connect" }).click();
+    await page.getByRole("button", { name: "Open Microsoft account picker" }).waitFor();
+    const serializedEvents = await page.evaluate(() => window.__microsoftAccountSmoke.events);
+    const finalCancel = serializedEvents.lastIndexOf("request:cancel");
+    const finalReaderStart = serializedEvents.lastIndexOf("request:start:reader");
+    assert(report, "closing and immediately reopening waits for exact login cancellation",
+      finalCancel >= 0 && finalReaderStart > finalCancel, serializedEvents);
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await page.evaluate(() => { window.__microsoftAccountSmoke.cancelDelayMs = 0; });
     const menuBox = await page.locator(".acct-menu").boundingBox();
     const viewport = page.viewportSize();
     assert(report, "account role controls fit the mobile viewport",
@@ -147,13 +178,17 @@ async function main() {
       await page.screenshot({ path: process.env.ISY_SMOKE_SCREENSHOT, fullPage: true });
     }
 
+    const beforeGuardFailure = await page.evaluate(() => ({
+      starts: window.__microsoftAccountSmoke.events.filter((event) => event === "request:start:reader").length,
+      opens: window.__microsoftAccountSmoke.events.filter((event) => event.startsWith("native:open:")).length,
+    }));
     await page.evaluate(() => { window.__microsoftAccountSmoke.guardAvailable = false; });
     await reader.getByRole("button", { name: "Connect" }).click();
     await page.getByText("Sign-in could not be kept active while the browser is open.").waitFor();
     const failedEvents = await page.evaluate(() => window.__microsoftAccountSmoke.events);
     assert(report, "guard failure prevents backend start and browser launch",
-      failedEvents.filter((event) => event === "request:start:reader").length === 1
-      && failedEvents.filter((event) => event.startsWith("native:open:")).length === 1,
+      failedEvents.filter((event) => event === "request:start:reader").length === beforeGuardFailure.starts
+      && failedEvents.filter((event) => event.startsWith("native:open:")).length === beforeGuardFailure.opens,
       failedEvents);
     report.ok = true;
   } catch (error) {

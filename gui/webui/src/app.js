@@ -4634,14 +4634,14 @@ async function doShare(it, btn) {
 // Account menu (#68): switch between configured accounts, sign out (clear the
 // cached token), and sign in / reconnect through Microsoft's account picker (cap-gated).
 let accountMenu = null, accountMenuPoll = null, accountMenuLogin = null;
+let accountMenuCancelPromise = Promise.resolve(true);
 const ACCOUNT_LOGIN_GUARDS = new Map();
 async function finishAccountLoginGuard(loginId) {
   const guardId = ACCOUNT_LOGIN_GUARDS.get(loginId);
   ACCOUNT_LOGIN_GUARDS.delete(loginId);
   await endNetworkGuard(guardId);
 }
-async function cancelAccountLogin() {
-  const loginId = accountMenuLogin;
+async function cancelAccountLogin(loginId = accountMenuLogin) {
   if (!loginId || !CAP.account) return true;
   try {
     const result = await postJson("/api/v1/account/login/cancel", CAP.account, {
@@ -4649,16 +4649,24 @@ async function cancelAccountLogin() {
       id: loginId,
     });
     if (result && result.cancelled === true) {
-      accountMenuLogin = null;
+      if (accountMenuLogin === loginId) accountMenuLogin = null;
       await finishAccountLoginGuard(loginId);
       return true;
     }
   } catch (_) {}
   return false;
 }
+function queueAccountLoginCancel() {
+  const loginId = accountMenuLogin;
+  if (!loginId) return accountMenuCancelPromise;
+  accountMenuCancelPromise = accountMenuCancelPromise
+    .catch(() => false)
+    .then(() => cancelAccountLogin(loginId));
+  return accountMenuCancelPromise;
+}
 function closeAccountMenu() {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
-  void cancelAccountLogin();
+  void queueAccountLoginCancel();
   if (accountMenu) { accountMenu.remove(); accountMenu = null; }
 }
 function openAccountSwitcher() {
@@ -6720,7 +6728,6 @@ async function reloadAccounts() {
 }
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
-  void cancelAccountLogin();
   clear(body);
   App.accounts.forEach(a => {
     const active = a.id === App.account;
@@ -6767,6 +6774,12 @@ async function accountSignOut(a, role, body) {
 async function startAccountLogin(a, role, body) {
   const roleMeta = ACCOUNT_ROLE_META[role];
   if (!roleMeta) return;
+  await accountMenuCancelPromise.catch(() => false);
+  if (accountMenuLogin) {
+    toast("The previous sign-in is still completing. Try again shortly.", "err");
+    renderAccountMenu(body);
+    return;
+  }
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
   clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: `Starting ${roleMeta.label} sign-in…` })));
   let guardId = null;
@@ -6826,12 +6839,31 @@ async function startAccountLogin(a, role, body) {
       if (await cancelAccountLogin()) renderAccountMenu(body);
       else status.textContent = "Completing Microsoft sign-in…";
     } }, "Cancel")));
-  accountMenuPoll = setInterval(async () => {
+  let consecutivePollFailures = 0;
+  const schedulePoll = () => {
+    if (!attemptIsActive()) return;
+    accountMenuPoll = setTimeout(pollOnce, 3000);
+  };
+  const pollOnce = async () => {
+    accountMenuPoll = null;
+    if (!attemptIsActive()) return;
     let r;
-    try { r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: login.login_id }); }
-    catch (_) { clearInterval(accountMenuPoll); accountMenuPoll = null; await endAttempt("Connection to the sign-in status was lost.", false); return; }
+    try {
+      r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: login.login_id });
+      if (consecutivePollFailures > 0) status.textContent = "Waiting for Microsoft sign-in…";
+      consecutivePollFailures = 0;
+    } catch (_) {
+      consecutivePollFailures += 1;
+      if (consecutivePollFailures < 3) {
+        status.textContent = "Reconnecting to the sign-in status…";
+        schedulePoll();
+        return;
+      }
+      await endAttempt("Connection to the sign-in status was lost.", false);
+      return;
+    }
     if (r.state === "done" && r.role === role) {
-      clearInterval(accountMenuPoll); accountMenuPoll = null; attemptEnded = true;
+      attemptEnded = true;
       if (accountMenuLogin === login.login_id) accountMenuLogin = null;
       pickerButton.disabled = true;
       await finishAccountLoginGuard(login.login_id);
@@ -6839,14 +6871,16 @@ async function startAccountLogin(a, role, body) {
       toast(`${roleMeta.label} connected`);
       renderAccountMenu(body);
     } else if (r.state === "error") {
-      clearInterval(accountMenuPoll); accountMenuPoll = null;
       const message = r.code === "account_login_expired" ? "Sign-in expired."
         : r.code === "account_identity_mismatch" ? "Reader and Writer must use the same Microsoft account."
           : r.code === "account_identity_unverified" ? "The Microsoft account could not be verified. Reconnect the other role first."
             : "Sign-in failed.";
       await endAttempt(message, true);
+    } else {
+      schedulePoll();
     }
-  }, 3000);
+  };
+  schedulePoll();
 }
 
 /* ---------------------------------------------------------------- command palette */
