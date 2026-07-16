@@ -82,6 +82,14 @@ mod store_backed {
     use isyncyou_store::{Item, Store};
     use std::path::PathBuf;
 
+    fn literal_fts_query(query: &str) -> Option<String> {
+        let terms = query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>();
+        (!terms.is_empty()).then(|| terms.join(" OR "))
+    }
+
     fn to_ref(it: Item) -> ItemRef {
         ItemRef {
             service: it.service,
@@ -136,9 +144,12 @@ mod store_backed {
         }
 
         fn search_names(&self, query: &str) -> Result<Vec<ItemRef>, AgentError> {
+            let Some(query) = literal_fts_query(query) else {
+                return Ok(Vec::new());
+            };
             let store = self.open_readonly()?;
             Ok(store
-                .search_names(&self.account, query)
+                .search_names(&self.account, &query)
                 .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .into_iter()
                 .map(to_ref)
@@ -146,9 +157,12 @@ mod store_backed {
         }
 
         fn search_bodies(&self, query: &str) -> Result<Vec<(String, String)>, AgentError> {
+            let Some(query) = literal_fts_query(query) else {
+                return Ok(Vec::new());
+            };
             let store = self.open_readonly()?;
             store
-                .search_bodies(&self.account, query)
+                .search_bodies(&self.account, &query)
                 .map_err(|_| AgentError::Provider("archive_query_failed".into()))
         }
 
@@ -331,6 +345,28 @@ mod store_archive_tests {
         let archive = StoreArchive::new("me", dir.path());
         let item = archive.get("mail", "m1").unwrap().unwrap();
         assert_eq!(item.name, "Mail item");
+    }
+
+    #[test]
+    fn store_archive_treats_model_search_as_literal_fts_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+        store
+            .upsert_item(&Item::new(
+                "me",
+                "mail",
+                "m1",
+                "Quarterly report",
+                "message",
+            ))
+            .unwrap();
+        drop(store);
+
+        let archive = StoreArchive::new("me", dir.path());
+        assert_eq!(archive.search_names("quarterly report").unwrap().len(), 1);
+        assert!(archive.search_names("*").unwrap().is_empty());
+        assert!(archive.search_names("\"").unwrap().is_empty());
+        assert!(archive.search_names("   ").unwrap().is_empty());
     }
 
     #[test]
