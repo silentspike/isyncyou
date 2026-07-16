@@ -19,6 +19,7 @@ const OUT_DIR = outFlag >= 0
   ? path.resolve(REPO, process.argv[outFlag + 1])
   : path.join(REPO, "docs/evidence/artifacts/issue-622");
 const AGENT_CAP = "fixture-agent-cap";
+const ACCOUNT_CAP = "fixture-account-cap";
 const ACCOUNT = "fixture";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,7 +28,9 @@ const readText = (p) => fs.readFileSync(path.join(REPO, p), "utf8");
 function fixtureAppJs() {
   return readText("gui/webui/src/app.js").replace(
     /__([A-Z0-9_]+_CAP_TOKEN)__/g,
-    (_m, token) => (token === "AGENT_CAP_TOKEN" ? AGENT_CAP : ""),
+    (_m, token) => token === "AGENT_CAP_TOKEN"
+      ? AGENT_CAP
+      : token === "ACCOUNT_CAP_TOKEN" ? ACCOUNT_CAP : "",
   );
 }
 
@@ -152,6 +155,7 @@ function makeFixtureServer(evidence) {
   const sessions = new Map();
   const turns = new Map();
   const state = {
+    accountLoginStarts: [],
     oauthStarts: [],
     modelPosts: [],
     confirmPosts: [],
@@ -221,6 +225,16 @@ function makeFixtureServer(evidence) {
         res.end();
       } else if (req.method === "GET" && url.pathname === "/api/v1/accounts") {
         json(res, 200, { accounts: [{ id: ACCOUNT, username: "Fixture account" }] });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/start") {
+        if (req.headers["x-capability-token"] !== ACCOUNT_CAP) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        state.accountLoginStarts.push(body);
+        json(res, 200, {
+          login_id: "fixture-device-login",
+          user_code: "SAFE-FIXTURE",
+          verification_uri: `${evidence.fixture_origin}/fixture-device-login`,
+          browser_logout_uri: `${evidence.fixture_origin}/fixture-browser-logout`,
+        });
       } else if (req.method === "GET" && url.pathname === "/api/v1/status") {
         json(res, 200, {
           services: [
@@ -565,6 +579,19 @@ async function main() {
 
     await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('.nav-item[data-service="assistant"]', { timeout: 10000 });
+    await page.locator('.sb-account').click();
+    await page.waitForSelector('button[title="Use a different Microsoft account"]', { timeout: 10000 });
+    assert(evidence, "account menu separates reconnect from different-account login",
+      await page.locator('button[title="Reconnect this Microsoft account"]').count() === 1
+      && await page.locator('button[title="Use a different Microsoft account"]').count() === 1);
+    await page.locator('button[title="Use a different Microsoft account"]').click();
+    await page.waitForSelector('button:has-text("Continue with another account")', { timeout: 10000 });
+    assert(evidence, "different-account login requires explicit browser sign-out first",
+      await page.getByRole("button", { name: "Sign out browser account" }).count() === 1
+      && await page.getByRole("button", { name: "Continue with another account" }).isDisabled()
+      && fixture.state.accountLoginStarts.length === 1);
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await page.locator('.acct-menu-wrap .scrim').click({ position: { x: 1, y: 1 } });
     const assistantNavVisible = await page.locator('.nav-item[data-service="assistant"]').first().isVisible();
     assert(evidence, "desktop Assistant nav visible", assistantNavVisible);
     await page.locator('.nav-item[data-service="assistant"]').first().click();

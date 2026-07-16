@@ -7,6 +7,7 @@ import java.util.Locale
 enum class AuthUrlKind(val wire: String) {
     AgentAuthorize("agent_authorize"),
     AccountDeviceCode("account_device_code"),
+    AccountBrowserLogout("account_browser_logout"),
 }
 
 data class ExternalUrlDecision(
@@ -33,6 +34,7 @@ object ExternalUrlPolicy {
     fun authKindFromWire(kind: String?): AuthUrlKind? = when (kind) {
         AuthUrlKind.AgentAuthorize.wire -> AuthUrlKind.AgentAuthorize
         AuthUrlKind.AccountDeviceCode.wire -> AuthUrlKind.AccountDeviceCode
+        AuthUrlKind.AccountBrowserLogout.wire -> AuthUrlKind.AccountBrowserLogout
         else -> null
     }
 
@@ -49,6 +51,7 @@ object ExternalUrlPolicy {
         val allowed = when (kind) {
             AuthUrlKind.AgentAuthorize -> isAgentAuthorizeHostPath(host, path)
             AuthUrlKind.AccountDeviceCode -> isAccountDeviceCodeHostPath(host, path)
+            AuthUrlKind.AccountBrowserLogout -> isAccountBrowserLogoutHostPath(host, path)
         }
         return if (allowed) {
             ExternalUrlDecision(true, "allowed", host)
@@ -108,6 +111,13 @@ object ExternalUrlPolicy {
         "www.microsoft.com" -> path == "/link"
         "login.microsoftonline.com" -> path == "/common/oauth2/deviceauth" || path == "/consumers/oauth2/deviceauth"
         "login.live.com" -> path == "/oauth20_remoteconnect.srf"
+        else -> false
+    }
+
+    private fun isAccountBrowserLogoutHostPath(host: String, path: String): Boolean = when (host) {
+        "login.microsoftonline.com" ->
+            path == "/common/oauth2/v2.0/logout" || path == "/consumers/oauth2/v2.0/logout"
+        "login.live.com" -> path == "/oauth20_logout.srf"
         else -> false
     }
 
