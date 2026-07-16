@@ -269,7 +269,7 @@ impl BodyKeyTestGuard {
         let guard = BODY_KEY_TEST_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .unwrap();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         isyncyou_core::envelope::reset_body_keys_for_tests();
         Self { _guard: guard }
     }
@@ -329,7 +329,7 @@ mod store_archive_tests {
         let archive = StoreArchive::new("me", dir.path());
         let err = archive.read_body("mail", "m1").unwrap_err();
         assert!(
-            err.to_string().contains("no body key"),
+            err.to_string().contains("archive_body_unavailable"),
             "missing key must fail closed, got {err}"
         );
     }
