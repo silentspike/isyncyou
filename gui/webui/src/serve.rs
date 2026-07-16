@@ -32,6 +32,10 @@ static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 /// upload yet bounded so a bogus `Content-Length` can't make the server allocate without
 /// limit; an oversized body is refused (413) rather than buffered.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+const MAX_REQUEST_HEAD: usize = 64 * 1024;
+const MAX_REQUEST_TARGET: usize = 8 * 1024;
+const MAX_HEADER_LINE: usize = 8 * 1024;
+const MAX_HEADER_FIELDS: usize = 128;
 
 /// Decrements the live-connection counter when a connection thread ends.
 struct ConnGuard;
@@ -80,34 +84,145 @@ enum AccessPolicy {
 struct RequestHeaders {
     cap_token: Option<String>,
     session_token: Option<String>,
+    per_action_token: Option<String>,
     cookie: Option<String>,
     host: Option<String>,
     origin: Option<String>,
     body_encoding: Option<String>,
     content_type: Option<String>,
+    storage_not_low: Option<bool>,
 }
 
 const AGENT_STRICT_JSON_MAX_BYTES: usize = 8 * 1024;
 
-fn strict_json_body_limit(method: &str, target: &str) -> Option<usize> {
-    if method != "POST" {
-        return None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteBodyPolicy {
+    None,
+    Json(usize),
+}
+
+impl RouteBodyPolicy {
+    fn limit(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Json(limit) => limit,
+        }
     }
+}
+
+fn route_body_policy(method: &str, target: &str) -> RouteBodyPolicy {
     let path = target
         .split_once('?')
         .map(|(path, _)| path)
         .unwrap_or(target);
-    matches!(
+    if method != "POST" {
+        return RouteBodyPolicy::None;
+    }
+    if path == "/api/v1/agent/turn" {
+        return RouteBodyPolicy::Json(64 * 1024);
+    }
+    if matches!(
+        path,
+        "/api/v1/mutation-intent/create"
+            | "/api/v1/mutation-intent/chunk"
+            | "/api/v1/mutation-intent/commit"
+            | "/api/v1/mutation-intent/cancel"
+    ) {
+        return RouteBodyPolicy::Json(16 * 1024);
+    }
+    if matches!(
+        path,
+        "/api/v1/mail/send"
+            | "/api/v1/mail/reply"
+            | "/api/v1/mail/forward"
+            | "/api/v1/mail/draft"
+            | "/api/v1/onenote/create"
+            | "/api/v1/onenote/append"
+    ) {
+        return RouteBodyPolicy::Json(64 * 1024);
+    }
+    if matches!(
         path,
         "/api/v1/agent/connectivity/preflight"
             | "/api/v1/agent/credential/refresh"
+            | "/api/v1/agent/session/create"
+            | "/api/v1/agent/session/select"
+            | "/api/v1/agent/session/archive"
+            | "/api/v1/agent/user-presence/start"
+            | "/api/v1/agent/user-presence/confirm"
+            | "/api/v1/agent/session/pairing/create"
+            | "/api/v1/agent/session/pairing/reveal"
+            | "/api/v1/agent/session/pairing/claim"
+            | "/api/v1/agent/session/pairing/finalize"
+            | "/api/v1/agent/session/pairing/revoke"
+            | "/api/v1/agent/turn/cancel"
+            | "/api/v1/agent/pending/cancel"
+            | "/api/v1/agent/confirm"
+            | "/api/v1/agent/model"
             | "/api/v1/agent/oauth/cancel"
             | "/api/v1/agent/oauth/complete"
             | "/api/v1/agent/oauth/start"
             | "/api/v1/agent/oauth/logout"
             | "/api/v1/agent/oauth/lifecycle/resume"
-    )
-    .then_some(AGENT_STRICT_JSON_MAX_BYTES)
+            | "/api/v1/mail/move"
+            | "/api/v1/mail/read"
+            | "/api/v1/mail/flag"
+            | "/api/v1/mail/categories"
+            | "/api/v1/calendar/create"
+            | "/api/v1/calendar/update"
+            | "/api/v1/calendar/delete"
+            | "/api/v1/calendar/respond"
+            | "/api/v1/contact/create"
+            | "/api/v1/contact/update"
+            | "/api/v1/contact/delete"
+            | "/api/v1/todo/create"
+            | "/api/v1/todo/update"
+            | "/api/v1/todo/complete"
+            | "/api/v1/todo/delete"
+            | "/api/v1/todo/checklist-add"
+            | "/api/v1/todo/checklist-toggle"
+            | "/api/v1/todo/checklist-delete"
+            | "/api/v1/todo/list-create"
+            | "/api/v1/todo/list-delete"
+            | "/api/v1/sync/pause"
+            | "/api/v1/sync/resume"
+            | "/api/v1/sync/now"
+            | "/api/v1/verify"
+            | "/api/v1/settings"
+            | "/api/v1/restore"
+            | "/api/v1/backup"
+            | "/api/v1/jobs/cancel"
+            | "/api/v1/share"
+            | "/api/v1/onenote/delete"
+            | "/api/v1/account/login/start"
+            | "/api/v1/account/login/poll"
+            | "/api/v1/account/signout"
+            | "/api/v1/onedrive/transfers/cancel"
+            | "/api/v1/onedrive/transfers/pause"
+            | "/api/v1/onedrive/transfers/retry"
+            | "/api/v1/onedrive/create"
+            | "/api/v1/onedrive/rename"
+            | "/api/v1/onedrive/move"
+            | "/api/v1/onedrive/delete"
+            | "/api/v1/onedrive/mode"
+            | "/api/v1/onedrive/free-up"
+            | "/api/v1/onedrive/download-now"
+            | "/api/v1/onedrive/conflict/resolve"
+            | "/api/v1/onedrive/cleanup"
+            | "/api/v1/push/register"
+            | "/api/v1/push/test"
+    ) {
+        return RouteBodyPolicy::Json(AGENT_STRICT_JSON_MAX_BYTES);
+    }
+    RouteBodyPolicy::None
+}
+
+#[cfg(test)]
+fn strict_json_body_limit(method: &str, target: &str) -> Option<usize> {
+    match route_body_policy(method, target) {
+        RouteBodyPolicy::Json(limit) => Some(limit),
+        RouteBodyPolicy::None => None,
+    }
 }
 
 /// Decode a request body per the `X-Body-Encoding` header (#657 in-app upload/replace):
@@ -154,25 +269,20 @@ pub fn parse_request_line(line: &str) -> Option<(String, String)> {
 /// effective session token (explicit `X-Session-Token`, else the `isy_session` loopback
 /// cookie) and attach the cap-token + body. Shared by the HTTP [`handle`] loop and the
 /// in-process [`dispatch_message`] bridge so both transports route **identically** (#0A).
-fn build_request(
-    method: &str,
-    target: &str,
-    cap_token: Option<String>,
-    session_token: Option<String>,
-    cookie: Option<String>,
-    content_type: Option<String>,
-    body: Vec<u8>,
-) -> ApiRequest {
-    let session_token = session_token.or_else(|| {
-        cookie
+fn build_request(request: BridgeDispatchRequest<'_>) -> ApiRequest {
+    let session_token = request.session_token.or_else(|| {
+        request
+            .cookie
             .as_deref()
             .and_then(|c| cookie_value(c, "isy_session"))
     });
-    ApiRequest::new(method, target)
-        .with_cap_token(cap_token)
+    ApiRequest::new(request.method, request.target)
+        .with_cap_token(request.cap_token)
         .with_session_token(session_token)
-        .with_content_type(content_type)
-        .with_body(body)
+        .with_per_action_token(request.per_action_token)
+        .with_storage_not_low(request.storage_not_low)
+        .with_content_type(request.content_type)
+        .with_body(request.body)
 }
 
 /// Dispatch one request that arrived over the Android in-process `WebMessage` bridge
@@ -187,26 +297,43 @@ pub struct BridgeDispatchRequest<'a> {
     pub target: &'a str,
     pub cap_token: Option<String>,
     pub session_token: Option<String>,
+    pub per_action_token: Option<String>,
     pub cookie: Option<String>,
     pub content_type: Option<String>,
+    pub storage_not_low: Option<bool>,
     pub body: Vec<u8>,
 }
 
 pub fn dispatch_message(router: &Router, request: BridgeDispatchRequest<'_>) -> ApiResponse {
-    if strict_json_body_limit(request.method, request.target)
-        .is_some_and(|limit| request.body.len() > limit)
-    {
+    let policy = route_body_policy(request.method, request.target);
+    if request.body.len() > policy.limit() {
         return ApiResponse::error(413, "request body too large");
     }
-    router.route(&build_request(
-        request.method,
-        request.target,
-        request.cap_token,
-        request.session_token,
-        request.cookie,
-        request.content_type,
-        request.body,
-    ))
+    if matches!(policy, RouteBodyPolicy::Json(_))
+        && request
+            .content_type
+            .as_deref()
+            .is_none_or(|value| !valid_json_content_type(value))
+    {
+        return ApiResponse::error(400, "application/json required");
+    }
+    router.route(&build_request(request))
+}
+
+fn valid_json_content_type(value: &str) -> bool {
+    let mut parts = value.split(';').map(str::trim);
+    if !parts
+        .next()
+        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"))
+    {
+        return false;
+    }
+    parts.all(|parameter| {
+        parameter.split_once('=').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("charset")
+                && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+        })
+    })
 }
 
 /// Handle one JSON-framed unary request from the Android in-process bridge (#0A) and
@@ -255,8 +382,14 @@ pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
             target: path,
             cap_token: header("X-Capability-Token"),
             session_token: header("X-Session-Token"),
+            per_action_token: header("X-Per-Action-Token"),
             cookie: header("Cookie"),
             content_type: header("Content-Type"),
+            storage_not_low: header("X-Storage-Not-Low").and_then(|value| match value.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }),
             body,
         },
     );
@@ -299,6 +432,11 @@ fn format_http_conn(resp: &ApiResponse, keep_alive: bool) -> Vec<u8> {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        411 => "Length Required",
+        413 => "Content Too Large",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        507 => "Insufficient Storage",
         500 => "Internal Server Error",
         _ => "Status",
     };
@@ -311,6 +449,13 @@ fn format_http_conn(resp: &ApiResponse, keep_alive: bool) -> Vec<u8> {
         resp.body.len(),
         conn
     );
+    if !resp
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+    {
+        head.push_str("Cache-Control: no-store\r\n");
+    }
     for (k, v) in &resp.headers {
         // header values are crafted in-process (constants); guard against any
         // accidental CRLF so a value can never inject extra headers.
@@ -369,6 +514,18 @@ fn is_local_origin(origin: &str) -> bool {
     origin_host(origin).is_some_and(is_loopback_host)
 }
 
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let Some((scheme, _)) = origin.trim().split_once("://") else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("http")
+        && origin_host(origin).is_some_and(|origin_host| {
+            origin_host
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(host.trim().trim_end_matches('.'))
+        })
+}
+
 fn forbidden(message: &str) -> ApiResponse {
     ApiResponse {
         status: 403,
@@ -394,11 +551,130 @@ fn validate_request_headers(
         }
     }
     if let Some(origin) = headers.origin.as_deref() {
-        if !is_local_origin(origin) {
+        if !is_local_origin(origin)
+            || (policy == AccessPolicy::TcpLoopback
+                && headers
+                    .host
+                    .as_deref()
+                    .is_none_or(|host| !origin_matches_host(origin, host)))
+        {
             return Some(forbidden("invalid origin header"));
         }
     }
+    if policy == AccessPolicy::TcpLoopback
+        && !matches!(method, "GET" | "HEAD")
+        && headers
+            .cookie
+            .as_deref()
+            .and_then(|cookie| cookie_value(cookie, "isy_session"))
+            .is_some()
+        && headers.origin.is_none()
+    {
+        return Some(forbidden("missing origin header"));
+    }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadReadError {
+    Closed,
+    BadRequest,
+    TooLarge,
+}
+
+fn read_http_head<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, HeadReadError> {
+    let mut head = Vec::with_capacity(1024);
+    loop {
+        let available = reader.fill_buf().map_err(|_| HeadReadError::BadRequest)?;
+        if available.is_empty() {
+            return if head.is_empty() {
+                Err(HeadReadError::Closed)
+            } else {
+                Err(HeadReadError::BadRequest)
+            };
+        }
+        let remaining = MAX_REQUEST_HEAD.saturating_sub(head.len());
+        if remaining == 0 {
+            return Err(HeadReadError::TooLarge);
+        }
+        let available_len = available.len();
+        let mut consumed = 0usize;
+        for byte in available.iter().take(remaining) {
+            if *byte == 0 || (*byte == b'\n' && head.last().copied() != Some(b'\r')) {
+                return Err(HeadReadError::BadRequest);
+            }
+            head.push(*byte);
+            consumed += 1;
+            if head.ends_with(b"\r\n\r\n") {
+                reader.consume(consumed);
+                return Ok(head);
+            }
+        }
+        reader.consume(consumed);
+        if consumed < available_len || head.len() == MAX_REQUEST_HEAD {
+            return Err(HeadReadError::TooLarge);
+        }
+    }
+}
+
+type ParsedHttpHead = (String, String, Vec<(String, String)>);
+
+fn parse_http_head(head: &[u8]) -> Result<ParsedHttpHead, ()> {
+    let mut lines = head.split(|byte| *byte == b'\n');
+    let _request_line = lines.next().ok_or(())?;
+    if lines.any(|line| {
+        line.len() > MAX_HEADER_LINE + 1
+            || line
+                .first()
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    }) {
+        return Err(());
+    }
+    let mut fields = [httparse::EMPTY_HEADER; MAX_HEADER_FIELDS];
+    let mut request = httparse::Request::new(&mut fields);
+    if !matches!(request.parse(head), Ok(httparse::Status::Complete(_)))
+        || request.version != Some(1)
+    {
+        return Err(());
+    }
+    let method = request.method.ok_or(())?;
+    let target = request.path.ok_or(())?;
+    if target.len() > MAX_REQUEST_TARGET
+        || !target.starts_with('/')
+        || target.starts_with("//")
+        || target.contains('#')
+    {
+        return Err(());
+    }
+    let headers = request
+        .headers
+        .iter()
+        .map(|header| {
+            let value = std::str::from_utf8(header.value).map_err(|_| ())?;
+            Ok((header.name.to_string(), value.trim().to_string()))
+        })
+        .collect::<Result<Vec<_>, ()>>()?;
+    Ok((method.to_string(), target.to_string(), headers))
+}
+
+fn write_head_error<S: Write>(stream: &mut S, error: HeadReadError) -> std::io::Result<()> {
+    if error == HeadReadError::Closed {
+        return Ok(());
+    }
+    let response = ApiResponse::error(
+        if error == HeadReadError::TooLarge {
+            431
+        } else {
+            400
+        },
+        if error == HeadReadError::TooLarge {
+            "request headers too large"
+        } else {
+            "invalid request framing"
+        },
+    );
+    stream.write_all(&format_http(&response))?;
+    stream.flush()
 }
 
 fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std::io::Result<()> {
@@ -409,88 +685,80 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
     // One iteration per request; the connection is reused (HTTP/1.1 persistent) until the
     // client closes it, it idles out, or a request can't be served cleanly.
     loop {
-        let mut request_line = String::new();
-        match reader.read_line(&mut request_line) {
-            Ok(0) => return Ok(()), // client closed the connection
-            Ok(_) => {}
-            // idle keep-alive timeout / reset: close quietly, don't surface as an error
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                return Ok(())
-            }
-            Err(e) => return Err(e),
-        }
-        let (method, target) = match parse_request_line(request_line.trim_end()) {
-            Some(mt) => mt,
-            None => {
-                let resp = ApiResponse {
-                    status: 400,
-                    content_type: "text/plain".into(),
-                    body: b"bad request line".to_vec(),
-                    headers: Vec::new(),
-                };
-                stream.write_all(&format_http(&resp))?;
-                stream.flush()?;
+        let head = match read_http_head(&mut reader) {
+            Ok(head) => head,
+            Err(HeadReadError::Closed) => return Ok(()),
+            Err(error) => {
+                write_head_error(stream, error)?;
                 return Ok(());
             }
         };
-        let strict_json_limit = strict_json_body_limit(&method, &target);
-        // Read headers up to the blank line; capture the small set the local security
-        // policy needs plus the body length. Unknown headers are ignored.
+        let (method, target, parsed_headers) = match parse_http_head(&head) {
+            Ok(parsed) => parsed,
+            Err(()) => {
+                write_head_error(stream, HeadReadError::BadRequest)?;
+                return Ok(());
+            }
+        };
+        let body_policy = route_body_policy(&method, &target);
         let mut headers = RequestHeaders::default();
         let mut content_length = None;
         let mut malformed_framing = false;
-        loop {
-            let mut h = String::new();
-            let n = reader.read_line(&mut h)?;
-            if n == 0 || h == "\r\n" || h == "\n" {
-                break;
+        let mut seen_authority = std::collections::BTreeSet::new();
+        for (k, v) in parsed_headers {
+            let authority = matches!(
+                k.to_ascii_lowercase().as_str(),
+                "host"
+                    | "origin"
+                    | "cookie"
+                    | "content-type"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "x-session-token"
+                    | "x-capability-token"
+                    | "x-per-action-token"
+                    | "x-storage-not-low"
+            );
+            if authority && !seen_authority.insert(k.to_ascii_lowercase()) {
+                malformed_framing = true;
             }
-            if let Some((k, v)) = h.split_once(':') {
-                let k = k.trim();
-                let v = v.trim().to_string();
-                if k.eq_ignore_ascii_case("x-capability-token") {
-                    headers.cap_token = Some(v);
-                } else if k.eq_ignore_ascii_case("x-session-token") {
-                    headers.session_token = Some(v);
-                } else if k.eq_ignore_ascii_case("cookie") {
-                    headers.cookie = Some(v);
-                } else if k.eq_ignore_ascii_case("host") {
-                    headers.host = Some(v);
-                } else if k.eq_ignore_ascii_case("origin") {
-                    headers.origin = Some(v);
-                } else if k.eq_ignore_ascii_case("content-length") {
-                    if strict_json_limit.is_some() {
-                        if content_length.is_some() {
-                            malformed_framing = true;
-                        } else {
-                            content_length = v.parse::<usize>().ok();
-                            if content_length.is_none() {
-                                malformed_framing = true;
-                            }
-                        }
-                    } else {
-                        // Preserve legacy framing behavior outside the strict JSON
-                        // endpoints. Their later hardening belongs to #628.
-                        content_length = Some(v.parse::<usize>().unwrap_or(0));
-                    }
-                } else if k.eq_ignore_ascii_case("x-body-encoding") {
-                    headers.body_encoding = Some(v);
-                } else if k.eq_ignore_ascii_case("content-type") {
-                    headers.content_type = Some(v);
-                } else if k.eq_ignore_ascii_case("transfer-encoding") && strict_json_limit.is_some()
-                {
+            if k.eq_ignore_ascii_case("x-capability-token") {
+                headers.cap_token = Some(v);
+            } else if k.eq_ignore_ascii_case("x-session-token") {
+                headers.session_token = Some(v);
+            } else if k.eq_ignore_ascii_case("x-per-action-token") {
+                headers.per_action_token = Some(v);
+            } else if k.eq_ignore_ascii_case("cookie") {
+                headers.cookie = Some(v);
+            } else if k.eq_ignore_ascii_case("host") {
+                headers.host = Some(v);
+            } else if k.eq_ignore_ascii_case("origin") {
+                headers.origin = Some(v);
+            } else if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse::<usize>().ok();
+                if content_length.is_none() {
                     malformed_framing = true;
                 }
+            } else if k.eq_ignore_ascii_case("x-body-encoding") {
+                headers.body_encoding = Some(v);
+            } else if k.eq_ignore_ascii_case("content-type") {
+                headers.content_type = Some(v);
+            } else if k.eq_ignore_ascii_case("x-storage-not-low") {
+                headers.storage_not_low = match v.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => {
+                        malformed_framing = true;
+                        None
+                    }
+                };
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                malformed_framing = true;
             }
         }
-        if malformed_framing || (strict_json_limit.is_some() && headers.body_encoding.is_some()) {
+        if malformed_framing
+            || (matches!(body_policy, RouteBodyPolicy::Json(_)) && headers.body_encoding.is_some())
+        {
             let resp = ApiResponse::error(400, "invalid request framing");
             stream.write_all(&format_http(&resp))?;
             stream.flush()?;
@@ -502,11 +770,53 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             stream.flush()?;
             return Ok(()); // rejected → close
         }
+        let cookie_session = headers
+            .cookie
+            .as_deref()
+            .and_then(|cookie| cookie_value(cookie, "isy_session"));
+        let session = headers
+            .session_token
+            .as_deref()
+            .or(cookie_session.as_deref());
+        if target.starts_with("/api/v1/") && !router.session_authorized(session) {
+            let request = build_request(BridgeDispatchRequest {
+                method: &method,
+                target: &target,
+                cap_token: headers.cap_token.clone(),
+                session_token: headers.session_token.clone(),
+                per_action_token: headers.per_action_token.clone(),
+                cookie: headers.cookie.clone(),
+                content_type: headers.content_type.clone(),
+                storage_not_low: headers.storage_not_low,
+                body: Vec::new(),
+            });
+            let response = router.route(&request);
+            stream.write_all(&format_http(&response))?;
+            stream.flush()?;
+            return Ok(());
+        }
+        if matches!(body_policy, RouteBodyPolicy::Json(_))
+            && headers
+                .content_type
+                .as_deref()
+                .is_none_or(|value| !valid_json_content_type(value))
+        {
+            let resp = ApiResponse::error(400, "application/json required");
+            stream.write_all(&format_http(&resp))?;
+            stream.flush()?;
+            return Ok(());
+        }
         // Read any request body into memory (bounded) so a body-bearing request works
         // over HTTP too (#0A); the query-string GETs that dominate today carry none. An
         // oversized body is refused (413) rather than buffered — it can't be reframed
         // safely on a keep-alive connection, so that path also closes.
-        let body_limit = strict_json_limit.unwrap_or(MAX_REQUEST_BODY);
+        let body_limit = body_policy.limit();
+        if body_limit > 0 && content_length.is_none() {
+            let resp = ApiResponse::error(411, "content length required");
+            stream.write_all(&format_http(&resp))?;
+            stream.flush()?;
+            return Ok(());
+        }
         let content_length = content_length.unwrap_or(0);
         let body = if content_length > body_limit {
             let resp = ApiResponse::error(413, "request body too large");
@@ -536,29 +846,31 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
         // Build the routed request from the same transport-agnostic path the in-process
         // bridge uses (#0A): explicit `X-Session-Token`, else the `isy_session` loopback
         // cookie that auto-rides iframe/img/EventSource subresource requests.
-        let req = build_request(
-            &method,
-            &target,
-            headers.cap_token.clone(),
-            headers.session_token.clone(),
-            headers.cookie.clone(),
-            headers.content_type.clone(),
+        let req = build_request(BridgeDispatchRequest {
+            method: &method,
+            target: &target,
+            cap_token: headers.cap_token.clone(),
+            session_token: headers.session_token.clone(),
+            per_action_token: headers.per_action_token.clone(),
+            cookie: headers.cookie.clone(),
+            content_type: headers.content_type.clone(),
+            storage_not_low: headers.storage_not_low,
             body,
-        );
+        });
         // SSE change stream: a long-lived connection that bypasses the one-shot
         // response model. Reached only after header validation, so the same
         // loopback/origin rules apply; needs the injected EventBus (daemon only).
         if method == "GET" && req.path == "/api/v1/events" {
             // Mobile profile (#89): SSE is a data route, so it is session-gated too.
-            // EventSource can't send headers, so the token rides the `_st` query param
-            // (the header is honored as well). No-op on the desktop daemon.
-            let st_query = req
-                .query
-                .iter()
-                .find(|(k, _)| k == "_st")
-                .map(|(_, v)| v.as_str());
-            let provided = req.session_token.as_deref().or(st_query);
-            if !router.session_authorized(provided) {
+            // Session authority is header/cookie-only. Reject legacy query
+            // credentials before opening any stream.
+            if req.q("_st").is_some() {
+                let resp = ApiResponse::error(400, "session token query is not allowed");
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(());
+            }
+            if !router.session_authorized(req.session_token.as_deref()) {
                 let resp = ApiResponse::error(401, "missing or invalid session token");
                 stream.write_all(&format_http(&resp))?;
                 stream.flush()?;
@@ -575,13 +887,13 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
         // handler's `Receiver<String>` (pre-serialized JSON data lines). Same session gate;
         // the turn id rides the `turn` query param (EventSource can't set headers).
         if method == "GET" && req.path == "/api/v1/agent/stream" {
-            let st_query = req
-                .query
-                .iter()
-                .find(|(k, _)| k == "_st")
-                .map(|(_, v)| v.as_str());
-            let provided = req.session_token.as_deref().or(st_query);
-            if !router.session_authorized(provided) {
+            if req.q("_st").is_some() {
+                let resp = ApiResponse::error(400, "session token query is not allowed");
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(());
+            }
+            if !router.session_authorized(req.session_token.as_deref()) {
                 let resp = ApiResponse::error(401, "missing or invalid session token");
                 stream.write_all(&format_http(&resp))?;
                 stream.flush()?;
@@ -810,11 +1122,164 @@ mod tests {
                 "{path} must be bounded before body allocation"
             );
         }
-        assert_eq!(strict_json_body_limit("POST", "/api/v1/agent/turn"), None);
+        assert_eq!(
+            strict_json_body_limit("POST", "/api/v1/agent/turn"),
+            Some(64 * 1024)
+        );
         assert_eq!(
             strict_json_body_limit("GET", "/api/v1/agent/connectivity/preflight"),
             None
         );
+    }
+
+    #[test]
+    fn bridge_and_http_share_body_policy() {
+        for (method, path, expected) in [
+            (
+                "POST",
+                "/api/v1/agent/oauth/start",
+                RouteBodyPolicy::Json(8 * 1024),
+            ),
+            (
+                "POST",
+                "/api/v1/agent/turn",
+                RouteBodyPolicy::Json(64 * 1024),
+            ),
+            ("POST", "/api/v1/nope", RouteBodyPolicy::None),
+            ("GET", "/api/v1/agent/turn", RouteBodyPolicy::None),
+        ] {
+            assert_eq!(route_body_policy(method, path), expected);
+        }
+
+        let router = Router::new(isyncyou_core::Config::default());
+        let response = dispatch_message(
+            &router,
+            BridgeDispatchRequest {
+                method: "POST",
+                target: "/api/v1/agent/oauth/start",
+                cap_token: None,
+                session_token: None,
+                per_action_token: None,
+                cookie: None,
+                content_type: Some("application/json".into()),
+                storage_not_low: None,
+                body: vec![b'x'; 8 * 1024 + 1],
+            },
+        );
+        assert_eq!(response.status, 413);
+    }
+
+    #[test]
+    fn every_post_route_has_one_dispatch_domain_and_body_policy() {
+        let routes = [
+            "/api/v1/restore",
+            "/api/v1/backup",
+            "/api/v1/jobs/cancel",
+            "/api/v1/share",
+            "/api/v1/sync/pause",
+            "/api/v1/sync/resume",
+            "/api/v1/sync/now",
+            "/api/v1/verify",
+            "/api/v1/settings",
+            "/api/v1/mail/send",
+            "/api/v1/mail/reply",
+            "/api/v1/mail/forward",
+            "/api/v1/mail/move",
+            "/api/v1/mail/read",
+            "/api/v1/mail/flag",
+            "/api/v1/mail/categories",
+            "/api/v1/mail/draft",
+            "/api/v1/calendar/create",
+            "/api/v1/calendar/update",
+            "/api/v1/calendar/delete",
+            "/api/v1/calendar/respond",
+            "/api/v1/contact/create",
+            "/api/v1/contact/update",
+            "/api/v1/contact/delete",
+            "/api/v1/todo/create",
+            "/api/v1/todo/update",
+            "/api/v1/todo/complete",
+            "/api/v1/todo/delete",
+            "/api/v1/todo/checklist-add",
+            "/api/v1/todo/checklist-toggle",
+            "/api/v1/todo/checklist-delete",
+            "/api/v1/todo/list-create",
+            "/api/v1/todo/list-delete",
+            "/api/v1/onenote/create",
+            "/api/v1/onenote/delete",
+            "/api/v1/onenote/append",
+            "/api/v1/onedrive/transfers/cancel",
+            "/api/v1/onedrive/transfers/pause",
+            "/api/v1/onedrive/transfers/retry",
+            "/api/v1/onedrive/create",
+            "/api/v1/onedrive/rename",
+            "/api/v1/onedrive/move",
+            "/api/v1/onedrive/delete",
+            "/api/v1/onedrive/mode",
+            "/api/v1/mutation-intent/create",
+            "/api/v1/mutation-intent/chunk",
+            "/api/v1/mutation-intent/commit",
+            "/api/v1/mutation-intent/cancel",
+            "/api/v1/onedrive/free-up",
+            "/api/v1/onedrive/download-now",
+            "/api/v1/onedrive/conflict/resolve",
+            "/api/v1/onedrive/cleanup",
+            "/api/v1/account/login/start",
+            "/api/v1/account/login/poll",
+            "/api/v1/account/signout",
+            "/api/v1/push/register",
+            "/api/v1/push/test",
+            "/api/v1/agent/turn",
+            "/api/v1/agent/session/create",
+            "/api/v1/agent/session/select",
+            "/api/v1/agent/session/archive",
+            "/api/v1/agent/user-presence/start",
+            "/api/v1/agent/user-presence/confirm",
+            "/api/v1/agent/session/pairing/create",
+            "/api/v1/agent/session/pairing/reveal",
+            "/api/v1/agent/session/pairing/claim",
+            "/api/v1/agent/session/pairing/finalize",
+            "/api/v1/agent/session/pairing/revoke",
+            "/api/v1/agent/confirm",
+            "/api/v1/agent/turn/cancel",
+            "/api/v1/agent/pending/cancel",
+            "/api/v1/agent/connectivity/preflight",
+            "/api/v1/agent/credential/refresh",
+            "/api/v1/agent/oauth/start",
+            "/api/v1/agent/oauth/logout",
+            "/api/v1/agent/oauth/lifecycle/resume",
+            "/api/v1/agent/oauth/cancel",
+            "/api/v1/agent/oauth/complete",
+            "/api/v1/agent/model",
+        ];
+        let unique = routes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            routes.len(),
+            "duplicate POST route in catalogue"
+        );
+        for route in routes {
+            assert!(
+                matches!(route_body_policy("POST", route), RouteBodyPolicy::Json(_)),
+                "{route} has no pre-allocation body policy"
+            );
+        }
+    }
+
+    #[test]
+    fn http_structured_parser_preserves_fragmented_body_bytes_after_headers() {
+        let bytes = b"POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let mut reader = BufReader::with_capacity(7, std::io::Cursor::new(bytes));
+        let head = read_http_head(&mut reader).unwrap();
+        let (method, target, _) = parse_http_head(&head).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(target, "/api/v1/agent/oauth/start");
+        let mut body = [0u8; 2];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"{}");
     }
 
     #[test]
@@ -956,7 +1421,10 @@ mod tests {
 
     fn one_tcp_response(request: &[u8]) -> String {
         use isyncyou_core::Config;
-        let router = Router::new(Config::default());
+        tcp_response_with_router(Router::new(Config::default()), request)
+    }
+
+    fn tcp_response_with_router(router: Router, request: &[u8]) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -977,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_complete_strict_limit_and_framing_apply_before_routing() {
+    fn existing_agent_lifecycle_json_routes_keep_8k_framing_and_no_store() {
         let oversized = one_tcp_response(
             format!(
                 "POST /api/v1/agent/oauth/complete HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -986,6 +1454,9 @@ mod tests {
             .as_bytes(),
         );
         assert!(oversized.starts_with("HTTP/1.1 413"), "got: {oversized}");
+        assert!(oversized
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"));
 
         let duplicate_length = one_tcp_response(
             b"POST /api/v1/agent/oauth/complete HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
@@ -1002,6 +1473,176 @@ mod tests {
             transfer_encoding.starts_with("HTTP/1.1 400"),
             "got: {transfer_encoding}"
         );
+    }
+
+    #[test]
+    fn http_rejects_duplicate_or_malformed_content_length() {
+        for framing in [
+            "Content-Length: 0\r\nContent-Length: 0\r\n",
+            "Content-Length: nope\r\n",
+        ] {
+            let request = format!(
+                "POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{framing}\r\n"
+            );
+            assert!(one_tcp_response(request.as_bytes()).starts_with("HTTP/1.1 400"));
+        }
+    }
+
+    #[test]
+    fn http_rejects_transfer_encoding() {
+        let response = one_tcp_response(
+            b"POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    }
+
+    #[test]
+    fn json_routes_require_application_json() {
+        for content_type in ["text/plain", "application/json; charset=latin1"] {
+            let request = format!(
+                "POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: 2\r\n\r\n{{}}"
+            );
+            assert!(one_tcp_response(request.as_bytes()).starts_with("HTTP/1.1 400"));
+        }
+    }
+
+    #[test]
+    fn desktop_api_requires_process_session_before_cap_or_body_lookup() {
+        let router = Router::new(isyncyou_core::Config::default())
+            .with_session_token("process-session".into());
+        let request = format!(
+            "POST /api/v1/agent/turn HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: {}\r\n\r\n",
+            64 * 1024 + 1
+        );
+        let response = tcp_response_with_router(router, request.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+        assert!(response
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"));
+    }
+
+    #[test]
+    fn tcp_cookie_mutation_requires_exact_origin_host_and_port() {
+        let router = Router::new(isyncyou_core::Config::default())
+            .with_session_token("process-session".into());
+        let missing_origin = tcp_response_with_router(
+            router,
+            b"POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: 127.0.0.1:8871\r\nCookie: isy_session=process-session\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(missing_origin.starts_with("HTTP/1.1 403"));
+
+        let router = Router::new(isyncyou_core::Config::default())
+            .with_session_token("process-session".into());
+        let wrong_port = tcp_response_with_router(
+            router,
+            b"POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: 127.0.0.1:8871\r\nOrigin: http://127.0.0.1:8872\r\nCookie: isy_session=process-session\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(wrong_port.starts_with("HTTP/1.1 403"));
+    }
+
+    #[test]
+    fn different_loopback_port_origin_is_rejected() {
+        assert!(!origin_matches_host(
+            "http://127.0.0.1:8872",
+            "127.0.0.1:8871"
+        ));
+        assert!(origin_matches_host(
+            "http://127.0.0.1:8871",
+            "127.0.0.1:8871"
+        ));
+    }
+
+    #[test]
+    fn unknown_or_get_route_body_is_rejected_without_allocation() {
+        assert_eq!(
+            route_body_policy("POST", "/api/v1/nope"),
+            RouteBodyPolicy::None
+        );
+        assert_eq!(
+            route_body_policy("GET", "/api/v1/agent/turn"),
+            RouteBodyPolicy::None
+        );
+        let response = one_tcp_response(
+            b"GET /api/v1/agent/turn HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+        );
+        assert!(response.starts_with("HTTP/1.1 413"), "got: {response}");
+    }
+
+    #[test]
+    fn http_applies_route_limit_before_allocation() {
+        let unknown = one_tcp_response(
+            b"POST /api/v1/nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+        );
+        assert!(unknown.starts_with("HTTP/1.1 413"), "got: {unknown}");
+
+        let missing_length = one_tcp_response(
+            b"POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n",
+        );
+        assert!(
+            missing_length.starts_with("HTTP/1.1 411"),
+            "got: {missing_length}"
+        );
+    }
+
+    #[test]
+    fn http_rejects_duplicate_host_origin_cookie_content_type_and_authority_headers() {
+        for header in [
+            "Host: localhost\r\nHost: localhost\r\n",
+            "Host: localhost\r\nOrigin: http://localhost\r\nOrigin: http://localhost\r\n",
+            "Host: localhost\r\nCookie: a=1\r\nCookie: b=2\r\n",
+            "Host: localhost\r\nContent-Type: application/json\r\nContent-Type: application/json\r\n",
+            "Host: localhost\r\nX-Session-Token: a\r\nX-Session-Token: a\r\n",
+            "Host: localhost\r\nX-Capability-Token: a\r\nX-Capability-Token: a\r\n",
+            "Host: localhost\r\nX-Per-Action-Token: a\r\nX-Per-Action-Token: a\r\n",
+        ] {
+            let request = format!("GET /api/v1/status HTTP/1.1\r\n{header}\r\n");
+            let response = one_tcp_response(request.as_bytes());
+            assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+        }
+    }
+
+    #[test]
+    fn http_fixed_header_buffer_rejects_oversize_line_count_fold_nul_and_bare_lf() {
+        let oversized = format!(
+            "GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\nX-Pad: {}\r\n\r\n",
+            "x".repeat(MAX_HEADER_LINE + 1)
+        );
+        assert!(one_tcp_response(oversized.as_bytes()).starts_with("HTTP/1.1 400"));
+
+        let many = format!(
+            "GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\n{}\r\n",
+            (0..MAX_HEADER_FIELDS)
+                .map(|index| format!("X-{index}: x\r\n"))
+                .collect::<String>()
+        );
+        assert!(one_tcp_response(many.as_bytes()).starts_with("HTTP/1.1 400"));
+        assert!(
+            one_tcp_response(b"GET / HTTP/1.1\r\nHost: localhost\r\n folded\r\n\r\n")
+                .starts_with("HTTP/1.1 400")
+        );
+        assert!(
+            one_tcp_response(b"GET / HTTP/1.1\r\nHost: local\0host\r\n\r\n")
+                .starts_with("HTTP/1.1 400")
+        );
+        assert!(
+            one_tcp_response(b"GET / HTTP/1.1\nHost: localhost\n\n").starts_with("HTTP/1.1 400")
+        );
+    }
+
+    #[test]
+    fn desktop_shell_bootstrap_sets_http_only_strict_process_session_cookie() {
+        let router = Router::new(isyncyou_core::Config::default())
+            .with_session_token("process-session".into());
+        let response = router.route(&ApiRequest::get("/"));
+        assert_eq!(response.status, 200);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie")
+                && value == "isy_session=process-session; HttpOnly; SameSite=Strict; Path=/api/v1"
+        }));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
+        assert!(!String::from_utf8_lossy(&response.body).contains("process-session"));
     }
 
     #[test]
@@ -1130,12 +1771,12 @@ mod tests {
             !with_tok.starts_with("HTTP/1.1 401"),
             "valid token must pass: {with_tok}"
         );
-        // Valid token via the `_st` query (iframe/img/EventSource path) → passes.
+        // Session credentials are never accepted from a query string.
         let with_q =
             req("GET /api/v1/status?_st=sess-http-tok HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
         assert!(
-            !with_q.starts_with("HTTP/1.1 401"),
-            "valid _st query must pass: {with_q}"
+            with_q.starts_with("HTTP/1.1 400"),
+            "_st query must be rejected: {with_q}"
         );
         // Valid token via the loopback cookie (auto-rides subresources on Android).
         let with_cookie = req(
@@ -1226,7 +1867,7 @@ mod tests {
         sse.set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
         sse.write_all(
-            b"GET /api/v1/agent/stream?turn=turn-123&_st=sess-http-tok HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            b"GET /api/v1/agent/stream?turn=turn-123 HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=sess-http-tok\r\n\r\n",
         )
         .unwrap();
         let mut raw = Vec::new();
@@ -1342,31 +1983,36 @@ mod tests {
     fn build_request_resolves_cookie_session_and_carries_body() {
         // #0A: the shared request builder carries the body and resolves the session from
         // the loopback cookie when no explicit header is present.
-        let r = build_request(
-            "POST",
-            "/api/v1/x?a=1",
-            Some("cap-1".into()),
-            None,
-            Some("other=z; isy_session=cook-tok".into()),
-            Some("application/json".into()),
-            b"hello-body".to_vec(),
-        );
+        let r = build_request(BridgeDispatchRequest {
+            method: "POST",
+            target: "/api/v1/x?a=1",
+            cap_token: Some("cap-1".into()),
+            session_token: None,
+            per_action_token: Some("pat-1".into()),
+            cookie: Some("other=z; isy_session=cook-tok".into()),
+            content_type: Some("application/json".into()),
+            storage_not_low: None,
+            body: b"hello-body".to_vec(),
+        });
         assert_eq!(r.method, "POST");
         assert_eq!(r.path, "/api/v1/x");
         assert_eq!(r.cap_token.as_deref(), Some("cap-1"));
         assert_eq!(r.session_token.as_deref(), Some("cook-tok"));
+        assert_eq!(r.per_action_token.as_deref(), Some("pat-1"));
         assert_eq!(r.content_type.as_deref(), Some("application/json"));
         assert_eq!(r.body, b"hello-body");
         // An explicit X-Session-Token header wins over the cookie.
-        let r2 = build_request(
-            "GET",
-            "/api/v1/x",
-            None,
-            Some("hdr-tok".into()),
-            Some("isy_session=cook-tok".into()),
-            None,
-            Vec::new(),
-        );
+        let r2 = build_request(BridgeDispatchRequest {
+            method: "GET",
+            target: "/api/v1/x",
+            cap_token: None,
+            session_token: Some("hdr-tok".into()),
+            per_action_token: None,
+            cookie: Some("isy_session=cook-tok".into()),
+            content_type: None,
+            storage_not_low: None,
+            body: Vec::new(),
+        });
         assert_eq!(r2.session_token.as_deref(), Some("hdr-tok"));
         assert!(r2.body.is_empty());
     }
@@ -1383,8 +2029,10 @@ mod tests {
                 target: "/api/v1/accounts",
                 cap_token: None,
                 session_token: None,
+                per_action_token: None,
                 cookie: None,
                 content_type: None,
+                storage_not_low: None,
                 body: Vec::new(),
             },
         );
@@ -1403,8 +2051,10 @@ mod tests {
                 target: "/api/v1/status",
                 cap_token: None,
                 session_token: None,
+                per_action_token: None,
                 cookie: None,
                 content_type: None,
+                storage_not_low: None,
                 body: Vec::new(),
             },
         );
@@ -1416,8 +2066,10 @@ mod tests {
                 target: "/api/v1/status",
                 cap_token: None,
                 session_token: Some("sess-bridge".into()),
+                per_action_token: None,
                 cookie: None,
                 content_type: None,
+                storage_not_low: None,
                 body: Vec::new(),
             },
         );
@@ -1430,8 +2082,10 @@ mod tests {
                 target: "/api/v1/agent/oauth/complete",
                 cap_token: None,
                 session_token: None,
+                per_action_token: None,
                 cookie: None,
                 content_type: Some("application/json".into()),
+                storage_not_low: None,
                 body: vec![b'x'; AGENT_STRICT_JSON_MAX_BYTES + 1],
             },
         );
@@ -1503,9 +2157,9 @@ mod tests {
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
-        // A POST with a 5-byte body to an unknown route: the body must be consumed.
+        // A strict JSON POST body must be consumed before the next request is read.
         c.write_all(
-            b"POST /api/v1/nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
+            b"POST /api/v1/agent/oauth/complete HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
         )
         .unwrap();
         let first = read_http_response(&mut c);
@@ -1520,5 +2174,11 @@ mod tests {
             "follow-up after body must succeed: {second}"
         );
         assert!(second.contains("\"accounts\""), "body: {second}");
+    }
+
+    #[test]
+    fn session_token_query_is_rejected_for_api_and_sse() {
+        session_token_gates_data_routes_over_http();
+        agent_stream_sse_requires_session_token_on_mobile();
     }
 }

@@ -108,6 +108,7 @@ object BiometricLabelPolicy {
         "mode-switch-offline-large" to "Make folder offline",
         "conflict-keep-mine" to "Keep local version",
         "bulk" to "Bulk change",
+        "user-presence" to "Confirm session action",
     )
     private val services = mapOf(
         "onedrive" to "OneDrive",

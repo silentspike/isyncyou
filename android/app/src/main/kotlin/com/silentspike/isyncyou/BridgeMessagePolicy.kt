@@ -40,17 +40,24 @@ object BridgeMessagePolicy {
         }
     }
 
-    fun sanitizeHeaders(headers: JSONObject?, trustedSessionToken: String): JSONObject {
+    fun sanitizeHeaders(
+        headers: JSONObject?,
+        trustedSessionToken: String,
+        trustedStorageNotLow: Boolean? = null,
+    ): JSONObject {
         val out = JSONObject()
         if (headers != null) {
             val keys = headers.keys()
             while (keys.hasNext()) {
                 val key = keys.next()
-                if (key.lowercase() == "x-session-token") continue
+                if (key.lowercase() in setOf("x-session-token", "x-storage-not-low")) continue
                 out.put(key, headers.opt(key))
             }
         }
         out.put("X-Session-Token", trustedSessionToken)
+        if (trustedStorageNotLow != null) {
+            out.put("X-Storage-Not-Low", trustedStorageNotLow.toString())
+        }
         return out
     }
 

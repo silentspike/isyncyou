@@ -35,6 +35,7 @@ pub mod http;
     feature = "agent-subscription-experimental"
 ))]
 pub mod oauth;
+pub mod pairing_v2;
 pub mod product_provider;
 pub mod provider;
 pub mod retrieval;
@@ -43,19 +44,27 @@ pub mod secrets;
 pub mod session;
 mod session_crypto;
 mod session_ids;
+pub mod session_v2;
 pub mod stream;
 pub mod tool;
 pub mod turn;
 
 pub use archive::{ArchiveSource, ItemRef};
 pub use confirm::{
-    action_hash, ConfirmError, PendingAction, PendingActionBinding, PendingRegistry,
+    action_hash, ConfirmError, PendingAction, PendingActionBinding, PendingOwnerBinding,
+    PendingPersistence, PendingRegistry, PersistedPendingAction,
 };
 pub use connectivity::{
     classify, target_for, AndroidNetworkSnapshot, ConnectivityPreflightCode, ConnectivityProvider,
     ConnectivityPurpose, ProbeLimiter, ProbeObservation, RestrictBackgroundStatus,
 };
 pub use error::AgentError;
+#[cfg(feature = "onedrive")]
+pub use pairing_v2::{OneDrivePairingTransportV2, VersionedPairingDescriptorV2};
+pub use pairing_v2::{
+    PairingClaimV2, PairingCodeV2, PairingDescriptorV2, PairingRemoteStateV2,
+    PairingSourceSecretV2, PairingV2Error,
+};
 pub use product_provider::ProductProviderId;
 pub use provider::{AssistantBlock, DoneReason, FakeProvider, LlmProvider, StreamEvent, Usage};
 pub use retrieval::RetrievalExecutor;
@@ -71,13 +80,32 @@ pub use session::{
     LoadedSession, LocalSessionCache, MemorySessionCache, PutTurnOutcome, Session, SessionFork,
     SessionTransport, Turn, TurnLeaseState,
 };
-pub use session_crypto::{KdfProfile, PairingPayload, SessionCryptoConfig};
-pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
-pub use stream::AgentStreamHub;
-pub use tool::{
-    help_text, parse_action, registry_tool_names, tool_schema, ToolAction, ToolClass, TOOL_NAME,
+pub use session_crypto::{
+    KdfProfile, PairingPayload, SessionCryptoConfig, SessionObjectClass, SessionObjectCrypto,
 };
-pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
+pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
+pub use session_v2::{
+    payload_digest, request_key, request_object_digest, select_provider_context,
+    session_write_policy, tool_result_digest, ContextBudget, HistoryCursorCodec, HistoryPageV1,
+    IdempotencyTombstoneV1, ImmutableIndexEntryV1, ImmutableIndexPageV1,
+    InMemorySessionV2Transport, IndexPageRef, InputTokenCounter, LocalEffectCheckpointV1,
+    LocalEffectState, ManifestDelta, ManifestLease, NormalizedAssistantBlock,
+    PersistedLeaseBinding, ProviderAttemptBindingV1, ReadToolCheckpointV1, RequestJournalV1,
+    RequestPhase, RequestReplayV1, RequestRouteDomain, RequestStepOutcomeV1, RequestStepRef,
+    RequestUuidBindingV1, SanitizedUsage, SessionCommitV1, SessionLeaseGuard, SessionManifestV1,
+    SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store, SessionV2Transport,
+    SessionWritePolicy, SourceRef, TurnTerminalStatus, VersionedManifest, VisibleContextMessage,
+    MAX_TOOL_CHECKPOINTS, REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
+};
+pub use stream::{AgentStreamHub, CancellationToken};
+pub use tool::{
+    help_text, parse_action, registry_tool_names, tool_schema, RecoveryPolicy, ToolAction,
+    ToolClass, TOOL_NAME,
+};
+pub use turn::{
+    run_turn, run_turn_cancellable, run_turn_observed, Message, ReadExecutionBinding, Role,
+    ToolExecutor, ToolUseRef, TurnObserver, TurnOutcome,
+};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
@@ -105,6 +133,8 @@ pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
 pub use provider::{attest_static_product_harness, HarnessProvider, HARNESS_CONTRACT_VERSION};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
+#[cfg(feature = "onedrive")]
+pub use session_v2::OneDriveSessionV2Transport;
 
 #[cfg(test)]
 mod tests {

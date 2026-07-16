@@ -55,6 +55,14 @@ function checkAgentCap(req) {
   return req.headers["x-capability-token"] === AGENT_CAP;
 }
 
+async function readJson(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const body = Buffer.concat(chunks);
+  if (body.length > 64 * 1024) throw new Error("fixture body too large");
+  return JSON.parse(body.toString("utf8"));
+}
+
 function sendSseMessage(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
@@ -139,6 +147,8 @@ function makeFixtureServer(evidence) {
   let onboardingMode = "not_started";
   let oauthAttemptSeq = 0;
   let turnSeq = 0;
+  let selectedSessionId = null;
+  const sessions = new Map();
   const turns = new Map();
   const state = {
     oauthStarts: [],
@@ -242,9 +252,10 @@ function makeFixtureServer(evidence) {
         json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/start") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.oauthStarts.push(Object.fromEntries(url.searchParams.entries()));
+        const body = await readJson(req);
+        state.oauthStarts.push(body);
         agentConnected = true;
-        agentProvider = url.searchParams.get("provider") === "codex" ? "codex" : "claude";
+        agentProvider = body.provider === "codex" ? "codex" : "claude";
         onboardingMode = "ready";
         json(res, 200, {
           authorize_url: `http://${req.headers.host}/fixture-auth-complete`,
@@ -262,13 +273,41 @@ function makeFixtureServer(evidence) {
         );
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/model") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.modelPosts.push(Object.fromEntries(url.searchParams.entries()));
-        agentProvider = url.searchParams.get("provider") || agentProvider;
-        agentModel = url.searchParams.get("model") || agentModel;
+        const body = await readJson(req);
+        state.modelPosts.push(body);
+        agentProvider = body.provider || agentProvider;
+        agentModel = body.model || agentModel;
         json(res, 200, { ok: true });
+      } else if (req.method === "GET" && url.pathname === "/api/v1/agent/session/list") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        json(res, 200, {
+          sessions: [...sessions.values()].map(({ records: _records, ...session }) => session),
+          selected_session_id: selectedSessionId,
+          next_cursor: null,
+        });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/session/create") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        await readJson(req);
+        const sessionId = `session-${sessions.size + 1}`;
+        const session = { session_id: sessionId, display_name: "Assistant", archived: false };
+        sessions.set(sessionId, { ...session, records: [] });
+        selectedSessionId = sessionId;
+        json(res, 200, { session });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/session/select") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        if (!sessions.has(body.session_id)) return json(res, 404, { error: "session_not_found" });
+        selectedSessionId = body.session_id;
+        json(res, 200, { selected: true });
+      } else if (req.method === "GET" && url.pathname === "/api/v1/agent/session/history") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const session = sessions.get(url.searchParams.get("session_id"));
+        if (!session) return json(res, 404, { error: "session_not_found" });
+        json(res, 200, { records: session.records, next_cursor: null });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/turn") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        const prompt = url.searchParams.get("prompt") || "";
+        const body = await readJson(req);
+        const prompt = body.prompt || "";
         const turn = `turn-${++turnSeq}`;
         const lower = prompt.toLowerCase();
         const scenario = lower.includes("error") ? "error"
@@ -284,11 +323,11 @@ function makeFixtureServer(evidence) {
         await sendStream(res, scenario, turn);
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/confirm") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.confirmPosts.push(Object.fromEntries(url.searchParams.entries()));
+        state.confirmPosts.push(await readJson(req));
         json(res, 200, { result: "Confirmed by fixture" });
-      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/cancel") {
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/pending/cancel") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.cancelPosts.push(Object.fromEntries(url.searchParams.entries()));
+        state.cancelPosts.push(await readJson(req));
         json(res, 200, { ok: true });
       } else if (req.method === "GET" && url.pathname === "/api/v1/view") {
         state.viewHits.push(Object.fromEntries(url.searchParams.entries()));
@@ -674,7 +713,8 @@ async function main() {
     const cancelCard = page.locator('[data-agent-pending-card="1"]').last();
     await cancelCard.getByRole("button", { name: "Cancel" }).click();
     await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-agent-pending-card="1"]')).at(-1)?.classList.contains("cancelled"), null, { timeout: 10000 });
-    assert(evidence, "cancel posts once for separate turn", fixture.state.cancelPosts.length === 1 && fixture.state.cancelPosts[0].turn, fixture.state.cancelPosts);
+    assert(evidence, "pending cancel posts once for separate turn", fixture.state.cancelPosts.length === 1
+      && fixture.state.cancelPosts[0].pending?.startsWith("pending-turn-"), fixture.state.cancelPosts);
     evidence.screenshots.pending_cancel = await screenshot(page, "pending-cancel.png");
 
     await page.locator('[data-testid="agent-input"]').fill("trigger error");

@@ -3,6 +3,7 @@ package com.silentspike.isyncyou
 import android.Manifest
 import android.app.KeyguardManager
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.os.BatteryManager
@@ -460,12 +461,25 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun sanitizedBridgeRequest(obj: JSONObject): String {
+        val path = obj.optString("path", "/")
+        val storageNotLow = if (path == "/api/v1/mutation-intent/create") {
+            registerReceiver(null, IntentFilter(Intent.ACTION_DEVICE_STORAGE_LOW)) == null
+        } else {
+            null
+        }
         val out = JSONObject()
             .put("t", "req")
             .put("id", obj.optString("id", ""))
             .put("method", obj.optString("method", "GET"))
-            .put("path", obj.optString("path", "/"))
-            .put("headers", BridgeMessagePolicy.sanitizeHeaders(obj.optJSONObject("headers"), sessionToken))
+            .put("path", path)
+            .put(
+                "headers",
+                BridgeMessagePolicy.sanitizeHeaders(
+                    obj.optJSONObject("headers"),
+                    sessionToken,
+                    storageNotLow,
+                ),
+            )
         if (obj.has("body") && !obj.isNull("body")) {
             out.put("body", obj.opt("body"))
         } else {

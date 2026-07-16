@@ -532,8 +532,10 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
             target: path,
             cap_token: None,
             session_token: None,
+            per_action_token: None,
             cookie,
             content_type: None,
+            storage_not_low: None,
             body: Vec::new(),
         },
     );
@@ -2010,6 +2012,12 @@ mod tests {
         cap
     }
 
+    fn strict_json_post(path: &str, body: serde_json::Value) -> isyncyou_webui::ApiRequest {
+        isyncyou_webui::ApiRequest::new("POST", path)
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
     fn restore_enabled_mobile_config(files_dir: &std::path::Path) {
         let mut cfg = Config::default();
         cfg.restore.cloud_restore_enabled = true;
@@ -2021,7 +2029,7 @@ mod tests {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(feature = "agent-session-kdf-bench")]
@@ -2623,16 +2631,43 @@ mod tests {
         );
         // Restore/backup are now present in the mobile full-node profile, but still gated by
         // the injected cap token and then the native per-action biometric token.
-        let restore_no_cap = bridge_request(&format!(
-            r#"{{"method":"POST","path":"/api/v1/restore?account=me&service=mail&id=x","headers":{{"X-Session-Token":"{tok}"}}}}"#
-        ));
+        let restore_no_cap = bridge_request(
+            &serde_json::json!({
+                "method": "POST",
+                "path": "/api/v1/restore",
+                "headers": {
+                    "X-Session-Token": tok.clone(),
+                    "Content-Type": "application/json"
+                },
+                "body": serde_json::json!({
+                    "request_id": "00000000-0000-4000-8000-000000000003",
+                    "account": "me",
+                    "service": "mail",
+                    "id": "x"
+                }).to_string()
+            })
+            .to_string(),
+        );
         assert!(
             restore_no_cap.contains("\"status\":401"),
             "restore must be wired and cap-gated, not absent: {restore_no_cap}"
         );
-        let backup_no_cap = bridge_request(&format!(
-            r#"{{"method":"POST","path":"/api/v1/backup?account=me&services=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
-        ));
+        let backup_no_cap = bridge_request(
+            &serde_json::json!({
+                "method": "POST",
+                "path": "/api/v1/backup",
+                "headers": {
+                    "X-Session-Token": tok,
+                    "Content-Type": "application/json"
+                },
+                "body": serde_json::json!({
+                    "request_id": "00000000-0000-4000-8000-000000000004",
+                    "account": "me",
+                    "services": "mail"
+                }).to_string()
+            })
+            .to_string(),
+        );
         assert!(
             backup_no_cap.contains("\"status\":401"),
             "backup must be wired and cap-gated, not absent: {backup_no_cap}"
@@ -2693,14 +2728,17 @@ mod tests {
             )
         };
 
+        let restore_body = serde_json::json!({
+            "request_id": "00000000-0000-4000-8000-000000000001",
+            "account": "me",
+            "service": "mail",
+            "id": "restore-src-1"
+        });
         let restore_challenge = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new(
-                    "POST",
-                    "/api/v1/restore?account=me&service=mail&id=restore-src-1",
-                )
-                .with_session_token(Some(tok.clone()))
-                .with_cap_token(Some(restore_cap.clone())),
+                &strict_json_post("/api/v1/restore", restore_body.clone())
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(restore_cap.clone())),
             ),
         );
         assert_eq!(
@@ -2716,23 +2754,24 @@ mod tests {
         assert!(router.confirm_biometric(restore_pat));
         let restore_ok = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new(
-                    "POST",
-                    &format!(
-                    "/api/v1/restore?account=me&service=mail&id=restore-src-1&_pat={restore_pat}"
-                ),
-                )
-                .with_session_token(Some(tok.clone()))
-                .with_cap_token(Some(restore_cap)),
+                &strict_json_post("/api/v1/restore", restore_body)
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(restore_cap))
+                    .with_per_action_token(Some(restore_pat.to_owned())),
             ),
         );
         assert_eq!(restore_ok["queued"].as_bool(), Some(true));
         assert_eq!(restore_ok["kind"].as_str(), Some("restore-cloud"));
         assert_eq!(restore_ok["state"].as_str(), Some("queued"));
 
+        let backup_body = serde_json::json!({
+            "request_id": "00000000-0000-4000-8000-000000000002",
+            "account": "me",
+            "services": "mail"
+        });
         let backup_challenge = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new("POST", "/api/v1/backup?account=me&services=mail")
+                &strict_json_post("/api/v1/backup", backup_body.clone())
                     .with_session_token(Some(tok.clone()))
                     .with_cap_token(Some(backup_cap.clone())),
             ),
@@ -2750,12 +2789,10 @@ mod tests {
         assert!(router.confirm_biometric(backup_pat));
         let backup_ok = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new(
-                    "POST",
-                    &format!("/api/v1/backup?account=me&services=mail&_pat={backup_pat}"),
-                )
-                .with_session_token(Some(tok.clone()))
-                .with_cap_token(Some(backup_cap)),
+                &strict_json_post("/api/v1/backup", backup_body)
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(backup_cap))
+                    .with_per_action_token(Some(backup_pat.to_owned())),
             ),
         );
         assert_eq!(backup_ok["queued"].as_bool(), Some(true));

@@ -142,9 +142,9 @@ requirements:
       - test: agent_stream_event_json_is_single_line_and_stable
       - test: daemon_agent_fake_turn_streams_tokens_to_subscriber
       - test: daemon_agent_pending_turn_stream_closes_with_pending_confirmation_done
-      - test: daemon_agent_cancel_ends_stream_with_cancelled_done
+      - test: daemon_agent_cancel_marks_registry_without_fabricating_terminal
       - test: daemon_agent_unopened_stream_is_swept
-      - test: agent_chat_alias_matches_turn_route
+      - test: agent_chat_alias_and_legacy_turn_query_are_rejected
       - test: mobile_agent_routes_require_session_token_even_with_cap_token
       - test: agent_stream_sse_requires_session_token_on_mobile
       - test: open_bridge_stream_gates_events_and_agent
@@ -427,7 +427,7 @@ requirements:
       cryptographically verified; every OAuth result is first retained as an encrypted,
       non-ready candidate and cannot replace an existing credential before validation and
       required cleanup complete. Android revoke work uses a bounded credential-revoke
-      foreground guard and one-shot native connectivity snapshot. (S-AG.16, #645)
+      foreground guard and one-shot native connectivity snapshot. (S-AG.20, #645)
     status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
@@ -455,3 +455,36 @@ requirements:
       - test: agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding
       - file: tools/agent-account-lifecycle-ui-smoke.mjs
       - file: docs/evidence/issue-645-manifest.json
+
+  - id: REQ-AGENT-016
+    title: Product shared-session integration and idempotent turn lifecycle
+    statement: >
+      Product Agent sessions use a versioned encrypted manifest and transcript with
+      bounded pagination, storage, and provider context. Every mutable request has a
+      route-, session-, and semantic-payload-bound UUID identity; provider steps,
+      recovery checkpoints, cancellation, confirmation, and terminal publication are
+      fenced so retries cannot duplicate provider calls or effects. Long turns renew
+      their authoritative session lease, remain bound to the exact provider credential
+      generation and product harness, and publish completion only after durable terminal
+      state. Cross-device transfer uses a confirmed, one-time, five-minute pairing
+      protocol with encrypted crash recovery. (S-AG.16, #628)
+    status: planned
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - V2 sessions publish visible transcript, request state, and UUID bindings through one fenced manifest CAS and enforce combined record and encrypted-byte budgets.
+      - Request journals retain the complete bounded provider-step chain, reject ambiguous outbound-call recovery, and revalidate provider, model, credential generation, policy, harness, and installation binding before continuation.
+      - Cancellation and pending cancellation reduce authority; done(complete) is emitted only after terminal persistence and late provider or tool results cannot publish.
+      - Desktop and Android use the same strict session/capability/request contract; mutable values are JSON or bounded sealed chunks rather than URL parameters.
+      - Pairing is confirmation-gated, single-use, expires after five minutes, and cannot be taken over by another claimant after a durable claim.
+    verified_by:
+      - test: session_v2_round_trips_user_assistant_sources_and_terminal_state
+      - test: manifest_cas_atomically_advances_visible_request_and_uuid_binding_heads
+      - test: request_journal_recovers_all_completed_provider_steps_in_order
+      - test: rejected_tool_help_digest_or_unknown_version_fails_closed
+      - test: duplicate_tool_use_ids_fail_closed_before_execution
+      - test: lease_renews_while_provider_emits_no_events_and_stops_on_drop
+      - test: lost_lease_rejects_late_append_and_finalization
+      - test: turn_cancel_stops_before_read_tool_execution
+      - test: provider_generation_recovery_rejects_every_authority_binding_change
+      - test: user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store
+      - file: tools/agent-epic-closeout-probe.py

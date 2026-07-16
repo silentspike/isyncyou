@@ -69,6 +69,7 @@ pub enum ConfirmationOperation {
     ModeSwitchOfflineLarge,
     ConflictKeepMine,
     Bulk,
+    UserPresence,
 }
 
 impl ConfirmationOperation {
@@ -85,6 +86,7 @@ impl ConfirmationOperation {
         Self::ModeSwitchOfflineLarge,
         Self::ConflictKeepMine,
         Self::Bulk,
+        Self::UserPresence,
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -101,6 +103,7 @@ impl ConfirmationOperation {
             "mode-switch-offline-large" => Self::ModeSwitchOfflineLarge,
             "conflict-keep-mine" => Self::ConflictKeepMine,
             "bulk" => Self::Bulk,
+            "user-presence" => Self::UserPresence,
             _ => return None,
         })
     }
@@ -119,6 +122,7 @@ impl ConfirmationOperation {
             Self::ModeSwitchOfflineLarge => "mode-switch-offline-large",
             Self::ConflictKeepMine => "conflict-keep-mine",
             Self::Bulk => "bulk",
+            Self::UserPresence => "user-presence",
         }
     }
 
@@ -151,6 +155,7 @@ impl ConfirmationOperation {
             | Self::ModeSwitchOfflineLarge
             | Self::ConflictKeepMine
             | Self::Bulk => service == ConfirmationService::Onedrive,
+            Self::UserPresence => service == ConfirmationService::Agent,
         }
     }
 }
@@ -463,7 +468,7 @@ mod tests {
 
     #[test]
     fn descriptor_table_covers_every_confirmation_operation() {
-        assert_eq!(ConfirmationOperation::ALL.len(), 12);
+        assert_eq!(ConfirmationOperation::ALL.len(), 13);
         for op in ConfirmationOperation::ALL {
             assert!(requires_confirmation(op.as_str()));
         }
@@ -516,6 +521,7 @@ mod tests {
             ("mode-switch-offline-large", "onedrive"),
             ("conflict-keep-mine", "onedrive"),
             ("bulk", "onedrive"),
+            ("user-presence", "agent"),
         ];
         for op in ConfirmationOperation::ALL {
             for service in ConfirmationService::ALL {

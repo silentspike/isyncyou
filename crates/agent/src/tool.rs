@@ -123,7 +123,31 @@ pub enum ToolClass {
     Destructive,
 }
 
+/// Crash-recovery behavior is deliberately separate from confirmation class. In
+/// particular, `RestoreLocal` is Read-Class but has a local filesystem effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPolicy {
+    RepeatableReadAndCompare,
+    IdempotentLocalMaterialize,
+    NeverRepeat,
+}
+
 impl ToolAction {
+    pub fn recovery_policy(&self) -> RecoveryPolicy {
+        match self {
+            ToolAction::Search { .. }
+            | ToolAction::DeepSearch { .. }
+            | ToolAction::Read { .. }
+            | ToolAction::List { .. }
+            | ToolAction::Export { .. } => RecoveryPolicy::RepeatableReadAndCompare,
+            ToolAction::RestoreLocal { .. } => RecoveryPolicy::IdempotentLocalMaterialize,
+            ToolAction::Backup { .. }
+            | ToolAction::RestoreCloud { .. }
+            | ToolAction::LiveWrite { .. }
+            | ToolAction::Share { .. } => RecoveryPolicy::NeverRepeat,
+        }
+    }
     /// Classify the action (REQ-AGENT-002).
     pub fn class(&self) -> ToolClass {
         match self {
@@ -219,11 +243,30 @@ pub fn help_text() -> String {
         .to_string()
 }
 
+pub const REJECTED_TOOL_HELP_SCHEMA_VERSION: u32 = 1;
+pub const INVALID_TOOL_ARGUMENTS_CODE: &str = "invalid_tool_arguments";
+
+/// Render the stable model-visible correction for a rejected tool call.
+///
+/// Retaining renderers by version makes crash recovery independent from Serde's
+/// diagnostic wording and from future schema changes.
+pub fn render_rejected_tool_help(version: u32, code: &str) -> Option<String> {
+    if version != REJECTED_TOOL_HELP_SCHEMA_VERSION || code != INVALID_TOOL_ARGUMENTS_CODE {
+        return None;
+    }
+    Some(format!("invalid isyncyou tool call\n\n{}", help_text()))
+}
+
 /// Parse a model tool input into a typed [`ToolAction`]. On failure the error carries
 /// the [`help_text`] so the model can correct itself rather than crash the turn.
 pub fn parse_action(input: &serde_json::Value) -> Result<ToolAction, String> {
-    serde_json::from_value::<ToolAction>(input.clone())
-        .map_err(|e| format!("invalid isyncyou tool call: {e}\n\n{}", help_text()))
+    serde_json::from_value::<ToolAction>(input.clone()).map_err(|_| {
+        render_rejected_tool_help(
+            REJECTED_TOOL_HELP_SCHEMA_VERSION,
+            INVALID_TOOL_ARGUMENTS_CODE,
+        )
+        .expect("the compiled rejected-tool renderer must exist")
+    })
 }
 
 /// Public stream representation for a parsed tool call. Read-class inputs are safe to
@@ -480,5 +523,66 @@ mod tests {
             );
         }
         assert_eq!(tool_schema()["name"], "isyncyou");
+    }
+
+    #[test]
+    fn recovery_policy_is_exhaustive_for_every_tool_action() {
+        let actions = [
+            (
+                json!({"op":"search","account":"me","query":"q"}),
+                RecoveryPolicy::RepeatableReadAndCompare,
+            ),
+            (
+                json!({"op":"deep-search","account":"me","query":"q"}),
+                RecoveryPolicy::RepeatableReadAndCompare,
+            ),
+            (
+                json!({"op":"read","account":"me","service":"mail","id":"x"}),
+                RecoveryPolicy::RepeatableReadAndCompare,
+            ),
+            (
+                json!({"op":"list","account":"me","service":"mail"}),
+                RecoveryPolicy::RepeatableReadAndCompare,
+            ),
+            (
+                json!({"op":"export","account":"me","service":"mail","id":"x"}),
+                RecoveryPolicy::RepeatableReadAndCompare,
+            ),
+            (
+                json!({"op":"restore-local","account":"me","service":"mail","id":"x"}),
+                RecoveryPolicy::IdempotentLocalMaterialize,
+            ),
+            (
+                json!({"op":"backup","account":"me","services":["mail"]}),
+                RecoveryPolicy::NeverRepeat,
+            ),
+            (
+                json!({"op":"restore-cloud","account":"me","service":"mail","id":"x"}),
+                RecoveryPolicy::NeverRepeat,
+            ),
+            (
+                json!({"op":"live-write","account":"me","service":"mail","change":{}}),
+                RecoveryPolicy::NeverRepeat,
+            ),
+            (
+                json!({"op":"share","account":"me","service":"mail","id":"x","recipient":"a@example.invalid"}),
+                RecoveryPolicy::NeverRepeat,
+            ),
+        ];
+        for (input, expected) in actions {
+            assert_eq!(parse_action(&input).unwrap().recovery_policy(), expected);
+        }
+    }
+
+    #[test]
+    fn pairing_intent_is_not_a_tool_action_or_provider_schema_entry() {
+        let schema = tool_schema().to_string();
+        assert!(!schema.contains("pairing"));
+        assert!(!schema.contains("session_archive"));
+        assert!(parse_action(&json!({
+            "op": "session_pairing_reveal",
+            "account": "me"
+        }))
+        .is_err());
     }
 }

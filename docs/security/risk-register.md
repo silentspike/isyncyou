@@ -115,6 +115,17 @@ README's [Known limitations](../../README.md#known-limitations).
 
 ---
 
+## R12 — Shared Agent session replay and cross-device authority
+
+| | |
+|---|---|
+| **Risk** | A transport retry duplicates a provider call or cloud effect, a stale session lease publishes after takeover, a request resumes under a different provider generation, or a one-time pairing transfer is reused. |
+| **Impact** | High — duplicate mutation, transcript fork, authority confusion, or session disclosure across devices. |
+| **Mitigation** | #628 adds route/session/payload-bound durable request IDs, bounded encrypted provider-step journals, provider-generation and harness binding, renewed server-time session leases, staged immutable objects with fenced manifest publication, host-owned cancellation/terminal ordering, and confirmation-gated one-time Pairing V2. Strict JSON and sealed mutation chunks remove mutable secrets and large bodies from URLs. |
+| **Status** | **In progress** — implementation and host tests are present, but REQ-AGENT-016 remains planned until the complete pre-RC host, Android, live-provider, cross-device, and evidence matrix passes. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
 ## How this register is maintained
 
 A risk is added the moment it is understood, with an honest status — not after it is

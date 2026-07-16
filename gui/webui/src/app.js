@@ -314,6 +314,7 @@ const CAP = {
   todowrite: "__TASKWRITE_CAP_TOKEN__",
   onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
   onedrivewrite: "__ONEDRIVEWRITE_CAP_TOKEN__",
+  mutationIntent: "__MUTATION_INTENT_CAP_TOKEN__",
   account: "__ACCOUNT_CAP_TOKEN__",
   push: "__PUSH_CAP_TOKEN__",
   agent: "__AGENT_CAP_TOKEN__",
@@ -417,7 +418,9 @@ async function registerPushToken() {
     const d = await nativeCall("pushToken", {}, NATIVE_TIMEOUT_MS);
     const token = d && d.token;
     if (!token) return false;
-    await post(`/api/v1/push/register?${qs({ token })}`, CAP.push);
+    await postJson("/api/v1/push/register", CAP.push, {
+      request_id: crypto.randomUUID(), token,
+    });
     return true;
   } catch (_) { return false; } // best-effort: never block UI load on push
 }
@@ -507,6 +510,7 @@ async function request(method, path, opts) {
   const o = opts || {};
   const headers = {};
   if (o.capToken) headers["X-Capability-Token"] = o.capToken;
+  if (o.perActionToken) headers["X-Per-Action-Token"] = o.perActionToken;
   if (o.headers) {
     Object.entries(o.headers).forEach(([k, v]) => {
       if (BRIDGE && k.toLowerCase() === "x-session-token") return;
@@ -528,13 +532,12 @@ async function request(method, path, opts) {
   // #onedrive-mobile 0.6: a destructive op the mobile router gated answers with a
   // confirmation_required challenge instead of acting. Run the native biometric and, on a
   // human confirm, re-issue exactly once with the per-action token. Guarded against loops:
-  // a request that already carries `_pat` is never re-challenged into another biometric.
+  // a request that already carries the public per-action handle is never re-challenged.
   if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
-      && d.pending_action_id && !/[?&]_pat=/.test(path)) {
+      && d.pending_action_id && !o.perActionToken) {
     const ok = await runBiometricConfirm(d.pending_action_id);
     if (!ok) throw new Error("Confirmation cancelled");
-    const sep = path.includes("?") ? "&" : "?";
-    return request(method, `${path}${sep}_pat=${encodeURIComponent(d.pending_action_id)}`, opts);
+    return request(method, path, { ...o, perActionToken: d.pending_action_id });
   }
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
     const error = new Error(d.error || status || "Request failed");
@@ -544,7 +547,6 @@ async function request(method, path, opts) {
   return d;
 }
 async function api(path) { return request("GET", path); }
-async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
 async function postJson(path, capToken, value) {
   return request("POST", path, {
     capToken,
@@ -560,10 +562,124 @@ function bytesToBase64(bytes) {
   for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   return btoa(bin);
 }
-/* POST a binary body base64-encoded, flagged X-Body-Encoding: base64 for serve.rs to decode.
-   Uniform across the native bridge and the desktop HTTP path (#657). */
-async function postBinary(path, capToken, bytes) {
-  return request("POST", path, { capToken, body: bytesToBase64(bytes), headers: { "X-Body-Encoding": "base64" } });
+async function sha256Hex(bytes) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, b => b.toString(16).padStart(2, "0")).join("");
+}
+class IncrementalSha256 {
+  constructor() {
+    this.h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+    this.buffer = new Uint8Array(64); this.buffered = 0; this.bytes = 0;
+  }
+  update(input) {
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+    this.bytes += bytes.length;
+    let offset = 0;
+    while (offset < bytes.length) {
+      const take = Math.min(64 - this.buffered, bytes.length - offset);
+      this.buffer.set(bytes.subarray(offset, offset + take), this.buffered);
+      this.buffered += take; offset += take;
+      if (this.buffered === 64) { this.compress(this.buffer); this.buffered = 0; }
+    }
+    return this;
+  }
+  compress(block) {
+    const k = IncrementalSha256.K, w = new Uint32Array(64);
+    for (let i = 0; i < 16; i++) {
+      const p = i * 4;
+      w[i] = ((block[p] << 24) | (block[p + 1] << 16) | (block[p + 2] << 8) | block[p + 3]) >>> 0;
+    }
+    for (let i = 16; i < 64; i++) {
+      const a = w[i - 15], b = w[i - 2];
+      const s0 = ((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3);
+      const s1 = ((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = this.h;
+    for (let i = 0; i < 64; i++) {
+      const s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + s1 + ch + k[i] + w[i]) >>> 0;
+      const s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (s0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    const values = [a, b, c, d, e, f, g, h];
+    for (let i = 0; i < 8; i++) this.h[i] = (this.h[i] + values[i]) >>> 0;
+  }
+  hex() {
+    const bitHigh = Math.floor(this.bytes / 0x20000000) >>> 0;
+    const bitLow = (this.bytes << 3) >>> 0;
+    this.buffer[this.buffered++] = 0x80;
+    if (this.buffered > 56) {
+      this.buffer.fill(0, this.buffered); this.compress(this.buffer); this.buffered = 0;
+    }
+    this.buffer.fill(0, this.buffered, 56);
+    const view = new DataView(this.buffer.buffer);
+    view.setUint32(56, bitHigh); view.setUint32(60, bitLow); this.compress(this.buffer);
+    return Array.from(this.h, word => word.toString(16).padStart(8, "0")).join("");
+  }
+}
+IncrementalSha256.K = new Uint32Array([
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+]);
+async function mutationSource(input) {
+  if (input instanceof Blob) {
+    return {
+      length: input.size,
+      read: async (start, end) => new Uint8Array(await input.slice(start, end).arrayBuffer()),
+    };
+  }
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  return { length: bytes.length, read: async (start, end) => bytes.subarray(start, end) };
+}
+async function hashMutationSource(source) {
+  const hash = new IncrementalSha256();
+  const block = 1024 * 1024;
+  for (let offset = 0; offset < source.length; offset += block) {
+    hash.update(await source.read(offset, Math.min(offset + block, source.length)));
+  }
+  return hash.hex();
+}
+async function stageMutation(purpose, metadata, input) {
+  const source = await mutationSource(input);
+  const totalHash = await hashMutationSource(source);
+  const created = await postJson("/api/v1/mutation-intent/create", CAP.mutationIntent, {
+    request_id: crypto.randomUUID(), purpose, metadata,
+    total_bytes: source.length, sha256: totalHash,
+  });
+  const chunkBytes = Number(created.chunk_bytes);
+  if (!created.intent_id || chunkBytes !== 8192) throw new Error("Invalid upload contract");
+  try {
+    for (let offset = 0, index = 0; offset < source.length; offset += chunkBytes, index++) {
+      const chunk = await source.read(offset, Math.min(offset + chunkBytes, source.length));
+      await postJson("/api/v1/mutation-intent/chunk", CAP.mutationIntent, {
+        request_id: crypto.randomUUID(), intent_id: created.intent_id,
+        index, offset, data_base64: bytesToBase64(chunk),
+        chunk_sha256: await sha256Hex(chunk),
+      });
+    }
+    return await postJson("/api/v1/mutation-intent/commit", CAP.mutationIntent, {
+      request_id: crypto.randomUUID(), intent_id: created.intent_id,
+      total_bytes: source.length, sha256: totalHash,
+    });
+  } catch (error) {
+    if (error && error.responseReceived) {
+      await postJson("/api/v1/mutation-intent/cancel", CAP.mutationIntent, {
+        request_id: crypto.randomUUID(), intent_id: created.intent_id,
+      }).catch(() => {});
+    }
+    throw error;
+  }
 }
 /* Confirm a destructive action before it is sent (#0.6). On the standalone phone the
    native biometric per-action gate IS the confirmation — a strictly stronger one shown
@@ -1148,7 +1264,7 @@ async function renderSyncWidget() {
   box.append(...syncNodes);
 }
 async function syncCmd(cmd) {
-  try { await post(`/api/v1/sync/${cmd}`, CAP.sync); toast(`sync ${cmd}`); renderSyncWidget(); }
+  try { await postJson(`/api/v1/sync/${cmd}`, CAP.sync, { request_id: crypto.randomUUID() }); toast(`sync ${cmd}`); renderSyncWidget(); }
   catch (e) { toast("sync " + cmd + " failed: " + e.message, "err"); }
 }
 // Update sidebar nav count badges in place (rebuilding the shell would wipe the view).
@@ -1733,13 +1849,21 @@ async function composeSubmit(btn, asDraft) {
   btn.disabled = true;
   try {
     if (asDraft) {
-      await post("/api/v1/mail/draft?" + qs({ account: App.account, to, subject, body }), CAP.mailwrite);
+      await postJson("/api/v1/mail/draft", CAP.mailwrite, {
+        request_id: crypto.randomUUID(), account: App.account, id: null,
+        to: splitEmails(to), subject, body,
+      });
       toast("Draft saved");
     } else {
       const params = { account: App.account, to, cc, bcc, subject, body };
       if (importance && importance !== "normal") params.importance = importance;
       if (rr) params.read_receipt = "1";
-      await post("/api/v1/mail/send?" + qs(params), CAP.mailwrite);
+      await postJson("/api/v1/mail/send", CAP.mailwrite, {
+        request_id: crypto.randomUUID(), account: App.account,
+        to: splitEmails(to), cc: splitEmails(cc), bcc: splitEmails(bcc),
+        subject, body, importance: params.importance || null,
+        read_receipt: params.read_receipt === "1",
+      });
       toast("Message sent");
     }
     closeSheet();
@@ -1795,18 +1919,18 @@ function openInlineComposer(it, mode) {
 async function inlineComposerSend(btn, it, mode) {
   const editor = $("#cmp-editor"); if (!editor) return;
   const body = (editor.innerHTML || "").trim();
-  const params = { account: App.account, id: it.remote_id, body };
+  const params = { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, body, comment: "" };
   let path = "/api/v1/mail/reply";
   if (mode === "forward") {
     const to = ($("#cmp-fwd-to").value || "").trim();
     if (!to) { toast("Add at least one recipient", "err"); return; }
-    params.to = to; path = "/api/v1/mail/forward";
+    params.to = splitEmails(to); path = "/api/v1/mail/forward";
   } else {
-    params.all = mode === "replyAll" ? "1" : "0";
+    params.all = mode === "replyAll";
   }
   btn.disabled = true;
   try {
-    await post(path + "?" + qs(params), CAP.mailwrite);
+    await postJson(path, CAP.mailwrite, params);
     toast(mode === "forward" ? "Forwarded" : "Reply sent");
     renderMailReader(it);
   } catch (e) { toast("Send failed: " + e.message, "err"); btn.disabled = false; }
@@ -1818,11 +1942,11 @@ function mailRerender(it) {
   mailRender();
   if (Mail.selected && Mail.selected.remote_id === it.remote_id) renderMailReader(it);
 }
-async function mailManage(it, optimistic, revert, path) {
+async function mailManage(it, optimistic, revert, path, values) {
   optimistic(it.preview = it.preview || {});
   mailRerender(it);
   try {
-    await post(path, CAP.mailwrite);
+    await postJson(path, CAP.mailwrite, { request_id: crypto.randomUUID(), ...values });
   } catch (e) {
     revert(it.preview);
     mailRerender(it);
@@ -1831,12 +1955,12 @@ async function mailManage(it, optimistic, revert, path) {
 }
 const mailSetRead = (it, isRead) => mailManage(
   it, p => { p.isRead = isRead; }, () => { (it.preview || {}).isRead = !isRead; },
-  "/api/v1/mail/read?" + qs({ account: App.account, id: it.remote_id, is_read: isRead ? "1" : "0" }));
+  "/api/v1/mail/read", { account: App.account, id: it.remote_id, is_read: isRead });
 const mailSetFlag = (it, status, due) => {
   const prev = (it.preview || {}).flag;
   const q = { account: App.account, id: it.remote_id, status };
   if (due) { q.due = due; q.tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || "UTC"; }
-  return mailManage(it, p => { p.flag = status; }, p => { p.flag = prev; }, "/api/v1/mail/flag?" + qs(q));
+  return mailManage(it, p => { p.flag = status; }, p => { p.flag = prev; }, "/api/v1/mail/flag", q);
 };
 // inline-animated follow-up menu (no popup): plain flag · due date · complete · clear
 function openFlagMenu(it, btn) {
@@ -1856,13 +1980,15 @@ function openFlagMenu(it, btn) {
 }
 const mailSetCategories = (it, cats) => { const prev = (it.preview || {}).categories; return mailManage(
   it, p => { p.categories = cats; }, p => { p.categories = prev; },
-  "/api/v1/mail/categories?" + qs({ account: App.account, id: it.remote_id, categories: cats.join(",") })); };
+  "/api/v1/mail/categories", { account: App.account, id: it.remote_id, categories: cats.join(",") }); };
 
 // Move changes the message id, so optimistically drop it from the current list;
 // the SSE refresh (B1) brings the authoritative state.
 async function mailMove(it, destination, label) {
   try {
-    await post("/api/v1/mail/move?" + qs({ account: App.account, id: it.remote_id, destination }), CAP.mailwrite);
+    await postJson("/api/v1/mail/move", CAP.mailwrite, {
+      request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, destination,
+    });
     toast(`Moved to ${label}`);
     Mail.all = Mail.all.filter(x => x.remote_id !== it.remote_id);
     if (Mail.selected && Mail.selected.remote_id === it.remote_id) mailBack();
@@ -2104,7 +2230,7 @@ async function renderOnedriveView(view) {
       el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"), driveSortSelect()),
-      CAP.onedrivewrite ? el("button", { class: "btn ghost sm", title: "Upload a file into this folder", onclick: driveUpload }, icon("upload", "icon-sm"), "Upload") : null,
+      CAP.onedrivewrite && CAP.mutationIntent ? el("button", { class: "btn ghost sm", title: "Upload a file into this folder", onclick: driveUpload }, icon("upload", "icon-sm"), "Upload") : null,
       verifyButton(() => renderOnedriveView(view)),
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
@@ -2424,7 +2550,9 @@ function transferRow(t) {
 }
 async function cancelTransfer(t) {
   try {
-    await post("/api/v1/onedrive/transfers/cancel?" + qs({ id: t.id }), CAP.transfers);
+    await postJson("/api/v1/onedrive/transfers/cancel", CAP.transfers, {
+      request_id: crypto.randomUUID(), id: t.id,
+    });
     // Optimistic: drop it from the panel now; the next poll confirms the engine skipped it.
     Drive.transfers = (Drive.transfers || []).filter(x => x.id !== t.id);
     renderTransfersPanel();
@@ -2433,7 +2561,9 @@ async function cancelTransfer(t) {
 }
 async function pauseTransfer(t) {
   try {
-    await post("/api/v1/onedrive/transfers/pause?" + qs({ id: t.id }), CAP.transfers);
+    await postJson("/api/v1/onedrive/transfers/pause", CAP.transfers, {
+      request_id: crypto.randomUUID(), id: t.id,
+    });
     // Optimistic: mark paused now; the next poll confirms it from the engine's pause-set.
     const row = (Drive.transfers || []).find(x => x.id === t.id); if (row) row.paused = true;
     renderTransfersPanel();
@@ -2442,7 +2572,9 @@ async function pauseTransfer(t) {
 }
 async function retryTransfer(t, verb) {
   try {
-    await post("/api/v1/onedrive/transfers/retry?" + qs({ id: t.id }), CAP.transfers);
+    await postJson("/api/v1/onedrive/transfers/retry", CAP.transfers, {
+      request_id: crypto.randomUUID(), id: t.id,
+    });
     const row = (Drive.transfers || []).find(x => x.id === t.id); if (row) { row.paused = false; row.retry_after_secs = 0; }
     renderTransfersPanel();
     toast((verb || "Retrying") + " " + (t.name || "transfer"));
@@ -2482,7 +2614,10 @@ function openModeSheet(folderId, name, effMode, explicit) {
 // indicator reflect the fresh server state (Drive.modes SSOT). Mirrors doShare's template.
 async function setFolderMode(folderId, mode) {
   try {
-    const resp = await post("/api/v1/onedrive/mode?" + qs({ account: App.account, folder: folderId, ...(mode ? { mode } : {}) }), CAP.onedriveMode);
+    const resp = await postJson("/api/v1/onedrive/mode", CAP.onedriveMode, {
+      request_id: crypto.randomUUID(), account: App.account, folder: folderId,
+      ...(mode ? { mode } : {}),
+    });
     toast(mode ? "Folder set to " + MODE_LABEL[mode] : "Folder reset to inherited");
     // #659 D1: switching a folder online runs the offline→online cleanup server-side; surface it.
     const c = resp && resp.cleanup;
@@ -2543,7 +2678,9 @@ async function resolveConflict(cf, resolution) {
   try {
     // keep-mine deletes the cloud copy → the mobile router raises the biometric gate, handled
     // automatically by request()'s confirmation_required flow.
-    await post("/api/v1/onedrive/conflict/resolve?" + qs({ account: App.account, id: cf.id, resolution }), CAP.onedriveManage);
+    await postJson("/api/v1/onedrive/conflict/resolve", CAP.onedriveManage, {
+      request_id: crypto.randomUUID(), account: App.account, id: cf.id, resolution,
+    });
     toast(RESOLUTION_LABEL[resolution] || "Resolved");
     closeSheet();
     await driveLoadConflicts();
@@ -2558,7 +2695,7 @@ function driveActions(it) {
   if (!folder && it.has_body) box.append(el("a", { class: "act", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (!folder && CAP.share) box.append(el("button", { class: "act", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
   // #657: in-app write actions (cap-gated; destructive ops are biometric-gated on mobile).
-  if (!folder && CAP.onedrivewrite) box.append(el("button", { class: "act", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
+  if (!folder && CAP.onedrivewrite && CAP.mutationIntent) box.append(el("button", { class: "act", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
   if (CAP.onedrivewrite) {
     box.append(el("button", { class: "act", title: "Rename", onclick: (e) => { e.stopPropagation(); driveRename(it); } }, icon("pencil", "icon-sm")));
     box.append(el("button", { class: "act", title: "Move to folder", onclick: (e) => { e.stopPropagation(); driveMovePicker(it); } }, icon("folder-input", "icon-sm")));
@@ -2566,33 +2703,32 @@ function driveActions(it) {
   }
   return box;
 }
-// #657 in-app upload: pick a file and upload it into the CURRENT folder (read live at click
-// time). Bytes → base64 → POST /onedrive/upload; execution lands with #655 (placeholder Err
-// surfaces honestly until then). Cap-gated; biometric-gated on mobile.
+// In-app upload stages sealed 8 KiB chunks and commits one bounded mutation intent.
 function driveUpload() {
-  if (!CAP.onedrivewrite) return;
+  if (!CAP.onedrivewrite || !CAP.mutationIntent) return;
   const cur = Drive.stack[Drive.stack.length - 1].id;
   const inp = el("input", { type: "file" });
   inp.addEventListener("change", async () => {
     const file = inp.files && inp.files[0]; if (!file) return;
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      await postBinary("/api/v1/onedrive/upload?" + qs({ account: App.account, parent: cur === "root" ? "" : cur, name: file.name }), CAP.onedrivewrite, bytes);
+      await stageMutation("onedrive_upload", {
+        account: App.account, parent: cur === "root" ? "" : cur, name: file.name,
+      }, file);
       toast(`Uploaded ${file.name}`); driveLoad(); driveLoadMetrics();
     } catch (e) { toast("Upload failed: " + e.message, "err"); }
   });
   inp.click();
 }
-// #657 in-app replace: overwrite a file's content in place (If-Match its eTag; a 412 conflict
-// is surfaced, never clobbered). Bytes → base64 → POST /onedrive/replace.
+// In-app replace uses the same staged protocol and preserves the listed If-Match eTag.
 function driveReplace(it) {
-  if (!CAP.onedrivewrite) return;
+  if (!CAP.onedrivewrite || !CAP.mutationIntent) return;
   const inp = el("input", { type: "file" });
   inp.addEventListener("change", async () => {
     const file = inp.files && inp.files[0]; if (!file) return;
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      await postBinary("/api/v1/onedrive/replace?" + qs({ account: App.account, id: it.remote_id, etag: it.etag || "" }), CAP.onedrivewrite, bytes);
+      await stageMutation("onedrive_replace", {
+        account: App.account, id: it.remote_id, etag: it.etag || "",
+      }, file);
       toast(`Replaced ${it.name || "file"}`); driveLoad(); driveLoadMetrics();
     } catch (e) { toast("Replace failed: " + e.message, "err"); }
   });
@@ -2605,7 +2741,7 @@ function driveRename(it) {
   const submit = async () => {
     const name = inp.value.trim(); if (!name || name === it.name) { closeSheet(); return; }
     closeSheet();
-    try { await post("/api/v1/onedrive/rename?" + qs({ account: App.account, id: it.remote_id, name }), CAP.onedrivewrite); toast(`Renamed to ${name}`); driveLoad(); }
+    try { await postJson("/api/v1/onedrive/rename", CAP.onedrivewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, name }); toast(`Renamed to ${name}`); driveLoad(); }
     catch (e) { toast("Rename failed: " + e.message, "err"); }
   };
   inp.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
@@ -2645,7 +2781,7 @@ function driveMovePicker(it) {
   load();
 }
 async function driveMove(it, parent, parentName) {
-  try { await post("/api/v1/onedrive/move?" + qs({ account: App.account, id: it.remote_id, parent, name: it.name || "" }), CAP.onedrivewrite); toast(`Moved to ${parentName}`); driveLoad(); driveLoadMetrics(); }
+  try { await postJson("/api/v1/onedrive/move", CAP.onedrivewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, parent, name: it.name || "" }); toast(`Moved to ${parentName}`); driveLoad(); driveLoadMetrics(); }
   catch (e) { toast("Move failed: " + e.message, "err"); }
 }
 // #657 delete: confirmDestructive (desktop confirm(); on mobile the biometric gate IS the
@@ -2653,7 +2789,7 @@ async function driveMove(it, parent, parentName) {
 async function driveDelete(it) {
   if (!CAP.onedrivewrite) return;
   if (!confirmDestructive(`Delete "${it.name || "this item"}"? This removes it from OneDrive.`)) return;
-  try { await post("/api/v1/onedrive/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onedrivewrite); toast(`Deleted ${it.name || "item"}`); driveLoad(); driveLoadMetrics(); }
+  try { await postJson("/api/v1/onedrive/delete", CAP.onedrivewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id }); toast(`Deleted ${it.name || "item"}`); driveLoad(); driveLoadMetrics(); }
   catch (e) { toast("Delete failed: " + e.message, "err"); }
 }
 // Item detail sheet (#564): facts + lazily-fetched "who has access" (one Graph
@@ -2728,7 +2864,9 @@ function driveRenderManage(box, it, row) {
 }
 async function freeUpItem(it) {
   try {
-    await post("/api/v1/onedrive/free-up?" + qs({ account: App.account, id: it.remote_id }), CAP.onedriveManage);
+    await postJson("/api/v1/onedrive/free-up", CAP.onedriveManage, {
+      request_id: crypto.randomUUID(), account: App.account, id: it.remote_id,
+    });
     toast("Freed up " + (it.name || "file"));
     closeSheet();
     driveLoad();
@@ -2736,7 +2874,9 @@ async function freeUpItem(it) {
 }
 async function downloadNowItem(it) {
   try {
-    const d = await post("/api/v1/onedrive/download-now?" + qs({ account: App.account, id: it.remote_id }), CAP.onedriveManage);
+    const d = await postJson("/api/v1/onedrive/download-now", CAP.onedriveManage, {
+      request_id: crypto.randomUUID(), account: App.account, id: it.remote_id,
+    });
     toast(d && d.downloaded === false ? "Not downloaded (blocked by policy)" : "Downloaded " + (it.name || "file"));
     closeSheet();
     driveLoad();
@@ -2848,7 +2988,7 @@ function driveRow(it) {
   if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
   if (folder && MOBILE && CAP.onedriveMode) acts.append(driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name));
   // #657: in-app write actions (cap-gated; destructive ops biometric-gated on mobile).
-  if (!folder && CAP.onedrivewrite) acts.append(el("button", { class: "btn ghost sm", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
+  if (!folder && CAP.onedrivewrite && CAP.mutationIntent) acts.append(el("button", { class: "btn ghost sm", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
   if (CAP.onedrivewrite) {
     acts.append(el("button", { class: "btn ghost sm", title: "Rename", onclick: (e) => { e.stopPropagation(); driveRename(it); } }, icon("pencil", "icon-sm")));
     acts.append(el("button", { class: "btn ghost sm", title: "Move to folder", onclick: (e) => { e.stopPropagation(); driveMovePicker(it); } }, icon("folder-input", "icon-sm")));
@@ -3256,7 +3396,7 @@ async function composeEventSubmit(btn, id) {
   if (id) params.id = id;
   btn.disabled = true;
   try {
-    await post((id ? "/api/v1/calendar/update?" : "/api/v1/calendar/create?") + qs(params), CAP.calendarwrite);
+    await postJson(id ? "/api/v1/calendar/update" : "/api/v1/calendar/create", CAP.calendarwrite, { request_id: crypto.randomUUID(), ...params });
     toast(id ? "Event updated" : "Event created");
     closeSheet(); calLoad();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
@@ -3272,7 +3412,7 @@ function eventRespondInline(ev, response, host) {
   const doSend = async (withMsg) => {
     const comment = withMsg ? (ta.value || "").trim() : "";
     try {
-      await post("/api/v1/calendar/respond?" + qs({ account: App.account, id: ev.it.remote_id, response, comment }), CAP.calendarwrite);
+      await postJson("/api/v1/calendar/respond", CAP.calendarwrite, { request_id: crypto.randomUUID(), account: App.account, id: ev.it.remote_id, response, comment });
       toast(cap + " sent" + (comment ? " with a message" : "")); closeSheet(); calLoad();
     } catch (e) { toast("Failed: " + e.message, "err"); }
   };
@@ -3291,7 +3431,7 @@ function eventRespondInline(ev, response, host) {
 async function deleteEvent(ev) {
   if (!confirmDestructive("Delete this event? This removes it from your calendar.")) return;
   try {
-    await post("/api/v1/calendar/delete?" + qs({ account: App.account, id: ev.it.remote_id }), CAP.calendarwrite);
+    await postJson("/api/v1/calendar/delete", CAP.calendarwrite, { request_id: crypto.randomUUID(), account: App.account, id: ev.it.remote_id });
     toast("Event deleted"); closeSheet(); calLoad();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -3348,7 +3488,7 @@ async function renderContactsView(view) {
 async function contactsVerify(btn) {
   btn.disabled = true;
   try {
-    const r = await post("/api/v1/verify?" + qs({ account: App.account }), CAP.verify);
+    const r = await postJson("/api/v1/verify", CAP.verify, { request_id: crypto.randomUUID(), account: App.account });
     toast(`Integrity: ${r.verified}/${r.checked} records verified`);
     const [status, d] = await Promise.all([
       api("/api/v1/status?" + qs({ account: App.account })).catch(() => Contacts.status),
@@ -3429,7 +3569,7 @@ async function composeContactSubmit(btn, id) {
   if (id) params.id = id;
   btn.disabled = true;
   try {
-    await post((id ? "/api/v1/contact/update?" : "/api/v1/contact/create?") + qs(params), CAP.contactwrite);
+    await postJson(id ? "/api/v1/contact/update" : "/api/v1/contact/create", CAP.contactwrite, { request_id: crypto.randomUUID(), ...params });
     toast(id ? "Contact updated" : "Contact created");
     await contactsReload();
     // create leaves nothing selected → clear the inline form back to the empty
@@ -3440,7 +3580,7 @@ async function composeContactSubmit(btn, id) {
 async function deleteContact(it) {
   if (!confirmDestructive("Delete this contact? This removes it from your Microsoft 365 account.")) return;
   try {
-    await post("/api/v1/contact/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.contactwrite);
+    await postJson("/api/v1/contact/delete", CAP.contactwrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id });
     toast("Contact deleted");
     if (Contacts.selected && Contacts.selected.remote_id === it.remote_id) contactBack();
     contactsReload();
@@ -3517,7 +3657,7 @@ function verifyButton(refreshFn) {
 async function runVerifyThen(btn, refreshFn) {
   btn.disabled = true;
   try {
-    const r = await post("/api/v1/verify?" + qs({ account: App.account }), CAP.verify);
+    const r = await postJson("/api/v1/verify", CAP.verify, { request_id: crypto.randomUUID(), account: App.account });
     toast(`Integrity: ${r.verified}/${r.checked} records verified`);
     await refreshFn();
   } catch (e) { toast("Verify failed: " + e.message, "err"); } finally { btn.disabled = false; }
@@ -4033,39 +4173,39 @@ async function composeTaskSubmit(btn, t) {
   if (t) params.id = t.remote_id;
   btn.disabled = true;
   try {
-    await post((t ? "/api/v1/todo/update?" : "/api/v1/todo/create?") + qs(params), CAP.todowrite);
+    await postJson(t ? "/api/v1/todo/update" : "/api/v1/todo/create", CAP.todowrite, { request_id: crypto.randomUUID(), ...params });
     toast(t ? "Task updated" : "Task created"); closeSheet(); todoReload();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function newTodoList() {
   const name = prompt("New list name:");
   if (!name || !name.trim()) return;
-  try { await post("/api/v1/todo/list-create?" + qs({ account: App.account, name: name.trim() }), CAP.todowrite); toast("List created"); todoReload(); }
+  try { await postJson("/api/v1/todo/list-create", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, name: name.trim() }); toast("List created"); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function completeTask(t) {
-  try { await post("/api/v1/todo/complete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task completed"); closeSheet(); todoReload(); }
+  try { await postJson("/api/v1/todo/complete", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, id: t.remote_id }); toast("Task completed"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function reopenTask(t) {
-  try { await post("/api/v1/todo/update?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id, status: "notStarted" }), CAP.todowrite); toast("Task reopened"); closeSheet(); todoReload(); }
+  try { await postJson("/api/v1/todo/update", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, id: t.remote_id, status: "notStarted" }); toast("Task reopened"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function deleteTask(t) {
   if (!confirmDestructive("Delete this task from your Microsoft 365 account?")) return;
-  try { await post("/api/v1/todo/delete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task deleted"); closeSheet(); todoReload(); }
+  try { await postJson("/api/v1/todo/delete", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, id: t.remote_id }); toast("Task deleted"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 // checklist ops use optimistic UI (the daemon doesn't re-sync on a self-write)
 async function toggleStep(t, s, renderSteps, updateCount) {
   try {
-    await post("/api/v1/todo/checklist-toggle?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id, checked: s.isChecked ? "0" : "1" }), CAP.todowrite);
+    await postJson("/api/v1/todo/checklist-toggle", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id, checked: !s.isChecked });
     s.isChecked = !s.isChecked; renderSteps(); updateCount();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function deleteStep(t, s, steps, renderSteps, updateCount) {
   try {
-    await post("/api/v1/todo/checklist-delete?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id }), CAP.todowrite);
+    await postJson("/api/v1/todo/checklist-delete", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id });
     const i = steps.indexOf(s); if (i >= 0) steps.splice(i, 1); renderSteps(); updateCount();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -4073,7 +4213,7 @@ async function addStep(t, inp, steps, renderSteps, updateCount) {
   const title = (inp.value || "").trim();
   if (!title) return;
   try {
-    const r = await post("/api/v1/todo/checklist-add?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, title }), CAP.todowrite);
+    const r = await postJson("/api/v1/todo/checklist-add", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, task: t.remote_id, title });
     steps.push({ id: r.id, displayName: title, isChecked: false }); inp.value = ""; renderSteps(); updateCount(); inp.focus();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -4268,14 +4408,17 @@ async function composePageSubmit(btn) {
   if (!title) { toast("Add a title", "err"); return; }
   btn.disabled = true;
   try {
-    await post("/api/v1/onenote/create?" + qs({ account: App.account, section, title, body: v("cpage-body") }), CAP.onenotewrite);
+    await postJson("/api/v1/onenote/create", CAP.onenotewrite, {
+      request_id: crypto.randomUUID(), account: App.account,
+      section, title, body: v("cpage-body"),
+    });
     toast("Page created"); closeSheet(); noteReload();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function deletePage(it) {
   if (!confirmDestructive("Delete this page from your Microsoft 365 account?")) return;
   try {
-    await post("/api/v1/onenote/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onenotewrite);
+    await postJson("/api/v1/onenote/delete", CAP.onenotewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id });
     toast("Page deleted"); Note.selected = null; renderNoteReader(null); noteReload();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -4294,7 +4437,10 @@ function appendPage(it) {
     if (!text) { ta.focus(); return; }
     btn.disabled = true; status.textContent = "Appending…";
     try {
-      await post("/api/v1/onenote/append?" + qs({ account: App.account, id: it.remote_id, text }), CAP.onenotewrite);
+      await postJson("/api/v1/onenote/append", CAP.onenotewrite, {
+        request_id: crypto.randomUUID(), account: App.account,
+        id: it.remote_id, text,
+      });
       toast("Appended — OneNote may take a moment to reflect it");
       panel.remove();
     } catch (e) { status.textContent = ""; btn.disabled = false; toast("Append failed: " + e.message, "err"); }
@@ -4443,7 +4589,7 @@ async function renderSettingsView(view) {
         oninput: (e) => { const s = POLL_STEPS[+e.target.value]; valLabel.textContent = pollLabel(s); setWarn(s); },
         onchange: async (e) => {
           const s = POLL_STEPS[+e.target.value];
-          try { await post("/api/v1/settings?" + qs({ poll_interval_secs: s }), CAP.settings); toast("Live-update interval: " + pollLabel(s)); }
+          try { await postJson("/api/v1/settings", CAP.settings, { request_id: crypto.randomUUID(), poll_interval_secs: s }); toast("Live-update interval: " + pollLabel(s)); }
           catch (err) { toast("Could not save interval: " + err.message, "err"); }
         },
       });
@@ -4467,7 +4613,7 @@ async function doRestore(it, btn) {
   if (!confirm(`Restore this ${it.service} item to the cloud as a new copy?`)) return;
   btn.disabled = true;
   try {
-    const d = await post("/api/v1/restore?" + qs({ account: App.account, service: it.service, id: it.remote_id }), CAP.restore);
+    const d = await postJson("/api/v1/restore", CAP.restore, { request_id: crypto.randomUUID(), account: App.account, service: it.service, id: it.remote_id });
     if (d.queued) {
       toast(`Restore queued (${String(d.job_id || "job").slice(0, 12)}…)`);
     } else {
@@ -4479,7 +4625,7 @@ async function doRestore(it, btn) {
 async function doShare(it, btn) {
   btn.disabled = true;
   try {
-    const d = await post("/api/v1/share?" + qs({ account: App.account, service: it.service, id: it.remote_id, type: "view", scope: "anonymous" }), CAP.share);
+    const d = await postJson("/api/v1/share", CAP.share, { request_id: crypto.randomUUID(), account: App.account, service: it.service, id: it.remote_id, type: "view", scope: "anonymous" });
     if (d.webUrl) { try { await navigator.clipboard.writeText(d.webUrl); } catch {} toast("Share link copied to clipboard"); }
   } catch (e) { toast("Share failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
@@ -5119,6 +5265,9 @@ const AssistantState = {
   pendingModelSelection: null,
   lifecycleRequestIds: new Map(),
   lifecycleAutoResume: new Set(),
+  selectedSessionId: null,
+  selectedSessionAccount: null,
+  sessionHydratedId: null,
 };
 
 function closeAssistantStream(_reason) {
@@ -5264,6 +5413,9 @@ async function renderAssistantView(view) {
     st = await refreshAssistantCredentialIfRequired(st);
   } catch (_) { st = {}; }
   rememberAssistantStatus(st);
+  if (assistantSelectedReady(st)) {
+    try { await loadSelectedAgentSession(); } catch (_) {}
+  }
   clear(body);
   // #639 T7/T10: `connected` is now host-verified per-provider readiness (provider_ready of the
   // selected provider), so the chat vs. wizard split is driven by host readiness, not credential
@@ -5378,6 +5530,8 @@ function renderAssistantChat(body, st) {
       el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
       agentModelSwitcher(st),
       renderAssistantUsageChip(st),
+      el("button", { class: "btn ghost sm", type: "button", onclick: openAgentSessionDialog, "data-agent-sessions": "1" },
+        icon("messages-square", "icon-sm"), "Sessions"),
       el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
         icon("shield", "icon-sm"), "Privacy"),
     ),
@@ -5561,7 +5715,9 @@ async function pickModel(provider, model) {
     return;
   }
   try {
-    await post("/api/v1/agent/model?" + qs({ provider, model }), CAP.agent);
+    await postJson("/api/v1/agent/model", CAP.agent, {
+      request_id: crypto.randomUUID(), provider, model,
+    });
     const st = await api("/api/v1/agent/status");
     rememberAssistantStatus(st);
     toast("Model: " + agentProviderLabel(provider) + " · " + model);
@@ -5798,7 +5954,10 @@ async function confirmAgentPending(pendingId) {
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
-    const d = await post("/api/v1/agent/confirm?" + qs({ pending: pendingId, token: record.token, action_hash: record.action_hash }), CAP.agent);
+    const d = await postJson("/api/v1/agent/confirm", CAP.agent, {
+      request_id: crypto.randomUUID(), pending: pendingId,
+      token: record.token, action_hash: record.action_hash,
+    });
     record.status = "confirmed";
     record.result = d && d.result ? d.result : "Confirmed";
     record.token = "";
@@ -5824,7 +5983,11 @@ async function cancelAgentPending(pendingId) {
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
-    await post("/api/v1/agent/cancel?" + qs({ turn }), CAP.agent);
+    await postJson("/api/v1/agent/pending/cancel", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      pending: pendingId,
+      action_hash: record.action_hash,
+    });
     record.status = "cancelled";
     record.token = "";
     record.action_hash = "";
@@ -5834,6 +5997,14 @@ async function cancelAgentPending(pendingId) {
     record.error = agentCompactValue(e.message || e, 180);
   }
   rerenderPendingCards(pendingId);
+}
+
+async function cancelAgentTurn(turnId) {
+  if (!turnId) return;
+  await postJson("/api/v1/agent/turn/cancel", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    turn_id: turnId,
+  });
 }
 
 function renderAgentPendingCard(pending, trackNode = true) {
@@ -5978,6 +6149,265 @@ function agentSendFromInput() {
   agentSend(text);
 }
 
+async function ensureAgentSession() {
+  if (AssistantState.selectedSessionId && AssistantState.selectedSessionAccount === App.account) {
+    return AssistantState.selectedSessionId;
+  }
+  const page = await request("GET", "/api/v1/agent/session/list?limit=100", {
+    capToken: CAP.agent,
+  });
+  const sessions = Array.isArray(page.sessions) ? page.sessions : [];
+  let session = sessions.find((entry) => entry.session_id === page.selected_session_id);
+  if (!session) session = sessions.find((entry) => !entry.archived);
+  if (!session) {
+    const created = await postJson("/api/v1/agent/session/create", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      display_name: "Assistant",
+    });
+    session = created && created.session;
+  }
+  if (!session || !session.session_id) throw new Error("session_transport_unavailable");
+  AssistantState.selectedSessionId = session.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  return session.session_id;
+}
+
+function sessionRecordsToTranscript(records) {
+  const transcript = [];
+  (records || []).forEach((record) => {
+    if (!record || typeof record !== "object") return;
+    if (record.kind === "turn_intent" && typeof record.user_text === "string") {
+      transcript.push({ role: "user", text: record.user_text });
+    } else if (record.kind === "assistant_result" && typeof record.text === "string") {
+      transcript.push({
+        role: "assistant",
+        text: record.text,
+        chips: [], stages: [], results: [], tools: [], errors: [],
+        citations: Array.isArray(record.sources) ? record.sources : [],
+        pending: null,
+        doneReason: "complete",
+      });
+    }
+  });
+  return transcript;
+}
+
+async function hydrateAgentSession(sessionId) {
+  if (!sessionId || AssistantState.busy || AssistantState.sessionHydratedId === sessionId) return;
+  let cursor = null;
+  const records = [];
+  do {
+    const path = "/api/v1/agent/session/history?" + qs({
+      session_id: sessionId,
+      limit: 100,
+      ...(cursor ? { cursor } : {}),
+    });
+    const page = await request("GET", path, { capToken: CAP.agent });
+    if (Array.isArray(page.records)) records.push(...page.records);
+    cursor = page.next_cursor || null;
+  } while (cursor && records.length < 10000);
+  AssistantState.transcript = sessionRecordsToTranscript(records);
+  AssistantState.sessionHydratedId = sessionId;
+}
+
+async function loadSelectedAgentSession() {
+  const page = await request("GET", "/api/v1/agent/session/list?limit=100", {
+    capToken: CAP.agent,
+  });
+  const sessions = Array.isArray(page.sessions) ? page.sessions : [];
+  let selected = sessions.find((entry) => entry.session_id === page.selected_session_id);
+  if (!selected) selected = sessions.find((entry) => !entry.archived);
+  if (!selected) return null;
+  AssistantState.selectedSessionId = selected.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  await hydrateAgentSession(selected.session_id);
+  return selected;
+}
+
+function closeAgentDialog(overlay) {
+  if (overlay) overlay.remove();
+}
+
+function agentPresenceConfirmCopy(kind) {
+  if (kind === "session_archive") return "Archive this Assistant session?";
+  if (kind === "session_pairing_reveal") return "Reveal a one-time session transfer code?";
+  return "Import the shared Assistant session on this device?";
+}
+
+function confirmAgentUserPresence(kind) {
+  if (MOBILE) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+    const close = (value) => { closeAgentDialog(overlay); resolve(value); };
+    const panel = el("section", {
+      class: "assistant-lifecycle-dialog",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": "Confirm Assistant session action",
+    },
+    el("h2", { text: "Confirm session action" }),
+    el("p", { text: agentPresenceConfirmCopy(kind) }),
+    el("div", { class: "assistant-lifecycle-dialog-actions" },
+      el("button", { class: "btn ghost", type: "button", onclick: () => close(false) }, "Cancel"),
+      el("button", { class: "btn primary", type: "button", onclick: () => close(true) }, "Confirm")));
+    const scrim = el("div", { class: "scrim", onclick: () => close(false) });
+    overlay.append(scrim, panel);
+    document.body.append(overlay);
+  });
+}
+
+async function authorizeAgentUserPresence(kind, binding) {
+  const challenge = await postJson("/api/v1/agent/user-presence/start", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    kind,
+    binding,
+  });
+  if (!(await confirmAgentUserPresence(kind))) throw new Error("presence_cancelled");
+  await postJson("/api/v1/agent/user-presence/confirm", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    operation_id: challenge.operation_id,
+    intent_id: challenge.intent_id,
+    token: challenge.token,
+    action_hash: challenge.action_hash,
+  });
+  return challenge.operation_id;
+}
+
+async function selectAgentSession(sessionId, overlay) {
+  await postJson("/api/v1/agent/session/select", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    session_id: sessionId,
+  });
+  AssistantState.selectedSessionId = sessionId;
+  AssistantState.selectedSessionAccount = App.account;
+  AssistantState.sessionHydratedId = null;
+  AssistantState.transcript = [];
+  await hydrateAgentSession(sessionId);
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+async function createAgentSession(overlay) {
+  const created = await postJson("/api/v1/agent/session/create", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    display_name: "Assistant",
+  });
+  const session = created && created.session;
+  if (!session || !session.session_id) throw new Error("session_store_unavailable");
+  AssistantState.selectedSessionId = session.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  AssistantState.sessionHydratedId = session.session_id;
+  AssistantState.transcript = [];
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+async function archiveAgentSession(sessionId, overlay) {
+  const operationId = await authorizeAgentUserPresence("session_archive", { session_id: sessionId });
+  await postJson("/api/v1/agent/session/archive", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    operation_id: operationId,
+  });
+  AssistantState.selectedSessionId = null;
+  AssistantState.sessionHydratedId = null;
+  AssistantState.transcript = [];
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+function showPairingCodeDialog(pairingCode, operationId, parentOverlay) {
+  closeAgentDialog(parentOverlay);
+  const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+  const close = () => closeAgentDialog(overlay);
+  const code = el("textarea", {
+    class: "input assistant-pairing-code",
+    readOnly: "readonly",
+    rows: "3",
+    value: pairingCode,
+    "aria-label": "One-time session transfer code",
+  });
+  const revoke = async () => {
+    try {
+      await postJson("/api/v1/agent/session/pairing/revoke", CAP.agent, {
+        request_id: crypto.randomUUID(), operation_id: operationId,
+      });
+      code.value = "Revoked";
+      toast("Session transfer revoked");
+    } catch (_) { toast("Could not revoke the transfer", "err"); }
+  };
+  const panel = el("section", { class: "assistant-lifecycle-dialog", role: "dialog", "aria-modal": "true" },
+    el("h2", { text: "Session transfer code" }),
+    el("p", { class: "dim", text: "This code expires in five minutes and can be claimed once." }),
+    code,
+    el("div", { class: "assistant-lifecycle-dialog-actions" },
+      el("button", { class: "btn danger", type: "button", onclick: revoke }, icon("ban", "icon-sm"), "Revoke"),
+      el("button", { class: "btn primary", type: "button", onclick: close }, "Done")));
+  overlay.append(el("div", { class: "scrim", onclick: close }), panel);
+  document.body.append(overlay);
+  code.select();
+}
+
+async function exportAgentSession(sessionId, overlay) {
+  const source = await postJson("/api/v1/agent/session/pairing/create", CAP.agent, {
+    request_id: crypto.randomUUID(), session_id: sessionId,
+  });
+  const operationId = await authorizeAgentUserPresence("session_pairing_reveal", {
+    session_id: sessionId,
+    pair_id: source.pair_id,
+  });
+  const revealed = await postJson("/api/v1/agent/session/pairing/reveal", CAP.agent, {
+    request_id: crypto.randomUUID(), operation_id: operationId,
+  });
+  showPairingCodeDialog(revealed.pairing_code, operationId, overlay);
+}
+
+async function importAgentSession(pairingCode, overlay) {
+  const operationId = await authorizeAgentUserPresence("session_pairing_import", {
+    pairing_code: pairingCode.trim(),
+  });
+  const claimed = await postJson("/api/v1/agent/session/pairing/claim", CAP.agent, {
+    request_id: crypto.randomUUID(), operation_id: operationId,
+  });
+  await postJson("/api/v1/agent/session/pairing/finalize", CAP.agent, {
+    request_id: crypto.randomUUID(), operation_id: operationId,
+  });
+  AssistantState.selectedSessionId = claimed.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  AssistantState.sessionHydratedId = null;
+  AssistantState.transcript = [];
+  await hydrateAgentSession(claimed.session_id);
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+async function openAgentSessionDialog() {
+  try {
+    const page = await request("GET", "/api/v1/agent/session/list?limit=100", { capToken: CAP.agent });
+    const sessions = Array.isArray(page.sessions) ? page.sessions : [];
+    const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+    const close = () => closeAgentDialog(overlay);
+    const importInput = el("input", { class: "input", type: "text", placeholder: "isy2 transfer code", "aria-label": "Session transfer code" });
+    const rows = sessions.map((session) => el("div", { class: "assistant-session-row", "data-session-id": session.session_id },
+      el("div", { class: "assistant-session-name" },
+        el("b", { text: session.display_name || "Assistant" }),
+        el("span", { class: "dim", text: session.archived ? "Archived" : "Available" })),
+      el("div", { class: "assistant-session-actions" },
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => selectAgentSession(session.session_id, overlay), title: "Open session" }, icon("folder-open", "icon-sm")) : null,
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => exportAgentSession(session.session_id, overlay), title: "Transfer session" }, icon("share-2", "icon-sm")) : null,
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => archiveAgentSession(session.session_id, overlay), title: "Archive session" }, icon("archive", "icon-sm")) : null)));
+    const panel = el("section", { class: "assistant-lifecycle-dialog assistant-session-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Assistant sessions" },
+      el("h2", { text: "Assistant sessions" }),
+      el("div", { class: "assistant-session-list" }, rows.length ? rows : el("p", { class: "dim", text: "No sessions yet." })),
+      el("div", { class: "assistant-session-import" }, importInput,
+        el("button", { class: "btn", type: "button", onclick: () => importAgentSession(importInput.value, overlay) }, icon("log-in", "icon-sm"), "Import")),
+      el("div", { class: "assistant-lifecycle-dialog-actions" },
+        el("button", { class: "btn", type: "button", onclick: () => createAgentSession(overlay) }, icon("plus", "icon-sm"), "New session"),
+        el("button", { class: "btn ghost", type: "button", onclick: close }, "Close")));
+    overlay.append(el("div", { class: "scrim", onclick: close }), panel);
+    document.body.append(overlay);
+  } catch (_) { toast("Sessions are temporarily unavailable", "err"); }
+}
+
 // Start a turn and stream its tokens into a fresh assistant bubble.
 async function agentSend(text) {
   const log = $("#asst-log"); if (!log) return;
@@ -6093,7 +6523,13 @@ async function agentSend(text) {
     startingGuardId = await beginNetworkGuard("agent_turn");
     if (BRIDGE && !startingGuardId) throw new Error("network_guard_unavailable");
     await runConnectivityPreflight(provider, "turn_start", startingGuardId);
-    const r = await post("/api/v1/agent/turn?" + qs({ account: App.account, prompt: text }), CAP.agent);
+    const sessionId = await ensureAgentSession();
+    const r = await postJson("/api/v1/agent/turn", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      session_id: sessionId,
+      account: App.account,
+      prompt: text,
+    });
     turn = r && r.turn;
   } catch (e) {
     await endNetworkGuard(startingGuardId);
@@ -6192,14 +6628,14 @@ function renderAccountMenu(body) {
     : "Read-only server — account switching only."));
 }
 async function accountSignOut(a, body) {
-  try { const d = await post("/api/v1/account/signout?account=" + encodeURIComponent(a.id), CAP.account); toast(d.message || "Signed out"); }
+  try { const d = await postJson("/api/v1/account/signout", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); toast(d.message || "Signed out"); }
   catch (e) { toast("Sign-out failed: " + e.message, "err"); }
   renderAccountMenu(body);
 }
 async function startDeviceLogin(a, body) {
   clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: "Starting sign-in…" })));
   let dc;
-  try { dc = await post("/api/v1/account/login/start?account=" + encodeURIComponent(a.id), CAP.account); }
+  try { dc = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id }); }
   catch (e) { toast("Sign-in failed: " + e.message, "err"); renderAccountMenu(body); return; }
   const openDeviceLogin = async () => {
     try {
@@ -6218,7 +6654,7 @@ async function startDeviceLogin(a, body) {
     el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: () => renderAccountMenu(body) }, "Cancel")));
   accountMenuPoll = setInterval(async () => {
     let r;
-    try { r = await post("/api/v1/account/login/poll?id=" + encodeURIComponent(dc.login_id), CAP.account); }
+    try { r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: dc.login_id }); }
     catch (e) { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Poll error: " + e.message; return; }
     if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
     else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Sign-in failed: " + (r.error || "unknown"); }

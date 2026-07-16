@@ -1588,8 +1588,58 @@ where
                 account,
                 service,
                 id,
-            } => self.restore_local(account, service, id),
+            } => self.restore_local(account, service, id, None, None),
             _ => self.delegate.execute_read(action),
+        }
+    }
+
+    fn execute_read_bound(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+    ) -> Result<String, isyncyou_agent::AgentError> {
+        match action {
+            isyncyou_agent::ToolAction::RestoreLocal {
+                account,
+                service,
+                id,
+            } => self.restore_local(account, service, id, Some(binding), None),
+            _ => self.delegate.execute_read_bound(action, binding),
+        }
+    }
+
+    fn prepare_read_effect(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+    ) -> Result<Option<isyncyou_agent::LocalEffectCheckpointV1>, isyncyou_agent::AgentError> {
+        match action {
+            isyncyou_agent::ToolAction::RestoreLocal {
+                account,
+                service,
+                id,
+            } => self
+                .planned_local_effect(account, service, id, binding)
+                .map(Some),
+            _ => self.delegate.prepare_read_effect(action, binding),
+        }
+    }
+
+    fn execute_read_prepared(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+        local_effect: Option<&isyncyou_agent::LocalEffectCheckpointV1>,
+    ) -> Result<String, isyncyou_agent::AgentError> {
+        match action {
+            isyncyou_agent::ToolAction::RestoreLocal {
+                account,
+                service,
+                id,
+            } => self.restore_local(account, service, id, Some(binding), local_effect),
+            _ => self
+                .delegate
+                .execute_read_prepared(action, binding, local_effect),
         }
     }
 
@@ -1619,6 +1669,8 @@ where
         account: &str,
         service: &str,
         id: &str,
+        binding: Option<&isyncyou_agent::ReadExecutionBinding>,
+        local_effect: Option<&isyncyou_agent::LocalEffectCheckpointV1>,
     ) -> Result<String, isyncyou_agent::AgentError> {
         if account != self.source.account() {
             return Err(isyncyou_agent::AgentError::ToolArgs(format!(
@@ -1638,11 +1690,38 @@ where
         ensure_under_root(&self.restore_root, &service_dir)?;
 
         let file_name = restore_file_name(&item.name, &item.id);
-        let path = allocate_restore_path(&service_dir, &file_name)?;
+        let path = binding.map_or_else(
+            || allocate_restore_path(&service_dir, &file_name),
+            |binding| {
+                Ok(deterministic_restore_path(
+                    &service_dir,
+                    &file_name,
+                    service,
+                    id,
+                    binding,
+                ))
+            },
+        )?;
+        if let Some(binding) = binding {
+            let planned = self.planned_local_effect(account, service, id, binding)?;
+            if local_effect.is_some_and(|checkpoint| {
+                checkpoint.relative_path != planned.relative_path
+                    || checkpoint.source_sha256 != planned.source_sha256
+                    || checkpoint.expected_file_sha256 != planned.expected_file_sha256
+            }) {
+                return Err(isyncyou_agent::AgentError::Provider(
+                    "outcome_unknown".into(),
+                ));
+            }
+        }
         ensure_under_root(&self.restore_root, path.parent().unwrap_or(&service_dir))?;
-        write_owner_only_atomic(&path, &bytes).map_err(|e| {
-            isyncyou_agent::AgentError::Provider(format!("restore-local write: {e}"))
-        })?;
+        if path.exists() {
+            adopt_matching_owner_only_file(&path, &bytes)?;
+        } else {
+            write_owner_only_atomic(&path, &bytes).map_err(|e| {
+                isyncyou_agent::AgentError::Provider(format!("restore-local write: {e}"))
+            })?;
+        }
 
         Ok(serde_json::json!({
             "service": item.service,
@@ -1657,6 +1736,46 @@ where
             }
         })
         .to_string())
+    }
+
+    fn planned_local_effect(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+    ) -> Result<isyncyou_agent::LocalEffectCheckpointV1, isyncyou_agent::AgentError> {
+        if account != self.source.account() {
+            return Err(isyncyou_agent::AgentError::ToolArgs(
+                "account mismatch".into(),
+            ));
+        }
+        let item = self
+            .source
+            .get(service, id)?
+            .ok_or_else(|| isyncyou_agent::AgentError::ToolArgs("item not found".into()))?;
+        let bytes = self.source.read_body(service, id)?;
+        let service_dir = self.restore_root.join(safe_path_segment(service));
+        let path = deterministic_restore_path(
+            &service_dir,
+            &restore_file_name(&item.name, &item.id),
+            service,
+            id,
+            binding,
+        );
+        let relative_path = path
+            .strip_prefix(&self.restore_root)
+            .map_err(|_| isyncyou_agent::AgentError::Provider("outcome_unknown".into()))?
+            .to_str()
+            .ok_or_else(|| isyncyou_agent::AgentError::Provider("outcome_unknown".into()))?
+            .to_owned();
+        let digest = content_sha256(&bytes);
+        Ok(isyncyou_agent::LocalEffectCheckpointV1 {
+            relative_path,
+            source_sha256: digest.clone(),
+            expected_file_sha256: digest,
+            state: isyncyou_agent::LocalEffectState::Planned,
+        })
     }
 }
 
@@ -1708,6 +1827,83 @@ fn restore_file_name(name: &str, id: &str) -> String {
     } else {
         safe_name
     }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn deterministic_restore_path(
+    dir: &Path,
+    file_name: &str,
+    service: &str,
+    source_item_id: &str,
+    binding: &isyncyou_agent::ReadExecutionBinding,
+) -> PathBuf {
+    let mut material = Vec::new();
+    material.extend_from_slice(b"isyncyou-restore-local-v1");
+    for value in [
+        binding.session_id.as_str(),
+        binding.request_id.as_str(),
+        binding.tool_use_id.as_str(),
+        service,
+        source_item_id,
+    ] {
+        material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        material.extend_from_slice(value.as_bytes());
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, &material);
+    let stem = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (_, extension) = split_extension(file_name);
+    let extension = if extension.len() <= 17 {
+        extension
+    } else {
+        String::new()
+    };
+    dir.join(format!("{stem}{extension}"))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn content_sha256(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn adopt_matching_owner_only_file(
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), isyncyou_agent::AgentError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| isyncyou_agent::AgentError::Provider("outcome_unknown".into()))?;
+    if !metadata.file_type().is_file() || std::fs::read(path).ok().as_deref() != Some(expected) {
+        return Err(isyncyou_agent::AgentError::Provider(
+            "outcome_unknown".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(isyncyou_agent::AgentError::Provider(
+                "outcome_unknown".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(

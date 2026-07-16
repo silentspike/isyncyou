@@ -46,10 +46,10 @@ pub use onedrive_live::{onedrive_lister, OneDriveLister};
 pub use onedrive_write::{
     create_folder_via_ledger, delete_via_ledger, invite_via_ledger, move_via_ledger,
     pending_cloud_write_count, recover_cloud_write_op, recover_pending_cloud_writes,
-    recover_pending_cloud_writes_for, rename_via_ledger, replace_via_ledger, run_cloud_write,
-    run_invite, run_share_link, share_link_via_ledger, upload_via_ledger, CloudWrite,
-    OneDriveShareSink, OneDriveWriteSink, ReplaceOutcome, ShareIntent, ShareKind, ShareOutcome,
-    WriteOutcome,
+    recover_pending_cloud_writes_for, rename_via_ledger, replace_streaming_via_ledger,
+    replace_via_ledger, run_cloud_write, run_invite, run_share_link, share_link_via_ledger,
+    upload_streaming_via_ledger, upload_via_ledger, CloudWrite, OneDriveShareSink,
+    OneDriveWriteSink, ReplaceOutcome, ShareIntent, ShareKind, ShareOutcome, WriteOutcome,
 };
 pub use onenote_live::{page_writer, PageWriter};
 pub use restore_calendar::{

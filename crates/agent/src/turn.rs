@@ -3,7 +3,7 @@
 //!
 //! (The module is named `turn`, not `loop`, because `loop` is a Rust keyword.)
 
-use crate::provider::{AssistantBlock, DoneReason, LlmProvider, StreamEvent};
+use crate::provider::{AssistantBlock, LlmProvider, StreamEvent};
 use crate::tool::{parse_action, public_tool_call_input, ToolAction, ToolClass, TOOL_NAME};
 
 /// Who authored a message in the conversation.
@@ -67,6 +67,31 @@ impl Message {
 pub trait ToolExecutor {
     fn execute_read(&self, action: &ToolAction) -> Result<String, crate::AgentError>;
 
+    fn execute_read_bound(
+        &self,
+        action: &ToolAction,
+        _binding: &ReadExecutionBinding,
+    ) -> Result<String, crate::AgentError> {
+        self.execute_read(action)
+    }
+
+    fn prepare_read_effect(
+        &self,
+        _action: &ToolAction,
+        _binding: &ReadExecutionBinding,
+    ) -> Result<Option<crate::LocalEffectCheckpointV1>, crate::AgentError> {
+        Ok(None)
+    }
+
+    fn execute_read_prepared(
+        &self,
+        action: &ToolAction,
+        binding: &ReadExecutionBinding,
+        _local_effect: Option<&crate::LocalEffectCheckpointV1>,
+    ) -> Result<String, crate::AgentError> {
+        self.execute_read_bound(action, binding)
+    }
+
     /// Execute a read that MAY stream intermediate progress via `emit` — used by the
     /// progressive search (S-AG.18/#643) to emit `SearchStage`/`PartialResult` between
     /// the fast, full-text and deep passes — returning the same final JSON as
@@ -80,6 +105,13 @@ pub trait ToolExecutor {
         let _ = emit;
         self.execute_read(action)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadExecutionBinding {
+    pub session_id: String,
+    pub request_id: String,
+    pub tool_use_id: String,
 }
 
 /// How a turn ended.
@@ -97,6 +129,51 @@ pub enum TurnOutcome {
     },
 }
 
+pub trait TurnObserver {
+    fn next_provider_step(&self) -> u8 {
+        0
+    }
+
+    fn read_execution_binding(&self, _tool_use_id: &str) -> Option<ReadExecutionBinding> {
+        None
+    }
+
+    fn provider_step_started(&mut self, _step_seq: u8) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+
+    fn provider_step_completed(
+        &mut self,
+        _step_seq: u8,
+        _blocks: &[crate::AssistantBlock],
+    ) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+
+    fn read_tool_started(
+        &mut self,
+        _step_seq: u8,
+        _tool_use_id: &str,
+        _action: &ToolAction,
+        _local_effect: Option<&crate::LocalEffectCheckpointV1>,
+    ) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+
+    fn read_tool_completed(
+        &mut self,
+        _step_seq: u8,
+        _tool_use_id: &str,
+        _action: &ToolAction,
+        _result: &str,
+    ) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+}
+
+struct NoopTurnObserver;
+impl TurnObserver for NoopTurnObserver {}
+
 const MAX_STEPS: usize = 16;
 
 /// Drive one user turn. `history` must already contain the user's message; the loop
@@ -107,10 +184,47 @@ pub fn run_turn(
     history: &mut Vec<Message>,
     emit: &mut dyn FnMut(StreamEvent),
 ) -> Result<TurnOutcome, crate::AgentError> {
+    run_turn_observed(provider, executor, history, emit, &mut NoopTurnObserver)
+}
+
+pub fn run_turn_observed(
+    provider: &mut dyn LlmProvider,
+    executor: &dyn ToolExecutor,
+    history: &mut Vec<Message>,
+    emit: &mut dyn FnMut(StreamEvent),
+    observer: &mut dyn TurnObserver,
+) -> Result<TurnOutcome, crate::AgentError> {
+    run_turn_cancellable(provider, executor, history, emit, observer, None)
+}
+
+pub fn run_turn_cancellable(
+    provider: &mut dyn LlmProvider,
+    executor: &dyn ToolExecutor,
+    history: &mut Vec<Message>,
+    emit: &mut dyn FnMut(StreamEvent),
+    observer: &mut dyn TurnObserver,
+    cancellation: Option<&crate::CancellationToken>,
+) -> Result<TurnOutcome, crate::AgentError> {
     let mut final_text = String::new();
 
-    for _ in 0..MAX_STEPS {
-        let blocks = provider.next(history, emit)?;
+    let check_cancelled = || {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            Err(crate::AgentError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+
+    for step_seq in usize::from(observer.next_provider_step())..MAX_STEPS {
+        let step_seq = u8::try_from(step_seq)
+            .map_err(|_| crate::AgentError::Provider("turn_step_invalid".into()))?;
+        check_cancelled()?;
+        observer.provider_step_started(step_seq)?;
+        check_cancelled()?;
+        let blocks = provider.next_cancellable(history, emit, cancellation)?;
+        check_cancelled()?;
+        observer.provider_step_completed(step_seq, &blocks)?;
+        check_cancelled()?;
 
         // Collect the assistant turn: its text + the tool calls it made.
         let mut text_this = String::new();
@@ -133,7 +247,6 @@ pub fn run_turn(
 
         // No tool calls → the turn is done.
         if tool_uses.is_empty() {
-            emit(StreamEvent::done(DoneReason::Complete));
             return Ok(TurnOutcome::Final { text: final_text });
         }
 
@@ -141,6 +254,7 @@ pub fn run_turn(
         // structure — never parsed out of content — so retrieved (untrusted) text can
         // never become an action (REQ-AGENT-005).
         for tu in tool_uses {
+            check_cancelled()?;
             let action = match parse_action(&tu.input) {
                 Ok(a) => a,
                 Err(help) => {
@@ -163,10 +277,25 @@ pub fn run_turn(
 
             match action.class() {
                 ToolClass::Read => {
+                    check_cancelled()?;
+                    let binding = observer.read_execution_binding(&tu.id);
+                    let local_effect = binding
+                        .as_ref()
+                        .map(|binding| executor.prepare_read_effect(&action, binding))
+                        .transpose()?
+                        .flatten();
+                    observer.read_tool_started(step_seq, &tu.id, &action, local_effect.as_ref())?;
                     // Streamed read: a progressive search emits its stage/partial-result
                     // events via `emit` before returning the final JSON (S-AG.18/#643);
                     // all other reads delegate to the plain path (default impl).
-                    let result = executor.execute_read_streamed(&action, emit)?;
+                    let result = if let Some(binding) = binding {
+                        executor.execute_read_prepared(&action, &binding, local_effect.as_ref())?
+                    } else {
+                        executor.execute_read_streamed(&action, emit)?
+                    };
+                    check_cancelled()?;
+                    observer.read_tool_completed(step_seq, &tu.id, &action, &result)?;
+                    check_cancelled()?;
                     // Results carrying archived content are untrusted input.
                     emit(StreamEvent::ToolResult {
                         id: tu.id.clone(),
@@ -176,6 +305,7 @@ pub fn run_turn(
                     history.push(Message::tool(tu.id, result));
                 }
                 ToolClass::Destructive => {
+                    check_cancelled()?;
                     // Never execute here — stop the turn for human confirmation.
                     let preview = format!("Requires confirmation — {} {:?}", action.op(), action);
                     return Ok(TurnOutcome::PendingConfirmation {
@@ -200,6 +330,26 @@ mod tests {
     use serde_json::json;
     use std::cell::Cell;
     use std::collections::VecDeque;
+
+    struct CancelOnReturnProvider {
+        token: crate::CancellationToken,
+        blocks: Vec<AssistantBlock>,
+    }
+
+    impl LlmProvider for CancelOnReturnProvider {
+        fn name(&self) -> &str {
+            "cancel-on-return"
+        }
+
+        fn next(
+            &mut self,
+            _history: &[Message],
+            _emit: &mut dyn FnMut(StreamEvent),
+        ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+            self.token.cancel();
+            Ok(std::mem::take(&mut self.blocks))
+        }
+    }
 
     /// Records how often a read executor ran, and returns a canned (or configured) body.
     struct CountingExecutor {
@@ -297,12 +447,12 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            StreamEvent::Done {
-                reason: DoneReason::Complete
-            }
-        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Done { .. })),
+            "the harness must leave terminal ordering to the host"
+        );
 
         // History must round-trip: the assistant turn records its tool_use, and the
         // tool-result turn binds back to it by id (so a real provider can pair them).
@@ -523,5 +673,65 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })));
+    }
+
+    #[test]
+    fn turn_cancel_stops_before_read_tool_execution() {
+        let token = crate::CancellationToken::default();
+        let mut provider = CancelOnReturnProvider {
+            token: token.clone(),
+            blocks: vec![tool_use(
+                "read-1",
+                json!({"op": "search", "account": "me", "query": "invoice"}),
+            )],
+        };
+        let executor = CountingExecutor::new("must not run");
+        let mut history = vec![Message::user("find invoice")];
+        let mut observer = NoopTurnObserver;
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |_| {},
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(executor.reads.get(), 0);
+    }
+
+    #[test]
+    fn turn_cancel_after_provider_return_blocks_pending_registration() {
+        let token = crate::CancellationToken::default();
+        let mut provider = CancelOnReturnProvider {
+            token: token.clone(),
+            blocks: vec![tool_use(
+                "write-1",
+                json!({"op": "backup", "account": "me", "services": ["mail"]}),
+            )],
+        };
+        let executor = CountingExecutor::new("must not run");
+        let mut history = vec![Message::user("back up mail")];
+        let mut observer = NoopTurnObserver;
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |_| {},
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(executor.reads.get(), 0);
+    }
+
+    #[test]
+    fn turn_cancel_before_persist_ignores_late_provider_result() {
+        turn_cancel_stops_before_read_tool_execution();
+        turn_cancel_after_provider_return_blocks_pending_registration();
     }
 }

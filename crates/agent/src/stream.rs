@@ -7,7 +7,9 @@
 //! disconnects its receiver. The HTTP layer subscribes a receiver and forwards events as
 //! SSE; the agent loop (on a background thread) emits into the hub.
 
-use crate::provider::{DoneReason, StreamEvent};
+#[cfg(test)]
+use crate::provider::DoneReason;
+use crate::provider::StreamEvent;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -20,6 +22,20 @@ const EMIT_RETRY_SLEEP: Duration = Duration::from_millis(2);
 struct TurnSink {
     tx: SyncSender<StreamEvent>,
     cancelled: Arc<AtomicBool>,
+}
+
+/// Shared cancellation state transferred with a running turn.
+#[derive(Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// A registry of per-turn event streams.
@@ -90,20 +106,24 @@ impl AgentStreamHub {
         }
     }
 
-    /// Mark a turn cancelled; the loop observes [`is_cancelled`] and stops.
-    pub fn cancel(&self, turn_id: &str) {
-        let sink = {
-            let turns = self.turns.lock().unwrap();
-            turns
-                .get(turn_id)
-                .map(|s| (s.tx.clone(), s.cancelled.clone()))
-        };
-        if let Some((tx, cancelled)) = sink {
-            let was_cancelled = cancelled.swap(true, Ordering::SeqCst);
-            if !was_cancelled {
-                let _ = tx.try_send(StreamEvent::done(DoneReason::Cancelled));
-            }
+    /// Mark a turn cancelled. The host persists the cancelled terminal state before
+    /// emitting `done(cancelled)`; this method deliberately emits no event itself.
+    pub fn cancel(&self, turn_id: &str) -> bool {
+        let token = self.cancellation_token(turn_id);
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
         }
+    }
+
+    pub fn cancellation_token(&self, turn_id: &str) -> Option<CancellationToken> {
+        self.turns
+            .lock()
+            .unwrap()
+            .get(turn_id)
+            .map(|sink| CancellationToken(Arc::clone(&sink.cancelled)))
     }
 
     /// Whether a turn has been cancelled (or is unknown).
@@ -149,6 +169,16 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_only_marks_state_and_never_emits_terminal_event() {
+        let hub = AgentStreamHub::new();
+        let rx = hub.open("cancel-order", 4);
+        assert!(hub.cancel("cancel-order"));
+        assert!(hub.is_cancelled("cancel-order"));
+        assert!(rx.try_recv().is_err(), "the host owns terminal emission");
+        assert!(!hub.cancel("missing"));
+    }
+
+    #[test]
     fn emit_to_unknown_turn_returns_false() {
         let hub = AgentStreamHub::new();
         assert!(!hub.emit("nope", StreamEvent::done(DoneReason::Complete)));
@@ -161,12 +191,7 @@ mod tests {
         assert!(!hub.is_cancelled("t1"));
         hub.cancel("t1");
         assert!(hub.is_cancelled("t1"));
-        assert!(matches!(
-            rx.recv().unwrap(),
-            StreamEvent::Done {
-                reason: DoneReason::Cancelled
-            }
-        ));
+        assert!(rx.try_recv().is_err(), "the host owns terminal emission");
         assert!(
             !hub.emit("t1", StreamEvent::Token("x".into())),
             "no emit after cancel"
@@ -221,11 +246,7 @@ mod tests {
             rx.recv().unwrap(),
             StreamEvent::ToolCall { ref id, .. } if id == "tool-1"
         ));
-        assert!(matches!(
-            rx.recv().unwrap(),
-            StreamEvent::Done {
-                reason: DoneReason::Cancelled
-            }
-        ));
+        assert!(rx.try_recv().is_err(), "cancel adds no terminal event");
+        assert!(!hub.emit("t1", StreamEvent::Token("late".into())));
     }
 }

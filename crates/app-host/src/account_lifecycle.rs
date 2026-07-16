@@ -4018,4 +4018,41 @@ mod tests {
     fn agent_oauth_lifecycle_resume_retries_same_revoked_grant_reference_only() {
         reconnect_and_switch_track_active_and_candidate_revoke_as_distinct_legs();
     }
+
+    #[test]
+    fn canonical_installation_principal_is_stable_and_not_account_derived() {
+        installation_principal_survives_webview_restart_and_is_never_public();
+    }
+
+    #[test]
+    fn parallel_lifecycle_and_control_store_initialization_converges_on_one_principal() {
+        parallel_first_lifecycle_migration_creates_exactly_one_installation_principal();
+    }
+
+    #[test]
+    fn missing_shared_principal_with_lifecycle_or_control_residue_fails_closed() {
+        missing_or_corrupt_installation_principal_fails_closed_without_new_operation_identity();
+    }
+
+    #[test]
+    fn canonical_installation_principal_changes_only_after_explicit_profile_reset() {
+        let root = temp_root("principal-profile-reset");
+        let original = repository(&root)
+            .initialize()
+            .unwrap()
+            .principal()
+            .to_owned();
+        assert_eq!(
+            repository(&root).initialize().unwrap().principal(),
+            original
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        let replacement = repository(&root)
+            .initialize()
+            .unwrap()
+            .principal()
+            .to_owned();
+        assert_ne!(replacement, original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

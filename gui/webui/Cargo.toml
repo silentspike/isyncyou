@@ -18,6 +18,9 @@ isyncyou-connectors = { path = "../../crates/connectors", default-features = fal
 ammonia = "4"
 # Decode base64 request bodies over the JSON bridge (#657 in-app upload/replace).
 base64 = "0.22"
+ring = "0.17"
+# Fixed-buffer HTTP/1 parsing for the loopback adapter.
+httparse = "1.10"
 
 [features]
 # Forward the store at-rest-encryption profile (default-on for desktop). The

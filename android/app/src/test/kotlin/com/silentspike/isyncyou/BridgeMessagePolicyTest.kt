@@ -194,14 +194,31 @@ class BridgeMessagePolicyTest {
             .put("X-Session-Token", "attacker-1")
             .put("x-session-token", "attacker-2")
             .put("x-SeSsIoN-ToKeN", "attacker-3")
+            .put("x-storage-not-low", "true")
             .put("Accept", "application/json")
 
-        val sanitized = BridgeMessagePolicy.sanitizeHeaders(headers, "trusted")
+        val sanitized = BridgeMessagePolicy.sanitizeHeaders(headers, "trusted", false)
         assertEquals("trusted", sanitized.getString("X-Session-Token"))
         assertEquals("application/json", sanitized.getString("Accept"))
         assertFalse(sanitized.has("x-session-token"))
         assertFalse(sanitized.has("x-SeSsIoN-ToKeN"))
-        assertEquals(2, sanitized.length())
+        assertEquals("false", sanitized.getString("X-Storage-Not-Low"))
+        assertEquals(3, sanitized.length())
+    }
+
+    @Test
+    fun android_bridge_ignores_cookie_authority_and_injects_native_session_header() {
+        val headers = JSONObject()
+            .put("Cookie", "isy_session=webview-controlled")
+            .put("x-session-token", "webview-controlled")
+            .put("X-Capability-Token", "agent-capability")
+
+        val sanitized = BridgeMessagePolicy.sanitizeHeaders(headers, "native-session")
+
+        assertEquals("native-session", sanitized.getString("X-Session-Token"))
+        assertEquals("agent-capability", sanitized.getString("X-Capability-Token"))
+        assertFalse(sanitized.has("x-session-token"))
+        assertEquals("isy_session=webview-controlled", sanitized.getString("Cookie"))
     }
 
     @Test

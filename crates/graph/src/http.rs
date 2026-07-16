@@ -11,6 +11,12 @@ use std::time::Duration;
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 
+#[derive(Debug, Clone)]
+pub struct ServerTimeSample {
+    pub server_unix_ms: u64,
+    pub received_at_monotonic: std::time::Instant,
+}
+
 /// One binary data part for a OneNote multipart page-create request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneNotePagePart {
@@ -37,6 +43,14 @@ pub enum ConflictBehavior {
     Fail,
     Replace,
     Rename,
+}
+
+/// Result of a streamed OneDrive content mutation. A create name collision and a stale
+/// replace ETag are policy outcomes, not transport failures.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamUploadOutcome {
+    Applied(serde_json::Value),
+    Conflict,
 }
 
 impl ConflictBehavior {
@@ -164,6 +178,8 @@ pub enum UploadError {
     Transport(String),
     Timeout(String),
     Parse(String),
+    /// The response exceeded the caller's explicit body limit.
+    TooLarge,
     /// The session ended without a completion response.
     Incomplete,
 }
@@ -175,6 +191,7 @@ impl std::fmt::Display for UploadError {
             UploadError::Transport(e) => write!(f, "transport error: {e}"),
             UploadError::Timeout(e) => write!(f, "timeout: {e}"),
             UploadError::Parse(e) => write!(f, "parse error: {e}"),
+            UploadError::TooLarge => write!(f, "response body exceeded limit"),
             UploadError::Incomplete => write!(f, "upload ended without completion"),
         }
     }
@@ -204,12 +221,13 @@ impl UploadError {
             Self::Http { status, .. } if matches!(*status, 408 | 425 | 429 | 500..=599) => {
                 Some(GraphTransientFailure::Http(*status))
             }
-            Self::Http { .. } | Self::Parse(_) | Self::Incomplete => None,
+            Self::Http { .. } | Self::Parse(_) | Self::TooLarge | Self::Incomplete => None,
         }
     }
 }
 
 /// A Microsoft Graph HTTP client carrying a bearer access token.
+#[derive(Clone)]
 pub struct GraphClient {
     client: reqwest::blocking::Client,
     token: String,
@@ -424,6 +442,41 @@ impl GraphClient {
         }
     }
 
+    /// Read trusted server time from a successful authenticated Graph response. Callers use the
+    /// process-local monotonic receipt instant only to reject stale samples; it is never persisted.
+    pub fn server_time_sample(&self) -> Result<ServerTimeSample, UploadError> {
+        let url = format!("{}/me/drive/root?$select=id", self.base);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(UploadError::from_reqwest)?;
+        if !response.status().is_success() {
+            return Err(UploadError::Http {
+                status: response.status().as_u16(),
+                body: String::new(),
+            });
+        }
+        let value = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| UploadError::Parse("missing server time".into()))?;
+        let time = httpdate::parse_http_date(value)
+            .map_err(|_| UploadError::Parse("invalid server time".into()))?;
+        let server_unix_ms = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| UploadError::Parse("invalid server time".into()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| UploadError::Parse("invalid server time".into()))?;
+        Ok(ServerTimeSample {
+            server_unix_ms,
+            received_at_monotonic: std::time::Instant::now(),
+        })
+    }
+
     /// Open a resumable upload session for `dest_path` (`total` = file size).
     pub fn create_upload_session(
         &self,
@@ -448,6 +501,171 @@ impl GraphClient {
             UploadError::Parse("createUploadSession response had no uploadUrl".into())
         })?;
         Ok(UploadSession::new(upload_url, total))
+    }
+
+    fn create_target_upload_session(
+        &self,
+        url: String,
+        total: u64,
+        behavior: ConflictBehavior,
+        if_match: Option<&str>,
+    ) -> Result<Option<UploadSession>, UploadError> {
+        let mut request = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "item": {
+                    "@microsoft.graph.conflictBehavior": behavior.as_graph(),
+                    "fileSize": total,
+                }
+            }));
+        if let Some(etag) = if_match {
+            request = request.header(reqwest::header::IF_MATCH, etag);
+        }
+        let response = request.send().map_err(UploadError::from_reqwest)?;
+        match response.status().as_u16() {
+            200 | 201 => {
+                let value = response
+                    .json::<serde_json::Value>()
+                    .map_err(|error| UploadError::Parse(error.to_string()))?;
+                let upload_url = value
+                    .get("uploadUrl")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        UploadError::Parse("createUploadSession response had no uploadUrl".into())
+                    })?;
+                Ok(Some(UploadSession::new(upload_url, total)))
+            }
+            409 | 412 => Ok(None),
+            status => Err(UploadError::Http {
+                status,
+                body: String::new(),
+            }),
+        }
+    }
+
+    fn upload_session_from_ranges<F>(
+        &self,
+        mut session: UploadSession,
+        mut read_range: F,
+    ) -> Result<serde_json::Value, UploadError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, UploadError>,
+    {
+        while let Some(plan) = session.next_chunk(CHUNK_ALIGN) {
+            let expected = usize::try_from(plan.len)
+                .map_err(|_| UploadError::Parse("upload range too large".into()))?;
+            let bytes = read_range(plan.start, expected)?;
+            if bytes.len() != expected {
+                return Err(UploadError::Parse(
+                    "upload source returned a short range".into(),
+                ));
+            }
+            let response = self
+                .client
+                .put(&session.upload_url)
+                .header(reqwest::header::CONTENT_RANGE, &plan.content_range)
+                .body(bytes)
+                .send()
+                .map_err(UploadError::from_reqwest)?;
+            match response.status().as_u16() {
+                202 => {
+                    let value = response.json::<serde_json::Value>().ok();
+                    let ranges = value
+                        .as_ref()
+                        .and_then(|value| value.get("nextExpectedRanges"))
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if ranges.is_empty() {
+                        session.advance(plan.len);
+                    } else {
+                        session.apply_next_expected(&ranges);
+                    }
+                }
+                200 | 201 => {
+                    return response
+                        .json::<serde_json::Value>()
+                        .map_err(|error| UploadError::Parse(error.to_string()));
+                }
+                status => {
+                    return Err(UploadError::Http {
+                        status,
+                        body: String::new(),
+                    });
+                }
+            }
+        }
+        Err(UploadError::Incomplete)
+    }
+
+    /// Upload a new child from a bounded random-access source without materializing the whole
+    /// body. `conflictBehavior=fail` preserves the ledger's probe-and-adopt recovery rule.
+    pub fn upload_to_parent_streaming<F>(
+        &self,
+        parent_id: &str,
+        name: &str,
+        total: u64,
+        read_range: F,
+    ) -> Result<StreamUploadOutcome, UploadError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, UploadError>,
+    {
+        let url = if parent_id.is_empty() {
+            format!(
+                "{}/me/drive/root:/{}:/createUploadSession",
+                self.base,
+                enc(name)
+            )
+        } else {
+            format!(
+                "{}/me/drive/items/{}:/{}:/createUploadSession",
+                self.base,
+                parent_id,
+                enc(name)
+            )
+        };
+        let Some(session) =
+            self.create_target_upload_session(url, total, ConflictBehavior::Fail, None)?
+        else {
+            return Ok(StreamUploadOutcome::Conflict);
+        };
+        match self.upload_session_from_ranges(session, read_range) {
+            Ok(value) => Ok(StreamUploadOutcome::Applied(value)),
+            Err(UploadError::Http { status: 409, .. }) => Ok(StreamUploadOutcome::Conflict),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Replace one item from a bounded random-access source. The ETag is checked before an
+    /// upload session is issued, so stale content never starts transferring.
+    pub fn replace_content_streaming_if_match<F>(
+        &self,
+        item_id: &str,
+        etag: &str,
+        total: u64,
+        read_range: F,
+    ) -> Result<StreamUploadOutcome, UploadError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, UploadError>,
+    {
+        let url = format!("{}/me/drive/items/{item_id}/createUploadSession", self.base);
+        let Some(session) =
+            self.create_target_upload_session(url, total, ConflictBehavior::Replace, Some(etag))?
+        else {
+            return Ok(StreamUploadOutcome::Conflict);
+        };
+        match self.upload_session_from_ranges(session, read_range) {
+            Ok(value) => Ok(StreamUploadOutcome::Applied(value)),
+            Err(UploadError::Http { status: 412, .. }) => Ok(StreamUploadOutcome::Conflict),
+            Err(error) => Err(error),
+        }
     }
 
     /// Upload `data` to `dest_path`. Small files go via a single PUT; larger ones
@@ -1079,6 +1297,48 @@ impl GraphClient {
         resp.bytes()
             .map(|b| b.to_vec())
             .map_err(|e| UploadError::Transport(e.to_string()))
+    }
+
+    /// Reads a response body up to an explicit caller-owned limit. The limit is
+    /// checked against both Content-Length and streamed bytes.
+    pub fn get_bytes_bounded(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, UploadError> {
+        use std::io::Read;
+
+        let url = self.abs(url);
+        let mut resp = self.get_with_retry(&url)?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(UploadError::Http {
+                status,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            });
+        }
+        if resp
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(UploadError::TooLarge);
+        }
+        let initial_capacity = resp
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(max_bytes);
+        let mut out = Vec::with_capacity(initial_capacity);
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let read = resp
+                .read(&mut chunk)
+                .map_err(|error| UploadError::Transport(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            if out.len().saturating_add(read) > max_bytes {
+                return Err(UploadError::TooLarge);
+            }
+            out.extend_from_slice(&chunk[..read]);
+        }
+        Ok(out)
     }
 
     /// Like [`get_bytes`](Self::get_bytes), but **streams** the body and reports the cumulative
@@ -2526,6 +2786,24 @@ mod tests {
         assert_eq!(seen.len(), 1);
         // space is encoded; the OneDrive path addressing form is used
         assert!(seen[0].starts_with("PUT /me/drive/root:/a%20dir/x.txt:/content"));
+    }
+
+    #[test]
+    fn get_bytes_bounded_rejects_declared_and_streamed_overflow() {
+        let (base, _server) = serve(vec![http_response(200, "OK", "", "12345")]);
+        let error = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_bytes_bounded("/bounded", 4)
+            .unwrap_err();
+        assert!(matches!(error, UploadError::TooLarge));
+
+        let response = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n12345".to_owned();
+        let (base, _server) = serve(vec![response]);
+        let error = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_bytes_bounded("/bounded", 4)
+            .unwrap_err();
+        assert!(matches!(error, UploadError::TooLarge));
     }
 
     #[test]

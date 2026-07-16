@@ -138,7 +138,7 @@ The constraints that force the shape of this decision:
     and never sets `connected`/activation/readiness; **FakeProvider** is a test/fixture provider only,
     never an unconfigured product turn.
 
-14. **Reversible product-account lifecycle (REQ-AGENT-015, S-AG.16/#645).** Disconnect,
+14. **Reversible product-account lifecycle (REQ-AGENT-015, S-AG.20/#645).** Disconnect,
     Reconnect, and verified-identity Switch are durable provider-scoped operations rather than
     local token deletion. A provider lifecycle lease excludes same-provider turns, refresh, OAuth,
     and maintenance while a mutation is active. An encrypted authority record reserves a monotonic
@@ -156,6 +156,24 @@ The constraints that force the shape of this decision:
     an equivalent verified identity contract exists. On Android, every revoke leg uses the bounded
     `credential_revoke` foreground guard and a one-shot session/guard/purpose-bound network
     snapshot. Default product artifacts exclude deterministic lifecycle test hooks.
+
+15. **Shared product-session authority (REQ-AGENT-016, S-AG.16/#628).** Writable
+    product sessions use V2 encrypted records and an authoritative manifest. Immutable
+    visible records, request journals, provider-step outcomes, and UUID bindings are
+    staged first and become authoritative only through one lease- and fence-bound
+    manifest CAS. Legacy V1 sessions remain readable but cannot accept new turns.
+    Request recovery is bound to provider, model, credential generation, OAuth policy,
+    harness contract, and the canonical installation identity. A changed binding or an
+    outbound provider step without a durable outcome fails closed rather than retrying.
+
+    A renewal worker owns quiet long turns. Cancellation is shared by the provider,
+    tool loop, and host, while the host alone emits terminal events after durable
+    publication. App-wide confirmation, pairing, mutation reservations, and request
+    tombstones live in one encrypted control store. Pairing V2 reveals a five-minute
+    one-time transfer only after user presence and permanently fences the first claim.
+    Mutable APIs use strict JSON and bounded sealed chunks; desktop authority is an
+    HttpOnly process cookie with exact-origin mutation checks, while Android injects
+    its native session authority.
 
 ## Consequences
 

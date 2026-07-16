@@ -180,6 +180,15 @@ pub trait LlmProvider {
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<Vec<AssistantBlock>, crate::AgentError>;
 
+    fn next_cancellable(
+        &mut self,
+        history: &[crate::turn::Message],
+        emit: &mut dyn FnMut(StreamEvent),
+        _cancellation: Option<&crate::CancellationToken>,
+    ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+        self.next(history, emit)
+    }
+
     fn last_usage(&self) -> Option<Usage> {
         None
     }

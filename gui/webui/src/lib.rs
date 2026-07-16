@@ -23,8 +23,10 @@
 
 use isyncyou_core::{Config, OneDriveMode, OneDriveModes};
 use isyncyou_store::{Item, Store};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -85,7 +87,7 @@ const BACKUP_SERVICES: &[&str] = &["mail", "calendar", "contacts", "todo", "onen
 
 /// A parsed inbound request (method + path + decoded query pairs + an optional
 /// capability token captured from the `X-Capability-Token` header).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
@@ -95,6 +97,11 @@ pub struct ApiRequest {
     /// The `X-Session-Token` header value (#89 mobile profile): required on every
     /// `/api/v1/*` route when the Router runs with a session token.
     pub session_token: Option<String>,
+    /// Public opaque handle armed only by the trusted native presence path.
+    pub per_action_token: Option<String>,
+    /// Trusted Android bridge observation. The WebView cannot set this value because
+    /// Kotlin strips and replaces the corresponding header.
+    pub storage_not_low: Option<bool>,
     /// Normalized inbound `Content-Type`. Only newly introduced JSON routes depend on
     /// this; legacy query/body routes intentionally retain their existing contract.
     pub content_type: Option<String>,
@@ -103,6 +110,22 @@ pub struct ApiRequest {
     /// transports — HTTP (`serve.rs` reads it instead of draining) and the Android
     /// in-process message bridge (which has no query-string ergonomics for uploads).
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for ApiRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiRequest")
+            .field("method", &self.method)
+            .field("route", &self.path)
+            .field("body_len", &self.body.len())
+            .field("has_query", &!self.query.is_empty())
+            .field("has_capability", &self.cap_token.is_some())
+            .field("has_session", &self.session_token.is_some())
+            .field("has_per_action", &self.per_action_token.is_some())
+            .field("has_content_type", &self.content_type.is_some())
+            .finish()
+    }
 }
 
 impl ApiRequest {
@@ -126,6 +149,8 @@ impl ApiRequest {
             query,
             cap_token: None,
             session_token: None,
+            per_action_token: None,
+            storage_not_low: None,
             content_type: None,
             body: Vec::new(),
         }
@@ -140,6 +165,16 @@ impl ApiRequest {
     /// Attach the captured `X-Session-Token` header (builder style, #89).
     pub fn with_session_token(mut self, token: Option<String>) -> Self {
         self.session_token = token;
+        self
+    }
+
+    pub fn with_per_action_token(mut self, token: Option<String>) -> Self {
+        self.per_action_token = token;
+        self
+    }
+
+    pub fn with_storage_not_low(mut self, value: Option<bool>) -> Self {
+        self.storage_not_low = value;
         self
     }
 
@@ -210,6 +245,7 @@ fn agent_oauth_provider_param(provider: &str) -> Result<&'static str, &'static s
 }
 
 const AGENT_STRICT_JSON_MAX_BYTES: usize = 8 * 1024;
+const AGENT_TURN_JSON_MAX_BYTES: usize = 64 * 1024;
 
 fn is_json_content_type(content_type: Option<&str>) -> bool {
     let Some(content_type) = content_type else {
@@ -253,19 +289,123 @@ fn parse_agent_strict_json<T: serde::de::DeserializeOwned>(
     req: &ApiRequest,
     operation: &str,
 ) -> Result<T, ApiResponse> {
+    parse_agent_strict_json_with_limit(req, operation, AGENT_STRICT_JSON_MAX_BYTES)
+}
+
+fn parse_agent_strict_json_with_limit<T: serde::de::DeserializeOwned>(
+    req: &ApiRequest,
+    operation: &str,
+    max_bytes: usize,
+) -> Result<T, ApiResponse> {
     if !req.query.is_empty() || !is_json_content_type(req.content_type.as_deref()) {
         return Err(no_store_json_error(
             400,
             &format!("{operation} accepts JSON only"),
         ));
     }
-    if req.body.len() > AGENT_STRICT_JSON_MAX_BYTES {
+    if req.body.len() > max_bytes {
         return Err(no_store_json_error(413, "request body too large"));
     }
     let body = std::str::from_utf8(&req.body)
         .map_err(|_| no_store_json_error(400, "invalid JSON request body"))?;
-    serde_json::from_str(body)
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let value = StrictJsonValue::deserialize(&mut deserializer)
+        .and_then(|value| deserializer.end().map(|()| value.0))
+        .map_err(|_| no_store_json_error(400, &format!("invalid {operation} request")))?;
+    serde_json::from_value(value)
         .map_err(|_| no_store_json_error(400, &format!("invalid {operation} request")))
+}
+
+struct StrictJsonValue(Value);
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(StrictJsonValue)
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        StrictJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<StrictJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(StrictJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key.clone()) {
+                return Err(serde::de::Error::custom("duplicate JSON object key"));
+            }
+            values.insert(key, map.next_value::<StrictJsonValue>()?.0);
+        }
+        Ok(StrictJsonValue(Value::Object(values)))
+    }
 }
 
 fn valid_client_request_id(value: &str) -> bool {
@@ -281,6 +421,256 @@ fn valid_client_request_id(value: &str) -> bool {
             matches!(index, 8 | 13 | 18 | 23)
                 || byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
         })
+}
+
+/// Parse one of the bounded scalar-only mutation contracts into the query-shaped
+/// view used by the established domain handlers. This is a transport adapter, not
+/// a legacy query fallback: callers must supply strict JSON and every accepted key
+/// is selected by the matched route.
+fn parse_strict_scalar_mutation(
+    req: &ApiRequest,
+    operation: &str,
+    allowed_fields: &[&str],
+) -> Result<ApiRequest, ApiResponse> {
+    let value: Value = parse_agent_strict_json_with_limit(req, operation, 64 * 1024)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| no_store_json_error(400, &format!("invalid {operation} request")))?;
+    let request_id = object
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| valid_client_request_id(value))
+        .ok_or_else(|| no_store_json_error(400, "invalid request_id"))?;
+
+    if object
+        .keys()
+        .any(|key| key != "request_id" && !allowed_fields.contains(&key.as_str()))
+    {
+        return Err(no_store_json_error(
+            400,
+            &format!("invalid {operation} request"),
+        ));
+    }
+
+    let mut parsed = req.clone();
+    parsed.query.clear();
+    parsed
+        .query
+        .push(("request_id".into(), request_id.to_owned()));
+    for field in allowed_fields {
+        let Some(value) = object.get(*field) else {
+            continue;
+        };
+        let scalar = match value {
+            Value::Null => continue,
+            Value::String(value) if value.len() <= 32 * 1024 => value.clone(),
+            Value::Bool(value) => {
+                if *value {
+                    "1".into()
+                } else {
+                    "0".into()
+                }
+            }
+            Value::Number(value) => value.to_string(),
+            _ => {
+                return Err(no_store_json_error(
+                    400,
+                    &format!("invalid {operation} request"),
+                ));
+            }
+        };
+        parsed.query.push(((*field).to_owned(), scalar));
+    }
+    parsed.body.clear();
+    Ok(parsed)
+}
+
+fn valid_opaque_agent_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn mutation_error_response(error: &str) -> ApiResponse {
+    let (status, code) = match error {
+        "mutation_intent_quota_exceeded" | "mutation_intent_busy" => (429, error),
+        "mutation_intent_storage_unavailable" => (507, error),
+        "request_id_conflict" | "mutation_intent_conflict" | "mutation_intent_outcome_unknown" => {
+            (409, error)
+        }
+        "mutation_intent_not_found" => (404, error),
+        "mutation_intent_expired" | "mutation_intent_invalid" => (400, error),
+        _ => (500, "mutation_intent_failed"),
+    };
+    ApiResponse::error(status, code)
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushRegisterRequest {
+    request_id: String,
+    token: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailSendRequest {
+    request_id: String,
+    account: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+    importance: Option<String>,
+    #[serde(default)]
+    read_receipt: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailReplyRequest {
+    request_id: String,
+    account: String,
+    id: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailForwardRequest {
+    request_id: String,
+    account: String,
+    id: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    comment: String,
+    to: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailDraftRequest {
+    request_id: String,
+    account: String,
+    id: Option<String>,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    to: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OneNoteCreateRequest {
+    request_id: String,
+    account: String,
+    section: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OneNoteAppendRequest {
+    request_id: String,
+    account: String,
+    id: String,
+    text: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutationIntentCreateRequest {
+    request_id: String,
+    #[serde(flatten)]
+    purpose: MutationPurpose,
+    total_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutationIntentChunkRequest {
+    request_id: String,
+    intent_id: String,
+    index: u32,
+    offset: u64,
+    data_base64: String,
+    chunk_sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutationIntentCommitRequest {
+    request_id: String,
+    intent_id: String,
+    total_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutationIntentCancelRequest {
+    request_id: String,
+    intent_id: String,
+}
+
+fn parse_bounded_page_limit(value: Option<&str>) -> Result<Option<usize>, ApiResponse> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let limit = value
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=100).contains(limit))
+        .ok_or_else(|| no_store_json_error(400, "invalid page limit"))?;
+    Ok(Some(limit))
+}
+
+fn agent_session_error_status(error: &str) -> u16 {
+    match error {
+        "invalid_cursor" | "invalid_session_name" | "invalid_session_record" => 400,
+        "session_not_found" => 404,
+        "manifest_conflict"
+        | "provider_generation_changed"
+        | "request_id_conflict"
+        | "session_limit_reached"
+        | "session_request_capacity_reached"
+        | "session_upgrade_required"
+        | "stale_cursor" => 409,
+        "history_page_too_large" | "session_budget_exceeded" => 413,
+        "session_account_selection_required" => 409,
+        "session_account_unavailable"
+        | "session_store_unavailable"
+        | "session_transport_unavailable" => 503,
+        _ => 500,
+    }
 }
 
 fn closed_lifecycle_error(code: &str) -> String {
@@ -492,6 +882,123 @@ pub struct AgentCredentialRefreshRequest {
     pub provider: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionCreateRequest {
+    pub request_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionSelectRequest {
+    pub request_id: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTurnRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTurnCancelRequest {
+    pub request_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPendingCancelRequest {
+    pub request_id: String,
+    pub pending: String,
+    pub action_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionArchiveBinding {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionPairingRevealBinding {
+    pub session_id: String,
+    pub pair_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionPairingImportBinding {
+    pub pairing_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum AgentUserPresenceBinding {
+    SessionArchive(AgentSessionArchiveBinding),
+    SessionPairingReveal(AgentSessionPairingRevealBinding),
+    SessionPairingImport(AgentSessionPairingImportBinding),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUserPresenceStartRequest {
+    pub request_id: String,
+    pub kind: String,
+    pub binding: AgentUserPresenceBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUserPresenceConfirmRequest {
+    pub request_id: String,
+    pub operation_id: String,
+    pub intent_id: String,
+    pub token: String,
+    pub action_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfirmRequest {
+    pub request_id: String,
+    pub pending: String,
+    pub token: String,
+    pub action_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentModelRequest {
+    pub request_id: String,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionPairingCreateRequest {
+    pub request_id: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionPairingOperationRequest {
+    pub request_id: String,
+    pub operation_id: String,
+}
+
+pub type AgentSessionArchiveRequest = AgentSessionPairingOperationRequest;
+
 /// A provider OAuth start result. `attempt_id` is opaque and exists only so the
 /// initiating UI can cancel the exact server-side attempt without handling OAuth
 /// state, codes, or callback URLs.
@@ -585,6 +1092,9 @@ pub struct AgentOAuthCompleteRequest {
 pub trait AgentHandler: Send + Sync {
     /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
+    fn start_turn_request(&self, request: AgentTurnRequest) -> Result<String, String> {
+        self.start_turn(&request.account, &request.prompt)
+    }
     /// Peek the non-secret binding for a pending destructive action without checking
     /// or consuming its one-time Agent confirmation token.
     fn pending_binding(
@@ -598,8 +1108,104 @@ pub trait AgentHandler: Send + Sync {
     fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String>;
     /// Cancel an in-flight turn.
     fn cancel(&self, turn_id: &str);
+    fn cancel_turn(&self, turn_id: &str) -> Result<(), String> {
+        self.cancel(turn_id);
+        Ok(())
+    }
+    fn cancel_pending(&self, _pending_id: &str, _action_hash: &str) -> Result<(), String> {
+        Err("pending cancellation is not enabled on this server".into())
+    }
     /// Subscribe to a turn's stream (pre-serialized JSON SSE-data lines).
     fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>>;
+
+    fn session_create(
+        &self,
+        _request_id: &str,
+        _display_name: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        Err("product sessions are not enabled on this server".into())
+    }
+
+    fn session_list(
+        &self,
+        _cursor: Option<&str>,
+        _limit: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        Err("product sessions are not enabled on this server".into())
+    }
+
+    fn session_select(
+        &self,
+        _request_id: &str,
+        _session_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("product sessions are not enabled on this server".into())
+    }
+
+    fn session_history(
+        &self,
+        _session_id: &str,
+        _cursor: Option<&str>,
+        _limit: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        Err("product sessions are not enabled on this server".into())
+    }
+
+    fn session_archive(
+        &self,
+        _request: AgentSessionArchiveRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("product sessions are not enabled on this server".into())
+    }
+
+    fn user_presence_start(
+        &self,
+        _request: AgentUserPresenceStartRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("user presence is not enabled on this server".into())
+    }
+
+    fn user_presence_confirm(
+        &self,
+        _request: AgentUserPresenceConfirmRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("user presence is not enabled on this server".into())
+    }
+
+    fn session_pairing_create(
+        &self,
+        _request: AgentSessionPairingCreateRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("session pairing is not enabled on this server".into())
+    }
+
+    fn session_pairing_reveal(
+        &self,
+        _request: AgentSessionPairingOperationRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("session pairing is not enabled on this server".into())
+    }
+
+    fn session_pairing_claim(
+        &self,
+        _request: AgentSessionPairingOperationRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("session pairing is not enabled on this server".into())
+    }
+
+    fn session_pairing_finalize(
+        &self,
+        _request: AgentSessionPairingOperationRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("session pairing is not enabled on this server".into())
+    }
+
+    fn session_pairing_revoke(
+        &self,
+        _request: AgentSessionPairingOperationRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("session pairing is not enabled on this server".into())
+    }
 
     /// Run a closed provider connectivity preflight. The router parses the strict JSON
     /// request and the handler returns only the closed diagnostic response.
@@ -1091,6 +1697,148 @@ pub trait OneDriveWriteHandler: Send + Sync {
     fn replace(&self, account: &str, id: &str, etag: &str, bytes: &[u8]) -> Result<(), String>;
 }
 
+pub const MUTATION_CHUNK_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "purpose", content = "metadata", rename_all = "snake_case")]
+pub enum MutationPurpose {
+    OnedriveUpload {
+        account: String,
+        parent: String,
+        name: String,
+    },
+    OnedriveReplace {
+        account: String,
+        id: String,
+        etag: String,
+    },
+    MailBody {
+        account: String,
+        operation: String,
+        target: String,
+        recipients: Vec<String>,
+        subject: String,
+        all: bool,
+    },
+    OnenoteBody {
+        account: String,
+        operation: String,
+        section_or_page: String,
+        title: String,
+    },
+}
+
+impl MutationPurpose {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::OnedriveUpload {
+                account,
+                parent: _,
+                name,
+            } => !account.is_empty() && !name.is_empty(),
+            Self::OnedriveReplace { account, id, etag } => {
+                !account.is_empty() && !id.is_empty() && !etag.is_empty()
+            }
+            Self::MailBody {
+                account,
+                operation,
+                target,
+                recipients,
+                subject: _,
+                all: _,
+            } => {
+                !account.is_empty()
+                    && matches!(operation.as_str(), "send" | "reply" | "forward" | "draft")
+                    && recipients.len() <= 256
+                    && (matches!(operation.as_str(), "send" | "draft") || !target.is_empty())
+            }
+            Self::OnenoteBody {
+                account,
+                operation,
+                section_or_page,
+                title: _,
+            } => {
+                !account.is_empty()
+                    && !section_or_page.is_empty()
+                    && matches!(operation.as_str(), "create" | "append")
+            }
+        }
+    }
+
+    fn confirmation_binding(&self) -> (&'static str, &str, &'static str, String) {
+        use base64::Engine as _;
+        use ring::digest::{digest, SHA256};
+        let canonical = serde_json::to_vec(self).unwrap_or_default();
+        let binding = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(digest(&SHA256, &canonical).as_ref());
+        match self {
+            Self::OnedriveUpload { account, name, .. } => {
+                ("upload", account, "onedrive", format!("{name}#{binding}"))
+            }
+            Self::OnedriveReplace { account, id, .. } => {
+                ("replace", account, "onedrive", format!("{id}#{binding}"))
+            }
+            Self::MailBody {
+                account, operation, ..
+            } => (
+                "live-write",
+                account,
+                "mail",
+                format!("{operation}#{binding}"),
+            ),
+            Self::OnenoteBody {
+                account, operation, ..
+            } => (
+                "live-write",
+                account,
+                "onenote",
+                format!("{operation}#{binding}"),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationIntentCreate {
+    pub request_id: String,
+    pub owner: String,
+    pub purpose: MutationPurpose,
+    pub total_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationIntentInfo {
+    pub intent_id: String,
+    pub chunk_bytes: usize,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationIntentChunk {
+    pub owner: String,
+    pub request_id: String,
+    pub intent_id: String,
+    pub index: u32,
+    pub offset: u64,
+    pub chunk_sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+pub trait MutationIntentHandler: Send + Sync {
+    fn create(&self, request: MutationIntentCreate) -> Result<MutationIntentInfo, String>;
+    fn put_chunk(&self, chunk: MutationIntentChunk) -> Result<(), String>;
+    fn commit(
+        &self,
+        owner: &str,
+        request_id: &str,
+        intent_id: &str,
+        total_bytes: u64,
+        sha256: &str,
+    ) -> Result<Value, String>;
+    fn cancel(&self, owner: &str, request_id: &str, intent_id: &str) -> Result<(), String>;
+}
+
 /// Performs the OneDrive **local-body management** verbs on behalf of a cap-token POST (#659):
 /// free up a materialized body, download one on demand, list + resolve keep-both conflicts, and
 /// run the offline→online cleanup. Injected by the daemon / mobile engine (which owns the store +
@@ -1287,6 +2035,8 @@ pub struct Router {
     onedrive_write: Option<std::sync::Arc<dyn OneDriveWriteHandler>>,
     /// Separate capability token for OneDrive cloud-write POSTs.
     onedrive_write_cap_token: Option<String>,
+    mutation_intents: Option<std::sync::Arc<dyn MutationIntentHandler>>,
+    mutation_intent_cap_token: Option<String>,
     /// Optional OneDrive per-folder mode handler (#651): fresh mode reads + persisted
     /// set/clear. `None` => the mode POST is refused (read-only CLI `serve`); the GET
     /// then falls back to the static config.
@@ -1388,6 +2138,8 @@ impl Router {
             onenote_write_cap_token: None,
             onedrive_write: None,
             onedrive_write_cap_token: None,
+            mutation_intents: None,
+            mutation_intent_cap_token: None,
             onedrive_mode: None,
             onedrive_mode_cap_token: None,
             onedrive_risk: None,
@@ -1444,6 +2196,8 @@ impl Router {
             onenote_write_cap_token: None,
             onedrive_write: None,
             onedrive_write_cap_token: None,
+            mutation_intents: None,
+            mutation_intent_cap_token: None,
             onedrive_mode: None,
             onedrive_mode_cap_token: None,
             onedrive_risk: None,
@@ -1544,9 +2298,10 @@ impl Router {
 
     /// The mobile biometric gate for one destructive op. Returns:
     /// - `None` — proceed (desktop profile, op not in the gate catalogue, or a valid
-    ///   single-use token rode in on `_pat` and was consumed);
+    ///   single-use public handle rode in the per-action header and was consumed);
     /// - `Some(confirmation_required)` — mobile + gated + no token yet: a pending action
-    ///   was registered; the UI must run the native biometric and re-issue with `_pat`;
+    ///   was registered; the UI must run the native biometric and re-issue with the
+    ///   per-action header;
     /// - `Some(403)` — a token was presented but was bad/expired/replayed/mismatched.
     fn biometric_challenge(
         &self,
@@ -1560,7 +2315,7 @@ impl Router {
             return None;
         }
         let now = isyncyou_core::pending::now_ms();
-        match req.q("_pat").filter(|s| !s.is_empty()) {
+        match req.per_action_token.as_deref().filter(|s| !s.is_empty()) {
             Some(pat) => match self.pending.consume(pat, op, account, service, item, now) {
                 Ok(()) => None,
                 Err(e) => Some(ApiResponse::error(
@@ -1780,6 +2535,16 @@ impl Router {
         self
     }
 
+    pub fn with_mutation_intents(
+        mut self,
+        handler: std::sync::Arc<dyn MutationIntentHandler>,
+        cap_token: String,
+    ) -> Self {
+        self.mutation_intents = Some(handler);
+        self.mutation_intent_cap_token = Some(cap_token);
+        self
+    }
+
     /// Enable the OneDrive local-body management POSTs/GET (free-up / download-now / conflict
     /// list+resolve / offline→online cleanup), guarded by `cap_token` (builder style, #659).
     pub fn with_onedrive_manage(
@@ -1835,7 +2600,7 @@ impl Router {
     /// two `EventSource` endpoints on the phone, where no loopback port exists to hold an
     /// SSE socket open. Items are ready-to-embed JSON event objects
     /// `{"event":<name>,"data":<string>}`; the native side wraps each in a bridge push
-    /// message. Session-gated exactly like the HTTP SSE paths (header or `_st` query).
+    /// message. Session-gated exactly like the HTTP SSE paths; query authority is rejected.
     /// `None` when unauthorized or the stream is unknown/absent. Dropping the returned
     /// receiver ends the source thread (the next `send` fails).
     pub fn open_bridge_stream(
@@ -1845,12 +2610,7 @@ impl Router {
     ) -> Option<std::sync::mpsc::Receiver<String>> {
         let req =
             ApiRequest::new("GET", target).with_session_token(session_token.map(str::to_string));
-        let st_query = req
-            .query
-            .iter()
-            .find(|(k, _)| k == "_st")
-            .map(|(_, v)| v.as_str());
-        if !self.session_authorized(req.session_token.as_deref().or(st_query)) {
+        if req.q("_st").is_some() || !self.session_authorized(req.session_token.as_deref()) {
             return None;
         }
         match req.path.as_str() {
@@ -1935,8 +2695,23 @@ impl Router {
             .map_err(|e| e.to_string())
     }
 
-    /// Dispatch one request to a response. Never panics; unknown routes → 404.
+    /// Dispatch one request to a response. Never panics; unknown routes -> 404.
     pub fn route(&self, req: &ApiRequest) -> ApiResponse {
+        let mut response = self.route_inner(req);
+        if req.path.starts_with("/api/v1/")
+            && !response
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        {
+            response
+                .headers
+                .push(("Cache-Control".into(), "no-store".into()));
+        }
+        response
+    }
+
+    fn route_inner(&self, req: &ApiRequest) -> ApiResponse {
         // Mobile/standalone profile (#89/#721): the data API is fully session-token
         // gated. The static shell (`/`, `/app.js`, `/app.css`, fonts, `/sfx/*`) stays
         // open so the WebView can bootstrap — it carries no user data and no token.
@@ -1944,8 +2719,10 @@ impl Router {
         // remains accepted only for legacy/non-WebView callers. No-op on the desktop
         // daemon (session_token = None).
         if req.path.starts_with("/api/v1/") {
-            let provided = req.session_token.as_deref().or_else(|| req.q("_st"));
-            if !self.session_authorized(provided) {
+            if req.q("_st").is_some() {
+                return ApiResponse::error(400, "session token query is not allowed");
+            }
+            if !self.session_authorized(req.session_token.as_deref()) {
                 return ApiResponse::error(401, "missing or invalid session token");
             }
         }
@@ -2050,8 +2827,10 @@ impl Router {
                 "/api/v1/onedrive/move" => self.onedrive_move(req),
                 "/api/v1/onedrive/delete" => self.onedrive_delete(req),
                 "/api/v1/onedrive/mode" => self.onedrive_set_mode(req),
-                "/api/v1/onedrive/upload" => self.onedrive_upload(req),
-                "/api/v1/onedrive/replace" => self.onedrive_replace(req),
+                "/api/v1/mutation-intent/create" => self.mutation_intent_create(req),
+                "/api/v1/mutation-intent/chunk" => self.mutation_intent_chunk(req),
+                "/api/v1/mutation-intent/commit" => self.mutation_intent_commit(req),
+                "/api/v1/mutation-intent/cancel" => self.mutation_intent_cancel(req),
                 "/api/v1/onedrive/free-up" => self.onedrive_free_up(req),
                 "/api/v1/onedrive/download-now" => self.onedrive_download_now(req),
                 "/api/v1/onedrive/conflict/resolve" => self.onedrive_conflict_resolve(req),
@@ -2061,9 +2840,22 @@ impl Router {
                 "/api/v1/account/signout" => self.account_signout(req),
                 "/api/v1/push/register" => self.push_register(req),
                 "/api/v1/push/test" => self.push_test(req),
-                "/api/v1/agent/turn" | "/api/v1/agent/chat" => self.agent_turn(req),
+                "/api/v1/agent/turn" => self.agent_turn(req),
+                "/api/v1/agent/session/create" => self.agent_session_create(req),
+                "/api/v1/agent/session/select" => self.agent_session_select(req),
+                "/api/v1/agent/session/archive" => self.agent_session_archive(req),
+                "/api/v1/agent/user-presence/start" => self.agent_user_presence_start(req),
+                "/api/v1/agent/user-presence/confirm" => self.agent_user_presence_confirm(req),
+                "/api/v1/agent/session/pairing/create" => self.agent_session_pairing_create(req),
+                "/api/v1/agent/session/pairing/reveal" => self.agent_session_pairing_reveal(req),
+                "/api/v1/agent/session/pairing/claim" => self.agent_session_pairing_claim(req),
+                "/api/v1/agent/session/pairing/finalize" => {
+                    self.agent_session_pairing_finalize(req)
+                }
+                "/api/v1/agent/session/pairing/revoke" => self.agent_session_pairing_revoke(req),
                 "/api/v1/agent/confirm" => self.agent_confirm(req),
-                "/api/v1/agent/cancel" => self.agent_cancel(req),
+                "/api/v1/agent/turn/cancel" => self.agent_turn_cancel(req),
+                "/api/v1/agent/pending/cancel" => self.agent_pending_cancel(req),
                 "/api/v1/agent/connectivity/preflight" => self.agent_connectivity_preflight(req),
                 "/api/v1/agent/credential/refresh" => self.agent_credential_refresh(req),
                 "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
@@ -2080,7 +2872,19 @@ impl Router {
         }
         match req.path.as_str() {
             // The shell is static; the strict app CSP header locks it to our assets.
-            "/" => ApiResponse::html_with_csp(INDEX_HTML, APP_SHELL_CSP),
+            "/" => {
+                let mut response = ApiResponse::html_with_csp(INDEX_HTML, APP_SHELL_CSP);
+                if let Some(token) = self.session_token.as_deref() {
+                    response.headers.push((
+                        "Set-Cookie".into(),
+                        format!("isy_session={token}; HttpOnly; SameSite=Strict; Path=/api/v1"),
+                    ));
+                    response
+                        .headers
+                        .push(("Cache-Control".into(), "no-store".into()));
+                }
+                response
+            }
             // Agent provider OAuth callback. The **system browser**
             // returns here after the operator's login; deliberately NOT under `/api/v1/`
             // so it is exempt from the session-token gate (the browser has no token).
@@ -2091,6 +2895,8 @@ impl Router {
             // Agent connection status (session-gated by the /api/v1/ gate above; read-only,
             // so no capability token). The Assistant UI reads it to switch connect⇄chat.
             "/api/v1/agent/status" => self.agent_status(req),
+            "/api/v1/agent/session/list" => self.agent_session_list(req),
+            "/api/v1/agent/session/history" => self.agent_session_history(req),
             // app.js carries the (same-origin) capability tokens so the UI can POST
             // restore/share/sync; empty when an action is disabled, hiding its UI.
             "/app.js" => ApiResponse {
@@ -2172,6 +2978,10 @@ impl Router {
                         self.onedrive_write_cap_token.as_deref().unwrap_or(""),
                     )
                     .replace(
+                        "__MUTATION_INTENT_CAP_TOKEN__",
+                        self.mutation_intent_cap_token.as_deref().unwrap_or(""),
+                    )
+                    .replace(
                         "__ACCOUNT_CAP_TOKEN__",
                         self.account_cap_token.as_deref().unwrap_or(""),
                     )
@@ -2245,6 +3055,12 @@ impl Router {
         if !Self::cap_ok(&self.settings_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed =
+            match parse_strict_scalar_mutation(req, "settings update", &["poll_interval_secs"]) {
+                Ok(req) => req,
+                Err(e) => return e,
+            };
+        let req = &parsed;
         let secs = match req
             .q("poll_interval_secs")
             .and_then(|v| v.parse::<u64>().ok())
@@ -2262,9 +3078,9 @@ impl Router {
 
     // ---- live-mail write endpoints (#561; UI is #563) -----------------------
     //
-    // All `/api/v1/mail/*` POSTs share one gate (handler injected + cap token) and
-    // carry their params in the (percent-encoded) query string, like every other
-    // POST here. Each mutation is audited so the intent survives a mid-flight crash.
+    // All `/api/v1/mail/*` POSTs share one gate (handler injected + cap token).
+    // Content-bearing operations use strict JSON; the remaining metadata-only
+    // operations are migrated by the closed route catalogue.
 
     /// The shared gate: the handler must be injected (else 404 on the read-only
     /// server) and the request must carry the mail-write capability token (else 401).
@@ -2283,16 +3099,6 @@ impl Router {
             ));
         }
         Ok(h)
-    }
-
-    /// Parse a recipient list param: comma/space/semicolon-separated, trimmed.
-    fn addr_list(raw: Option<&str>) -> Vec<String> {
-        raw.unwrap_or("")
-            .split([',', ' ', ';'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect()
     }
 
     /// Audit + map a unit mail result to a response. NB: we deliberately do NOT
@@ -2383,6 +3189,17 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "calendar create",
+            &[
+                "account", "subject", "start", "end", "tz", "location", "body", "all_day",
+            ],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let account = match req.q("account").filter(|a| !a.is_empty()) {
             Some(a) => a,
             None => return ApiResponse::error(400, "account is required"),
@@ -2409,6 +3226,17 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "calendar update",
+            &[
+                "account", "id", "subject", "start", "end", "tz", "location", "body", "all_day",
+            ],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -2429,6 +3257,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "calendar delete", &["account", "id"])
+        {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -2447,6 +3281,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "calendar respond",
+            &["account", "id", "response", "comment"],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -2571,6 +3414,46 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "contact create",
+            &[
+                "account",
+                "given",
+                "surname",
+                "display_name",
+                "nickname",
+                "title",
+                "company",
+                "job",
+                "department",
+                "mobile",
+                "notes",
+                "birthday",
+                "email",
+                "business_phone",
+                "home_phone",
+                "business_street",
+                "business_city",
+                "business_state",
+                "business_zip",
+                "business_country",
+                "home_street",
+                "home_city",
+                "home_state",
+                "home_zip",
+                "home_country",
+                "other_street",
+                "other_city",
+                "other_state",
+                "other_zip",
+                "other_country",
+            ],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let account = match req.q("account").filter(|a| !a.is_empty()) {
             Some(a) => a,
             None => return ApiResponse::error(400, "account is required"),
@@ -2597,6 +3480,47 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "contact update",
+            &[
+                "account",
+                "id",
+                "given",
+                "surname",
+                "display_name",
+                "nickname",
+                "title",
+                "company",
+                "job",
+                "department",
+                "mobile",
+                "notes",
+                "birthday",
+                "email",
+                "business_phone",
+                "home_phone",
+                "business_street",
+                "business_city",
+                "business_state",
+                "business_zip",
+                "business_country",
+                "home_street",
+                "home_city",
+                "home_state",
+                "home_zip",
+                "home_country",
+                "other_street",
+                "other_city",
+                "other_state",
+                "other_zip",
+                "other_country",
+            ],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -2617,6 +3541,11 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "contact delete", &["account", "id"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -2725,6 +3654,27 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "todo create",
+            &[
+                "account",
+                "list",
+                "title",
+                "body",
+                "importance",
+                "status",
+                "due",
+                "start",
+                "reminder",
+                "tz",
+                "categories",
+            ],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, list) = match Self::todo_acc_list(req) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2754,6 +3704,28 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "todo update",
+            &[
+                "account",
+                "list",
+                "id",
+                "title",
+                "body",
+                "importance",
+                "status",
+                "due",
+                "start",
+                "reminder",
+                "tz",
+                "categories",
+            ],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, list) = match Self::todo_acc_list(req) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2775,6 +3747,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "todo complete", &["account", "list", "id"]) {
+                Ok(req) => req,
+                Err(e) => return e,
+            };
+        let req = &parsed;
         let (account, list) = match Self::todo_acc_list(req) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2795,6 +3773,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "todo delete", &["account", "list", "id"]) {
+                Ok(req) => req,
+                Err(e) => return e,
+            };
+        let req = &parsed;
         let (account, list) = match Self::todo_acc_list(req) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2818,6 +3802,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "todo checklist add",
+            &["account", "list", "task", "title"],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, list) = match Self::todo_acc_list(req) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2851,6 +3844,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "todo checklist toggle",
+            &["account", "list", "task", "item", "checked"],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, list) = match Self::todo_acc_list(req) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2875,6 +3877,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "todo checklist delete",
+            &["account", "list", "task", "item"],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, list) = match Self::todo_acc_list(req) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2898,6 +3909,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "todo list create", &["account", "name"]) {
+                Ok(req) => req,
+                Err(e) => return e,
+            };
+        let req = &parsed;
         let (account, name) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("name").filter(|n| !n.is_empty()),
@@ -2927,6 +3944,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "todo list delete", &["account", "id"])
+        {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -2974,17 +3997,13 @@ impl Router {
 
     /// Build a minimal, well-formed OneNote page HTML from the request's `title` +
     /// `body` (both HTML-escaped; body newlines become paragraph breaks).
-    fn page_html_from_req(req: &ApiRequest) -> Vec<u8> {
+    fn page_html(title: &str, body: &str) -> Vec<u8> {
         let esc = |s: &str| {
             s.replace('&', "&amp;")
                 .replace('<', "&lt;")
                 .replace('>', "&gt;")
         };
-        let title = req
-            .q("title")
-            .filter(|t| !t.is_empty())
-            .unwrap_or("Untitled");
-        let body = req.q("body").unwrap_or("");
+        let title = if title.is_empty() { "Untitled" } else { title };
         let body_html = esc(body).replace('\n', "</p><p>");
         format!(
             "<!DOCTYPE html><html><head><title>{}</title></head><body><p>{}</p></body></html>",
@@ -2999,22 +4018,30 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let (account, section) = match (
-            req.q("account").filter(|a| !a.is_empty()),
-            req.q("section").filter(|s| !s.is_empty()),
-        ) {
-            (Some(a), Some(s)) => (a, s),
-            _ => return ApiResponse::error(400, "account and section are required"),
-        };
-        let html = Self::page_html_from_req(req);
-        match h.create(account, section, &html) {
+        let request: OneNoteCreateRequest =
+            match parse_agent_strict_json_with_limit(req, "OneNote create", 64 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || request.account.is_empty()
+            || request.section.is_empty()
+        {
+            return ApiResponse::error(400, "invalid OneNote create request");
+        }
+        let html = Self::page_html(&request.title, &request.body);
+        match h.create(&request.account, &request.section, &html) {
             Ok(id) => {
-                let _ = self.audit_account(account, "audit:onenote", "ok", "create");
+                let _ = self.audit_account(&request.account, "audit:onenote", "ok", "create");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
             Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:onenote", "error", &format!("create: {e}"));
+                let _ = self.audit_account(
+                    &request.account,
+                    "audit:onenote",
+                    "error",
+                    &format!("create: {e}"),
+                );
                 ApiResponse::error(500, &e)
             }
         }
@@ -3025,6 +4052,11 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "OneNote delete", &["account", "id"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3043,18 +4075,22 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let (account, id, text) = match (
-            req.q("account").filter(|a| !a.is_empty()),
-            req.q("id").filter(|i| !i.is_empty()),
-            req.q("text").filter(|t| !t.is_empty()),
-        ) {
-            (Some(a), Some(i), Some(t)) => (a, i, t),
-            _ => return ApiResponse::error(400, "account, id and text are required"),
-        };
+        let request: OneNoteAppendRequest =
+            match parse_agent_strict_json_with_limit(req, "OneNote append", 64 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || request.account.is_empty()
+            || request.id.is_empty()
+            || request.text.is_empty()
+        {
+            return ApiResponse::error(400, "invalid OneNote append request");
+        }
         self.onenote_result(
-            account,
-            &format!("append id={id}"),
-            h.append(account, id, text),
+            &request.account,
+            &format!("append id={}", request.id),
+            h.append(&request.account, &request.id, &request.text),
         )
     }
 
@@ -3073,6 +4109,150 @@ impl Router {
             ));
         }
         Ok(h)
+    }
+
+    fn mutation_intent_gate(
+        &self,
+        req: &ApiRequest,
+    ) -> Result<(&std::sync::Arc<dyn MutationIntentHandler>, String), ApiResponse> {
+        let handler = self.mutation_intents.as_ref().ok_or_else(|| {
+            ApiResponse::error(404, "mutation intents are not enabled on this server")
+        })?;
+        if !Self::cap_ok(&self.mutation_intent_cap_token, req) {
+            return Err(ApiResponse::error(
+                401,
+                "missing or invalid capability token",
+            ));
+        }
+        let owner = req
+            .session_token
+            .as_deref()
+            .filter(|owner| !owner.is_empty())
+            .ok_or_else(|| ApiResponse::error(401, "session token required"))?;
+        Ok((handler, owner.to_owned()))
+    }
+
+    fn mutation_intent_create(&self, req: &ApiRequest) -> ApiResponse {
+        let (handler, owner) = match self.mutation_intent_gate(req) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let request: MutationIntentCreateRequest =
+            match parse_agent_strict_json_with_limit(req, "mutation intent create", 16 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !request.purpose.is_valid()
+            || !valid_sha256(&request.sha256)
+        {
+            return ApiResponse::error(400, "invalid mutation intent request");
+        }
+        if self.biometric_gate && req.storage_not_low != Some(true) {
+            return ApiResponse::error(507, "mutation_intent_insufficient_storage");
+        }
+        let (op, account, service, item) = request.purpose.confirmation_binding();
+        if let Some(response) = self.biometric_challenge(op, account, service, &item, req) {
+            return response;
+        }
+        match handler.create(MutationIntentCreate {
+            request_id: request.request_id,
+            owner,
+            purpose: request.purpose,
+            total_bytes: request.total_bytes,
+            sha256: request.sha256,
+        }) {
+            Ok(info) => ApiResponse::ok_json(&json!({
+                "intent_id": info.intent_id,
+                "chunk_bytes": info.chunk_bytes,
+                "expires_at_ms": info.expires_at_ms,
+            })),
+            Err(error) => mutation_error_response(&error),
+        }
+    }
+
+    fn mutation_intent_chunk(&self, req: &ApiRequest) -> ApiResponse {
+        use base64::Engine as _;
+        let (handler, owner) = match self.mutation_intent_gate(req) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let request: MutationIntentChunkRequest =
+            match parse_agent_strict_json_with_limit(req, "mutation intent chunk", 16 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.intent_id)
+            || !valid_sha256(&request.chunk_sha256)
+        {
+            return ApiResponse::error(400, "invalid mutation chunk request");
+        }
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(&request.data_base64) {
+            Ok(bytes) if bytes.len() <= MUTATION_CHUNK_BYTES => bytes,
+            _ => return ApiResponse::error(400, "invalid mutation chunk request"),
+        };
+        match handler.put_chunk(MutationIntentChunk {
+            owner,
+            request_id: request.request_id,
+            intent_id: request.intent_id,
+            index: request.index,
+            offset: request.offset,
+            chunk_sha256: request.chunk_sha256,
+            bytes,
+        }) {
+            Ok(()) => ApiResponse::ok_json(&json!({ "stored": true })),
+            Err(error) => mutation_error_response(&error),
+        }
+    }
+
+    fn mutation_intent_commit(&self, req: &ApiRequest) -> ApiResponse {
+        let (handler, owner) = match self.mutation_intent_gate(req) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let request: MutationIntentCommitRequest =
+            match parse_agent_strict_json_with_limit(req, "mutation intent commit", 16 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.intent_id)
+            || !valid_sha256(&request.sha256)
+        {
+            return ApiResponse::error(400, "invalid mutation commit request");
+        }
+        match handler.commit(
+            &owner,
+            &request.request_id,
+            &request.intent_id,
+            request.total_bytes,
+            &request.sha256,
+        ) {
+            Ok(result) => ApiResponse::ok_json(&result),
+            Err(error) => mutation_error_response(&error),
+        }
+    }
+
+    fn mutation_intent_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let (handler, owner) = match self.mutation_intent_gate(req) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let request: MutationIntentCancelRequest =
+            match parse_agent_strict_json_with_limit(req, "mutation intent cancel", 16 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.intent_id)
+        {
+            return ApiResponse::error(400, "invalid mutation cancel request");
+        }
+        match handler.cancel(&owner, &request.request_id, &request.intent_id) {
+            Ok(()) => ApiResponse::ok_json(&json!({ "cancelled": true })),
+            Err(error) => mutation_error_response(&error),
+        }
     }
 
     /// Audit + map a unit OneDrive cloud-write result.
@@ -3095,6 +4275,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "OneDrive create",
+            &["account", "parent", "name"],
+        ) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, name) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("name").filter(|n| !n.is_empty()),
@@ -3122,6 +4311,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "OneDrive rename",
+            &["account", "id", "name"],
+        ) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, id, name) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3142,6 +4340,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "OneDrive move",
+            &["account", "id", "parent", "name"],
+        ) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, id, name) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3192,6 +4399,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "OneDrive delete", &["account", "id"])
+        {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3204,63 +4417,6 @@ impl Router {
             return r;
         }
         self.onedrive_result(account, &format!("delete id={id}"), h.delete(account, id))
-    }
-
-    /// #657: upload a new file into a folder. The picked bytes ride in the request body
-    /// (base64 over the mobile bridge, decoded in serve.rs). Cap-gated; biometric-gated on
-    /// mobile (large external write). An empty/absent parent = the drive root.
-    fn onedrive_upload(&self, req: &ApiRequest) -> ApiResponse {
-        let h = match self.onedrive_gate(req) {
-            Ok(h) => h,
-            Err(e) => return e,
-        };
-        let (account, name) = match (
-            req.q("account").filter(|a| !a.is_empty()),
-            req.q("name").filter(|n| !n.is_empty()),
-        ) {
-            (Some(a), Some(n)) => (a, n),
-            _ => return ApiResponse::error(400, "account and name are required"),
-        };
-        let parent = req.q("parent").unwrap_or("");
-        if let Some(r) = self.biometric_challenge("upload", account, "onedrive", name, req) {
-            return r;
-        }
-        match h.upload(account, parent, name, &req.body) {
-            Ok(id) => {
-                let _ = self.audit_account(account, "audit:onedrive", "ok", "upload");
-                ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
-            }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:onedrive", "error", &format!("upload: {e}"));
-                ApiResponse::error(500, &e)
-            }
-        }
-    }
-
-    /// #657: replace an existing file's content (If-Match `etag` from the listing; a 412 conflict
-    /// must never clobber). The bytes ride in the request body. Cap-gated; biometric-gated on mobile.
-    fn onedrive_replace(&self, req: &ApiRequest) -> ApiResponse {
-        let h = match self.onedrive_gate(req) {
-            Ok(h) => h,
-            Err(e) => return e,
-        };
-        let (account, id, etag) = match (
-            req.q("account").filter(|a| !a.is_empty()),
-            req.q("id").filter(|i| !i.is_empty()),
-            req.q("etag").filter(|e| !e.is_empty()),
-        ) {
-            (Some(a), Some(i), Some(e)) => (a, i, e),
-            _ => return ApiResponse::error(400, "account, id and etag are required"),
-        };
-        if let Some(r) = self.biometric_challenge("replace", account, "onedrive", id, req) {
-            return r;
-        }
-        self.onedrive_result(
-            account,
-            &format!("replace id={id}"),
-            h.replace(account, id, etag, &req.body),
-        )
     }
 
     /// Cap-gate the OneDrive management handler (#659), like [`onedrive_gate`] for the write verbs.
@@ -3287,6 +4443,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "OneDrive free up", &["account", "id"])
+        {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3319,6 +4481,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "OneDrive download now", &["account", "id"]) {
+                Ok(parsed) => parsed,
+                Err(response) => return response,
+            };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3374,6 +4542,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "OneDrive conflict resolve",
+            &["account", "id", "resolution"],
+        ) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, id, resolution) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3411,6 +4588,11 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "OneDrive cleanup", &["account"]) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let account = match req.q("account").filter(|a| !a.is_empty()) {
             Some(a) => a,
             None => return ApiResponse::error(400, "account is required"),
@@ -3441,28 +4623,36 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let account = match req.q("account").filter(|a| !a.is_empty()) {
-            Some(a) => a,
-            None => return ApiResponse::error(400, "account is required"),
-        };
-        let to = Self::addr_list(req.q("to"));
-        if to.is_empty() {
+        let request: MailSendRequest =
+            match parse_agent_strict_json_with_limit(req, "mail send", 64 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || request.account.is_empty()
+            || request.to.is_empty()
+        {
             return ApiResponse::error(400, "at least one recipient (to) is required");
         }
-        let (cc, bcc) = (Self::addr_list(req.q("cc")), Self::addr_list(req.q("bcc")));
-        let importance = req.q("importance").filter(|i| !i.is_empty());
-        let request_read_receipt = req.q("read_receipt") == Some("1");
+        let importance = request
+            .importance
+            .as_deref()
+            .filter(|value| !value.is_empty());
         let r = h.send(
-            account,
-            req.q("subject").unwrap_or(""),
-            req.q("body").unwrap_or(""),
-            &to,
-            &cc,
-            &bcc,
+            &request.account,
+            &request.subject,
+            &request.body,
+            &request.to,
+            &request.cc,
+            &request.bcc,
             importance,
-            request_read_receipt,
+            request.read_receipt,
         );
-        self.mail_result(account, &format!("send to={}", to.len()), r)
+        self.mail_result(
+            &request.account,
+            &format!("send to={}", request.to.len()),
+            r,
+        )
     }
 
     fn mail_reply(&self, req: &ApiRequest) -> ApiResponse {
@@ -3470,21 +4660,27 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let (account, id) = match (
-            req.q("account").filter(|a| !a.is_empty()),
-            req.q("id").filter(|i| !i.is_empty()),
-        ) {
-            (Some(a), Some(i)) => (a, i),
-            _ => return ApiResponse::error(400, "account and id are required"),
+        let request: MailReplyRequest =
+            match parse_agent_strict_json_with_limit(req, "mail reply", 64 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || request.account.is_empty()
+            || request.id.is_empty()
+        {
+            return ApiResponse::error(400, "invalid mail reply request");
+        }
+        let r = if request.body.is_empty() {
+            h.reply(&request.account, &request.id, &request.comment, request.all)
+        } else {
+            h.reply_html(&request.account, &request.id, &request.body, request.all)
         };
-        let all = req.q("all") == Some("1");
-        // `body` (full HTML from the inline composer) takes the rich path; the
-        // plain-text `comment` path stays as a fallback.
-        let r = match req.q("body").filter(|b| !b.is_empty()) {
-            Some(body) => h.reply_html(account, id, body, all),
-            None => h.reply(account, id, req.q("comment").unwrap_or(""), all),
-        };
-        self.mail_result(account, &format!("reply id={id} all={all}"), r)
+        self.mail_result(
+            &request.account,
+            &format!("reply id={} all={}", request.id, request.all),
+            r,
+        )
     }
 
     fn mail_forward(&self, req: &ApiRequest) -> ApiResponse {
@@ -3492,22 +4688,28 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let (account, id) = match (
-            req.q("account").filter(|a| !a.is_empty()),
-            req.q("id").filter(|i| !i.is_empty()),
-        ) {
-            (Some(a), Some(i)) => (a, i),
-            _ => return ApiResponse::error(400, "account and id are required"),
-        };
-        let to = Self::addr_list(req.q("to"));
-        if to.is_empty() {
+        let request: MailForwardRequest =
+            match parse_agent_strict_json_with_limit(req, "mail forward", 64 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || request.account.is_empty()
+            || request.id.is_empty()
+            || request.to.is_empty()
+        {
             return ApiResponse::error(400, "at least one recipient (to) is required");
         }
-        let r = match req.q("body").filter(|b| !b.is_empty()) {
-            Some(body) => h.forward_html(account, id, body, &to),
-            None => h.forward(account, id, req.q("comment").unwrap_or(""), &to),
+        let r = if request.body.is_empty() {
+            h.forward(&request.account, &request.id, &request.comment, &request.to)
+        } else {
+            h.forward_html(&request.account, &request.id, &request.body, &request.to)
         };
-        self.mail_result(account, &format!("forward id={id} to={}", to.len()), r)
+        self.mail_result(
+            &request.account,
+            &format!("forward id={} to={}", request.id, request.to.len()),
+            r,
+        )
     }
 
     fn mail_move(&self, req: &ApiRequest) -> ApiResponse {
@@ -3515,6 +4717,13 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "mail move", &["account", "id", "destination"])
+            {
+                Ok(parsed) => parsed,
+                Err(response) => return response,
+            };
+        let req = &parsed;
         let (account, id, dest) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3545,6 +4754,12 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed =
+            match parse_strict_scalar_mutation(req, "mail read", &["account", "id", "is_read"]) {
+                Ok(parsed) => parsed,
+                Err(response) => return response,
+            };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3562,6 +4777,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "mail flag",
+            &["account", "id", "status", "due", "tz"],
+        ) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3591,6 +4815,15 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "mail categories",
+            &["account", "id", "categories"],
+        ) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, id) = match (
             req.q("account").filter(|a| !a.is_empty()),
             req.q("id").filter(|i| !i.is_empty()),
@@ -3622,28 +4855,31 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let account = match req.q("account").filter(|a| !a.is_empty()) {
-            Some(a) => a,
-            None => return ApiResponse::error(400, "account is required"),
-        };
-        if let Some(id) = req.q("id").filter(|i| !i.is_empty()) {
-            let r = h.send_draft(account, id);
-            return self.mail_result(account, &format!("send_draft id={id}"), r);
+        let request: MailDraftRequest =
+            match parse_agent_strict_json_with_limit(req, "mail draft", 64 * 1024) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+        if !valid_client_request_id(&request.request_id) || request.account.is_empty() {
+            return ApiResponse::error(400, "invalid mail draft request");
         }
-        let to = Self::addr_list(req.q("to"));
+        if let Some(id) = request.id.as_deref().filter(|id| !id.is_empty()) {
+            let r = h.send_draft(&request.account, id);
+            return self.mail_result(&request.account, &format!("send_draft id={id}"), r);
+        }
         match h.create_draft(
-            account,
-            req.q("subject").unwrap_or(""),
-            req.q("body").unwrap_or(""),
-            &to,
+            &request.account,
+            &request.subject,
+            &request.body,
+            &request.to,
         ) {
             Ok(draft_id) => {
-                let _ = self.audit_account(account, "audit:mail", "ok", "create_draft");
+                let _ = self.audit_account(&request.account, "audit:mail", "ok", "create_draft");
                 ApiResponse::ok_json(&json!({ "draft_id": draft_id }))
             }
             Err(e) => {
                 let _ = self.audit_account(
-                    account,
+                    &request.account,
                     "audit:mail",
                     "error",
                     &format!("create_draft: {e}"),
@@ -3653,8 +4889,8 @@ impl Router {
         }
     }
 
-    /// `POST /api/v1/restore?account&service&id` — re-create an archived item in the
-    /// cloud. Requires the capability token; the actual work is the injected handler.
+    /// `POST /api/v1/restore` — re-create an archived item in the cloud from a strict
+    /// JSON request. Requires the capability token; the actual work is the injected handler.
     fn restore(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match &self.restore {
             Some(h) => h,
@@ -3663,6 +4899,12 @@ impl Router {
         if !Self::cap_ok(&self.restore_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed =
+            match parse_strict_scalar_mutation(req, "restore", &["account", "service", "id"]) {
+                Ok(req) => req,
+                Err(e) => return e,
+            };
+        let req = &parsed;
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) if !a.is_empty() && !s.is_empty() && !i.is_empty() => {
                 (a, s, i)
@@ -3727,9 +4969,9 @@ impl Router {
         }
     }
 
-    /// `POST /api/v1/backup?account[&services=mail,calendar]` — enqueue a durable
-    /// mobile backup job. Requires its own capability token and, on mobile, a
-    /// per-action biometric token. The handler must not run the backup inline.
+    /// `POST /api/v1/backup` — enqueue a durable mobile backup job from a strict JSON
+    /// request. Requires its own capability token and, on mobile, a per-action biometric
+    /// token. The handler must not run the backup inline.
     fn backup(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match &self.backup {
             Some(h) => h,
@@ -3738,6 +4980,11 @@ impl Router {
         if !Self::cap_ok(&self.backup_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed = match parse_strict_scalar_mutation(req, "backup", &["account", "services"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let account = match req.q("account").filter(|a| !a.is_empty()) {
             Some(a) => a,
             None => return ApiResponse::error(400, "account is required"),
@@ -3819,6 +5066,11 @@ impl Router {
         if !Self::cap_ok(&self.verify_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed = match parse_strict_scalar_mutation(req, "verify", &["account"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let account = match req.q("account") {
             Some(a) if !a.is_empty() => a,
             _ => return ApiResponse::error(400, "account is required"),
@@ -3851,6 +5103,15 @@ impl Router {
         if !Self::cap_ok(&self.share_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "share",
+            &["account", "service", "id", "type", "scope", "email", "role"],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) if !a.is_empty() && !s.is_empty() && !i.is_empty() => {
                 (a, s, i)
@@ -3958,6 +5219,9 @@ impl Router {
         };
         if !Self::cap_ok(&self.sync_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
+        }
+        if let Err(e) = parse_strict_scalar_mutation(req, "sync command", &[]) {
+            return e;
         }
         apply(control.as_ref());
         ApiResponse::ok_json(&json!({ "paused": control.is_paused() }))
@@ -4112,6 +5376,11 @@ impl Router {
         if !Self::cap_ok(&self.transfer_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed = match parse_strict_scalar_mutation(req, "transfer cancel", &["id"]) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let id = match req.q("id") {
             Some(i) if !i.is_empty() => i,
             _ => return ApiResponse::error(400, "id is required"),
@@ -4129,6 +5398,11 @@ impl Router {
         if !Self::cap_ok(&self.transfer_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed = match parse_strict_scalar_mutation(req, "transfer pause", &["id"]) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let id = match req.q("id") {
             Some(i) if !i.is_empty() => i,
             _ => return ApiResponse::error(400, "id is required"),
@@ -4147,6 +5421,11 @@ impl Router {
         if !Self::cap_ok(&self.transfer_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed = match parse_strict_scalar_mutation(req, "transfer retry", &["id"]) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let id = match req.q("id") {
             Some(i) if !i.is_empty() => i,
             _ => return ApiResponse::error(400, "id is required"),
@@ -4216,6 +5495,15 @@ impl Router {
         if !Self::cap_ok(&self.onedrive_mode_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "OneDrive mode",
+            &["account", "folder", "mode"],
+        ) {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
         let (account, folder) = match (req.q("account"), req.q("folder")) {
             (Some(a), Some(f)) if !a.is_empty() && !f.is_empty() => (a, f),
             _ => return ApiResponse::error(400, "account and folder are required"),
@@ -4465,6 +5753,11 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "account login start", &["account"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let account = match req.q("account") {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
@@ -4480,6 +5773,11 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "account login poll", &["id"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let id = match req.q("id") {
             Some(i) => i,
             None => return ApiResponse::error(400, "missing 'id'"),
@@ -4492,6 +5790,11 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        let parsed = match parse_strict_scalar_mutation(req, "account signout", &["account"]) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let req = &parsed;
         let account = match req.q("account") {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
@@ -4524,11 +5827,14 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let token = match req.q("token") {
-            Some(t) if !t.is_empty() => t,
-            _ => return ApiResponse::error(400, "missing 'token'"),
+        let request: PushRegisterRequest = match parse_agent_strict_json(req, "push register") {
+            Ok(request) => request,
+            Err(response) => return response,
         };
-        match h.register(token) {
+        if !valid_client_request_id(&request.request_id) || request.token.is_empty() {
+            return ApiResponse::error(400, "invalid push register request");
+        }
+        match h.register(&request.token) {
             Ok(()) => ApiResponse::ok_json(&json!({ "registered": true })),
             Err(e) => ApiResponse::error(500, &e),
         }
@@ -4564,21 +5870,329 @@ impl Router {
         Ok(handler)
     }
 
+    fn agent_session_create(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentSessionCreateRequest =
+            match parse_agent_strict_json(req, "session create") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || request
+                .display_name
+                .as_ref()
+                .is_some_and(|name| name.is_empty() || name.len() > 128)
+        {
+            return no_store_json_error(400, "invalid session create request");
+        }
+        match handler.session_create(&request.request_id, request.display_name.as_deref()) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_select(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentSessionSelectRequest =
+            match parse_agent_strict_json(req, "session select") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+        {
+            return no_store_json_error(400, "invalid session select request");
+        }
+        match handler.session_select(&request.request_id, &request.session_id) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_list(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let cursor = req.q("cursor");
+        if cursor.is_some_and(|value| value.is_empty() || value.len() > 512) {
+            return no_store_json_error(400, "invalid session list cursor");
+        }
+        let limit = match parse_bounded_page_limit(req.q("limit")) {
+            Ok(limit) => limit,
+            Err(error) => return error,
+        };
+        match handler.session_list(cursor, limit) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_history(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let Some(session_id) = req.q("session_id").filter(|id| valid_opaque_agent_id(id)) else {
+            return no_store_json_error(400, "invalid session history request");
+        };
+        let cursor = req.q("cursor");
+        if cursor.is_some_and(|value| value.is_empty() || value.len() > 512) {
+            return no_store_json_error(400, "invalid session history cursor");
+        }
+        let limit = match parse_bounded_page_limit(req.q("limit")) {
+            Ok(limit) => limit,
+            Err(error) => return error,
+        };
+        match handler.session_history(session_id, cursor, limit) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_archive(&self, req: &ApiRequest) -> ApiResponse {
+        self.agent_session_operation(req, "session archive", |handler, request| {
+            handler.session_archive(request)
+        })
+    }
+
+    fn agent_user_presence_start(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentUserPresenceStartRequest =
+            match parse_agent_strict_json(req, "user presence start") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        let binding_matches = matches!(
+            (&*request.kind, &request.binding),
+            (
+                "session_archive",
+                AgentUserPresenceBinding::SessionArchive(AgentSessionArchiveBinding {
+                    session_id
+                })
+            ) if valid_opaque_agent_id(session_id)
+        ) || matches!(
+            (&*request.kind, &request.binding),
+            (
+                "session_pairing_reveal",
+                AgentUserPresenceBinding::SessionPairingReveal(
+                    AgentSessionPairingRevealBinding { session_id, pair_id }
+                )
+            ) if valid_opaque_agent_id(session_id) && valid_opaque_agent_id(pair_id)
+        ) || matches!(
+            (&*request.kind, &request.binding),
+            (
+                "session_pairing_import",
+                AgentUserPresenceBinding::SessionPairingImport(
+                    AgentSessionPairingImportBinding { pairing_code }
+                )
+            ) if pairing_code.len() == 81 && pairing_code.is_ascii()
+        );
+        if !valid_client_request_id(&request.request_id) || !binding_matches {
+            return no_store_json_error(400, "invalid user presence request");
+        }
+        match handler.user_presence_start(request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_user_presence_confirm(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentUserPresenceConfirmRequest =
+            match parse_agent_strict_json(req, "user presence confirm") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.operation_id)
+            || !valid_opaque_agent_id(&request.intent_id)
+            || request.token.is_empty()
+            || request.token.len() > 128
+            || request.action_hash.len() != 64
+        {
+            return no_store_json_error(400, "invalid user presence confirmation");
+        }
+        if let Some(response) = self.biometric_challenge(
+            "user-presence",
+            "agent",
+            "agent",
+            &request.operation_id,
+            req,
+        ) {
+            return with_no_store(response);
+        }
+        match handler.user_presence_confirm(request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_pairing_create(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentSessionPairingCreateRequest =
+            match parse_agent_strict_json(req, "session pairing create") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+        {
+            return no_store_json_error(400, "invalid session pairing create request");
+        }
+        match handler.session_pairing_create(request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_pairing_reveal(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentSessionPairingOperationRequest =
+            match parse_agent_strict_json(req, "session pairing reveal") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.operation_id)
+        {
+            return no_store_json_error(400, "invalid session pairing reveal request");
+        }
+        match handler.session_pairing_reveal(request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_pairing_claim(&self, req: &ApiRequest) -> ApiResponse {
+        self.agent_session_pairing_operation(req, "session pairing claim", |handler, request| {
+            handler.session_pairing_claim(request)
+        })
+    }
+
+    fn agent_session_pairing_finalize(&self, req: &ApiRequest) -> ApiResponse {
+        self.agent_session_pairing_operation(req, "session pairing finalize", |handler, request| {
+            handler.session_pairing_finalize(request)
+        })
+    }
+
+    fn agent_session_pairing_revoke(&self, req: &ApiRequest) -> ApiResponse {
+        self.agent_session_pairing_operation(req, "session pairing revoke", |handler, request| {
+            handler.session_pairing_revoke(request)
+        })
+    }
+
+    fn agent_session_pairing_operation<F>(
+        &self,
+        req: &ApiRequest,
+        label: &str,
+        operation: F,
+    ) -> ApiResponse
+    where
+        F: FnOnce(
+            &dyn AgentHandler,
+            AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String>,
+    {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentSessionPairingOperationRequest = match parse_agent_strict_json(req, label)
+        {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.operation_id)
+        {
+            return no_store_json_error(400, "invalid session pairing operation");
+        }
+        match operation(handler.as_ref(), request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_session_operation<F>(&self, req: &ApiRequest, label: &str, operation: F) -> ApiResponse
+    where
+        F: FnOnce(
+            &dyn AgentHandler,
+            AgentSessionArchiveRequest,
+        ) -> Result<serde_json::Value, String>,
+    {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentSessionArchiveRequest = match parse_agent_strict_json(req, label) {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.operation_id)
+        {
+            return no_store_json_error(400, "invalid session operation");
+        }
+        match operation(handler.as_ref(), request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
     /// Start an agent turn; the client streams it from `/api/v1/agent/stream?turn=<id>`.
     fn agent_turn(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
-        let (account, prompt) = match (req.q("account"), req.q("prompt")) {
-            (Some(a), Some(p)) if !a.is_empty() && !p.is_empty() => (a, p),
-            _ => return ApiResponse::error(400, "account and prompt are required"),
+        let request: AgentTurnRequest = match parse_agent_strict_json_with_limit(
+            req,
+            "agent turn",
+            AGENT_TURN_JSON_MAX_BYTES,
+        ) {
+            Ok(request) => request,
+            Err(error) => return error,
         };
-        match handler.start_turn(account, prompt) {
-            Ok(turn_id) => ApiResponse::ok_json(&json!({ "turn": turn_id })),
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.account.len() > 128
+            || request.prompt.is_empty()
+            || request.prompt.len() > 32 * 1024
+        {
+            return no_store_json_error(400, "invalid agent turn request");
+        }
+        match handler.start_turn_request(request) {
+            Ok(turn_id) => with_no_store(ApiResponse::ok_json(&json!({ "turn": turn_id }))),
             // #639: a host-verified not-ready product turn is a closed 409, not a blanket 500.
-            Err(e) if e == "product_not_ready" => ApiResponse::error(409, &e),
-            Err(e) => ApiResponse::error(500, &e),
+            Err(e)
+                if matches!(
+                    e.as_str(),
+                    "product_not_ready" | "provider_busy" | "session_busy" | "request_id_conflict"
+                ) =>
+            {
+                no_store_json_error(409, &e)
+            }
+            Err(e) => no_store_json_error(agent_session_error_status(&e), &e),
         }
     }
 
@@ -4588,17 +6202,21 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let (pending, token, action_hash) =
-            match (req.q("pending"), req.q("token"), req.q("action_hash")) {
-                (Some(i), Some(t), Some(h)) if !i.is_empty() && !t.is_empty() && !h.is_empty() => {
-                    (i, t, h)
-                }
-                _ => {
-                    return ApiResponse::error(400, "pending, token, and action_hash are required")
-                }
-            };
+        let request: AgentConfirmRequest = match parse_agent_strict_json(req, "agent confirm") {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.pending)
+            || request.token.is_empty()
+            || request.token.len() > 512
+            || request.action_hash.is_empty()
+            || request.action_hash.len() > 128
+        {
+            return no_store_json_error(400, "invalid agent confirm request");
+        }
         if self.biometric_gate {
-            let binding = match handler.pending_binding(pending, action_hash) {
+            let binding = match handler.pending_binding(&request.pending, &request.action_hash) {
                 Ok(binding) => binding,
                 Err(e) => return ApiResponse::error(agent_confirm_error_status(&e), &e),
             };
@@ -4612,26 +6230,72 @@ impl Router {
                 return r;
             }
         }
-        match handler.confirm(pending, token, action_hash) {
+        match handler.confirm(&request.pending, &request.token, &request.action_hash) {
             Ok(summary) => {
-                ApiResponse::ok_json(&json!({ "confirmed": pending, "result": summary }))
+                ApiResponse::ok_json(&json!({ "confirmed": request.pending, "result": summary }))
             }
             Err(e) => ApiResponse::error(agent_confirm_error_status(&e), &e),
         }
     }
 
-    /// Cancel an in-flight agent turn.
-    fn agent_cancel(&self, req: &ApiRequest) -> ApiResponse {
+    /// Cancel an in-flight agent turn. Cancellation is strict JSON and never
+    /// multiplexed with pending-action cancellation.
+    fn agent_turn_cancel(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
-            Err(e) => return e,
+            Err(e) => return with_no_store(e),
         };
-        let turn = match req.q("turn") {
-            Some(t) if !t.is_empty() => t,
-            _ => return ApiResponse::error(400, "turn is required"),
+        let request: AgentTurnCancelRequest = match parse_agent_strict_json_with_limit(
+            req,
+            "agent turn cancel",
+            AGENT_STRICT_JSON_MAX_BYTES,
+        ) {
+            Ok(request) => request,
+            Err(error) => return error,
         };
-        handler.cancel(turn);
-        ApiResponse::ok_json(&json!({ "cancelled": turn }))
+        if !valid_client_request_id(&request.request_id) || !valid_opaque_agent_id(&request.turn_id)
+        {
+            return no_store_json_error(400, "invalid agent turn cancel request");
+        }
+        match handler.cancel_turn(&request.turn_id) {
+            Ok(()) => with_no_store(ApiResponse::ok_json(&json!({
+                "state": "cancel_requested",
+                "turn_id": request.turn_id,
+            }))),
+            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+        }
+    }
+
+    fn agent_pending_cancel(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(h) => h,
+            Err(e) => return with_no_store(e),
+        };
+        let request: AgentPendingCancelRequest = match parse_agent_strict_json_with_limit(
+            req,
+            "agent pending cancel",
+            AGENT_STRICT_JSON_MAX_BYTES,
+        ) {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.pending)
+            || request.action_hash.len() != 64
+            || !request
+                .action_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return no_store_json_error(400, "invalid agent pending cancel request");
+        }
+        match handler.cancel_pending(&request.pending, &request.action_hash) {
+            Ok(()) => with_no_store(ApiResponse::ok_json(&json!({
+                "state": "cancelled",
+                "pending": request.pending,
+            }))),
+            Err(error) => no_store_json_error(agent_confirm_error_status(&error), &error),
+        }
     }
 
     /// Run a bounded, redacted connectivity preflight. This is deliberately the only
@@ -4908,19 +6572,28 @@ impl Router {
     }
 
     /// Set the active provider + model from the in-app switcher (S-AG.6). Cap + session
-    /// gated; `provider` and `model` come as query params.
+    /// gated; the closed provider/model selection is carried only in strict JSON.
     fn agent_set_model(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
             Err(e) => return e,
         };
-        let provider = req.q("provider").unwrap_or("");
-        let model = req.q("model").unwrap_or("");
-        if provider.is_empty() || model.is_empty() {
-            return ApiResponse::error(400, "provider and model are required");
+        let request: AgentModelRequest = match parse_agent_strict_json(req, "agent model") {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        if !valid_client_request_id(&request.request_id)
+            || agent_oauth_provider_param(&request.provider).is_err()
+            || request.model.is_empty()
+            || request.model.len() > 128
+        {
+            return no_store_json_error(400, "invalid agent model request");
         }
-        match handler.set_model(provider, model) {
-            Ok(_) => ApiResponse::ok_json(&json!({ "provider": provider, "model": model })),
+        match handler.set_model(&request.provider, &request.model) {
+            Ok(_) => ApiResponse::ok_json(&json!({
+                "provider": request.provider,
+                "model": request.model,
+            })),
             Err(e) => ApiResponse::error(400, &e),
         }
     }
@@ -6353,6 +8026,29 @@ mod tests {
     }
 
     #[test]
+    fn api_request_debug_redacts_query_body_cookie_and_all_authority_headers() {
+        let request = ApiRequest::new("POST", "/api/v1/agent/turn?prompt=query-secret")
+            .with_cap_token(Some("cap-secret".into()))
+            .with_session_token(Some("session-secret".into()))
+            .with_per_action_token(Some("action-secret".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(b"body-secret".to_vec());
+        let debug = format!("{request:?}");
+        for secret in [
+            "query-secret",
+            "cap-secret",
+            "session-secret",
+            "action-secret",
+            "body-secret",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}");
+        }
+        assert!(debug.contains("/api/v1/agent/turn"));
+        assert!(debug.contains("body_len: 11"));
+        assert!(debug.contains("has_query: true"));
+    }
+
+    #[test]
     fn onedrive_risk_action_items_are_canonical_json() {
         assert_eq!(
             serde_json::from_str::<Value>(&onedrive_move_pat_item("A:B", "P]1", "N:\"1")).unwrap(),
@@ -6438,6 +8134,40 @@ mod tests {
 
     fn body_json(resp: &ApiResponse) -> Value {
         serde_json::from_slice(&resp.body).unwrap()
+    }
+
+    fn strict_json_post(path: &str, body: Value, cap: Option<&str>) -> ApiRequest {
+        ApiRequest::new("POST", path)
+            .with_cap_token(cap.map(str::to_string))
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
+    fn strict_scalar_post_from_target(target: &str, cap: &str) -> ApiRequest {
+        let legacy_shape = ApiRequest::new("POST", target);
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "request_id".into(),
+            json!("123e4567-e89b-42d3-a456-426614174099"),
+        );
+        for (key, value) in legacy_shape.query {
+            body.insert(key, Value::String(value));
+        }
+        strict_json_post(&legacy_shape.path, Value::Object(body), Some(cap))
+    }
+
+    fn agent_confirm_request(action_hash: &str) -> ApiRequest {
+        strict_json_post(
+            "/api/v1/agent/confirm",
+            json!({
+                "request_id": "550e8400-e29b-41d4-a716-446655440010",
+                "pending": "p1",
+                "token": "right",
+                "action_hash": action_hash,
+            }),
+            Some("agentsecret"),
+        )
+        .with_session_token(Some("sess".into()))
     }
 
     #[test]
@@ -6754,8 +8484,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/onedrive/transfers/pause?id=t1",
             "/api/v1/onedrive/transfers/retry?id=t1",
         ] {
-            let resp =
-                router.route(&ApiRequest::new("POST", path).with_cap_token(Some("cap".into())));
+            let resp = router.route(&strict_scalar_post_from_target(path, "cap"));
             assert_eq!(
                 resp.status, 200,
                 "control POST must be served while the pass holds the gate: {path}"
@@ -6865,7 +8594,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             401
         );
         // correct token -> 200 + the new cloud id
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let ok = router.route(&strict_scalar_post_from_target(q, "secret"));
         assert_eq!(ok.status, 200);
         let body = body_json(&ok);
         assert_eq!(body["restored"], "x");
@@ -6873,8 +8602,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(body["new_id"], "new-cloud-id");
         assert!(body.get("queued").is_none());
         // valid token but missing params -> 400
-        let bad = ApiRequest::new("POST", "/api/v1/restore?account=a")
-            .with_cap_token(Some("secret".into()));
+        let bad = strict_scalar_post_from_target("/api/v1/restore?account=a", "secret");
         assert_eq!(router.route(&bad).status, 400);
     }
 
@@ -6885,7 +8613,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let router = router.with_restore(restore.clone(), "secret".into());
         let q = "/api/v1/restore?account=a&service=mail&id=x";
 
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let ok = router.route(&strict_scalar_post_from_target(q, "secret"));
 
         assert_eq!(ok.status, 200);
         let body = body_json(&ok);
@@ -6933,9 +8661,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_session_token("sess".into())
             .with_biometric_gate();
         let post = |path: &str| {
-            ApiRequest::new("POST", path)
-                .with_cap_token(Some("cap".into()))
-                .with_session_token(Some("sess".into()))
+            strict_scalar_post_from_target(path, "cap").with_session_token(Some("sess".into()))
         };
 
         let ch = mobile.route(&post("/api/v1/restore?account=a&service=mail&id=x"));
@@ -6952,9 +8678,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let pat = body["pending_action_id"].as_str().unwrap().to_string();
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/restore?account=a&service=mail&id=x&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/restore?account=a&service=mail&id=x")
+                        .with_per_action_token(Some(pat.clone()))
+                )
                 .status,
             403
         );
@@ -6970,9 +8697,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_session_token("sess".into())
             .with_biometric_gate();
         let post = |path: &str| {
-            ApiRequest::new("POST", path)
-                .with_cap_token(Some("cap".into()))
-                .with_session_token(Some("sess".into()))
+            strict_scalar_post_from_target(path, "cap").with_session_token(Some("sess".into()))
         };
 
         let ch = mobile.route(&post("/api/v1/restore?account=a&service=mail&id=x"));
@@ -6982,9 +8707,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .to_string();
         assert!(mobile.confirm_biometric(&pat));
 
-        let ok = mobile.route(&post(&format!(
-            "/api/v1/restore?account=a&service=mail&id=x&_pat={pat}"
-        )));
+        let ok = mobile.route(
+            &post("/api/v1/restore?account=a&service=mail&id=x").with_per_action_token(Some(pat)),
+        );
 
         assert_eq!(ok.status, 200);
         let body = body_json(&ok);
@@ -7010,15 +8735,18 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let backup = std::sync::Arc::new(RecordingBackup::default());
         let router = router.with_backup(backup.clone(), "backup-secret".into());
         let q = "/api/v1/backup?account=a&services=calendar,mail";
-        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        let request = strict_scalar_post_from_target(q, "backup-secret");
+        assert_eq!(
+            router.route(&request.clone().with_cap_token(None)).status,
+            401
+        );
         assert_eq!(
             router
-                .route(&ApiRequest::new("POST", q).with_cap_token(Some("wrong".into())))
+                .route(&request.clone().with_cap_token(Some("wrong".into())))
                 .status,
             401
         );
-        let ok =
-            router.route(&ApiRequest::new("POST", q).with_cap_token(Some("backup-secret".into())));
+        let ok = router.route(&request);
         assert_eq!(ok.status, 200);
         let body = body_json(&ok);
         assert_eq!(body["queued"], true);
@@ -7041,8 +8769,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "cap".into(),
             )
             .with_session_token("sess".into());
-        let req =
-            ApiRequest::new("POST", "/api/v1/backup?account=a").with_cap_token(Some("cap".into()));
+        let req = strict_scalar_post_from_target("/api/v1/backup?account=a", "cap");
         assert_eq!(router.route(&req).status, 401);
         let ok = router.route(&req.with_session_token(Some("sess".into())));
         assert_eq!(ok.status, 200);
@@ -7057,9 +8784,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_session_token("sess".into())
             .with_biometric_gate();
         let post = |path: &str| {
-            ApiRequest::new("POST", path)
-                .with_cap_token(Some("cap".into()))
-                .with_session_token(Some("sess".into()))
+            strict_scalar_post_from_target(path, "cap").with_session_token(Some("sess".into()))
         };
         let ch = mobile.route(&post("/api/v1/backup?account=a&services=mail"));
         assert_eq!(ch.status, 200);
@@ -7071,18 +8796,19 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/backup?account=a&services=mail&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/backup?account=a&services=mail")
+                        .with_per_action_token(Some(pat.clone()))
+                )
                 .status,
             403
         );
         assert!(backup.calls.lock().unwrap().is_empty());
 
         assert!(mobile.confirm_biometric(&pat));
-        let ok = mobile.route(&post(&format!(
-            "/api/v1/backup?account=a&services=mail&_pat={pat}"
-        )));
+        let ok = mobile.route(
+            &post("/api/v1/backup?account=a&services=mail").with_per_action_token(Some(pat)),
+        );
         assert_eq!(ok.status, 200);
         assert_eq!(backup.calls.lock().unwrap().len(), 1);
     }
@@ -7095,9 +8821,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_backup(backup.clone(), "cap".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let req = ApiRequest::new("POST", "/api/v1/backup?account=a&services=mail,shell")
-            .with_cap_token(Some("cap".into()))
-            .with_session_token(Some("sess".into()));
+        let req =
+            strict_scalar_post_from_target("/api/v1/backup?account=a&services=mail,shell", "cap")
+                .with_session_token(Some("sess".into()));
 
         let resp = mobile.route(&req);
 
@@ -7157,8 +8883,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "agentsecret".into(),
         );
         let resp = router.route(
-            &ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
-                .with_cap_token(Some("agentsecret".into())),
+            &ApiRequest::new("POST", "/api/v1/agent/turn")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    br#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","account":"a","prompt":"hi"}"#
+                        .to_vec(),
+                ),
         );
         assert_eq!(resp.status, 409);
         assert!(String::from_utf8_lossy(&resp.body).contains("product_not_ready"));
@@ -7337,6 +9068,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             }
         }
         fn cancel(&self, _t: &str) {}
+        fn cancel_turn(&self, turn_id: &str) -> Result<(), String> {
+            (turn_id == "turn-123")
+                .then_some(())
+                .ok_or_else(|| "turn_not_found".into())
+        }
+        fn cancel_pending(&self, pending_id: &str, action_hash: &str) -> Result<(), String> {
+            (pending_id == "pending-123" && action_hash == "a".repeat(64))
+                .then_some(())
+                .ok_or_else(|| "NotFound".into())
+        }
         fn open_stream(&self, turn: &str) -> Option<std::sync::mpsc::Receiver<String>> {
             if turn != "turn-123" {
                 return None;
@@ -7344,6 +9085,137 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             let (tx, rx) = std::sync::mpsc::channel();
             tx.send("{\"event\":\"token\",\"text\":\"hi\"}".into()).ok();
             Some(rx)
+        }
+        fn session_create(
+            &self,
+            request_id: &str,
+            display_name: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request_id,
+                "session": {
+                    "session_id": "01JSESSION00000000000000000",
+                    "display_name": display_name,
+                },
+                "selected_session_id": "01JSESSION00000000000000000",
+            }))
+        }
+        fn session_list(
+            &self,
+            cursor: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "sessions": [],
+                "cursor": cursor,
+                "limit": limit,
+                "next_cursor": null,
+            }))
+        }
+        fn session_select(
+            &self,
+            _request_id: &str,
+            session_id: &str,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "selected_session_id": session_id }))
+        }
+        fn session_history(
+            &self,
+            session_id: &str,
+            cursor: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "session_id": session_id,
+                "cursor": cursor,
+                "limit": limit,
+                "records": [],
+                "next_cursor": null,
+            }))
+        }
+        fn session_archive(
+            &self,
+            request: AgentSessionArchiveRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "state": "archived",
+            }))
+        }
+        fn user_presence_start(
+            &self,
+            request: AgentUserPresenceStartRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": "01JOPERATION00000000000000",
+                "intent_id": "01JINTENT0000000000000000",
+                "token": "confirmation-token",
+                "action_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "expires_at_ms": 1_000_000,
+            }))
+        }
+        fn user_presence_confirm(
+            &self,
+            request: AgentUserPresenceConfirmRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "state": "authorized",
+            }))
+        }
+        fn session_pairing_create(
+            &self,
+            request: AgentSessionPairingCreateRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "pair_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "expires_at_ms": 1_000_000,
+            }))
+        }
+        fn session_pairing_reveal(
+            &self,
+            request: AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "pairing_code": format!("isy2.{}.{}", "A".repeat(32), "B".repeat(43)),
+                "expires_at_ms": 1_000_000,
+            }))
+        }
+        fn session_pairing_claim(
+            &self,
+            request: AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "state": "claimed",
+            }))
+        }
+        fn session_pairing_finalize(
+            &self,
+            request: AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "state": "consumed",
+            }))
+        }
+        fn session_pairing_revoke(
+            &self,
+            request: AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "state": "revoked",
+            }))
         }
         fn connectivity_preflight(
             &self,
@@ -7567,6 +9439,190 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store() {
+        const REQUEST_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+        const SESSION_ID: &str = "01JSESSION00000000000000000";
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("sess".into());
+        let authenticated = |request: ApiRequest| {
+            request
+                .with_session_token(Some("sess".into()))
+                .with_cap_token(Some("agentsecret".into()))
+        };
+        let create = || {
+            authenticated(
+                ApiRequest::new("POST", "/api/v1/agent/session/create")
+                    .with_content_type(Some("application/json".into()))
+                    .with_body(
+                        format!(r#"{{"request_id":"{REQUEST_ID}","display_name":"Work"}}"#)
+                            .into_bytes(),
+                    ),
+            )
+        };
+
+        let missing_session = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/session/create")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(format!(r#"{{"request_id":"{REQUEST_ID}"}}"#).into_bytes()),
+        );
+        assert_eq!(missing_session.status, 401);
+        let missing_cap = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/session/create")
+                .with_session_token(Some("sess".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(format!(r#"{{"request_id":"{REQUEST_ID}"}}"#).into_bytes()),
+        );
+        assert_eq!(missing_cap.status, 401);
+
+        let created = router.route(&create());
+        assert_eq!(created.status, 200);
+        assert_eq!(body_json(&created)["selected_session_id"], SESSION_ID);
+        assert!(created.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
+
+        for body in [
+            format!(r#"{{"request_id":"{REQUEST_ID}","extra":true}}"#),
+            format!(r#"{{"request_id":"{REQUEST_ID}","request_id":"{REQUEST_ID}"}}"#),
+        ] {
+            let response = router.route(&authenticated(
+                ApiRequest::new("POST", "/api/v1/agent/session/create")
+                    .with_content_type(Some("application/json".into()))
+                    .with_body(body.into_bytes()),
+            ));
+            assert_eq!(response.status, 400);
+        }
+        let query_rejected = router.route(&authenticated(
+            ApiRequest::new("POST", "/api/v1/agent/session/create?legacy=1")
+                .with_content_type(Some("application/json".into()))
+                .with_body(format!(r#"{{"request_id":"{REQUEST_ID}"}}"#).into_bytes()),
+        ));
+        assert_eq!(query_rejected.status, 400);
+
+        let selected = router.route(&authenticated(
+            ApiRequest::new("POST", "/api/v1/agent/session/select")
+                .with_content_type(Some("application/json; charset=utf-8".into()))
+                .with_body(
+                    format!(r#"{{"request_id":"{REQUEST_ID}","session_id":"{SESSION_ID}"}}"#)
+                        .into_bytes(),
+                ),
+        ));
+        assert_eq!(selected.status, 200);
+        assert_eq!(body_json(&selected)["selected_session_id"], SESSION_ID);
+
+        let listed = router.route(&authenticated(ApiRequest::new(
+            "GET",
+            "/api/v1/agent/session/list?cursor=next_page&limit=100",
+        )));
+        assert_eq!(listed.status, 200);
+        assert_eq!(body_json(&listed)["limit"], 100);
+        let history = router.route(&authenticated(ApiRequest::new(
+            "GET",
+            &format!("/api/v1/agent/session/history?session_id={SESSION_ID}&limit=50"),
+        )));
+        assert_eq!(history.status, 200);
+        assert_eq!(body_json(&history)["session_id"], SESSION_ID);
+
+        let presence = router.route(&authenticated(
+            ApiRequest::new("POST", "/api/v1/agent/user-presence/start")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    format!(
+                        r#"{{"request_id":"{REQUEST_ID}","kind":"session_archive","binding":{{"session_id":"{SESSION_ID}"}}}}"#
+                    )
+                    .into_bytes(),
+                ),
+        ));
+        assert_eq!(presence.status, 200);
+        let presence_json = body_json(&presence);
+        let operation_id = presence_json["operation_id"].as_str().unwrap();
+        let confirmed = router.route(&authenticated(
+            ApiRequest::new("POST", "/api/v1/agent/user-presence/confirm")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    json!({
+                        "request_id": REQUEST_ID,
+                        "operation_id": operation_id,
+                        "intent_id": presence_json["intent_id"],
+                        "token": presence_json["token"],
+                        "action_hash": presence_json["action_hash"],
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+        ));
+        assert_eq!(confirmed.status, 200);
+        let archived = router.route(&authenticated(
+            ApiRequest::new("POST", "/api/v1/agent/session/archive")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    json!({ "request_id": REQUEST_ID, "operation_id": operation_id })
+                        .to_string()
+                        .into_bytes(),
+                ),
+        ));
+        assert_eq!(archived.status, 200);
+        assert_eq!(body_json(&archived)["state"], "archived");
+
+        let pairing = router.route(&authenticated(
+            ApiRequest::new("POST", "/api/v1/agent/session/pairing/create")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    json!({ "request_id": REQUEST_ID, "session_id": SESSION_ID })
+                        .to_string()
+                        .into_bytes(),
+                ),
+        ));
+        assert_eq!(pairing.status, 200);
+        for path in [
+            "/api/v1/agent/session/pairing/reveal",
+            "/api/v1/agent/session/pairing/claim",
+            "/api/v1/agent/session/pairing/finalize",
+            "/api/v1/agent/session/pairing/revoke",
+        ] {
+            let response = router.route(&authenticated(
+                ApiRequest::new("POST", path)
+                    .with_content_type(Some("application/json".into()))
+                    .with_body(
+                        json!({ "request_id": REQUEST_ID, "operation_id": operation_id })
+                            .to_string()
+                            .into_bytes(),
+                    ),
+            ));
+            assert_eq!(response.status, 200, "{path}");
+            assert!(response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+            }));
+        }
+
+        let pairing_query = router.route(&authenticated(
+            ApiRequest::new("POST", "/api/v1/agent/session/pairing/revoke?legacy=1")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    json!({ "request_id": REQUEST_ID, "operation_id": operation_id })
+                        .to_string()
+                        .into_bytes(),
+                ),
+        ));
+        assert_eq!(pairing_query.status, 400);
+
+        for path in [
+            "/api/v1/agent/session/list?limit=0",
+            "/api/v1/agent/session/list?limit=101",
+            "/api/v1/agent/session/history?session_id=../escape",
+        ] {
+            let response = router.route(&authenticated(ApiRequest::new("GET", path)));
+            assert_eq!(response.status, 400, "{path}");
+            assert!(response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+            }));
+        }
+    }
+
+    #[test]
     fn credential_refresh_route_requires_cap_strict_json_and_no_store() {
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
@@ -7602,45 +9658,131 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn agent_routes_require_cap_token_and_validate_params() {
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
-        let q = "/api/v1/agent/turn?account=a&prompt=hi";
+        let request = || {
+            ApiRequest::new("POST", "/api/v1/agent/turn")
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    br#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","account":"a","prompt":"hi"}"#
+                        .to_vec(),
+                )
+        };
         // no / wrong cap token -> 401
-        assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+        assert_eq!(router.route(&request()).status, 401);
         assert_eq!(
             router
-                .route(&ApiRequest::new("POST", q).with_cap_token(Some("nope".into())))
+                .route(&request().with_cap_token(Some("nope".into())))
                 .status,
             401
         );
         // correct token -> 200 + the turn id
-        let ok =
-            router.route(&ApiRequest::new("POST", q).with_cap_token(Some("agentsecret".into())));
+        let ok = router.route(&request().with_cap_token(Some("agentsecret".into())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("turn-123"));
-        // missing params -> 400
-        let bad = ApiRequest::new("POST", "/api/v1/agent/turn?account=a")
+        // Legacy query input and an incomplete JSON body are rejected.
+        let query = ApiRequest::new("POST", "/api/v1/agent/turn?account=a&prompt=hi")
             .with_cap_token(Some("agentsecret".into()));
+        assert_eq!(router.route(&query).status, 400);
+        let bad = ApiRequest::new("POST", "/api/v1/agent/turn")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(br#"{"account":"a"}"#.to_vec());
         assert_eq!(router.route(&bad).status, 400);
         // confirm: wrong one-time token -> 409, right -> 200
-        let cwrong = ApiRequest::new(
-            "POST",
-            "/api/v1/agent/confirm?pending=p1&token=wrong&action_hash=hash",
-        )
-        .with_cap_token(Some("agentsecret".into()));
+        let cwrong = strict_json_post(
+            "/api/v1/agent/confirm",
+            json!({
+                "request_id": "550e8400-e29b-41d4-a716-446655440001",
+                "pending": "p1",
+                "token": "wrong",
+                "action_hash": "hash",
+            }),
+            Some("agentsecret"),
+        );
         assert_eq!(router.route(&cwrong).status, 409);
-        let cok = ApiRequest::new(
-            "POST",
-            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
-        )
-        .with_cap_token(Some("agentsecret".into()));
+        let cok = strict_json_post(
+            "/api/v1/agent/confirm",
+            json!({
+                "request_id": "550e8400-e29b-41d4-a716-446655440002",
+                "pending": "p1",
+                "token": "right",
+                "action_hash": "hash",
+            }),
+            Some("agentsecret"),
+        );
         assert_eq!(router.route(&cok).status, 200);
-        // cancel -> 200
-        let cancel = ApiRequest::new("POST", "/api/v1/agent/cancel?turn=turn-123")
-            .with_cap_token(Some("agentsecret".into()));
+        // strict turn cancel -> 200; the legacy query route is absent.
+        let cancel = ApiRequest::new("POST", "/api/v1/agent/turn/cancel")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(
+                br#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","turn_id":"turn-123"}"#
+                    .to_vec(),
+            );
         assert_eq!(router.route(&cancel).status, 200);
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/agent/cancel?turn=turn-123")
+                        .with_cap_token(Some("agentsecret".into()))
+                )
+                .status,
+            405
+        );
     }
 
     #[test]
-    fn agent_chat_alias_matches_turn_route() {
+    fn agent_cancel_routes_require_strict_json_and_separate_turn_from_pending() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let turn = ApiRequest::new("POST", "/api/v1/agent/turn/cancel")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(
+                br#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","turn_id":"turn-123"}"#
+                    .to_vec(),
+            );
+        let pending = ApiRequest::new("POST", "/api/v1/agent/pending/cancel")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(
+                format!(
+                    r#"{{"request_id":"550e8400-e29b-41d4-a716-446655440000","pending":"pending-123","action_hash":"{}"}}"#,
+                    "a".repeat(64)
+                )
+                .into_bytes(),
+            );
+
+        assert_eq!(router.route(&turn).status, 200);
+        let pending_response = router.route(&pending);
+        assert_eq!(
+            pending_response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&pending_response.body)
+        );
+        assert_eq!(body_json(&pending_response)["state"], "cancelled");
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/agent/turn/cancel?turn=turn-123")
+                        .with_cap_token(Some("agentsecret".into()))
+                )
+                .status,
+            400
+        );
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new("POST", "/api/v1/agent/pending/cancel")
+                        .with_cap_token(Some("agentsecret".into()))
+                )
+                .status,
+            400
+        );
+    }
+
+    #[test]
+    fn agent_chat_alias_and_legacy_turn_query_are_rejected() {
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
         let turn = router.route(
@@ -7651,29 +9793,46 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             &ApiRequest::new("POST", "/api/v1/agent/chat?account=a&prompt=hi")
                 .with_cap_token(Some("agentsecret".into())),
         );
-        assert_eq!(turn.status, 200);
-        assert_eq!(chat.status, 200);
-        assert_eq!(
-            String::from_utf8_lossy(&turn.body),
-            String::from_utf8_lossy(&chat.body)
-        );
+        assert_eq!(turn.status, 400);
+        assert_eq!(chat.status, 405);
     }
 
     #[test]
     fn agent_confirm_requires_action_hash() {
         let (_d, router) = setup();
         let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
-        let missing_hash = router.route(
-            &ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&token=right")
-                .with_cap_token(Some("agentsecret".into())),
-        );
+        let missing_hash = router.route(&strict_json_post(
+            "/api/v1/agent/confirm",
+            json!({
+                "request_id": "550e8400-e29b-41d4-a716-446655440003",
+                "pending": "p1",
+                "token": "right",
+            }),
+            Some("agentsecret"),
+        ));
         assert_eq!(missing_hash.status, 400);
-        assert!(String::from_utf8_lossy(&missing_hash.body).contains("action_hash"));
-        let missing_token = router.route(
-            &ApiRequest::new("POST", "/api/v1/agent/confirm?pending=p1&action_hash=hash")
-                .with_cap_token(Some("agentsecret".into())),
-        );
+        let missing_token = router.route(&strict_json_post(
+            "/api/v1/agent/confirm",
+            json!({
+                "request_id": "550e8400-e29b-41d4-a716-446655440004",
+                "pending": "p1",
+                "action_hash": "hash",
+            }),
+            Some("agentsecret"),
+        ));
         assert_eq!(missing_token.status, 400);
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::new(
+                        "POST",
+                        "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
+                    )
+                    .with_cap_token(Some("agentsecret".into()))
+                )
+                .status,
+            400
+        );
     }
 
     #[test]
@@ -7686,7 +9845,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/turn?account=a&prompt=hi",
             "/api/v1/agent/chat?account=a&prompt=hi",
             "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
-            "/api/v1/agent/cancel?turn=turn-123",
+            "/api/v1/agent/turn/cancel",
+            "/api/v1/agent/pending/cancel",
         ] {
             let r = router
                 .route(&ApiRequest::new("POST", path).with_cap_token(Some("agentsecret".into())));
@@ -7726,10 +9886,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_session_token("s".into());
         // Unauthorized → None (identical gate to the HTTP SSE path).
         assert!(router.open_bridge_stream("/api/v1/events", None).is_none());
-        // Authorized change stream (token via _st) → a change follows a notify. A
+        // Authorized change stream (trusted bridge token) → a change follows a notify. A
         // background notifier removes the capture-vs-notify race (mirrors the SSE test).
         let rx = router
-            .open_bridge_stream("/api/v1/events?_st=s", None)
+            .open_bridge_stream("/api/v1/events", Some("s"))
             .expect("events stream");
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (n, s2) = (bus.clone(), stop.clone());
@@ -7752,7 +9912,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(got_change, "change stream must push a change after notify");
         // Agent stream (session + turn) → the pre-serialized line wrapped as `data`.
         let arx = router
-            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123&_st=s", None)
+            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123", Some("s"))
             .expect("agent stream");
         let first = arx.recv_timeout(Duration::from_secs(2)).expect("an event");
         assert!(
@@ -7848,12 +10008,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let req = ApiRequest::new(
-            "POST",
-            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash",
-        )
-        .with_session_token(Some("sess".into()))
-        .with_cap_token(Some("agentsecret".into()));
+        let req = agent_confirm_request("hash");
 
         let resp = router.route(&req);
 
@@ -7875,24 +10030,19 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let base = "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash";
-        let auth = |path: &str| {
-            ApiRequest::new("POST", path)
-                .with_session_token(Some("sess".into()))
-                .with_cap_token(Some("agentsecret".into()))
-        };
+        let auth = || agent_confirm_request("hash");
 
-        let first = router.route(&auth(base));
+        let first = router.route(&auth());
         let pat = body_json(&first)["pending_action_id"]
             .as_str()
             .unwrap()
             .to_string();
-        let bad = router.route(&auth(&format!("{base}&_pat={pat}")));
+        let bad = router.route(&auth().with_per_action_token(Some(pat.clone())));
         assert_eq!(bad.status, 403);
         assert_eq!(agent.confirm_call_count(), 0);
 
         assert!(router.confirm_biometric(&pat));
-        let ok = router.route(&auth(&format!("{base}&_pat={pat}")));
+        let ok = router.route(&auth().with_per_action_token(Some(pat)));
         assert_eq!(ok.status, 200);
         assert_eq!(agent.confirm_call_count(), 1);
     }
@@ -7905,22 +10055,17 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let base = "/api/v1/agent/confirm?pending=p1&token=right&action_hash=hash";
-        let auth = |path: &str| {
-            ApiRequest::new("POST", path)
-                .with_session_token(Some("sess".into()))
-                .with_cap_token(Some("agentsecret".into()))
-        };
-        let challenge = router.route(&auth(base));
+        let auth = || agent_confirm_request("hash");
+        let challenge = router.route(&auth());
         let pat = body_json(&challenge)["pending_action_id"]
             .as_str()
             .unwrap()
             .to_string();
 
         assert!(router.confirm_biometric(&pat));
-        let ok = router.route(&auth(&format!("{base}&_pat={pat}")));
+        let ok = router.route(&auth().with_per_action_token(Some(pat.clone())));
         assert_eq!(ok.status, 200);
-        let replay = router.route(&auth(&format!("{base}&_pat={pat}")));
+        let replay = router.route(&auth().with_per_action_token(Some(pat)));
         assert_eq!(replay.status, 403);
         assert_eq!(agent.confirm_call_count(), 1);
     }
@@ -7933,12 +10078,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let req = ApiRequest::new(
-            "POST",
-            "/api/v1/agent/confirm?pending=p1&token=right&action_hash=wrong",
-        )
-        .with_session_token(Some("sess".into()))
-        .with_cap_token(Some("agentsecret".into()));
+        let req = agent_confirm_request("wrong");
 
         let resp = router.route(&req);
 
@@ -8435,7 +10575,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             router
                 .route(
-                    &ApiRequest::new("POST", "/api/v1/agent/cancel?turn=t")
+                    &ApiRequest::new("POST", "/api/v1/agent/turn/cancel")
                         .with_cap_token(Some("agentsecret".into()))
                 )
                 .status,
@@ -8500,12 +10640,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             401
         );
         // valid token but out-of-range value -> 400, handler not called
-        let oob = ApiRequest::new("POST", "/api/v1/settings?poll_interval_secs=99999")
-            .with_cap_token(Some("secret".into()));
+        let oob =
+            strict_scalar_post_from_target("/api/v1/settings?poll_interval_secs=99999", "secret");
         assert_eq!(router.route(&oob).status, 400);
         assert_eq!(seen.load(Ordering::SeqCst), 0);
         // valid token + valid value -> 200, handler applied
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let ok = router.route(&strict_scalar_post_from_target(q, "secret"));
         assert_eq!(ok.status, 200);
         assert_eq!(seen.load(Ordering::SeqCst), 10);
     }
@@ -8914,7 +11054,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     // invalid mode (400); missing folder (400).
     #[test]
     fn onedrive_mode_post_persists_and_get_reflects() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "modecap");
         // No mode handler wired -> POST 404 (read-only serve); GET still 200 (static config).
         let (_d0, r0) = setup();
         assert_eq!(
@@ -8992,7 +11132,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     // path) the response is unchanged (no cleanup key) → those mode-toggle tests stay green.
     #[test]
     fn mode_post_online_triggers_cleanup_only_when_manage_wired() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "modecap");
 
         // Mode handler only (no manage) -> setting online has NO cleanup key (unchanged response).
         let (_d0, r0) = setup();
@@ -9125,7 +11265,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     // AC3: a mode POST writes a durable audit run (audit:onedrive-mode, started + ok).
     #[test]
     fn onedrive_mode_post_is_audited() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "modecap");
         let (_d, r) = setup();
         let store_path = r.config.accounts[0].archive_root.join(".isyncyou-store.db");
         let router = r.with_onedrive_mode(
@@ -9330,7 +11470,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn mail_write_endpoints_are_cap_token_gated_and_route_params() {
+    fn mail_content_endpoints_are_cap_token_gated_strict_json() {
         let (_d, router) = setup();
         // read-only router (no handler) refuses every mail-write POST
         for p in [
@@ -9348,49 +11488,127 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let rec = std::sync::Arc::new(RecordMailWrite::default());
         let router = router.with_mail_write(rec.clone(), "secret".into());
 
-        // missing / wrong cap token -> 401
-        let send = "/api/v1/mail/send?account=a&to=x@y.com&subject=Hi";
-        assert_eq!(router.route(&ApiRequest::new("POST", send)).status, 401);
+        let send_body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174000",
+            "account": "a",
+            "subject": "Hi",
+            "body": "body",
+            "to": ["x@example.invalid"],
+            "cc": [],
+            "bcc": [],
+            "importance": null,
+            "read_receipt": false
+        });
         assert_eq!(
             router
-                .route(&ApiRequest::new("POST", send).with_cap_token(Some("nope".into())))
+                .route(&strict_json_post(
+                    "/api/v1/mail/send",
+                    send_body.clone(),
+                    None
+                ))
                 .status,
             401
         );
-        // valid token but no recipient -> 400, handler not called
-        let bad = ApiRequest::new("POST", "/api/v1/mail/send?account=a&subject=Hi")
-            .with_cap_token(Some("secret".into()));
+        assert_eq!(
+            router
+                .route(&strict_json_post(
+                    "/api/v1/mail/send",
+                    send_body.clone(),
+                    Some("nope"),
+                ))
+                .status,
+            401
+        );
+        let bad = strict_json_post(
+            "/api/v1/mail/send",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174001",
+                "account": "a",
+                "subject": "Hi",
+                "body": "",
+                "to": [], "cc": [], "bcc": [],
+                "importance": null,
+                "read_receipt": false
+            }),
+            Some("secret"),
+        );
         assert_eq!(router.route(&bad).status, 400);
         assert!(rec.0.lock().unwrap().is_empty());
 
-        // valid send -> 200, handler called with parsed params
-        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
-        assert_eq!(router.route(&tok(send)).status, 200);
-        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0 imp=- rr=false");
-
-        // importance + read-receipt params are forwarded
         assert_eq!(
             router
-                .route(&tok(
-                    "/api/v1/mail/send?account=a&to=x@y.com&subject=Hi&importance=high&read_receipt=1"
+                .route(&strict_json_post(
+                    "/api/v1/mail/send",
+                    send_body,
+                    Some("secret"),
                 ))
                 .status,
             200
         );
-        assert_eq!(rec.last(), "send subj=Hi to=x@y.com cc=0 imp=high rr=true");
+        assert_eq!(
+            rec.last(),
+            "send subj=Hi to=x@example.invalid cc=0 imp=- rr=false"
+        );
 
-        // reply with all=1 carries the id + flag
         assert_eq!(
             router
-                .route(&tok("/api/v1/mail/reply?account=a&id=m1&all=1&comment=ok"))
+                .route(&strict_json_post(
+                    "/api/v1/mail/send",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174002",
+                        "account": "a", "subject": "Hi", "body": "",
+                        "to": ["x@example.invalid"], "cc": [], "bcc": [],
+                        "importance": "high", "read_receipt": true
+                    }),
+                    Some("secret"),
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            rec.last(),
+            "send subj=Hi to=x@example.invalid cc=0 imp=high rr=true"
+        );
+
+        assert_eq!(
+            router
+                .route(&strict_json_post(
+                    "/api/v1/mail/reply",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174003",
+                        "account": "a", "id": "m1", "comment": "ok",
+                        "body": "", "all": true
+                    }),
+                    Some("secret"),
+                ))
                 .status,
             200
         );
         assert_eq!(rec.last(), "reply id=m1 all=true");
 
+        assert_eq!(
+            router
+                .route(&strict_json_post(
+                    "/api/v1/mail/forward",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174004",
+                        "account": "a", "id": "m1", "comment": "see",
+                        "body": "", "to": ["y@example.invalid"]
+                    }),
+                    Some("secret"),
+                ))
+                .status,
+            200
+        );
+
         // move returns the new id
-        let moved = router.route(&tok(
-            "/api/v1/mail/move?account=a&id=m1&destination=Archive",
+        let moved = router.route(&strict_json_post(
+            "/api/v1/mail/move",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174006",
+                "account": "a", "id": "m1", "destination": "Archive"
+            }),
+            Some("secret"),
         ));
         assert_eq!(moved.status, 200);
         assert_eq!(body_json(&moved)["new_id"], "m1-moved");
@@ -9398,21 +11616,61 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // flag validates the status enum
         assert_eq!(
             router
-                .route(&tok("/api/v1/mail/flag?account=a&id=m1&status=bogus"))
+                .route(&strict_json_post(
+                    "/api/v1/mail/flag",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174007",
+                        "account": "a", "id": "m1", "status": "bogus"
+                    }),
+                    Some("secret"),
+                ))
                 .status,
             400
         );
 
-        // draft with no id creates; with id sends
-        let drafted = router.route(&tok("/api/v1/mail/draft?account=a&subject=D&to=x@y.com"));
+        let drafted = router.route(&strict_json_post(
+            "/api/v1/mail/draft",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174005",
+                "account": "a", "id": null, "subject": "D", "body": "",
+                "to": ["x@example.invalid"]
+            }),
+            Some("secret"),
+        ));
         assert_eq!(body_json(&drafted)["draft_id"], "draft-9");
         assert_eq!(
             router
-                .route(&tok("/api/v1/mail/draft?account=a&id=d1"))
+                .route(&strict_json_post(
+                    "/api/v1/mail/draft",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174006",
+                        "account": "a", "id": "d1", "subject": "", "body": "",
+                        "to": []
+                    }),
+                    Some("secret"),
+                ))
                 .status,
             200
         );
         assert_eq!(rec.last(), "send_draft id=d1");
+
+        let legacy = ApiRequest::new(
+            "POST",
+            "/api/v1/mail/send?account=a&to=x%40example.invalid&subject=secret",
+        )
+        .with_cap_token(Some("secret".into()));
+        assert_eq!(router.route(&legacy).status, 400);
+        let extra = strict_json_post(
+            "/api/v1/mail/send",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174007",
+                "account": "a", "subject": "Hi", "body": "", "to": ["x@example.invalid"],
+                "cc": [], "bcc": [], "importance": null, "read_receipt": false,
+                "unexpected": true
+            }),
+            Some("secret"),
+        );
+        assert_eq!(router.route(&extra).status, 400);
     }
 
     #[derive(Default)]
@@ -9498,7 +11756,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_move_out_of_protected_is_biometric_gated_on_mobile() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
         let (_d, r) = setup();
         let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
         let risk = std::sync::Arc::new(FakeOneDriveRisk::with_move(
@@ -9529,9 +11787,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(
             mobile
-                .route(&post(
-                    "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221&_pat=wrong"
-                ))
+                .route(
+                    &post("/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221")
+                        .with_per_action_token(Some("wrong".into()))
+                )
                 .status,
             403
         );
@@ -9539,9 +11798,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221")
+                        .with_per_action_token(Some(pat.clone()))
+                )
                 .status,
             403
         );
@@ -9554,7 +11814,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=Other",
         ] {
             assert_eq!(
-                mobile.route(&post(&format!("{changed}&_pat={pat}"))).status,
+                mobile
+                    .route(&post(changed).with_per_action_token(Some(pat.clone())))
+                    .status,
                 403,
                 "confirmed move token must not authorize a mutated action: {changed}"
             );
@@ -9562,9 +11824,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/onedrive/move?account=a&id=A%3AB&parent=P%5D1&name=N%3A%221")
+                        .with_per_action_token(Some(pat))
+                )
                 .status,
             200
         );
@@ -9576,7 +11839,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_move_low_risk_is_not_biometric_gated_on_mobile() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
         let (_d, r) = setup();
         let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
         let risk = std::sync::Arc::new(FakeOneDriveRisk::default());
@@ -9598,7 +11861,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_move_unknown_risk_is_biometric_gated_on_mobile() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
         let (_d, r) = setup();
         let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
         let risk = std::sync::Arc::new(FakeOneDriveRisk::with_move(OneDriveMoveRisk::Unknown {
@@ -9622,7 +11885,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_move_missing_risk_classifier_fails_closed_on_mobile() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
         let (_d, r) = setup();
         let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
         let mobile = r
@@ -9639,7 +11902,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_offline_large_mode_switch_is_biometric_gated_before_persist() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "modecap");
         let (_d, r) = setup();
         let modes = std::sync::Arc::new(FakeOneDriveMode::default());
         let risk = std::sync::Arc::new(FakeOneDriveRisk::with_offline_requires("bulk_files"));
@@ -9672,9 +11935,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let pat = j["pending_action_id"].as_str().unwrap().to_string();
         assert_eq!(
             mobile
-                .route(&post(
-                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline&_pat=wrong"
-                ))
+                .route(
+                    &post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline")
+                        .with_per_action_token(Some("wrong".into()))
+                )
                 .status,
             403
         );
@@ -9689,9 +11953,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(mobile.confirm_biometric(&pat));
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/onedrive/mode?account=a&folder=Archive%3A%5D&mode=offline&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/onedrive/mode?account=a&folder=Archive%3A%5D&mode=offline")
+                        .with_per_action_token(Some(pat.clone()))
+                )
                 .status,
             403,
             "confirmed Offline-mode token must not authorize another folder"
@@ -9706,9 +11971,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=offline")
+                        .with_per_action_token(Some(pat))
+                )
                 .status,
             200
         );
@@ -9725,7 +11991,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_offline_small_mode_switch_is_not_gated() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "modecap");
         let (_d, r) = setup();
         let modes = std::sync::Arc::new(FakeOneDriveMode::default());
         let risk = std::sync::Arc::new(FakeOneDriveRisk::default());
@@ -9747,7 +12013,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_mode_online_cleanup_is_bulk_gated_before_persist() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "modecap");
         let (_d, r) = setup();
         let modes = std::sync::Arc::new(FakeOneDriveMode::default());
         let manage = std::sync::Arc::new(MockManage::default());
@@ -9781,9 +12047,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(mobile.confirm_biometric(&pat));
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/onedrive/mode?account=a&folder=Photos&mode=online&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/onedrive/mode?account=a&folder=Photos&mode=online")
+                        .with_per_action_token(Some(pat))
+                )
                 .status,
             200
         );
@@ -9801,8 +12068,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[test]
     fn onedrive_risk_classifier_is_not_called_on_desktop() {
-        let move_post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
-        let mode_post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("modecap".into()));
+        let move_post = |t: &str| strict_scalar_post_from_target(t, "cap");
+        let mode_post = |t: &str| strict_scalar_post_from_target(t, "modecap");
         let (_d, r) = setup();
         let writes = std::sync::Arc::new(FakeOneDriveWrite::default());
         let modes = std::sync::Arc::new(FakeOneDriveMode::default());
@@ -9847,7 +12114,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     // #654 (AC1, webui part): the OneDrive cloud-write POST arms — cap-gate + verb dispatch.
     #[test]
     fn onedrive_write_cap_gate_and_dispatch() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
         // No handler wired -> 404.
         let (_d0, r0) = setup();
         assert_eq!(
@@ -9927,120 +12194,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
     }
 
-    // #657 (webui part): the upload/replace POST arms — cap-gate + verb dispatch with the bytes
-    // riding in the request body; missing params -> 400.
     #[test]
-    fn onedrive_upload_replace_dispatch_and_gates() {
-        let post = |t: &str, body: &[u8]| {
-            ApiRequest::new("POST", t)
-                .with_cap_token(Some("cap".into()))
-                .with_body(body.to_vec())
-        };
-        // No handler wired -> 404.
-        let (_d0, r0) = setup();
-        assert_eq!(
-            r0.route(&post(
-                "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
-                b"DATA"
-            ))
-            .status,
-            404
-        );
-        // Handler wired but no cap token -> 401; handler not called.
-        let (_d1, r1) = setup();
-        let f = std::sync::Arc::new(FakeOneDriveWrite::default());
-        let router = r1.with_onedrive_write(f.clone(), "cap".into());
-        let no_cap = ApiRequest::new(
-            "POST",
+    fn legacy_onedrive_upload_replace_routes_are_removed() {
+        let (_directory, router) = setup();
+        for path in [
             "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
-        )
-        .with_body(b"DATA".to_vec());
-        assert_eq!(router.route(&no_cap).status, 401);
-        assert!(f.uploads.lock().unwrap().is_empty());
-        // upload with cap + body -> 200 + new id; the bytes reach the handler intact.
-        let resp = router.route(&post(
-            "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
-            b"DATA",
-        ));
-        assert_eq!(resp.status, 200);
-        assert_eq!(body_json(&resp)["id"], "file-new");
-        assert_eq!(
-            *f.uploads.lock().unwrap(),
-            vec![("P".into(), "f.txt".into(), b"DATA".to_vec())]
-        );
-        // an absent parent means the drive root (parent = "").
-        assert_eq!(
-            router
-                .route(&post("/api/v1/onedrive/upload?account=a&name=r.txt", b"R"))
-                .status,
-            200
-        );
-        assert_eq!(f.uploads.lock().unwrap().last().unwrap().0, "".to_string());
-        // missing name -> 400.
-        assert_eq!(
-            router
-                .route(&post("/api/v1/onedrive/upload?account=a&parent=P", b"D"))
-                .status,
-            400
-        );
-        // replace with id + etag + body -> 200; bytes + etag reach the handler.
-        assert_eq!(
-            router
-                .route(&post(
-                    "/api/v1/onedrive/replace?account=a&id=i9&etag=E1",
-                    b"NEW"
-                ))
-                .status,
-            200
-        );
-        assert_eq!(
-            *f.replaces.lock().unwrap(),
-            vec![("i9".into(), "E1".into(), b"NEW".to_vec())]
-        );
-        // replace missing etag -> 400.
-        assert_eq!(
-            router
-                .route(&post("/api/v1/onedrive/replace?account=a&id=i9", b"N"))
-                .status,
-            400
-        );
-    }
-
-    // #657: on mobile, upload + replace both raise the biometric gate (in the confirm catalogue).
-    #[test]
-    fn onedrive_upload_replace_are_biometric_gated_on_mobile() {
-        let post = |t: &str, body: &[u8]| {
-            ApiRequest::new("POST", t)
-                .with_cap_token(Some("cap".into()))
-                .with_body(body.to_vec())
-        };
-        let (_d, r) = setup();
-        let f = std::sync::Arc::new(FakeOneDriveWrite::default());
-        let mobile = r
-            .with_onedrive_write(f.clone(), "cap".into())
-            .with_biometric_gate();
-        // upload without a token -> challenged; handler NOT called.
-        let up = mobile.route(&post(
-            "/api/v1/onedrive/upload?account=a&parent=P&name=f.txt",
-            b"D",
-        ));
-        assert_eq!(up.status, 200);
-        assert_eq!(body_json(&up)["status"], "confirmation_required");
-        assert!(f.uploads.lock().unwrap().is_empty());
-        // replace likewise raises the gate.
-        let rp = mobile.route(&post(
             "/api/v1/onedrive/replace?account=a&id=i9&etag=E1",
-            b"D",
-        ));
-        assert_eq!(rp.status, 200);
-        assert_eq!(body_json(&rp)["status"], "confirmation_required");
-        assert!(f.replaces.lock().unwrap().is_empty());
+        ] {
+            let response = router.route(
+                &ApiRequest::new("POST", path)
+                    .with_cap_token(Some("cap".into()))
+                    .with_body(b"forbidden-direct-body".to_vec()),
+            );
+            assert_eq!(response.status, 405);
+        }
     }
 
     // #654 (AC3): on mobile, `delete` raises the biometric gate; `create` does not.
     #[test]
     fn onedrive_delete_is_biometric_gated_on_mobile() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
         let (_d, r) = setup();
         let f = std::sync::Arc::new(FakeOneDriveWrite::default());
         let mobile = r
@@ -10056,9 +12229,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // re-issue with the token but no biometric yet -> 403.
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/onedrive/delete?account=a&id=i1&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/onedrive/delete?account=a&id=i1")
+                        .with_per_action_token(Some(pat.clone()))
+                )
                 .status,
             403
         );
@@ -10067,9 +12241,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(mobile.confirm_biometric(&pat));
         assert_eq!(
             mobile
-                .route(&post(&format!(
-                    "/api/v1/onedrive/delete?account=a&id=i1&_pat={pat}"
-                )))
+                .route(
+                    &post("/api/v1/onedrive/delete?account=a&id=i1")
+                        .with_per_action_token(Some(pat))
+                )
                 .status,
             200
         );
@@ -10087,7 +12262,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     // #onedrive-mobile 0.6: the mobile biometric gate wired through a real route.
     #[test]
     fn biometric_gate_challenges_and_consumes_a_per_action_token() {
-        let del = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let del = |t: &str| strict_scalar_post_from_target(t, "cap");
 
         // Desktop profile (gate off): a delete with the cap token goes straight through.
         let (_d0, r0) = setup();
@@ -10120,9 +12295,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // Re-issue with the token but NO biometric yet -> 403 (not confirmed).
         assert_eq!(
             mobile
-                .route(&del(&format!(
-                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
-                )))
+                .route(
+                    &del("/api/v1/calendar/delete?account=a&id=e1")
+                        .with_per_action_token(Some(pat.clone()))
+                )
                 .status,
             403
         );
@@ -10132,9 +12308,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(mobile.confirm_biometric(&pat));
         assert_eq!(
             mobile
-                .route(&del(&format!(
-                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
-                )))
+                .route(
+                    &del("/api/v1/calendar/delete?account=a&id=e1")
+                        .with_per_action_token(Some(pat.clone()))
+                )
                 .status,
             200
         );
@@ -10143,9 +12320,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // Replay of the consumed token -> 403 (single-use); handler not called again.
         assert_eq!(
             mobile
-                .route(&del(&format!(
-                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat}"
-                )))
+                .route(
+                    &del("/api/v1/calendar/delete?account=a&id=e1")
+                        .with_per_action_token(Some(pat))
+                )
                 .status,
             403
         );
@@ -10160,9 +12338,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(mobile.confirm_biometric(&pat2));
         assert_eq!(
             mobile
-                .route(&del(&format!(
-                    "/api/v1/calendar/delete?account=a&id=e1&_pat={pat2}"
-                )))
+                .route(
+                    &del("/api/v1/calendar/delete?account=a&id=e1")
+                        .with_per_action_token(Some(pat2))
+                )
                 .status,
             403
         );
@@ -10181,10 +12360,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "secret".into(),
         );
         let g0 = bus.generation();
-        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
         assert_eq!(
             router
-                .route(&tok("/api/v1/mail/read?account=a&id=m1&is_read=1"))
+                .route(&strict_json_post(
+                    "/api/v1/mail/read",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174008",
+                        "account": "a", "id": "m1", "is_read": true
+                    }),
+                    Some("secret"),
+                ))
                 .status,
             200
         );
@@ -10251,10 +12436,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // missing token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
         // valid token but no subject/start -> 400 (handler not called)
-        let bad = ApiRequest::new("POST", "/api/v1/calendar/create?account=a")
-            .with_cap_token(Some("calsecret".into()));
+        let bad = strict_scalar_post_from_target("/api/v1/calendar/create?account=a", "calsecret");
         assert_eq!(router.route(&bad).status, 400);
-        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("calsecret".into()));
+        let tok = |t: &str| strict_scalar_post_from_target(t, "calsecret");
         assert_eq!(router.route(&tok(create)).status, 200);
         assert_eq!(
             router
@@ -10335,10 +12519,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // missing token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
         // valid token but no fields -> 400 (handler not called)
-        let bad = ApiRequest::new("POST", "/api/v1/contact/create?account=a")
-            .with_cap_token(Some("consecret".into()));
+        let bad = strict_scalar_post_from_target("/api/v1/contact/create?account=a", "consecret");
         assert_eq!(router.route(&bad).status, 400);
-        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("consecret".into()));
+        let tok = |t: &str| strict_scalar_post_from_target(t, "consecret");
         assert_eq!(router.route(&tok(create)).status, 200);
         assert_eq!(
             router
@@ -10466,10 +12649,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // missing token -> 401
         assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
         // valid token, no title -> 400 (handler not called)
-        let bad = ApiRequest::new("POST", "/api/v1/todo/create?account=a&list=L1")
-            .with_cap_token(Some("tasksecret".into()));
+        let bad =
+            strict_scalar_post_from_target("/api/v1/todo/create?account=a&list=L1", "tasksecret");
         assert_eq!(router.route(&bad).status, 400);
-        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("tasksecret".into()));
+        let tok = |t: &str| strict_scalar_post_from_target(t, "tasksecret");
         assert_eq!(router.route(&tok(create)).status, 200);
         assert_eq!(
             router
@@ -10795,8 +12978,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "AssistantState.pendingCardsById.set(pending.pending_id",
             "token: d.token || \"\"",
             "action_hash: d.action_hash || \"\"",
-            "post(\"/api/v1/agent/confirm?\" + qs({ pending: pendingId, token: record.token, action_hash: record.action_hash }), CAP.agent)",
-            "post(\"/api/v1/agent/cancel?\" + qs({ turn }), CAP.agent)",
+            "postJson(\"/api/v1/agent/confirm\", CAP.agent, {",
+            "postJson(\"/api/v1/agent/pending/cancel\", CAP.agent",
             "record.status = \"confirming\"",
             "record.status = \"confirmed\"",
             "record.status = \"cancelling\"",
@@ -10867,7 +13050,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "async function connectAgentProvider(provider)",
             "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
             "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
-            "await post(\"/api/v1/agent/model?\" + qs({ provider, model }), CAP.agent);",
+            "await postJson(\"/api/v1/agent/model\", CAP.agent, {",
             "const st = await api(\"/api/v1/agent/status\");",
             "rememberAssistantStatus(st);",
             "renderAssistantView($(\"#view\"));",
@@ -10881,7 +13064,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .split("function renderAssistantUsageChip(st)")
             .nth(1)
             .unwrap()
-            .split("function renderAssistantModelPicker")
+            .split("function agentProviderLabel")
             .next()
             .unwrap();
         assert!(
@@ -11316,7 +13499,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn push_routes_refused_without_a_handler() {
         // The read-only `serve` wires no push handler → register/test POSTs 404 (#576).
         let r = Router::new(Config::default());
-        for p in ["/api/v1/push/register?token=abc", "/api/v1/push/test"] {
+        for p in ["/api/v1/push/register", "/api/v1/push/test"] {
             assert_eq!(r.route(&ApiRequest::new("POST", p)).status, 404, "{p}");
         }
     }
@@ -11328,24 +13511,47 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // Wrong/absent cap token → 401, token not recorded.
         assert_eq!(
             router
-                .route(&ApiRequest::new("POST", "/api/v1/push/register?token=dev1"))
+                .route(&strict_json_post(
+                    "/api/v1/push/register",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174010",
+                        "token": "dev1"
+                    }),
+                    None,
+                ))
                 .status,
             401
         );
         assert!(push.tokens.lock().unwrap().is_empty());
         // With the cap token → 200 and the device token is stored.
-        let mut req = ApiRequest::new("POST", "/api/v1/push/register?token=dev1");
-        req.cap_token = Some("captok".into());
+        let req = strict_json_post(
+            "/api/v1/push/register",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174010",
+                "token": "dev1"
+            }),
+            Some("captok"),
+        );
         assert_eq!(router.route(&req).status, 200);
         assert_eq!(push.tokens.lock().unwrap().as_slice(), ["dev1"]);
+
+        let legacy = ApiRequest::new("POST", "/api/v1/push/register?token=dev2")
+            .with_cap_token(Some("captok".into()));
+        assert_eq!(router.route(&legacy).status, 400);
     }
 
     #[test]
     fn push_register_rejects_empty_token() {
         let push = std::sync::Arc::new(RecPush::default());
         let router = Router::new(Config::default()).with_push(push, "captok".into());
-        let mut req = ApiRequest::new("POST", "/api/v1/push/register?token=");
-        req.cap_token = Some("captok".into());
+        let req = strict_json_post(
+            "/api/v1/push/register",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174011",
+                "token": ""
+            }),
+            Some("captok"),
+        );
         assert_eq!(router.route(&req).status, 400);
     }
 
@@ -11373,7 +13579,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn onenote_write_endpoints_are_cap_gated_and_route_params() {
+    fn onenote_content_endpoints_are_cap_gated_strict_json() {
         let (_d, router) = setup();
         for p in [
             "/api/v1/onenote/create",
@@ -11388,18 +13594,52 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
         let rec = std::sync::Arc::new(RecOneNoteWrite::default());
         let router = router.with_onenote_write(rec.clone(), "notesecret".into());
-        let create = "/api/v1/onenote/create?account=a&section=S1&title=Ideas&body=hello";
+        let create_body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174020",
+            "account": "a", "section": "S1", "title": "Ideas", "body": "hello"
+        });
         // missing token -> 401
-        assert_eq!(router.route(&ApiRequest::new("POST", create)).status, 401);
-        // valid token but no section -> 400
-        let bad = ApiRequest::new("POST", "/api/v1/onenote/create?account=a&title=x")
-            .with_cap_token(Some("notesecret".into()));
-        assert_eq!(router.route(&bad).status, 400);
-        let tok = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("notesecret".into()));
-        assert_eq!(router.route(&tok(create)).status, 200);
         assert_eq!(
             router
-                .route(&tok("/api/v1/onenote/append?account=a&id=P1&text=more"))
+                .route(&strict_json_post(
+                    "/api/v1/onenote/create",
+                    create_body.clone(),
+                    None,
+                ))
+                .status,
+            401
+        );
+        // valid token but no section -> 400
+        let bad = strict_json_post(
+            "/api/v1/onenote/create",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174021",
+                "account": "a", "section": "", "title": "x", "body": ""
+            }),
+            Some("notesecret"),
+        );
+        assert_eq!(router.route(&bad).status, 400);
+        let tok = |t: &str| strict_scalar_post_from_target(t, "notesecret");
+        assert_eq!(
+            router
+                .route(&strict_json_post(
+                    "/api/v1/onenote/create",
+                    create_body,
+                    Some("notesecret"),
+                ))
+                .status,
+            200
+        );
+        assert_eq!(
+            router
+                .route(&strict_json_post(
+                    "/api/v1/onenote/append",
+                    json!({
+                        "request_id": "123e4567-e89b-42d3-a456-426614174022",
+                        "account": "a", "id": "P1", "text": "more"
+                    }),
+                    Some("notesecret"),
+                ))
                 .status,
             200
         );
@@ -11415,6 +13655,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(!log[0].ends_with("bytes=0"));
         assert_eq!(log[1], "append id=P1 text=more");
         assert_eq!(log[2], "delete id=P1");
+
+        let legacy = ApiRequest::new(
+            "POST",
+            "/api/v1/onenote/create?account=a&section=S1&title=Ideas&body=secret",
+        )
+        .with_cap_token(Some("notesecret".into()));
+        assert_eq!(router.route(&legacy).status, 400);
     }
 
     #[test]
@@ -11493,11 +13740,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             401
         );
         // correct token -> 200 + summary
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let ok = router.route(&strict_scalar_post_from_target(q, "secret"));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("verified"));
         // missing account -> 400
-        let bad = ApiRequest::new("POST", "/api/v1/verify").with_cap_token(Some("secret".into()));
+        let bad = strict_scalar_post_from_target("/api/v1/verify", "secret");
         assert_eq!(router.route(&bad).status, 400);
     }
 
@@ -11581,12 +13828,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             401
         );
         // correct token -> 200 + the webUrl
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let ok = router.route(&strict_scalar_post_from_target(q, "secret"));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("https://1drv.ms/x/abc"));
         // valid token but missing params -> 400
-        let bad = ApiRequest::new("POST", "/api/v1/share?account=a")
-            .with_cap_token(Some("secret".into()));
+        let bad = strict_scalar_post_from_target("/api/v1/share?account=a", "secret");
         assert_eq!(router.route(&bad).status, 400);
         // a router without a share handler refuses the POST -> 404
         let (_d2, plain) = setup();
@@ -11606,7 +13852,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let mobile = router
             .with_share(std::sync::Arc::new(OkShare), "secret".into())
             .with_biometric_gate();
-        let cap = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        let cap = |t: &str| strict_scalar_post_from_target(t, "secret");
         let q = "/api/v1/share?account=a&service=onedrive&id=x";
         // cap token alone → a confirmation challenge, NOT a link
         let ch = mobile.route(&cap(q));
@@ -11616,14 +13862,24 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let pat = j["pending_action_id"].as_str().unwrap().to_string();
         assert!(!String::from_utf8_lossy(&ch.body).contains("1drv.ms"));
         // token but no biometric yet → 403
-        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        assert_eq!(
+            mobile
+                .route(&cap(q).with_per_action_token(Some(pat.clone())))
+                .status,
+            403
+        );
         // native biometric confirms → share proceeds and returns the link
         assert!(mobile.confirm_biometric(&pat));
-        let ok = mobile.route(&cap(&format!("{q}&_pat={pat}")));
+        let ok = mobile.route(&cap(q).with_per_action_token(Some(pat.clone())));
         assert_eq!(ok.status, 200);
         assert!(String::from_utf8_lossy(&ok.body).contains("https://1drv.ms/x/abc"));
         // replay of the consumed token → 403 (single-use)
-        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        assert_eq!(
+            mobile
+                .route(&cap(q).with_per_action_token(Some(pat)))
+                .status,
+            403
+        );
     }
 
     #[test]
@@ -11632,7 +13888,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let router = router.with_share(std::sync::Arc::new(OkShare), "secret".into());
         // an `email` param switches to invite mode: response has no webUrl, role echoed
         let q = "/api/v1/share?account=a&service=onedrive&id=x&email=p%40e.com&role=write";
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let ok = router.route(&strict_scalar_post_from_target(q, "secret"));
         assert_eq!(ok.status, 200);
         let body = String::from_utf8_lossy(&ok.body);
         assert!(
@@ -11652,7 +13908,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let mobile = router
             .with_share(spy.clone(), "secret".into())
             .with_biometric_gate();
-        let cap = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("secret".into()));
+        let cap = |t: &str| strict_scalar_post_from_target(t, "secret");
         let q = "/api/v1/share?account=a&service=onedrive&id=x&email=p%40e.com&role=write";
 
         let ch = mobile.route(&cap(q));
@@ -11666,14 +13922,19 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(spy.share_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let pat = j["pending_action_id"].as_str().unwrap().to_string();
 
-        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        assert_eq!(
+            mobile
+                .route(&cap(q).with_per_action_token(Some(pat.clone())))
+                .status,
+            403
+        );
         assert_eq!(
             spy.invite_calls.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
 
         assert!(mobile.confirm_biometric(&pat));
-        let ok = mobile.route(&cap(&format!("{q}&_pat={pat}")));
+        let ok = mobile.route(&cap(q).with_per_action_token(Some(pat.clone())));
         assert_eq!(ok.status, 200);
         assert_eq!(
             spy.invite_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -11681,7 +13942,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         assert_eq!(spy.share_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        assert_eq!(mobile.route(&cap(&format!("{q}&_pat={pat}"))).status, 403);
+        assert_eq!(
+            mobile
+                .route(&cap(q).with_per_action_token(Some(pat)))
+                .status,
+            403
+        );
         assert_eq!(
             spy.invite_calls.load(std::sync::atomic::Ordering::SeqCst),
             1
@@ -11701,7 +13967,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         let q = "/api/v1/share?account=a&service=onedrive&id=x&email=person%40example.com";
 
-        let resp = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let resp = router.route(&strict_scalar_post_from_target(q, "secret"));
 
         assert_eq!(resp.status, 500);
         let body = String::from_utf8_lossy(&resp.body);
@@ -11731,7 +13997,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         let q = "/api/v1/share?account=a&service=onedrive&id=x&email=p%40e.com";
 
-        let resp = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let resp = router.route(&strict_scalar_post_from_target(q, "secret"));
 
         assert_eq!(resp.status, 409);
         let body = String::from_utf8_lossy(&resp.body);
@@ -11744,7 +14010,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let router = router.with_restore(std::sync::Arc::new(OkRestore), "secret".into());
         let q = "/api/v1/restore?account=a&service=mail&id=m1";
 
-        let ok = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let ok = router.route(&strict_scalar_post_from_target(q, "secret"));
         assert_eq!(ok.status, 200);
 
         let audit =
@@ -11776,7 +14042,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let router = router.with_restore(std::sync::Arc::new(ErrRestore), "secret".into());
         let q = "/api/v1/restore?account=a&service=mail&id=m1";
 
-        let err = router.route(&ApiRequest::new("POST", q).with_cap_token(Some("secret".into())));
+        let err = router.route(&strict_scalar_post_from_target(q, "secret"));
         assert_eq!(err.status, 500);
         let body = String::from_utf8_lossy(&err.body);
         assert!(body.contains("restore_failed"));
@@ -11921,12 +14187,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             401,
             "correct header token must pass the gate"
         );
-        // Legacy `_st` query support remains accepted at the router gate.
+        // Query-string session credentials are rejected before routing.
         let ok_q = ApiRequest::get("/api/v1/status?_st=sess-tok-0001");
-        assert_ne!(
+        assert_eq!(
             r.route(&ok_q).status,
-            401,
-            "correct _st query token must pass the gate"
+            400,
+            "_st query token must be rejected"
         );
     }
 
@@ -12023,15 +14289,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             401
         );
-        let ok = router
-            .route(&ApiRequest::new("POST", "/api/v1/sync/pause").with_cap_token(Some("s".into())));
+        let ok = router.route(&strict_scalar_post_from_target("/api/v1/sync/pause", "s"));
         assert_eq!(ok.status, 200);
         assert!(m.is_paused());
-        router.route(
-            &ApiRequest::new("POST", "/api/v1/sync/resume").with_cap_token(Some("s".into())),
-        );
+        router.route(&strict_scalar_post_from_target("/api/v1/sync/resume", "s"));
         assert!(!m.is_paused());
-        router.route(&ApiRequest::new("POST", "/api/v1/sync/now").with_cap_token(Some("s".into())));
+        router.route(&strict_scalar_post_from_target("/api/v1/sync/now", "s"));
         assert!(m.triggered.load(std::sync::atomic::Ordering::SeqCst));
         // a router without a controller reports disabled and refuses the POST
         let ro = Router::new(Config::default());
@@ -12151,10 +14414,20 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         assert!(mock.cancelled.lock().unwrap().is_empty());
         // with the cap token → 200 and the handler ran once.
-        let ok = router.route(
-            &ApiRequest::new("POST", "/api/v1/onedrive/transfers/cancel?id=t1")
-                .with_cap_token(Some("cap".into())),
-        );
+        let transfer_request = |path: &str, suffix: u8, id: Option<&str>| {
+            let mut body = json!({
+                "request_id": format!("123e4567-e89b-42d3-a456-4266141740{suffix:02}")
+            });
+            if let Some(id) = id {
+                body["id"] = json!(id);
+            }
+            strict_json_post(path, body, Some("cap"))
+        };
+        let ok = router.route(&transfer_request(
+            "/api/v1/onedrive/transfers/cancel",
+            20,
+            Some("t1"),
+        ));
         assert_eq!(ok.status, 200);
         assert_eq!(body_json(&ok)["cancelled"], true);
         assert_eq!(*mock.cancelled.lock().unwrap(), vec!["t1"]);
@@ -12169,27 +14442,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             401
         );
-        let pok = router.route(
-            &ApiRequest::new("POST", "/api/v1/onedrive/transfers/pause?id=t1")
-                .with_cap_token(Some("cap".into())),
-        );
+        let pok = router.route(&transfer_request(
+            "/api/v1/onedrive/transfers/pause",
+            21,
+            Some("t1"),
+        ));
         assert_eq!(pok.status, 200);
         assert_eq!(body_json(&pok)["paused"], true);
         assert_eq!(*mock.paused.lock().unwrap(), vec!["t1"]);
-        let rok = router.route(
-            &ApiRequest::new("POST", "/api/v1/onedrive/transfers/retry?id=t1")
-                .with_cap_token(Some("cap".into())),
-        );
+        let rok = router.route(&transfer_request(
+            "/api/v1/onedrive/transfers/retry",
+            22,
+            Some("t1"),
+        ));
         assert_eq!(rok.status, 200);
         assert_eq!(body_json(&rok)["retried"], true);
         assert_eq!(*mock.retried.lock().unwrap(), vec!["t1"]);
         // missing id → 400.
         assert_eq!(
             router
-                .route(
-                    &ApiRequest::new("POST", "/api/v1/onedrive/transfers/pause")
-                        .with_cap_token(Some("cap".into()))
-                )
+                .route(&transfer_request(
+                    "/api/v1/onedrive/transfers/pause",
+                    23,
+                    None,
+                ))
                 .status,
             400
         );
@@ -12247,7 +14523,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     // cleanup) — cap-gate (401) / no-handler (404) / param (400) / dispatch.
     #[test]
     fn onedrive_manage_endpoints_cap_gate_and_dispatch() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
 
         // No handler wired -> every management route 404 (POST + the conflicts GET).
         let (_d0, r0) = setup();
@@ -12338,7 +14614,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     // and free-up do not (local-only, reversible).
     #[test]
     fn onedrive_manage_biometric_gating_on_mobile() {
-        let post = |t: &str| ApiRequest::new("POST", t).with_cap_token(Some("cap".into()));
+        let post = |t: &str| strict_scalar_post_from_target(t, "cap");
         let (_d, r) = setup();
         let m = std::sync::Arc::new(MockManage::default());
         let mobile = r
@@ -12421,19 +14697,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // Each action still succeeds with its own token.
         assert_eq!(
             router
-                .route(
-                    &ApiRequest::new("POST", restore_q)
-                        .with_cap_token(Some("restore-secret".into()))
-                )
+                .route(&strict_scalar_post_from_target(restore_q, "restore-secret"))
                 .status,
             200
         );
         assert_eq!(
             router
-                .route(
-                    &ApiRequest::new("POST", "/api/v1/sync/pause")
-                        .with_cap_token(Some("sync-secret".into()))
-                )
+                .route(&strict_scalar_post_from_target(
+                    "/api/v1/sync/pause",
+                    "sync-secret",
+                ))
                 .status,
             200
         );
@@ -13760,5 +16033,313 @@ Content-Type: text/html; charset=utf-8\r\n\
                 .status,
             405
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingMutationIntents {
+        creates: std::sync::Mutex<Vec<MutationIntentCreate>>,
+        chunks: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl MutationIntentHandler for RecordingMutationIntents {
+        fn create(&self, request: MutationIntentCreate) -> Result<MutationIntentInfo, String> {
+            self.creates.lock().unwrap().push(request);
+            Ok(MutationIntentInfo {
+                intent_id: "intent_fixture".into(),
+                chunk_bytes: MUTATION_CHUNK_BYTES,
+                expires_at_ms: 10_000,
+            })
+        }
+
+        fn put_chunk(&self, chunk: MutationIntentChunk) -> Result<(), String> {
+            self.chunks.lock().unwrap().push(chunk.bytes);
+            Ok(())
+        }
+
+        fn commit(
+            &self,
+            _owner: &str,
+            _request_id: &str,
+            _intent_id: &str,
+            _total_bytes: u64,
+            _sha256: &str,
+        ) -> Result<Value, String> {
+            Ok(json!({"ok": true}))
+        }
+
+        fn cancel(&self, _owner: &str, _request_id: &str, _intent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn mutation_request(path: &str, body: Value) -> ApiRequest {
+        ApiRequest::new("POST", path)
+            .with_session_token(Some("session".into()))
+            .with_cap_token(Some("mutation-cap".into()))
+            .with_content_type(Some("application/json; charset=utf-8".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
+    #[test]
+    fn mutation_intent_routes_require_session_cap_and_strict_json() {
+        let handler = std::sync::Arc::new(RecordingMutationIntents::default());
+        let router = Router::new(Config::default())
+            .with_session_token("session".into())
+            .with_mutation_intents(handler.clone(), "mutation-cap".into());
+        let body = json!({
+            "request_id": "019f0000-0000-4000-8000-000000000201",
+            "purpose": "onedrive_upload",
+            "metadata": {"account": "controlled", "parent": "root", "name": "fixture.bin"},
+            "total_bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        });
+        let missing_session = ApiRequest::new("POST", "/api/v1/mutation-intent/create")
+            .with_cap_token(Some("mutation-cap".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap());
+        assert_eq!(router.route(&missing_session).status, 401);
+        let missing_cap = ApiRequest::new("POST", "/api/v1/mutation-intent/create")
+            .with_session_token(Some("session".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap());
+        assert_eq!(router.route(&missing_cap).status, 401);
+        let mut extra = body.clone();
+        extra["url"] = json!("https://forbidden.invalid");
+        assert_eq!(
+            router
+                .route(&mutation_request("/api/v1/mutation-intent/create", extra))
+                .status,
+            400
+        );
+        assert_eq!(handler.creates.lock().unwrap().len(), 0);
+        let nested_duplicate = ApiRequest::new("POST", "/api/v1/mutation-intent/create")
+            .with_session_token(Some("session".into()))
+            .with_cap_token(Some("mutation-cap".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(
+                br#"{"request_id":"019f0000-0000-4000-8000-000000000204","purpose":"onedrive_upload","metadata":{"account":"controlled","account":"other","parent":"root","name":"fixture.bin"},"total_bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#.to_vec(),
+            );
+        assert_eq!(router.route(&nested_duplicate).status, 400);
+        assert_eq!(handler.creates.lock().unwrap().len(), 0);
+        let response = router.route(&mutation_request("/api/v1/mutation-intent/create", body));
+        assert_eq!(response.status, 200);
+        assert_eq!(handler.creates.lock().unwrap().len(), 1);
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("cache-control")
+                    && value == "no-store")
+        );
+    }
+
+    #[test]
+    fn mutation_intent_largest_chunk_fits_bridge_envelope_and_oversize_is_rejected() {
+        use base64::Engine as _;
+        let handler = std::sync::Arc::new(RecordingMutationIntents::default());
+        let router = Router::new(Config::default())
+            .with_session_token("session".into())
+            .with_mutation_intents(handler.clone(), "mutation-cap".into());
+        let bytes = vec![0x5a; MUTATION_CHUNK_BYTES];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let body = json!({
+            "request_id": "019f0000-0000-4000-8000-000000000202",
+            "intent_id": "intent_fixture",
+            "index": 0,
+            "offset": 0,
+            "data_base64": encoded,
+            "chunk_sha256": "1f763e7e3b4935be8bf981d803d1ef7a2ec5e5ad1bd45609e694ce71dbd77794"
+        });
+        let serialized = serde_json::to_vec(&body).unwrap();
+        assert!(serialized.len() < 16 * 1024);
+        let response = router.route(&mutation_request("/api/v1/mutation-intent/chunk", body));
+        assert_eq!(response.status, 200);
+        assert_eq!(handler.chunks.lock().unwrap().as_slice(), &[bytes]);
+
+        let oversized = vec![0x5a; MUTATION_CHUNK_BYTES + 1];
+        let response = router.route(&mutation_request(
+            "/api/v1/mutation-intent/chunk",
+            json!({
+                "request_id": "019f0000-0000-4000-8000-000000000203",
+                "intent_id": "intent_fixture",
+                "index": 0,
+                "offset": 0,
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(oversized),
+                "chunk_sha256": "1f763e7e3b4935be8bf981d803d1ef7a2ec5e5ad1bd45609e694ce71dbd77794"
+            }),
+        ));
+        assert_eq!(response.status, 400);
+        assert_eq!(handler.chunks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mutation_intent_create_requires_mobile_presence_before_accepting_chunks() {
+        let handler = std::sync::Arc::new(RecordingMutationIntents::default());
+        let router = Router::new(Config::default())
+            .with_session_token("session".into())
+            .with_mutation_intents(handler.clone(), "mutation-cap".into())
+            .with_biometric_gate();
+        let body = json!({
+            "request_id": "019f0000-0000-4000-8000-000000000204",
+            "purpose": "onedrive_upload",
+            "metadata": {"account": "controlled", "parent": "root", "name": "fixture.bin"},
+            "total_bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        });
+        let storage_low = router.route(&mutation_request(
+            "/api/v1/mutation-intent/create",
+            body.clone(),
+        ));
+        assert_eq!(storage_low.status, 507);
+        assert_eq!(handler.creates.lock().unwrap().len(), 0);
+        let response = router.route(
+            &mutation_request("/api/v1/mutation-intent/create", body.clone())
+                .with_storage_not_low(Some(true)),
+        );
+        assert_eq!(response.status, 200);
+        let pending = body_json(&response)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(handler.creates.lock().unwrap().len(), 0);
+        assert!(router.confirm_biometric(&pending));
+        let response = router.route(
+            &mutation_request("/api/v1/mutation-intent/create", body)
+                .with_storage_not_low(Some(true))
+                .with_per_action_token(Some(pending)),
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(handler.creates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_session_route_gate_matrix_requires_session_and_agent_cap() {
+        user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store();
+    }
+
+    #[test]
+    fn agent_session_route_gate_matrix_enforces_user_presence_variants() {
+        user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store();
+    }
+
+    #[test]
+    fn user_presence_start_confirm_contract_executes_archive_reveal_and_import() {
+        user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store();
+    }
+
+    #[test]
+    fn user_presence_operation_routes_reject_missing_or_unconfirmed_operation_id() {
+        user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store();
+    }
+
+    #[test]
+    fn android_user_presence_confirm_requires_armed_public_handle() {
+        mobile_agent_confirm_requires_biometric_before_agent_token_consumption();
+        mobile_agent_confirm_after_biometric_consumes_agent_token_once();
+    }
+
+    #[test]
+    fn per_action_header_without_armed_registry_entry_has_no_authority() {
+        mobile_agent_confirm_wrong_biometric_token_does_not_consume_agent_pending();
+    }
+
+    #[test]
+    fn per_action_token_is_header_only_and_case_normalized() {
+        biometric_gate_challenges_and_consumes_a_per_action_token();
+        let source = include_str!("app.js");
+        assert!(!source.contains("_pat="));
+        assert!(source.contains("X-Per-Action-Token"));
+    }
+
+    #[test]
+    fn largest_bridge_chunk_fits_actual_16k_envelope() {
+        mutation_intent_largest_chunk_fits_bridge_envelope_and_oversize_is_rejected();
+    }
+
+    #[test]
+    fn mutation_intent_requires_storage_not_low_and_reserved_free_space() {
+        mutation_intent_create_requires_mobile_presence_before_accepting_chunks();
+    }
+
+    #[test]
+    fn strict_json_rejects_recursive_duplicate_keys_and_trailing_data() {
+        let router = Router::new(Config::default())
+            .with_session_token("session".into())
+            .with_mutation_intents(
+                std::sync::Arc::new(RecordingMutationIntents::default()),
+                "mutation-cap".into(),
+            );
+        let request = ApiRequest::new("POST", "/api/v1/mutation-intent/create")
+            .with_content_type(Some("application/json".into()))
+            .with_session_token(Some("session".into()))
+            .with_cap_token(Some("mutation-cap".into()))
+            .with_storage_not_low(Some(true))
+            .with_body(
+                br#"{"request_id":"019f0000-0000-4000-8000-000000000240","purpose":"onedrive_upload","metadata":{"account":"a","account":"b","parent":"root","name":"x"},"total_bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"} trailing"#.to_vec(),
+            );
+        assert_eq!(router.route(&request).status, 400);
+    }
+
+    #[test]
+    fn api_responses_are_no_store() {
+        status_carries_no_store_and_no_secrets();
+        agent_oauth_logout_response_is_no_store_and_closed_schema_only();
+        static_assets_carry_correct_type_and_no_store();
+    }
+
+    #[test]
+    fn mail_onenote_push_and_agent_secrets_are_absent_from_urls() {
+        let source = include_str!("app.js");
+        for forbidden in [
+            "_st=",
+            "_pat=",
+            "prompt=",
+            "recipients=",
+            "pairing_code=",
+            "push_token=",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "URL secret marker: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_session_token_is_absent_from_html_js_logs_and_errors() {
+        let source = include_str!("app.js");
+        assert!(!source.contains("isy_session="));
+        assert!(!source.contains("X-Session-Token"));
+        assert!(!source.contains("_st="));
+    }
+
+    #[test]
+    fn errors_do_not_echo_body_query_or_header_values() {
+        let sentinel = "redaction-fixture-628";
+        let route = format!("/api/v1/nope?value={sentinel}");
+        let request = ApiRequest::new("POST", &route)
+            .with_body(sentinel.as_bytes().to_vec())
+            .with_session_token(Some(sentinel.into()))
+            .with_cap_token(Some(sentinel.into()))
+            .with_per_action_token(Some(sentinel.into()));
+        let debug = format!("{request:?}");
+        let response = Router::new(Config::default()).route(&request);
+        assert!(!debug.contains(sentinel));
+        assert!(!String::from_utf8_lossy(&response.body).contains(sentinel));
+    }
+
+    #[test]
+    fn agent_post_routes_require_one_canonical_request_id() {
+        assert!(valid_client_request_id(
+            "123e4567-e89b-42d3-a456-426614174000"
+        ));
+        for invalid in [
+            "",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "123E4567-E89B-42D3-A456-426614174000",
+            "123e4567-e89b-42d3-c456-426614174000",
+        ] {
+            assert!(!valid_client_request_id(invalid));
+        }
     }
 }

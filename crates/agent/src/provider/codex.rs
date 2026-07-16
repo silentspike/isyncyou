@@ -297,6 +297,15 @@ mod live {
             history: &[Message],
             emit: &mut dyn FnMut(StreamEvent),
         ) -> Result<Vec<AssistantBlock>, AgentError> {
+            self.next_cancellable(history, emit, None)
+        }
+
+        fn next_cancellable(
+            &mut self,
+            history: &[Message],
+            emit: &mut dyn FnMut(StreamEvent),
+            cancellation: Option<&crate::CancellationToken>,
+        ) -> Result<Vec<AssistantBlock>, AgentError> {
             // #639: attest THIS round's request, then send only the attested object.
             let attested = crate::provider::build_attested_provider_request(
                 crate::provider::ProviderRequestBinding::Codex {
@@ -314,19 +323,28 @@ mod live {
             let mut usage = Usage::default();
             let mut failure: Option<String> = None;
             let mut parse_error: Option<AgentError> = None;
-            let response = self.http.post_attested_sse(&attested, &mut |event| {
-                if parse_error.is_some() {
-                    return false;
-                }
-                let advances_turn = sse_event_advances_turn(&event.data);
-                match apply_sse_event(&event.data, &mut text, &mut tools, &mut usage, &mut failure)
-                {
-                    Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
-                    Ok(None) => {}
-                    Err(e) => parse_error = Some(e),
-                }
-                advances_turn
-            })?;
+            let response = self.http.post_attested_sse_cancellable(
+                &attested,
+                &mut |event| {
+                    if parse_error.is_some() {
+                        return false;
+                    }
+                    let advances_turn = sse_event_advances_turn(&event.data);
+                    match apply_sse_event(
+                        &event.data,
+                        &mut text,
+                        &mut tools,
+                        &mut usage,
+                        &mut failure,
+                    ) {
+                        Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                        Ok(None) => {}
+                        Err(e) => parse_error = Some(e),
+                    }
+                    advances_turn
+                },
+                cancellation,
+            )?;
             if response.status == 401 || response.status == 403 {
                 return Err(AgentError::Provider(
                     "codex: unauthorized — connect ChatGPT again".into(),

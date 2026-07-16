@@ -322,6 +322,15 @@ impl LlmProvider for SubscriptionProvider {
         history: &[Message],
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<Vec<AssistantBlock>, AgentError> {
+        self.next_cancellable(history, emit, None)
+    }
+
+    fn next_cancellable(
+        &mut self,
+        history: &[Message],
+        emit: &mut dyn FnMut(StreamEvent),
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Result<Vec<AssistantBlock>, AgentError> {
         // #639: build + attest the exact request for THIS round's history, then send only the
         // attested object — the transport's product path accepts nothing un-attested.
         let attested = crate::provider::build_attested_provider_request(
@@ -339,18 +348,22 @@ impl LlmProvider for SubscriptionProvider {
         )?;
         let mut state = ClaudeStreamState::default();
         let mut parse_error: Option<AgentError> = None;
-        let response = self.http.post_attested_sse(&attested, &mut |event| {
-            if parse_error.is_some() {
-                return false;
-            }
-            let advances_turn = sse_event_advances_turn(&event.data);
-            match apply_claude_sse_event(&event.data, &mut state) {
-                Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
-                Ok(None) => {}
-                Err(e) => parse_error = Some(e),
-            }
-            advances_turn
-        })?;
+        let response = self.http.post_attested_sse_cancellable(
+            &attested,
+            &mut |event| {
+                if parse_error.is_some() {
+                    return false;
+                }
+                let advances_turn = sse_event_advances_turn(&event.data);
+                match apply_claude_sse_event(&event.data, &mut state) {
+                    Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                    Ok(None) => {}
+                    Err(e) => parse_error = Some(e),
+                }
+                advances_turn
+            },
+            cancellation,
+        )?;
         if response.status == 401 || response.status == 403 {
             return Err(AgentError::Provider(
                 "subscription: unauthorized — connect Claude again".into(),
