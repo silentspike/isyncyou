@@ -8123,12 +8123,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         ))]
         {
             let account = self.product_session_account()?;
-            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, account)
-                .map_err(|_| "session_transport_unavailable".to_string())?;
             let store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
             let session = product_session::ProductSessionRegistry::new(&store).create(
-                &token,
                 account,
                 request_id,
                 display_name,
@@ -8216,6 +8213,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .map_err(|_| "session_store_unavailable".to_string())?;
             let registry = product_session::ProductSessionRegistry::new(&store);
             let account = registry.account_for(session_id)?;
+            if registry.remote_initialization_pending(session_id)? {
+                return Ok(serde_json::json!({
+                    "records": [],
+                    "next_cursor": null,
+                }));
+            }
             let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
                 .map_err(|_| "session_transport_unavailable".to_string())?;
             let page = registry
@@ -8525,6 +8528,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let account = registry.account_for(payload.session_id.as_str())?;
             let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
                 .map_err(|_| "pairing_transport_unavailable".to_string())?;
+            registry.ensure_remote_session(&token, payload.session_id.as_str())?;
             isyncyou_agent::OneDrivePairingTransportV2::new(token)
                 .create_or_adopt(&source)
                 .map_err(|error| error.to_string())?;
@@ -14238,6 +14242,28 @@ mod tests {
         assert!(spawn < manifest);
         assert!(manifest < response);
         assert!(function[..spawn].find("begin_turn").is_none());
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_session_create_never_waits_for_graph_before_turn_reservation() {
+        let source = include_str!("lib.rs");
+        let function = source
+            .split("impl isyncyou_webui::AgentHandler for DaemonAgent {")
+            .nth(1)
+            .expect("AgentHandler implementation")
+            .split("fn session_create(")
+            .nth(1)
+            .expect("session_create implementation")
+            .split("fn session_list(")
+            .next()
+            .expect("session_create boundary");
+        assert!(function.contains("ProductSessionRegistry::new(&store).create"));
+        assert!(!function.contains("resolve_cached_sync_token"));
+        assert!(!function.contains("OneDriveSessionV2Transport"));
     }
 
     #[test]

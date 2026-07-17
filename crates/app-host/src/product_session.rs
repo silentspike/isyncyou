@@ -41,6 +41,10 @@ struct ProductSessionStoredSummaryV1 {
     created_at_ms: u64,
     archived: bool,
     local_account: String,
+    // Missing means the record predates local-first creation. Those sessions were
+    // created remotely before the local index was committed.
+    #[serde(default)]
+    remote_initialized: Option<bool>,
 }
 
 impl ProductSessionStoredSummaryV1 {
@@ -117,7 +121,10 @@ impl ProductSessionIndexV1 {
         let mut request_ids = std::collections::BTreeSet::new();
         for receipt in &self.request_receipts {
             if !request_ids.insert(receipt.request_id.as_str())
-                || !matches!(receipt.route.as_str(), "create" | "select" | "import")
+                || !matches!(
+                    receipt.route.as_str(),
+                    "create" | "select" | "import" | "archive"
+                )
                 || receipt.payload_digest.len() != 43
                 || !ids.contains(receipt.session_id.as_str())
             {
@@ -821,7 +828,6 @@ impl<'a> ProductSessionRegistry<'a> {
 
     pub fn create(
         &self,
-        graph_token: &str,
         local_account: &str,
         request_id: &str,
         display_name: Option<&str>,
@@ -857,10 +863,6 @@ impl<'a> ProductSessionRegistry<'a> {
             SessionId::new(&session_id).map_err(|_| "session_store_unavailable")?,
         )
         .map_err(|_| "session_store_unavailable")?;
-        OneDriveSessionV2Transport::new(graph_token, &session_id)
-            .map_err(map_session_error)?
-            .create_session()
-            .map_err(map_session_error)?;
         self.store
             .put_bounded(
                 SecretClass::SessionPairingKey,
@@ -880,6 +882,7 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             archived: false,
             local_account: local_account.to_owned(),
+            remote_initialized: Some(false),
         };
         index.sessions.push(summary.clone());
         index.request_receipts.push(ProductSessionRequestReceiptV1 {
@@ -1122,6 +1125,9 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             archived: false,
             local_account: local_account.to_owned(),
+            // Pairing reveal ensures the source manifest exists before exposing
+            // the transfer code, so an imported session can read it immediately.
+            remote_initialized: Some(true),
         };
         index.sessions.push(summary.clone());
         index.selected_session_id = Some(session_id.to_owned());
@@ -1178,6 +1184,43 @@ impl<'a> ProductSessionRegistry<'a> {
         Ok(SessionV2Store::new(transport, &cursor_key, object_crypto))
     }
 
+    pub fn remote_initialization_pending(&self, session_id: &str) -> Result<bool, String> {
+        self.load_index()?
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id && !session.archived)
+            .map(|session| session.remote_initialized == Some(false))
+            .ok_or_else(|| "session_not_found".into())
+    }
+
+    pub fn ensure_remote_session(
+        &self,
+        graph_token: &str,
+        session_id: &str,
+    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        let session = self.open(graph_token, session_id)?;
+        if !self.remote_initialization_pending(session_id)? {
+            return Ok(session);
+        }
+        OneDriveSessionV2Transport::new(graph_token, session_id)
+            .map_err(map_session_error)?
+            .create_session()
+            .map_err(map_session_error)?;
+        let mut index = self.load_index()?;
+        let stored = index
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id && !session.archived)
+            .ok_or_else(|| "session_not_found".to_string())?;
+        stored.remote_initialized = Some(true);
+        index.generation = index
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "session_store_unavailable".to_string())?;
+        self.save_index(&index)?;
+        Ok(session)
+    }
+
     pub fn begin_turn(&self, request: ProductTurnRequest<'_>) -> Result<ProductTurnStart, String> {
         let ProductTurnRequest {
             graph_token,
@@ -1190,7 +1233,10 @@ impl<'a> ProductSessionRegistry<'a> {
             installation_principal,
             created_at_ms,
         } = request;
-        let store = self.open(graph_token, session_id)?;
+        // This runs only in the admission worker. The route has already returned
+        // the deterministic turn ID, so Graph manifest creation cannot delay the
+        // user's acknowledgement of the turn.
+        let store = self.ensure_remote_session(graph_token, session_id)?;
         let context_records = store
             .recent_visible_records(session_id, 128)
             .map_err(map_session_error)?
@@ -1688,6 +1734,7 @@ mod tests {
             created_at_ms,
             archived: false,
             local_account: account.into(),
+            remote_initialized: None,
         });
         index.selected_session_id = Some(session_id.into());
         index.generation += 1;
@@ -1705,6 +1752,51 @@ mod tests {
         let public = serde_json::to_string(&summary).unwrap();
         assert!(!public.contains("private-local-account"));
         assert!(!public.contains("local_account"));
+    }
+
+    #[test]
+    fn product_session_create_is_local_and_defers_remote_manifest() {
+        let root = temp_root("local-create");
+        let store = credential_store(&root);
+        let registry = ProductSessionRegistry::new(&store);
+        let session = registry
+            .create(
+                "me",
+                "123e4567-e89b-42d3-a456-426614174000",
+                Some("Assistant"),
+                1,
+            )
+            .unwrap();
+
+        assert!(registry
+            .remote_initialization_pending(&session.session_id)
+            .unwrap());
+        assert_eq!(
+            registry
+                .list_page("me", None, Some(1))
+                .unwrap()
+                .selected_session_id,
+            Some(session.session_id)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn product_session_index_accepts_durable_archive_receipt() {
+        let root = temp_root("archive-receipt");
+        let store = credential_store(&root);
+        let registry = ProductSessionRegistry::new(&store);
+        insert_session(&registry, "01J00000000000000000000000", "me", 1);
+        let mut index = registry.load_index().unwrap();
+        index.request_receipts.push(ProductSessionRequestReceiptV1 {
+            request_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+            route: "archive".into(),
+            payload_digest: payload_digest(&"01J00000000000000000000000").unwrap(),
+            session_id: "01J00000000000000000000000".into(),
+        });
+        registry.save_index(&index).unwrap();
+        assert_eq!(registry.load_index().unwrap(), index);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
