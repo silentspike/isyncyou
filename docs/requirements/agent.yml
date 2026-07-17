@@ -195,7 +195,7 @@ requirements:
       - test: product_oauth_config_rejects_endpoint_client_scope_override
       - test: claude_sse_event_returns_text_delta_immediately
       - test: apply_sse_event_returns_text_delta_immediately
-      - test: build_request_uses_responses_shape_with_instructions_and_tool
+      - test: build_request_uses_responses_lite_shape_for_current_models
       - test: claude_billing_block_remains_first_and_unchanged
       - test: codex_subscription_identity_envelope_remains_unchanged
       - test: custom_harness_replaces_only_non_auth_non_billing_sections
