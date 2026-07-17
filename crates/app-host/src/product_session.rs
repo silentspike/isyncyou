@@ -323,7 +323,7 @@ impl ProductTurnRuntime {
         ];
         let tombstone = self.terminal_tombstone(TurnTerminalStatus::Complete, &visible_records)?;
         self.guard
-            .publish_terminal_compacted(visible_records, &self.request_id, tombstone)
+            .publish_terminal(visible_records, &self.request_id, tombstone)
             .map_err(map_session_error)?;
         Ok(())
     }
@@ -351,7 +351,7 @@ impl ProductTurnRuntime {
         }];
         let tombstone = self.terminal_tombstone(status, &visible_records)?;
         self.guard
-            .publish_terminal_compacted(visible_records, &self.request_id, tombstone)
+            .publish_terminal(visible_records, &self.request_id, tombstone)
             .map_err(map_session_error)?;
         Ok(())
     }

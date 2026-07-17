@@ -1661,6 +1661,43 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         }
     }
 
+    /// Publish the user-visible terminal records and authoritative idempotency
+    /// tombstone in one manifest CAS without scanning historical request state.
+    /// Recovery-payload compaction is a separate maintenance operation because
+    /// it may require bounded reads of older index pages and objects.
+    pub fn publish_terminal(
+        &self,
+        visible_records: Vec<SessionRecordV2>,
+        request_id: &str,
+        tombstone: IdempotencyTombstoneV1,
+    ) -> Result<(), SessionV2Error> {
+        if visible_records.is_empty()
+            || !valid_uuid_v4(request_id)
+            || tombstone.tombstone_version != 1
+            || visible_records
+                .iter()
+                .any(|record| record.request_id != request_id)
+        {
+            return Err(SessionV2Error::InvalidRecord);
+        }
+        let session_id = visible_records[0].session_id.as_str();
+        if tombstone.session_scope != session_id
+            || visible_records
+                .iter()
+                .any(|record| record.session_id != session_id)
+        {
+            return Err(SessionV2Error::InvalidRecord);
+        }
+        let tombstone_id = crate::session::new_ulid().map_err(|_| SessionV2Error::InvalidRecord)?;
+        let tombstone_bytes =
+            serde_json::to_vec(&tombstone).map_err(|_| SessionV2Error::InvalidRecord)?;
+        self.publish(SessionCommitV1 {
+            visible_records,
+            request_objects: vec![(tombstone_id, tombstone_bytes)],
+            uuid_bindings: vec![],
+        })
+    }
+
     pub fn reap_orphans(&self) -> Result<usize, SessionV2Error> {
         let now = fresh_server_time(&self.store.transport)?;
         let Some(cutoff) = now.checked_sub(ORPHAN_RETENTION_MS) else {
@@ -4065,6 +4102,88 @@ mod tests {
         assert!(replay.journal.is_none());
         assert!(replay.outcomes.is_empty());
         assert_eq!(replay.visible_records.len(), 3);
+    }
+
+    #[test]
+    fn terminal_publication_does_not_scan_historical_request_objects() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[6; 32], object_crypto());
+        let request_binding = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            "s",
+            RID,
+            payload_digest(&("account", "prompt")).unwrap(),
+        )
+        .unwrap();
+        let journal = RequestJournalV1 {
+            journal_version: REQUEST_JOURNAL_VERSION,
+            session_id: "s".into(),
+            request_id: RID.into(),
+            turn_id: ULID_A.into(),
+            provider_binding: binding(),
+            phase: RequestPhase::ProviderStepCompleted,
+            next_step_seq: 0,
+            completed_steps: vec![],
+            read_checkpoints: vec![],
+        };
+        store
+            .publish(
+                &current,
+                SessionCommitV1 {
+                    visible_records: vec![],
+                    request_objects: vec![(ULID_B.into(), serde_json::to_vec(&journal).unwrap())],
+                    uuid_bindings: vec![request_binding.clone()],
+                },
+            )
+            .unwrap();
+
+        let guard = store.acquire_lease("s", "lease-a", "holder-a").unwrap();
+        let terminal_lease = guard.binding().unwrap();
+        let mut assistant = assistant_record("0000000000000000000000000D", ULID_A, RID, "answer");
+        assistant.lease = terminal_lease.clone();
+        let mut terminal = record("0000000000000000000000000E", ULID_A, RID, "placeholder");
+        terminal.kind = SessionRecordKind::TurnTerminal {
+            status: TurnTerminalStatus::Complete,
+            error_code: None,
+        };
+        terminal.lease = terminal_lease;
+        let visible_records = vec![assistant, terminal];
+        let tombstone = IdempotencyTombstoneV1 {
+            tombstone_version: 1,
+            route_domain: RequestRouteDomain::AgentTurn.canonical().into(),
+            session_scope: "s".into(),
+            request_key: request_binding.request_key.clone(),
+            payload_digest: request_binding.payload_digest.clone(),
+            terminal_status: TurnTerminalStatus::Complete,
+            public_result_digest: request_object_digest(
+                &serde_json::to_vec(&visible_records).unwrap(),
+            ),
+            visible_record_ids: visible_records
+                .iter()
+                .map(|record| record.record_id.clone())
+                .collect(),
+        };
+
+        transport.reset_immutable_load_counts();
+        guard
+            .publish_terminal(visible_records, RID, tombstone.clone())
+            .unwrap();
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::RequestState),
+            0
+        );
+        drop(guard);
+
+        let replay = store
+            .request_replay("s", &request_binding)
+            .unwrap()
+            .expect("terminal replay");
+        assert_eq!(replay.tombstone, Some(tombstone));
+        assert!(replay.journal.is_none());
+        assert!(replay.outcomes.is_empty());
+        assert_eq!(replay.visible_records.len(), 2);
     }
 
     #[test]
