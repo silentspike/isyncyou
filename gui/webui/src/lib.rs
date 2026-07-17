@@ -13412,6 +13412,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "const st = await api(\"/api/v1/agent/status\");",
             "rememberAssistantStatus(st);",
             "renderAssistantView($(\"#view\"));",
+            "let ASSISTANT_RENDER_SEQUENCE = 0;",
+            "const previousStatus = AssistantState.status;",
+            "st = previousStatus && Object.keys(previousStatus).length ? previousStatus : {};",
+            "if (renderSequence !== ASSISTANT_RENDER_SEQUENCE || App.route !== \"assistant\") return;",
+            "data-agent-status-unavailable",
         ] {
             assert!(
                 APP_JS.contains(needle),

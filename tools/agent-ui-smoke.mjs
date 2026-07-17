@@ -643,6 +643,11 @@ async function main() {
       const nativeFetch = window.fetch;
       window.fetch = (...args) => {
         record("fetch", args[0]);
+        const requestUrl = new URL(String(args[0]), location.href);
+        if (window.__agentSmokeFailNextStatus && requestUrl.pathname === "/api/v1/agent/status") {
+          window.__agentSmokeFailNextStatus = false;
+          return Promise.reject(new Error("fixture status unavailable"));
+        }
         return nativeFetch(...args);
       };
       const nativeOpen = XMLHttpRequest.prototype.open;
@@ -833,6 +838,17 @@ async function main() {
     });
     assert(evidence, "handoff DOM console and storage exclude capability and attempt secrets",
       !secretSurfaceText.includes(AGENT_CAP) && !secretSurfaceText.includes("fixture-attempt-"));
+
+    await page.evaluate(() => {
+      window.__agentSmokeFailNextStatus = true;
+      return renderAssistantView(document.querySelector("#view"));
+    });
+    await page.waitForSelector('[data-agent-status-unavailable="1"]', { timeout: 10000 });
+    assert(evidence, "transient status failure preserves the last verified connected surface",
+      await page.locator('[data-testid="agent-transcript"]').isVisible()
+      && await page.locator('[data-testid="agent-setup"]').count() === 0);
+    await page.locator('[data-agent-status-unavailable="1"]').getByRole("button", { name: "Retry" }).click();
+    await page.waitForFunction(() => !document.querySelector('[data-agent-status-unavailable="1"]'));
 
     fixture.failNextSessionCreate();
     await page.locator('[data-testid="agent-input"]').fill("Check shared session storage");

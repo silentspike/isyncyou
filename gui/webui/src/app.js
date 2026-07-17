@@ -5434,7 +5434,10 @@ function renderAssistantConsentPanel(providers) {
         icon("x", "icon-sm"), "Reset")));
 }
 
+let ASSISTANT_RENDER_SEQUENCE = 0;
 async function renderAssistantView(view) {
+  const renderSequence = ++ASSISTANT_RENDER_SEQUENCE;
+  const previousStatus = AssistantState.status;
   clear(view).append(
     el("section", { id: "assistant-view", class: "assistant-view", "data-testid": "assistant-view" },
       el("h1", { class: "view-title", text: "Assistant" }),
@@ -5445,10 +5448,15 @@ async function renderAssistantView(view) {
   body.append(el("div", { class: "assistant-loading" },
     el("div", { class: "skel", style: "height:20px;width:50%" })));
   let st = {};
+  let statusRefreshFailed = false;
   try {
     st = await api("/api/v1/agent/status");
     st = await refreshAssistantCredentialIfRequired(st);
-  } catch (_) { st = {}; }
+  } catch (_) {
+    statusRefreshFailed = true;
+    st = previousStatus && Object.keys(previousStatus).length ? previousStatus : {};
+  }
+  if (renderSequence !== ASSISTANT_RENDER_SEQUENCE || App.route !== "assistant") return;
   rememberAssistantStatus(st);
   let selectedSession = null;
   if (assistantSelectedReady(st)) {
@@ -5460,6 +5468,18 @@ async function renderAssistantView(view) {
   // presence. The manual code step keys off the in-flight attempt + the per-provider onboarding state.
   if (assistantSelectedReady(st)) renderAssistantChat(body, st);
   else renderAssistantWizard(body, st);
+  if (statusRefreshFailed && Object.keys(st).length) {
+    body.prepend(el("div", {
+      class: "assistant-consent",
+      "data-agent-status-unavailable": "1",
+    },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Status refresh unavailable" }),
+      el("p", { class: "dim", text: "The last verified assistant state is shown." })),
+    el("div", { class: "assistant-consent-actions" },
+      el("button", { class: "btn sm", type: "button", onclick: () => renderAssistantView($("#view")) },
+        icon("refresh-cw", "icon-sm"), "Retry"))));
+  }
   if (selectedSession && AssistantState.sessionHydratedId !== selectedSession.session_id) {
     void hydrateAgentSession(selectedSession.session_id).then(() => {
       if (App.route === "assistant"
