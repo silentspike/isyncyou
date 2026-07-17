@@ -206,6 +206,67 @@ impl ProductTurnRuntime {
         }
     }
 
+    fn persist_provider_step_outcome(
+        &mut self,
+        step_seq: u8,
+        normalized_blocks: Vec<NormalizedAssistantBlock>,
+        final_text: Option<String>,
+        terminal_validation_error: Option<String>,
+    ) -> Result<(), isyncyou_agent::AgentError> {
+        let outcome_id = new_ulid().map_err(|_| {
+            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
+        })?;
+        let outcome = RequestStepOutcomeV1 {
+            outcome_version: 1,
+            outcome_id: outcome_id.clone(),
+            step_seq,
+            previous_outcome_id: self
+                .journal
+                .completed_steps
+                .last()
+                .map(|step| step.outcome_id.clone()),
+            provider: self.provider_binding.provider,
+            model: self.provider_binding.model.clone(),
+            normalized_blocks,
+            final_text,
+            sanitized_usage: None,
+            terminal_validation_error,
+            outcome_digest: String::new(),
+        }
+        .seal_digest()
+        .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))?;
+        let outcome_bytes = serde_json::to_vec(&outcome).map_err(|_| {
+            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
+        })?;
+        self.journal.completed_steps.push(RequestStepRef {
+            step_seq,
+            outcome_id: outcome_id.clone(),
+            outcome_sha256: request_object_digest(&outcome_bytes),
+        });
+        self.journal.next_step_seq = step_seq
+            .checked_add(1)
+            .ok_or_else(|| isyncyou_agent::AgentError::Provider("turn_step_invalid".into()))?;
+        self.journal.phase = RequestPhase::ProviderStepCompleted;
+        let journal_id = new_ulid().map_err(|_| {
+            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
+        })?;
+        self.guard
+            .publish(SessionCommitV1 {
+                visible_records: vec![],
+                request_objects: vec![
+                    (outcome_id, outcome_bytes),
+                    (
+                        journal_id,
+                        serde_json::to_vec(&self.journal).map_err(|_| {
+                            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
+                        })?,
+                    ),
+                ],
+                uuid_bindings: vec![],
+            })
+            .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))
+    }
+
     pub fn finish_final(
         self,
         text: String,
@@ -639,6 +700,31 @@ impl TurnObserver for ProductTurnRuntime {
                 "turn_outcome_unknown".into(),
             ));
         }
+        let mut step_tool_use_ids = std::collections::BTreeSet::new();
+        let invalid_tool_use_id = blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantBlock::ToolUse { id, .. } => Some(id),
+                AssistantBlock::Text(_) => None,
+            })
+            .any(|id| {
+                id.is_empty()
+                    || id.len() > 128
+                    || self.seen_tool_use_ids.contains(id)
+                    || !step_tool_use_ids.insert(id.clone())
+            });
+        if invalid_tool_use_id {
+            self.persist_provider_step_outcome(
+                step_seq,
+                Vec::new(),
+                None,
+                Some("duplicate_tool_use_id".into()),
+            )?;
+            return Err(isyncyou_agent::AgentError::Provider(
+                "duplicate_tool_use_id".into(),
+            ));
+        }
+        self.seen_tool_use_ids.extend(step_tool_use_ids);
         let mut normalized_blocks = Vec::with_capacity(blocks.len());
         let mut final_text = String::new();
         for block in blocks {
@@ -647,84 +733,30 @@ impl TurnObserver for ProductTurnRuntime {
                     final_text.push_str(text);
                     normalized_blocks.push(NormalizedAssistantBlock::Text { text: text.clone() });
                 }
-                AssistantBlock::ToolUse { id, input } => {
-                    if id.is_empty() || id.len() > 128 || !self.seen_tool_use_ids.insert(id.clone())
-                    {
-                        return Err(isyncyou_agent::AgentError::Provider(
-                            "duplicate_tool_use_id".into(),
-                        ));
-                    }
-                    match parse_action(input) {
-                        Ok(action) => normalized_blocks.push(NormalizedAssistantBlock::ToolUse {
+                AssistantBlock::ToolUse { id, input } => match parse_action(input) {
+                    Ok(action) => normalized_blocks.push(NormalizedAssistantBlock::ToolUse {
+                        tool_use_id: id.clone(),
+                        action,
+                    }),
+                    Err(help) => {
+                        normalized_blocks.push(NormalizedAssistantBlock::RejectedToolUse {
                             tool_use_id: id.clone(),
-                            action,
-                        }),
-                        Err(help) => {
-                            normalized_blocks.push(NormalizedAssistantBlock::RejectedToolUse {
-                                tool_use_id: id.clone(),
-                                stable_error_code:
-                                    isyncyou_agent::tool::INVALID_TOOL_ARGUMENTS_CODE.into(),
-                                help_schema_version:
-                                    isyncyou_agent::tool::REJECTED_TOOL_HELP_SCHEMA_VERSION,
-                                help_digest: tool_result_digest(help.as_bytes()),
-                            })
-                        }
+                            stable_error_code: isyncyou_agent::tool::INVALID_TOOL_ARGUMENTS_CODE
+                                .into(),
+                            help_schema_version:
+                                isyncyou_agent::tool::REJECTED_TOOL_HELP_SCHEMA_VERSION,
+                            help_digest: tool_result_digest(help.as_bytes()),
+                        })
                     }
-                }
+                },
             }
         }
-        let outcome_id = new_ulid().map_err(|_| {
-            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
-        })?;
-        let outcome = RequestStepOutcomeV1 {
-            outcome_version: 1,
-            outcome_id: outcome_id.clone(),
+        self.persist_provider_step_outcome(
             step_seq,
-            previous_outcome_id: self
-                .journal
-                .completed_steps
-                .last()
-                .map(|step| step.outcome_id.clone()),
-            provider: self.provider_binding.provider,
-            model: self.provider_binding.model.clone(),
             normalized_blocks,
-            final_text: (!final_text.is_empty()).then_some(final_text),
-            sanitized_usage: None,
-            terminal_validation_error: None,
-            outcome_digest: String::new(),
-        }
-        .seal_digest()
-        .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))?;
-        let outcome_bytes = serde_json::to_vec(&outcome).map_err(|_| {
-            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
-        })?;
-        self.journal.completed_steps.push(RequestStepRef {
-            step_seq,
-            outcome_id: outcome_id.clone(),
-            outcome_sha256: request_object_digest(&outcome_bytes),
-        });
-        self.journal.next_step_seq = step_seq
-            .checked_add(1)
-            .ok_or_else(|| isyncyou_agent::AgentError::Provider("turn_step_invalid".into()))?;
-        self.journal.phase = RequestPhase::ProviderStepCompleted;
-        let journal_id = new_ulid().map_err(|_| {
-            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
-        })?;
-        self.guard
-            .publish(SessionCommitV1 {
-                visible_records: vec![],
-                request_objects: vec![
-                    (outcome_id, outcome_bytes),
-                    (
-                        journal_id,
-                        serde_json::to_vec(&self.journal).map_err(|_| {
-                            isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
-                        })?,
-                    ),
-                ],
-                uuid_bindings: vec![],
-            })
-            .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))
+            (!final_text.is_empty()).then_some(final_text),
+            None,
+        )
     }
 
     fn read_tool_started(
@@ -1910,5 +1942,39 @@ mod tests {
         assert_eq!(history.len(), 5);
         assert_eq!(history[2].tool_use_id.as_deref(), Some("tool-a"));
         assert_eq!(history[4].tool_use_id.as_deref(), Some("tool-b"));
+    }
+
+    #[test]
+    fn duplicate_tool_use_ids_persist_terminal_validation_outcome_before_failure() {
+        let source = include_str!("product_session.rs");
+        let invalid_branch = source
+            .split("if invalid_tool_use_id")
+            .nth(1)
+            .and_then(|source| source.split("self.seen_tool_use_ids.extend").next())
+            .expect("invalid tool-use branch");
+        assert!(invalid_branch.contains("persist_provider_step_outcome"));
+        assert!(invalid_branch.contains("Some(\"duplicate_tool_use_id\".into())"));
+
+        let binding = recovery_binding();
+        let outcome = RequestStepOutcomeV1 {
+            outcome_version: 1,
+            outcome_id: new_ulid().unwrap(),
+            step_seq: 0,
+            previous_outcome_id: None,
+            provider: binding.provider,
+            model: binding.model.clone(),
+            normalized_blocks: vec![],
+            final_text: None,
+            sanitized_usage: None,
+            terminal_validation_error: Some("duplicate_tool_use_id".into()),
+            outcome_digest: String::new(),
+        }
+        .seal_digest()
+        .unwrap();
+        outcome.validate(&binding).unwrap();
+        assert_eq!(
+            outcome.terminal_validation_error.as_deref(),
+            Some("duplicate_tool_use_id")
+        );
     }
 }
