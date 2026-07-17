@@ -176,7 +176,7 @@ impl TurnObserver for NoopTurnObserver {}
 
 const MAX_STEPS: usize = 16;
 
-fn recoverable_read_error_result(error: &crate::AgentError) -> Option<String> {
+fn recoverable_read_error_result(action: &ToolAction, error: &crate::AgentError) -> Option<String> {
     match error {
         crate::AgentError::Provider(code) if code == "archive_body_unavailable" => Some(
             serde_json::json!({
@@ -186,6 +186,18 @@ fn recoverable_read_error_result(error: &crate::AgentError) -> Option<String> {
             })
             .to_string(),
         ),
+        crate::AgentError::ToolArgs(_)
+            if action.recovery_policy() == crate::RecoveryPolicy::RepeatableReadAndCompare =>
+        {
+            Some(
+                serde_json::json!({
+                    "status": "unavailable",
+                    "code": "read_target_unavailable",
+                    "retryable": false,
+                })
+                .to_string(),
+            )
+        }
         _ => None,
     }
 }
@@ -309,7 +321,7 @@ pub fn run_turn_cancellable(
                     };
                     let (result, untrusted) = match read_result {
                         Ok(result) => (result, true),
-                        Err(error) => match recoverable_read_error_result(&error) {
+                        Err(error) => match recoverable_read_error_result(&action, &error) {
                             Some(result) => (result, false),
                             None => return Err(error),
                         },
@@ -398,6 +410,16 @@ mod tests {
         fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
             Err(crate::AgentError::Provider(
                 "archive_body_unavailable".into(),
+            ))
+        }
+    }
+
+    struct InvalidReadTargetExecutor;
+
+    impl ToolExecutor for InvalidReadTargetExecutor {
+        fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+            Err(crate::AgentError::ToolArgs(
+                "sensitive executor detail must not escape".into(),
             ))
         }
     }
@@ -552,6 +574,70 @@ mod tests {
             })
         );
         assert!(!tool_result.0.contains("missing"));
+    }
+
+    #[test]
+    fn invalid_repeatable_read_target_returns_safe_tool_result_and_turn_can_continue() {
+        let mut provider = FakeProvider::new(vec![
+            vec![tool_use(
+                "t1",
+                json!({"op": "read", "account": "me", "service": "calendar", "id": "stale"}),
+            )],
+            vec![AssistantBlock::Text(
+                "I could not read that source, so I used the remaining results.".into(),
+            )],
+        ]);
+        let mut history = vec![Message::user("summarize recent events")];
+        let mut events = Vec::new();
+
+        let outcome = run_turn(
+            &mut provider,
+            &InvalidReadTargetExecutor,
+            &mut history,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        let content = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolResult {
+                    content,
+                    untrusted: false,
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .expect("safe unavailable result");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(content).unwrap(),
+            json!({
+                "status": "unavailable",
+                "code": "read_target_unavailable",
+                "retryable": false,
+            })
+        );
+        assert!(!content.contains("sensitive executor detail"));
+    }
+
+    #[test]
+    fn invalid_restore_local_target_remains_fail_closed() {
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({"op": "restore-local", "account": "me", "service": "onedrive", "id": "stale"}),
+        )]]);
+        let mut history = vec![Message::user("restore the file")];
+
+        let error = run_turn(
+            &mut provider,
+            &InvalidReadTargetExecutor,
+            &mut history,
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, crate::AgentError::ToolArgs(_)));
     }
 
     #[test]
