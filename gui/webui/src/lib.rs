@@ -2834,6 +2834,14 @@ impl Router {
             "/api/v1/accounts",
             "/api/v1/settings",
             "/api/v1/debug/stats",
+            // Agent status and session projections are backed by their own encrypted stores,
+            // lifecycle locks, and bounded hot caches. They never touch the archive Store guarded
+            // by the sync pass, so taking that gate here would let an unrelated M365 sync stall
+            // the Assistant bridge until its 15-second watchdog expires.
+            "/api/v1/agent/status",
+            "/api/v1/agent/session/list",
+            "/api/v1/agent/session/history",
+            "/api/v1/agent/request/status",
             // #656: the live transfer-progress poll reads only the in-memory SharedProgress
             // snapshot (no store). It MUST be gate-exempt: the mobile offline pass holds the
             // store gate for the whole blocking materialize, so a gated poll would block until
@@ -2851,6 +2859,12 @@ impl Router {
             "/api/v1/onedrive/transfers/cancel",
             "/api/v1/onedrive/transfers/pause",
             "/api/v1/onedrive/transfers/retry",
+            // Turn admission and cancellation are owned by AgentHandler and do not open the
+            // archive Store protected by this gate. Keeping them gated would let an unrelated
+            // sync delay the turn ID or make cancellation unresponsive.
+            "/api/v1/agent/turn",
+            "/api/v1/agent/turn/cancel",
+            "/api/v1/agent/pending/cancel",
         ];
         let static_get = req.method == "GET"
             && (matches!(
@@ -8609,6 +8623,52 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             resp.status, 200,
             "the live transfer poll must be served while the offline pass holds the gate"
+        );
+    }
+
+    #[test]
+    fn agent_hot_reads_are_gate_exempt_during_archive_sync() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router = Router::with_gate(Config::default(), gate.clone());
+        let _held = gate.lock().unwrap_or_else(|e| e.into_inner());
+        for (path, expected_status) in [
+            ("/api/v1/agent/status", 200),
+            ("/api/v1/agent/session/list?limit=100", 404),
+            (
+                "/api/v1/agent/session/history?session_id=session&limit=100",
+                404,
+            ),
+            (
+                "/api/v1/agent/request/status?session_id=session&route=turn&request_id=request",
+                404,
+            ),
+        ] {
+            let response = router.route(&ApiRequest::get(path));
+            assert_eq!(
+                response.status, expected_status,
+                "Agent hot read must be served without the archive gate: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_turn_admission_is_gate_exempt_during_archive_sync() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router = Router::with_gate(Config::default(), gate.clone())
+            .with_agent(std::sync::Arc::new(FakeAgent), "agent-cap".into());
+        let _held = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let response = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/turn")
+                .with_cap_token(Some("agent-cap".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    br#"{"request_id":"123e4567-e89b-42d3-a456-426614174000","session_id":"session","account":"reader","prompt":"status"}"#
+                        .to_vec(),
+                ),
+        );
+        assert_eq!(
+            response.status, 200,
+            "Agent turn admission must not wait for the archive gate"
         );
     }
 
